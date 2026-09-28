@@ -171,15 +171,19 @@ runs:
           done
         }
 
-        retry gh api \
-          --method GET \
-          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-          --paginate \
-          -f per_page=100 \
-          --jq '.jobs[]
-                | select(.name | startswith("model-ops / "))
-                | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
-        > /tmp/jobs.jsonl
+        # Redirect inside the function so each retry starts from an empty file.
+        list_jobs() {
+          gh api \
+            --method GET \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --paginate \
+            -f per_page=100 \
+            --jq '.jobs[]
+                  | select(.name | startswith("model-ops / "))
+                  | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
+          > /tmp/jobs.jsonl
+        }
+        retry list_jobs
 
         if [ ! -s /tmp/jobs.jsonl ]; then
           echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."

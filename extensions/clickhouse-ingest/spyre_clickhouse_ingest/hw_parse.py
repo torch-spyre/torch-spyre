@@ -748,8 +748,9 @@ class SuiteFilenames:
         # Strip a leading "run-tests" / "test" caller-job prefix before the skip check below,
         # however its separator survived filename sanitization: a literal "_" when the
         # original name used "/" with spaces, or whitespace when "/" was stripped bare.
+        # "test" stays case-sensitive: suite names themselves start with "Test ".
         m = re.match(r"^run-tests[\s_]+(.+)$", stem, re.IGNORECASE) or re.match(
-            r"^test(?: _ |\s{2,})(.+)$", stem
+            r"^test[\s_]+(.+)$", stem
         )
         if m:
             stem = m.group(1).strip()

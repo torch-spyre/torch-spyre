@@ -177,15 +177,19 @@ runs:
 
         # filter=latest excludes a prior attempt of this run leaking in and doubling every
         # row. --method GET is required: gh api infers POST as soon as any -f/-F field is
-        # given, and this endpoint has no POST route.
-        retry gh api \
-          --method GET \
-          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-          --paginate \
-          -f filter=latest \
-          -f per_page=100 \
-          --jq '.jobs[] | {id: .id, name: .name}' \
-        > /tmp/jobs.jsonl
+        # given, and this endpoint has no POST route. The redirect lives inside the function
+        # so each retry starts from an empty file, not the pages an earlier attempt wrote.
+        list_jobs() {
+          gh api \
+            --method GET \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --paginate \
+            -f filter=latest \
+            -f per_page=100 \
+            --jq '.jobs[] | {id: .id, name: .name}' \
+          > /tmp/jobs.jsonl
+        }
+        retry list_jobs
 
         python3 - << 'PYEOF'
         import os
