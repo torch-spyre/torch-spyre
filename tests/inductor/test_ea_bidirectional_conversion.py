@@ -482,6 +482,27 @@ def test_fp16_to_fp32_on_qkv_slice(shape, part):
     assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
 
 
+@pytest.mark.parametrize("start", [0, 1024], ids=lambda n: f"start{n}")
+def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
+    """A sliced staggered upcast puts its stick where the input's stick lands.
+
+    Transposing the column slice moves the input's stick dim to output dim 0,
+    which is not the output's last dim.
+    """
+    tokens, width = 8, 256
+
+    def fn(x):
+        x32 = x[:, start : start + width].t().float()
+        return (x32 * x32).sum(0).to(x.dtype), x32
+
+    x = torch.randn(tokens, 1536, dtype=torch.float16)
+    expected, _ = fn(x)
+    result, upcast = torch.compile(fn, dynamic=False)(x.to(DEVICE_NAME))
+
+    torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.01)
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+
+
 # ---------------------------------------------------------------------------
 # Eager-path unit tests
 # ---------------------------------------------------------------------------

@@ -287,7 +287,13 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
+    out_coords,
+    output_dep,
+    c_size,
+    c_stride,
+    stick_dim,
+    dtype,
+    ea=ElementArrangement.STANDARD,
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -297,7 +303,7 @@ def _make_output_stl(
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order, ea)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
@@ -506,6 +512,99 @@ def rescale_stl_for_dtype(
     )
 
 
+def _conversion_layouts(
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    dep: MemoryDep,
+    in_layout: FixedLayout,
+    stl: SpyreTensorLayout,
+) -> list[SpyreTensorLayout]:
+    """Output STLs of a dtype conversion that changes the stick depth.
+
+    The input stick must start on a stick boundary. For an fp16<->fp32
+    conversion (a staggered EA on either side) the output keeps that stick, on
+    the host dim walking the same variable, so each input stick maps onto
+    output sticks without a restickify:
+
+    - Reading the input exactly as it writes the output, the conversion
+      inherits the input's device layout, rescaled for the new stick depth. That
+      layout can carry a stick choice or a fold its host size cannot express. A
+      conversion creating the stagger also offers the layouts a restickify of its
+      STANDARD input would reach, so a downstream reduction can ask for the
+      normalized dim as the stick (Gemma 4: an embedding entering RMSNorm).
+    - Reading a slice of a wider buffer (Gemma's ``q_norm``/``k_norm`` upcast
+      part of the fused QKV projection into a narrower per-head buffer), the
+      conversion builds its layout from the output's host size. The input's
+      outer device dims describe the wider buffer's rows, so inheriting them
+      would misaddress the output.
+
+    Any other conversion (e.g. fp8->fp16 after qfp8ch) rebuilds a dense layout
+    from the output host size with the stick on the last dim.
+    """
+    try:
+        in_stick_expr = device_coordinates(stl, dep, None)[-1]
+    except Unsupported:
+        # Staggered-EA candidate whose physical stick depth differs from
+        # elems_per_stick — not a valid input for this conversion path.
+        return []
+    if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
+        return []
+
+    input_ea = stl.element_arrangement
+    out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    if out_ea not in STAGGERED_EAS and input_ea not in STAGGERED_EAS:
+        # An unaligned input stick dim is padded to a full stick (4x16 FP16
+        # holds 64 elements per row, 64 FP32 elements once converted), so size
+        # the output's last dim to a full input stick (#1756).
+        in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+        if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
+            c_size[-1] = in_elems_per_stick
+            c_stride[-1] = 1
+        return [
+            SpyreTensorLayout(
+                c_size, c_stride, output.dtype, list(range(len(c_size))), out_ea
+            )
+        ]
+
+    if not _convert_reads_whole_input(in_layout, output, dep, output_dep):
+        out_coords = host_coordinates(output, output_dep, None)
+        stick_dim = _pick_stick_dim(in_stick_expr, out_coords)
+        if in_stick_expr.free_symbols and stick_dim < 0:
+            return []
+        out_stl = _make_output_stl(
+            out_coords, output_dep, c_size, c_stride, stick_dim, output.dtype, out_ea
+        )
+        return [] if out_stl is None else [out_stl]
+
+    layouts = [rescale_stl_for_dtype(stl, output.dtype, out_ea, in_layout, dep)]
+    # Only a STANDARD input maps to a staggered output. A staggered input is the
+    # reverse restoration, which keeps the stick selected before the upcast.
+    if out_ea in STAGGERED_EAS:
+        in_coords = host_coordinates(in_layout, dep, None)
+        source_device_coords = device_coordinates(stl, dep, None)
+        for target_stick_expr in in_coords:
+            if not target_stick_expr.free_symbols:
+                continue
+            target_stl = compute_restickify_target_layout(
+                stl,
+                in_layout,
+                target_stick_expr,
+                in_coords,
+                source_device_coords,
+            )
+            if target_stl is None:
+                continue
+            candidate = rescale_stl_for_dtype(
+                target_stl, output.dtype, out_ea, in_layout, dep
+            )
+            if candidate not in layouts:
+                layouts.append(candidate)
+    return layouts
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -641,95 +740,7 @@ def _single_arg_op_layout(
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
-            # Type conversion may require padding when input has padding due to stick
-            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-            # which becomes 64 FP32 elements when converted. We need to reflect this
-            # in the output host size so the constructor creates the correct device layout.
-            try:
-                in_stick_expr = device_coordinates(stl, dep, None)[-1]
-            except Unsupported:
-                # Staggered-EA candidate whose physical stick depth differs from
-                # elems_per_stick — not a valid input for this conversion path.
-                return []
-            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
-                return []
-
-            input_ea = stl.element_arrangement
-
-            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
-
-            # Two strategies, chosen by whether a staggered EA is involved:
-            #
-            # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that
-            #    traverse the whole input. The staggered element ordering only
-            #    exists on the physical device layout, so propagate the input's
-            #    device_size/stride_map and rescale just the stick depth via
-            #    rescale_stl_for_dtype; reconstructing from the logical host size
-            #    would lose the stick choice a downstream reduction needs.
-            #    Inheriting is only sound for an identical access -- see
-            #    _convert_reads_whole_input; a sliced read falls through to (2),
-            #    which still stamps the staggered EA.
-            #
-            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). There is no
-            #    staggered ordering to keep, so rebuild a dense layout from the
-            #    output host size, as the general (non-EA) convert path does.
-            staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-            if staggered and _convert_reads_whole_input(
-                in_layout, output, dep, output_dep
-            ):
-                layouts = [
-                    rescale_stl_for_dtype(stl, output.dtype, fmt, in_layout, dep)
-                ]
-
-                # A conversion that creates a staggered EA must also expose
-                # outputs reachable by restickifying its STANDARD input first.
-                # Otherwise the conversion permanently inherits the input's
-                # stick and a downstream reduction-broadcast join has no way to
-                # request the normalized dimension as the stick. Gemma 4 hits
-                # this when an embedding output enters RMSNorm with its sequence
-                # dimension on the stick.
-                if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
-                    in_coords = host_coordinates(in_layout, dep, None)
-                    source_device_coords = device_coordinates(stl, dep, None)
-                    for target_stick_expr in in_coords:
-                        if not target_stick_expr.free_symbols:
-                            continue
-                        target_stl = compute_restickify_target_layout(
-                            stl,
-                            in_layout,
-                            target_stick_expr,
-                            in_coords,
-                            source_device_coords,
-                        )
-                        if target_stl is None:
-                            continue
-                        candidate = rescale_stl_for_dtype(
-                            target_stl, output.dtype, fmt, in_layout, dep
-                        )
-                        if candidate not in layouts:
-                            layouts.append(candidate)
-
-                # Under the current EA map, an already-staggered input is the
-                # reverse staggered-to-STANDARD restoration. It needs no
-                # expansion: preserve the stick selected before the upcast.
-
-                return layouts
-
-            # Dense reconstruction from the output host size. When the input
-            # stick dim is unaligned, force a full input-stick depth so stick
-            # padding is reflected in the device layout (see #1756 example above).
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-                c_size = [concretize_expr(s) for s in output.size[:-1]] + [
-                    in_elems_per_stick
-                ]
-                c_stride = [concretize_expr(s) for s in output.stride[:-1]] + [1]
-            return [
-                SpyreTensorLayout(
-                    c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
-                )
-            ]
+            return _conversion_layouts(output, output_dep, dep, in_layout, stl)
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization: an
