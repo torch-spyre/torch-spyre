@@ -570,13 +570,9 @@ def _single_arg_op_layout(
             #    _convert_reads_whole_input; a sliced read falls through to (2),
             #    which still stamps the staggered EA.
             #
-            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
-            #    device layout can be degenerate — qfp8ch rescales a size-1
-            #    num-sticks dim to 0 (1*64//128), leaving a size-0 dim — and
-            #    rescale_stl_for_dtype would faithfully propagate that garbage,
-            #    changing the layout rank and downstream graph partitioning.
-            #    Rebuild a clean dense layout from the output host size instead,
-            #    as the general (non-EA) convert path does.
+            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). There is no
+            #    staggered ordering to keep, so rebuild a dense layout from the
+            #    output host size, as the general (non-EA) convert path does.
             staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep

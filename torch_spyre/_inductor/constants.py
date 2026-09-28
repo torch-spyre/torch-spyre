@@ -48,8 +48,8 @@ DEVICE_NAME = "spyre"
 # NOTE: this is deliberately narrower than "all non-STANDARD EAs". is_ea_compatible
 # does NOT use this set — it treats any single non-STANDARD EA (except EXX2) as
 # broadcastable. QFP8CH is intentionally excluded here because membership also
-# forces the convert-preserve path, which would mishandle the degenerate qfp8ch
-# convert layout.
+# forces the convert-preserve path, and the fp8->fp16 convert after qfp8ch
+# rebuilds a dense layout instead.
 STAGGERED_EAS = frozenset(
     {
         ElementArrangement.DL16_TO_FP32,
@@ -96,8 +96,8 @@ def is_ea_compatible(eas) -> bool:
     # combination — QFP8CH tensors are consumed by an fp8 matmul or the fp8->fp16
     # convert, never a multi-arg pointwise. So QFP8CH is intentionally kept OUT of
     # STAGGERED_EAS (which doubles as the "convert must preserve the device
-    # layout" gate; adding QFP8CH there would mis-handle the degenerate qfp8ch
-    # convert layout). If QFP8CH broadcast ever becomes real, split those two
+    # layout" gate; adding QFP8CH there would send the fp8->fp16 convert down
+    # the preserve path). If QFP8CH broadcast ever becomes real, split those two
     # uses rather than widening STAGGERED_EAS.
     non_standard = unique - {ElementArrangement.STANDARD}
     return len(non_standard) == 1 and ElementArrangement.EXX2 not in non_standard
