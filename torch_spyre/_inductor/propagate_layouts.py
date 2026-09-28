@@ -694,7 +694,9 @@ def _conversion_layouts(
       normalized dim as the stick (Gemma 4: an embedding entering RMSNorm).
 
     Any other conversion (e.g. fp8->fp16 after qfp8ch) rebuilds a dense layout
-    from the output host size with the stick on the last dim.
+    from the output host size with the stick on the last dim.  It holds only the
+    sticks the live elements reach; the whole sticks of the coarser grid that
+    the conversion writes are ``insert_staggered_ea_padding``'s to add.
     """
     try:
         in_stick_expr = device_coordinates(stl, dep, None)[-1]
@@ -711,13 +713,6 @@ def _conversion_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     if out_ea not in STAGGERED_EAS and input_ea not in STAGGERED_EAS:
-        # An unaligned input stick dim is padded to a full stick (4x16 FP16
-        # holds 64 elements per row, 64 FP32 elements once converted), so size
-        # the output's last dim to a full input stick (#1756).
-        in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-        if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-            c_size[-1] = in_elems_per_stick
-            c_stride[-1] = 1
         return [
             SpyreTensorLayout(
                 c_size, c_stride, output.dtype, list(range(len(c_size))), out_ea

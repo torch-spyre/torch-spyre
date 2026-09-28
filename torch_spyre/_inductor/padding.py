@@ -785,13 +785,18 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
     return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
 
 
-def _staggered_ea(op: Operation) -> ElementArrangement | None:
-    """The staggered arrangement ``op``'s output carries, or ``None`` for neither.
+# Arrangements a narrowing conversion stamps on its output.
+_NARROWING_EAS = (ElementArrangement.FP32_TO_DL16, ElementArrangement.QFP8CH)
+
+
+def _conversion_ea(op: Operation) -> ElementArrangement | None:
+    """The arrangement that tells how ``op``'s output crosses stick grids, or ``None``.
 
     A buffer carries ``DL16_TO_FP32`` while it holds a value on the FP32 side of a
     widening conversion, which includes pointwise ops downstream of the conversion
-    itself, and ``FP32_TO_DL16`` when it feeds a narrowing one.  The two need
-    padding on opposite sides, so callers dispatch on which one comes back.
+    itself.  ``FP32_TO_DL16`` and ``QFP8CH`` mark the output of a narrowing
+    conversion, FP32 to FP16 and FP16 to FP8.  The two directions need padding on
+    opposite sides, so callers dispatch on which one comes back.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -799,33 +804,32 @@ def _staggered_ea(op: Operation) -> ElementArrangement | None:
     if not isinstance(out_layout, FixedTiledLayout):
         return None
     ea = out_layout.device_layout.element_arrangement
-    return ea if ea in STAGGERED_EAS else None
+    return ea if ea in _NARROWING_EAS or ea in STAGGERED_EAS else None
 
 
-def _widens_to_the_fp32_grid(op: Operation, graph: GraphLowering) -> bool:
-    """Whether ``op`` converts a value from the FP16 stick grid onto the FP32 one.
+def _widening_source_eps(op: Operation, graph: GraphLowering) -> int | None:
+    """The stick depth ``op`` widens from, or ``None`` unless it moves to a finer grid.
 
-    Identified by comparing the stick depth of the single value ``op`` reads
-    against the depth it writes, rather than by the arrangement its output
-    carries.  A widening conversion's output may come back ``STANDARD``, holding
-    densely packed FP32 elements, yet codegen still iterates the coarser FP16
-    grid for it: ``iterates_on_the_fp16_grid`` in op_spec names both conversions
-    outright for exactly this reason.  Keying on the arrangement here would leave
-    such an output a stick short of what that iteration writes.
+    A widening conversion reads each stick of its single input into several
+    output sticks: an FP16 stick into an FP32 pair, an FP8 stick into two FP16
+    sticks.  It is identified by comparing the stick depth it reads against the
+    depth it writes, rather than by the arrangement its output carries.  The
+    output may come back ``STANDARD``, holding densely packed elements, yet
+    codegen still iterates the coarser input grid for it
+    (``conversion_stick_grid`` in op_spec), so keying on the arrangement would
+    leave such an output a stick short of what that iteration writes.
     """
     if not isinstance(op, ComputedBuffer):
-        return False
+        return None
     out_layout = op.get_layout()
     if not isinstance(out_layout, FixedTiledLayout):
-        return False
+        return None
     # A conversion is unary: one value in, one out.
     in_dep, _in_buf, in_layout = _unary_input(op, graph)
     if in_dep is None:
-        return False
-    return (
-        in_layout.device_layout.device_size[-1]
-        > out_layout.device_layout.device_size[-1]
-    )
+        return None
+    in_eps = in_layout.device_layout.device_size[-1]
+    return in_eps if in_eps > out_layout.device_layout.device_size[-1] else None
 
 
 def _assert_input_paddable(
@@ -1079,14 +1083,16 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
-    """Grow a narrowing conversion's FP32 input to the capacity its output spans.
+def _pad_narrowing_input(op: Operation, graph: GraphLowering) -> None:
+    """Grow a narrowing conversion's input to the capacity its output spans.
 
-    Narrowing FP32 to FP16 gathers each pair of 32-slot FP32 sticks into one
-    64-element FP16 stick, and the output is sized in whole FP16 sticks.  An input
-    whose live elements end inside a pair would leave the last output stick
-    reading past the input's allocation: 96 elements occupy 3 FP32 sticks but 2
-    FP16 sticks, whose 128 slots need 4 FP32 sticks behind them.
+    Narrowing gathers several input sticks into one output stick: a pair of
+    32-slot FP32 sticks into one 64-element FP16 stick, a pair of FP16 sticks into
+    one 128-element FP8 stick.  The output is sized in whole sticks, so an input
+    whose live elements end inside a group would leave the last output stick
+    reading past the input's allocation: 96 FP32 elements occupy 3 FP32 sticks but
+    2 FP16 sticks, whose 128 slots need 4 FP32 sticks behind them, and 192 FP16
+    elements likewise need 4 FP16 sticks behind their 2 FP8 sticks.
 
     The producer's output is padded in place; a graph input has no producer, so
     it is cloned and the clone padded (``_clone_input_for_padding``).  Only the
@@ -1115,8 +1121,8 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     if in_num_sticks_dim is None or out_num_sticks_dim is None:
         return
 
-    # The FP16 output is the coarser grid, and its num-sticks count is already
-    # rounded up to whole sticks, so its capacity bounds what the input must hold.
+    # The output is the coarser grid, and its num-sticks count is already rounded
+    # up to whole sticks, so its capacity bounds what the input must hold.
     in_eps = in_stl.device_size[-1]
     out_eps = out_stl.device_size[-1]
     out_num_sticks = out_stl.device_size[out_num_sticks_dim]
@@ -1146,26 +1152,31 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-def _pad_staggered_fp32_buffer(op: Operation) -> None:
-    """Grow a staggered FP32 buffer to both sticks of the pair its elements span.
+def _pad_to_whole_coarse_sticks(op: Operation, coarse_eps: int) -> None:
+    """Grow a buffer on a finer stick grid to whole sticks of the coarser one.
 
-    Widening FP16 to FP32 staggers one 64-element FP16 stick across a *pair* of
-    32-slot FP32 sticks, so every buffer holding such a value spans two sticks as
-    soon as its stick-dim extent passes the first 32 slots.  That is true of the
-    conversion's own output and equally of any pointwise op downstream that keeps
-    the arrangement: the op is ordinary by name and dtype, but its elements are
-    still split across the pair, so it needs the same capacity.  The conversion
-    output needs the pair even when it comes back ``STANDARD``, because codegen
-    iterates the coarse FP16 grid for the conversion whatever its output
-    arrangement says.
+    Widening spreads one coarse stick across several fine ones: one 64-element
+    FP16 stick staggers across a *pair* of 32-slot FP32 sticks, and one
+    128-element FP8 stick converts into two FP16 sticks.  The hardware writes
+    the whole group, so the buffer spans all of it as soon as its stick-dim
+    extent passes the first fine stick.  That is true of the conversion's own
+    output and, for the FP32 stagger, equally of any pointwise op downstream
+    that keeps the arrangement: the op is ordinary by name and dtype, but its
+    elements are still split across the pair, so it needs the same capacity.
+    The FP8 conversion's FP16 output is sequential, so its consumers read only
+    the sticks their live elements occupy and need nothing.
 
-    ``rescale_stl_for_dtype`` sizes an output by the sticks its live elements
-    occupy, which is the first stick alone whenever the extent is under half a
-    stick, so the room for the rest of the pair is added here.
+    ``rescale_stl_for_dtype`` and the dense conversion layout size an output by
+    the sticks its live elements occupy, so the room for the rest of the group
+    is added here.
 
     Only the device layout changes, and the host size stays put: the num-sticks
     dim, found from the op's write coordinates by ``stick_dims``, grows, or a gap
     dim is prepended when it holds one stick (``_grow_num_sticks``).
+
+    Args:
+        op: The buffer to grow.
+        coarse_eps: Elements per stick of the coarser grid its value came from.
     """
     assert isinstance(op, ComputedBuffer)
     layout = op.get_layout()
@@ -1179,8 +1190,6 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     if num_sticks_dim is None:
         return
     out_eps = stl.device_size[-1]
-    # The stagger is defined against the FP16 grid: the pair holds one FP16 stick.
-    coarse_eps = DataFormats.SEN169_FP16.elems_per_stick()
     if out_eps >= coarse_eps:
         return
     sticks_per_pair = -(-coarse_eps // out_eps)
@@ -1238,35 +1247,40 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
 
 def insert_staggered_ea_padding(graph: GraphLowering) -> None:
-    """Give a conversion between the FP16 and FP32 stick grids the capacity it needs.
+    """Give a conversion between two stick grids the capacity it needs.
 
-    One FP16 stick's elements stagger across a pair of FP32 sticks, so a conversion
-    either way has to reach both halves of that pair even when the live elements
-    fill only part of it.  ``rescale_stl_for_dtype`` sizes an output by the sticks
-    those live elements occupy, so the extra capacity is added here, on the one
-    buffer that needs it, rather than propagated into every downstream consumer.
+    A conversion maps one stick of the coarser grid onto several sticks of the
+    finer one: one FP16 stick's elements stagger across a pair of FP32 sticks, and
+    one FP8 stick holds the elements of two FP16 sticks.  The hardware converts
+    whole sticks, so a conversion either way reaches every fine stick of the group
+    even when the live elements fill only part of it.  Layout propagation sizes an
+    output by the sticks those live elements occupy, so the extra capacity is
+    added here, on the one buffer that needs it, rather than propagated into
+    every downstream consumer.
 
-    The buffer that needs room is always the one on the finer FP32 grid, which
-    differs by direction:
+    The buffer that needs room is always the one on the finer grid, which differs
+    by direction:
 
-    - Narrowing (``_pad_fp32_to_dl16_input``): the conversion's input, reached from
-      the ``FP32_TO_DL16`` output that consumes it.
-    - Widening (``_pad_staggered_fp32_buffer``): the buffer itself.  Two kinds need
-      it.  A widening conversion is recognized by the grids it spans
-      (``_widens_to_the_fp32_grid``) because its output may be ``STANDARD`` while
-      codegen still iterates the coarse FP16 grid for it.  A pointwise op
-      downstream is recognized by the ``DL16_TO_FP32`` arrangement it carries,
-      which is the only signal its name and dtypes leave.
+    - Narrowing (``_pad_narrowing_input``): the conversion's input, reached from
+      the ``FP32_TO_DL16`` or ``QFP8CH`` output that consumes it.
+    - Widening (``_pad_to_whole_coarse_sticks``): the buffer itself.  Two kinds
+      need it.  A widening conversion is recognized by the grids it spans
+      (``_widening_source_eps``) because its output may be ``STANDARD`` while
+      codegen still iterates the coarse grid for it.  A pointwise op downstream
+      of an FP16 to FP32 conversion is recognized by the ``DL16_TO_FP32``
+      arrangement it carries, which is the only signal its name and dtypes leave.
 
     Padding touches only ``device_size``, never the host size or ``stride_map``, so
     later passes see the tensor unchanged and codegen's backGap path covers the
     resulting gap.
     """
     for op in list(graph.operations):
-        ea = _staggered_ea(op)
-        if ea == ElementArrangement.FP32_TO_DL16:
-            _pad_fp32_to_dl16_input(op, graph)
-        elif ea == ElementArrangement.DL16_TO_FP32 or _widens_to_the_fp32_grid(
-            op, graph
-        ):
-            _pad_staggered_fp32_buffer(op)
+        ea = _conversion_ea(op)
+        if ea in _NARROWING_EAS:
+            _pad_narrowing_input(op, graph)
+        elif ea == ElementArrangement.DL16_TO_FP32:
+            # The stagger is defined against the FP16 grid: the pair holds one
+            # FP16 stick.
+            _pad_to_whole_coarse_sticks(op, DataFormats.SEN169_FP16.elems_per_stick())
+        elif (source_eps := _widening_source_eps(op, graph)) is not None:
+            _pad_to_whole_coarse_sticks(op, source_eps)

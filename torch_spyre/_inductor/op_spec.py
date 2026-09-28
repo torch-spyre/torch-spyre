@@ -26,7 +26,14 @@ from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
 
-from .constants import DL16TOFP32_OP, FP32TODL16_OP, IDENTITY_OP, STAGGERED_EAS
+from .constants import (
+    DL16TOFP32_OP,
+    FP32TODL16_OP,
+    FP8TODL16_OP,
+    IDENTITY_OP,
+    QFP8CH_OP,
+    STAGGERED_EAS,
+)
 
 
 LX_RELAYOUT_INFO_KEY = "lx_relayout_certified"
@@ -407,15 +414,23 @@ def clear_constant_tensor_cache():
 # coarser FP16 grid whichever way the conversion runs.
 STAGGERING_CONVERSION_OPS = (DL16TOFP32_OP, FP32TODL16_OP)
 
+# A conversion between the FP8 and FP16 stick grids, in either direction.  One FP8
+# stick holds the elements of two FP16 sticks, so the iteration follows the
+# coarser FP8 grid.
+FP8_CONVERSION_OPS = (FP8TODL16_OP, QFP8CH_OP)
 
-def iterates_on_the_fp16_grid(op_spec: OpSpec) -> bool:
-    """Whether this op's iteration must follow the coarser FP16 stick grid.
 
-    True for the FP16<->FP32 conversions themselves, named by op, and for an op
-    that carries a value one of them produced into its own output, recognized by
-    the staggered arrangement that output holds.  The arrangement is the only
-    signal available for such an op: it is an ordinary pointwise op whose name
-    and dtypes say nothing about how its elements are laid out.
+def conversion_stick_grid(op_spec: OpSpec) -> int | None:
+    """The stick depth this op's iteration must follow, or ``None`` for its own.
+
+    A conversion between two stick grids converts whole sticks of the coarser
+    one, so its iteration is rounded to that grid on both sides: FP16 for the
+    FP16<->FP32 conversions, FP8 for FP16<->FP8.  The conversions are named by
+    op.  An op that carries a value an FP16->FP32 conversion produced into its
+    own output follows the FP16 grid too, recognized by the staggered
+    arrangement that output holds.  The arrangement is the only signal available
+    for such an op: it is an ordinary pointwise op whose name and dtypes say
+    nothing about how its elements are laid out.
 
     The output decides, not the inputs: ``insert_staggered_ea_padding`` gives
     the pair's second stick only to a buffer that carries the arrangement, so an
@@ -424,11 +439,13 @@ def iterates_on_the_fp16_grid(op_spec: OpSpec) -> bool:
     each row into the next.
     """
     if op_spec.op in STAGGERING_CONVERSION_OPS:
-        return True
+        return DataFormats.SEN169_FP16.elems_per_stick()
+    if op_spec.op in FP8_CONVERSION_OPS:
+        return DataFormats.SEN143_FP8.elems_per_stick()
     outputs = [arg for arg in op_spec.args if not arg.is_input]
-    return bool(outputs) and all(
-        arg.element_arrangement in STAGGERED_EAS for arg in outputs
-    )
+    if outputs and all(arg.element_arrangement in STAGGERED_EAS for arg in outputs):
+        return DataFormats.SEN169_FP16.elems_per_stick()
+    return None
 
 
 @dataclasses.dataclass
