@@ -63,7 +63,10 @@ class SchemaApplier:
         r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: TO \S+)?) \(.*?\) AS (SELECT|WITH)\b"
     )
     SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
-    ALTER = re.compile(r"\bALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
+    ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
+    ADDS = re.compile(
+        r"\bADD\s+(?:COLUMN|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
+    )
     LEDGER = "schema_migrations"
     LEDGER_DDL = (
         "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
@@ -188,18 +191,34 @@ class SchemaApplier:
         return "\n".join(list(diff)[:40])
 
     @classmethod
+    def pending_adds(cls, pending: list) -> dict:
+        """table -> column/index names that pending migrations ADD."""
+        out: dict = {}
+        for p in pending:
+            for stmt in cls.statements(p.read_text()):
+                m = cls.ALTER.match(stmt)
+                if m:
+                    out.setdefault(m.group(1), set()).update(cls.ADDS.findall(stmt))
+        return out
+
+    @classmethod
+    def without(cls, obj: SchemaObject, names: set) -> SchemaObject:
+        """obj with the column/index definitions named in `names` removed (obj itself if none)."""
+        if not names:
+            return obj
+        alt = "|".join(re.escape(n) for n in names)
+        sql = re.sub(rf"(?m)^\s*(?:INDEX\s+)?`?(?:{alt})`?\s[^\n]*\n", "", obj.sql)
+        sql = re.sub(r",(\s*\))", r"\1", sql)
+        return SchemaObject(obj.kind, obj.name, sql, obj.file)
+
+    @classmethod
     def plan(cls, client, db: str, files: list, migrations: list) -> list:
         """(action, name, detail) for every change an apply would make, in order."""
         live = cls.live(client, db)
         done = cls.applied(client, db)
         objs = [o for path, text in files for o in cls.objects(path, text)]
         pending = [p for p in migrations if p.name not in done]
-        # A difference a pending migration ALTERs is expected; apply re-checks after migrating.
-        altered = {
-            m.group(1)
-            for p in pending
-            for m in cls.ALTER.finditer(cls.LINE_COMMENT.sub("", p.read_text()))
-        }
+        added = cls.pending_adds(pending)
         steps = []
         for o in objs:
             if o.kind == "view":
@@ -209,8 +228,19 @@ class SchemaApplier:
             else:
                 diff = cls.differs(client, o, live[o.name], db)
                 if diff:
-                    kind = "migrates" if o.name in altered else "drift"
-                    steps.append((kind, o.name, diff))
+                    # Expected only if the table matches once what a pending migration adds (and
+                    # the live table lacks: the ADDs are IF NOT EXISTS) is left out.
+                    stored = live[o.name]
+                    missing = {
+                        n
+                        for n in added.get(o.name, set())
+                        if not re.search(rf"\b{n}\b", stored)
+                    }
+                    before = cls.without(o, missing)
+                    resolved = before is not o and not cls.differs(
+                        client, before, stored, db
+                    )
+                    steps.append(("migrates" if resolved else "drift", o.name, diff))
         steps += [("migrate", p.name, "") for p in pending]
         for o in objs:
             if o.kind != "view":

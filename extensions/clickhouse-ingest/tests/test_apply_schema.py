@@ -154,14 +154,23 @@ def test_migration_can_resolve_drift_before_the_check(tmp_path):
     assert ("migrate", "001_widen.sql") in [(a, n) for a, n, _ in steps]
 
 
-def test_plan_labels_a_difference_a_pending_migration_alters(tmp_path):
+def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
+    wide = "CREATE TABLE IF NOT EXISTS {} (\n    a {},\n    b UInt8\n) ENGINE = MergeTree ORDER BY a"
     d = _schema(
         tmp_path,
-        {"10-t.sql": TABLE, "20-u.sql": TABLE.replace(" t ", " u ")},
-        {"001_add.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS a UInt8"},
+        {"10-t.sql": wide.format("t", "UInt8"), "20-u.sql": wide.format("u", "UInt8")},
+        {
+            "001_add.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8;\n"
+            "ALTER TABLE u ADD COLUMN IF NOT EXISTS b UInt8"
+        },
     )
-    narrow = "CREATE TABLE {} (a UInt16) ENGINE = MergeTree ORDER BY a"
-    server = FakeServer({"t": narrow.format("t"), "u": narrow.format("u")})
+    server = FakeServer(
+        {
+            # t lacks only the added column; u also has a different type for a.
+            "t": "CREATE TABLE t ( a UInt8 ) ENGINE = MergeTree ORDER BY a",
+            "u": "CREATE TABLE u ( a UInt16 ) ENGINE = MergeTree ORDER BY a",
+        }
+    )
     files = SchemaApplier.selected_files(d)
     steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
     assert [(a, n) for a, n, _ in steps] == [
@@ -169,6 +178,29 @@ def test_plan_labels_a_difference_a_pending_migration_alters(tmp_path):
         ("drift", "u"),
         ("migrate", "001_add.sql"),
     ]
+
+
+def test_an_addition_the_live_table_already_has_is_not_left_out(tmp_path):
+    d = _schema(
+        tmp_path,
+        {
+            "10-t.sql": "CREATE TABLE IF NOT EXISTS t (\n    a UInt8,\n    b UInt8,\n"
+            "    INDEX ix a TYPE minmax GRANULARITY 1\n) ENGINE = MergeTree ORDER BY a"
+        },
+        {
+            "001_ix.sql": "ALTER TABLE t ADD INDEX IF NOT EXISTS ix a TYPE minmax GRANULARITY 1",
+            "002_b.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8",
+        },
+    )
+    # ix already exists live (added by hand); only b is really missing.
+    server = FakeServer(
+        {
+            "t": "CREATE TABLE t ( a UInt8, INDEX ix a TYPE minmax GRANULARITY 1 ) ENGINE = MergeTree ORDER BY a"
+        }
+    )
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps][0] == ("migrates", "t")
 
 
 def test_non_create_statement_in_schema_is_rejected(tmp_path):
