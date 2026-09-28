@@ -18,7 +18,7 @@ At import time the Spyre backend registers three components with Inductor. Toget
 
 | Component | Module | Role |
 |---|---|---|
-| `SuperDSCScheduling` | [`scheduler.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scheduler.py) | Inductor backend scheduling class. Decides how to group and order operations on the LoopLevelIR. Replaces Triton scheduling. |
+| `SuperDSCScheduling` | [`scheduler.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scheduler.py) | Inductor backend scheduling class. Decides how to group and order operations on the LoopLevelIR. Replaces Triton scheduling. Inductor's own node-pairwise fusion (`can_fuse_vertical`/`can_fuse_horizontal`) is permanently disabled here — real op-to-kernel grouping happens later, in `spyre_fuse_nodes` (see `CustomPostFusionPasses` below). |
 | `SpyrePythonWrapperCodegen` | [`wrapper.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wrapper.py) | Inductor wrapper-codegen class. Generates the Python wrapper that allocates tiled buffers via `spyre_empty_with_layout()` and dispatches kernels via `async_compile.sdsc()`. |
 | `SpyreDeviceOpOverrides` | [`device/op_overrides.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/device/op_overrides.py) | Device-specific op overrides surfaced to Inductor. |
 

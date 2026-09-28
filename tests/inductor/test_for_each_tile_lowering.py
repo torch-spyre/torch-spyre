@@ -3757,7 +3757,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
-        from tests.inductor.utils_inductor import cached_xavier, dl16_round
+        from utils_inductor import cached_xavier, dl16_round
 
         torch._dynamo.reset()
         X = cached_xavier((256, 256))
@@ -3796,7 +3796,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_online_softmax_fn,
             nested_online_softmax_reference,
         )
-        from tests.inductor.utils_inductor import cached_xavier, dl16_round
+        from utils_inductor import cached_xavier, dl16_round
 
         torch._dynamo.reset()
         Q = cached_xavier((LQ, D))

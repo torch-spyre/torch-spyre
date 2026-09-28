@@ -273,6 +273,11 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
+void SpyreStream::launchHostCompute(flex::HostComputeParams* params) const {
+  RECORD_FUNCTION("launch::HostCompute", {});
+  resolveRuntimeHandle()->launchHostCompute(params);
+}
+
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args,
                          std::vector<SymbolicArg> symbolic_args) const {

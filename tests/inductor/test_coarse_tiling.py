@@ -2234,6 +2234,21 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
+    def test_refuses_to_overwrite_existing_loop_info(self):
+        """An op that already carries loop_info -- a for_each_tile loop, say --
+        is not re-tiled: coarse_tile raises rather than replace the record."""
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)):
+            tiled_op, _, operations = _make_full_buffer_read_fixture()
+            before = tiled_op.loop_info
+            self.assertIsNotNone(before)
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            with self.assertRaises(Unsupported) as ctx:
+                coarse_tile_post_stickify(_graph(operations), groups)
+            self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
+            self.assertIs(tiled_op.loop_info, before)
+
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
@@ -2247,6 +2262,9 @@ class TestCoarseTile(unittest.TestCase):
             tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
             self.assertEqual(len(full_deps), 1)
             full_buf_name = full_deps[0].name
+            # The fixture pre-stamps loop_info for the read-copy tests; here
+            # coarse_tile does the stamping, and refuses to overwrite a stamp.
+            tiled_op.loop_info = None
 
             groups = [([tiled_op], [(0, Integer(8))])]
             coarse_tile_post_stickify(_graph(operations), groups)
@@ -9732,6 +9750,90 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             self.assertFalse(
                 hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
             )
+
+
+class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
+    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+
+    A region spans every op between the first and last op one outermost loop
+    stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
+    stamped and any op sitting between them unstamped.  The pass must raise
+    before it touches the graph.
+    """
+
+    _SPEC = TileSpec((TileAxis(0, 4),))
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _bare(self, name):
+        op = _make_op(_make_pointwise([Integer(256)]), name)
+        op._test_out_coords = [Symbol("c0")]
+        op.dim_hints = []
+        return op
+
+    def _stamped(self, name):
+        """An op stamped the way ``_stamp_direct_loop_info`` stamps a loop body
+        op: ``loop_info`` plus a DimHint carrying the trip count."""
+        op = self._bare(name)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
+        )
+        op.dim_hints = [
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=Symbol("u0"),
+                is_reduction=False,
+                loop_var_range=2,
+            )
+        ]
+        return op
+
+    def _state(self, ops):
+        return [
+            (list(op.dim_hints), getattr(op, "loop_info", None), list(op.data.ranges))
+            for op in ops
+        ]
+
+    def test_refuses_op_the_loop_stamped(self):
+        ops = [self._stamped("op0"), self._stamped("op1")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_refuses_unstamped_op_inside_the_loop(self):
+        """op1 has no ``loop_info``; only its position puts it in the loop."""
+        ops = [self._stamped("op0"), self._bare("op1"), self._stamped("op2")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_tiles_op_after_the_loop(self):
+        ops = [self._stamped("op0"), self._bare("op1")]
+        loop_before = self._state(ops[:1])
+        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
+        self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
+        self.assertEqual(ops[1].data.ranges[0], Integer(64))
+        self.assertEqual(self._state(ops[:1]), loop_before)
 
 
 if __name__ == "__main__":

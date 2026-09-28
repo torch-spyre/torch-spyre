@@ -42,18 +42,16 @@ from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
-# default. `convolution` is aten's direct-conv op name and `conv2d` is the
-# depthwise (`torch.ops.spyre.conv2d`) op name -- those two are listed because
-# a stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
-# its output is pinned to LX; see the direct-lowering codegen follow-up
-# tracked from PR #3284. `avg_pool2d` is listed for an unrelated reason: a
+# default. `convolution` is aten's direct-conv op name; it is listed because a
+# stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when its
+# output is pinned to LX; see the direct-lowering codegen follow-up tracked
+# from PR #3284. `avg_pool2d` is listed for an unrelated reason: a
 # windowed pool's operand paged through LX aborts DeepTools L3 scheduling
 # ("Expect valid lower and upper bound parameters"), because windowed padding
 # and LX paging disagree on the per-core bounds.
 OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     {
         "convolution",
-        "conv2d",
         "avg_pool2d",
     }
 )

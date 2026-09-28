@@ -2952,6 +2952,21 @@ def _apply_plan(
 
     _validate_contiguous(ops, op_to_position, stamped_group_id)
 
+    # The stamp below replaces loop_info wholesale, so an op some earlier tiling
+    # already stamped (a for_each_tile loop, above all) would silently lose it.
+    already_tiled = [
+        op.get_operation_name()
+        for op in ops
+        if isinstance(op, ComputedBuffer)
+        and id(op) in plan
+        and getattr(op, "loop_info", None) is not None
+    ]
+    if already_tiled:
+        raise Unsupported(
+            f"coarse_tile: group {stamped_group_id} would overwrite the existing "
+            f"loop_info of {', '.join(already_tiled)}."
+        )
+
     retiled_infos: dict[str, _RetiledBufferInfo] = {}
     for op in ops:
         if not isinstance(op, ComputedBuffer):

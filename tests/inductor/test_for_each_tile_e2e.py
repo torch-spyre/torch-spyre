@@ -52,11 +52,18 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 
 import functools
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    PrescribedRegion,
+    prescribed_regions,
+)
 
 from for_each_tile_fixtures import (
     B,
@@ -116,7 +123,7 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from tests.inductor.utils_inductor import cached_randn, cached_xavier, dl16_round
+from utils_inductor import cached_randn, cached_xavier, dl16_round
 
 
 def _with_dynamo_reset(test_fn):
@@ -846,6 +853,118 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+
+class _CollectRegions(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the graph's regions once it is done."""
+
+    operations: list = []
+    regions: list[PrescribedRegion] = []
+
+    def __call__(self, graph) -> None:
+        super().__call__(graph)
+        cls = type(self)
+        cls.operations = list(graph.operations)
+        cls.regions = prescribed_regions(graph.operations)
+
+
+class TestPrescribedRegionsE2E(_DynamoResetTestCase):
+    """``prescribed_regions`` on real spliced graphs.
+
+    A region is every op between the first and last op one outermost
+    ``for_each_tile`` loop stamped.  These tests compile the loop and read the
+    regions off the graph at the end of the pre-scheduling pipeline.
+    """
+
+    def _compile(self, fn, *args):
+        _CollectRegions.operations = []
+        _CollectRegions.regions = []
+        with patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions):
+            torch.compile(fn, backend="inductor", fullgraph=True)(*args)
+        return _CollectRegions.operations, _CollectRegions.regions
+
+    def _assert_region_is_whole(self, operations, region) -> None:
+        """The region is exactly its loop: every op the loop stamped is inside
+        it, and every op inside it is either stamped by that loop or listed as
+        unstamped."""
+        members = operations[region.start : region.stop]
+        self.assertEqual({op.get_operation_name() for op in members}, set(region.names))
+        for op in members:
+            name = op.get_operation_name()
+            if name in region.unstamped:
+                continue
+            self.assertEqual(
+                op.loop_info.loop_group_id[0],
+                region.loop_group_id,
+                f"{name} is stamped by another loop than its region's",
+            )
+        outside = operations[: region.start] + operations[region.stop :]
+        strays = [
+            op.get_operation_name()
+            for op in outside
+            if getattr(op, "loop_info", None) is not None
+            and op.loop_info.loop_group_id[0] == region.loop_group_id
+        ]
+        self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
+
+    def test_single_loop_leaves_later_ops_outside(self):
+        """An op after the loop is not in the loop's region."""
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+
+        def fn(a, b):
+            return add_tiled_fn(a, b, 128) * 2.0
+
+        operations, regions = self._compile(fn, A.to(DEVICE_NAME), B.to(DEVICE_NAME))
+
+        self.assertEqual(len(regions), 1, regions)
+        (region,) = regions
+        self._assert_region_is_whole(operations, region)
+        after = operations[region.stop :]
+        self.assertTrue(after, "the multiply after the loop disappeared")
+        self.assertFalse(
+            [
+                op.get_operation_name()
+                for op in after
+                if op.get_operation_name() in region.names
+            ]
+        )
+
+    def test_nested_loops_form_one_region(self):
+        """An inner loop is part of its outer loop's region, not a region of its own."""
+        X = cached_xavier((256, 256))
+        Y = cached_xavier((256, 64), differentiation=1)
+
+        operations, regions = self._compile(
+            nested_split_m_then_k_fn, X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        )
+
+        self.assertEqual(len(regions), 1, regions)
+        (region,) = regions
+        self._assert_region_is_whole(operations, region)
+        depths = {
+            len(op.loop_info.loop_count)
+            for op in operations[region.start : region.stop]
+            if op.get_operation_name() not in region.unstamped
+        }
+        self.assertIn(2, depths, "no op in the region carries both loop levels")
+
+    def test_sibling_loops_form_separate_regions(self):
+        """Two loops one after the other give two regions, in order."""
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+
+        def fn(a, b):
+            return add_tiled_fn(add_tiled_fn(a, b, 128), b, 128)
+
+        operations, regions = self._compile(fn, A.to(DEVICE_NAME), B.to(DEVICE_NAME))
+
+        self.assertEqual(len(regions), 2, regions)
+        first, second = regions
+        self.assertLessEqual(first.stop, second.start)
+        self.assertNotEqual(first.loop_group_id, second.loop_group_id)
+        for region in regions:
+            self._assert_region_is_whole(operations, region)
 
 
 # --- trip-range vector gather (loop-trip ranges reach coordinate queries) -----

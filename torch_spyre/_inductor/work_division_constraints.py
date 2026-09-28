@@ -488,9 +488,15 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
         )
         window_dims = ctx.reduction_vars[-kernel_dims:] if kernel_dims else []
     elif op == DEPTHWISE_CONV2D_OP:
-        # Depthwise reduction order is kh, kw, then optional group. Unlike the
-        # forward-conv path, a group dimension may therefore follow the window.
-        window_dims = ctx.reduction_vars[:2]
+        # The kernel window is what depthwise reduces over: the reduction vars
+        # absent from the output index. Position in ``reduction_vars`` cannot
+        # select it -- the output's stick dim (channel) is listed there too,
+        # ahead of kh/kw. SuperDSC rejects a ki/kj split for every conv, and
+        # the scheduler transport cannot carry one (the input read indexes the
+        # output position; window offsets live in conv_params), so an unblocked
+        # window split would be scored here and silently dropped before codegen.
+        write_vars = ctx.output_td.dep.index.free_symbols
+        window_dims = [v for v in ctx.reduction_vars if v not in write_vars]
     else:
         return ConstraintResult()
 
