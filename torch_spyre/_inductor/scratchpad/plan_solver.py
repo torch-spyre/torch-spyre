@@ -76,7 +76,7 @@ class LifetimeBoundBuffer:
     would let such a buffer pass as an in-place parent.
 
     ``start_time`` and ``end_time`` are convenience properties derived from
-    ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
+    ``uses`` and widened by optional counted-loop lifetime overrides.
     """
 
     name: str
@@ -88,9 +88,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
-    # Optional exclusive lifetime end for storage reused by a counted loop.
-    # Keep this separate from ``uses``: it changes address overlap, but must not
-    # manufacture a read or inflate residency/spill benefit.
+    # Optional lifetime bounds for storage reused by a counted loop. Keep these
+    # separate from ``uses``: they change address overlap, but must not
+    # manufacture reads or inflate residency/spill benefit.
+    lifetime_start_override: Optional[int] = None
     lifetime_end_override: Optional[int] = None
     # Buffers that must be placed atomically with this one. Despite the name,
     # this is one-to-many: only the group root carries the complete partner list.
@@ -119,6 +120,11 @@ class LifetimeBoundBuffer:
             f"buffer {self.name} has uses={self.uses}, which is not strictly "
             "increasing; uses carries one distinct index per accessing operation"
         )
+        if self.lifetime_start_override is not None and self.uses:
+            assert self.lifetime_start_override <= self.uses[0], (
+                f"buffer {self.name} has lifetime_start_override="
+                f"{self.lifetime_start_override} after nominal start {self.uses[0]}"
+            )
         if self.lifetime_end_override is not None and self.uses:
             assert self.lifetime_end_override >= self.uses[-1] + 1, (
                 f"buffer {self.name} has lifetime_end_override="
@@ -143,7 +149,9 @@ class LifetimeBoundBuffer:
 
     @property
     def start_time(self) -> int:
-        return self.uses[0]
+        nominal = self.uses[0]
+        override = self.lifetime_start_override
+        return min(nominal, override if override is not None else nominal)
 
     @property
     def end_time(self) -> int:
@@ -452,6 +460,8 @@ def cost_expr_record(
     bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
     buffers: Sequence["LifetimeBoundBuffer"],
     params: object = None,
+    *,
+    context: dict | None = None,
 ) -> dict:
     """One dump record for a solved co-optimized graph: the objective's
     per-bundle terms and relayout charges as ``sympy.srepr`` strings (lossless,
@@ -460,9 +470,18 @@ def cost_expr_record(
     ``buffers`` names (the graph's stores) are what a reader joins on.
 
     ``divisions`` carries each buffer's candidate core counts, the one chosen,
-    its producers, and the division pairs the residency gate admitted on each
-    incoming edge -- the alternatives a decision was made over, which the
-    objective alone cannot show."""
+    its producers, its residency ``reason`` when one kept it out of LX, and the
+    division pairs the residency gate admitted on each incoming edge -- the
+    alternatives a decision was made over, which the objective alone cannot
+    show. ``priced_relayouts`` adds the alternatives per edge, the copies that
+    were available and not taken, which ``relayout_terms`` (the ones that fired)
+    cannot show.
+
+    ``context`` is whatever the caller knows and this function cannot see -- the
+    environment the plan was made in, and how the solve went -- so a reader gets
+    one self-describing record per solve rather than a set of numbers whose
+    meaning depends on flags nobody wrote down. Its keys may not collide with
+    the record's own."""
     import dataclasses
 
     bindings = solved_bindings(buffers)
@@ -485,6 +504,32 @@ def cost_expr_record(
         }
         for copy in copies
     ]
+    # The relayouts that were PRICED, as opposed to the ones that fired. A
+    # candidate the solver did not take is an alternative it declined, and
+    # without them a reader cannot tell "relayout was never on the table" from
+    # "relayout was available and lost". Keyed by consumer, like ``divisions``,
+    # and already bounded by ``lx_solver_relayout_groups_per_edge``.
+    priced_relayouts: dict = {}
+    for b in buffers:
+        if isinstance(b, RelayoutCopyBuffer):
+            continue  # excluded as from ``divisions``: a copy is not a consumer
+        by_parent = {
+            parent: [
+                {
+                    "source_division": c.source_division,
+                    "consumer_division": c.consumer_division,
+                    "group": c.group,
+                    "cost_ns": c.cost_ns,
+                }
+                for c in per_parent
+            ]
+            for parent, per_parent in (
+                getattr(b, "cd_parent_relayouts", None) or {}
+            ).items()
+            if per_parent
+        }
+        if by_parent:
+            priced_relayouts[b.name] = by_parent
     objective_ns = _evaluate(cost_expr, bindings)
     record = {
         "buffers": [b.name for b in buffers if not isinstance(b, RelayoutCopyBuffer)],
@@ -500,6 +545,7 @@ def cost_expr_record(
         else {},
         "bundles": bundles,
         "relayout_terms": relayout_terms,
+        "priced_relayouts": priced_relayouts,
         # Reading why a division was chosen needs the alternatives it was
         # chosen over: per buffer the core count and split shape of every
         # candidate, the index the solver took, and the ``(parent, consumer)``
@@ -519,6 +565,12 @@ def cost_expr_record(
                 "labels": [cd.label for cd in b.core_divisions],
                 "chosen": b.chosen_division,
                 "parents": list(b.parents),
+                # Why this buffer never reached the solver, in the allocator's
+                # own words ("op not allowed", "partial/offset read"). None
+                # means it DID reach the solver, and ``bindings`` says what the
+                # solve then decided -- three outcomes a reader must not
+                # conflate: excluded, weighed and declined, or resident.
+                "reason": b.residency_reason,
                 "matches": {
                     parent: [list(pair) for pair in pairs]
                     for parent, pairs in (b.cd_parent_matches or {}).items()
@@ -532,6 +584,11 @@ def cost_expr_record(
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,
     }
+    # Additive only: context describes the record, it does not get to redefine
+    # it. Without this a caller key named `bundles` would replace the terms.
+    clashes = set(context or ()) & set(record)
+    assert not clashes, f"context may not override record keys: {sorted(clashes)}"
+    record.update(context or {})
     # A term that would not evaluate under the solved bindings reads in the JSON
     # exactly like one deliberately left unpriced. The difference matters: the
     # second is normal, the first means the objective and the bindings have

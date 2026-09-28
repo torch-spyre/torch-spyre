@@ -78,6 +78,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
+from utils_inductor import mock_backend_compiler
 
 
 class _GatherScenarios:
@@ -345,7 +346,7 @@ class _GatherScenarios:
 
     @pytest.mark.skip(
         reason=(
-            "dxp_standalone SIGABRT: std::fmod(dsDim, size) == 0 in "
+            "backend compiler SIGABRT: std::fmod(dsDim, size) == 0 in "
             "GatherIndexConversion.cpp — torch.gather with a 2-D index "
             "tensor is not yet supported by the backend"
         )
@@ -989,7 +990,7 @@ class _GatherScenarios:
         """Real generate_bundle runs end-to-end with the backend mocked.
 
         All hardware/toolchain touchpoints are stubbed so no device is needed:
-        subprocess.run (the dxp_standalone --bundle step that produces
+        subprocess.run (the backend-compiler step that produces
         spyreCodeDir), launch_jobplan (device execution), and
         prepare_kernel (reads spyreCodeDir; only invoked when DUMP_SPYRE_CODE is
         set). Stubbing prepare_kernel + launch_jobplan exercises the
@@ -1003,7 +1004,7 @@ class _GatherScenarios:
         kr = "torch_spyre.execution.kernel_runner"
         x, i = self._xi(P=3, two_d=True)
         with (
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(f"{kr}.launch_jobplan"),
             patch(f"{kr}.prepare_kernel"),
         ):
@@ -1012,7 +1013,7 @@ class _GatherScenarios:
 
     @pytest.mark.skip(
         reason=(
-            "dxp_standalone crash: std::out_of_range (map::at) — "
+            "backend compiler crash: std::out_of_range (map::at) — "
             "multiple gathers sharing the same index tensor in one kernel "
             "are not yet supported"
         )

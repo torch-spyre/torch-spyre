@@ -53,7 +53,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import compare_with_cpu  # noqa: E402
+from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -5675,7 +5675,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             patch(self._PLAN_PATCH, _forced_span_plan_on_dim1(5, 20)),
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *args)
         self.assertTrue(source_codes)
@@ -5948,7 +5948,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x, y)
 
@@ -5986,7 +5986,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x)
 
@@ -6051,7 +6051,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
                 return_value=fake_plan,
@@ -6108,7 +6108,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
                 "plan_span_overflow_tile",
@@ -6178,7 +6178,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
                 "plan_span_overflow_tile",
@@ -6270,7 +6270,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, auto_sources = run_and_get_code(
                 torch.compile(auto_fn, dynamic=False), x, y
@@ -6293,7 +6293,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, manual_sources = run_and_get_code(
                 torch.compile(manual_hint_fn, dynamic=False), x, y
@@ -6313,7 +6313,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
     Every test class above this one either mocks out kernel launch/compile
     (``patch(_LAUNCH_JOBPLAN)``, ``patch(_PREPARE_KERNEL)``,
-    ``patch("subprocess.run")``) or inspects internal Python state directly.
+    ``mock_backend_compiler()``) or inspects internal Python state directly.
     Those are valuable and cheap, and prove the *decision* to join is made
     correctly -- but none of them prove the resulting shared loop nest
     actually *executes* correctly on hardware. A join could be structurally
@@ -7225,6 +7225,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             with (
                 patch(_LAUNCH_JOBPLAN),
                 patch(_PREPARE_KERNEL),
-                patch("subprocess.run"),
+                mock_backend_compiler(),
             ):
                 run_and_get_code(cfn, x)

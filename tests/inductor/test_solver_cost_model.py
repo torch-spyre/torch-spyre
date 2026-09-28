@@ -125,6 +125,158 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
     assert wd._matmul_split_cost(*axes, 32) > standalone
 
 
+def test_fused_reduction_compute_uses_work_per_active_core():
+    small = ArgTraffic("small", "input", True, 1024)
+    large = ArgTraffic("large", "input", True, 6144, loop_factor=2)
+    output = ArgTraffic("out", "output", True, 64)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [small, output]),
+        OpFeatures("sum", True, 64, 8, 2, [large, output]),
+        # Matmul has a different compute model and must not set this floor.
+        OpFeatures("bmm", True, 1 << 20, 1, 2, [], is_matmul=True),
+    ]
+
+    expected = (6144 * 2) / 8 / CostParams().fused_reduction_elems_per_core_ns
+    assert cost_model._fused_reduction_compute_ns(
+        reductions, CostParams()
+    ) == pytest.approx(expected)
+
+
+def test_fused_reduction_compute_keeps_core_count_symbolic():
+    heads, rows = sympy.symbols("split_heads split_rows", integer=True, positive=True)
+    op = OpFeatures(
+        "sum",
+        True,
+        64,
+        heads * rows,
+        2,
+        [ArgTraffic("input", "input", True, 12_288)],
+    )
+
+    compute = cost_model._fused_reduction_compute_ns([op], CostParams())
+
+    assert compute.free_symbols == {heads, rows}
+    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+
+
+def test_fused_reduction_compute_skips_independent_boundary_reductions():
+    boundary = ArgTraffic("arg0_1", "input", False, 6144, is_boundary=True)
+    output = ArgTraffic("out", "output", False, 64, is_boundary=True)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [boundary, output]),
+        OpFeatures("amin", True, 64, 8, 2, [boundary, output]),
+    ]
+
+    assert cost_model._fused_reduction_compute_ns(reductions, CostParams()) == 0.0
+
+
+def test_fused_reduction_compute_keeps_spill_cost_visible():
+    params = CostParams(overlap_gamma=0.46)
+
+    def prediction(is_lx):
+        intermediate = ArgTraffic("buf0", "input", is_lx, 12_288, is_boundary=False)
+        output = ArgTraffic("buf1", "output", False, 64, is_boundary=True)
+        reduction = OpFeatures("sum", True, 64, 8, 2, [intermediate, output])
+        pointwise = OpFeatures("exp", False, 12_288, 8, 2, [intermediate])
+        return cost_model.predict_ops([pointwise, reduction], params)
+
+    assert prediction(False) > prediction(True)
+
+
+def test_standalone_reduction_keeps_its_calibrated_bandwidth_model():
+    op = OpFeatures(
+        "amax",
+        True,
+        64,
+        1,
+        2,
+        [
+            ArgTraffic("input", "input", False, 6144),
+            ArgTraffic("out", "output", False, 64),
+        ],
+    )
+
+    assert cost_model.predict_ops(
+        [op], CostParams(fused_reduction_elems_per_core_ns=1e-6)
+    ) == pytest.approx(
+        cost_model.predict_ops([op], CostParams(fused_reduction_elems_per_core_ns=1e6))
+    )
+
+
+def test_isinf_is_symbolic_aware():
+    from torch_spyre._inductor.work_division import isinf
+
+    m = sympy.Symbol("output_split_m", integer=True, positive=True)
+    for infinite in (float("inf"), -float("inf"), sympy.oo, -sympy.oo, sympy.zoo):
+        assert isinf(infinite), infinite
+    for finite in (0, 1.5, sympy.Integer(3), m, 2 / m, sympy.Max(1, m)):
+        assert not isinf(finite), finite
+    # Undecidable is not infinite: a symbolic cost's finiteness rests on the
+    # enumerated candidate menu, not on this test.
+    assert not isinf(sympy.Piecewise((sympy.oo, m > 32), (m, True)))
+
+
+def test_matmul_split_cost_over_symbolic_splits_matches_concrete_in_budget():
+    from torch_spyre._inductor import work_division as wd
+
+    m, n, k = (
+        sympy.Symbol(name, integer=True, positive=True)
+        for name in ("output_split_m", "output_split_n", "reduction_split_k")
+    )
+    B, M, N, K = 1, 1024, 1024, 64
+    symbolic = wd._matmul_split_cost((B, 1), (M, m), (N, n), (K, k), 32)
+    assert isinstance(symbolic, sympy.Basic)
+    assert not wd.isinf(symbolic)
+    for m_split, n_split, k_split in ((4, 4, 2), (1, 8, 1), (2, 2, 2)):
+        concrete = wd._matmul_split_cost(
+            (B, 1), (M, m_split), (N, n_split), (K, k_split), 32
+        )
+        assert not wd.isinf(concrete)
+        point = {m: m_split, n: n_split, k: k_split}
+        assert float(symbolic.subs(point)) == pytest.approx(concrete)
+
+
+def _issue_4387_matmul(cores, m_split, n_split, k_split):
+    """``[1, 1024, 64] @ [1, 64, 1024]`` from issue #4387, at the given split."""
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=1024 * 1024,
+        cores=cores,
+        reduction_cores=k_split,
+        matmul_macs=1024 * 1024 * 64,
+        matmul_rows_per_core=1024 // m_split,
+        matmul_cols_per_core=1024 // n_split,
+        matmul_m_split=m_split,
+        matmul_n_split=n_split,
+        matmul_a_bytes=1024 * 64 * 2,
+        matmul_b_bytes=64 * 1024 * 2,
+    )
+
+
+def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    priced = cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
+    assert priced > 0
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(64, 4, 8, 2)], params)
+
+
+@pytest.mark.parametrize("infinity", [float("inf"), sympy.oo, sympy.zoo])
+def test_upstream_matmul_price_rejects_a_symbolic_infinity(monkeypatch, infinity):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    monkeypatch.setattr(
+        cost_model, "_matmul_execution_cost", lambda *args, **kwargs: infinity
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
+
+
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
     """A pointwise op reading the graph input ``input_name`` and writing ``out``.
 
@@ -522,23 +674,14 @@ def _stamps(op, graph):
     return {(a.role, a.name): a.is_boundary for a in feats.args}
 
 
-def test_extractor_reads_residency_and_store_divisions_from_buffers(monkeypatch):
+def test_extractor_reads_residency_from_is_lx(monkeypatch):
     from torch._inductor.virtualized import V
-    from torch_spyre._inductor.scratchpad.plan_solver import (
-        CoreDivision,
-        CoreDivisionBuffer,
-        division_symbol,
-    )
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
 
     row, other, cores = sympy.symbols("row other cores", integer=True)
-    output = CoreDivisionBuffer(
-        "buf1",
-        128,
-        [0],
-        core_divisions=[CoreDivision(splits={row: n, other: 2}) for n in (1, 4, 8)],
-    )
+    output = CoreDivisionBuffer("buf1", 128, [0])
     source = CoreDivisionBuffer("buf0", 128, [0])
-    buffers = {b.name: b for b in (output, source)}
+    is_lx = {output.name: output.sym_is_lx, source.name: source.sym_is_lx}
     op = _extractable_op("buf1", ["buf0", "outside"])
     rw = op.get_read_writes()
     rw.writes.append(SimpleNamespace(index=row))
@@ -549,16 +692,14 @@ def test_extractor_reads_residency_and_store_divisions_from_buffers(monkeypatch)
     # Store geometry is covered separately; this checks the buffer-data wiring.
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: 32)
     with V.set_graph_handler(graph):
-        feature = dcm.extract_op_features(op, {row: cores}, buffers)
+        feature = dcm.extract_op_features(op, {row: cores}, is_lx=is_lx)
     residency = {a.name: a.is_lx for a in feature.args}
     assert residency == {
         "op_buf1": output.sym_is_lx,
         "buf0": source.sym_is_lx,
         "outside": False,
     }
-    assert feature.store_division == division_symbol(output.name)
     assert feature.cores == cores
-    assert feature.store_cores_by_division == ((0, 1), (1, 4), (2, 8))
 
 
 @pytest.mark.parametrize("placement", [None, {"buf0": True, "buf1": False}])
@@ -576,8 +717,6 @@ def test_extractor_without_buffers_keeps_committed_or_explicit_placement(placeme
         if placement is None
         else {"op_buf1": False, "buf0": True}
     )
-    assert feature.store_division is None
-    assert feature.store_cores_by_division == ()
 
 
 def test_the_extractor_stamps_reads_of_graph_inputs():
@@ -683,50 +822,14 @@ def test_store_rate_does_not_change_other_ops():
     assert cost_model._store_core_excess_ns([store], CostParams()) == 0
 
 
-def test_store_symbolic_cost_matches_concrete_and_cp_sat():
-    from ortools.sat.python import cp_model
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
-    from torch_spyre._inductor.scratchpad.plan_solver import division_symbol
-
+def test_store_symbolic_cost_matches_concrete():
     params = CostParams()
-    division = division_symbol("store")
-    resident, cores_symbol = sympy.symbols("resident cores", integer=True)
-    menu = tuple(enumerate((1, 2, 4, 8, 16, 32)))
-    feature = _indirect_store(
-        cores_symbol, resident, store_division=division, store_cores_by_division=menu
-    )
+    cores_symbol = sympy.symbols("cores", integer=True)
+    feature = _indirect_store(cores_symbol)
     expression = cost_model._store_core_excess_ns([feature], params)
-    assert expression.has(resident, division)
-    assert expression.subs(resident, 1) == 0
-    expression = expression.subs(resident, 0)
-    for index, cores in menu:
+    for cores in (1, 2, 4, 5, 8, 16, 32):
         expected = cost_model._store_core_excess_ns([_indirect_store(cores)], params)
-        assert float(expression.subs(division, index)) == pytest.approx(expected)
-        model = cp_model.CpModel()
-        chosen = model.new_int_var(0, len(menu) - 1, division.name)
-        literals = []
-        for i, _ in menu:
-            literal = model.new_bool_var(f"chosen_{i}")
-            model.add(chosen == i).only_enforce_if(literal)
-            model.add(chosen != i).only_enforce_if(literal.Not())
-            literals.append(literal)
-        symbols = {
-            division.name: chosen,
-            f"_division_of_{division.name}": SimpleNamespace(
-                division_is=literals.__getitem__
-            ),
-        }
-        # The bundle's compute/memory overlap also wraps this cost in Min.
-        wrapped = cost_model._lazy_min(sympy.Integer(1000000), expression)
-        converted = _SympyExprToCpSat(model, symbols, {}).convert(wrapped)
-        assert converted is not None
-        model.add(chosen == index)
-        model.minimize(converted)
-        solver = cp_model.CpSolver()
-        assert solver.solve(model) == cp_model.OPTIMAL
-        assert solver.objective_value == pytest.approx(expected, abs=1)
-    feature.store_cores_by_division = ()
-    assert cost_model._store_core_excess_ns([feature], params) == 0
+        assert float(expression.subs(cores_symbol, cores)) == pytest.approx(expected)
 
 
 def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):

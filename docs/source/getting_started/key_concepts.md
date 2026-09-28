@@ -217,7 +217,7 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
    plus a Taylor polynomial).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `cumsum`, `tril`, `triu`, ...). Transparent, but
+   `arange`, `cumsum`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether

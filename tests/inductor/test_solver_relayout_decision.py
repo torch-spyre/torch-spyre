@@ -44,6 +44,7 @@ pytest.importorskip("ortools")
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor.scratchpad import ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -169,7 +170,7 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
 
 
 @pytest.mark.parametrize("priced", [False, True])
-def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, priced):
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
     from ortools.sat.python import cp_model
 
     p = _producer([0, 1])
@@ -185,8 +186,38 @@ def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, price
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
     result = _solve(buffers, expr=_objective(buffers) if priced else None)
-    assert parameters and all(value == (not priced) for value in parameters)
+    assert parameters and all(parameters)
     assert (_copy(result).address is not None) == priced
+
+
+@pytest.mark.parametrize("deterministic,expected_workers", [(False, 96), (True, 1)])
+def test_relayout_solve_uses_available_parallel_search_workers(
+    monkeypatch, deterministic, expected_workers
+):
+    """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    workers = []
+
+    monkeypatch.setattr(ilp_solver_ortools, "get_cpu_count", lambda: 96)
+    monkeypatch.setattr(
+        ilp_solver_ortools.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: deterministic,
+    )
+
+    def solve(solver, model, *args, **kwargs):
+        workers.append(solver.parameters.num_search_workers)
+        assert solver.parameters.share_level_zero_bounds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    _solve(buffers, expr=_objective(buffers))
+    assert workers == [expected_workers]
 
 
 # ---------------------------------------------------------------------------

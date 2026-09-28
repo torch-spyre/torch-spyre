@@ -32,6 +32,10 @@ test_suite_config:
             - TestOps::test_slice_scatter.*
             - TestOps::test_split.*
             - TestOps::test_storage_offset_placeholder.*
+            # views that split the stick dim into (heads, D) and then slice or
+            # stride D, incl. rotate_half on a transposed q/k (issue #4050)
+            - TestOps::test_view_split_stick_slice.*
+            - TestOps::test_rope_on_split_stick_view.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

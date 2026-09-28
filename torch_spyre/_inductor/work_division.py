@@ -1442,22 +1442,33 @@ def work_distribution_pass(
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
+def _minmax(sympy_fn, builtin_fn, args, kwargs):
+    """Shared body of :func:`max` / :func:`min`.
+
+    Accepts both the variadic (``max(a, b)``) and single-iterable
+    (``max([a, b])``) forms. Dispatches to ``sympy_fn`` when any value is a
+    sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
+    otherwise defers to ``builtin_fn``, which also handles ``default``."""
+    if len(args) == 1:
+        values = args[0]
+    else:
+        values = args
+    if "key" not in kwargs and any(isinstance(a, sympy.Basic) for a in values):
+        return sympy_fn(*values)
+    return builtin_fn(*args, **kwargs)
+
+
 def max(*args, **kwargs):
     """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
     a sympy expression (whose truth-valued comparisons the builtin can't
     resolve), otherwise defers to the builtin -- including its ``key``/
-    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
-    supports."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Max(*args)
-    return builtins.max(*args, **kwargs)
+    ``default`` kwargs. Both ``max(a, b)`` and ``max([a, b])`` are supported."""
+    return _minmax(sympy.Max, builtins.max, args, kwargs)
 
 
 def min(*args, **kwargs):
     """``min`` counterpart of :func:`max`; see its docstring."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Min(*args)
-    return builtins.min(*args, **kwargs)
+    return _minmax(sympy.Min, builtins.min, args, kwargs)
 
 
 def log2(arg):
@@ -1482,6 +1493,16 @@ def piecewise(*args):
         if cond:
             return expr
     raise ValueError("piecewise(...) requires a catch-all True branch")
+
+
+def isinf(value) -> bool:
+    """``math.isinf``, symbolic-aware: ``True`` for a float infinity
+    or a sympy expression sympy can *decide* is infinite (``oo``, ``zoo``),
+    ``False`` for a finite value or an expression whose finiteness is
+    undecidable (``is_infinite`` is ``None``, e.g. a cost over symbolic splits)."""
+    if isinstance(value, sympy.Basic):
+        return value.is_infinite is True
+    return math.isinf(value)
 
 
 _PT_ROWS = 8  # PT block rows per corelet
@@ -1625,7 +1646,7 @@ def _matmul_split_cost(
     execution_us = _matmul_execution_cost(
         b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, include_hbm
     )
-    if execution_us == math.inf:
+    if isinf(execution_us):
         return execution_us
     (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k

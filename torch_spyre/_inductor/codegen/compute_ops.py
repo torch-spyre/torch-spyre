@@ -243,7 +243,7 @@ def generate_constant_info(
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encoded_value]},
+                "data_": {"[0, 0, 0]": [str(encoded_value)]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -1349,7 +1349,7 @@ def generate_sdsc(
             f"{idx}_{sdsc_spec.opfunc}": {
                 # Source-to-kernel provenance. JSON key uses the SDSC
                 # trailing-underscore convention; the Python field stays
-                # `debug_handle`. dxp_standalone ignores unknown keys.
+                # `debug_handle`. The backend ignores unknown keys.
                 "debug_handle_": (
                     sdsc_spec.debug_handle.to_dict()
                     if sdsc_spec.debug_handle is not None

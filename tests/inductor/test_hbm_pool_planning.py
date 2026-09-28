@@ -40,6 +40,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.hbm_pool_planning import Allocator, hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
+from utils_inductor import mock_backend_compiler
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -759,7 +760,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             mock_patch.object(SpyreKernel, "codegen_kernel", _recording_codegen_kernel),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             torch.compile(fn)(x, y)
 
@@ -805,7 +806,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch.object(
                 async_compile_mod, "get_output_dir", _recording_get_output_dir
             ),
@@ -871,7 +872,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
@@ -914,7 +915,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
@@ -946,7 +947,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
@@ -993,7 +994,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             # Without the alias-read guard this raises InductorError from
             # generate_bundle's pool_size assertion.

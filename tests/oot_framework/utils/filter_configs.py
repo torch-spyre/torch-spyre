@@ -21,7 +21,7 @@ Selection rules
   "unit"             Configs whose test_suite_config.labels contains "unit".
   "integration"      Configs whose test_suite_config.labels contains
                      "integration" -- the device-layer surfaces flex and
-                     deeptools/dxp_standalone exercise most (streams, job
+                     deeptools exercise most (streams, job
                      launch plans, codegen, LX/scratchpad planning, tensor
                      layout, allocator/GC, D2D copies). Used as the default
                      test_type for integration-tests.yaml.

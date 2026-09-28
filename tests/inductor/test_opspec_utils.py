@@ -38,6 +38,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     buf_id,
     core_divisions,
+    operand_indexing,
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
@@ -301,6 +302,85 @@ class TestPlaceholderAxes(unittest.TestCase):
             placeholder_axes([sympy.Integer(0), rows, sympy.Integer(0)], [1, 256, 64]),
             (0,),
         )
+
+
+class TestOperandIndexing(unittest.TestCase):
+    """One pointwise operand's map row, read off the coordinates."""
+
+    def test_a_row_broadcast_keeps_the_axes_either_side_of_it(self):
+        """``#map_row``: a weight read at one coordinate of the middle dim."""
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        self.assertEqual(
+            operand_indexing(
+                [d0, sympy.Integer(0), d2], [32, 1, 64], [d0, d1, d2], [32, 48, 64]
+            ),
+            (0, None, 2),
+        )
+
+    def test_a_statistic_read_is_rank_reducing(self):
+        """``#map_stat``: one value per coordinate of the middle dim, at the head"""
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        self.assertEqual(
+            operand_indexing(
+                [d1, sympy.Integer(0)], [48, 1], [d0, d1, d2], [32, 48, 64]
+            ),
+            (1, None),
+        )
+
+    def test_a_splat_reads_one_element_and_writes_a_stick(self):
+        """``#map_splat``: the statistic read back across the whole stick."""
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(
+            operand_indexing([d0, sympy.Integer(0)], [48, 1], [d0, d1], [48, 64]),
+            (0, None),
+        )
+
+    def test_an_aligned_operand_is_the_identity(self):
+        """The row a matching operand derives to, so the fast path and the"""
+        coords = list(sympy.symbols("d0:3"))
+        self.assertEqual(
+            operand_indexing(coords, [32, 48, 64], coords, [32, 48, 64]), (0, 1, 2)
+        )
+
+    def test_the_within_stick_and_outer_stick_spellings_match_by_kind(self):
+        """Matched by classification, not by expression: the projection writes an"""
+        c0 = sympy.Symbol("c0")
+        self.assertEqual(
+            operand_indexing(
+                [FloorDiv(c0, 64), sympy.Mod(c0, 64)],
+                [2, 64],
+                [sympy.floor(c0 / 64), sympy.Mod(c0, 64)],
+                [2, 64],
+            ),
+            (0, 1),
+        )
+
+    def test_a_stretched_axis_is_refused(self):
+        """One element under a dim that runs 48: the coordinate says the operand"""
+        d0, d1 = sympy.symbols("d0 d1")
+        with self.assertRaises(NotImplementedError) as ctx:
+            operand_indexing([d0, d1], [1, 64], [d0, d1], [48, 64])
+        self.assertIn("not a stretch of it", str(ctx.exception))
+
+    def test_a_constant_axis_carrying_elements_is_refused(self):
+        """A constant coordinate over 64 elements is the broadcast LANE a"""
+        d0, d1 = sympy.symbols("d0 d1")
+        with self.assertRaises(NotImplementedError) as ctx:
+            operand_indexing([d0, sympy.Integer(0)], [48, 64], [d0, d1], [48, 64])
+        self.assertIn("carries more than the one element", str(ctx.exception))
+
+    def test_an_unmatched_axis_is_refused(self):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        with self.assertRaises(NotImplementedError) as ctx:
+            operand_indexing([d2, d1], [64, 48], [d0, d1], [32, 48])
+        self.assertIn("matches no output device axis", str(ctx.exception))
+
+    def test_permuted_axes_are_refused(self):
+        """Expressible as a map and still refused: reading the operand's own"""
+        d0, d1 = sympy.symbols("d0 d1")
+        with self.assertRaises(NotImplementedError) as ctx:
+            operand_indexing([d1, d0], [48, 32], [d0, d1], [32, 48])
+        self.assertIn("permuted", str(ctx.exception))
 
 
 class TestReductionIndexing(unittest.TestCase):
