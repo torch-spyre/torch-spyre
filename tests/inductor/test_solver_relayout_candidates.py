@@ -110,6 +110,31 @@ def test_grouped_gather_is_priced_like_a_permutation_of_the_same_tensor():
     ), "same tensor, same cores, same governing geometry: same price"
 
 
+@pytest.mark.parametrize("fragments", [8, 10, 11, 16])
+def test_gather_fanin_respects_shuffle_register_budget(fragments):
+    # A row/column split feeding a row-only matmul view. The innermost
+    # physical split is only two, within the cost law's fitted range, while
+    # each destination gathers `fragments` columns. Gemma's 10-way gather
+    # fails Deeptools register initialization if admitted here.
+    cores = 2 * fragments
+    source = PerCoreView(
+        ((0, fragments), (1, 2)),
+        ((0, floor(_CORE_ID / 2)), (1, Mod(_CORE_ID, 2))),
+        num_cores=cores,
+    )
+    destination = PerCoreView(((1, 2),), ((1, Mod(_CORE_ID, 2)),), num_cores=cores)
+    dims = [4 * fragments, 256, 64]
+    assert governing_run_split(source, destination, dims)[1] == 2
+    supported = fragments <= 8
+    assert (
+        lx_relayout.movement_supported(source, destination, cores, cores) == supported
+    )
+    cost = solver_relayout_pair_cost(
+        source, destination, cores, dims, 4 * fragments * 256 * 64, 2
+    )
+    assert (cost is not None) == supported
+
+
 def test_split_past_fitted_range_is_declined_not_clamped():
     # Governing split 16 is outside the law's fitted range [2, 8], where it
     # over-predicts 12-40%. The reporting path clamps (the shuffle already

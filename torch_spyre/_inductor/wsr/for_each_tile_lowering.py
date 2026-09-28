@@ -86,6 +86,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import logging
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -94,9 +95,16 @@ import torch
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
+from .. import timing_recorder
+from ..deadcode_elimination import deadcode_elimination
+from ..logging_utils import get_inductor_logger
+from ..pass_utils import format_operations
+
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.dependencies import Dep
+
+logger = get_inductor_logger("wsr.for_each_tile_lowering")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1942,7 +1950,10 @@ def _identity_load(
     try:
         with V.set_ops_handler(recorder):
             result = op.data.inner_fn(indices)
-    except (AssertionError, TypeError, ValueError):
+    except Exception:  # noqa: BLE001
+        # This is a speculative recognizer over arbitrary pointwise bodies.
+        # Any body that cannot execute under the recording handler is simply
+        # not the generated single-load identity this optimization needs.
         return None
     # V.ops is an OpsWrapper, so scalar handler results normally come back as
     # OpsValue(value).  Accept the unwrapped form too for direct unit tests.
@@ -1953,6 +1964,685 @@ def _identity_load(
         return None
     name, index = recorder.loads[0]
     return name, sympy.sympify(index), indices
+
+
+class _IdentityChainLoadHandler(WrapperHandler):
+    """Inline a chain of affine identity loads into one consumer load."""
+
+    def __init__(
+        self,
+        inner,
+        transforms,
+        loop_specs,
+        rescale_index,
+        iteration_symbols: set[sympy.Symbol] | None = None,
+    ):
+        super().__init__(inner)
+        self._transforms = transforms
+        self._loop_specs = loop_specs
+        self._rescale_index = rescale_index
+        self._iteration_symbols = iteration_symbols
+
+    def load(self, name, index):
+        visited = set()
+        while name in self._transforms:
+            if name in visited:
+                raise RuntimeError(f"cyclic identity chain through {name!r}")
+            visited.add(name)
+            (
+                source_name,
+                full_sizes,
+                full_strides,
+                source_strides,
+                source_base,
+            ) = self._transforms[name]
+
+            loop_terms = sympy.S.Zero
+            mapped_loop_terms = sympy.S.Zero
+            for loop_var, trip_count in self._loop_specs:
+                coefficient = sympy.simplify(index.coeff(loop_var))
+                if coefficient == 0:
+                    continue
+                axes = []
+                for axis, (size, stride) in enumerate(
+                    zip(full_sizes, full_strides, strict=True)
+                ):
+                    extent = sympy.simplify(size / trip_count)
+                    if (
+                        extent.is_integer is not False
+                        and sympy.simplify(size - trip_count * extent) == 0
+                        and sympy.simplify(stride * extent - coefficient) == 0
+                    ):
+                        axes.append((axis, extent))
+                if len(axes) != 1:
+                    raise RuntimeError(
+                        f"cannot map loop step {coefficient} for {loop_var} "
+                        f"through identity {name!r}"
+                    )
+                axis, extent = axes[0]
+                loop_terms += coefficient * loop_var
+                mapped_loop_terms += source_strides[axis] * extent * loop_var
+
+            local_index = sympy.simplify(index - loop_terms)
+            iteration_symbols = self._iteration_symbols
+            if iteration_symbols is None:
+                parameter_symbols: set[sympy.Symbol] = set()
+                for expr in (
+                    *full_sizes,
+                    *full_strides,
+                    *source_strides,
+                    *(trip_count for _loop_var, trip_count in self._loop_specs),
+                ):
+                    parameter_symbols.update(sympy.sympify(expr).free_symbols)
+                iteration_symbols = local_index.free_symbols - parameter_symbols
+            local_constant = sympy.simplify(
+                local_index.subs({symbol: sympy.S.Zero for symbol in iteration_symbols})
+            )
+            if local_constant != 0:
+                # A flat offset in the identity's output layout cannot in
+                # general be reused in its source layout.  Decomposing that
+                # offset into source coordinates would need a separate proof;
+                # this speculative optimization instead retains the staged
+                # path.
+                raise RuntimeError(
+                    f"cannot compose constant offset {local_constant} "
+                    f"through identity {name!r}"
+                )
+            rescaled_source_strides = list(source_strides)
+            for axis, full_stride in enumerate(full_strides):
+                equal_axes = [
+                    other_axis
+                    for other_axis, other_stride in enumerate(full_strides)
+                    if sympy.simplify(full_stride - other_stride) == 0
+                ]
+                non_unit_axes = [
+                    other_axis
+                    for other_axis in equal_axes
+                    if sympy.simplify(full_sizes[other_axis] - 1) != 0
+                ]
+                if len(non_unit_axes) == 1:
+                    # A size-one coordinate cannot contribute to the flat
+                    # index.  Treat duplicate strides belonging to such dims
+                    # as the one non-degenerate dimension rather than as an
+                    # ambiguity in the inverse layout map.
+                    rescaled_source_strides[axis] = source_strides[non_unit_axes[0]]
+            index = sympy.simplify(
+                source_base
+                + mapped_loop_terms
+                + self._rescale_index(
+                    local_index,
+                    full_strides,
+                    rescaled_source_strides,
+                    strip_constant=True,
+                    reject_ambiguous=True,
+                )
+            )
+            name = source_name
+        return super().load(name, index)
+
+
+def _identity_chain_has_valid_loop_advances(
+    graph: Any,
+    chain_names: list[str],
+    final_consumer: "ir.ComputedBuffer",
+    loop_by_group: dict[int, tuple[sympy.Symbol, sympy.Expr]],
+) -> bool:
+    """Prove that each identity edge stays within one nested-loop path.
+
+    Entering a deeper loop is valid when the edge either selects exactly one
+    equal producer slice per trip on one physical axis, or is invariant in that
+    loop.  The latter is how K/V pass unchanged through the enclosing Lq loop
+    before advancing in the inner Lk loop.
+    """
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+    final_info = getattr(final_consumer, "loop_info", None)
+    if not isinstance(final_info, CoarseTileInfo):
+        return False
+
+    def memory_reads(op):
+        return [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+
+    previous_group: tuple[int, ...] = ()
+    previous_name = chain_names[0]
+    readers = [
+        *(graph.try_get_buffer(name) for name in chain_names[1:]),
+        final_consumer,
+    ]
+    for reader in readers:
+        reader_info = getattr(reader, "loop_info", None)
+        if not isinstance(reader_info, CoarseTileInfo):
+            return False
+        reader_group = reader_info.loop_group_id
+        if (
+            reader_group[: len(previous_group)] != previous_group
+            or final_info.loop_group_id[: len(reader_group)] != reader_group
+        ):
+            return False
+        reads = memory_reads(reader)
+        matching = [dep for dep in reads if dep.name == previous_name]
+        producer = graph.try_get_buffer(previous_name)
+        if len(matching) != 1 or not isinstance(
+            getattr(producer, "layout", None), FixedLayout
+        ):
+            return False
+        dep = matching[0]
+        dep_idx = reads.index(dep)
+        tiled = (
+            reader_info.tiled_dims_per_read[dep_idx]
+            if dep_idx < len(reader_info.tiled_dims_per_read)
+            else ()
+        )
+        squeezed = (
+            reader_info.squeezed_advance_per_read[dep_idx]
+            if dep_idx < len(reader_info.squeezed_advance_per_read)
+            else ()
+        )
+        for group_idx in reader_group[len(previous_group) :]:
+            level_idx = reader_group.index(group_idx)
+            loop_spec = loop_by_group.get(group_idx)
+            if loop_spec is None:
+                return False
+            loop_var, trip_count = loop_spec
+            coefficient = sympy.simplify(dep.index.coeff(loop_var))
+            level_tiled = tiled[level_idx] if level_idx < len(tiled) else ()
+            level_squeezed = squeezed[level_idx] if level_idx < len(squeezed) else ()
+            if not (level_tiled or level_squeezed):
+                if coefficient != 0:
+                    return False
+                continue
+            matching_axes = []
+            for axis, (size, stride) in enumerate(
+                zip(producer.layout.size, producer.layout.stride, strict=True)
+            ):
+                extent = sympy.simplify(size / trip_count)
+                if (
+                    coefficient != 0
+                    and extent.is_integer is not False
+                    and sympy.simplify(size - trip_count * extent) == 0
+                    and sympy.simplify(stride * extent - coefficient) == 0
+                ):
+                    matching_axes.append(axis)
+            if len(matching_axes) != 1:
+                return False
+        previous_group = reader_group
+        previous_name = reader.get_name()
+    return True
+
+
+def _prune_unsafe_identity_selections(
+    selected: dict[str, tuple[int, sympy.Expr, bool]],
+    identity_sources: dict[str, str],
+    readers_by_source: dict[str, set[tuple[str, object]]],
+    advancing_reads: dict[str, set[tuple[str, object]]],
+) -> dict[str, tuple[int, sympy.Expr, bool]]:
+    """Keep only identity contractions whose complete use graph is covered.
+
+    Shrinking an identity is safe when every reader either selects the same
+    advancing tile or is another identity that will be shrunk with it.  Apply
+    this to a fixed point because removing one unsafe parent also invalidates
+    every descendant selected solely by propagation from that parent.
+    """
+    selected = dict(selected)
+    while True:
+        unsafe = set()
+        selected_names = set(selected)
+        for name, (_axis, _source_step, owns_advance) in selected.items():
+            source_name = identity_sources.get(name)
+            if not owns_advance and source_name not in selected_names:
+                unsafe.add(name)
+                continue
+
+            safe_reads = set(advancing_reads.get(name, ()))
+            safe_reads.update(
+                (reader_name, dep)
+                for reader_name, dep in readers_by_source.get(name, ())
+                if reader_name in selected_names
+                and identity_sources.get(reader_name) == name
+            )
+            if readers_by_source.get(name, set()) - safe_reads:
+                unsafe.add(name)
+
+        if not unsafe:
+            return selected
+        for name in unsafe:
+            selected.pop(name, None)
+
+
+def _contract_cross_scope_input_materializations(
+    graph: Any,
+    pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
+) -> None:
+    """Compose loop-external input copies through nested identity slices.
+
+    A full graph can normalize a non-contiguous graph input before an outer
+    ``for_each_tile`` and then select successively smaller tiles in nested
+    loops.  The loop-external normalization intentionally has no
+    :class:`CoarseTileInfo`; it is not a loop operation.  Instead of assigning
+    it fictitious loop membership, bypass the intervening pure identities,
+    make the final consumer read that normalization with the composed loop
+    address, and save the equivalent graph-input read for the post-layout
+    safety proof.
+    """
+    from torch._inductor import ir
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+
+    from torch_spyre._inductor.constants import MATMUL_REDUCTION_OPS
+    from torch_spyre._inductor.loop_info import (
+        CoarseTileInfo,
+        ReadCopyElisionRecord,
+    )
+    from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
+    from torch_spyre._inductor.wsr.coarse_tile import (
+        _LoopVarRebaseHandler,
+        _rescale_index,
+    )
+
+    loop_by_group = {
+        group_idx: (loop_var, sympy.sympify(trip_count))
+        for loop_var, trip_count, group_idx, _op_names in pending_levels
+    }
+    loop_specs = tuple(loop_by_group.values())
+    graph_output_names = set(graph.get_output_names())
+
+    def memory_reads(op):
+        return [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+
+    def clone_with_inner(op, inner_fn):
+        data = dataclasses.replace(op.data, inner_fn=inner_fn)
+        clone = ir.ComputedBuffer(
+            name=op.get_name(),
+            layout=op.layout,
+            data=data,
+            _split_size=op._split_size,
+            _original_inner_fn=op._original_inner_fn,
+            _original_ranges=op._original_ranges,
+            _original_reduction_ranges=op._original_reduction_ranges,
+        )
+        clone.operation_name = op.operation_name
+        clone.origins = op.origins
+        return clone
+
+    def one_target_dep(op, inner_fn, target_name):
+        candidate = clone_with_inner(op, inner_fn)
+        try:
+            deps = [dep for dep in memory_reads(candidate) if dep.name == target_name]
+        except Exception:  # noqa: BLE001
+            # Affine-chain composition is speculative.  If an identity's
+            # body or physical strides cannot represent the composed index,
+            # leave the original materialization path intact.
+            return None
+        return deps[0] if len(deps) == 1 else None
+
+    def per_read_metadata(info, dep_idx):
+        tiled = (
+            copy.deepcopy(info.tiled_dims_per_read[dep_idx])
+            if dep_idx < len(info.tiled_dims_per_read)
+            else [[] for _ in info.loop_count]
+        )
+        squeezed = (
+            copy.deepcopy(info.squeezed_advance_per_read[dep_idx])
+            if dep_idx < len(info.squeezed_advance_per_read)
+            else [[] for _ in info.loop_count]
+        )
+        tiled.extend([] for _ in range(len(info.loop_count) - len(tiled)))
+        squeezed.extend([] for _ in range(len(info.loop_count) - len(squeezed)))
+        return tiled, squeezed
+
+    def metadata_for_target(info, dep_idx, unrebased_dep):
+        tiled, squeezed = per_read_metadata(info, dep_idx)
+        loop_vars = {loop_var for loop_var, _trip_count in loop_specs}
+        residual = sympy.expand(unrebased_dep.index)
+        for level_idx, group_idx in enumerate(info.loop_group_id):
+            loop_spec = loop_by_group.get(group_idx)
+            if loop_spec is None:
+                return None
+            loop_var, _trip_count = loop_spec
+            coefficient = sympy.simplify(unrebased_dep.index.coeff(loop_var))
+            residual -= coefficient * loop_var
+            if coefficient.has(*loop_vars):
+                return None
+            if tiled[level_idx]:
+                # The dim/extent description remains valid after an affine
+                # identity composition; codegen derives the new source stride
+                # from the transformed dependency itself.
+                if coefficient == 0:
+                    return None
+                continue
+            if squeezed[level_idx]:
+                if coefficient == 0:
+                    return None
+                squeezed[level_idx] = [(coefficient, sympy.Integer(1))]
+            elif coefficient != 0:
+                # The advance lived on an enclosing identity, so the final
+                # consumer had no local dimension with which to describe it.
+                squeezed[level_idx] = [(coefficient, sympy.Integer(1))]
+        if sympy.expand(residual).has(*loop_vars):
+            return None
+        return tiled, squeezed
+
+    while True:
+        operations = graph.operations
+        identities = {
+            op.get_name(): identity
+            for op in operations
+            if (identity := _identity_load(op)) is not None
+        }
+        roots = [
+            name
+            for name, (source_name, _index, _indices) in identities.items()
+            if source_name in graph.graph_input_names
+            and getattr(graph.try_get_buffer(name), "loop_info", None) is None
+        ]
+        transformed = False
+
+        for root_name in roots:
+            chain_names = [root_name]
+            cursor = root_name
+            terminal_consumer = None
+            terminal_dep = None
+            valid_chain = True
+
+            while True:
+                if cursor in graph_output_names:
+                    valid_chain = False
+                    break
+                users = []
+                for op in operations:
+                    deps = [
+                        dep
+                        for dep in op.get_read_writes().reads
+                        if getattr(dep, "name", None) == cursor
+                    ]
+                    if deps:
+                        users.append((op, deps))
+                if len(users) != 1 or len(users[0][1]) != 1:
+                    valid_chain = False
+                    break
+                reader, (dep,) = users[0]
+                if not isinstance(reader, ir.ComputedBuffer) or not isinstance(
+                    dep, MemoryDep
+                ):
+                    valid_chain = False
+                    break
+                if reader.get_name() in identities:
+                    if reader.get_name() in chain_names:
+                        valid_chain = False
+                        break
+                    chain_names.append(reader.get_name())
+                    cursor = reader.get_name()
+                    continue
+                terminal_consumer, terminal_dep = reader, dep
+                break
+
+            if not valid_chain or terminal_consumer is None or terminal_dep is None:
+                continue
+            terminal_info = getattr(terminal_consumer, "loop_info", None)
+            if not isinstance(terminal_info, CoarseTileInfo):
+                continue
+
+            # Keep the deepest identity that already belongs to the terminal
+            # consumer's complete loop nest.  It is the tile-sized staging op
+            # whose storage encoding the final proof must compare against the
+            # graph input (notably K's restickified matmul operand).  If no
+            # such identity exists, the terminal pointwise/matmul itself is
+            # the direct-read candidate, as on V's path.
+            target_idx = next(
+                (
+                    idx
+                    for idx in range(len(chain_names) - 1, 0, -1)
+                    if getattr(
+                        getattr(
+                            graph.try_get_buffer(chain_names[idx]), "loop_info", None
+                        ),
+                        "loop_group_id",
+                        None,
+                    )
+                    == terminal_info.loop_group_id
+                ),
+                None,
+            )
+            if target_idx is None:
+                final_consumer = terminal_consumer
+                final_dep = terminal_dep
+            else:
+                final_consumer = graph.try_get_buffer(chain_names[target_idx])
+                chain_names = chain_names[:target_idx]
+                previous_name = chain_names[-1]
+                matching = [
+                    dep
+                    for dep in memory_reads(final_consumer)
+                    if dep.name == previous_name
+                ]
+                if len(matching) != 1:
+                    continue
+                final_dep = matching[0]
+
+            final_info = getattr(final_consumer, "loop_info", None)
+            if not isinstance(final_info, CoarseTileInfo):
+                continue
+            if isinstance(
+                getattr(final_consumer, "_read_copy_elision_record", None),
+                ReadCopyElisionRecord,
+            ):
+                # This fixed-point loop revisits every still-live root after
+                # each successful rewrite.  A consumer already carrying a
+                # proposal has reached its canonical fallback form; wrapping
+                # it again would overwrite the proof and can otherwise loop
+                # forever for an input invariant at every nesting level.
+                continue
+            if not (
+                isinstance(final_consumer.data, ir.Pointwise)
+                or (
+                    isinstance(final_consumer.data, ir.Reduction)
+                    and final_consumer.data.reduction_type in MATMUL_REDUCTION_OPS
+                )
+            ):
+                continue
+
+            if not _identity_chain_has_valid_loop_advances(
+                graph, chain_names, final_consumer, loop_by_group
+            ):
+                continue
+
+            transforms = {}
+            for name in chain_names:
+                op = graph.try_get_buffer(name)
+                if not isinstance(op, ir.ComputedBuffer) or not isinstance(
+                    op.layout, FixedLayout
+                ):
+                    valid_chain = False
+                    break
+                source_name, source_index, identity_indices = identities[name]
+                source_strides = [
+                    sympy.simplify(source_index.coeff(index))
+                    for index in identity_indices
+                ]
+                source_base = sympy.simplify(
+                    source_index.subs(
+                        {index: sympy.S.Zero for index in identity_indices}
+                    )
+                )
+                residual = sympy.simplify(
+                    source_index
+                    - source_base
+                    - sum(
+                        (
+                            stride * index
+                            for stride, index in zip(
+                                source_strides, identity_indices, strict=True
+                            )
+                        ),
+                        sympy.S.Zero,
+                    )
+                )
+                if residual != 0:
+                    valid_chain = False
+                    break
+                transforms[name] = (
+                    source_name,
+                    list(op.layout.size),
+                    list(op.layout.stride),
+                    source_strides,
+                    source_base,
+                )
+            if not valid_chain:
+                continue
+
+            fallback_transforms = {
+                name: transform
+                for name, transform in transforms.items()
+                if name != root_name
+            }
+            source_name = identities[root_name][0]
+            original_inner = final_consumer.data.inner_fn
+
+            def composed_inner(
+                *args,
+                _inner=original_inner,
+                _transforms=fallback_transforms,
+            ):
+                iteration_symbols = {
+                    symbol
+                    for arg_group in args
+                    for arg in arg_group
+                    for symbol in sympy.sympify(arg).free_symbols
+                }
+                with V.set_ops_handler(
+                    _IdentityChainLoadHandler(
+                        V.ops,
+                        _transforms,
+                        loop_specs,
+                        _rescale_index,
+                        iteration_symbols,
+                    )
+                ):
+                    return _inner(*args)
+
+            def direct_composed_inner(
+                *args,
+                _inner=original_inner,
+                _transforms=transforms,
+            ):
+                iteration_symbols = {
+                    symbol
+                    for arg_group in args
+                    for arg in arg_group
+                    for symbol in sympy.sympify(arg).free_symbols
+                }
+                with V.set_ops_handler(
+                    _IdentityChainLoadHandler(
+                        V.ops,
+                        _transforms,
+                        loop_specs,
+                        _rescale_index,
+                        iteration_symbols,
+                    )
+                ):
+                    return _inner(*args)
+
+            fallback_dep = one_target_dep(final_consumer, composed_inner, root_name)
+            direct_dep = one_target_dep(
+                final_consumer, direct_composed_inner, source_name
+            )
+            original_reads = memory_reads(final_consumer)
+            original_dep_idx = original_reads.index(final_dep)
+            fallback_metadata = (
+                metadata_for_target(final_info, original_dep_idx, fallback_dep)
+                if fallback_dep is not None
+                else None
+            )
+            direct_metadata = (
+                metadata_for_target(final_info, original_dep_idx, direct_dep)
+                if direct_dep is not None
+                else None
+            )
+            if fallback_metadata is None or direct_metadata is None:
+                continue
+            direct_tiled, direct_squeezed = direct_metadata
+            if not any(direct_tiled) and not any(direct_squeezed):
+                # There is no loop-varying read to stream.  Rewriting a wholly
+                # invariant input cannot remove a per-iteration materialization,
+                # and the post-layout proof requires a nonzero loop advance.
+                continue
+
+            loop_var_zeros = {
+                loop_var: sympy.S.Zero for loop_var, _trip_count in loop_specs
+            }
+
+            def fallback_inner(
+                *args,
+                _inner=composed_inner,
+                _target=root_name,
+                _zeros=loop_var_zeros,
+            ):
+                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
+                    return _inner(*args)
+
+            def direct_inner(
+                *args,
+                _inner=direct_composed_inner,
+                _target=source_name,
+                _zeros=loop_var_zeros,
+            ):
+                with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
+                    return _inner(*args)
+
+            fallback_tiled, fallback_squeezed = fallback_metadata
+            tiled_per_read = copy.deepcopy(final_info.tiled_dims_per_read)
+            tiled_per_read[original_dep_idx] = fallback_tiled
+            squeezed_per_read = copy.deepcopy(final_info.squeezed_advance_per_read)
+            squeezed_per_read.extend(
+                [] for _ in range(len(original_reads) - len(squeezed_per_read))
+            )
+            squeezed_per_read[original_dep_idx] = fallback_squeezed
+
+            replacement = replace_computed_buffer_body(
+                final_consumer,
+                dataclasses.replace(final_consumer.data, inner_fn=fallback_inner),
+                operations,
+                pass_name="for_each_tile_lowering",
+                reason="compose nested exact-stride input identities",
+            )
+            replacement.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+                replacement.loop_info,
+                tiled_dims_per_read=tiled_per_read,
+                squeezed_advance_per_read=squeezed_per_read,
+            )
+            replacement._read_copy_elision_record = ReadCopyElisionRecord(  # type: ignore[attr-defined]
+                consumer_name=replacement.get_name(),
+                copy_name=root_name,
+                source_name=source_name,
+                direct_inner_fn=direct_inner,
+                direct_tiled_dims_per_level=tuple(
+                    tuple(tuple(pair) for pair in level) for level in direct_tiled
+                ),
+                direct_squeezed_advance_per_level=tuple(
+                    tuple(tuple(pair) for pair in level) for level in direct_squeezed
+                ),
+            )
+
+            for name in chain_names[1:]:
+                dead_identity = next(
+                    (
+                        op
+                        for op in operations
+                        if isinstance(op, ir.ComputedBuffer) and op.get_name() == name
+                    ),
+                    None,
+                )
+                if dead_identity is not None:
+                    operations.remove(dead_identity)
+                    graph.removed_buffers.add(name)
+            transformed = True
+            break
+
+        if not transformed:
+            return
 
 
 def _contract_exact_stride_input_materializations(
@@ -1985,23 +2675,29 @@ def _contract_exact_stride_input_materializations(
         _LoopVarRebaseHandler,
         _NameSwapHandler,
         _divide_ranges,
+        _loop_var_hinted_ranges,
         _patch_retiled_load_indexes,
         _splice_loop_vars,
     )
 
-    operations = graph.operations
-    identities = {
-        op.get_name(): identity
-        for op in operations
-        if (identity := _identity_load(op)) is not None
-    }
-    if not identities:
-        return
+    _contract_cross_scope_input_materializations(graph, pending_levels)
 
-    direct_read_roots: set[str] = set()
+    operations = graph.operations
+    direct_read_roots: list[str] = []
     contracted_names: set[str] = set()
 
     for loop_var, trip_count, group_idx, _op_names in reversed(pending_levels):
+        # Earlier (deeper) levels can rewrite identity bodies and layouts.
+        # Recompute the behavioral description so every level reasons from
+        # the current IR rather than stale pre-rewrite strides/indexes.
+        identities = {
+            op.get_name(): identity
+            for op in operations
+            if (identity := _identity_load(op)) is not None
+        }
+        if not identities:
+            continue
+
         # Every op carrying this level records its absolute group index in the
         # corresponding loop_group_id slot.  Different top-level HOPs can have
         # different tuple lengths, so resolve the slot per op instead of using
@@ -2015,11 +2711,15 @@ def _contract_exact_stride_input_materializations(
                 return None
 
         selected: dict[str, tuple[int, sympy.Expr, bool]] = {}
+        conflicting_selections: set[str] = set()
+        advancing_reads: dict[str, set[tuple[str, object]]] = {}
 
         # Roots are identities whose consumer explicitly selects one slice
         # with this loop's variable.  The coefficient has to equal exactly one
         # producer-axis stride, and that axis has to have trip_count elements.
         for consumer in operations:
+            if not isinstance(consumer, ir.ComputedBuffer):
+                continue
             consumer_level = level_index(consumer)
             consumer_info = getattr(consumer, "loop_info", None)
             if consumer_level is None or consumer_info is None:
@@ -2078,9 +2778,22 @@ def _contract_exact_stride_input_materializations(
                 source_step = sympy.simplify(source_index.coeff(identity_indices[axis]))
                 if source_step == 0:
                     continue
-                selected[dep.name] = (axis, source_step, True)
-                if source_name in graph.graph_input_names:
-                    direct_read_roots.add(dep.name)
+                selection = (axis, source_step, True)
+                previous = selected.get(dep.name)
+                if previous is not None and previous != selection:
+                    # One staging identity cannot be shrunk along two
+                    # different axes (or advanced by two different source
+                    # steps) for different consumers.  The old last-writer-
+                    # wins behavior made the result depend on operation order.
+                    conflicting_selections.add(dep.name)
+                    continue
+                selected[dep.name] = selection
+                advancing_reads.setdefault(dep.name, set()).add(
+                    (consumer.get_name(), dep)
+                )
+
+        for name in conflicting_selections:
+            selected.pop(name, None)
 
         # Exact-stride normalization can also add a second whole-size identity
         # on the pass-through body output.  Contract a pure identity chain as
@@ -2131,6 +2844,43 @@ def _contract_exact_stride_input_materializations(
                 selected[name] = (axes[0], sympy.S.Zero, False)
                 changed = True
 
+        # Prove every selected link can actually be shrunk before mutating any
+        # of them.  A loop-var-hinted range is already per-iteration, and a
+        # coincidental size match must not make it look like a whole-loop
+        # materialization.  Removing such a link here also removes descendants
+        # that depended solely on its contraction in the fixed-point pruning
+        # below, preventing a partially contracted identity chain.
+        for name, (axis, _source_step, _owns_advance) in list(selected.items()):
+            producer = graph.try_get_buffer(name)
+            if (
+                not isinstance(producer, ir.ComputedBuffer)
+                or not isinstance(producer.data, (ir.Pointwise, ir.Reduction))
+                or axis >= len(producer.data.ranges)
+                or axis in _loop_var_hinted_ranges(producer)
+                or sympy.simplify(producer.data.ranges[axis] - trip_count) != 0
+                or sympy.simplify(producer.layout.size[axis] - 1) == 0
+            ):
+                selected.pop(name)
+
+        readers_by_source: dict[str, set[tuple[str, object]]] = {}
+        for reader in operations:
+            for dep in reader.get_read_writes().reads:
+                dependency_name = getattr(dep, "name", None)
+                if dependency_name in selected:
+                    readers_by_source.setdefault(dependency_name, set()).add(
+                        (reader.get_name(), dep)
+                    )
+        for name in set(selected).intersection(graph.get_output_names()):
+            # A graph output has no reader operation, but it is still an
+            # externally observable use of the full buffer.
+            readers_by_source.setdefault(name, set()).add(("<graph output>", None))
+        selected = _prune_unsafe_identity_selections(
+            selected,
+            {name: identity[0] for name, identity in identities.items()},
+            readers_by_source,
+            advancing_reads,
+        )
+
         if not selected:
             continue
 
@@ -2148,17 +2898,27 @@ def _contract_exact_stride_input_materializations(
             == group_id
         ]
 
+        contracted_level_names: set[str] = set()
         retiled_infos = {}
         for name, (axis, source_step, owns_advance) in selected.items():
             producer = graph.try_get_buffer(name)
             assert isinstance(producer, ir.ComputedBuffer)
+            old_size = tuple(producer.layout.size)
             divide_result = _divide_ranges(producer, trip_count, [axis])
-            if divide_result.retiled_info is None:
+            if tuple(producer.layout.size) == old_size:
                 continue
-            retiled_infos[name] = divide_result.retiled_info
+            contracted_level_names.add(name)
             contracted_names.add(name)
+            if divide_result.retiled_info is not None:
+                retiled_infos[name] = divide_result.retiled_info
 
             if owns_advance:
+                source_name = identities[name][0]
+                if (
+                    source_name in graph.graph_input_names
+                    and name not in direct_read_roots
+                ):
+                    direct_read_roots.append(name)
                 producer_info = producer.loop_info
                 producer_level = level_index(producer)
                 assert producer_level is not None
@@ -2178,12 +2938,12 @@ def _contract_exact_stride_input_materializations(
                     squeezed_advance_per_read=squeezed,
                 )
 
-        if not retiled_infos:
+        if not contracted_level_names:
             continue
 
         # The advancing consumer now reads iteration zero of a scratch tile;
         # its old per-level advance belongs to the identity's source instead.
-        selected_names = set(retiled_infos)
+        selected_names = contracted_level_names
         for consumer in group_ops:
             consumer_level = level_index(consumer)
             consumer_info = getattr(consumer, "loop_info", None)
@@ -2212,12 +2972,13 @@ def _contract_exact_stride_input_materializations(
                     squeezed_advance_per_read=squeezed,
                 )
 
-        _patch_retiled_load_indexes(
-            group_id,
-            group_ops,
-            retiled_infos,
-            operations,
-        )
+        if retiled_infos:
+            _patch_retiled_load_indexes(
+                group_id,
+                group_ops,
+                retiled_infos,
+                operations,
+            )
 
     # Preserve the direct source form for the existing post-layout proof.
     # Until layout selection has proved that the source's device encoding and
@@ -2225,6 +2986,11 @@ def _contract_exact_stride_input_materializations(
     # authoritative fallback.  Attaching these records only after every
     # retile rewrite is important: replace_computed_buffer_body deliberately
     # drops a saved record whenever it changes a consumer body.
+    identities = {
+        op.get_name(): identity
+        for op in operations
+        if (identity := _identity_load(op)) is not None
+    }
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)
         identity = identities.get(copy_name)
@@ -2268,6 +3034,15 @@ def _contract_exact_stride_input_materializations(
         if len(candidate_readers) != 1 or len(candidate_readers[0][1]) != 1:
             continue
         consumer, (copy_dep,) = candidate_readers[0]
+        if isinstance(
+            getattr(consumer, "_read_copy_elision_record", None),
+            ReadCopyElisionRecord,
+        ):
+            # A consumer can have multiple eligible staged inputs, but the IR
+            # stores one deferred rewrite.  Keep the first stable proposal
+            # rather than overwriting it according to incidental traversal
+            # order; the remaining copy is still the safe fallback.
+            continue
         # _NameSwapHandler intentionally discards the compact copy's constant
         # offset.  A nonzero one would need coordinate decomposition rather
         # than stride substitution, so retain the staging fallback for it.
@@ -2383,7 +3158,9 @@ def splice_while_loops(graph) -> None:
     that loop is later spliced, its final recordable names are appended to
     every ancestor's pending name list. This makes those late-created ops
     members of the complete loop nest instead of a sibling group containing
-    only their immediate level.
+    only their immediate level. A pre-loop carry copy that the splice
+    inserts before the loop (carry ownership, #4838) is appended to the
+    ancestors only: it runs once per enclosing trip, outside its own loop.
 
     Stamping itself still proceeds level-0-first (outermost first) within
     the single final phase: level 0's call stamps first (existing=None,
@@ -2400,6 +3177,12 @@ def splice_while_loops(graph) -> None:
         carry_bindings_for,
         splice_while_loop,
     )
+
+    if logger.isEnabledFor(logging.INFO):
+        with timing_recorder.stage("stage:splice_while_loops:log_before"):
+            logger.info(
+                "BEFORE SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+            )
 
     group_idx = 0
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]] = []
@@ -2433,12 +3216,24 @@ def splice_while_loops(graph) -> None:
                 while_op,
                 _stacking_carry_indices(while_op, loop_var, result.trip_count),
             )
+            names_before_splice = {op.get_name() for op in graph.operations}
             group_ops = splice_while_loop(
                 graph,
                 while_op,
                 carries,
                 trip_count=result.trip_count,
             )
+            # The splice can also add an op OUTSIDE this loop's body: a
+            # carry's pre-loop ownership copy. It runs once per trip of every
+            # enclosing level, never per trip of this one, so it joins the
+            # ancestors' names below but not this level's.
+            group_names = {op.get_name() for op in group_ops}
+            pre_loop_names = [
+                op.get_name()
+                for op in graph.operations
+                if op.get_name() not in names_before_splice
+                and op.get_name() not in group_names
+            ]
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
@@ -2446,7 +3241,7 @@ def splice_while_loops(graph) -> None:
             for ancestor_idx in ancestor_level_indices:
                 ancestor_names = pending_levels[ancestor_idx][3]
                 ancestor_name_set = set(ancestor_names)
-                for name in recordable_names:
+                for name in (*pre_loop_names, *recordable_names):
                     if name not in ancestor_name_set:
                         ancestor_names.append(name)
                         ancestor_name_set.add(name)
@@ -2517,3 +3312,21 @@ def splice_while_loops(graph) -> None:
     # merged in above, so squeezed_advance_per_read reflects each op's final,
     # fully-merged state rather than a partially-stamped intermediate.
     _rebase_point_splice_reads(graph.operations)
+
+    if pending_levels:
+        # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
+        # behind. The pipeline's deadcode_elimination pass runs before this one,
+        # so nothing downstream would otherwise clean this up until scheduling --
+        # run it here too so the AFTER dump below reflects the IR later passes
+        # actually see, not transient splice debris. Idempotent: a later
+        # deadcode_elimination call finds nothing new to remove.
+        deadcode_elimination(graph)
+
+    if logger.isEnabledFor(logging.INFO):
+        if pending_levels:
+            with timing_recorder.stage("stage:splice_while_loops:log_after"):
+                logger.info(
+                    "AFTER SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+                )
+        else:
+            logger.info("SPLICE_WHILE_LOOPS: no while_loops spliced")

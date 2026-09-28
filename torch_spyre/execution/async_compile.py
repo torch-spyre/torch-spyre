@@ -344,7 +344,7 @@ class SpyreAsyncCompile(AsyncCompile):
         self, kernel_name: str, compile_dir: str
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
-        if _spyre_config.async_backend_compile and get_compile_threads() > 1:
+        if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
             # parallel too, rather than accidentally compiling it inline.

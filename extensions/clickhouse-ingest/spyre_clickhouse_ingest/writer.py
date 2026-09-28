@@ -366,14 +366,18 @@ class ArtifactWriter:
         result_kind: str,
         test_type: str,
     ) -> bool:
-        """Has this verdict landed? Scoped by the sort key: one run reports N tiers."""
+        """Has this verdict landed? Scoped by the sort key: one run reports N tiers.
+
+        A `running` row is a pre-dispatch SEED (Jenkins writes it before the leg starts), not
+        a recorded verdict -- it must not block the leg's own terminal insert at the same key.
+        """
         return (
             cls.result_table.count_rows(
                 client,
                 db,
                 "artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
                 "AND result_kind = {result_kind:String} "
-                "AND test_type = {test_type:String}",
+                "AND test_type = {test_type:String} AND state != 'running'",
                 {
                     "artifact_id": artifact_id,
                     "run_id": run_id,

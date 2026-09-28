@@ -1493,6 +1493,57 @@ class NativeSolverDifferentialTests(TestCase):
         self._assert_equal(py_plan, cpp_plan, "lifetime end override")
         self.assertNotEqual(cpp_plan.addresses[0], cpp_plan.addresses[1])
 
+    def test_loop_start_override_does_not_change_unrelated_preloop_plan(self):
+        import sympy
+
+        from torch_spyre._inductor.scratchpad.exhaustive_search import (
+            ExhaustiveSearchSolver,
+        )
+        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+            FirstFitLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivision,
+            CoreDivisionBuffer,
+        )
+
+        loop_carry = LifetimeBoundBuffer(
+            "loop_carry",
+            64,
+            [2, 3],
+            lifetime_start_override=1,
+            lifetime_end_override=5,
+        )
+        preloop = LifetimeBoundBuffer("preloop", 64, [0])
+        buffers = [loop_carry, preloop]
+        permutation = [0, 1]
+
+        py_plan = PermutationBasedLayoutSolver(buffers, permutation, 10_000, 1)
+        cpp_plan = NativePermutationLayoutSolver(buffers, permutation, 10_000, 1)
+
+        self._assert_equal(py_plan, cpp_plan, "lifetime start override")
+        self.assertEqual(loop_carry.start_time, 1)
+        self.assertEqual(preloop.start_time, 0)
+        self.assertEqual(cpp_plan.addresses[0], cpp_plan.addresses[1])
+
+        q = sympy.Symbol("q")
+        unrelated = CoreDivisionBuffer(
+            "unrelated",
+            128,
+            [2, 3],
+            lifetime_end_override=5,
+            core_divisions=[CoreDivision(), CoreDivision(splits={q: 4})],
+        )
+        before = CoreDivisionBuffer(
+            "before", 128, [0, 1], core_divisions=[CoreDivision()]
+        )
+        result = ExhaustiveSearchSolver(
+            [unrelated, before], 160, FirstFitLayoutSolver, alignment=1
+        ).plan_layout_and_core_divisions()
+
+        self.assertEqual(result[0].start_time, 2)
+        self.assertEqual(result[0].chosen_division, 0)
+
     def test_random_mixed_sequences_match_python(self):
         seeds = 4000 if _STRESS else 800
         for seed in range(seeds):

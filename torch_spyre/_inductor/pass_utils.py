@@ -2597,17 +2597,30 @@ def replace_computed_buffer_body(
     ``ComputedBuffer`` is a frozen dataclass, so its ``data`` field cannot be
     mutated in place.  This function constructs a new ``ComputedBuffer`` with
     the updated body and swaps it into ``operations``, copying all metadata
-    fields that downstream passes depend on: ``operation_name``, ``origins``,
-    ``origin_node``, and the ``_split_size`` / ``_original_*`` fields used by
-    ``get_default_sizes_body``.  The ``get_default_sizes_body`` cache is
-    cleared on the new buffer so stale size results from the old body are not
-    reused.  Also repoints any ``MutationLayoutSHOULDREMOVE.target`` or
+    fields that downstream passes depend on: the body's ``origins`` plus the
+    buffer's ``operation_name``, ``origins``, ``origin_node``, and the
+    ``_split_size`` / ``_original_*`` fields used by
+    ``get_default_sizes_body``.  Preserving body origins is essential because
+    ``dataclasses.replace(op.data, ...)`` constructs a fresh ``Loops`` whose
+    ``init=False`` origins otherwise come from the ambient (usually empty)
+    ``IRNode._current_origins``.  Layout propagation dispatches on those body
+    origins, not the containing buffer's origins.  The ``get_default_sizes_body``
+    cache is cleared on the new buffer so stale size results from the old body
+    are not reused.  Also repoints any ``MutationLayoutSHOULDREMOVE.target`` or
     nested ``ir.WhileLoop.carried_inputs``/``.additional_inputs`` elsewhere in
     ``operations`` that referenced the old object (see
     ``_repoint_mutation_targets``).
 
     Returns the replacement ComputedBuffer.
     """
+    # A body replacement is a 1:1 rewrite.  Keep both any origins deliberately
+    # attached to the replacement and the original body's origins.  Updating
+    # the existing OrderedSet also works when new_data is op.data.
+    old_data_origins = getattr(op.data, "origins", None)
+    new_data_origins = getattr(new_data, "origins", None)
+    if old_data_origins and new_data_origins is not None:
+        new_data_origins.update(old_data_origins)
+
     # Always wrap the original inner_fn via WrapperHandler; never rebuild
     # index expressions from scratch (they go stale — see issue #2797).
     new_buf = ComputedBuffer(
@@ -3786,6 +3799,22 @@ def completed_reduction_split_on_buf(
     return reduction_splits[0]
 
 
+# torch._inductor.ir.IRNode.common_repr() appends one "stack_traces = { ... }"
+# block per distinct origin stack trace to every Loops/Pointwise/Reduction
+# __str__ -- there's no flag to suppress it, so it has to be stripped from
+# the rendered text. Blocks don't nest, and each line inside is a Python
+# source snippet (never a bare "}"), so matching up to the first line that is
+# only "}" (plus the join's trailing comma) is unambiguous.
+_STACK_TRACES_BLOCK_RE = regex.compile(
+    r"[ \t]*stack_traces = \{,?\n(?:.*\n)*?[ \t]*\},?\n", regex.MULTILINE
+)
+
+
+def _strip_stack_traces(text: str) -> str:
+    """Remove IRNode "stack_traces = { ... }" blocks from formatted op text."""
+    return _STACK_TRACES_BLOCK_RE.sub("", text)
+
+
 def format_operations(operations: list[Operation]) -> str:
     """Format LLIR operations including torch-spyre custom metadata"""
     buf = io.StringIO()
@@ -3809,6 +3838,6 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  dim_hints={dim_hints}")
             if loop_info := getattr(op, "loop_info", None):
                 buf.write(f"\n  loop_info={loop_info}")
-            buf.write(f"\n  {op.data}")
+            buf.write(f"\n  {_strip_stack_traces(str(op.data))}")
         buf.write("\n\n")
     return buf.getvalue()

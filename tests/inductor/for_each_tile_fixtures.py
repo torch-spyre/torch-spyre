@@ -93,6 +93,115 @@ def split_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return final
 
 
+def split_k_caller_init_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose init is a CALLER tensor (a graph input, not an in-graph fill).
+
+    Carry ownership: the accumulator must not overwrite acc0 in place.
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=acc0)
+    return final
+
+
+def split_k_transposed_caller_init_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose carry init is a TRANSPOSED VIEW of a caller tensor.
+
+    ``acc0`` is ``[N, M]``; the carry value is ``acc0.t()`` (a ReinterpretView,
+    zero offset, full span). The pre-loop ownership copy is therefore a view
+    copy: copy the backing storage identity-wise, present the transposed view,
+    preserve values and leave ``acc0`` untouched (#4838).
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=acc0.t())
+    return final
+
+
+def split_k_transposed_caller_init_two_carries_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two carries: ``a`` starts from ``acc0.t()``; ``b`` adds ``a``'s old value.
+
+    ``b`` reads ``a``'s pre-trip value, so besides its pre-loop ownership copy
+    ``a`` needs an in-loop snapshot (a write-after-read hazard). Both copies
+    must copy the caller's storage and keep the transpose (#4838).
+    """
+
+    def body(carry, ops):
+        a, b = carry
+        x_tile, y_tile = ops
+        return (a + x_tile @ y_tile, b + a), None
+
+    init = acc0.t()
+    (a, b), _ = for_each_tile(
+        body,
+        (X, Y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=(init, torch.zeros_like(init)),
+    )
+    return a, b
+
+
+def split_k_transposed_caller_init_two_carries_reference(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager float reference for split_k_transposed_caller_init_two_carries_fn."""
+    a = acc0.t().float()
+    b = torch.zeros_like(a)
+    for k in range(0, X.shape[1], 64):
+        b = b + a
+        a = a + X[:, k : k + 64].float() @ Y[k : k + 64].float()
+    return a, b
+
+
+def split_k_private_transposed_init_fn(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose carry init is a TRANSPOSED VIEW of an in-graph fill.
+
+    The backing storage is compiler-created scratch, so ownership must keep the
+    single-buffer (zero-copy) accumulator path even though the carry value is a
+    permuted view (#4838 private-view case).
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    init = torch.zeros(N, M, device=X.device, dtype=X.dtype)
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init.t())
+    return final
+
+
+def two_loops_shared_init_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Two split-K reductions sharing ONE in-graph `init` buffer.
+
+    Ownership: each loop must get its own initial value, so the two
+    accumulators must not write the same buffer.
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    init = torch.zeros(M, N, device=X.device, dtype=X.dtype)
+    a, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init)
+    b, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init)
+    return a + b
+
+
 def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Nested case: outer for_each_tile maps M; inner for_each_tile carries K.
 
@@ -122,6 +231,53 @@ def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
 
     _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
+
+
+def nested_two_inner_loops_shared_init_fn(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Two inner loops sharing ONE fill made in the outer M loop's body.
+
+    The nested form of two_loops_shared_init_fn: the fill has two readers, so
+    it is private to neither inner loop, and splicing each inner loop inserts
+    a pre-loop copy of it (#4838). Each copy sits inside the outer loop's
+    body: it must run on every outer trip, and never inside its inner loop.
+    Only the first inner loop reads the outer M tile; the second tiles the
+    loop-invariant ``Y``, so no outer tile has two sibling consumers (#4581).
+    """
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+
+        def k_body(acc, inner_ops):
+            x_k_tile, y_k_tile = inner_ops
+            return acc + x_k_tile @ y_k_tile, None
+
+        def row_body(acc, inner_ops):
+            (y_rows,) = inner_ops
+            return acc + y_rows, None
+
+        init = torch.zeros(x_tile.shape[0], N, device=X.device, dtype=X.dtype)
+        a, _ = for_each_tile(
+            k_body, (x_tile, y_whole), dims=(-1, 0), tile_size=64, init=init
+        )
+        b, _ = for_each_tile(row_body, (y_whole,), dims=(0,), tile_size=64, init=init)
+        return None, a + b
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
+def nested_two_inner_loops_shared_init_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager float reference for nested_two_inner_loops_shared_init_fn.
+
+    Every outer M tile gets ``X_tile @ Y`` from the first inner loop, plus the
+    sum of ``Y``'s 64-row blocks from the second, both started from zeros.
+    """
+    y_blocks = Y.float().reshape(-1, 64, Y.shape[1]).sum(0)
+    return X.float() @ Y.float() + y_blocks.repeat(X.shape[0] // 64, 1)
 
 
 def nested_split_m_then_k_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:

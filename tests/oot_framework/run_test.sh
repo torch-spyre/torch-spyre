@@ -3166,10 +3166,22 @@ echo "========================================================================"
 if [[ ${#_FILE_SUMMARY_LABELS[@]} -eq 0 ]]; then
     echo "  (no file results recorded)"
 else
+    _tot_passed=0
+    _tot_failed=0
+    _tot_error=0
+    _tot_skipped=0
+    _tot_xfailed=0
+    _tot_xpassed=0
     for _fi in "${!_FILE_SUMMARY_LABELS[@]}"; do
         _flbl="${_FILE_SUMMARY_LABELS[$_fi]}"
         _fstat="${_FILE_SUMMARY_STATUS[$_fi]}"
         read -r _fp _ff _fe _fs _fxf _fxp _ft <<< "${_FILE_SUMMARY_COUNTS[$_fi]}"
+        _tot_passed=$(( _tot_passed + ${_fp:-0} ))
+        _tot_failed=$(( _tot_failed + ${_ff:-0} ))
+        _tot_error=$(( _tot_error + ${_fe:-0} ))
+        _tot_skipped=$(( _tot_skipped + ${_fs:-0} ))
+        _tot_xfailed=$(( _tot_xfailed + ${_fxf:-0} ))
+        _tot_xpassed=$(( _tot_xpassed + ${_fxp:-0} ))
         _fparts=()
         [[ "${_fp:-0}"  -gt 0 ]] && _fparts+=("${_fp} passed")
         [[ "${_ff:-0}"  -gt 0 ]] && _fparts+=("${_ff} failed")
@@ -3191,8 +3203,12 @@ else
         fi
         printf "  %-8s  %-52s  %s\n" "$_fstat" "$_flbl" "$_fsummary"
     done
+    _tot_all=$(( _tot_passed + _tot_failed + _tot_error + _tot_skipped + _tot_xfailed + _tot_xpassed ))
 fi
 echo "========================================================================"
+if [[ ${#_FILE_SUMMARY_LABELS[@]} -gt 0 ]]; then
+    echo "[torch_oot_device_tests_run] Totals: ${_tot_all} tests (${_tot_passed} passed, ${_tot_failed} failed, ${_tot_error} error, ${_tot_skipped} skipped, ${_tot_xpassed} xpassed, ${_tot_xfailed} xfailed)"
+fi
 
 # ---------------------------------------------------------------------------
 # Failed test names — printed when any failures were recorded.

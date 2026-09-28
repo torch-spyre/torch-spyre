@@ -23,6 +23,8 @@ import torch
 import torch.nn.functional as F
 from torch._inductor.utils import run_and_get_code
 
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
 _decompositions = sys.modules["torch_spyre._inductor.decompositions"]
 _select_sdpa_tiling = _decompositions._select_sdpa_tiling
 _axis_slice_is_dense = _decompositions._axis_slice_is_dense
@@ -763,6 +765,44 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    def test_gqa_decode_with_interleaved_kv_cache(self):
+        """A tiled-away group must preserve query strides across KV heads."""
+        generator = torch.Generator().manual_seed(123)
+        dtype = torch.bfloat16
+        query = torch.randn(1, 16, 1, 128, dtype=dtype, generator=generator)
+        key = torch.randn(1, 4, 512, 128, dtype=dtype, generator=generator)
+        value = torch.randn(1, 4, 512, 128, dtype=dtype, generator=generator)
+        mask = torch.full((1, 16, 1, 512), float("-inf"), dtype=dtype)
+        # Include values on both sides of the 256-token KV tile boundary.
+        mask[..., 246:257] = 0
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, scale=1 / 128, enable_gqa=True
+            )
+
+        query_device = query.to("spyre")
+        # Position-first cache layout used by decode: [L, Hkv, D/64, B, D%64].
+        cache_layout = SpyreTensorLayout(
+            device_size=[512, 4, 2, 1, 64],
+            stride_map=[128, 512 * 128, 64, 4 * 512 * 128, 1],
+            device_dtype=get_device_dtype(dtype),
+        )
+        caches = [
+            torch.empty(
+                tensor.shape,
+                dtype=dtype,
+                device=torch.device("spyre"),
+                device_layout=cache_layout,
+            ).copy_(tensor)
+            for tensor in (key, value)
+        ]
+        expected = sdpa(query.float(), key.float(), value.float(), mask.float())
+        actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+            query_device, *caches, mask.to("spyre")
+        )
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=0.03, rtol=0.03)
+
     def test_gqa_decode_direct_body_tracks_effective_group_loop(self):
         """A nominal G split is a real loop only when a sequence axis is tiled."""
 

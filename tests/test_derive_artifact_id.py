@@ -19,6 +19,7 @@ identity functions it calls are stdlib-only, which is why the action needs no ve
 """
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,10 +44,31 @@ def derive_mod():
 
 @pytest.fixture
 def base_file(tmp_path):
-    # Upper-case and padded: the builder's spelling must not change the identity.
+    # New format: the full JSON record every component now stamps. Upper-case id, so the
+    # builder's spelling must not change the identity.
+    f = tmp_path / "spyre_artifact.json"
+    f.write_text(json.dumps({"artifact_id": BASE.upper()}))
+    return str(f)
+
+
+@pytest.fixture
+def bare_base_file(tmp_path):
+    # Pre-rollout format: a bare id beside installed_rpms.txt. Kept so an image built before
+    # every component stamped its own JSON still derives something.
     f = tmp_path / "spyre_artifact_id.txt"
     f.write_text(f"  {BASE.upper()} \n")
     return str(f)
+
+
+def test_a_leg_still_chains_onto_a_pre_rollout_bare_string_base(
+    derive_mod, bare_base_file
+):
+    record, aid, base = derive_mod.derive(
+        "torch-spyre", "amd64", "lxml", bare_base_file, str(LIB)
+    )
+    assert base == BASE
+    assert aid != BASE
+    assert record == f"{aid}|{BASE}|lxml"
 
 
 def test_a_leg_that_installed_something_chains_onto_the_base(derive_mod, base_file):
@@ -66,13 +88,25 @@ def test_install_order_does_not_change_the_identity(derive_mod, base_file):
     assert a == b
 
 
-def test_an_unchanged_image_uses_its_own_id_verbatim(derive_mod, base_file):
-    # The prebaked path: a derived id there would invent an artifact that never existed.
+def test_the_prebaked_path_still_mints_its_own_component_scoped_id(
+    derive_mod, base_file
+):
+    # The image ran unchanged, but its base id was minted under whichever component built
+    # it (e.g. spyre-backend) -- reusing it verbatim for a torch-spyre leg misattributed the
+    # result. component is always folded in, delta or not, so this leg gets its own id.
     record, aid, base = derive_mod.derive(
         "torch-spyre", "amd64", "", base_file, str(LIB)
     )
-    assert aid == base == BASE
-    assert record == f"{BASE}|{BASE}|"
+    assert base == BASE
+    assert aid != BASE
+    assert record == f"{aid}|{BASE}|"
+
+
+def test_the_prebaked_id_differs_by_component(derive_mod, base_file):
+    # Same base image, same empty delta, different component -- must not collide.
+    ts = derive_mod.derive("torch-spyre", "amd64", "", base_file, str(LIB))[1]
+    sb = derive_mod.derive("spyre-backend", "amd64", "", base_file, str(LIB))[1]
+    assert ts != sb
 
 
 def test_an_unstamped_image_derives_nothing(derive_mod, tmp_path):
@@ -90,6 +124,22 @@ def test_an_unstamped_image_derives_nothing(derive_mod, tmp_path):
         "",
         "",
     )
+
+
+def test_no_override_reaches_the_librarys_json_first_default(derive_mod, monkeypatch):
+    # An empty --base-id-file must reach the library as '', not as the bare-id path, or the
+    # JSON record is never read once images stop shipping the bare file.
+    seen = []
+
+    def read(path=""):
+        seen.append(path)
+        return BASE
+
+    monkeypatch.setattr(
+        derive_mod, "_identity", lambda _dir: (read, lambda *a: "derived")
+    )
+    assert derive_mod.derive("torch-spyre", "amd64", "", "", str(LIB))[1] == "derived"
+    assert seen == [""]
 
 
 def test_a_blank_component_refuses_rather_than_colliding(derive_mod, base_file):
@@ -180,7 +230,7 @@ def test_the_script_uses_the_shared_library_not_a_local_copy(derive_mod):
     # The point of extensions/clickhouse-ingest is that ONE definition runs everywhere.
     # Asserted on the FILE, not object identity: the script binds the module under a private
     # package name (see below), so it is the same source loaded twice, not a copy.
-    _, _, derive_id = derive_mod._identity(str(LIB))
+    _, derive_id = derive_mod._identity(str(LIB))
     assert derive_id.__module__.endswith(".identity")
     assert sys.modules[derive_id.__module__].__file__ == str(
         LIB / "spyre_clickhouse_ingest" / "identity.py"
@@ -224,7 +274,7 @@ def test_it_derives_with_no_clickhouse_driver_installed(tmp_path):
 def test_a_second_call_honours_a_different_library_dir(derive_mod, tmp_path):
     # The private package name is rebound per call; caching it would serve the first dir
     # forever, which is how a bogus --library-dir came back as a working import.
-    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
+    assert derive_mod._identity(str(LIB))[0].__module__ == f"{derive_mod._PKG}.identity"
     with pytest.raises(ModuleNotFoundError):
         derive_mod._identity(str(tmp_path / "nowhere"))
-    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
+    assert derive_mod._identity(str(LIB))[0].__module__ == f"{derive_mod._PKG}.identity"
