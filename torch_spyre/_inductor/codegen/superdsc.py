@@ -62,7 +62,6 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     TensorArg,
     TensorWorkDivision,
-    conversion_stick_grid,
     is_lx_relayout_identity,
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -1855,37 +1854,6 @@ def _extend_restickify_to_padded(
         )
 
 
-def _extend_conversion_to_padded(
-    op_spec: OpSpec,
-    sdsc_iteration_space: dict,
-    symbol_mapping: dict,
-    grid_eps: int,
-) -> None:
-    """Round sdsc_iteration_space up to the coarser stick of a grid conversion.
-
-    A conversion between two stick grids converts whole sticks of the coarser
-    one: an FP16 stick's elements stagger across two FP32 sticks, and an FP8
-    stick's across two FP16 sticks.  An op reaching only part of the group
-    touches a fraction of the live elements, and a core split of the stick dim
-    then starts every core but the first off a group boundary.
-    ``insert_staggered_ea_padding`` grows the finer side's device dim to hold
-    the whole group; this extends the iteration to match.
-
-    Applies to a consumer of a staggered wide value too, which derives its own
-    window from the same extent.  ``grid_eps`` (``conversion_stick_grid``) names
-    the coarser stick rather than reading it off an arg's own dtype, because the
-    two sides of a conversion disagree and the coarser grid is the one that
-    governs.
-    """
-    for arg in op_spec.args:
-        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
-        if stick_sym is None or stick_sym not in sdsc_iteration_space:
-            continue
-        _round_up_to_stick(
-            sdsc_iteration_space, stick_sym, grid_eps, "_extend_conversion_to_padded"
-        )
-
-
 def _inject_implicit_conv_kernel_dims(
     is_conv2d: bool,
     op_spec: OpSpec,
@@ -1985,7 +1953,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
-    grid_eps = conversion_stick_grid(op_spec)
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -2227,10 +2194,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
-    elif grid_eps is not None:
-        _extend_conversion_to_padded(
-            op_spec, sdsc_iteration_space, symbol_mapping, grid_eps
-        )
 
     # Grow the index-entry iteration to the padded output device_size so a
     # partial-last-stick gather splits stick-aligned across cores. The output's

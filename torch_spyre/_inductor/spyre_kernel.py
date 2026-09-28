@@ -34,6 +34,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import CeilDiv
 from torch._inductor.virtualized import V
 
 
@@ -1850,6 +1851,28 @@ def _check_relayout_boundary(
         )
 
 
+def _round_stick_range_to_grid(op_spec, grid_eps: int) -> None:
+    """Round each stick var's range up to whole sticks of a conversion's grid.
+
+    A conversion between two stick grids converts whole sticks of the coarser
+    one (``conversion_stick_grid``), and ``insert_staggered_ea_padding`` sizes
+    every operand to hold them, so the op iterates the padded extent, not the
+    live one: 192 FP16 elements convert as 256 on the FP8 grid.  Rounding before
+    align_tensors keeps the range whole in every operand's sticks, so the stick
+    count align re-intersects the committed split with is a multiple of the one
+    work division planned it on, whichever operand it counts.
+    """
+    for arg in op_spec.args:
+        lane = arg.device_coordinates[-1]
+        if len(lane.free_symbols) != 1:
+            continue
+        (sym,) = lane.free_symbols
+        if sym not in op_spec.iteration_space:
+            continue
+        extent, split = op_spec.iteration_space[sym]
+        op_spec.iteration_space[sym] = (CeilDiv(extent, grid_eps) * grid_eps, split)
+
+
 def _restore_stick_pair_dim(op_spec, grid_eps: int) -> None:
     """Bind a sub-stick lane's stick index to its gap dim before align_tensors.
 
@@ -1894,6 +1917,7 @@ def simplify_op_spec(
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
     if (grid_eps := conversion_stick_grid(op_spec)) is not None:
+        _round_stick_range_to_grid(op_spec, grid_eps)
         _restore_stick_pair_dim(op_spec, grid_eps)
 
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(

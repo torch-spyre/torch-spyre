@@ -47,6 +47,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -1000,6 +1001,7 @@ class TestStaggeredFp32Consumer(InductorTestCase):
             ],
             op_info={},
         )
+        simplify_op_spec(spec)
         sdsc_spec, _ = parse_op_spec(spec)
         return sorted(int(size) for size in sdsc_spec.iteration_space.values())
 
