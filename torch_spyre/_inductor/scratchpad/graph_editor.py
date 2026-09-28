@@ -25,6 +25,7 @@ from torch_spyre._inductor.pass_utils import (
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
+    origin_in_graph,
     register_operation_after_graph_edit,
 )
 from torch._inductor.virtualized import V
@@ -41,7 +42,6 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.split_multi_ops import _origin_in_graph
 
 
 class GraphEditor:
@@ -144,8 +144,8 @@ class GraphEditor:
         # and the subgraph's own compute node. inserting_after requires an anchor
         # in the current lowering graph, so select the graph-local origin rather
         # than list(origins)[0] (which may be a foreign parent-graph node and
-        # asserts). See split_multi_ops._origin_in_graph for the same pattern.
-        buf_fx = _origin_in_graph(buffer.origins, self.fx_graph)
+        # asserts). See pass_utils.origin_in_graph for the same pattern.
+        buf_fx = origin_in_graph(buffer.origins, self.fx_graph)
         assert buf_fx is not None, (
             f"no origin of {buf_name} lives in the current lowering graph; "
             f"origins={[getattr(n, 'name', n) for n in buffer.origins]}"
@@ -154,7 +154,7 @@ class GraphEditor:
         if private:
             anchors = []
             for consumer in buffer_users:
-                anchor = getattr(consumer, "origin_node", None) or _origin_in_graph(
+                anchor = getattr(consumer, "origin_node", None) or origin_in_graph(
                     consumer.origins, self.fx_graph
                 )
                 assert anchor is not None, (
