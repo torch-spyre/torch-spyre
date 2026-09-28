@@ -70,7 +70,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
-    access_stick_dims,
     concretize_expr,
     concretize_index,
     device_coordinates,
@@ -84,6 +83,7 @@ from .pass_utils import (
     patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
+    stick_dims,
 )
 from .views import compute_coordinates
 from torch_spyre._C import (
@@ -1103,18 +1103,25 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
 
     in_stl = in_layout.device_layout
     out_stl = out_layout.device_layout
-    in_dims = access_stick_dims(in_stl, in_layout, in_dep)
-    out_dims = access_stick_dims(out_stl, out_layout, _write_dep(op))
-    if in_dims is None or out_dims is None:
+    out_dep = _write_dep(op)
+    _, in_num_sticks_dim = stick_dims(
+        host_coordinates(in_layout, in_dep, None),
+        device_coordinates(in_stl, in_dep, None),
+    )
+    _, out_num_sticks_dim = stick_dims(
+        host_coordinates(out_layout, out_dep, None),
+        device_coordinates(out_stl, out_dep, None),
+    )
+    if in_num_sticks_dim is None or out_num_sticks_dim is None:
         return
 
     # The FP16 output is the coarser grid, and its num-sticks count is already
     # rounded up to whole sticks, so its capacity bounds what the input must hold.
     in_eps = in_stl.device_size[-1]
     out_eps = out_stl.device_size[-1]
-    out_num_sticks = out_stl.device_size[out_dims.num_sticks]
+    out_num_sticks = out_stl.device_size[out_num_sticks_dim]
     required_num_sticks = -(-out_num_sticks * out_eps // in_eps)
-    current_num_sticks = in_stl.device_size[in_dims.num_sticks]
+    current_num_sticks = in_stl.device_size[in_num_sticks_dim]
     if current_num_sticks >= required_num_sticks:
         return
 
@@ -1127,13 +1134,13 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
         in_buf = clone_buf
 
     in_buf.layout = _grow_num_sticks(
-        in_buf.get_layout(), in_dims.num_sticks, required_num_sticks
+        in_buf.get_layout(), in_num_sticks_dim, required_num_sticks
     )
 
     logger.debug(
         "insert_staggered_ea_padding: padded input %s device dim %d %d -> %d",
         in_buf.get_name(),
-        in_dims.num_sticks,
+        in_num_sticks_dim,
         current_num_sticks,
         required_num_sticks,
     )
@@ -1165,10 +1172,12 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     assert isinstance(layout, FixedTiledLayout)
     stl = layout.device_layout
 
-    dims = access_stick_dims(stl, layout, _write_dep(op))
-    if dims is None:
+    dep = _write_dep(op)
+    _, num_sticks_dim = stick_dims(
+        host_coordinates(layout, dep, None), device_coordinates(stl, dep, None)
+    )
+    if num_sticks_dim is None:
         return
-    sticks_dim = dims.num_sticks
     out_eps = stl.device_size[-1]
     # The stagger is defined against the FP16 grid: the pair holds one FP16 stick.
     coarse_eps = DataFormats.SEN169_FP16.elems_per_stick()
@@ -1176,17 +1185,17 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
         return
     sticks_per_pair = -(-coarse_eps // out_eps)
 
-    current_num_sticks = stl.device_size[sticks_dim]
+    current_num_sticks = stl.device_size[num_sticks_dim]
     required_num_sticks = -(-current_num_sticks // sticks_per_pair) * sticks_per_pair
     if current_num_sticks >= required_num_sticks:
         return
 
-    op.layout = _grow_num_sticks(layout, sticks_dim, required_num_sticks)
+    op.layout = _grow_num_sticks(layout, num_sticks_dim, required_num_sticks)
 
     logger.debug(
         "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",
         op.get_name(),
-        sticks_dim,
+        num_sticks_dim,
         current_num_sticks,
         required_num_sticks,
     )

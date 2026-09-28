@@ -766,7 +766,7 @@ class TestSpyreTensorLayout(TestCase):
         device.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp32 = get_device_dtype(torch.float32)
 
@@ -808,7 +808,7 @@ class TestSpyreTensorLayout(TestCase):
         and never stepped) is left alone for the same reason. Needs no device.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
         # Host extent 5 at fp16: the num-sticks stride is the extent, not 64.
@@ -846,7 +846,7 @@ class TestSpyreTensorLayout(TestCase):
         sticks instead. Needs no device.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
         stl = SpyreTensorLayout(
@@ -870,7 +870,7 @@ class TestSpyreTensorLayout(TestCase):
         rebuilds a dense layout from the host size, so the partial stick is the
         padded case it already handles."""
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
 
@@ -932,7 +932,7 @@ class TestSpyreTensorLayout(TestCase):
         Verify it is preserved: 3*32=96 elements -> ceil(96/64)=2 fp16 sticks.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp32 = get_device_dtype(torch.float32)
         three_sticks = SpyreTensorLayout(
