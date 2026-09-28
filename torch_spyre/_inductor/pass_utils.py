@@ -182,6 +182,14 @@ class StickDims(NamedTuple):
     within_stick: int | None
     """Host dim the innermost device dim walks, or None for a stick holding one
     element (a size-1 or sparse stick dim), whose coordinate has no variable."""
+    folds_outer_dims: bool = False
+    """Whether the num-sticks dim also steps host dims outside the stick dim.
+
+    A layout may lay whole-stick rows end to end on one device dim, so that dim
+    counts the sticks of the stick dim's outer host dims as well. A ``[2, 128]``
+    access over ``[12, 1, 64]`` (the first third of a ``[1, 768]`` buffer) puts
+    ``2*d0 + floor(d1/64)`` on it, holding twelve sticks where the stick dim's
+    extent accounts for two."""
 
 
 def stick_dims(host_coords: list[Expr], device_coords: list[Expr]) -> StickDims | None:
@@ -217,7 +225,8 @@ def stick_dims(host_coords: list[Expr], device_coords: list[Expr]) -> StickDims 
     )
     if num_sticks is None:
         return None
-    return StickDims(num_sticks, within_stick)
+    folds_outer_dims = bool(device_coords[num_sticks].free_symbols - stick_syms)
+    return StickDims(num_sticks, within_stick, folds_outer_dims)
 
 
 def access_stick_dims(
@@ -241,21 +250,6 @@ def access_stick_dims(
     return dims
 
 
-def _num_sticks_dim_folds_outer_dims(
-    stl: SpyreTensorLayout, dep: MemoryDep, num_sticks: int
-) -> bool:
-    """Whether ``dep``'s num-sticks device coordinate also steps a non-stick host dim.
-
-    A layout may lay whole-stick rows end to end on one device dim, so that dim
-    counts the sticks of the stick dim's outer host dims as well. A ``[2, 128]``
-    access over ``[12, 1, 64]`` (the first third of a ``[1, 768]`` buffer) puts
-    ``2*d0 + floor(d1/64)`` on it, holding twelve sticks where the stick dim's
-    extent accounts for two.
-    """
-    coords = device_coordinates(stl, dep, None)
-    return bool(coords[num_sticks].free_symbols - coords[-1].free_symbols)
-
-
 def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
@@ -271,20 +265,23 @@ def rescale_stl_for_dtype(
     padding present in the input STL instead of reconstructing a dense layout from
     the logical size/stride.
 
-    The num-sticks count is the live host extent of the stick dim rounded up to
-    whole output sticks. Rounding the input's padded capacity instead would
-    re-pad it on a widening conversion: 65 fp16 elements occupy two sticks holding
-    128, and rounding 128 up gives four fp32 sticks where three hold the 65.
-    Rounding up at all keeps a single input stick from flooring to a size-0 dim,
-    which reached ``get_device_stride_infos`` to divide by it and kill the process
-    with SIGFPE (issue #3604). A num-sticks dim that folds in outer host dims
-    counts their sticks too, so the stick dim's extent does not size it; its
-    capacity is rescaled instead (``_num_sticks_dim_folds_outer_dims``).
+    The num-sticks dim is resized from the input layout wherever that layout
+    determines it, and its ``stride_map`` entry follows the layout invariant: a
+    dim of several sticks steps by the stick pitch, and a dim of one stick carries
+    its host extent times the stick dim's step, as ``dim_map_to_stride_map``
+    writes it. Input sticks that merge into wider output sticks redistribute
+    exactly. Two cases read the host extent instead, because the input layout
+    does not record it:
 
-    The stride takes the clamp ``dim_map_to_stride_map`` applies: a dim left
-    holding one stick carries its host extent rather than the pitch a second stick
-    would step by. A stick dim within one output stick therefore keeps its entry,
-    and one that widens past it becomes a real stick step.
+    - Sticks that split, as FP16 into FP32, leave the last output stick live or
+      empty depending on how full the last input stick is: 65 FP16 elements take
+      three FP32 sticks, not four. A dim that folds in outer host dims
+      (``StickDims.folds_outer_dims``) is the exception; it steps only whole
+      input sticks, so its capacity splits exactly.
+    - A single output stick carries the extent in its entry. The input entry
+      cannot supply it: a pitch entry keeps only a stick count, and a one-stick
+      entry never enters an address, so not every layout producer writes the
+      extent there.
 
     A narrowing output may end in a partially filled stick, and a widening one
     counts only the sticks its live elements reach. Giving the rest of the stick
@@ -308,22 +305,23 @@ def rescale_stl_for_dtype(
     # A stick holding one element (a size-1 or sparse stick dim) has as many
     # sticks at any depth.
     if dims is not None and dims.within_stick is not None:
-        num_sticks = dims.num_sticks
-        if _num_sticks_dim_folds_outer_dims(stl, dep, num_sticks):
-            # Every stick the dim steps is a whole input stick, so its capacity
-            # redistributes exactly.
-            in_eps = stl.device_size[-1]
-            out_device_size[num_sticks] = -(
-                -stl.device_size[num_sticks] * in_eps // out_eps
-            )
-            out_stride_map[num_sticks] = out_eps * stl.stride_map[-1]
-        else:
-            extent = concretize_expr(host_layout.size[dims.within_stick])
-            host_stride = concretize_expr(host_layout.stride[dims.within_stick])
-            out_device_size[num_sticks] = -(-extent // out_eps)
-            out_stride_map[num_sticks] = min(
-                out_eps * stl.stride_map[-1], host_stride * extent
-            )
+        dim = dims.num_sticks
+        in_eps = stl.device_size[-1]
+        elem_step = stl.stride_map[-1]
+        host_extent = concretize_expr(host_layout.size[dims.within_stick])
+
+        # General case: the input sticks redistribute into output sticks, which
+        # the dim steps by the output pitch.
+        in_elems = stl.device_size[dim] * in_eps
+        out_device_size[dim] = (in_elems + out_eps - 1) // out_eps
+        out_stride_map[dim] = out_eps * elem_step
+
+        if out_eps < in_eps and not dims.folds_outer_dims:
+            # Splitting sticks: the last input stick may fill only part of them.
+            out_device_size[dim] = (host_extent + out_eps - 1) // out_eps
+        if out_device_size[dim] == 1:
+            # A single output stick carries the host extent instead of a pitch.
+            out_stride_map[dim] = host_extent * elem_step
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
