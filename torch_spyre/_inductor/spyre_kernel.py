@@ -1855,23 +1855,24 @@ def _restore_stick_pair_dim(op_spec) -> None:
 
     On the fp16 grid a sub-stick (e.g. fp32) operand spans a stick pair per
     64-lane fp16 stick. When its count dim held one stick, padding prepends an
-    outermost gap dim of ``64 // elems_per_stick`` sticks with coordinate 0
+    outermost gap dim of ``fp16_eps // elems_per_stick`` sticks with coordinate 0
     (``_grow_num_sticks``). Left alone, align_tensors splits the lane into
     ``floor(s/eps)`` and ``Mod(s, eps)`` on a new size-1 outer axis, and the gap
     dim becomes a separate zero-coordinate dim with a back gap, so the SDSC
     counts the pair's second stick twice. Writing the split onto the gap dim
     here gives align the same structure as a multi-stick count dim.
     """
+    fp16_eps = DataFormats.SEN169_FP16.elems_per_stick()
     for arg in op_spec.args:
         coords = list(arg.device_coordinates)
         lane = coords[-1]
         eps = arg.device_dtype.elems_per_stick()
-        if eps >= 64 or len(lane.free_symbols) != 1:
+        if eps >= fp16_eps or len(lane.free_symbols) != 1:
             continue
         (sym,) = lane.free_symbols
         if any(sym in sympy.sympify(c).free_symbols for c in coords[:-1]):
             continue
-        if coords[0] != 0 or arg.device_size[0] != 64 // eps:
+        if coords[0] != 0 or arg.device_size[0] != fp16_eps // eps:
             continue
         coords[0] = sympy.floor(lane / eps)
         coords[-1] = sympy.Mod(lane, eps)

@@ -36,7 +36,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
@@ -447,11 +447,10 @@ def adjust_it_space_for_sticks(
             )
         output_ea = tensor_deps[-1].layout.device_layout.element_arrangement
         if output_ea == ElementArrangement.DL16_TO_FP32:
-            # DL16_TO_FP32 tensors use paired FP32 sticks (64 elements).
-            # This override is only required for DL16_TO_FP32 -> DL16_TO_FP32
-            # pointwise operations, where all participating tensors are FP32 and
-            # would otherwise contribute elems_per_stick() == 32.
-            elems_per_stick = 32 * 2
+            # A DL16_TO_FP32 value spans a pair of FP32 sticks per FP16 stick, so
+            # it divides on the FP16 grid.  A pointwise op between two such values
+            # has only FP32 operands, which would otherwise give 32.
+            elems_per_stick = DataFormats.SEN169_FP16.elems_per_stick()
         else:
             elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
