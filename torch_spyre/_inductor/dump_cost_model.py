@@ -47,7 +47,6 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space_from_op,
 )
-from .scratchpad.plan_solver import CoreDivisionBuffer, division_symbol
 
 logger = get_logger("cost_model")
 
@@ -76,14 +75,16 @@ def _prod_ints(seq) -> int:
 
 
 def _op_name(op) -> str:
-    data = getattr(op, "data", None)
-    node = getattr(data, "origin_node", None)
-    if node is not None:
-        return getattr(node, "name", None) or str(getattr(node, "target", node))
-    rtype = getattr(data, "reduction_type", None)
-    if rtype:
-        return str(rtype)
-    return type(data).__name__ if data is not None else op.get_operation_name()
+    """The op's origin-node name.
+
+    ``dump_common`` owns the definition so this dump and the cost-expression
+    dump name ops identically -- the two are joined on it. Imported inside the
+    function because ``dump_common`` is the shared sink and importing it at
+    module scope would close a cycle.
+    """
+    from .dump_common import origin_op_name
+
+    return origin_op_name(op)
 
 
 def _work_slices(op, write_index, read_index, iteration_space, work_slices=None):
@@ -362,6 +363,99 @@ def _row_split(op, default: int, work_slices=None) -> int:
         return max(1, int(readable.get(out_vars[-1][1], default)))
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return default
+
+
+def _contiguous_device_run(coords, dims, iteration_space, work_slices):
+    """Elements in a core's contiguous input run, or None if not provable.
+
+    Flatten the *device* access, not the host index. Adjacent stick-plane and
+    stick coordinates cancel back into an affine index; a real transpose within
+    the stick planes does not, and is deliberately left unmodelled. Walking the
+    affine axes from stride one outward coalesces an axis only when every inner
+    axis is unsplit and fully contiguous. Candidate splits may be symbolic.
+    """
+    from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+
+    index = sum(c * math.prod(dims[i + 1 :]) for i, c in enumerate(coords))
+    index = sympy.sympify(index).replace(FloorDiv, lambda a, b: sympy.floor(a / b))
+    index = index.replace(
+        ModularIndexing, lambda a, b, c: sympy.Mod(sympy.floor(a / b), c)
+    )
+    index = sympy.expand(
+        index.replace(sympy.Mod, lambda a, b: a - b * sympy.floor(a / b))
+    )
+    axes = []
+    remainder = index
+    for symbol, size in iteration_space.items():
+        stride = index.coeff(symbol)
+        if (
+            not stride.is_Integer
+            or stride <= 0
+            or not sympy.sympify(size).is_Integer
+            or size <= 0
+        ):
+            return None
+        axes.append((int(stride), symbol, int(size)))
+        remainder -= stride * symbol
+    if remainder.free_symbols or not remainder.is_Integer:
+        return None
+    axes.sort(key=lambda a: a[0])
+    if not axes or axes[0][0] != 1:
+        return None
+    run, extent = sympy.Integer(1), 1
+    inner_whole = sympy.true
+    for stride, symbol, size in axes:
+        if stride != extent:
+            break
+        split = work_slices.get(symbol, 1)
+        # Once an inner dimension is split, outer axes introduce gaps.
+        run = sympy.Piecewise(
+            (sympy.Integer(extent) * size / split, inner_whole), (run, True)
+        )
+        inner_whole = sympy.And(inner_whole, sympy.Eq(split, 1))
+        extent *= size
+    return run
+
+
+def _transport_read_geometry(op, work_slices=None):
+    """(per-core input run in bytes, elements per invocation), else unknown.
+
+    The calibrated transports have an affine DL16 device read, with or without
+    a stick-axis swap. Do not mistake logical order, unavailable ownership, another
+    device dtype, or a non-affine gather for that physical access pattern.
+    """
+    try:
+        from torch._inductor.virtualized import V
+        from torch_spyre._C import DataFormats
+
+        from .pass_utils import device_coordinates
+
+        if (
+            work_slices is None
+            and getattr(op, "iteration_space_ownership", None) is None
+            and not getattr(op, "op_it_space_splits", None)
+        ):
+            return None, None
+        rw = op.get_read_writes()
+        if len(rw.reads) != 1 or len(rw.writes) != 1:
+            return None, None
+        read, write = next(iter(rw.reads)), next(iter(rw.writes))
+        src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
+        dst = _real_layout(op.get_layout()).device_layout
+        if any(dl.device_dtype != DataFormats.SEN169_FP16 for dl in (src, dst)):
+            return None, None
+        it_space = iteration_space_from_op(op)
+        src_coords = device_coordinates(src, read, None, op=op)
+        slices = _work_slices(op, write.index, read.index, it_space, work_slices)
+        run = _contiguous_device_run(src_coords, src.device_size, it_space, slices)
+        if run is None:
+            return None, None
+        return run * op.get_dtype().itemsize, math.prod(
+            int(size) for size in it_space.values()
+        )
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        logger.debug("transport geometry unavailable", exc_info=True)
+        return None, None
 
 
 def _matmul_features(
@@ -766,7 +860,6 @@ def _relayout_logger():
 def extract_op_features(
     op,
     work_slices=None,
-    buffers: Optional[Mapping[str, CoreDivisionBuffer]] = None,
     *,
     is_lx: Optional[Mapping[str, bool]] = None,
 ) -> OpFeatures:
@@ -776,16 +869,15 @@ def extract_op_features(
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
 
-    ``buffers`` supplies each arg's symbolic residency and the output's candidate
-    divisions. Missing buffers use their committed layouts. ``is_lx`` overrides
-    residency when pricing a specific placement, such as a relayout candidate.
+    ``is_lx`` supplies each arg's residency (symbolic or concrete) by buffer
+    name, such as a relayout candidate's forced placement. A name missing from
+    it falls back to the buffer's committed layout.
 
     Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
     graph boundary, resolved against the arg's own role, so a buffer that is both a
     graph input and a graph output (a returned view of an input; a mutated input that
     is returned) needs no special case.
     """
-    buffers = buffers or {}
     is_lx = is_lx or {}
     boundary = _graph_boundary_names()
     graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
@@ -817,12 +909,9 @@ def extract_op_features(
     if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    output_buffer = buffers.get(op.name)
     out_is_lx = is_lx.get(
         op.name,
-        output_buffer.sym_is_lx
-        if output_buffer is not None
-        else _mem_of_layout(op.get_layout()) == "lx",
+        _mem_of_layout(op.get_layout()) == "lx",
     )
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
@@ -915,16 +1004,6 @@ def extract_op_features(
     if not is_reduction and loop_trip == 1 and out_is_lx is not True:
         out_write_elems = _indirect_write_elems(op, out_elems)
 
-    # Use the same resolved axes as `cores`, not a candidate's raw split product.
-    store_division = None
-    store_cores_by_division: tuple[tuple[int, int], ...] = ()
-    if out_write_elems is not None and output_buffer is not None:
-        store_division = division_symbol(output_buffer.name)
-        store_cores_by_division = tuple(
-            (index, math.prod(cd.splits.get(key, 1) for key in slices))
-            for index, cd in enumerate(output_buffer.core_divisions)
-        )
-
     args: list = []
     # Output arg (device-sized).
     args.append(
@@ -984,10 +1063,9 @@ def extract_op_features(
                 dims, in_elems, in_logical = list(out_dims), out_elems, []
             inp_is_lx = False
         else:
-            input_buffer = buffers.get(name)
             inp_is_lx = is_lx.get(
                 name,
-                input_buffer.sym_is_lx if input_buffer is not None else mem == "lx",
+                mem == "lx",
             )
         args.append(
             ArgTraffic(
@@ -1014,6 +1092,23 @@ def extract_op_features(
 
     _rl = _relayout_features(op, out_dims)
 
+    hbm_pattern = "" if is_matmul else _hbm_pattern(op, is_reduction, out_dims)
+    # A staging copy still issues the source DMA even if it is later elided into
+    # its consumer. Price its physical read during planning too, not only the
+    # final restickify's rewritten access. Arithmetic/unary compute ops are not
+    # part of this transport calibration.
+    try:
+        is_transport = (
+            data is not None
+            and not is_reduction
+            and set(data.inner_fn_opcount().used_ops) == {"load"}
+        )
+    except (AttributeError, TypeError):
+        is_transport = False
+    transport_read_run_bytes, transport_tile_elems = (
+        _transport_read_geometry(op, work_slices) if is_transport else (None, None)
+    )
+
     features = OpFeatures(
         name=_op_name(op),
         is_reduction=is_reduction,
@@ -1034,12 +1129,12 @@ def extract_op_features(
         matmul_b_bytes=matmul_b_bytes,
         matmul_m_split=matmul_m_split,
         matmul_n_split=matmul_n_split,
-        hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        hbm_pattern=hbm_pattern,
+        transport_read_run_bytes=transport_read_run_bytes,
+        transport_tile_elems=transport_tile_elems,
         is_lx_relayout=_rl[0],
         relayout_run_elems=_rl[1],
         relayout_split=_rl[2],
-        store_division=store_division,
-        store_cores_by_division=store_cores_by_division,
         # The byte-count check defines which store geometry gets the rate estimate.
         is_indirect_store=out_write_elems is not None,
     )

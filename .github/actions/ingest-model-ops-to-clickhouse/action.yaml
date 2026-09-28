@@ -1,0 +1,268 @@
+name: Ingest model-ops capability logs into ClickHouse
+description: >
+  Download the model-ops job logs from a GHA run, parse them for operation-support variants
+  (.github/scripts/parse_model_ops_logs.py) and insert the records into ClickHouse
+  (.github/scripts/ingest_model_ops.py). The SINGLE implementation of the
+  push-model-ops-logs-to-clickhouse.yaml job, extracted so another repo can call it directly
+  instead of copying that job's checkout+venv+install+download+parse+ingest steps. Secrets
+  cannot reach a composite action, so the caller passes the ClickHouse connection and a GH
+  token as plain inputs.
+
+inputs:
+  gha-run-id:
+    description: >
+      Numeric GitHub Actions run ID of the nightly run whose job logs are analysed. This
+      downloads only jobs named "model-ops / ...", which parse_model_ops_logs.py's own
+      \bSpyre\b filter cannot tell apart from same-worded regression-matrix job names.
+    required: true
+  workflow-name:
+    description: >
+      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
+      input) -- e.g. 'model-ops-tests'.
+    required: false
+    default: model-ops-tests
+  branch:
+    description: Branch recorded against the rows.
+    required: false
+    default: ''
+  sha:
+    description: Commit sha recorded against the rows.
+    required: false
+    default: ''
+  component:
+    description: Component whose suite this is.
+    required: false
+    default: torch-spyre
+  arch:
+    description: >
+      Arch of the ANALYSED legs, never $(uname -m) (which would report the ingest runner);
+      arch is a run_id hash input, so a wrong value derives an id that joins nothing.
+    required: false
+    default: x86_64
+  jenkins-run-key:
+    description: Jenkins externalizable id ('folder/job#123'), when Jenkins dispatched this leg.
+    required: false
+    default: ''
+  schema:
+    description: Which schema generation to write -- v1 | v2 | both.
+    required: false
+    default: v1
+  gh-token:
+    description: Token `gh api` uses to list and download job logs.
+    required: true
+  repository:
+    description: owner/repo the analysed run belongs to. Empty = this job's own repository.
+    required: false
+    default: ''
+  script-repo:
+    description: Repository holding the canonical scripts, for the sparse-checkout fallback.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: Ref of script-repo to check out. Pin to a tag from another repo.
+    required: false
+    default: ''
+  torch-spyre-dir:
+    description: Fallback directory holding a torch-spyre checkout. Empty = workspace, then sparse-checkout.
+    required: false
+    default: ''
+  clickhouse-host:
+    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port (default 443 inside the script).
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user (default "default" inside the script).
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+  clickhouse-db-v2:
+    description: Schema-v2 database. Empty makes the v2 write a no-op.
+    required: false
+    default: ''
+
+outputs:
+  json-file:
+    description: Path to the parsed JSON file, for the caller to upload as its own artifact.
+    value: ${{ steps.parse.outputs.json-file }}
+  log-file:
+    description: Path to the cleaned plain-text log, for the caller to upload as its own artifact.
+    value: ${{ steps.parse.outputs.log-file }}
+  has-variant-data:
+    description: '"true" when parsing found any variants; the caller may skip its own summary.'
+    value: ${{ steps.parse.outputs.has-variant-data }}
+
+runs:
+  using: composite
+  steps:
+    # The no-op gate lives here, not in the library: ingest_model_ops.py's get_client() reads
+    # CLICKHOUSE_HOST as a required env (a KeyError, not a clean skip, when absent).
+    - name: Gate on ClickHouse config
+      id: gate
+      shell: bash
+      env:
+        CH_HOST: ${{ inputs.clickhouse-host }}
+      run: |
+        if [ -z "${CH_HOST}" ]; then
+          echo "::notice::ClickHouse host not configured — skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Setup spyre-clickhouse-ingest
+      id: setup
+      if: steps.gate.outputs.configured == 'true'
+      uses: ./.github/actions/setup-clickhouse-ingest
+      with:
+        extra-scripts: |
+          .github/scripts/parse_model_ops_logs.py
+          .github/scripts/ingest_model_ops.py
+        script-repo: ${{ inputs.script-repo }}
+        script-ref: ${{ inputs.script-ref }}
+        torch-spyre-dir: ${{ inputs.torch-spyre-dir }}
+
+    - name: Setup the GitHub CLI
+      if: steps.gate.outputs.configured == 'true'
+      uses: ./.github/actions/setup-gh-cli
+
+    # Only the model-ops jobs, and strip the reusable-workflow prefix: the triggering run is
+    # the whole nightly, whose regression jobs also carry a "Spyre" token, enough to pass the
+    # parser's own \bSpyre\b filter and land as fake model-ops suites, so this selects on the
+    # caller's job id (exact) rather than the "Spyre" substring. The name is reduced to the
+    # suite alone -- a reusable workflow reports "<caller-job-id> / <job name>", and the
+    # parser derives suite_name from that verbatim, so leaving the prefix on would break
+    # continuity with every row already stored under the un-prefixed suite name.
+    - name: Download job logs
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        REPO: ${{ inputs.repository || github.repository }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        mkdir -p raw_logs
+
+        gh api \
+          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+          --paginate \
+          --jq '.jobs[]
+                | select(.name | startswith("model-ops / "))
+                | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
+        > /tmp/jobs.jsonl
+
+        if [ ! -s /tmp/jobs.jsonl ]; then
+          echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."
+        fi
+
+        python3 - << 'PYEOF'
+        import os
+
+        from spyre_clickhouse_ingest.gha_logs import download_job_logs_or_die, load_jobs
+
+        download_job_logs_or_die(
+            load_jobs("/tmp/jobs.jsonl"),
+            repo=os.environ["REPO"],
+            out_dir="raw_logs",
+        )
+        PYEOF
+
+    - name: Parse logs
+      id: parse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.setup.outputs.root }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+        WORKFLOW: ${{ inputs.workflow-name }}
+        SHA: ${{ inputs.sha }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+
+        SAFE_WF=$(echo "${WORKFLOW}" | tr ' ' '_')
+        JSON_FILE="model_ops_${SAFE_WF}_${RUN_ID}.json"
+        LOG_FILE="model_ops_log_${SHA}_${RUN_ID}.txt"
+        echo "json-file=${JSON_FILE}" >> "$GITHUB_OUTPUT"
+        echo "log-file=${LOG_FILE}" >> "$GITHUB_OUTPUT"
+        echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
+
+        python3 "${ROOT}/.github/scripts/parse_model_ops_logs.py" \
+          --log-dir raw_logs \
+          --run-id  "${RUN_ID}" \
+          --out     "${JSON_FILE}" \
+          --log-out "${LOG_FILE}"
+
+        # Skip ingest when parsing produced no variant data (all-zero suites) -- e.g. GHA job
+        # logs not yet available, or the run had no parseable XPASS/XFAIL lines because it was
+        # still in progress when this action triggered. Rather than overwrite good stored
+        # suites with empty ones.
+        TOTAL_VARIANTS=$(python3 -c "
+        import json
+        try:
+            recs = json.load(open('${JSON_FILE}'))
+            total = sum(
+                len(op.get('variants', []))
+                for r in recs
+                for cat in (r.get('operations') or {}).values()
+                for op in (cat if isinstance(cat, list) else [])
+            )
+            print(total)
+        except Exception:
+            print(0)
+        " 2>/dev/null || echo 0)
+
+        echo "[info] Total parsed variants: ${TOTAL_VARIANTS}"
+        if [ "${TOTAL_VARIANTS}" -eq 0 ]; then
+          echo "has-variant-data=false" >> "$GITHUB_OUTPUT"
+          echo "[warn] No variant data found — skipping ClickHouse ingest to avoid" \
+               "overwriting good data with empty suites."
+        else
+          echo "has-variant-data=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Ingest into ClickHouse
+      if: steps.gate.outputs.configured == 'true' && steps.parse.outputs.has-variant-data == 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.setup.outputs.root }}
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CH_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_DB_IN: ${{ inputs.clickhouse-db }}
+        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
+        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
+        # --trigger-type is the RUN's test_type (a run_id hash input), not the capability
+        # analysis name -- the writer passes 'model_ops' for that itself.
+        python3 "${ROOT}/.github/scripts/ingest_model_ops.py" \
+          --json-file       "${JSON_FILE}" \
+          --workflow        "${{ inputs.workflow-name }}" \
+          --branch          "${{ inputs.branch }}" \
+          --sha             "${{ inputs.sha }}" \
+          --run-id          "${RUN_ID}" \
+          --schema          "${{ inputs.schema }}" \
+          --component       "${{ inputs.component }}" \
+          --arch            "${{ inputs.arch }}" \
+          --gha-run-id      "${RUN_ID}" \
+          --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
+          --trigger-type    capability

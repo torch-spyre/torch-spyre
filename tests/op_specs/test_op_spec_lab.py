@@ -339,7 +339,7 @@ def test_emitted_script_forwards_the_pool_size():
 
 
 def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
-    """Bundle a pool spec for real -- no device, no mock, no dxp_standalone.
+    """Bundle a pool spec for real -- no device, no mock, no backend compiler.
 
     The unmocked call is the point: ``generate_bundle`` is where a dropped
     pool_size actually bites, and it asserts ``0 < pool_size`` only when it sees

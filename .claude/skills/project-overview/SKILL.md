@@ -36,7 +36,7 @@ It supports two execution paths:
 1. **Eager mode** — operator-by-operator dispatch via auto-generated Python
    wrappers that call SendNN
 2. **Compiled mode** — `torch.compile()` via a custom Inductor backend that
-   generates SuperDSC descriptors compiled by the `dxp_standalone` backend
+   generates SuperDSC descriptors compiled by the `dbo-opt` backend
    compiler
 
 ---
@@ -104,7 +104,7 @@ torch.compile(model)
       3. Scratchpad planning (scratchpad.py) — optional LX on-chip memory reuse
   → SpyreKernel codegen (spyre_kernel.py) — LoopLevelIR → KernelSpec
   → SuperDSC generation (codegen/superdsc.py) — KernelSpec → JSON descriptor
-  → dxp_standalone (backend compiler) — JSON → g2.graph.cbor binary
+  → dbo-opt (backend compiler) — bundle.mlir + JSON → spyreCodeDir/
   → SpyreSDSCKernelRunner — calls _C.launch_jobplan() at runtime
 ```
 
@@ -194,7 +194,7 @@ Two separate pybind11 modules:
    against `sendnn`, `flex`
 2. **Entry point**: `torch.backends` → `torch_spyre = torch_spyre:_autoload`
 
-Key external deps: `torch~=2.13.0`, `sendnn`, `flex`, `dxp_standalone`
+Key external deps: `torch~=2.13.0`, `sendnn`, `flex`, `dbo-opt` (deeptools)
 
 ---
 

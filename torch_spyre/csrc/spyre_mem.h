@@ -65,6 +65,6 @@ at::Tensor py_empty_with_layout(
     std::optional<c10::MemoryFormat> memory_format_opt);
 
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
-                  SpyreTensorLayout stl, int64_t cpu_offset, bool host2device)
+                  SpyreTensorLayout stl, bool host2device)
     -> DataConversionInfo;
 }  // namespace spyre

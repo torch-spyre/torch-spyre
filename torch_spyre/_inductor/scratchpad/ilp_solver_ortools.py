@@ -99,14 +99,17 @@ below are written once against whichever wrapper ``_wrap`` chose.
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import math
 import operator
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from functools import cache
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
+import numpy as np
 import sympy
 from sympy.printing.printer import Printer
 import torch
@@ -150,9 +153,9 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
-# fallback scale for the inverse of a core split, used when the LCM of the
-# split's candidate values (see _SympyExprToCpSat._inv_scale) exceeds it.
-# error <= ~2.5%
+# cap on the scale for the inverse of a core split, and the scale itself when
+# the split has no candidate values (see _SympyExprToCpSat._inv_scale).
+# error <= ~4%
 _CORE_INV_SCALE = 1024
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
@@ -646,11 +649,44 @@ class _SympyExprToCpSat(Printer):
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
         across the candidate divisions, so every ``scale // v`` is exact and the
         variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
-        are no values or their LCM exceeds it."""
+        are no values, or a value with many divisors if the LCM exceeds it."""
         _, raw = self._buffer_map.get(name, (None, ()))
         if not raw or min(raw) < 1:
             return _CORE_INV_SCALE
-        return min(math.lcm(*map(int, raw)), _CORE_INV_SCALE)
+
+        ints = [int(r) for r in raw]
+        lcm = math.lcm(*ints)
+        if lcm <= _CORE_INV_SCALE:
+            return lcm
+
+        # Otherwise: find the highest power of 2 in ints; among its multiples,
+        # find which has the most entries of ints as divisors, and use that.
+        # (We weight entries of ints by multiplicity.)
+        cnt = Counter(ints)
+        pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
+        assert pow2 < _CORE_INV_SCALE, (
+            f"expected _CORE_INV_SCALE={_CORE_INV_SCALE} to be greater than any "
+            f"power of 2 that might occur as a core division, but found {pow2}"
+        )
+        scaled_core_inv_scale = _CORE_INV_SCALE // pow2
+        counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
+        for a, mult in cnt.items():
+            step = a // math.gcd(a, pow2)
+            if step <= scaled_core_inv_scale:
+                counts[step::step] += mult
+
+        # Among those, the one whose worst-rounded entry rounds best: the error
+        # of an inexact v is (scale % v) / scale, so width is what buys
+        # accuracy. A worst case does not accumulate, so unlike the count above
+        # this weighs each value once. Ties -- frequent, since a scale and its
+        # multiples often round alike -- go to the narrowest, keeping the
+        # products in _print_multiply clear of _MAX_PRODUCT_BOUND.
+        candidates = pow2 * (np.flatnonzero(counts[1:] == counts[1:].max()) + 1)
+        values = sorted(cnt)
+        return min(
+            (int(c) for c in candidates),
+            key=lambda s: (Fraction(max(s % v for v in values), s), s),
+        )
 
     def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
@@ -928,7 +964,7 @@ class _SympyExprToCpSat(Printer):
             scale = self._inv_scale(name)
             values = [scale // v for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
-            self._model.AddDivisionEquality(cp_var, scale, self._sym_map[name])
+            self._model.add_division_equality(cp_var, scale, self._sym_map[name])
         self._sym_map[expr.name] = cp_var
         return cp_var
 
@@ -1155,6 +1191,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "or select a different layout_solver (e.g. 'greedy')."
             )
         super().__init__(buffers, size, alignment)
+        # What the last solve cost and returned, for the cost-expression dump.
+        # Here rather than on the base class: this is the only solver that
+        # reports it, and the allocator reads it with a default, so the base
+        # contract does not change. Empty until a solve, so a reader can tell
+        # "not recorded" from "no solve".
+        self.last_solve_stats: dict = {}
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
@@ -1306,7 +1348,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
                 model.minimize(cp_cost)
-            status = solver.Solve(model)
+            status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1319,7 +1361,47 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             )
             if not config._cpsat_warn_on_cost_expr:
                 raise
+            # The objective could not be lowered. A fallback solve follows and
+            # records over this with ``objective_used`` False; this entry stands
+            # only if no fallback runs, and says why.
+            self.last_solve_stats = {
+                "status": "NOT_LINEARIZABLE",
+                "error": str(exc),
+                "objective_used": False,
+            }
             return None
+
+    def _solve_and_record(
+        self,
+        solver: "cp_model.CpSolver",
+        model: "cp_model.CpModel",
+        *,
+        objective: bool = False,
+    ) -> int:
+        """Solve, and stash what it cost and returned for the cost-expression
+        dump. The one way this class solves.
+
+        Recording is bound to solving rather than left to each call site:
+        ``_run`` solves in its own occupancy passes when
+        ``_minimize_cost_expr`` returns no status, and a site that solved
+        without recording would leave its plan described by an earlier call's
+        numbers -- silently wrong data rather than an error. The two paths are
+        exclusive (the fallbacks sit under ``if status is None``), so the last
+        record always describes the solve that produced this plan.
+
+        Nothing else in the pipeline records this, so "why was that compile
+        slow" currently has no artifact behind it.
+        """
+        status = solver.Solve(model)
+        self.last_solve_stats = {
+            "status": solver.StatusName(status),
+            "solve_s": round(solver.WallTime(), 3),
+            "variables": len(model.proto.variables),
+            "constraints": len(model.proto.constraints),
+            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "objective_used": objective,
+        }
+        return status
 
     def _run(
         self,
@@ -1340,11 +1422,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        # Priced relayout models couple division tables, optional copies and
-        # variable-sized placements. Their first presolve pass can consume the
-        # budget before search starts, even below the copy-count threshold.
-        # Search the same model directly; do not change its objective or budget.
-        # Keep the existing threshold for models without a cost objective.
+        # Presolve runs on every model, priced or not: the lin_max proxy
+        # variables (see _SympyExprToCpSat._lin_max_operand) removed the
+        # subset-sum domain work that let it consume the budget, and without it
+        # the LNS workers on a priced model can run out of memory. The copy-count
+        # threshold remains as an opt-in escape hatch (off by default).
         free_copies = sum(
             isinstance(
                 tensors.get(copy_w.buffer.relayout_parent),
@@ -1353,15 +1435,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for copy_w in copies.values()
         )
         max_copies = config.lx_solver_relayout_presolve_max_copies
-        if (cost_expr is not None and free_copies) or (
-            max_copies > 0 and free_copies > max_copies
-        ):
+        if max_copies > 0 and free_copies > max_copies:
             solver.parameters.cp_model_presolve = False
             logger.info(
-                "[CP-SAT layout solver] %d free relayout copies, priced=%s; "
-                "solving without presolve",
+                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
+                "threshold of %d; solving without presolve",
                 free_copies,
-                cost_expr is not None,
+                max_copies,
             )
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
@@ -1399,7 +1479,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1426,7 +1506,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             ]
             if core_terms:
                 model.maximize(sum(core_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1442,7 +1522,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # spill a buffer or lower its core count.
                 model.add(sum(core_terms) >= occupancy)
                 model.minimize(sum(core_cost_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1630,10 +1710,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     x_start, x_size, sb.end_time, sb.in_buffer, f"x_{sb.name}"
                 )
             )
-            # An interval's ``end`` must be affine (a single var), so the address
-            # top ``offset + eff_size`` (a sum of two vars) needs its own var; the
-            # interval ties it to start+size whenever the buffer is resident.
-            y_end = model.new_int_var(0, self._capacity_units, f"top_{sb.name}")
+            # An interval's ``end`` must be affine (a single var), so the top
+            # of a division-dependent footprint needs its own var, tied to
+            # ``offset + eff_size`` unconditionally. Its range covers every
+            # offset/footprint pair, so a spilled buffer loses no assignment.
+
+            # the top bound must be larger than capacity to account for buffers
+            # which are larger than LX itself
+            y_end = model.new_int_var(
+                0,
+                max(0, self._capacity_units - 1) + sb.buffer.size,
+                f"top_{sb.name}",
+            )
+            model.add(y_end == sb.offset + sb.eff_size)
             y_intervals.append(
                 model.new_optional_interval_var(
                     sb.offset,

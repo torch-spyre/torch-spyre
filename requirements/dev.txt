@@ -71,6 +71,9 @@ packaging==26.2
     # via
     #   build
     #   pytest
+    #   setuptools-scm
+    #   torch-spyre
+    #   vcs-versioning
     #   wheel
 pandas==3.0.5 ; platform_machine != 'ppc64le' and platform_machine != 's390x'
     # via ortools
@@ -114,8 +117,11 @@ regex==2026.7.19
     # via torch-spyre
 setuptools==81.0.0
     # via
+    #   setuptools-scm
     #   torch
     #   torch-spyre
+setuptools-scm==10.2.3
+    # via torch-spyre
 six==1.17.0 ; platform_machine != 'ppc64le' and platform_machine != 's390x'
     # via python-dateutil
 sympy==1.14.0
@@ -140,6 +146,8 @@ tzdata==2026.3 ; (platform_machine != 'ppc64le' and platform_machine != 's390x' 
     # via pandas
 uv==0.11.33
     # via torch-spyre
+vcs-versioning==2.4.1
+    # via setuptools-scm
 virtualenv==21.7.0
     # via pre-commit
 wheel==0.47.0

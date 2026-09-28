@@ -17,12 +17,13 @@ product repos share one definition; this file is the CLI around it.
 """
 
 import argparse
+import os
 import platform as _platform
 import sys
 from collections import Counter
 from pathlib import Path
 
-from spyre_clickhouse_ingest.client import client_summary, get_client
+from spyre_clickhouse_ingest.client import client_summary, get_client, target_database
 from spyre_clickhouse_ingest.hw_diagnostics import (
     NIL_UUID,
     RunContext,
@@ -37,7 +38,11 @@ from spyre_clickhouse_ingest.identity import (
     component_of,
     run_id_for,
 )
-from spyre_clickhouse_ingest.hw_schema import DEFAULT_TABLE, already_ingested
+from spyre_clickhouse_ingest.hw_schema import (
+    DEFAULT_TABLE,
+    already_ingested,
+    ensure_extra_columns,
+)
 
 
 def main() -> None:
@@ -97,7 +102,22 @@ def main() -> None:
         default="",
         help="artifact_id of the image this leg ran, read from its OCI label / in-image file",
     )
+    # hw_failure_diagnostics has the SAME shape in both generations (unlike test_cases /
+    # benchmark_runs, which v2 replaces outright with a different model): v2 is reached by
+    # qualifying this run's --table name with CLICKHOUSE_DB_V2, not by writing a second shape.
+    parser.add_argument(
+        "--schema",
+        choices=["v1", "v2", "both"],
+        default=os.environ.get("INGEST_SCHEMA", "v1"),
+        help="Which schema generation to write: v1 (default, the legacy self-migrating "
+        "table), v2 (the CLICKHOUSE_DB_V2-qualified table only), or both (the migration "
+        "window). Also settable via INGEST_SCHEMA so a workflow can set it once for every "
+        "leg.",
+    )
     args = parser.parse_args()
+    args.write_v1 = args.schema in ("v1", "both")
+    args.write_v2 = args.schema in ("v2", "both")
+    print(f"[info] schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
 
     json_path = Path(args.json_file)
     if not json_path.exists():
@@ -144,13 +164,6 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if already_ingested(client, run_id, component, table=args.table):
-        print(
-            f"[info] run_id={run_id} component={component!r} already ingested "
-            f"— skipping. Re-run with a different table or clear the existing rows."
-        )
-        sys.exit(0)
-
     ctx = RunContext(
         run_id=run_id,
         artifact_id=_str(args.artifact_id) or NIL_UUID,
@@ -180,18 +193,63 @@ def main() -> None:
         print("[error] No valid rows to insert.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[info] Inserting {len(rows)} row(s) into {args.table} ...")
-    try:
-        insert_rows(client, rows, table=args.table)
-    except Exception as exc:
-        print(f"[error] Insert failed: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # ── v1: hw_failure_diagnostics (legacy, self-migrating) ─────────────────────
+    if args.write_v1:
+        ensure_extra_columns(client, table=args.table)
+        if already_ingested(client, run_id, component, table=args.table):
+            print(
+                f"[info] v1: run_id={run_id} component={component!r} already ingested "
+                f"in {args.table} — skipping."
+            )
+        else:
+            print(f"[info] v1: inserting {len(rows)} row(s) into {args.table} ...")
+            try:
+                insert_rows(client, rows, table=args.table)
+            except Exception as exc:
+                print(f"[error] v1 insert failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"[info] v1: inserted {len(rows)} row(s) into {args.table}")
+
+    # ── v2: {CLICKHOUSE_DB_V2}.hw_failure_diagnostics (same shape, DDL-managed) ─
+    # Wrapped so a v2 failure never costs the v1 rows already inserted above -- v1 stays
+    # authoritative during the migration window (--schema both), same as every other writer.
+    if args.write_v2:
+        v2db = target_database()
+        if not v2db:
+            print(
+                "[warn] --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — "
+                "v2 rows skipped",
+                file=sys.stderr,
+            )
+        else:
+            v2_table = f"{v2db}.{args.table}"
+            try:
+                if not client.command(f"EXISTS TABLE {v2_table}"):
+                    print(
+                        f"[warn] v2 table {v2_table} does not exist — skipping v2 write",
+                        file=sys.stderr,
+                    )
+                elif already_ingested(client, run_id, component, table=v2_table):
+                    print(
+                        f"[info] v2: run_id={run_id} component={component!r} already "
+                        f"ingested in {v2_table} — skipping."
+                    )
+                else:
+                    print(
+                        f"[info] v2: inserting {len(rows)} row(s) into {v2_table} ..."
+                    )
+                    insert_rows(client, rows, table=v2_table)
+                    print(f"[info] v2: inserted {len(rows)} row(s) into {v2_table}")
+            except Exception as exc:
+                print(
+                    f"[warn] v2 write failed (v1 rows unaffected): {exc}",
+                    file=sys.stderr,
+                )
 
     reasons: Counter = Counter(_str(r.get("failure_reason"), "none") for r in records)
     outcomes: Counter = Counter(_str(r.get("outcome"), "unknown") for r in records)
 
-    print(f"\n[info] Successfully inserted {len(rows)} row(s) into {args.table}")
-    print(f"[info]   run_id     : {ctx.run_id}")
+    print(f"\n[info]   run_id     : {ctx.run_id}")
     print(f"[info]   external   : {ctx.external_run_id} (tier {args.trigger_type!r})")
     print(f"[info]   component  : {ctx.component}  arch: {ctx.arch}")
     print(f"[info]   artifact_id: {ctx.artifact_id}")

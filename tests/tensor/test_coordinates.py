@@ -33,6 +33,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    compute_restickify_needed,
     device_coordinates,
     try_device_coordinates,
 )
@@ -40,6 +41,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    _flat_dense_projection_x_layout,
     find_stick_compatible_input_layout,
 )
 from torch_spyre._inductor.views import (
@@ -515,6 +517,67 @@ class TestCoordinates(TestCase):
             )
 
 
+class TestAlignTensorsStridedTerm(TestCase):
+    """A coordinate that steps over a device dim (``2*d1``) must keep the dim's
+    footprint exact (issue #4050).
+
+    ``h.view(B, L, H, D)[..., :64]`` on a ``[B, L, H*D]`` input reads the
+    stick-tile dim as ``2*d1``: one head is two sticks and the slice keeps one.
+    """
+
+    def _tensors(self, stick_coord):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        it_space = {d0: (sympy.Integer(8), 1), d1: (sympy.Integer(4), 1), d2: (64, 1)}
+        zero = sympy.S.Zero
+        inp = {"size": [8, 8, 1, 64], "coordinates": [d0, stick_coord(d1), zero, d2]}
+        out = {"size": [4, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        return (d0, d1, d2), it_space, inp, out
+
+    def test_stride_realized_as_gap_keeps_footprint(self):
+        (d0, d1, d2), it_space, inp, out = self._tensors(lambda d1: 2 * d1)
+        _, tensors, _ = align_tensors(it_space, [inp, out])
+        aligned_in = tensors[0]
+        # 8 rows x 8 sticks x 64: a stride-2 walk over 4 heads must not inflate
+        # the stick-tile dim to 8 iterations *and* add a gap of 2 (it did, and
+        # doubled the row stride so output row l read input row 2*l).
+        self.assertEqual(sympy.prod(aligned_in["size"]), 8 * 8 * 64)
+        sizes = [int(s) for s in aligned_in["size"]]
+        gap_idx = sizes.index(2)
+        self.assertEqual(sizes[gap_idx - 1], 4, "stick-tile dim counted in iterations")
+        self.assertEqual(aligned_in["coordinates"][gap_idx - 1], d1)
+        self.assertEqual(aligned_in["coordinates"][gap_idx], 0)
+
+    def test_stride_with_residual_offset_selects_gap_position(self):
+        """``2*d1 + 1`` (e.g. ``[..., 64:]`` or ``[:, 1::2]``) keeps the +1.
+
+        The residual is below the stride, so it cannot live on the variable's
+        own coordinate; it hangs off a synthetic size-1 variable in the gap dim,
+        the same way an elided dim with an offset is restored.
+        """
+        (d0, d1, d2), it_space, inp, out = self._tensors(lambda d1: 2 * d1 + 1)
+        new_it_space, tensors, _ = align_tensors(it_space, [inp, out])
+        aligned_in = tensors[0]
+        self.assertEqual(sympy.prod(aligned_in["size"]), 8 * 8 * 64)
+        sizes = [int(s) for s in aligned_in["size"]]
+        gap_coord = aligned_in["coordinates"][sizes.index(2)]
+        synthetic = gap_coord.free_symbols
+        self.assertEqual(len(synthetic), 1)
+        z = next(iter(synthetic))
+        self.assertEqual(gap_coord, z + 1)
+        self.assertEqual(new_it_space[z][0], 1)
+        # The other tensor gains a size-1 dim for the synthetic variable.
+        self.assertIn(z, {s for c in tensors[1]["coordinates"] for s in c.free_symbols})
+
+    def test_stride_not_dividing_dim_is_rejected(self):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        it_space = {d0: (8, 1), d1: (3, 1), d2: (64, 1)}
+        zero = sympy.S.Zero
+        inp = {"size": [8, 7, 1, 64], "coordinates": [d0, 2 * d1, zero, d2]}
+        out = {"size": [3, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        with self.assertRaisesRegex(Unsupported, "does not divide"):
+            align_tensors(it_space, [inp, out])
+
+
 class TestUnrepresentableStickCandidates(TestCase):
     """Cover the skip-unrepresentable-candidate behavior added for the
     ``floor(var/N)`` cross-stick crash (transpose feeding a matmul).
@@ -743,6 +806,168 @@ class TestFactorizedMatmulCandidates(TestCase):
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)
+
+    def test_flat_dense_projection_layout(self):
+        """A contiguous BLHD view read as [B*L, H*D] gets canonical flat M."""
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        M, N, K = 2048, 768, 768
+        ranges = (M, N, K)
+        x_dep = MemoryDep("x", K * m + contraction, (m, generated, contraction), ranges)
+        y_dep = MemoryDep(
+            "y", K * generated + contraction, (m, generated, contraction), ranges
+        )
+        out_dep = MemoryDep(
+            "out", N * m + generated, (m, generated, contraction), ranges
+        )
+        x_host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [4, 512, 12, 64],
+            [393216, 768, 64, 1],
+        )
+        y_host = FixedLayout(torch.device("cpu"), torch.float16, [K, N], [N, 1])
+        output = FixedLayout(torch.device("cpu"), torch.float16, [M, N], [N, 1])
+        source = SpyreTensorLayout(
+            [512, 12, 1, 4, 64],
+            [768, 64, 64, 393216, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [12, 768, 64],
+            [49152, 1, 768],
+            get_device_dtype(torch.float16),
+        )
+        x = PropArg(x_dep, x_host, [source])
+        y = PropArg(y_dep, y_host, [weight])
+
+        result = _flat_dense_projection_x_layout(
+            x, y, output, out_dep, contraction, M, N
+        )
+        expected = SpyreTensorLayout([M, K], [K, 1], torch.float16, [0, 1])
+
+        self.assertEqual(result, expected)
+        with V.set_graph_handler(SimpleNamespace()):
+            self.assertEqual(
+                device_coordinates(result, x_dep, None),
+                [sympy.floor(contraction / 64), m, sympy.Mod(contraction, 64)],
+            )
+
+            compatible, compatible_target = compute_restickify_needed(
+                source, x_host, x_dep, result, x_dep
+            )
+            needed, target = compute_restickify_needed(
+                source,
+                x_host,
+                x_dep,
+                result,
+                x_dep,
+                require_exact=True,
+            )
+        self.assertFalse(compatible)
+        self.assertIsNone(compatible_target)
+        self.assertTrue(needed)
+        self.assertEqual(target, expected)
+
+        strided_x = PropArg(
+            x_dep,
+            FixedLayout(
+                torch.device("cpu"),
+                torch.float16,
+                [4, 512, 12, 64],
+                [786432, 1536, 64, 1],
+            ),
+            [source],
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                strided_x, y, output, out_dep, contraction, M, N
+            )
+        )
+
+        fp32_source = SpyreTensorLayout(
+            [512, 24, 1, 4, 32],
+            [768, 32, 32, 393216, 1],
+            get_device_dtype(torch.float32),
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                PropArg(
+                    x_dep,
+                    FixedLayout(
+                        torch.device("cpu"),
+                        torch.float32,
+                        [4, 512, 12, 64],
+                        [393216, 768, 64, 1],
+                    ),
+                    [fp32_source],
+                ),
+                y,
+                output,
+                out_dep,
+                contraction,
+                M,
+                N,
+            )
+        )
+
+    def test_flat_dense_projection_rejects_true_bmm(self):
+        """A rank-3 output and per-batch weight retain genuine BMM geometry."""
+        batch, m, generated, contraction = sympy.symbols(
+            "batch m generated contraction", integer=True, nonnegative=True
+        )
+        B, M, N, K = 4, 512, 768, 768
+        ranges = (B, M, N, K)
+        x_dep = MemoryDep(
+            "x",
+            M * K * batch + K * m + contraction,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        y_dep = MemoryDep(
+            "y",
+            K * N * batch + N * contraction + generated,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        out_dep = MemoryDep(
+            "out",
+            M * N * batch + N * m + generated,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        x_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, K], [M * K, K, 1]
+        )
+        y_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, K, N], [K * N, N, 1]
+        )
+        output = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, N], [M * N, N, 1]
+        )
+        source = SpyreTensorLayout(
+            [12, M, B, 64],
+            [64, K, M * K, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [12, K, B, 64],
+            [64, N, K * N, 1],
+            get_device_dtype(torch.float16),
+        )
+
+        result = _flat_dense_projection_x_layout(
+            PropArg(x_dep, x_host, [source]),
+            PropArg(y_dep, y_host, [weight]),
+            output,
+            out_dep,
+            contraction,
+            M,
+            N,
+        )
+
+        self.assertIsNone(result)
 
 
 class TestTilingExprToDeviceExpr(TestCase):

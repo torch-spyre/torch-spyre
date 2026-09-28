@@ -160,20 +160,22 @@ compiler.
 
 ### Stage 7: Backend Compiler
 
-**File:** External `dxp_standalone` binary
+**File:** External `dbo-opt` binary (deeptools)
 
-**What happens:** SuperDSC JSON → `g2.graph.cbor` binary.
+**What happens:** `bundle.mlir` + SuperDSC JSON → `spyreCodeDir/`
+(`spyrecode.json`, `init_binary.bin`).
 
 **Failure symptoms:**
 
-- `dxp_standalone` exit code != 0
-- Compilation timeout
-- Invalid CBOR output
+- `dbo-opt` exit code != 0
+- Compilation timeout (bounded by `_COMPILE_TIMEOUT_S`, 60s)
+- Exit 0 having written no `spyreCodeDir/spyrecode.json`
 
 **Debugging:**
 
 - Check `TORCH_COMPILE_DEBUG=1` output for the input JSON
-- Run `dxp_standalone` manually on the JSON to get detailed errors
+- Re-run `dbo-opt --export-dir=<dir> -kEmitSpyreCode <dir>/bundle.mlir`
+  manually; add `DBO_DEBUG=1` for numbered per-pass dumps
 - Check `torch_spyre/execution/async_compile.py` for the invocation
 
 ---

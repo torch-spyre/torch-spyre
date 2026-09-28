@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 import torch
 
 from torch._inductor import config as t_inductor_config
@@ -125,25 +125,27 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
 def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
     """Unsupported paired plans remain fail-closed under ``python -O``."""
 
-    import torch_spyre._inductor.cost_model as cost_model_module
     import torch_spyre._inductor.scratchpad.allocator as allocator_module
 
-    solver = SimpleNamespace(
-        buffers=[],
-        plan_layout_and_core_divisions=lambda _cost: [
-            SimpleNamespace(lx_relayout_plans=[object()])
-        ],
+    solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
+    solver.buffers = []
+    solver.decides_lx_relayouts = False
+    solver.plan_layout_and_core_divisions.return_value = [
+        SimpleNamespace(lx_relayout_plans=[object()])
+    ]
+    allocator = allocator_module.CoOptimizingAllocator(
+        layout_planning=lambda _buffers, _size: solver,
+        size=0,
     )
-    graph = SimpleNamespace(operations=[])
+    graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
     with (
-        patch.object(allocator_module, "CoreDivisionLayoutSolver", object),
         patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
-        patch.object(cost_model_module, "predict_by_bundle", return_value=0),
         unittest.TestCase().assertRaisesRegex(
             AssertionError, "CoOptimizingAllocator does not support LX relayout"
         ),
     ):
-        allocator_module.CoOptimizingAllocator._solve(SimpleNamespace(), solver, graph)
+        allocator._solve(solver, graph)
+    solver.plan_layout_and_core_divisions.assert_called_once()
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -378,7 +380,7 @@ class _ParameterizedScratchpadMeta(type):
     # added to ``parameter_axes`` work without editing this method.
     _AXIS_LABELS = {
         "solver_method": lambda v: str(v),
-        "hint_mode": lambda v: str(v),
+        "tiling_mode": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
         "co_optimization": lambda v: "coopt" if v else "nocoopt",
     }
@@ -482,6 +484,11 @@ class ParameterizedScratchpadUsage(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            # greedy/bestfit/firstfit have no core-division-capable solver, so
+            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
+            # DFS fallback, which this sweep deliberately exercises. (No-op for
+            # cpsat/simulated_annealing, and for co_optimization=False.)
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -830,6 +837,11 @@ class TestCloneAtGraphBoundaries(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            # greedy/bestfit/firstfit have no core-division-capable solver, so
+            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
+            # DFS fallback, which this sweep deliberately exercises. (No-op for
+            # cpsat, and for co_optimization=False.)
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -1262,6 +1274,12 @@ class TestCpSatAllocatorFallback(
     still reduce HBM traffic (the greedy fallback is correct, just not
     CP-SAT-optimal). The metaclass injects one ``test_<model>__<combo>`` method
     per ``(model, config-combo)``.
+
+    Without ortools, ``cpsat`` degrades to greedy placement, which is not
+    core-division-capable; the ``co_optimization=True`` cases must therefore opt
+    into the ``ExhaustiveSearchSolver`` DFS fallback via
+    ``allow_exhaustive_search=True`` (see ``run_case`` below), which is exactly
+    the degraded routing this class exists to cover.
     """
 
     # Models swept by the parameterized suites, as ``(label, factory)`` where
@@ -1308,6 +1326,12 @@ class TestCpSatAllocatorFallback(
                 layout_solver=params["solver_method"],
                 sencores=params["sencores"],
                 co_optimizing_lx_planning=params["co_optimization"],
+                # Without ortools, cpsat degrades to greedy placement, which is
+                # not core-division-capable, so co_optimization=True can only
+                # proceed via the ExhaustiveSearchSolver DFS fallback -- the
+                # degraded routing this class exists to cover. (No-op for
+                # co_optimization=False.)
+                allow_exhaustive_search=True,
                 _cpsat_warn_on_cost_expr=False,
             ):
                 model, args, kwargs = factory(self)
@@ -1501,6 +1525,7 @@ class TestSelectAllocator(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
         from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
             BestFitLayoutSolver,
+            FirstFitLayoutSolver,
         )
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
             CpSatLayoutSolver,
@@ -1521,21 +1546,68 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertEqual(a.layout_planning, BestFitLayoutSolver)
 
         with ts_inductor_config.patch(
-            layout_solver="greedy", co_optimizing_lx_planning=True
+            layout_solver="firstfit", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
-            solver = a.layout_planning([], a.size)
-            self.assertIsInstance(solver, ExhaustiveSearchSolver)
-            self.assertIs(solver._inner_factory, GreedyLayoutSolver)
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertEqual(a.layout_planning, FirstFitLayoutSolver)
 
-        # cpsat + co-optimization always routes to the joint allocator: when
-        # ortools is present the cpsat factory is core-division-capable and is
-        # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
-        # the cpsat factory's own greedy fallback.
+        # greedy/bestfit/firstfit + co-optimization have no core-division-capable
+        # solver to co-optimize with, so they can only proceed by falling back to
+        # ExhaustiveSearchSolver -- disallowed unless allow_exhaustive_search is
+        # set. All three go through the same generic dict-driven dispatch in
+        # select_allocator(), so this exercises that shared path for each.
+        for solver_method, solver_cls in (
+            ("greedy", GreedyLayoutSolver),
+            ("bestfit", BestFitLayoutSolver),
+            ("firstfit", FirstFitLayoutSolver),
+        ):
+            with self.subTest(solver_method=solver_method):
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=False,
+                ):
+                    with self.assertRaises(ValueError):
+                        select_allocator()
+
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=True,
+                ):
+                    a = select_allocator()
+                    self.assertIsInstance(a, CoOptimizingAllocator)
+                    solver = a.layout_planning([], a.size)
+                    self.assertIsInstance(solver, ExhaustiveSearchSolver)
+                    self.assertIs(solver._inner_factory, solver_cls)
+
+        # cpsat + co-optimization routes to the joint allocator when ortools
+        # is present (the cpsat factory is core-division-capable and is used
+        # directly); without ortools it would need to degrade to an
+        # ExhaustiveSearchSolver wrapping the cpsat factory's own greedy
+        # fallback, which is likewise disallowed unless
+        # allow_exhaustive_search is set.
         with ts_inductor_config.patch(
             layout_solver="cpsat",
             co_optimizing_lx_planning=True,
+            allow_exhaustive_search=False,
+            _cpsat_warn_on_cost_expr=False,
+        ):
+            if _HAS_ORTOOLS:
+                a = select_allocator()
+                self.assertIsInstance(a, CoOptimizingAllocator)
+                solver = a.layout_planning([], a.size)
+                self.assertIs(a.layout_planning, _make_cpsat_solver)
+                self.assertIsInstance(solver, CpSatLayoutSolver)
+            else:
+                with self.assertRaises(ValueError):
+                    select_allocator()
+
+        with ts_inductor_config.patch(
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             a = select_allocator()
@@ -1592,6 +1664,51 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 select_allocator()
+
+    def test_exhaustive_search_guard_error_text(self):
+        """The ValueError raised for a non-core-division-capable solver names the
+        offending solver and every documented way out, regardless of host ortools
+        availability."""
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+
+        for solver_method in ("greedy", "bestfit", "firstfit"):
+            with self.subTest(solver_method=solver_method):
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=False,
+                ):
+                    with self.assertRaises(ValueError) as ctx:
+                        select_allocator()
+                message = str(ctx.exception)
+                self.assertIn(solver_method, message)
+                self.assertIn("allow_exhaustive_search", message)
+                self.assertIn("co_optimizing_lx_planning", message)
+
+    def test_cpsat_co_optimization_guard_with_ortools_forced_absent(self):
+        """Forces the missing-ortools condition explicitly (rather than branching
+        on the host's actual ortools install) so this assertion runs the same way
+        on every machine: ``cpsat`` degrades to a greedy factory, which is not
+        core-division-capable, so co-optimization must raise unless
+        ``allow_exhaustive_search`` is set."""
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+
+        saved = ilp_solver_ortools.cp_model
+        ilp_solver_ortools.cp_model = None
+        try:
+            with ts_inductor_config.patch(
+                layout_solver="cpsat",
+                co_optimizing_lx_planning=True,
+                allow_exhaustive_search=False,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    select_allocator()
+            self.assertIn("cpsat", str(ctx.exception))
+            self.assertIn("allow_exhaustive_search", str(ctx.exception))
+        finally:
+            ilp_solver_ortools.cp_model = saved
 
 
 class TestInplaceEdgeGate(unittest.TestCase):
@@ -1692,6 +1809,7 @@ class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
             lx_planning=True,
             layout_solver="greedy",
             co_optimizing_lx_planning=True,
+            allow_exhaustive_search=True,
         ):
             device_result = torch.compile(fn, fullgraph=True)(*args).to("cpu")
         torch.testing.assert_close(device_result, cpu_result, atol=1e-2, rtol=1e-3)

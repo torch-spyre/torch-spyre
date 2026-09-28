@@ -196,8 +196,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
                   host2device);
@@ -271,6 +271,11 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
   RECORD_FUNCTION("launch::Memset", {});
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+}
+
+void SpyreStream::launchHostCompute(flex::HostComputeParams* params) const {
+  RECORD_FUNCTION("launch::HostCompute", {});
+  resolveRuntimeHandle()->launchHostCompute(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,

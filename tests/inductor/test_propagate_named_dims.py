@@ -32,7 +32,7 @@ import torch_spyre._inductor.passes as _passes
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import spyre_hint as _spyre_hint
 from torch_spyre._inductor.pass_utils import find_reduction_var
-from utils_inductor import _compile_and_run
+from utils_inductor import _compile_and_run, mock_backend_compiler
 
 DEVICE = torch.device("spyre")
 
@@ -121,7 +121,7 @@ def _run_and_capture(
         patch.object(_passes, "assign_dim_hints", capturing_assign),
         patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
         patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
-        patch("torch_spyre.execution.async_compile.subprocess.run"),
+        mock_backend_compiler(),
     ):
         try:
             _compile_and_run(fn, args, DEVICE)

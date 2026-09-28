@@ -148,7 +148,7 @@ def main(
         default="run",
         help=(
             "bundle: write sdsc_N.json + bundle.mlir and stop (no device or"
-            " dxp_standalone needed). run: compile and launch. Default: run."
+            " backend compiler needed). run: compile and launch. Default: run."
         ),
     )
     parser.add_argument(

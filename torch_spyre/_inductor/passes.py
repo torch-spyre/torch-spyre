@@ -65,6 +65,7 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
+from .nonstick_dim_order import reorder_nonstick_dims
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
     finalize_layouts,
@@ -513,6 +514,8 @@ class CustomPreSchedulingPasses:
 
     def __init__(self):
         self.passes = [
+            #
+            # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
             deadcode_elimination,
             #
@@ -543,9 +546,22 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            reorder_nonstick_dims,
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
+            # insert_restickify's advance-transfer logic (see its own
+            # docstring) branches on whether old_name already has
+            # `loop_info` stamped, to decide whether the per-trip advance
+            # belongs on the restickify stage or stays on the consumer.
+            # splice_while_loops runs first in this list and stamps every
+            # for_each_tile level's CoarseTileInfo in one deferred final
+            # phase, so by the time insert_restickify runs, every tiled
+            # stage's loop_info is already in place. If this pass ever
+            # moved ahead of splice_while_loops' stamping, that check would
+            # silently take the "not yet tiled" branch and emit an empty
+            # tiled_dims_per_read for a stage that is actually tiled -- a
+            # wrong-answer, not a crash.
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
