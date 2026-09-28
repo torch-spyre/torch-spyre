@@ -161,7 +161,8 @@ runs:
         mkdir -p raw_logs
 
         retry() {
-          local max_attempts=5 attempt=1 delay=2
+          # ~2 min of backoff: GitHub's 502 spells outlast 30s.
+          local max_attempts=7 attempt=1 delay=2
           until "$@"; do
             if [ "${attempt}" -ge "${max_attempts}" ]; then
               echo "::error::command failed after ${attempt} attempts: $*" >&2
@@ -182,6 +183,7 @@ runs:
           "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
           --paginate \
           -f filter=latest \
+          -f per_page=100 \
           --jq '.jobs[] | {id: .id, name: .name}' \
         > /tmp/jobs.jsonl
 
