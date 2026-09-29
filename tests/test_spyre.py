@@ -170,6 +170,20 @@ class TestSpyre(TestCase):
         self.assertEqual(cpu.numel(), 0)
         self.assertEqual(cpu.device.type, "cpu")
 
+    def test_empty_host_cache_preserves_active_allocation(self):
+        active = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        active.fill_(7)
+
+        torch.accelerator.empty_host_cache()
+
+        self.assertTrue(active.is_pinned())
+        self.assertTrue(active.eq(7).all())
+
+        del active
+        torch.accelerator.empty_host_cache()
+        replacement = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        self.assertTrue(replacement.is_pinned())
+
     def test_empty_factory_in_device_context(self):
         # The error only repros if at least one allocation
         # has already happened

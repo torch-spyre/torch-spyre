@@ -256,21 +256,28 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
     auto* allocator =
         static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
     const auto pinned_allocation = allocator->retain(cpu_ptr);
-    void* iova = nullptr;
+    flex::DmaParams* params = nullptr;
     if (pinned_allocation) {
       TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
                   "D2H host storage exceeds pinned allocation capacity: ",
                   host_capacity, " vs ", pinned_allocation.capacity, " bytes");
       host_lifetime = std::static_pointer_cast<void>(pinned_allocation.owner);
-      iova = reinterpret_cast<void*>(pinned_allocation.iova);
+      params = flex::createDmaParamsWithPinnedBuffer(
+          pinned_allocation.buffer, pinned_allocation.offset, host_capacity,
+          device_address->total_size(), host2device, device_address,
+          std::move(dci_ptr),
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else {
+      params = flex::createDmaParamsWithHostCapacity(
+          cpu_ptr, device_address->total_size(), host2device, device_address,
+          host_capacity, std::move(dci_ptr),
+          /*iova=*/nullptr,
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
     }
-
-    auto* params = flex::createDmaParamsWithHostCapacity(
-        cpu_ptr, device_address->total_size(), host2device, device_address,
-        host_capacity, std::move(dci_ptr), iova,
-        /*use_compute_pipeline=*/false,
-        /*pipeline_barrier=*/false,
-        /*skip_hazard=*/false, std::move(host_lifetime));
     try {
       launchD2H(params);
     }

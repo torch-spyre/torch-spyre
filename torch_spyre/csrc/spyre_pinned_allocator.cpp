@@ -17,12 +17,12 @@
 #include "spyre_pinned_allocator.h"
 
 #include <cstring>
-#include <flex/memory_interface/pinned_staging_cache.hpp>
 #include <flex/runtime_stream/runtime_context.hpp>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "module.h"
 
@@ -86,7 +86,7 @@ c10::DataPtr SpyrePinnedAllocator::allocate(size_t size) {
         "SpyrePinnedAllocator: pinned staging cache returned null");
   }
 
-  void* const ptr = buffer->Hmva();
+  void* const ptr = buffer->hmva();
   auto state =
       std::make_shared<PinnedAllocationState>(buffer, std::move(cache));
   {
@@ -96,6 +96,7 @@ c10::DataPtr SpyrePinnedAllocator::allocate(size_t size) {
       throw std::runtime_error(
           "SpyrePinnedAllocator: cache returned an active allocation");
     }
+    caches_.insert(std::weak_ptr<flex::PinnedStagingCache>(state->cache));
   }
 
   return {ptr, ptr, &deallocate, c10::DeviceType::CPU};
@@ -111,14 +112,28 @@ void SpyrePinnedAllocator::copy_data(void* dest, const void* src,
 }
 
 bool SpyrePinnedAllocator::record_event(void*, void*, c10::Stream) {
-  // DMA submissions retain PinnedAllocationState explicitly through Flex's
-  // host_lifetime token. This allocator does not maintain a separate event
-  // queue, so it must not claim that an event was recorded.
+  // D2H retains PinnedAllocationState through Flex's host_lifetime token; H2D
+  // converts into a Flex-owned staging buffer before asynchronous submission.
+  // This allocator has no event queue, so it must not claim to record an event.
   return false;
 }
 
 void SpyrePinnedAllocator::empty_cache() {
-  // Free cache entries are owned by Flex's process-lifetime staging cache.
+  std::vector<std::shared_ptr<flex::PinnedStagingCache>> caches;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = caches_.begin(); it != caches_.end();) {
+      if (auto cache = it->lock()) {
+        caches.push_back(std::move(cache));
+        ++it;
+      } else {
+        it = caches_.erase(it);
+      }
+    }
+  }
+  for (const auto& cache : caches) {
+    cache->clear();
+  }
 }
 
 at::HostStats SpyrePinnedAllocator::get_stats() {
@@ -153,7 +168,7 @@ bool SpyrePinnedAllocator::isPinnedPtr(const void* ptr) const {
   const std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& [base_ptr, state] : allocations_) {
     const auto base = reinterpret_cast<uintptr_t>(base_ptr);
-    if (address >= base && address - base < state->buffer->Capacity()) {
+    if (address >= base && address - base < state->buffer->capacity()) {
       return true;
     }
   }
@@ -165,11 +180,12 @@ PinnedAllocation SpyrePinnedAllocator::retain(const void* ptr) const {
   const std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& [base_ptr, state] : allocations_) {
     const auto base = reinterpret_cast<uintptr_t>(base_ptr);
-    if (address >= base && address - base < state->buffer->Capacity()) {
+    if (address >= base && address - base < state->buffer->capacity()) {
       const auto offset = address - base;
       return {
-          state->buffer->Iova() + offset,
-          state->buffer->Capacity() - offset,
+          state->buffer,
+          offset,
+          state->buffer->capacity() - offset,
           state,
       };
     }

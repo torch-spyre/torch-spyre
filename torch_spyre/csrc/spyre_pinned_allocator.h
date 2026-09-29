@@ -18,9 +18,11 @@
 
 #include <ATen/core/CachingHostAllocator.h>
 
-#include <cstdint>
+#include <cstddef>
+#include <flex/memory_interface/pinned_staging_cache.hpp>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 namespace spyre {
@@ -28,7 +30,8 @@ namespace spyre {
 struct PinnedAllocationState;
 
 struct PinnedAllocation {
-  uint64_t iova = 0;
+  std::shared_ptr<flex::PinnedBuffer> buffer;
+  size_t offset = 0;
   size_t capacity = 0;
   std::shared_ptr<PinnedAllocationState> owner;
 
@@ -57,6 +60,9 @@ class SpyrePinnedAllocator : public at::HostAllocator {
 
   std::unordered_map<void*, std::shared_ptr<PinnedAllocationState>>
       allocations_;
+  std::set<std::weak_ptr<flex::PinnedStagingCache>,
+           std::owner_less<std::weak_ptr<flex::PinnedStagingCache>>>
+      caches_;
   mutable std::mutex mutex_;
 };
 
