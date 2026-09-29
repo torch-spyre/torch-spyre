@@ -521,75 +521,100 @@ def _conversion_layouts(
 ) -> list[SpyreTensorLayout]:
     """Output STLs of a dtype conversion that changes the stick depth.
 
-    The input stick must start on a stick boundary. The output keeps that
-    stick, on the host dim walking the same variable, so each input stick maps
-    onto output sticks without a restickify. This holds for every such
-    conversion alike: fp16<->fp32 (a staggered EA on either side) and fp8->fp16.
+    Each candidate is what the conversion writes from one layout of its input,
+    the source: the input as it stands, and the input restickified onto each
+    other dim when it can be restickified (``ReStickifyOpHBM`` handles only the
+    fp16 device format in its standard arrangement). The restickified sources
+    let a downstream op ask for another stick dim (Gemma 4: an embedding
+    entering RMSNorm), and they are the only route for an input whose stick
+    carries a slice offset. The restickify itself is the optimizer's to insert
+    on the input edge.
+
+    From each source the output is built one of two ways:
 
     - Reading the input exactly as it writes the output, the conversion
-      inherits the input's device layout, rescaled for the new stick depth. That
-      layout can carry a stick choice or a fold its host size cannot express. A
-      conversion creating the stagger also offers the layouts a restickify of its
-      STANDARD input would reach, so a downstream reduction can ask for the
-      normalized dim as the stick (Gemma 4: an embedding entering RMSNorm).
+      inherits the source layout, rescaled for the new stick depth. Every
+      device dim of the source carries over: the order of the non-stick dims,
+      their folds and size-1 slots, and their ``stride_map`` entries. Only the
+      stick depth and the num-sticks count change. Such a read has no offset,
+      so every source starts its sticks on a stick boundary.
     - Reading a slice of a wider buffer (Gemma's ``q_norm``/``k_norm`` upcast
       part of the fused QKV projection into a narrower per-head buffer), the
-      conversion builds its layout from the output's host size. The input's
-      outer device dims describe the wider buffer's rows, so inheriting them
-      would misaddress the output. It offers no restickify alternatives, so the
-      output keeps the input's stick.
+      source's ``stride_map`` steps through the wider buffer, so rescaling it
+      would misaddress the output. The conversion instead builds its layout
+      from the output's host size, with the stick on the output dim walking
+      the source stick's variable. The stick dim matches the source's, but
+      the non-stick device dims take the default order for the output's host
+      size, which may permute them or add or drop size-1 dims. The conversion
+      works on whole sticks, so a source whose stick the slice starts
+      mid-stick is not used.
 
     Either layout holds only the sticks the live elements reach; the whole
     sticks of the coarser grid that the conversion writes are
     ``insert_staggered_ea_padding``'s to add.
     """
-    in_stick_expr = device_coordinates(stl, dep, None)[-1]
-    if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
-        return []
-
+    in_device_coords = device_coordinates(stl, dep, None)
+    in_stick_expr = in_device_coords[-1]
     input_ea = stl.element_arrangement
     out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    reads_whole_input = _convert_reads_whole_input(in_layout, output, dep, output_dep)
+    out_coords = host_coordinates(output, output_dep, None)
 
-    if not _convert_reads_whole_input(in_layout, output, dep, output_dep):
-        # TODO: offer the restickify candidates a whole read gets, so a consumer
-        # can ask a sliced conversion for another stick dim; needs the input
-        # layout carried over to the output buffer, and
-        # compute_restickify_target_layout to match sliced and reshaped
-        # coordinates.
-        out_coords = host_coordinates(output, output_dep, None)
-        stick_dim = _pick_stick_dim(in_stick_expr, out_coords)
-        if in_stick_expr.free_symbols and stick_dim < 0:
-            return []
-        out_stl = _make_output_stl(
-            out_coords, output_dep, c_size, c_stride, stick_dim, output.dtype, out_ea
-        )
-        return [] if out_stl is None else [out_stl]
-
-    layouts = [rescale_stl_for_dtype(stl, output.dtype, out_ea, in_layout, dep)]
-    # Only a STANDARD input maps to a staggered output. A staggered input is the
-    # reverse restoration, which keeps the stick selected before the upcast.
-    if out_ea in STAGGERED_EAS:
+    sources = [stl]
+    if (
+        stl.device_dtype == DataFormats.SEN169_FP16
+        and input_ea == ElementArrangement.STANDARD
+    ):
         in_coords = host_coordinates(in_layout, dep, None)
-        source_device_coords = device_coordinates(stl, dep, None)
         for target_stick_expr in in_coords:
-            if not target_stick_expr.free_symbols:
+            target_vars = target_stick_expr.free_symbols
+            # Restickifying onto the input's own stick dim changes nothing.
+            if not target_vars or target_vars & in_stick_expr.free_symbols:
                 continue
             target_stl = compute_restickify_target_layout(
-                stl,
-                in_layout,
-                target_stick_expr,
-                in_coords,
-                source_device_coords,
+                stl, in_layout, target_stick_expr, in_coords, in_device_coords
             )
-            if target_stl is None:
-                continue
+            if target_stl is not None:
+                sources.append(target_stl)
+
+    layouts: list[SpyreTensorLayout] = []
+    for source_stl in sources:
+        candidate: SpyreTensorLayout | None
+        if reads_whole_input:
+            # Keeps every device dim of the source; only the stick depth and
+            # the num-sticks count change.
+            # TODO: support slices in rescale_stl_for_dtype, so a sliced read
+            # keeps the source's device dims too. Alternatively drop this
+            # branch: the host-size layout below is correct for whole reads
+            # as well, only it may permute the non-stick device dims.
             candidate = rescale_stl_for_dtype(
-                target_stl, output.dtype, out_ea, in_layout, dep
+                source_stl, output.dtype, out_ea, in_layout, dep
             )
-            if candidate not in layouts:
-                layouts.append(candidate)
+        else:
+            # The source's stride_map steps through the wider buffer, so only
+            # its stick dim carries over; the non-stick device dims are rebuilt
+            # from the output's host size and may come out permuted.
+            source_stick_expr = device_coordinates(source_stl, dep, None)[-1]
+            if not is_stick_expr_offset_free(
+                source_stick_expr, source_stl.elems_per_stick()
+            ):
+                continue
+            stick_dim = _pick_stick_dim(source_stick_expr, out_coords)
+            if source_stick_expr.free_symbols and stick_dim < 0:
+                continue
+            candidate = _make_output_stl(
+                out_coords,
+                output_dep,
+                c_size,
+                c_stride,
+                stick_dim,
+                output.dtype,
+                out_ea,
+            )
+        if candidate is not None and candidate not in layouts:
+            layouts.append(candidate)
     return layouts
 
 

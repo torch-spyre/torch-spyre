@@ -932,6 +932,33 @@ class TestSpyreTensorLayout(TestCase):
             [dequantized_sticks(e) for e in [64, 128, 192, 256, 320]], [1, 2, 3, 4, 5]
         )
 
+    def test_offset_stick_conversion_writes_from_a_restickified_input(self):
+        """An upcast reading ``x[:, 32:96]`` of an fp16 ``[64, 128]`` starts its
+        input stick mid-stick, which the whole-stick conversion cannot read. Its
+        only layout is the one written from the input restickified onto the
+        rows, so the output's stick walks the row variable. Needs no device."""
+        import sympy
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _conversion_layouts
+
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout(
+            [2, 64, 64], [64, 128, 1], fp16, ElementArrangement.STANDARD
+        )
+        d0, d1 = (sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in (0, 1))
+        sliced_read = MemoryDep("x", 128 * d0 + d1 + 32, (d0, d1), (64, 64))
+        [out] = _conversion_layouts(
+            _host_layout(torch.float32, [64, 64]),
+            _dep("y", [64, 64]),
+            sliced_read,
+            _host_layout(torch.float16, [64, 128]),
+            stl,
+        )
+        self.assertEqual(list(out.device_size), [2, 64, 32])
+        self.assertEqual(list(out.stride_map), [2048, 1, 64])
+        self.assertEqual(out.element_arrangement, ElementArrangement.DL16_TO_FP32)
+
     def test_explicit_layout_rejects_malformed_device_size(self):
         """The explicit (device_size, stride_map) constructor validates the one
         invariant every consumer assumes: non-negative device dims, one
