@@ -65,17 +65,70 @@ class TestResultWriter(RunWriter):
     identity_table = schema.TestCases
     fact_table = schema.TestCaseRuns
 
+    # A re-run attempt reuses the run_id and every file name, so "this file has rows" alone
+    # would refuse its results; only rows from this attempt or a later one count as landed.
+    _ATTEMPT = "toUInt32OrZero(props['run_attempt'])"
+    _FILE = (
+        "component = {component:String} AND run_id = {run_id:UUID}"
+        " AND props['source_file'] = {sf:String}"
+    )
+
     @classmethod
     def already_ingested(
-        cls, client, db: str, run_id: str, component: str, source_file: str = ""
+        cls,
+        client,
+        db: str,
+        run_id: str,
+        component: str,
+        source_file: str = "",
+        attempt: int = 0,
     ) -> bool:
-        """Have this source file's rows for this run already landed?"""
-        return cls._seen(
-            client,
-            db,
-            run_id,
-            component,
-            (("props['source_file']", "sf", source_file),),
+        """Have this source file's rows for this run, from this attempt or later, landed?"""
+        if not attempt:
+            return cls._seen(
+                client,
+                db,
+                run_id,
+                component,
+                (("props['source_file']", "sf", source_file),),
+            )
+        return (
+            cls.fact_table.count_rows(
+                client,
+                db,
+                f"{cls._FILE} AND {cls._ATTEMPT} >= {{attempt:UInt32}}",
+                {
+                    "component": component,
+                    "run_id": run_id,
+                    "sf": source_file,
+                    "attempt": attempt,
+                },
+            )
+            > 0
+        )
+
+    @classmethod
+    def drop_older_attempts(
+        cls,
+        client,
+        db: str,
+        run_id: str,
+        component: str,
+        source_file: str,
+        attempt: int,
+    ) -> None:
+        """Delete this file's rows from attempts before `attempt`, so a re-run replaces them."""
+        if not (attempt and source_file):
+            return
+        client.command(
+            f"DELETE FROM {cls.fact_table.qualified(db)} "
+            f"WHERE {cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}",
+            parameters={
+                "component": component,
+                "run_id": run_id,
+                "sf": source_file,
+                "attempt": attempt,
+            },
         )
 
     @classmethod
@@ -87,6 +140,7 @@ class TestResultWriter(RunWriter):
         run_id: str,
         cases: list,
         source_file: str = "",
+        attempt: int = 0,
     ) -> int:
         """Write one leg's cases; returns the number of outcome rows written."""
         if not cases:
@@ -124,6 +178,7 @@ class TestResultWriter(RunWriter):
                 "props": {
                     "ran_in": run_id,
                     **({"source_file": source_file} if source_file else {}),
+                    **({"run_attempt": str(attempt)} if attempt else {}),
                 },
             }
             run_rows.append(run_row)
@@ -645,6 +700,7 @@ class ArtifactWriter:
 
 # Function API, kept so installed consumers import one definition, not a copy.
 cases_already_ingested = TestResultWriter.already_ingested
+drop_older_case_attempts = TestResultWriter.drop_older_attempts
 insert_test_results = TestResultWriter.insert
 benchmarks_already_ingested = BenchmarkWriter.already_ingested
 insert_benchmarks = BenchmarkWriter.insert

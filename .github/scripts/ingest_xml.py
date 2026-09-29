@@ -45,6 +45,7 @@ from spyre_clickhouse_ingest import (
     insert_test_results,
     promote_xpass,
     cases_already_ingested,
+    drop_older_case_attempts,
     benchmarks_already_ingested,
     component_of,
     target_database,
@@ -1386,6 +1387,14 @@ def main():
     )
     parser.add_argument("--gha-run-id", default="")
     parser.add_argument(
+        "--run-attempt",
+        type=int,
+        default=0,
+        help="GitHub run attempt the XMLs came from. A re-run reuses the run_id and file "
+        "names, so given, a newer attempt's cases replace an older attempt's in v2 instead "
+        "of being refused as already ingested. 0 (default) keeps first-write-wins.",
+    )
+    parser.add_argument(
         "--artifact-id",
         default="",
         help="Identity of what this leg ACTUALLY RAN, derived on the runner by "
@@ -1717,6 +1726,7 @@ def main():
             runner_run_id = _runner_run_id(args, run_id)
             # v1-table reads, so gated on v1 being written. v2 dedups on its own table via
             # cases_already_ingested(run_id, component).
+            v1_seen = False
             if args.write_v1:
                 existing = client.query(
                     "SELECT count() FROM test_runs "
@@ -1738,9 +1748,13 @@ def main():
                             "filename": run["filename"],
                         },
                     )
-                if existing.result_rows[0][0] > 0:
+                v1_seen = existing.result_rows[0][0] > 0
+                if v1_seen:
                     print(f"  Already ingested — skipping {run['filename']}")
-                    continue
+                    # v1 stays first-write-wins; a re-run attempt still reaches v2, whose
+                    # attempt-aware dedup lets the newer results replace the older.
+                    if not args.run_attempt:
+                        continue
             # `errors` is printed separately from `failed` even though it is a SUBSET of
             # it: a run whose outcomes are pytest errors could not start (bad import,
             # unloadable model), which is a different triage path from N regressions.
@@ -1752,7 +1766,7 @@ def main():
                 + f"  xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
-            if args.write_v1:
+            if args.write_v1 and not v1_seen:
                 insert_run(client, run_id, run, args)
 
                 # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
@@ -1785,9 +1799,20 @@ def main():
                         _v2_run_id,
                         component_of(args, COMPONENT_DEFAULT),
                         xml_path.name,
+                        attempt=args.run_attempt,
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
+                        # Before the insert, so a failed delete aborts this file (caught
+                        # below) rather than leaving two attempts' rows under one run_id.
+                        drop_older_case_attempts(
+                            client,
+                            v2db,
+                            _v2_run_id,
+                            component_of(args, COMPONENT_DEFAULT),
+                            xml_path.name,
+                            args.run_attempt,
+                        )
                         _n = insert_test_results(
                             client,
                             v2db,
@@ -1795,6 +1820,7 @@ def main():
                             _v2_run_id,
                             cases,
                             xml_path.name,
+                            attempt=args.run_attempt,
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
@@ -1816,7 +1842,7 @@ def main():
                 )
 
             total_cases += len(cases)
-            if args.write_v1:
+            if args.write_v1 and not v1_seen:
                 print(
                     f"  Inserted {len(cases)} test cases + "
                     f"{sum(len(c['properties']) for c in cases)} properties"

@@ -177,6 +177,8 @@ jobs:
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      # Empty on a manual re-ingest, which then keeps first-write-wins.
+      TRIGGERING_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || '' }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
@@ -391,6 +393,7 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.
