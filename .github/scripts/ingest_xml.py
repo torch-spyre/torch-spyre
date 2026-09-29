@@ -37,6 +37,9 @@ from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
     extract_properties,
     get_client,
+    ArtifactIdentity,
+    insert_artifact,
+    insert_artifact_result,
     insert_benchmarks,
     insert_gha_artifact_result,
     insert_test_results,
@@ -1232,55 +1235,129 @@ def _leg_state(failed: int, total: int) -> str:
     return "failed" if failed > 0 else "passed"
 
 
+def _opt(args, name: str):
+    """An optional flag's value; '' when the caller built `args` without it (tests do)."""
+    return getattr(args, name, "") or ""
+
+
+def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
+    """A perf leg's verdict: it measured something. There is no pass/fail to read."""
+    if args.artifact_id or _opt(args, "artifact"):
+        acc = legs.setdefault(
+            (run_id, "perf"), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += measured
+
+
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
-    """Write one artifacts row and one artifact_results row per (run_id, tier) of this leg."""
-    if not legs or not v2db or not args.artifact_id:
-        return
-    artifact_id, base_id, installed = _parse_artifact_record(args.artifact_id)
-    if not artifact_id:
+    """Write the artifact and one artifact_results row per (run_id, tier) of this leg."""
+    if not legs or not v2db or not (args.artifact_id or _opt(args, "artifact")):
         return
     try:
-        for (run_id, tier), acc in sorted(legs.items()):
-            if tier not in schema_model.TEST_TYPE_VALUES:
-                # Loud: this is the last thing between a derived id and its verdict.
-                print(
-                    f"  [warn] v2: artifact verdict skipped for run_id={run_id} -- "
-                    f"test_type {tier!r} is not a tier the DDL admits "
-                    f"({sorted(schema_model.TEST_TYPE_VALUES)}); --trigger-type is the "
-                    "field usually missing",
-                    file=sys.stderr,
-                )
-                continue
-            wrote = insert_gha_artifact_result(
-                client,
-                v2db,
-                artifact_id=artifact_id,
-                component=component_of(args, COMPONENT_DEFAULT),
-                arch=args.platform or "",
-                run_id=run_id,
-                test_type=tier,
-                state=_leg_state(acc["failed"], acc["total"]),
-                duration_s=acc["duration_s"],
-                # Hash inputs, carried through the record -- unreachable from this job.
-                base_artifact_id=base_id,
-                installed=installed,
-                repo=args.repository,
-                git_ref=args.branch,
-                git_sha=args.sha,
-                run_url=_gha_run_url(args),
-            )
-            if wrote:
-                print(
-                    f"  v2: artifact_results {artifact_id} "
-                    f"[{tier}] state={_leg_state(acc['failed'], acc['total'])} "
-                    f"under run_id={run_id}"
-                )
+        if _opt(args, "artifact"):
+            _write_named_artifact_verdicts(client, v2db, args, legs)
+        else:
+            _write_gha_artifact_verdicts(client, v2db, args, legs)
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
             f"  [warn] v2: artifact verdict write failed, rows unaffected: {err!r}",
             file=sys.stderr,
         )
+
+
+def _admitted_legs(legs: dict):
+    """(run_id, tier, acc) for the tiers the DDL admits; the rest are skipped loudly."""
+    for (run_id, tier), acc in sorted(legs.items()):
+        if tier not in schema_model.TEST_TYPE_VALUES:
+            # Loud: this is the last thing between a derived id and its verdict.
+            print(
+                f"  [warn] v2: artifact verdict skipped for run_id={run_id} -- "
+                f"test_type {tier!r} is not a tier the DDL admits "
+                f"({sorted(schema_model.TEST_TYPE_VALUES)}); --trigger-type is the "
+                "field usually missing",
+                file=sys.stderr,
+            )
+            continue
+        yield run_id, tier, acc
+
+
+def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
+    """--artifact: register what the spec names (and tag it), then its verdicts."""
+    component = component_of(args, COMPONENT_DEFAULT)
+    identity = ArtifactIdentity.parse(args.artifact, args.platform or "", component)
+    if identity is None:
+        print(
+            f"  [warn] v2: --artifact {args.artifact!r} names no identity",
+            file=sys.stderr,
+        )
+        return
+    run_url = _opt(args, "run_url") or _gha_run_url(args)
+    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    tag_props = {"run_url": run_url, "source": source}
+    aid = insert_artifact(
+        client,
+        v2db,
+        identity,
+        # A test leg did not build what it ran; the build's own record (write-once) wins.
+        origin="promoted",
+        sources=[(args.repository, args.branch, args.sha)],
+        props={"run_url": run_url, "source": source},
+        tags=[
+            (t, _opt(args, "tag_family") or "release", tag_props)
+            for t in _opt(args, "tag") or []
+        ],
+    )
+    if not aid:
+        return
+    for run_id, tier, acc in _admitted_legs(legs):
+        state = _leg_state(acc["failed"], acc["total"])
+        if insert_artifact_result(
+            client,
+            v2db,
+            artifact_id=aid,
+            run_id=run_id,
+            test_type=tier,
+            state=state,
+            arch=args.platform or "",
+            duration_s=acc["duration_s"],
+            props={"run_url": run_url, "source": source},
+        ):
+            print(
+                f"  v2: artifact_results {aid} [{tier}] state={state} under run_id={run_id}"
+            )
+
+
+def _write_gha_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
+    """--artifact-id: the GHA record derived on the runner (derive-gha-artifact-id)."""
+    artifact_id, base_id, installed = _parse_artifact_record(args.artifact_id)
+    if not artifact_id:
+        return
+    for run_id, tier, acc in _admitted_legs(legs):
+        wrote = insert_gha_artifact_result(
+            client,
+            v2db,
+            artifact_id=artifact_id,
+            component=component_of(args, COMPONENT_DEFAULT),
+            arch=args.platform or "",
+            run_id=run_id,
+            test_type=tier,
+            state=_leg_state(acc["failed"], acc["total"]),
+            duration_s=acc["duration_s"],
+            # Hash inputs, carried through the record -- unreachable from this job.
+            base_artifact_id=base_id,
+            installed=installed,
+            repo=args.repository,
+            git_ref=args.branch,
+            git_sha=args.sha,
+            run_url=_opt(args, "run_url") or _gha_run_url(args),
+        )
+        if wrote:
+            print(
+                f"  v2: artifact_results {artifact_id} "
+                f"[{tier}] state={_leg_state(acc['failed'], acc['total'])} "
+                f"under run_id={run_id}"
+            )
 
 
 def _gha_run_url(args) -> str:
@@ -1316,6 +1393,28 @@ def main():
         "'<artifact_id>|<base_artifact_id>|<installed,comma,joined>' whose extra fields are "
         "the hash inputs. Given, the ingest also writes the artifacts row and the "
         "artifact_results verdict; empty writes neither and the cases land as before.",
+    )
+    parser.add_argument(
+        "--artifact",
+        default="",
+        help="What this leg ran, when no derive-gha-artifact-id record exists: "
+        "'image:<repo>[:tag]@sha256:<digest>' (the per-arch image) or "
+        "'generic:<url>#<sha256>', each optionally followed by ';component=<c>', "
+        "';name=<n>' and (image) ';id12=<12 hex>' to match how its producer recorded it. "
+        "The artifact is registered (and tagged with --tag) before its verdicts are written.",
+    )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="artifact_tags tag for --artifact; repeat to tag it under several names "
+        "(e.g. a dated tag and the producer's own name).",
+    )
+    parser.add_argument("--tag-family", default="release")
+    parser.add_argument(
+        "--run-url",
+        default="",
+        help="The CI run behind these rows when it is not a GHA run (e.g. $BUILD_URL).",
     )
     parser.add_argument(
         "--repository",
@@ -1509,6 +1608,8 @@ def main():
                         source_file=run_meta["source_file"],
                     )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                if _v2_run_id:
+                    _perf_leg(artifact_legs, args, _v2_run_id, len(kernels))
 
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
@@ -1590,6 +1691,8 @@ def main():
                         source_file=run_meta["source_file"],
                     )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
+                if _v2_run_id:
+                    _perf_leg(artifact_legs, args, _v2_run_id, len(benchmarks))
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
@@ -1697,7 +1800,7 @@ def main():
 
                     # Accumulated even when the cases were already ingested, so a re-ingest
                     # can still land a verdict that failed to write. The writer dedups.
-                    if _v2_run_id and args.artifact_id:
+                    if _v2_run_id and (args.artifact_id or _opt(args, "artifact")):
                         _acc = artifact_legs.setdefault(
                             (_v2_run_id, _v2_tier),
                             {"failed": 0, "total": 0, "duration_s": 0.0},

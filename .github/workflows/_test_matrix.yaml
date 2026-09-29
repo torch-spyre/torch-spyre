@@ -414,6 +414,12 @@ jobs:
     timeout-minutes: 10
     # Belt and braces with the action's degrade-to-empty: telemetry never reddens a run.
     continue-on-error: true
+    # For jobs that ingest inline (perf), which cannot read the uploaded artifact.
+    outputs:
+      record: >-
+        ${{ steps.derive.outputs.artifact_id != '' && format('{0}|{1}|{2}',
+        steps.derive.outputs.artifact_id, steps.derive.outputs.base_artifact_id,
+        steps.delta.outputs.installed) || '' }}
     steps:
       # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
       # At THIS ref, like every other job -- one definition of the id formula per commit.
@@ -750,7 +756,7 @@ jobs:
   # ---------------------------------------------------------------------------
   perf:
     name: Perf benchmark
-    needs: [generate_matrix, build_torch_spyre]
+    needs: [generate_matrix, build_torch_spyre, artifact_identity]
     if: >-
       !cancelled() &&
       github.event_name != 'pull_request' &&
@@ -897,6 +903,7 @@ jobs:
           trigger-type: perf
           # perf runs on x86 GitHub-hosted runners, so the rows are x86_64.
           platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
           # Workspace sparse-checkout of this ref's .github — not the baked
           # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
           torch-spyre-dir: ${{ github.workspace }}
