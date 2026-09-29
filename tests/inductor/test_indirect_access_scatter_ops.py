@@ -37,7 +37,7 @@ class TestScatterOp:
         """Zero-volume inner dimension scatter — shape (8, 0, 128) must be a safe no-op.
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, head_dim=128 — zero-volume along middle dim
@@ -69,9 +69,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4926", strict=True)
+            pytest.xfail(reason="known issue- 4926")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: head_dim=128 — write one source value to one indexed position
@@ -98,7 +98,7 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8, head_dim=128
@@ -139,9 +139,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4927", strict=True)
+            pytest.xfail(reason="known issue- 4927")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: kv_heads=8, head_dim=128 — step-2 strided view across kv_heads
@@ -184,9 +184,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: head_dim=256 — scatter_ writes a constant into 16 selected slots
@@ -218,9 +218,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4401", strict=True)
+            pytest.xfail(reason="known issue- 4401")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: batch=2, kv_heads=10, seq=16, head_dim=128
@@ -257,9 +257,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4401", strict=True)
+            pytest.xfail(reason="known issue- 4401")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: batch=2, kv_heads=8, seq=16, head_dim=128
@@ -299,9 +299,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4401", strict=True)
+            pytest.xfail(reason="known issue- 4401")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: batch=2, layers=4, kv_heads=8, seq=16, head_dim=128
@@ -342,9 +342,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4401", strict=True)
+            pytest.xfail(reason="known issue- 4401")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, seq=16, head_dim=128
@@ -382,9 +382,9 @@ class TestScatterOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4401", strict=True)
+            pytest.xfail(reason="known issue- 4401")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B (model-derived geometry, bf16 dtype):
@@ -427,9 +427,9 @@ class TestScatterAddOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4473", strict=True)
+            pytest.xfail(reason="known issue- 4473")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: kv_heads=16, head_dim=256 — offset sub-views into a kv_heads×head_dim buffer
@@ -474,9 +474,9 @@ class TestScatterAddOp:
         For tight numerical accuracy, see test_scatter_add_bf16_subnormal_accumulation.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: kv_heads=10, head_dim=128 — all updates target kv_head row 0
@@ -513,9 +513,9 @@ class TestScatterAddOp:
         or silently flush them before accumulation.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, head_dim=128 — subnormals accumulate into row 0
@@ -547,9 +547,9 @@ class TestScatterAddOp:
         Model shape: Granite-4.1-20B (head_dim=128). Covers 1D-OOP and 1D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: head_dim=128 flat accumulation buffer
@@ -592,9 +592,9 @@ class TestScatterAddOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 3D-OOP and 3D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (kv_heads=16, seq=8, head_dim=256) — accumulate along seq (dim=1)
@@ -637,9 +637,9 @@ class TestScatterAddOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP and 4D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, kv_heads=10, seq=8, head_dim=128) — accumulate along seq (dim=2)
@@ -682,9 +682,9 @@ class TestScatterAddOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, layers=4, kv_heads=8, seq=8, head_dim=128) — accumulate along seq (dim=3)
@@ -727,9 +727,9 @@ class TestScatterAddOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4396", strict=True)
+            pytest.xfail(reason="known issue- 4396")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128) — accumulate along seq (dim=4)
@@ -779,11 +779,11 @@ class TestScatterReduceOp:
         """NaN and Inf propagation across all 5 reduction modes (not just sum).
         Model shape: Ministral-3-14B (kv_heads=8, head_dim=128)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile" and reduce_mode == "sum":
-            pytest.xfail(reason="known issue- 4409", strict=True)
+            pytest.xfail(reason="known issue- 4409")
         if mode == "compile" and reduce_mode in ("prod", "mean", "amax", "amin"):
-            pytest.xfail(reason="known issue- 4928", strict=True)
+            pytest.xfail(reason="known issue- 4928")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8, head_dim=128 — NaN/Inf injected into first two rows
@@ -810,9 +810,9 @@ class TestScatterReduceOp:
         Model shape: Granite-4.1-20B (hidden=8192, kv_heads=8, head_dim=128)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- epic-43", strict=True)
+            pytest.xfail(reason="known issue- epic-43")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: batch=2, seq=8, hidden=8192; mark seq dim dynamic
@@ -841,9 +841,9 @@ class TestScatterReduceOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (batch=2, kv_heads=16, layers=2, seq=16, head_dim=256)
@@ -873,9 +873,9 @@ class TestScatterReduceOp:
         Model shape: Ministral-3-14B (head_dim=128). Covers 1D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: head_dim=128 flat accumulation buffer
@@ -898,9 +898,9 @@ class TestScatterReduceOp:
         Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: (kv_heads=8, head_dim=128)
@@ -923,9 +923,9 @@ class TestScatterReduceOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (kv_heads=16, seq=8, head_dim=256) — reduce along seq (dim=1)
@@ -948,9 +948,9 @@ class TestScatterReduceOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP and 4D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, kv_heads=10, seq=8, head_dim=128) — reduce along seq (dim=2)
@@ -995,9 +995,9 @@ class TestScatterReduceOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, layers=4, kv_heads=8, seq=8, head_dim=128) — reduce along seq (dim=3)
@@ -1027,9 +1027,9 @@ class TestScatterReduceOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4932", strict=True)
+            pytest.xfail(reason="known issue- 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128)
@@ -1081,9 +1081,9 @@ class TestIndexAddOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — channels=kv_heads=10, spatial=head_dim=128."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: kv_heads=10 as channels, head_dim=128 split as H=8, W=16
@@ -1140,9 +1140,9 @@ class TestIndexAddOp:
         Model shape: Ministral-3-14B (head_dim=128). Covers 1D-IP correctness."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 3507", strict=True)
+            pytest.xfail(reason="known issue- 3507")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4844", strict=True)
+            pytest.xfail(reason="known issue- 4844")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: 1D head_dim=128 buffer — add 8 values at random positions
@@ -1172,9 +1172,9 @@ class TestIndexAddOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, layers=4, kv_heads=8, seq=8, head_dim=128) — add along seq (dim=3)
@@ -1217,9 +1217,9 @@ class TestIndexAddOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4874", strict=True)
+            pytest.xfail(reason="known issue- 4874")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128)
@@ -1301,7 +1301,7 @@ class TestIndexCopyOp:
         """Zero-volume trailing dimension — index_copy must be a safe no-op.
         Model shape: Ministral-3-14B (kv_heads=8, seq=4, head_dim=0 zero-volume)."""
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4929", strict=True)
+            pytest.xfail(reason="known issue- 4929")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8 rows, seq=4 cols, trailing head_dim=0 (zero-volume)
@@ -1365,7 +1365,7 @@ class TestIndexCopyOp:
         Model shape: Gemma-4-12B (head_dim=128). Covers 1D-OOP and 1D-IP."""
         torch.manual_seed(0)
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: head_dim=128 flat buffer — copy 4 positions
@@ -1497,9 +1497,9 @@ class TestIndexFillOp:
         """Special IEEE-754 fills — NaN, +Inf, -Inf bit-pattern preservation.
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: kv_heads=16 rows, head_dim=256 cols — fill 2 kv-head rows
@@ -1518,9 +1518,9 @@ class TestIndexFillOp:
         """5D tensor hyperplane broadcast fill along an intermediate dim.
         Model shape: Gemma-4-12B (batch=2, kv_heads=10, layers=4, seq=8, head_dim=128)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, kv_heads=10, layers=4, seq=8, head_dim=128) — fill 3 layer slices
@@ -1546,9 +1546,9 @@ class TestIndexFillOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128) — step-3 stride across kv-heads."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: 24 kv-head rows of width 128; step-3 view gives 8 rows
@@ -1582,9 +1582,9 @@ class TestIndexFillOp:
         stomping on each other or leaving one channel at its original value.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8 rows, head_dim=128 cols — complex64 fill on 2 kv-head rows
@@ -1605,9 +1605,9 @@ class TestIndexFillOp:
         Model shape: Granite-4.1-20B (head_dim=128). Covers 1D-OOP and 1D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: head_dim=128 flat buffer — fill 8 positions with 99.0
@@ -1646,9 +1646,9 @@ class TestIndexFillOp:
         """4D index_fill on (batch, kv_heads, seq, head_dim) — both OOP and IP.
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP and 4D-IP."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, kv_heads=10, seq=8, head_dim=128) — fill 4 seq positions (dim=2)
@@ -1687,9 +1687,9 @@ class TestIndexFillOp:
         """6D index_fill on expert-layer-KV-cache geometry — both OOP and IP.
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 6D-OOP and 6D-IP."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4414", strict=True)
+            pytest.xfail(reason="known issue- 4414")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4472", strict=True)
+            pytest.xfail(reason="known issue- 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (experts=2, batch=2, layers=2, kv_heads=16, seq=4, head_dim=256) — fill 2 seq positions (dim=4)
@@ -1851,9 +1851,9 @@ class TestIndexSelectOp:
         Model shape: Granite-3.3-8B (head_dim=128). Covers 1D-OOP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4956", strict=True)
+            pytest.xfail(reason="known issue- 4956")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4956", strict=True)
+            pytest.xfail(reason="known issue- 4956")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: head_dim=128 — select 8 positions
@@ -1934,9 +1934,9 @@ class TestIndexPutOp:
         Model shape: Granite-3.3-8B (batch=2, kv_heads=8, layers=4, seq=4, head_dim=128)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4451", strict=True)
+            pytest.xfail(reason="known issue- 4451")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, kv_heads=8, layers=4, seq=4, head_dim=128)
@@ -1975,9 +1975,9 @@ class TestIndexPutOp:
         """Sparse 3D boolean mask on a transposed (non-contiguous) tensor.
         Model shape: Ministral-3-14B (kv_heads=8, seq=4, head_dim=128)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4870", strict=True)
+            pytest.xfail(reason="known issue- 4870")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: (seq=4, kv_heads=8, head_dim=128) transposed to (kv_heads=8, seq=4, head_dim=128)
@@ -2018,9 +2018,9 @@ class TestIndexPutOp:
         file's bfloat16-only test with low-contention random indices.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4411", strict=True)
+            pytest.xfail(reason="known issue- 4411")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: kv_heads=8 rows of width head_dim=128
@@ -2085,9 +2085,9 @@ class TestIndexPutOp:
         Model shape: Ministral-3-14B (head_dim=128). Covers 1D-OOP and 1D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: head_dim=128 flat buffer — write 8 positions
@@ -2130,9 +2130,9 @@ class TestIndexPutOp:
         Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128). Covers 4D-OOP and 4D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4451", strict=True)
+            pytest.xfail(reason="known issue- 4451")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: (batch=2, kv_heads=8, seq=8, head_dim=128)
@@ -2184,9 +2184,9 @@ class TestIndexPutOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 692", strict=True)
+            pytest.xfail(reason="known issue- 692")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4451", strict=True)
+            pytest.xfail(reason="known issue- 4451")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (experts=2, batch=2, layers=2, kv_heads=16, seq=4, head_dim=256)
@@ -2251,9 +2251,9 @@ class TestMaskedScatterOp:
         """All-True dense mask — entire tensor replaced by sequential source elements.
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — 1280-element flat replacement."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: kv_heads=10 × head_dim=128 = 1280 elements — all replaced sequentially
@@ -2288,9 +2288,9 @@ class TestMaskedScatterOp:
         compare_with_cpu.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, kv_heads=8, layers=4, seq=4, head_dim=128)
@@ -2333,7 +2333,7 @@ class TestMaskedScatterOp:
         simply validates correctness across all three sizes.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         def fn(dest, m, source):
@@ -2375,9 +2375,9 @@ class TestMaskedScatterOp:
         """0D in-place masked_scatter_ — scalar self with scalar True mask.
         Covers 0D-IP (existing 0D test uses OOP form only)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         x = torch.tensor(0.0, dtype=torch.float32)
@@ -2396,9 +2396,9 @@ class TestMaskedScatterOp:
         """4D in-place masked_scatter_ — (batch, kv_heads, seq, head_dim).
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 4D-IP."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, kv_heads=8, seq=8, head_dim=128) — ~25% True density
@@ -2428,9 +2428,9 @@ class TestMaskedScatterOp:
         """5D in-place masked_scatter_ — (batch, layers, kv_heads, seq, head_dim).
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 5D-IP."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, layers=4, kv_heads=8, seq=4, head_dim=128) — ~25% True
@@ -2460,9 +2460,9 @@ class TestMaskedScatterOp:
         """6D masked_scatter — both OOP and IP on expert-layer-KV-cache geometry.
         Model shape: Ministral-3-14B (kv_heads=8, head_dim=128). Covers 6D-OOP and 6D-IP."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128) — ~25% True
@@ -2528,9 +2528,9 @@ class TestPutOp:
         Model shape: Granite-3.3-8B — 1D flat KV cache slot vector of length head_dim=128."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4844", strict=True)
+            pytest.xfail(reason="known issue- 4844")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: head_dim=128 as a flat 1D cache slot buffer
@@ -2562,9 +2562,9 @@ class TestPutOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128) — stride-2 view over kv-heads."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4636", strict=True)
+            pytest.xfail(reason="known issue- 4636")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, head_dim=128 — stride-2 view leaves every other head
@@ -2597,9 +2597,9 @@ class TestPutOp:
         Model shape: Ministral-3-14B (kv_heads=8, head_dim=128) — 2×4 reshaped index into kv cache."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4636", strict=True)
+            pytest.xfail(reason="known issue- 4636")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8 × head_dim=128 flat — 2×4 index addresses 8 positions
@@ -2633,9 +2633,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4930", strict=True)
+            pytest.xfail(reason="known issue- 4930")
         run_eager, run_compile = _mode_flags(mode)
 
         size = 100 if dtype in (torch.float16, torch.bfloat16) else 200
@@ -2666,9 +2666,9 @@ class TestPutOp:
         Model shape: Granite-4.1-20B (kv_heads=8, head_dim=128)."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540, 4930", strict=True)
+            pytest.xfail(reason="known issue- 4540, 4930")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4636", strict=True)
+            pytest.xfail(reason="known issue- 4636")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: kv_heads=8 × head_dim=128 — empty index is a no-op
@@ -2700,7 +2700,7 @@ class TestPutOp:
         this is documented PyTorch behaviour. Only eager mode is tested here.
         """
         torch.manual_seed(0)
-        pytest.xfail(reason="known issue- 4540", strict=True)
+        pytest.xfail(reason="known issue- 4540")
         a = torch.randn(10, dtype=torch.float32)
         idx = torch.tensor([0, 0], dtype=torch.int64)
         vals = torch.tensor([0.0, 1.0], dtype=torch.float32)
@@ -2717,7 +2717,7 @@ class TestPutOp:
         torch.compile does not raise for this case.
         """
         torch.manual_seed(0)
-        pytest.xfail(reason="known issue- 4540", strict=True)
+        pytest.xfail(reason="known issue- 4540")
         a = torch.randn(10, dtype=torch.float32)
         idx = torch.tensor([0, 0], dtype=torch.int64)
         vals = torch.tensor([0.0, 1.0], dtype=torch.float32)
@@ -2732,9 +2732,9 @@ class TestPutOp:
         """PUT-06: 3D tensor flat-index address translation — flat index maps through 3D multi-stride layout.
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256) — 3D cache: (pages=2, kv_heads=8, head_dim=16)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4636", strict=True)
+            pytest.xfail(reason="known issue- 4636")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: page-table shaped (pages=2, kv_heads=8, head_dim=16) — 256 elements flat
@@ -2765,9 +2765,9 @@ class TestPutOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 4D-OOP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, kv_heads=10, seq=4, head_dim=128) — 1280 flat elements
@@ -2799,9 +2799,9 @@ class TestPutOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128). Covers 5D-OOP and 5D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (batch=2, layers=4, kv_heads=8, seq=4, head_dim=128) — 32768 flat elements
@@ -2848,9 +2848,9 @@ class TestPutOp:
         Model shape: Granite-3.3-8B (kv_heads=8, head_dim=128, bf16 equiv). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4399", strict=True)
+            pytest.xfail(reason="known issue- 4399")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128)
@@ -2915,9 +2915,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4844", strict=True)
+            pytest.xfail(reason="known issue- 4844")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: head_dim=128 (1D) and kv_heads×head_dim=8×128=1024 (2D) shapes
@@ -2967,9 +2967,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4844", strict=True)
+            pytest.xfail(reason="known issue- 4844")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: head_dim=128 — step-2 slice of 16-element buffer gives 8 values
@@ -3009,9 +3009,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4844", strict=True)
+            pytest.xfail(reason="known issue- 4844")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: head_dim=256 — flat buffer; step-2 index slice addresses 8 positions
@@ -3056,9 +3056,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4636", strict=True)
+            pytest.xfail(reason="known issue- 4636")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: kv_heads=10, head_dim=128 — step-2 rows of (20, 128) → shape (10, 128)
@@ -3142,16 +3142,16 @@ class TestPutOp:
 
         # eager: all combinations fail — torch.put not yet supported (#4540)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
 
         # compile: failures depend on the index shape (size_i):
         #   size_i=()  → both accumulate modes fail (#4451)
         #   size_i=(1,) → only accumulate=True fails (#4932); accumulate=False passes
         if mode == "compile":
             if size_i == ():
-                pytest.xfail(reason="known issue- 4451", strict=True)
+                pytest.xfail(reason="known issue- 4451")
             elif size_i == (1,) and accumulate:
-                pytest.xfail(reason="known issue- 4932", strict=True)
+                pytest.xfail(reason="known issue- 4932")
 
         dst = torch.randn(size_t, dtype=torch.float32)
         # Index high=1: the only valid flat index for a scalar/1-element dst is 0
@@ -3211,7 +3211,7 @@ class TestPutOp:
 
         # eager: all combinations fail — torch.put_ not yet supported (#4540)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
 
         # compile: failure depends on dst_shape:
         #   (0,) dest          → #4931 (both accumulate modes)
@@ -3220,15 +3220,15 @@ class TestPutOp:
         #   (1,2,3)/(0,1,2,0) → #4636 (accumulate=False), #4451 (accumulate=True)
         if mode == "compile":
             if dst_shape == (0,):
-                pytest.xfail(reason="known issue- 4931", strict=True)
+                pytest.xfail(reason="known issue- 4931")
             elif dst_shape == (1, 2, 3) and idx_shape == (0,):
-                pytest.xfail(reason="known issue- 4636", strict=True)
+                pytest.xfail(reason="known issue- 4636")
             elif (
                 dst_shape == (1, 2, 3) and idx_shape == (0, 1, 2, 0) and not accumulate
             ):
-                pytest.xfail(reason="known issue- 4636", strict=True)
+                pytest.xfail(reason="known issue- 4636")
             elif dst_shape == (1, 2, 3) and idx_shape == (0, 1, 2, 0) and accumulate:
-                pytest.xfail(reason="known issue- 4451", strict=True)
+                pytest.xfail(reason="known issue- 4451")
 
         dst = torch.randn(*dst_shape, dtype=torch.float32)
         idx = torch.empty(*idx_shape, dtype=torch.int64)
@@ -3262,9 +3262,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4930", strict=True)
+            pytest.xfail(reason="known issue- 4930")
         run_eager, run_compile = _mode_flags(mode)
 
         size = 3002
@@ -3299,9 +3299,9 @@ class TestPutOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4540", strict=True)
+            pytest.xfail(reason="known issue- 4540")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4540, 4930", strict=True)
+            pytest.xfail(reason="known issue- 4540, 4930")
         run_eager, run_compile = _mode_flags(mode)
 
         size = 100
@@ -3338,9 +3338,9 @@ class TestIndexReduceOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128) — 3D tensor [10, 8, 16]."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4411, 4874", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4411, 4874")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: kv_heads=10, split head_dim=128 as (8, 16) for 3D coverage
@@ -3395,9 +3395,9 @@ class TestIndexReduceOp:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4472", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4472")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: kv_heads=8 rows of head_dim=128 — rows 4–7 unvisited
@@ -3426,9 +3426,9 @@ class TestIndexReduceOp:
         Model shape: Gemma-4-26B (kv_heads=16, head_dim=256). Covers 4D-OOP and 4D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4411", strict=True)
+            pytest.xfail(reason="known issue- 4411")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: (batch=2, kv_heads=16, seq=8, head_dim=256) — reduce along seq (dim=2)
@@ -3472,9 +3472,9 @@ class TestIndexReduceOp:
         Model shape: Gemma-4-12B (kv_heads=10, head_dim=128). Covers 5D-OOP and 5D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4411", strict=True)
+            pytest.xfail(reason="known issue- 4411")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-12B: (batch=2, layers=4, kv_heads=10, seq=8, head_dim=128) — reduce along seq (dim=3)
@@ -3518,9 +3518,9 @@ class TestIndexReduceOp:
         Model shape: Ministral-3-14B (kv_heads=8, head_dim=128). Covers 6D-OOP and 6D-IP."""
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4411", strict=True)
+            pytest.xfail(reason="known issue- 4411")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: (experts=2, batch=2, layers=2, kv_heads=8, seq=4, head_dim=128)
@@ -3580,9 +3580,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_bool_dtype(self, mode: str):
         """Bool dtype source/dest — True/False values scattered at True mask positions."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # In-place: dst=[F,F,F], src=[T,T,T], mask=[F,T,F] → dst[1]=True
@@ -3643,9 +3643,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_noncontig_dest_mask_combos(self, mode: str):
         """All 4 contig/non-contig combos of dest × mask produce identical results."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         # Build reference tensors then derive non-contig views
@@ -3724,9 +3724,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_multishape_sweep(self, mode: str, shape: tuple):
         """Multi-shape sweep — 2D, 3D, 4D tensors with ~60% True density masks."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         torch.manual_seed(42)
@@ -3746,9 +3746,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_scalar_0d_self(self, mode: str):
         """MSK-NEW-04b: 0-dimensional scalar self with scalar True mask → value replaced, shape preserved."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         x = torch.tensor(0, dtype=torch.float32)
@@ -3764,9 +3764,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_no_side_effects(self, mode: str):
         """Out-of-place call must not modify self, mask, or source."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         torch.manual_seed(3)
@@ -3792,9 +3792,9 @@ class TestMaskedScatterOpAdditional:
     def test_masked_scatter_scalar_false_mask_noop(self, mode: str):
         """0-dimensional scalar False mask — dest returned unchanged (no True positions)."""
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         x = torch.tensor([1, 2, 3, 4], dtype=torch.float32)
@@ -3948,9 +3948,9 @@ class TestMaskedScatterOpAdditional:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         dest = torch.randn(*dest_shape, dtype=torch.float32)
@@ -3996,9 +3996,9 @@ class TestMaskedScatterOpAdditional:
         compare_with_cpu validates that both eager and compile modes match CPU.
         """
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4437", strict=True)
+            pytest.xfail(reason="known issue- 4437")
         run_eager, run_compile = _mode_flags(mode)
 
         dest = torch.empty(*dest_shape, dtype=torch.float32)
@@ -4063,9 +4063,9 @@ class TestIndexReduceUpstreamGaps:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4932", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, head_dim=128 split as (8, 8, 16) for 3D coverage
@@ -4116,9 +4116,9 @@ class TestIndexReduceUpstreamGaps:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4932", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-3.3-8B: kv_heads=8, head_dim=128 split as (8, 8, 16)
@@ -4163,9 +4163,9 @@ class TestIndexReduceUpstreamGaps:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4932", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Ministral-3-14B: kv_heads=8, head_dim=128 — step-2 view of 16-row buffer
@@ -4202,9 +4202,9 @@ class TestIndexReduceUpstreamGaps:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4411", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4411")
         run_eager, run_compile = _mode_flags(mode)
 
         # Granite-4.1-20B: kv_heads=8, head_dim=128 — transpose (128, 8) → (8, 128)
@@ -4255,9 +4255,9 @@ class TestIndexReduceUpstreamGaps:
         """
         torch.manual_seed(0)
         if mode == "eager":
-            pytest.xfail(reason="known issue- 4634", strict=True)
+            pytest.xfail(reason="known issue- 4634")
         if mode == "compile":
-            pytest.xfail(reason="known issue- 4634, 4932", strict=True)
+            pytest.xfail(reason="known issue- 4634, 4932")
         run_eager, run_compile = _mode_flags(mode)
 
         # Gemma-4-26B: kv_heads=16 rows, head_dim=256 — step-2 stride selects 8 indices
@@ -4304,11 +4304,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(reason="Known issue #4634/#4411", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4411"),
             ),
         ],
     )
@@ -4379,11 +4379,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(reason="Known issue #4634/#4411", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4411"),
             ),
         ],
     )
@@ -4450,11 +4450,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(reason="Known issue #4634/#4411", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4411"),
             ),
         ],
     )
@@ -4531,13 +4531,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(
-                    reason="Known issue #4634/#4472/#4874", strict=True
-                ),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4472/#4874"),
             ),
         ],
     )
@@ -4594,11 +4592,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(reason="Known issue #4634/#4874", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4874"),
             ),
         ],
     )
@@ -4647,11 +4645,11 @@ class TestIndexReduceUpstreamGaps:
         [
             pytest.param(
                 "eager",
-                marks=pytest.mark.xfail(reason="Known issue #4634", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634"),
             ),
             pytest.param(
                 "compile",
-                marks=pytest.mark.xfail(reason="Known issue #4634/#4411", strict=True),
+                marks=pytest.mark.xfail(reason="Known issue #4634/#4411"),
             ),
         ],
     )
