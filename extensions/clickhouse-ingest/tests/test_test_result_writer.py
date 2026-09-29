@@ -15,6 +15,7 @@
 """The test-result write path across re-run attempts: a newer attempt must replace, not be refused."""
 
 from spyre_clickhouse_ingest import (
+    ArtifactWriter,
     cases_already_ingested,
     drop_older_case_attempts,
     insert_test_results,
@@ -75,7 +76,7 @@ def test_dedup_with_an_attempt_counts_only_that_attempt_or_later():
 
 
 def test_older_attempts_are_deleted_for_that_file_only():
-    c = FakeClient()
+    c = FakeClient(run_count=5)
     drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
     (sql, params) = c.commands[0]
     assert sql.startswith("DELETE FROM db.test_case_runs")
@@ -93,4 +94,63 @@ def test_no_attempt_never_deletes():
     # Jenkins and manual re-ingests pass no attempt: first-write-wins, nothing removed.
     c = FakeClient()
     drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 0)
+    assert c.commands == []
+
+
+def test_a_drop_recounts_the_run_counters_the_insert_only_mv_cannot_subtract():
+    c = FakeClient(run_count=5)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    sqls = [sql for sql, _ in c.commands]
+    assert sqls[1].startswith("DELETE FROM db.run_case_counters")
+    assert sqls[2].startswith("INSERT INTO db.run_case_counters SELECT")
+    assert "FROM db.test_case_runs" in sqls[2]
+    # Recounted per run, not per file: the counters hold one row per run.
+    assert "source_file" not in sqls[2]
+
+
+def test_nothing_older_means_no_delete_and_no_recount():
+    c = FakeClient(run_count=0)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    assert c.commands == []
+
+
+AID = "5f0e7d3c-2b1a-5c4d-8e9f-0a1b2c3d4e5f"
+BASE = "6a1f8e4d-3c2b-5d5e-9fa0-1b2c3d4e5f60"
+
+
+def _verdict(c, attempt):
+    return ArtifactWriter.insert_gha_result(
+        c,
+        "db",
+        artifact_id=AID,
+        component="torch-spyre",
+        arch="x86_64",
+        run_id=RUN,
+        test_type="regression",
+        state="passed",
+        base_artifact_id=AID,
+        attempt=attempt,
+    )
+
+
+def test_a_rerun_verdict_replaces_the_earlier_attempts():
+    c = FakeClient(run_count=0)
+    assert _verdict(c, 2)
+    (sql, params) = c.commands[0]
+    assert sql.startswith("DELETE FROM db.artifact_results")
+    assert "< {attempt:UInt32}" in sql and "state != 'running'" in sql
+    assert params["attempt"] == 2
+    (_, rows, cols) = next(i for i in c.inserts if i[0] == "artifact_results")
+    assert dict(zip(cols, rows[0]))["props"]["run_attempt"] == "2"
+
+
+def test_a_verdict_from_this_attempt_is_not_rewritten():
+    c = FakeClient(run_count=1)
+    assert _verdict(c, 2)
+    assert c.commands == [] and not [i for i in c.inserts if i[0] == "artifact_results"]
+
+
+def test_no_attempt_keeps_first_write_wins_for_verdicts():
+    c = FakeClient(run_count=1)
+    assert _verdict(c, 0)
     assert c.commands == []

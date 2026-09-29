@@ -1352,6 +1352,7 @@ def _write_gha_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
             git_ref=args.branch,
             git_sha=args.sha,
             run_url=_opt(args, "run_url") or _gha_run_url(args),
+            attempt=getattr(args, "run_attempt", 0),
         )
         if wrote:
             print(

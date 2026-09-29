@@ -120,15 +120,40 @@ class TestResultWriter(RunWriter):
         """Delete this file's rows from attempts before `attempt`, so a re-run replaces them."""
         if not (attempt and source_file):
             return
+        where = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
+        params = {
+            "component": component,
+            "run_id": run_id,
+            "sf": source_file,
+            "attempt": attempt,
+        }
+        if not cls.fact_table.count_rows(client, db, where, params):
+            return
         client.command(
-            f"DELETE FROM {cls.fact_table.qualified(db)} "
-            f"WHERE {cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}",
-            parameters={
-                "component": component,
-                "run_id": run_id,
-                "sf": source_file,
-                "attempt": attempt,
-            },
+            f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
+            parameters=params,
+        )
+        cls._rebuild_counters(client, db, run_id, component)
+
+    @classmethod
+    def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
+        """Recount this run's run_case_counters from test_case_runs.
+
+        The counters MV fires on INSERT only, so a DELETE leaves the old attempt's counts
+        summed in; the SELECT mirrors run_case_counters_mv.
+        """
+        counters = f"{db}.run_case_counters" if db else "run_case_counters"
+        params = {"component": component, "run_id": run_id}
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        client.command(f"DELETE FROM {counters} WHERE {where}", parameters=params)
+        client.command(
+            f"INSERT INTO {counters} SELECT run_id, component, count(), "
+            "countIf(status = 'passed'), countIf(status = 'failed'), "
+            "countIf(status = 'error'), countIf(status = 'skipped'), "
+            "countIf(status = 'xfail'), countIf(status = 'xpass') "
+            f"FROM {cls.fact_table.qualified(db)} WHERE {where} "
+            "GROUP BY run_id, component",
+            parameters=params,
         )
 
     @classmethod
@@ -449,27 +474,31 @@ class ArtifactWriter:
         run_id: str,
         result_kind: str,
         test_type: str,
+        attempt: int = 0,
     ) -> bool:
-        """Has this verdict landed? Scoped by the sort key: one run reports N tiers.
+        """Has this verdict, from this attempt or later, landed? One run reports N tiers.
 
         A `running` row is a pre-dispatch SEED (Jenkins writes it before the leg starts), not
         a recorded verdict -- it must not block the leg's own terminal insert at the same key.
         """
+        where, params = cls._verdict_key(artifact_id, run_id, result_kind, test_type)
+        if attempt:
+            where += f" AND {TestResultWriter._ATTEMPT} >= {{attempt:UInt32}}"
+            params["attempt"] = attempt
+        return cls.result_table.count_rows(client, db, where, params) > 0
+
+    @staticmethod
+    def _verdict_key(artifact_id, run_id, result_kind, test_type) -> tuple[str, dict]:
         return (
-            cls.result_table.count_rows(
-                client,
-                db,
-                "artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
-                "AND result_kind = {result_kind:String} "
-                "AND test_type = {test_type:String} AND state != 'running'",
-                {
-                    "artifact_id": artifact_id,
-                    "run_id": run_id,
-                    "result_kind": result_kind,
-                    "test_type": test_type,
-                },
-            )
-            > 0
+            "artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
+            "AND result_kind = {result_kind:String} "
+            "AND test_type = {test_type:String} AND state != 'running'",
+            {
+                "artifact_id": artifact_id,
+                "run_id": run_id,
+                "result_kind": result_kind,
+                "test_type": test_type,
+            },
         )
 
     @classmethod
@@ -564,8 +593,12 @@ class ArtifactWriter:
         result_kind: str = "",
         duration_s: float = 0.0,
         props=None,
+        attempt: int = 0,
     ) -> bool:
-        """One verdict of one leg on one artifact; refuses a partial key, skips a repeat."""
+        """One verdict of one leg on one artifact; refuses a partial key, skips a repeat.
+
+        Given an attempt, the verdict replaces any from an earlier attempt of the same run.
+        """
         aid, rid, a = (
             DerivedId.norm(artifact_id),
             DerivedId.norm(run_id),
@@ -585,8 +618,15 @@ class ArtifactWriter:
                 file=sys.stderr,
             )
             return False
-        if cls.result_recorded(client, db, aid, rid, kind, test_type):
+        if cls.result_recorded(client, db, aid, rid, kind, test_type, attempt):
             return True
+        if attempt:
+            where, params = cls._verdict_key(aid, rid, kind, test_type)
+            client.command(
+                f"DELETE FROM {cls.result_table.qualified(db)} WHERE {where} "
+                f"AND {TestResultWriter._ATTEMPT} < {{attempt:UInt32}}",
+                parameters={**params, "attempt": attempt},
+            )
         result_row: schema.ArtifactResultRow = {
             "artifact_id": aid,
             "run_id": rid,
@@ -596,7 +636,9 @@ class ArtifactWriter:
             # Where it RAN; kept apart from artifacts.arch by design.
             "arch": a,
             "duration_s": float(duration_s or 0.0),
-            "props": cls._props(props or {}),
+            "props": cls._props(
+                {**(props or {}), "run_attempt": str(attempt) if attempt else ""}
+            ),
         }
         cls.result_table.insert(client, [result_row], db=db)
         return True
@@ -621,6 +663,7 @@ class ArtifactWriter:
         git_ref: str = "",
         git_sha: str = "",
         run_url: str = "",
+        attempt: int = 0,
     ) -> bool:
         """Record the artifact a GHA leg ran and its verdict; refuses a partial id."""
         aid, rid = DerivedId.norm(artifact_id), DerivedId.norm(run_id)
@@ -684,6 +727,7 @@ class ArtifactWriter:
             result_kind=result_kind,
             duration_s=duration_s,
             props={"run_url": run_url, "source": "gha"},
+            attempt=attempt,
         )
 
     @staticmethod
