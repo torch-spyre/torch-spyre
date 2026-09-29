@@ -418,44 +418,23 @@ def rescale_stl_for_dtype(
     host_layout: FixedLayout,
     dep: MemoryDep,
 ) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
+    """Rescale a device layout across a conversion that changes the stick depth.
 
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus the num-sticks dim, both found from ``dep``'s
-    coordinates by ``stick_dims``. This preserves any non-canonical layout or
-    padding present in the input STL instead of reconstructing a dense layout from
-    the logical size/stride.
+    Keeps every device dim of ``stl`` and resizes only the stick (the last device
+    dim) and the num-sticks dim, both found by ``stick_dims`` from ``dep``'s
+    coordinates. ``dep`` must read the input exactly as the conversion writes its
+    output; a slice of a wider buffer would keep that buffer's ``stride_map``.
 
-    The num-sticks dim is resized from the input layout wherever that layout
-    determines it, and its ``stride_map`` entry follows the layout invariant: a
-    dim of several sticks steps by the stick pitch, and a dim of one stick carries
-    its host extent times the stick dim's step, as ``dim_map_to_stride_map``
-    writes it. Input sticks that merge into wider output sticks redistribute
-    exactly. Two cases read the host extent instead, because the input layout
-    does not record it:
+    The new stick count comes from the input layout, except where the input does
+    not record it. Splitting sticks (fp16 into fp32) counts from the host extent,
+    so 65 fp16 elements take three fp32 sticks, not four, unless the num-sticks
+    dim also folds outer host dims and so steps only whole input sticks. Merging
+    into a single output stick (fp32 into fp16) writes the host extent as the
+    dim's ``stride_map`` entry, as ``dim_map_to_stride_map`` does.
 
-    - Sticks that split, as FP16 into FP32, leave the last output stick live or
-      empty depending on how full the last input stick is: 65 FP16 elements take
-      three FP32 sticks, not four. A num-sticks dim that also steps host dims
-      outside the stick dim is the exception: it lays whole-stick rows end to
-      end, as a ``[2, 128]`` access over ``[12, 1, 64]`` (the first third of a
-      ``[1, 768]`` buffer) puts ``2*d0 + floor(d1/64)`` on it, so it steps only
-      whole input sticks and its capacity splits exactly.
-    - Sticks that merge into a single output stick, as FP32 into FP16, leave an
-      entry that carries the extent; the input's pitch entry keeps only a stick
-      count.
-
-    A single input stick that stays a single stick keeps its dim as is. Its
-    num-sticks dim is one of possibly several zero-coordinate dims
-    (``stick_dims``), and its entry never enters an address, so rewriting it
-    could only change a dim the tensor does not use.
-
-    A narrowing output may end in a partially filled stick, and a widening one
-    counts only the sticks its live elements reach. Giving the rest of the stick
-    capacity real storage is ``insert_staggered_ea_padding``'s job, and it sizes
-    that padding from the layout returned here (issue #3999). Growing it here would
-    follow the value into every consumer, since ``propagate_spyre_tensor_layouts``
-    hands a pointwise output its input's STL directly.
+    The layout holds only the sticks the live elements reach; the rest of the
+    stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
+    growing it here would follow the value into every consumer of this STL.
 
     Args:
         stl: Input device layout to rescale.
@@ -500,6 +479,7 @@ def rescale_stl_for_dtype(
             out_device_size[num_sticks_dim] = (host_extent + out_eps - 1) // out_eps
         if out_device_size[num_sticks_dim] == 1:
             if in_sticks == 1:
+                # A single stick's entry never enters an address.
                 out_stride_map[num_sticks_dim] = stl.stride_map[num_sticks_dim]
             else:
                 # Merged into a single output stick: the host extent, not a pitch.
@@ -521,48 +501,39 @@ def _conversion_layouts(
 ) -> list[SpyreTensorLayout]:
     """Output STLs of a dtype conversion that changes the stick depth.
 
-    Each candidate is what the conversion writes from one layout of its input,
-    the source: the input as it stands, and the input restickified onto each
-    other dim when it can be restickified (``ReStickifyOpHBM`` handles only the
-    fp16 device format in its standard arrangement). The restickified sources
-    let a downstream op ask for another stick dim (Gemma 4: an embedding
-    entering RMSNorm), and they are the only route for an input whose stick
-    carries a slice offset. The restickify itself is the optimizer's to insert
-    on the input edge.
+    One candidate per source layout of the input: the input as it stands and,
+    where it can be restickified, the input restickified onto each other dim.
+    These let a consumer ask for another stick dim, and are the only route for an
+    input whose stick starts at a slice offset. The optimizer inserts the
+    restickify on the input edge.
 
-    From each source the output is built one of two ways:
+    A read of the whole input rescales the source (``rescale_stl_for_dtype``),
+    keeping all its device dims. A slice of a wider buffer cannot, since the
+    source's ``stride_map`` steps through the wider buffer: it builds the layout
+    from the output's host size with the source's stick dim instead, which may
+    reorder the non-stick device dims. The conversion works on whole sticks, so a
+    slice skips a source whose stick it starts mid-stick.
 
-    - Reading the input exactly as it writes the output, the conversion
-      inherits the source layout, rescaled for the new stick depth. Every
-      device dim of the source carries over: the order of the non-stick dims,
-      their folds and size-1 slots, and their ``stride_map`` entries. Only the
-      stick depth and the num-sticks count change. Such a read has no offset,
-      so every source starts its sticks on a stick boundary.
-    - Reading a slice of a wider buffer (Gemma's ``q_norm``/``k_norm`` upcast
-      part of the fused QKV projection into a narrower per-head buffer), the
-      source's ``stride_map`` steps through the wider buffer, so rescaling it
-      would misaddress the output. The conversion instead builds its layout
-      from the output's host size, with the stick on the output dim walking
-      the source stick's variable. The stick dim matches the source's, but
-      the non-stick device dims take the default order for the output's host
-      size, which may permute them or add or drop size-1 dims. The conversion
-      works on whole sticks, so a source whose stick the slice starts
-      mid-stick is not used.
-
-    Either layout holds only the sticks the live elements reach; the whole
-    sticks of the coarser grid that the conversion writes are
-    ``insert_staggered_ea_padding``'s to add.
+    Either layout holds only the sticks the live elements reach;
+    ``insert_staggered_ea_padding`` adds the rest.
     """
     in_device_coords = device_coordinates(stl, dep, None)
     in_stick_expr = in_device_coords[-1]
     input_ea = stl.element_arrangement
-    out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
+    if output.dtype == torch.float8_e4m3fn:
+        out_ea = ElementArrangement.QFP8CH
+    else:
+        out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     reads_whole_input = _convert_reads_whole_input(in_layout, output, dep, output_dep)
     out_coords = host_coordinates(output, output_dep, None)
 
     sources = [stl]
+    # ReStickifyOpHBM supports only fp16 in the STANDARD arrangement, so the output
+    # of a conversion from fp16 cannot be restickified. Add candidates from the
+    # input's alternate layouts, so the optimizer restickifies the input just
+    # before the conversion instead.
     if (
         stl.device_dtype == DataFormats.SEN169_FP16
         and input_ea == ElementArrangement.STANDARD
@@ -750,24 +721,11 @@ def _single_arg_op_layout(
             prims.convert_element_type.default
             | aten.copy.default
             | torch.ops.spyre.to_dtype_d2d.default
+            | spyreop.qfp8ch.default
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
             return _conversion_layouts(output, output_dep, dep, in_layout, stl)
-
-        case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization: an
-            # fp16 tensor with an odd stick count ends in a partially filled
-            # fp8 stick.
-            return [
-                rescale_stl_for_dtype(
-                    stl,
-                    output.dtype,
-                    ElementArrangement.QFP8CH,
-                    in_layout,
-                    dep,
-                )
-            ]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
