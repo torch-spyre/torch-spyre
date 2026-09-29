@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     -- stages, each its own leg; model_ops/model_support are result_kind 'capability'.
     CONSTRAINT chk_test_type   CHECK test_type   IN
         ('smoke','unit','integration','regression','trunk','perf',
-         'fvt','fvt-static','fvt-dynamic','svt','svt-dynamic','model_ops','model_support'),
+         'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic','model_ops','model_support'),
 
     -- run_id can't lead the sort key (reads want "this artifact's verdicts" first), so this index
     -- covers the reverse direction; built inline since ALTER...ADD INDEX registers but builds nothing.

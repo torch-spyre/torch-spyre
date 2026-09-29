@@ -13,4 +13,4 @@ ALTER TABLE artifact_results ADD CONSTRAINT chk_result_kind CHECK result_kind IN
 
 ALTER TABLE artifact_results DROP CONSTRAINT IF EXISTS chk_test_type;
 
-ALTER TABLE artifact_results ADD CONSTRAINT chk_test_type CHECK test_type IN ('smoke', 'unit', 'integration', 'regression', 'trunk', 'perf', 'fvt', 'fvt-static', 'fvt-dynamic', 'svt', 'svt-dynamic', 'model_ops', 'model_support');
+ALTER TABLE artifact_results ADD CONSTRAINT chk_test_type CHECK test_type IN ('smoke', 'unit', 'integration', 'regression', 'trunk', 'perf', 'fvt', 'fvt-static', 'fvt-dynamic', 'svt', 'svt-static', 'svt-dynamic', 'model_ops', 'model_support');

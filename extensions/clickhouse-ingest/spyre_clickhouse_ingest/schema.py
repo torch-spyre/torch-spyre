@@ -30,7 +30,7 @@ RESULT_KIND_VALUES = frozenset({"functional", "performance", "image", "capabilit
 CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
 # spyre-test-framework's stages, each its own leg.
 SUITE_STAGE_VALUES = frozenset(
-    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-dynamic"}
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
 )
 TEST_TYPE_VALUES = (
     frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
