@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     artifact_id UUID,                       -- WHAT was tested: immutable identity, never a tag
     run_id      UUID,                       -- joins the test/benchmark run for case detail
 
-    result_kind LowCardinality(String),     -- functional | performance | image
+    result_kind LowCardinality(String),     -- functional | performance | capability
     test_type   LowCardinality(String),     -- the tier ladder, constrained below
     state       LowCardinality(String),     -- passed | failed | error | running
     arch        LowCardinality(String),     -- where it RAN; may differ from artifacts.arch
@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     -- capability_runs. This and chk_test_type are declared last, in this order: migrations/005
     -- re-adds both and the server appends them.
     CONSTRAINT chk_result_kind CHECK result_kind IN
-        ('functional','performance','image','capability'),
+        ('functional','performance','capability'),
     -- Closes a v1 defect where image names leaked into test_type. Not an Enum: an unknown value
     -- would throw on insert instead of needing an ALTER, and Enum declaration order would silently
     -- reorder tier_satisfies()'s ladder comparisons. The fvt*/svt* values are spyre-test-framework's

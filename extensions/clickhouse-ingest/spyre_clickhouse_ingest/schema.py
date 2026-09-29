@@ -24,7 +24,7 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image", "capability"})
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
 # Which capability analysis produced a capability_runs row; also the test_type of a
 # result_kind='capability' verdict.
 CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})

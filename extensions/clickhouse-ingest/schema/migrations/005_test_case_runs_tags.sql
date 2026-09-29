@@ -9,7 +9,7 @@ ALTER TABLE test_case_runs ADD COLUMN IF NOT EXISTS measurements Map(LowCardinal
 
 ALTER TABLE artifact_results DROP CONSTRAINT IF EXISTS chk_result_kind;
 
-ALTER TABLE artifact_results ADD CONSTRAINT chk_result_kind CHECK result_kind IN ('functional', 'performance', 'image', 'capability');
+ALTER TABLE artifact_results ADD CONSTRAINT chk_result_kind CHECK result_kind IN ('functional', 'performance', 'capability');
 
 ALTER TABLE artifact_results DROP CONSTRAINT IF EXISTS chk_test_type;
 
