@@ -756,7 +756,7 @@ def extract_modules(torch_spyre_root, repo_root):
         rel_path = str(filepath.relative_to(repo_root))
         mod_name = _module_from_path(filepath, repo_root)
 
-        if mod_name == "torch_spyre.version":
+        if mod_name == "torch_spyre._version":
             continue
 
         mod_id = f"module::{mod_name}"

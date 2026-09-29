@@ -806,7 +806,9 @@ def _clone_layout(
             f"Cannot find alternative layout with size={output.size} and coordinates={out_coords}"
         )
 
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [required_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [required_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -829,7 +831,9 @@ def _exx2_layout(
     )
     reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -852,7 +856,9 @@ def _layernormnorm_layout(
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args[:1], out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -1403,6 +1409,7 @@ def _matmul_layouts(
         out_stl,
         [x_req_stl, y_req_stl],
         op,
+        output_dep,
         exact_input_indices=exact_input_indices,
     )
     return [out_stl]
@@ -1485,7 +1492,7 @@ def _conv_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+        [x, y], out_stl, [x_req_stl, y_req_stl], op, output_dep
     )
     return [out_stl]
 
@@ -1654,7 +1661,7 @@ def _multi_arg_pointwise_layouts(
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes)]
+        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
     }
 
@@ -1668,8 +1675,10 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
-    out_coords = host_coordinates(output, output_dep, ind_sizes)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -1707,7 +1716,7 @@ def _multi_arg_pointwise_layouts(
                 projected_dim_order,
                 output_ea,
             )
-            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
+            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes, op=op)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
             # For indirect-access value tensors, the stick dimension cannot
@@ -1815,7 +1824,7 @@ def _multi_arg_pointwise_layouts(
             continue
         # Stick must be offset-free; per-input feasibility is left to
         # AllSameNode (INF-costs incompatible).
-        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes, op=op)
         if not is_stick_expr_offset_free(out_coord[-1], stick_size):
             continue
         # Move to front (or insert if new): the in-place layout must win on
@@ -1998,7 +2007,7 @@ def _keep_by_index_layouts(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op, output_dep
     )
     return [out_stl]
 

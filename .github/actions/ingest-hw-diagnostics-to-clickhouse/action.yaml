@@ -13,11 +13,15 @@ inputs:
     description: Numeric GitHub Actions run ID of the run whose job logs are analysed.
     required: true
   workflow-name:
-    description: >
-      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
-      input) -- e.g. 'tests'.
+    description: Name of the triggering workflow, e.g. 'tests'. The tier when trigger-type is empty.
     required: false
     default: tests
+  trigger-type:
+    description: >
+      Test tier of the analysed run, a run_id hash input: pass the value the case ingest used,
+      so the two writers derive one id. Empty falls back to workflow-name.
+    required: false
+    default: ''
   run-url:
     description: URL of the analysed run. Empty computes it from repository + gha-run-id.
     required: false
@@ -42,7 +46,9 @@ inputs:
     required: false
     default: ''
   artifact-id:
-    description: artifact_id of the image this leg ran, when known.
+    description: >
+      artifact_id of what this leg ran, when known; a derive-gha-artifact-id record
+      ("id|base|installed") is accepted as is.
     required: false
     default: ''
   table:
@@ -86,6 +92,20 @@ inputs:
     default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+  clickhouse-db-v2:
+    description: >
+      Schema-v2 database. hw_failure_diagnostics has the same shape in both generations, so
+      the v2 write reinserts the same rows qualified with this database name instead of
+      diverging into a different table model. Empty makes the v2 write a no-op, so a caller
+      without it degrades to v1 only.
+    required: false
+    default: ''
+  schema:
+    description: >
+      Which schema generation to write: v1 (default) | v2 | both. `both` is the migration
+      window -- v1 stays authoritative while v2 accumulates the same runs.
     required: false
     default: ''
 
@@ -141,7 +161,8 @@ runs:
         mkdir -p raw_logs
 
         retry() {
-          local max_attempts=5 attempt=1 delay=2
+          # ~2 min of backoff: GitHub's 502 spells outlast 30s.
+          local max_attempts=7 attempt=1 delay=2
           until "$@"; do
             if [ "${attempt}" -ge "${max_attempts}" ]; then
               echo "::error::command failed after ${attempt} attempts: $*" >&2
@@ -156,14 +177,19 @@ runs:
 
         # filter=latest excludes a prior attempt of this run leaking in and doubling every
         # row. --method GET is required: gh api infers POST as soon as any -f/-F field is
-        # given, and this endpoint has no POST route.
-        retry gh api \
-          --method GET \
-          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-          --paginate \
-          -f filter=latest \
-          --jq '.jobs[] | {id: .id, name: .name}' \
-        > /tmp/jobs.jsonl
+        # given, and this endpoint has no POST route. The redirect lives inside the function
+        # so each retry starts from an empty file, not the pages an earlier attempt wrote.
+        list_jobs() {
+          gh api \
+            --method GET \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --paginate \
+            -f filter=latest \
+            -f per_page=100 \
+            --jq '.jobs[] | {id: .id, name: .name}' \
+          > /tmp/jobs.jsonl
+        }
+        retry list_jobs
 
         python3 - << 'PYEOF'
         import os
@@ -207,6 +233,8 @@ runs:
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}
+        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
+        SCHEMA_IN: ${{ inputs.schema }}
         RUN_URL_IN: ${{ inputs.run-url }}
         REPO: ${{ inputs.repository || github.repository }}
         RUN_ID: ${{ inputs.gha-run-id }}
@@ -216,6 +244,10 @@ runs:
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        # Only exported when non-empty: target_database() treats an unset value as "v2 not
+        # configured", which is what makes the v1 default cost nothing.
+        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
+        [ -n "${SCHEMA_IN}" ] && export INGEST_SCHEMA="${SCHEMA_IN}"
         RUN_URL="${RUN_URL_IN:-${{ github.server_url }}/${REPO}/actions/runs/${RUN_ID}}"
         TABLE_ARGS=()
         [ -n "${{ inputs.table }}" ] && TABLE_ARGS=(--table "${{ inputs.table }}")
@@ -226,7 +258,7 @@ runs:
           --arch           "${{ inputs.arch }}" \
           --gha-run-id     "${RUN_ID}" \
           --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
-          --trigger-type   "${{ inputs.workflow-name }}" \
+          --trigger-type   "${{ inputs.trigger-type || inputs.workflow-name }}" \
           --run-url        "${RUN_URL}" \
           --artifact-id    "${{ inputs.artifact-id }}" \
           "${TABLE_ARGS[@]}"

@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS artifacts
     -- id12/artifact_name are hash inputs kept readable here since artifact_id is opaque; run_url
     -- is the ONE url key across the schema (v1 spread this over five differently-named columns).
     props         Map(LowCardinality(String), String),  -- id12, content hash + alg, size,
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
                                                         -- labels, run_url, build_number
 
     CONSTRAINT chk_kind   CHECK kind   IN ('image','rpm','wheel','generic'),
@@ -67,6 +70,9 @@ CREATE TABLE IF NOT EXISTS artifact_refs
     ref            String,
     content_digest String DEFAULT '',       -- '' rather than Nullable: no per-row null mask
     props          Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_method   CHECK method   IN ('container-pull','dnf','pip','download'),
     CONSTRAINT chk_ref_kind CHECK ref_kind IN ('pullspec','glob','url')
@@ -98,7 +104,9 @@ CREATE TABLE IF NOT EXISTS artifact_tags
     -- The other direction: an immutable address a promotion also publishes lives in artifact_refs;
     -- only its key is recorded here.
     published_refs Array(String),
-    props          Map(LowCardinality(String), String)     -- promoted_by, run_url, actor
+    props          Map(LowCardinality(String), String),     -- promoted_by, run_url, actor
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3)
 )
 ENGINE = MergeTree()
 ORDER BY (tag, ts);
@@ -114,7 +122,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     artifact_id UUID,                       -- WHAT was tested: immutable identity, never a tag
     run_id      UUID,                       -- joins the test/benchmark run for case detail
 
-    result_kind LowCardinality(String),     -- functional | performance | image
+    result_kind LowCardinality(String),     -- functional | performance | capability
     test_type   LowCardinality(String),     -- the tier ladder, constrained below
     state       LowCardinality(String),     -- passed | failed | error | running
     arch        LowCardinality(String),     -- where it RAN; may differ from artifacts.arch
@@ -126,14 +134,23 @@ CREATE TABLE IF NOT EXISTS artifact_results
     -- run_url is THE link (Jenkins or GHA, one key); no separate run_key/job_key since the key
     -- form is recoverable from the url and is already a run_id hash input.
     props       Map(LowCardinality(String), String),  -- run_url, source, per-producer keys
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
 
+
+    CONSTRAINT chk_state       CHECK state       IN ('passed','failed','error','running'),
+    -- capability: the model_ops/model_support analyses, whose per-capability rows live in
+    -- capability_runs. This and chk_test_type are declared last, in this order: migrations/005
+    -- re-adds both and the server appends them.
+    CONSTRAINT chk_result_kind CHECK result_kind IN
+        ('functional','performance','capability'),
     -- Closes a v1 defect where image names leaked into test_type. Not an Enum: an unknown value
     -- would throw on insert instead of needing an ALTER, and Enum declaration order would silently
-    -- reorder tier_satisfies()'s ladder comparisons.
+    -- reorder tier_satisfies()'s ladder comparisons. The fvt*/svt* values are spyre-test-framework's
+    -- stages, each its own leg; model_ops/model_support are result_kind 'capability'.
     CONSTRAINT chk_test_type   CHECK test_type   IN
-        ('smoke','unit','integration','regression','trunk','perf'),
-    CONSTRAINT chk_state       CHECK state       IN ('passed','failed','error','running'),
-    CONSTRAINT chk_result_kind CHECK result_kind IN ('functional','performance','image'),
+        ('smoke','unit','integration','regression','trunk','perf',
+         'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic','model_ops','model_support'),
 
     -- run_id can't lead the sort key (reads want "this artifact's verdicts" first), so this index
     -- covers the reverse direction; built inline since ALTER...ADD INDEX registers but builds nothing.

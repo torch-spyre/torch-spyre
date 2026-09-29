@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -39,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
 from .pass_utils import (
     _per_core_view_on_buf,
+    commit_iteration_space_ownership,
     device_coordinates,
     find_matmul_generated_var,
     identify_matmul_inputs,
@@ -176,13 +178,12 @@ def _loop_advance_bound(
     return lo, hi
 
 
-def _copy_readers(operations: list[Operation], copy_name: str) -> list[ComputedBuffer]:
+def _copy_readers(operations: list[Operation], copy_name: str) -> list[Operation]:
     readers = []
     for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
         if any(
-            dep.name == copy_name for dep in _memory_deps(op.get_read_writes().reads)
+            getattr(dep, "name", None) == copy_name
+            for dep in op.get_read_writes().reads
         ):
             readers.append(op)
     return readers
@@ -329,14 +330,23 @@ def _prove_matmul_direct_read(
     ]
     copy_loop_info = getattr(copy_op, "loop_info", None)
     current_loop_info = getattr(consumer, "loop_info", None)
-    if (
-        len(copy_source_indices) != 1
-        or not isinstance(copy_loop_info, CoarseTileInfo)
-        or not isinstance(current_loop_info, CoarseTileInfo)
+    if len(copy_source_indices) > 1 or not isinstance(
+        current_loop_info, CoarseTileInfo
     ):
         return None, "copy has no complete loop-address record"
-    copy_source_idx = copy_source_indices[0]
-    if copy_source_idx >= len(copy_loop_info.tiled_dims_per_read):
+    recorded_tiled = record.direct_tiled_dims_per_level
+    recorded_squeezed = record.direct_squeezed_advance_per_level
+    has_recorded_address = recorded_tiled is not None and recorded_squeezed is not None
+    if not has_recorded_address and (
+        len(copy_source_indices) != 1 or not isinstance(copy_loop_info, CoarseTileInfo)
+    ):
+        return None, "copy has no complete loop-address record"
+    copy_source_idx = copy_source_indices[0] if copy_source_indices else None
+    if (
+        isinstance(copy_loop_info, CoarseTileInfo)
+        and copy_source_idx is not None
+        and copy_source_idx >= len(copy_loop_info.tiled_dims_per_read)
+    ):
         return None, "copy has no tiled-dimension record for its source"
 
     tiled_dims = [
@@ -350,9 +360,9 @@ def _prove_matmul_direct_read(
     if direct_source_idx >= len(tiled_dims):
         return None, "direct-read metadata does not match its dependencies"
     squeezed.extend([] for _ in range(len(direct_reads) - len(squeezed)))
-    recorded_tiled = record.direct_tiled_dims_per_level
-    recorded_squeezed = record.direct_squeezed_advance_per_level
     if recorded_tiled is None or recorded_squeezed is None:
+        assert isinstance(copy_loop_info, CoarseTileInfo)
+        assert copy_source_idx is not None
         recorded_tiled = tuple(
             tuple(tuple(pair) for pair in level)
             for level in copy_loop_info.tiled_dims_per_read[copy_source_idx]
@@ -393,6 +403,18 @@ def _prove_matmul_direct_read(
         )[-1]
     except Exception as exc:
         return None, f"source layout is not directly readable: {exc}"
+    if isinstance(consumer.data, Pointwise):
+        try:
+            copy_stick = device_coordinates(copy_layout.device_layout, copy_dep, None)[
+                -1
+            ]
+        except Exception as exc:
+            return None, f"staged copy layout is not directly readable: {exc}"
+        if source_stick.free_symbols != copy_stick.free_symbols:
+            return None, (
+                "direct source changes the pointwise stick variables: "
+                f"{source_stick} != {copy_stick}"
+            )
     if is_matmul:
         try:
             generated_var = find_matmul_generated_var(
@@ -407,9 +429,14 @@ def _prove_matmul_direct_read(
     advance_bounds = _loop_advance_bound(
         direct_op, source_dep, resolved_loop_info, direct_source_idx
     )
-    if advance_bounds is None and (
-        record.direct_tiled_dims_per_level is not None
-        or record.direct_squeezed_advance_per_level is not None
+    if (
+        advance_bounds is None
+        and isinstance(copy_loop_info, CoarseTileInfo)
+        and copy_source_idx is not None
+        and (
+            record.direct_tiled_dims_per_level is not None
+            or record.direct_squeezed_advance_per_level is not None
+        )
     ):
         # Rebasing a spliced-loop source removes the induction variable from
         # its load index.  Usually the recorded pre-rebase metadata still
@@ -518,12 +545,72 @@ def _validate_proposal(
     return None
 
 
+def project_transport_read_copies(graph, division_splits, *, relayout_sources=()):
+    """Non-mutating cost view of transport copies removable for every candidate.
+
+    The allocator still plans the original buffers, and the normal late pass
+    still validates and performs removal. Pricing a removable staging copy's
+    own division is misleading: the executed direct read uses its consumer's
+    division instead. Reuse the full address/ownership/loop proof for *every*
+    candidate, declining the projection if any candidate or graph check fails.
+    No assumption about a preferred split or final LX placement is needed.
+    """
+    operations = list(graph.operations)
+    if not config.read_copy_elision:
+        return operations
+    graph_output_names = set(graph.get_output_names())
+    for consumer in list(operations):
+        record = getattr(consumer, "_read_copy_elision_record", None)
+        if (
+            not isinstance(consumer, ComputedBuffer)
+            or not isinstance(record, ReadCopyElisionRecord)
+            or not isinstance(consumer.data, Pointwise)
+            or set(consumer.data.inner_fn_opcount().used_ops) != {"load"}
+        ):
+            continue
+        candidates = division_splits.get(consumer.get_name(), ())
+        # A later input clone or LX relayout can redirect this read and invalidate
+        # its saved record. Keep those allocation-dependent cases authoritative.
+        if (
+            not candidates
+            or record.source_name in division_splits
+            or record.copy_name in relayout_sources
+            or record.copy_name in graph_output_names
+        ):
+            continue
+        copy_op = next(
+            (op for op in operations if op.get_name() == record.copy_name), None
+        )
+        if not isinstance(copy_op, ComputedBuffer):
+            continue
+        if _copy_readers(operations, record.copy_name) != [consumer]:
+            continue
+        direct_op = None
+        for splits in candidates:
+            candidate = copy.copy(consumer)
+            commit_iteration_space_ownership(candidate, splits)
+            direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)
+            if direct_op is None:
+                break
+            if _validate_proposal(operations, consumer, direct_op, copy_op) is not None:
+                direct_op = None
+                break
+        if direct_op is not None:
+            operations = [
+                direct_op if op is consumer else op
+                for op in operations
+                if op is not copy_op
+            ]
+    return operations
+
+
 def elide_proven_read_copies(graph: GraphLowering) -> None:
     """Remove only copies whose post-allocation direct-read proof succeeds."""
     if not config.read_copy_elision:
         return
 
     operations = graph.operations
+    graph_output_names = set(graph.get_output_names())
     for consumer in list(operations):
         record = getattr(consumer, "_read_copy_elision_record", None)
         if not isinstance(consumer, ComputedBuffer) or not isinstance(
@@ -541,6 +628,12 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
         if copy_op is None:
             logger.debug(
                 "read-copy elision declined for %s: copy is absent",
+                record.consumer_name,
+            )
+            continue
+        if record.copy_name in graph_output_names:
+            logger.debug(
+                "read-copy elision declined for %s: copy is a graph output",
                 record.consumer_name,
             )
             continue
@@ -584,6 +677,22 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
         V.graph.name_to_buffer[replacement.get_name()] = replacement
         graph.removed_buffers.add(copy_op.get_name())
         operations.remove(copy_op)
+        for orphan_name in record.orphaned_copy_names:
+            orphan = next(
+                (
+                    op
+                    for op in operations
+                    if isinstance(op, ComputedBuffer) and op.get_name() == orphan_name
+                ),
+                None,
+            )
+            if (
+                orphan is not None
+                and orphan_name not in graph_output_names
+                and not _copy_readers(operations, orphan_name)
+            ):
+                graph.removed_buffers.add(orphan_name)
+                operations.remove(orphan)
         logger.info(
             "removed read copy %s; %s reads %s directly",
             copy_op.get_name(),

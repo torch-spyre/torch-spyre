@@ -243,7 +243,7 @@ def generate_constant_info(
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encoded_value]},
+                "data_": {"[0, 0, 0]": [str(encoded_value)]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci

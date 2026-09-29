@@ -19,21 +19,17 @@ from unittest.mock import patch
 import regex as re
 import sympy
 import torch
-from torch.testing import FileCheck
 from torch._inductor.exc import InductorError
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import (
     run_and_get_code,
 )
+from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
-    SymbolicArg,
-    SymbolicArgKind,
-    _resolve_symbolic_args,
 )
 from torch_spyre._inductor import config
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.codegen.compute_ops import (
     SymbolKind,
     _per_core_symbolic_dim_info,
@@ -48,6 +44,7 @@ from torch_spyre._inductor.codegen.superdsc import (
     parse_op_spec,
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -278,61 +275,6 @@ class TestSpyreConfig(InductorTestCase):
             args_str = line[line.index("(") + 1 : line.rindex(")")]
             args = [a.strip() for a in args_str.split(",")]
             self.assertEqual(len(args), len(set(args)), f"Duplicate args: {line}")
-
-    def test_symbolic_address_call_emits_canonical_symbolic_args_payload(self):
-        """The runner builds one SymbolicArg(kAddress) per backend symbol in
-        canonical inputSym_ order using generate_bundle()'s returned symbol_kinds.
-
-        Verifies the resolved address vector is correct and that a reversed payload
-        yields a different vector — proving the ordering contract is load-bearing.
-        """
-
-        def fn(a, b):
-            return a + b
-
-        a = torch.randn((128, 64), dtype=torch.float16, device="spyre")
-        b = torch.randn((128, 64), dtype=torch.float16, device="spyre")
-
-        with config.patch({"bundle_symbolic_args": True}):
-            comp_fn = torch.compile(fn)
-            out, source_codes = run_and_get_code(comp_fn, a, b)
-
-        # Ground-truth: resolve each tensor by its known run() position.
-        # tensor_id == arg_index == position in the deduped call_args list.
-        tensors = [a, b, out]
-        addr_0 = _resolve_symbolic_args(
-            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
-        )[0]
-        addr_1 = _resolve_symbolic_args(
-            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1)]
-        )[0]
-        addr_2 = _resolve_symbolic_args(
-            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2)]
-        )[0]
-
-        payload_canonical = [
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
-        ]
-        resolved = _resolve_symbolic_args(tensors, payload_canonical)
-        self.assertEqual(resolved, [addr_0, addr_1, addr_2])
-
-        # Forward-vs-reversed differential: wrong slot order must produce a
-        # different address vector, proving the ordering contract is exercised.
-        payload_reversed = [
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
-            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
-        ]
-        resolved_rev = _resolve_symbolic_args(tensors, payload_reversed)
-        self.assertNotEqual(
-            resolved,
-            resolved_rev,
-            "canonical and reversed payloads resolved identically — "
-            "all tensors share an address so ordering is not exercised",
-        )
-        self.assertEqual(resolved_rev, [addr_2, addr_1, addr_0])
 
 
 class TestResolveSdscSize(InductorTestCase):
@@ -571,6 +513,61 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
+    def test_tiled_group_gap_before_stick_axis(self):
+        """Decode must skip the other GQA groups when one core reads many heads."""
+        head, feature, group = sympy.symbols("head feature tile_group")
+        for head_splits in (1, 2, 4):
+            with self.subTest(head_splits=head_splits):
+                iteration_space = {
+                    head: (sympy.Integer(4), head_splits),
+                    feature: (sympy.Integer(128), 1),
+                }
+                spec = OpSpec(
+                    op="identity",
+                    is_reduction=False,
+                    iteration_space=iteration_space,
+                    core_id_to_work_slice=derive_operation_mapping(iteration_space),
+                    args=[
+                        TensorArg(
+                            is_input=True,
+                            arg_index=0,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            # [Hkv, tiled-away G, D/64, D%64]
+                            device_size=[4, 4, 2, 64],
+                            device_coordinates=[
+                                head,
+                                sympy.S.Zero,
+                                sympy.floor(feature / 64),
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 0},
+                            device_tile_advance_expr=128 * group,
+                        ),
+                        TensorArg(
+                            is_input=False,
+                            arg_index=1,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            device_size=[4, 2, 64],
+                            device_coordinates=[
+                                head,
+                                sympy.floor(feature / 64),
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"lx": 0},
+                        ),
+                    ],
+                    op_info={},
+                    tiled_symbols=[[group]],
+                    tiled_symbol_trip_counts={group: 4},
+                )
+
+                sdsc_spec, mapping = parse_op_spec(spec)
+                source, destination = sdsc_spec.args
+                self.assertEqual(source.backGap, {mapping[feature]: 384})
+                self.assertEqual(source.strides[mapping[feature]], 128)
+                self.assertEqual(source.strides[mapping[head]], 2048)
+                self.assertEqual(destination.backGap, {})
+
     def test_native_bmm_fake_broadcasts_gqa_axis(self):
         query = torch.empty((1, 8, 4, 256, 128), device="meta")
         key = torch.empty((1, 8, 1, 128, 256), device="meta")

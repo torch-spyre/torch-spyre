@@ -155,13 +155,35 @@ runs:
         source .venv/bin/activate
         mkdir -p raw_logs
 
-        gh api \
-          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-          --paginate \
-          --jq '.jobs[]
-                | select(.name | startswith("model-ops / "))
-                | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
-        > /tmp/jobs.jsonl
+        # A nightly lists hundreds of jobs, and a transient 502 here dropped whole nights.
+        retry() {
+          # ~2 min of backoff: GitHub's 502 spells outlast 30s.
+          local max_attempts=7 attempt=1 delay=2
+          until "$@"; do
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "::error::command failed after ${attempt} attempts: $*" >&2
+              return 1
+            fi
+            echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
+
+        # Redirect inside the function so each retry starts from an empty file.
+        list_jobs() {
+          gh api \
+            --method GET \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --paginate \
+            -f per_page=100 \
+            --jq '.jobs[]
+                  | select(.name | startswith("model-ops / "))
+                  | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
+          > /tmp/jobs.jsonl
+        }
+        retry list_jobs
 
         if [ ! -s /tmp/jobs.jsonl ]; then
           echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."

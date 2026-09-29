@@ -125,6 +125,158 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
     assert wd._matmul_split_cost(*axes, 32) > standalone
 
 
+def test_fused_reduction_compute_uses_work_per_active_core():
+    small = ArgTraffic("small", "input", True, 1024)
+    large = ArgTraffic("large", "input", True, 6144, loop_factor=2)
+    output = ArgTraffic("out", "output", True, 64)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [small, output]),
+        OpFeatures("sum", True, 64, 8, 2, [large, output]),
+        # Matmul has a different compute model and must not set this floor.
+        OpFeatures("bmm", True, 1 << 20, 1, 2, [], is_matmul=True),
+    ]
+
+    expected = (6144 * 2) / 8 / CostParams().fused_reduction_elems_per_core_ns
+    assert cost_model._fused_reduction_compute_ns(
+        reductions, CostParams()
+    ) == pytest.approx(expected)
+
+
+def test_fused_reduction_compute_keeps_core_count_symbolic():
+    heads, rows = sympy.symbols("split_heads split_rows", integer=True, positive=True)
+    op = OpFeatures(
+        "sum",
+        True,
+        64,
+        heads * rows,
+        2,
+        [ArgTraffic("input", "input", True, 12_288)],
+    )
+
+    compute = cost_model._fused_reduction_compute_ns([op], CostParams())
+
+    assert compute.free_symbols == {heads, rows}
+    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+
+
+def test_fused_reduction_compute_skips_independent_boundary_reductions():
+    boundary = ArgTraffic("arg0_1", "input", False, 6144, is_boundary=True)
+    output = ArgTraffic("out", "output", False, 64, is_boundary=True)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [boundary, output]),
+        OpFeatures("amin", True, 64, 8, 2, [boundary, output]),
+    ]
+
+    assert cost_model._fused_reduction_compute_ns(reductions, CostParams()) == 0.0
+
+
+def test_fused_reduction_compute_keeps_spill_cost_visible():
+    params = CostParams(overlap_gamma=0.46)
+
+    def prediction(is_lx):
+        intermediate = ArgTraffic("buf0", "input", is_lx, 12_288, is_boundary=False)
+        output = ArgTraffic("buf1", "output", False, 64, is_boundary=True)
+        reduction = OpFeatures("sum", True, 64, 8, 2, [intermediate, output])
+        pointwise = OpFeatures("exp", False, 12_288, 8, 2, [intermediate])
+        return cost_model.predict_ops([pointwise, reduction], params)
+
+    assert prediction(False) > prediction(True)
+
+
+def test_standalone_reduction_keeps_its_calibrated_bandwidth_model():
+    op = OpFeatures(
+        "amax",
+        True,
+        64,
+        1,
+        2,
+        [
+            ArgTraffic("input", "input", False, 6144),
+            ArgTraffic("out", "output", False, 64),
+        ],
+    )
+
+    assert cost_model.predict_ops(
+        [op], CostParams(fused_reduction_elems_per_core_ns=1e-6)
+    ) == pytest.approx(
+        cost_model.predict_ops([op], CostParams(fused_reduction_elems_per_core_ns=1e6))
+    )
+
+
+def test_isinf_is_symbolic_aware():
+    from torch_spyre._inductor.work_division import isinf
+
+    m = sympy.Symbol("output_split_m", integer=True, positive=True)
+    for infinite in (float("inf"), -float("inf"), sympy.oo, -sympy.oo, sympy.zoo):
+        assert isinf(infinite), infinite
+    for finite in (0, 1.5, sympy.Integer(3), m, 2 / m, sympy.Max(1, m)):
+        assert not isinf(finite), finite
+    # Undecidable is not infinite: a symbolic cost's finiteness rests on the
+    # enumerated candidate menu, not on this test.
+    assert not isinf(sympy.Piecewise((sympy.oo, m > 32), (m, True)))
+
+
+def test_matmul_split_cost_over_symbolic_splits_matches_concrete_in_budget():
+    from torch_spyre._inductor import work_division as wd
+
+    m, n, k = (
+        sympy.Symbol(name, integer=True, positive=True)
+        for name in ("output_split_m", "output_split_n", "reduction_split_k")
+    )
+    B, M, N, K = 1, 1024, 1024, 64
+    symbolic = wd._matmul_split_cost((B, 1), (M, m), (N, n), (K, k), 32)
+    assert isinstance(symbolic, sympy.Basic)
+    assert not wd.isinf(symbolic)
+    for m_split, n_split, k_split in ((4, 4, 2), (1, 8, 1), (2, 2, 2)):
+        concrete = wd._matmul_split_cost(
+            (B, 1), (M, m_split), (N, n_split), (K, k_split), 32
+        )
+        assert not wd.isinf(concrete)
+        point = {m: m_split, n: n_split, k: k_split}
+        assert float(symbolic.subs(point)) == pytest.approx(concrete)
+
+
+def _issue_4387_matmul(cores, m_split, n_split, k_split):
+    """``[1, 1024, 64] @ [1, 64, 1024]`` from issue #4387, at the given split."""
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=1024 * 1024,
+        cores=cores,
+        reduction_cores=k_split,
+        matmul_macs=1024 * 1024 * 64,
+        matmul_rows_per_core=1024 // m_split,
+        matmul_cols_per_core=1024 // n_split,
+        matmul_m_split=m_split,
+        matmul_n_split=n_split,
+        matmul_a_bytes=1024 * 64 * 2,
+        matmul_b_bytes=64 * 1024 * 2,
+    )
+
+
+def test_upstream_matmul_price_rejects_an_over_budget_split(monkeypatch):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    priced = cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
+    assert priced > 0
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(64, 4, 8, 2)], params)
+
+
+@pytest.mark.parametrize("infinity", [float("inf"), sympy.oo, sympy.zoo])
+def test_upstream_matmul_price_rejects_a_symbolic_infinity(monkeypatch, infinity):
+    monkeypatch.setattr(cost_model.config, "sencores", 32)
+    monkeypatch.setattr(
+        cost_model, "_matmul_execution_cost", lambda *args, **kwargs: infinity
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    with pytest.raises(RuntimeError, match="infeasible core split"):
+        cost_model._matmul_ns_upstream([_issue_4387_matmul(32, 4, 4, 2)], params)
+
+
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
     """A pointwise op reading the graph input ``input_name`` and writing ``out``.
 

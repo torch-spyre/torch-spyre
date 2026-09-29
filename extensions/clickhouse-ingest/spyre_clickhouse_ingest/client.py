@@ -70,7 +70,7 @@ class ClickHouse:
     ENV = ClickHouseEnv
 
     @classmethod
-    def connect(cls, *, verify: bool = True):
+    def connect(cls, *, verify: bool = True, database: str = ""):
         """Connect with the resolved settings; `verify=False` for an unverified cert."""
         host = cls.ENV.host()
         if not host:
@@ -93,7 +93,7 @@ class ClickHouse:
             port=port,
             user=cls.ENV.get("CLICKHOUSE_USER", cls.ENV.DEFAULT_USER),
             password=password,
-            database=cls.ENV.database(),
+            database=database or cls.ENV.database(),
             secure=secure,
             verify=verify,
         )
