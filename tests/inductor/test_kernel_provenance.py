@@ -56,6 +56,7 @@ from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre.execution import async_compile
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+from utils_inductor import mock_backend_compiler
 
 
 def _handle(
@@ -609,7 +610,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
@@ -632,7 +633,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,
@@ -657,7 +658,7 @@ class TestKernelProvenancePropagation:
                 return_value="/tmp/kernel",
             ),
             patch("torch_spyre.execution.async_compile.generate_bundle"),
-            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
                 return_value=runner,

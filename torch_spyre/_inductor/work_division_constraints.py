@@ -488,9 +488,15 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
         )
         window_dims = ctx.reduction_vars[-kernel_dims:] if kernel_dims else []
     elif op == DEPTHWISE_CONV2D_OP:
-        # Depthwise reduction order is kh, kw, then optional group. Unlike the
-        # forward-conv path, a group dimension may therefore follow the window.
-        window_dims = ctx.reduction_vars[:2]
+        # The kernel window is what depthwise reduces over: the reduction vars
+        # absent from the output index. Position in ``reduction_vars`` cannot
+        # select it -- the output's stick dim (channel) is listed there too,
+        # ahead of kh/kw. SuperDSC rejects a ki/kj split for every conv, and
+        # the scheduler transport cannot carry one (the input read indexes the
+        # output position; window offsets live in conv_params), so an unblocked
+        # window split would be scored here and silently dropped before codegen.
+        write_vars = ctx.output_td.dep.index.free_symbols
+        window_dims = [v for v in ctx.reduction_vars if v not in write_vars]
     else:
         return ConstraintResult()
 
@@ -1048,7 +1054,7 @@ def keep_by_index_search_adjacent_blocked_vars(
     sweep: each core then compares only the first stick's worth of search
     positions, so kept values beyond the first stick come back as the fill value
     -- silently wrong (~1.5-2.4% of a 6x17x4x128 dim-3 keep_by_index) and a
-    dxp_standalone abort at some core counts. This is independent of
+    backend-compiler abort at some core counts. This is independent of
     co-optimization: the plain work-division pass hits it too whenever it happens
     to split that dim. The leading and other batch dims split correctly, so only
     the enclosing dim is blocked, and only when the search axis spans more than

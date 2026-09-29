@@ -118,7 +118,8 @@ for both.
 
 A number of operations on Spyre produce _sparse_ tensors, i.e., tensors with a
 single element per _stick_. A **stick** is a 128-byte aligned, 128-byte contiguous
-block of tensor elements in device memory. The constant `BYTES_IN_STICK = 128` is defined in [`spyre_tensor_impl.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_tensor_impl.cpp) and used throughout the runtime, compiler, and tensor-layout code. At fp16 it works out to 64 elements per stick. The size lines up with the natural granularity of transfers between LPDDR5 device memory and the per-core LX scratchpad, so the hardware can pull in a full stick of contiguous elements in a single transfer.
+block of tensor elements in device memory. The per-stick element count for a
+data type is computed by `elems_per_stick()` in [`spyre_tensor_impl.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_tensor_impl.cpp) and used throughout the runtime, compiler, and tensor-layout code. At fp16 it works out to 64 elements per stick. The size lines up with the natural granularity of transfers between LPDDR5 device memory and the per-core LX scratchpad, so the hardware can pull in a full stick of contiguous elements in a single transfer.
 
 In order to describe sparse tensor layouts we permit Spyre tensor layouts to
 optionally include a single synthetic dimension that does not correspond to any
@@ -219,55 +220,42 @@ offset = dot(device_coordinates, stride_map)
 In other words, the stride_map is precisely what lets you walk a tensor
 in device-coordinate order and still land on the right host element.
 
-### Why stride_map replaced dim_map
+### Why the layout uses stride_map
 
-The first version of the Spyre layout took a different approach. It
-carried a `dim_map`: a vector that, for each device dimension, named
-the index of the PyTorch dimension it came from. For a PyTorch tensor
-of shape `[128, 256, 512]` laid out on device as
-`device_size = [256, 8, 128, 64]`, the `dim_map` would be
-`[1, 2, 0, 2]`. Read from left to right, that says device dim 0 came
-from PyTorch dim 1, device dim 1 from PyTorch dim 2 (the tile-index
-half of the inner dimension), device dim 2 from PyTorch dim 0, and
-device dim 3 from PyTorch dim 2 again (this time the within-stick
-half).
+The layout records one host stride per device dimension, with `-1`
+reserved for synthetic or fully-padded dims that have no host
+counterpart. A stride is an integer count of how many host elements to
+step by, and that count stays meaningful through padding, split
+dimensions, fused dimensions, synthetic dims, and views. That is why
+the layout carries strides directly rather than a per-dimension index
+back into the PyTorch shape.
 
-That representation reads nicely on slides, but it gets messy in the
-cases the Spyre stack handles every day. Padded dimensions are the
-first symptom. When the compiler rounds 150 fp16 values up to 192, or
-pads B's k-dim to a full stick for a matmul, the device dim no longer
-maps cleanly back to a single PyTorch dim. A `dim_map` has to fall
-back on a sentinel, and every pass that reads it grows a
-"if it's the sentinel, do something else" branch.
+Padding is the first case a stride handles cleanly. When the compiler
+rounds 150 fp16 values up to 192, or pads the k-dim of a matmul operand
+to a full stick, a device dimension no longer corresponds to a single
+PyTorch dimension. The stride still counts host elements correctly
+across the padded region, so no pass needs a sentinel branch.
 
-Fused and split dimensions are the second symptom. A `flatten`
-collapses two PyTorch dims into one; a `reshape` can split one into
-two. Tracking that with dim indices means tagging entries with
-"this is the upper half of dim 2", and the tag has to survive every
-intermediate pass: work division, scratchpad planning, codegen.
+Fused and split dimensions are the second case. A `flatten` collapses
+two PyTorch dims into one and a `reshape` can split one into two. The
+stride for each device dimension continues to record the host step, so
+work division, scratchpad planning, and codegen read it without special
+handling.
 
-Sparse Spyre layouts then add a synthetic inner dimension that has no
-corresponding PyTorch dim at all. Yet another sentinel. Views without
-copies make the picture even worse: when the compiler implements
-`transpose`, `flatten`, or `permute` as a different read pattern over
-the same storage, the PyTorch dim indices the view exposes have nothing
-to do with the device dims of the underlying buffer, and `dim_map` has
-to translate at every boundary.
+Sparse Spyre layouts add a synthetic inner dimension that has no
+corresponding PyTorch dim; its stride is `-1`. Views without copies are
+handled the same way. When the compiler implements `transpose`,
+`flatten`, or `permute` as a different read pattern over the same
+storage, the device strides describe that read pattern directly, with
+no translation at each boundary.
 
-Strides sidestep all of that. A stride is just an integer count of
-"how many host elements to step by", and that number stays meaningful
-through padding, splits, fuses, synthetic dims, and views. So the
-representation moved to a `stride_map`: one host stride per device
-dimension, with `-1` reserved for synthetic or fully-padded dims that
-have no host counterpart. Code that walks the device-coordinate space
-just dot-products with `stride_map` to recover the host offset, and
-the special cases listed above stop needing dedicated code paths.
-
-The compiler team puts it more directly: tensor strides are robust;
-tensor dimensions are not.
+Code that walks the device-coordinate space recovers the host offset
+with the identity `offset = dot(device_coordinates, stride_map)`. Tensor
+strides remain robust across padding, splits, fuses, synthetic dims, and
+views, which is why the layout represents them directly.
 
 :::{figure} ../_static/images/spyre-stride-map.png
-:alt: From PyTorch shape to Spyre device shape — logical view, physical view, stride_map identity
+:alt: From PyTorch shape to Spyre device shape: logical view, physical view, stride_map identity
 :width: 95%
 :align: center
 

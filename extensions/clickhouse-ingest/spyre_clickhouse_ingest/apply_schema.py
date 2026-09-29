@@ -12,130 +12,303 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Apply schema/*.sql to a ClickHouse database, in filename order.
-
-The DDL files are the ONLY definition of these tables. The alternative this replaces -- an
-ALTER ... ADD COLUMN IF NOT EXISTS pass run from the ingest on every insert -- is how
-hw_failure_diagnostics reached 45 columns with an empty sorting key and no checked-in shape:
-each writer added what it needed, nothing declared the whole, and the accumulated result was
-not reproducible from anything in the repo.
-
-Every statement is CREATE ... IF NOT EXISTS, so applying is idempotent and safe to re-run. It
-does NOT alter an existing table: a table whose live shape has diverged is reported, not
-silently patched, because reconciling it needs a decision (an ORDER BY cannot be changed in
-place, so it means DROP+CREATE or a rewrite through a temp table).
-"""
+"""Converges a database on schema/: creates what is missing, runs schema/migrations/ once
+each, recreates changed views, and fails on table drift rather than ALTERing."""
 
 import argparse
+import difflib
+import hashlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import regex as re
 
 
-def _schema_dir() -> Path:
-    """Where the .sql files live, in a checkout AND in an installed copy.
+@dataclass(frozen=True)
+class SchemaObject:
+    """One CREATE statement: kind is 'table', 'mv' or 'view'."""
 
-    Two layouts, because `schema/` is a SIBLING of the package in the repo but is packaged
-    INSIDE it (as package data) by a build -- a sibling directory cannot be installed, and
-    flat-layout autodiscovery refuses to treat it as a second top-level package. Checked in
-    that order so a checkout keeps editing one copy of the DDL rather than a stale build's.
-    """
-    here = Path(__file__).resolve().parent
-    sibling = here.parent / "schema"
-    return sibling if sibling.is_dir() else here / "schema"
+    kind: str
+    name: str
+    sql: str
+    file: str
 
 
-SCHEMA_DIR = _schema_dir()
-
-# A trailing ';' is optional in the files, and two of them carry ';' inside comment prose, so
-# statements are split after comments are stripped rather than on every ';' in the text.
-_LINE_COMMENT = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-
-# Minimum server version per file, read from a `-- NEEDS CLICKHOUSE >= X.Y` line in its header.
-# Declared in the file rather than here so the requirement travels with the DDL that has it.
-_NEEDS_VERSION = re.compile(r"--\s*NEEDS CLICKHOUSE >=\s*(\d+)\.(\d+)", re.IGNORECASE)
+class SchemaDrift(RuntimeError):
+    """A live table or MV differs from its file; only a migration may change one."""
 
 
-def _version_tuple(text: str) -> tuple:
-    return tuple(int(p) for p in re.findall(r"\d+", text)[:2])
+class SchemaApplier:
+    """Plans and applies schema/*.sql and schema/migrations/*.sql against one database."""
 
+    # A trailing ';' is optional, and two files carry ';' inside comment prose, so
+    # statements are split after stripping comments, not on every ';' in the text.
+    LINE_COMMENT = re.compile(r"--[^\n]*")
+    BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+    # Minimum server version per file, from a `-- NEEDS CLICKHOUSE >= X.Y` header line,
+    # declared in the file so the requirement travels with the DDL that has it.
+    NEEDS_VERSION = re.compile(
+        r"--\s*NEEDS CLICKHOUSE >=\s*(\d+)\.(\d+)", re.IGNORECASE
+    )
+    # A file that belongs in a different database (e.g. otel) applies only when named.
+    EXPLICIT = re.compile(r"^--\s*APPLY:\s*explicit\b", re.IGNORECASE | re.MULTILINE)
+    CREATE = re.compile(
+        r"^CREATE\s+(MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+        re.IGNORECASE,
+    )
+    # The server stores a view with its resolved column list and adds default settings;
+    # both are stripped so a stored definition compares equal to the file that made it.
+    VIEW_COLUMNS = re.compile(
+        r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: TO \S+)?) \(.*?\) AS (SELECT|WITH)\b"
+    )
+    SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
+    ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
+    ADDS = re.compile(
+        r"\bADD\s+(?:COLUMN|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
+    )
+    LEDGER = "schema_migrations"
+    LEDGER_DDL = (
+        "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
+        "checksum String, applied_at DateTime DEFAULT now()) "
+        "ENGINE = MergeTree ORDER BY migration_id"
+    )
 
-def required_version(text: str) -> tuple:
-    """The (major, minor) floor this file declares, or () when it declares none."""
-    m = _NEEDS_VERSION.search(text)
-    return (int(m.group(1)), int(m.group(2))) if m else ()
+    @staticmethod
+    def schema_dir() -> Path:
+        """Where the .sql files live: a checkout's sibling dir, else the install."""
+        here = Path(__file__).resolve().parent
+        sibling = here.parent / "schema"
+        return sibling if sibling.is_dir() else here / "schema"
 
+    @classmethod
+    def sql_files(cls, schema_dir: Path) -> list:
+        """The DDL files in apply order: filename order (prefix encodes dependency)."""
+        return sorted(schema_dir.glob("*.sql"))
 
-def sql_files(schema_dir: Path = SCHEMA_DIR) -> list:
-    """The DDL files in apply order, which is filename order (the numeric prefix encodes the
-    dependency: a view cannot precede the table it selects from)."""
-    return sorted(schema_dir.glob("*.sql"))
+    @classmethod
+    def migration_files(cls, schema_dir: Path) -> list:
+        """One-shot migrations in apply order; each runs once per database, ever."""
+        return sorted((schema_dir / "migrations").glob("*.sql"))
 
+    @classmethod
+    def statements(cls, text: str) -> list:
+        """The executable statements in one file, comments removed."""
+        stripped = cls.LINE_COMMENT.sub("", cls.BLOCK_COMMENT.sub("", text))
+        return [s.strip() for s in stripped.split(";") if s.strip()]
 
-def statements(text: str) -> list:
-    """The executable statements in one file, comments removed.
+    @classmethod
+    def required_version(cls, text: str) -> tuple:
+        """The (major, minor) floor this file declares, or () when it declares none."""
+        m = cls.NEEDS_VERSION.search(text)
+        return (int(m.group(1)), int(m.group(2))) if m else ()
 
-    clickhouse_connect sends one statement per command(), so a multi-statement file must be
-    split; splitting the RAW text breaks on a ';' that appears inside a comment.
-    """
-    stripped = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", text))
-    return [s.strip() for s in stripped.split(";") if s.strip()]
+    @staticmethod
+    def version_tuple(text: str) -> tuple:
+        return tuple(int(p) for p in re.findall(r"\d+", text)[:2])
 
+    @staticmethod
+    def checksum(text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
 
-def apply_file(client, path: Path, dry_run: bool = False, text: str = "") -> int:
-    """Execute one DDL file. Returns the number of statements applied."""
-    stmts = statements(text or path.read_text())
-    for stmt in stmts:
-        if dry_run:
-            print(f"    {stmt.splitlines()[0][:100]}")
-            continue
-        client.command(stmt)
-    return len(stmts)
+    @classmethod
+    def objects(cls, path: Path, text: str) -> list:
+        """The CREATE statements of one schema file; anything else belongs in migrations/."""
+        out = []
+        for stmt in cls.statements(text):
+            m = cls.CREATE.match(stmt)
+            if not m:
+                raise ValueError(
+                    f"{path.name}: only CREATE statements belong in schema/ -- move "
+                    f"'{stmt.splitlines()[0][:80]}' to schema/migrations/"
+                )
+            kind = {"table": "table", "view": "view"}.get(m.group(1).lower(), "mv")
+            out.append(SchemaObject(kind, m.group(2), stmt, path.name))
+        return out
 
+    @classmethod
+    def selected_files(cls, schema_dir: Path, include=(), server: tuple = ()) -> list:
+        """(path, text) for every file this run applies, in order."""
+        chosen = []
+        for path in cls.sql_files(schema_dir):
+            text = path.read_text()
+            if cls.EXPLICIT.search(text) and path.name not in include:
+                print(f"  {path.name:34} skipped -- APPLY: explicit, not --include'd")
+                continue
+            need = cls.required_version(text)
+            if need and server and server < need:
+                print(
+                    f"  {path.name:34} SKIPPED -- needs ClickHouse >= "
+                    f"{need[0]}.{need[1]}, server is {server[0]}.{server[1]}"
+                )
+                continue
+            chosen.append((path, text))
+        return chosen
 
-def apply_all(client, schema_dir: Path = SCHEMA_DIR, dry_run: bool = False) -> int:
-    """Apply every DDL file in order. Returns the total statements applied.
+    @classmethod
+    def canonical(cls, client, sql: str, db: str) -> str:
+        """One definition in the server's own formatting, database-unqualified."""
+        # Client-side binding: a DDL-sized value overflows a server-side URL parameter.
+        s = client.query(
+            "SELECT formatQuerySingleLine(%(s)s)", parameters={"s": sql}
+        ).result_rows[0][0]
+        s = s.replace(" IF NOT EXISTS", "", 1).replace(f"{db}.", "")
+        for default in cls.SERVER_DEFAULTS:
+            s = s.replace(default, "")
+        return cls.VIEW_COLUMNS.sub(r"\1 AS \2", s, count=1)
 
-    No try/except around a statement: a DDL failure means the database does not have the shape
-    the writers assume, and continuing past it would produce exactly the partially-migrated
-    state this module exists to prevent.
+    @classmethod
+    def live(cls, client, db: str) -> dict:
+        """name -> stored CREATE statement, for every object in `db`."""
+        rows = client.query(
+            "SELECT name, create_table_query FROM system.tables "
+            "WHERE database = %(db)s",
+            parameters={"db": db},
+        ).result_rows
+        return {name: ddl for name, ddl in rows}
 
-    A file whose declared version floor the server does not meet is SKIPPED with a warning
-    rather than attempted. Those tables are the OTel exporter's, which we only read, so an old
-    server should still get every table we write -- and the alternative was an opaque
-    "Only literals can be skip index arguments" that stopped the whole apply.
-    """
-    files = sql_files(schema_dir)
-    if not files:
-        # Raise rather than return 0: an empty glob means the DDL was not found, and reporting
-        # "applied 0 statements" as success leaves the caller believing a database it never
-        # created is ready. Reached for real when the package is installed without its schema
-        # data -- the applier then built nothing and said so in a way nobody could see.
-        raise FileNotFoundError(f"no .sql files in {schema_dir}")
-    server = ()
-    if not dry_run:
-        server = _version_tuple(client.command("SELECT version()"))
-    total = 0
-    for path in files:
-        text = path.read_text()
-        need = required_version(text)
-        if need and server and server < need:
-            print(
-                f"  {path.name:34} SKIPPED -- needs ClickHouse >= "
-                f"{need[0]}.{need[1]}, server is {server[0]}.{server[1]}"
+    @classmethod
+    def applied(cls, client, db: str) -> dict:
+        """migration_id -> checksum already recorded; {} before the ledger exists."""
+        if not bool(client.command(f"EXISTS TABLE {db}.{cls.LEDGER}")):
+            return {}
+        rows = client.query(
+            f"SELECT migration_id, checksum FROM {db}.{cls.LEDGER}"
+        ).result_rows
+        return {mid: chk for mid, chk in rows}
+
+    @classmethod
+    def differs(cls, client, obj: SchemaObject, stored: str, db: str) -> str:
+        """'' when `stored` matches the file, else a short unified diff of the two."""
+        want = cls.canonical(client, obj.sql, db)
+        have = cls.canonical(client, stored, db)
+        if want == have:
+            return ""
+        split = lambda s: s.replace(", ", ",\n").splitlines()  # noqa: E731
+        diff = difflib.unified_diff(
+            split(have), split(want), "live", obj.file, lineterm="", n=0
+        )
+        return "\n".join(list(diff)[:40])
+
+    @classmethod
+    def pending_adds(cls, pending: list) -> dict:
+        """table -> column/index names that pending migrations ADD."""
+        out: dict = {}
+        for p in pending:
+            for stmt in cls.statements(p.read_text()):
+                m = cls.ALTER.match(stmt)
+                if m:
+                    out.setdefault(m.group(1), set()).update(cls.ADDS.findall(stmt))
+        return out
+
+    @classmethod
+    def without(cls, obj: SchemaObject, names: set) -> SchemaObject:
+        """obj with the column/index definitions named in `names` removed (obj itself if none)."""
+        if not names:
+            return obj
+        alt = "|".join(re.escape(n) for n in names)
+        sql = re.sub(rf"(?m)^\s*(?:INDEX\s+)?`?(?:{alt})`?\s[^\n]*\n", "", obj.sql)
+        sql = re.sub(r",(\s*\))", r"\1", sql)
+        return SchemaObject(obj.kind, obj.name, sql, obj.file)
+
+    @classmethod
+    def plan(cls, client, db: str, files: list, migrations: list) -> list:
+        """(action, name, detail) for every change an apply would make, in order."""
+        live = cls.live(client, db)
+        done = cls.applied(client, db)
+        objs = [o for path, text in files for o in cls.objects(path, text)]
+        pending = [p for p in migrations if p.name not in done]
+        added = cls.pending_adds(pending)
+        steps = []
+        for o in objs:
+            if o.kind == "view":
+                continue
+            if o.name not in live:
+                steps.append(("create", o.name, o.file))
+            else:
+                diff = cls.differs(client, o, live[o.name], db)
+                if diff:
+                    # Expected only if the table matches once what a pending migration adds (and
+                    # the live table lacks: the ADDs are IF NOT EXISTS) is left out.
+                    stored = live[o.name]
+                    missing = {
+                        n
+                        for n in added.get(o.name, set())
+                        if not re.search(rf"\b{n}\b", stored)
+                    }
+                    before = cls.without(o, missing)
+                    resolved = before is not o and not cls.differs(
+                        client, before, stored, db
+                    )
+                    steps.append(("migrates" if resolved else "drift", o.name, diff))
+        steps += [("migrate", p.name, "") for p in pending]
+        for o in objs:
+            if o.kind != "view":
+                continue
+            if o.name not in live:
+                steps.append(("create", o.name, o.file))
+            elif cls.differs(client, o, live[o.name], db):
+                steps.append(("recreate", o.name, o.file))
+        return steps
+
+    @classmethod
+    def apply(cls, client, db: str, files: list, migrations: list) -> list:
+        """Converge `db` on the files. Tables/MVs, then migrations, then views."""
+        client.command(cls.LEDGER_DDL)
+        objs = [o for path, text in files for o in cls.objects(path, text)]
+        steps = []
+        live = cls.live(client, db)
+        for o in objs:
+            if o.kind != "view" and o.name not in live:
+                client.command(o.sql)
+                steps.append(("create", o.name, o.file))
+        done = cls.applied(client, db)
+        for path in migrations:
+            text = path.read_text()
+            if path.name in done:
+                if done[path.name] != cls.checksum(text):
+                    print(f"  [warn] {path.name} changed after it was applied")
+                continue
+            for stmt in cls.statements(text):
+                client.command(stmt)
+            client.insert(
+                cls.LEDGER,
+                [[path.name, cls.checksum(text)]],
+                column_names=["migration_id", "checksum"],
+                database=db,
             )
-            continue
-        stmts = apply_file(client, path, dry_run=dry_run, text=text)
-        total += stmts
-        print(f"  {path.name:34} {stmts} statement(s)")
-    return total
+            steps.append(("migrate", path.name, ""))
+        live = cls.live(client, db)
+        drift = [
+            (o.name, d)
+            for o in objs
+            if o.kind != "view" and (d := cls.differs(client, o, live[o.name], db))
+        ]
+        if drift:
+            raise SchemaDrift(
+                "live definition differs from schema/ -- add a migration:\n"
+                + "\n".join(f"{name}:\n{d}" for name, d in drift)
+            )
+        for o in objs:
+            if o.kind != "view":
+                continue
+            if o.name not in live:
+                client.command(o.sql)
+                steps.append(("create", o.name, o.file))
+            elif cls.differs(client, o, live[o.name], db):
+                # A plain view holds no data; the server rejects CREATE OR REPLACE.
+                client.command(f"DROP VIEW IF EXISTS {o.name}")
+                client.command(o.sql)
+                steps.append(("recreate", o.name, o.file))
+        return steps
+
+
+SCHEMA_DIR = SchemaApplier.schema_dir()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Apply the v2 schema DDL to a ClickHouse database"
+        description="Converge a ClickHouse database on the v2 schema DDL"
     )
     parser.add_argument(
         "--schema-dir",
@@ -144,28 +317,68 @@ def main() -> None:
         help=f"Directory of *.sql files (default: {SCHEMA_DIR})",
     )
     parser.add_argument(
+        "--database",
+        default="",
+        help="Target database (default: $CLICKHOUSE_DB_V2, else $CLICKHOUSE_DB)",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="Also apply this APPLY: explicit file (repeatable)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the statements that would run, without connecting",
+        help="List the statements, without connecting",
+    )
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="Print what an apply would change; exit 1 if anything would, 2 on drift",
     )
     args = parser.parse_args()
 
-    files = sql_files(args.schema_dir)
-    if not files:
+    if not SchemaApplier.sql_files(args.schema_dir):
         print(f"[error] No .sql files in {args.schema_dir}", file=sys.stderr)
         sys.exit(1)
+    migrations = SchemaApplier.migration_files(args.schema_dir)
 
     if args.dry_run:
-        print(f"[dry-run] Would apply {len(files)} file(s) from {args.schema_dir}:")
-        apply_all(None, args.schema_dir, dry_run=True)
+        print(f"[dry-run] {args.schema_dir}:")
+        for path, text in SchemaApplier.selected_files(args.schema_dir, args.include):
+            for o in SchemaApplier.objects(path, text):
+                print(f"  {path.name:34} {o.kind:5} {o.name}")
+        for path in migrations:
+            print(f"  migrations/{path.name}")
         return
 
-    from .client import client_summary, get_client
+    from .client import ClickHouse, ClickHouseEnv
 
-    print(f"[info] Applying {len(files)} file(s) to {client_summary()} ...")
-    client = get_client()
-    total = apply_all(client, args.schema_dir)
-    print(f"[info] Applied {total} statement(s) from {len(files)} file(s).")
+    db = args.database or ClickHouseEnv.target_database() or ClickHouseEnv.database()
+    client = ClickHouse.connect(database=db)
+    server = SchemaApplier.version_tuple(client.command("SELECT version()"))
+    files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
+    print(f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}")
+
+    if args.check:
+        steps = SchemaApplier.plan(client, db, files, migrations)
+        for action, name, detail in steps:
+            print(f"  {action:8} {name}" + (f"\n{detail}" if action == "drift" else ""))
+        print(f"[check] {len(steps)} change(s) pending")
+        if any(action == "drift" for action, _, _ in steps):
+            sys.exit(2)
+        sys.exit(1 if steps else 0)
+
+    try:
+        steps = SchemaApplier.apply(client, db, files, migrations)
+    except SchemaDrift as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(1)
+    for action, name, _ in steps:
+        print(f"  {action:8} {name}")
+    print(f"[info] {len(steps)} change(s) applied to {db}")
 
 
 if __name__ == "__main__":

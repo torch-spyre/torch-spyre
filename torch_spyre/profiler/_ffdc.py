@@ -280,7 +280,7 @@ def _safe_torch_version() -> str:
 
 def _safe_torch_spyre_version() -> str:
     try:
-        from torch_spyre.version import __version__
+        from torch_spyre._version import __version__
 
         return __version__
     except Exception:

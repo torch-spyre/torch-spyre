@@ -49,7 +49,9 @@ class EdgeCostMap:
 
     Entries are computed on demand by compute_restickify_needed. `dep` is the
     MemoryDep for this input; it is not used locally but is forwarded to
-    compute_restickify_needed in pass_utils.
+    compute_restickify_needed in pass_utils. ``require_exact`` makes physical
+    layout equality, rather than ordinary stick compatibility, the zero-cost
+    condition for this edge.
     """
 
     def __init__(
@@ -60,12 +62,14 @@ class EdgeCostMap:
         target_dep: "MemoryDep",
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
+        require_exact: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._require_exact = require_exact
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
@@ -90,14 +94,20 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if compatible, the input element count if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            require_exact=self._require_exact,
         )
         if not needed and self._forbidden_stick_sym is not None:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
@@ -295,26 +305,56 @@ class FixedInOutNode(RestickNodeCost):
         edge_costs,
         required_out_stl: "SpyreTensorLayout",
         required_in_stls: "list[SpyreTensorLayout]",
+        out_dep: "MemoryDep",
     ):
         super().__init__(edge_costs)
         self.required_out_stl = required_out_stl
         # Parallel to edge_costs by construction in from_args (both built from the
         # same zip over args/req_stls). strict=True in min_input_cost asserts this.
         self.required_in_stls = required_in_stls
+        self._out_dep = out_dep
+        self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep, exact_input_indices=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        exact_input_indices = exact_input_indices or set()
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                require_exact=i in exact_input_indices,
+            )
+            for i, (arg, req) in enumerate(zip(args, req_stls))
         ]
-        return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+        return cls(
+            edge_costs,
+            required_out_stl=out_stl,
+            required_in_stls=req_stls,
+            out_dep=out_dep,
+        )
+
+    def _out_stick_compatible(self, out_stl: "SpyreTensorLayout") -> bool:
+        """True if out_stl is stick-compatible with required_out_stl."""
+        if out_stl == self.required_out_stl:
+            return True
+        needed, _ = compute_restickify_needed(
+            self.required_out_stl,
+            self._out_host,
+            self._out_dep,
+            out_stl,
+            self._out_dep,
+            None,
+        )
+        return not needed
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
             ec.cost(lk, rk)
@@ -325,7 +365,7 @@ class FixedInOutNode(RestickNodeCost):
         return list(zip(self.edge_costs, self.required_in_stls))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         matching = [
             (ec, req)

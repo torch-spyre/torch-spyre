@@ -131,6 +131,104 @@ def test_metrics_absent_from_the_xml_stay_null(ingest, tmp_path):
     assert row["mem_size_mb"] is None
 
 
+def test_uncaptured_zero_metrics_are_not_stored_as_measurements(ingest):
+    """A metric the harness zero-filled on every record is absent, not measured."""
+    records = [
+        {
+            "operation_name": "a",
+            "spyre_ms": 1.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+        {
+            "operation_name": "b",
+            "spyre_ms": 2.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+    ]
+    for entry in ingest._bench_entries(records):
+        assert set(entry["measurements"]) == {"spyre_ms"}
+
+
+def test_a_zero_beside_captured_values_is_kept(ingest):
+    records = [
+        {"operation_name": "a", "pt_util_percent": 0.0, "memory_transfer_mean_ms": 0.0},
+        {
+            "operation_name": "b",
+            "pt_util_percent": 42.0,
+            "memory_transfer_mean_ms": 0.0,
+        },
+    ]
+    a, b = ingest._bench_entries(records)
+    assert a["measurements"]["pt_util_percent"] == [0.0]
+    assert b["measurements"]["pt_util_percent"] == [42.0]
+    # Not a zero-filled metric: an all-zero column is still a measurement.
+    assert a["measurements"]["memory_transfer_mean_ms"] == [0.0]
+
+
+def test_torch_spyre_ms_is_not_duplicated_into_measurements(ingest):
+    (entry,) = ingest._bench_entries(
+        [
+            {
+                "operation_name": "a",
+                "metric": "spyre_kernel_ms",
+                "duration_ms": 3.0,
+                "torch_spyre_ms": 3.0,
+            }
+        ]
+    )
+    assert entry["measurements"] == {"duration_ms": [3.0]}
+    assert entry["backend"] == "spyre"
+
+
+def test_report_records_fall_back_to_the_spyre_backend(ingest):
+    (report,) = ingest._bench_entries([{"operation_name": "a", "spyre_ms": 1.0}])
+    (sendnn,) = ingest._bench_entries([{"operation_name": "a", "sendnn_ms": 1.0}])
+    assert report["backend"] == "spyre"
+    assert sendnn["backend"] == "sendnn"
+
+
+@pytest.mark.parametrize(
+    ("argv", "component"),
+    [([], "torch-spyre"), (["--component", "hf-adapters"], "hf-adapters")],
+)
+def test_benchmarks_are_stamped_with_the_callers_component(
+    ingest, monkeypatch, tmp_path, argv, component
+):
+    xml = _write_suite(
+        tmp_path,
+        _hf_case(f"perf_matmul_wall_clock_ms_{SHAPES}", "12.5"),
+        version_info=FULL_PROVENANCE,
+    )
+    written = []
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "v2")
+    monkeypatch.setattr(ingest, "benchmark_tables_present", lambda *a: True)
+    monkeypatch.setattr(ingest, "benchmarks_already_ingested", lambda *a: False)
+    monkeypatch.setattr(
+        ingest,
+        "insert_benchmarks",
+        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
+        or len(entries),
+    )
+    _run_main(
+        ingest,
+        monkeypatch,
+        xml,
+        FakeClient(dict(FULL_RUN_SCHEMA)),
+        extra_argv=[
+            "--trigger-type",
+            "perf",
+            "--schema",
+            "both",
+            "--gha-run-id",
+            "7",
+            *argv,
+        ],
+    )
+    assert written == [component]
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -164,6 +262,13 @@ FULL_PROVENANCE = {
     "flex": {"commit": "def5678", "branch": "main"},
     "deeptools": {"commit": "aaa111", "branch": "master"},
     "spyre-comms": {"commit": "bbb222", "branch": "main"},
+}
+
+RPM_PROVENANCE = {
+    "torch-spyre": {"commit": "abc1234", "branch": "main", "version": None},
+    "flex/ibm-flex": {"commit": "def5678", "branch": "main"},
+    "deeptools/ibm-deeptools": {"commit": "aaa111", "branch": "master"},
+    "spyre-comms/ibm-spyre-comms": {"commit": "bbb222", "branch": "main"},
 }
 
 
@@ -340,6 +445,33 @@ def test_full_provenance_is_valid_and_regression_eligible(ingest):
     quality, eligible = ingest.classify_run_quality(json.dumps(FULL_PROVENANCE))
     assert quality == "valid"
     assert eligible == 1
+
+
+def test_rpm_provenance_keys_are_valid_and_regression_eligible(ingest):
+    """Prod version_info uses flex/ibm-flex etc.; must not classify incomplete."""
+    quality, eligible = ingest.classify_run_quality(json.dumps(RPM_PROVENANCE))
+    assert quality == "valid"
+    assert eligible == 1
+
+
+def test_rpm_provenance_missing_commit_is_incomplete(ingest):
+    missing = dict(RPM_PROVENANCE)
+    missing["flex/ibm-flex"] = {"commit": "N/A"}
+    assert ingest.classify_run_quality(json.dumps(missing)) == ("incomplete", 0)
+    empty = dict(RPM_PROVENANCE)
+    empty["deeptools/ibm-deeptools"] = {"commit": ""}
+    assert ingest.classify_run_quality(json.dumps(empty)) == ("incomplete", 0)
+    absent = dict(RPM_PROVENANCE)
+    del absent["spyre-comms/ibm-spyre-comms"]
+    assert ingest.classify_run_quality(json.dumps(absent)) == ("incomplete", 0)
+
+
+def test_bare_bad_commit_falls_through_to_rpm_alias(ingest):
+    """OR semantics: bare N/A must not block a good RPM commit (#4896)."""
+    payload = dict(FULL_PROVENANCE)
+    payload["flex"] = {"commit": "N/A"}
+    payload["flex/ibm-flex"] = {"commit": "def5678"}
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("valid", 1)
 
 
 def test_incomplete_version_info_is_visible_not_regression_eligible(ingest):
@@ -562,6 +694,7 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
         "component_of",
         "run_id_for",
         "cases_already_ingested",
+        "insert_gha_artifact_result",
         "insert_test_results",
         "extract_properties",
         "promote_xpass",
@@ -572,3 +705,135 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
     ):
         assert getattr(ingest, name) is getattr(lib, name), name
     assert ingest.schema_model is lib.schema
+
+
+# The GHA leg's artifact identity: derived on the RUNNER, arriving as --artifact-id.
+# These cover what the ingest side does with it.
+
+_BASE = "2b397099-6200-52fb-98c4-b603961a0582"
+_AID = "8a4c410c-320d-5711-b987-c15b50bec3fc"
+_RUN_ID = "1a6080e8-d061-547f-ab63-1af99b18ad0c"
+
+
+def test_artifact_record_splits_into_its_three_fields(ingest):
+    assert ingest._parse_artifact_record(
+        f"{_AID}|{_BASE}|torch-spyre@07379f50,lxml"
+    ) == (
+        _AID,
+        _BASE,
+        "torch-spyre@07379f50,lxml",
+    )
+
+
+def test_a_bare_id_still_parses(ingest):
+    # Producer and parser are versioned independently; a format bump must not lose rows.
+    assert ingest._parse_artifact_record(_AID) == (_AID, "", "")
+    assert ingest._parse_artifact_record(f"{_AID}|{_BASE}") == (_AID, _BASE, "")
+    assert ingest._parse_artifact_record("") == ("", "", "")
+
+
+def test_a_leg_with_no_cases_is_an_error_not_a_failure(ingest):
+    # A suite that produced no test did not regress -- it did not run.
+    assert ingest._leg_state(0, 0) == "error"
+    assert ingest._leg_state(0, 12) == "passed"
+    assert ingest._leg_state(1, 12) == "failed"
+
+
+def test_run_url_needs_both_coordinates(ingest):
+    args = types.SimpleNamespace(repository="o/r", gha_run_id="42")
+    assert ingest._gha_run_url(args).endswith("/o/r/actions/runs/42")
+    assert (
+        ingest._gha_run_url(types.SimpleNamespace(repository="", gha_run_id="42")) == ""
+    )
+    assert (
+        ingest._gha_run_url(types.SimpleNamespace(repository="o/r", gha_run_id=""))
+        == ""
+    )
+
+
+class _ArtifactClient:
+    """Reports nothing recorded yet, and keeps what was inserted."""
+
+    def __init__(self):
+        self.inserts = []
+
+    def query(self, sql, parameters=None):
+        return _Result([[0]])
+
+    def insert(self, table, rows, column_names=None, database=None):
+        self.inserts.append((table, rows, column_names))
+
+
+def _args(**kw):
+    a = types.SimpleNamespace(
+        artifact_id=f"{_AID}|{_BASE}|torch-spyre@07379f50",
+        component="torch-spyre",
+        platform="x86_64",
+        repository="torch-spyre/torch-spyre",
+        branch="main",
+        sha="07379f50",
+        gha_run_id="42",
+    )
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
+    # Many files under one run_id: a per-file write would report only the first shard.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 3, "total": 90, "duration_s": 12.5}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    results = [i for i in c.inserts if i[0] == "artifact_results"]
+    assert len(results) == 1
+    row = dict(zip(results[0][2], results[0][1][0]))
+    assert row["state"] == "failed"
+    assert row["duration_s"] == 12.5
+    assert row["artifact_id"] == _AID
+
+
+def test_no_artifact_id_writes_nothing(ingest):
+    # Any image baked before the id was stamped: cases land, nothing claims an artifact.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert c.inserts == []
+
+
+def test_a_tier_the_ddl_rejects_is_skipped_not_raised(ingest):
+    # An empty --trigger-type is the commonest cause; the server would reject the row.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, ""): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    assert c.inserts == []
+
+
+def test_a_write_failure_never_propagates(ingest):
+    # The cases are already in; losing the verdict must not also lose them.
+    class Boom(_ArtifactClient):
+        def insert(self, *a, **kw):
+            raise RuntimeError("clickhouse is down")
+
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)
+
+
+def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_path):
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a' time='1'><failure message='x'/></testcase>"
+        "<testcase classname='c' name='test_b' time='2'/>"
+        "<testcase classname='c' name='test_a' time='3'/>"
+        "<testcase classname='c' name='test_B' time='4'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    by_name = {c["name"]: c for c in cases}
+    # Exact match only: test_b and test_B are different tests.
+    assert sorted(by_name) == ["test_B", "test_a", "test_b"]
+    assert by_name["test_a"]["status"] == "passed"
+    assert by_name["test_a"]["duration_s"] == 3.0
+    assert run["total_tests"] == 3
+    assert run["failed"] == 0

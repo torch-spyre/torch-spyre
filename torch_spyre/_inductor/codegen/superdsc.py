@@ -330,10 +330,10 @@ def _unambiguous_physical_axis(
     Coarse tiling can leave a constant physical axis in ``device_size`` after
     its loop role has moved to a ``LoopSpec``. Positional alignment between
     the remaining logical dimensions and physical axes is then invalid. A
-    non-stick dimension with one coordinate dependency still has an
-    unambiguous physical axis, which is authoritative for its extent and
-    stride. Factorized dimensions intentionally return ``None`` here and keep
-    the established positional handling.
+    dimension carried by one non-lane coordinate still has an unambiguous
+    physical axis, which is authoritative for its extent and stride.
+    Dimensions factorized across multiple non-lane coordinates return
+    ``None`` here and keep the established positional handling.
     """
     positions = [
         index
@@ -841,8 +841,9 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
     # which the pipeline squeezes out (so its label was already dropped by
     # _align_pool_dim_labels).  Such an axis is a plain pass-through: emitting a
     # paddingSizes_/windowDim_ entry for it would reference a dim the SDSC no
-    # longer has, and dxp_standalone aborts with "Missing window size for padded
-    # size calculation".  So skip any axis whose window dim is absent.
+    # longer has, which the backend rejects -- dxp_standalone aborted with
+    # "Missing window size for padded size calculation".  So skip any axis whose
+    # window dim is absent.
     axes = [
         ("i", "ki", kH, sH, pH),
         ("j", "kj", kW, sW, pW),
@@ -1328,11 +1329,12 @@ def _create_sdsc_tensors(
             # appear in x's layout with scale=-1 (reduced_dim).
             #
             # M=1 (coarse-tiling GEMV): N leaks into x's physical dep index,
-            # so x_dim_order already contains y_stick (N).  DXP computes x's
-            # reuse dim by set-subtraction (KERNEL - INPUT); if N is in both,
-            # the result is empty and DXP asserts inp0_reuse_dim.size() == 1.
-            # Strip N from x's layout so INPUT stays K-only and DXP correctly
-            # identifies N as x's broadcast dim.
+            # so x_dim_order already contains y_stick (N).  The backend
+            # computes x's reuse dim by set-subtraction (KERNEL - INPUT); if N is
+            # in both, the result is empty and the backend asserts
+            # inp0_reuse_dim.size() == 1.  Strip N from x's layout so INPUT stays
+            # K-only and the backend correctly identifies N as x's broadcast
+            # dim.
             # Partition matmul_x_reuse_dims into two mutually exclusive,
             # exhaustive subsets based on membership in x's current dim_order.
             x_dim_order_set = set(dim_order)
@@ -1367,13 +1369,16 @@ def _create_sdsc_tensors(
 
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
-            if dim is not stick_dim:
-                # A tiled-away loop role may survive as a constant physical
-                # axis. Locate every other role by coordinate identity so the
-                # constant slot cannot shift an outer role onto the wrong
-                # device extent (notably Hkv in native GQA with D=128).
-                physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            else:
+            # A tiled-away loop role may survive as a constant physical axis.
+            # Locate live roles by coordinate identity so that slot cannot
+            # shift an outer role onto the wrong device extent.
+            physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
+            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+                # Keep the positional handling for ordinary stick dimensions.
+                # When a tiled-away axis precedes the stick's block axis,
+                # however, include its gap just as for a non-stick dimension:
+                # [Hkv, G, D/64, D%64] with G tiled to one still has a G*D
+                # stride between heads, even if one core handles several heads.
                 physical_axis = None
 
             if has_indirect_access and (

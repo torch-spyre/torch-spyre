@@ -1,0 +1,144 @@
+name: Ingest a pytorch/pytorch CI-relay dispatch into ClickHouse
+description: >
+  Classify a repository_dispatch payload from pytorch/pytorch's CI relay (CRCR) and record it
+  in ClickHouse (.github/scripts/ingest_pytorch_dispatch.py). The SINGLE implementation of the
+  push-pytorch-dispatch-to-clickhouse.yaml ingest steps, extracted so another repo tracking
+  the same relay can call it directly instead of copying the checkout+venv+install+ingest
+  steps. Secrets cannot reach a composite action, so the caller passes the ClickHouse
+  connection as plain inputs.
+
+inputs:
+  payload-json:
+    description: The repository_dispatch client_payload, as JSON text (e.g. toJSON(...)).
+    required: true
+  event-type:
+    description: repository_dispatch event type (github.event.action), e.g. pull_request | push.
+    required: false
+    default: ''
+  run-id:
+    description: GHA run ID of the ingesting workflow.
+    required: false
+    default: '0'
+  run-link:
+    description: URL to the ingesting GHA run.
+    required: false
+    default: ''
+  job-name:
+    description: Name of the job run for this dispatch, set by a later pipeline stage once decided.
+    required: false
+    default: ''
+  progress:
+    description: 'Lifecycle state of job-name: in_progress | completed | rejected.'
+    required: false
+    default: ''
+  stage:
+    description: 'Finer-grained pipeline point: rejected | torch_build | torch_spyre_build | running_tests | completed.'
+    required: false
+    default: ''
+  pytorch-sha:
+    description: Exact pytorch/pytorch commit SHA being built for this dispatch.
+    required: false
+    default: ''
+  torch-spyre-sha:
+    description: Exact torch-spyre commit SHA used for this dispatch's build.
+    required: false
+    default: ''
+  result-payload-file:
+    description: Optional path to a JSON file with the job's result payload.
+    required: false
+    default: ''
+  script-repo:
+    description: Repository holding the canonical script, for the sparse-checkout fallback.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: Ref of script-repo to check out. Pin to a tag from another repo.
+    required: false
+    default: ''
+  torch-spyre-dir:
+    description: Fallback directory holding a torch-spyre checkout. Empty = workspace, then sparse-checkout.
+    required: false
+    default: ''
+  clickhouse-host:
+    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port (default 443 inside the script).
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user (default "default" inside the script).
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # The no-op gate lives here, not in the library: get_client() reads CLICKHOUSE_HOST as a
+    # required env (a KeyError, not a clean skip, when absent).
+    - name: Gate on ClickHouse config
+      id: gate
+      shell: bash
+      env:
+        CH_HOST: ${{ inputs.clickhouse-host }}
+      run: |
+        if [ -z "${CH_HOST}" ]; then
+          echo "::notice::ClickHouse host not configured — skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Setup spyre-clickhouse-ingest
+      id: setup
+      if: steps.gate.outputs.configured == 'true'
+      uses: ./.github/actions/setup-clickhouse-ingest
+      with:
+        extra-scripts: .github/scripts/ingest_pytorch_dispatch.py
+        script-repo: ${{ inputs.script-repo }}
+        script-ref: ${{ inputs.script-ref }}
+        torch-spyre-dir: ${{ inputs.torch-spyre-dir }}
+
+    - name: Write dispatch payload to file
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        PAYLOAD_JSON: ${{ inputs.payload-json }}
+      run: printf '%s' "$PAYLOAD_JSON" > payload.json
+
+    - name: Classify dispatch and ingest into ClickHouse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.setup.outputs.root }}
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CH_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_DB_IN: ${{ inputs.clickhouse-db }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
+        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        python3 "${ROOT}/.github/scripts/ingest_pytorch_dispatch.py" \
+          --payload-file          payload.json \
+          --event-type            "${{ inputs.event-type }}" \
+          --run-id                "${{ inputs.run-id }}" \
+          --run-link              "${{ inputs.run-link }}" \
+          --job-name              "${{ inputs.job-name }}" \
+          --progress              "${{ inputs.progress }}" \
+          --stage                 "${{ inputs.stage }}" \
+          --pytorch-sha           "${{ inputs.pytorch-sha }}" \
+          --torch-spyre-sha       "${{ inputs.torch-spyre-sha }}" \
+          --result-payload-file   "${{ inputs.result-payload-file }}"

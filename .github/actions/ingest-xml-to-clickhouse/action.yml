@@ -36,6 +36,19 @@ inputs:
     description: Numeric GitHub Actions run id, used as the dedup key.
     required: false
     default: ''
+  artifact-id:
+    description: >
+      artifact_id of what the leg ACTUALLY RAN, derived by derive-gha-artifact-id on the
+      runner. Set, the ingest also writes the artifacts row and the artifact_results verdict;
+      empty (default) writes neither, leaving every existing caller unchanged.
+    required: false
+    default: ''
+  repository:
+    description: >
+      owner/repo the tested commit came from, recorded in artifacts.sources -- the column
+      resolve_covered_tiers.py reaches an artifact through. Empty = GITHUB_REPOSITORY.
+    required: false
+    default: ''
   triggered-at:
     description: Trigger timestamp recorded against the rows (may be empty).
     required: false
@@ -253,6 +266,8 @@ runs:
         SCHEMA_IN: ${{ inputs.schema }}
         PLATFORM_IN: ${{ inputs.platform }}
         COMPONENT_IN: ${{ inputs.component }}
+        ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
+        REPOSITORY_IN: ${{ inputs.repository }}
       run: |
         source .venv/bin/activate
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
@@ -273,6 +288,19 @@ runs:
            && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--component"; then
           COMPONENT_ARGS=(--component "${COMPONENT_IN}")
         fi
+        # Same --help probe: a prebaked image can carry a script older than these flags, and
+        # argparse exits 2 on an unknown one. Probed once for both -- they landed together.
+        ARTIFACT_ARGS=()
+        if [ -n "${ARTIFACT_ID_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--artifact-id"; then
+          ARTIFACT_ARGS=(--artifact-id "${ARTIFACT_ID_IN}")
+          if [ -n "${REPOSITORY_IN}" ]; then
+            ARTIFACT_ARGS+=(--repository "${REPOSITORY_IN}")
+          fi
+        elif [ -n "${ARTIFACT_ID_IN}" ]; then
+          echo "::warning::ingest script predates --artifact-id; no artifact row will be" \
+               "written for this run (id was ${ARTIFACT_ID_IN})."
+        fi
         python3 "${INGEST_SCRIPT}" \
           --xml-dir "${{ inputs.xml-dir }}" \
           --workflow "${{ inputs.workflow }}" \
@@ -283,4 +311,4 @@ runs:
           --triggered-at "${{ inputs.triggered-at }}" \
           --pr-number "${{ inputs.pr-number }}" \
           --trigger-type "${{ inputs.trigger-type }}" \
-          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}"
+          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}" "${ARTIFACT_ARGS[@]}"

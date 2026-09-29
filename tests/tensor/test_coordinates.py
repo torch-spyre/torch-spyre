@@ -33,6 +33,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    compute_restickify_needed,
     device_coordinates,
     try_device_coordinates,
 )
@@ -40,6 +41,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    _flat_dense_projection_x_layout,
     find_stick_compatible_input_layout,
 )
 from torch_spyre._inductor.views import (
@@ -804,6 +806,168 @@ class TestFactorizedMatmulCandidates(TestCase):
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)
+
+    def test_flat_dense_projection_layout(self):
+        """A contiguous BLHD view read as [B*L, H*D] gets canonical flat M."""
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        M, N, K = 2048, 768, 768
+        ranges = (M, N, K)
+        x_dep = MemoryDep("x", K * m + contraction, (m, generated, contraction), ranges)
+        y_dep = MemoryDep(
+            "y", K * generated + contraction, (m, generated, contraction), ranges
+        )
+        out_dep = MemoryDep(
+            "out", N * m + generated, (m, generated, contraction), ranges
+        )
+        x_host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [4, 512, 12, 64],
+            [393216, 768, 64, 1],
+        )
+        y_host = FixedLayout(torch.device("cpu"), torch.float16, [K, N], [N, 1])
+        output = FixedLayout(torch.device("cpu"), torch.float16, [M, N], [N, 1])
+        source = SpyreTensorLayout(
+            [512, 12, 1, 4, 64],
+            [768, 64, 64, 393216, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [12, 768, 64],
+            [49152, 1, 768],
+            get_device_dtype(torch.float16),
+        )
+        x = PropArg(x_dep, x_host, [source])
+        y = PropArg(y_dep, y_host, [weight])
+
+        result = _flat_dense_projection_x_layout(
+            x, y, output, out_dep, contraction, M, N
+        )
+        expected = SpyreTensorLayout([M, K], [K, 1], torch.float16, [0, 1])
+
+        self.assertEqual(result, expected)
+        with V.set_graph_handler(SimpleNamespace()):
+            self.assertEqual(
+                device_coordinates(result, x_dep, None),
+                [sympy.floor(contraction / 64), m, sympy.Mod(contraction, 64)],
+            )
+
+            compatible, compatible_target = compute_restickify_needed(
+                source, x_host, x_dep, result, x_dep
+            )
+            needed, target = compute_restickify_needed(
+                source,
+                x_host,
+                x_dep,
+                result,
+                x_dep,
+                require_exact=True,
+            )
+        self.assertFalse(compatible)
+        self.assertIsNone(compatible_target)
+        self.assertTrue(needed)
+        self.assertEqual(target, expected)
+
+        strided_x = PropArg(
+            x_dep,
+            FixedLayout(
+                torch.device("cpu"),
+                torch.float16,
+                [4, 512, 12, 64],
+                [786432, 1536, 64, 1],
+            ),
+            [source],
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                strided_x, y, output, out_dep, contraction, M, N
+            )
+        )
+
+        fp32_source = SpyreTensorLayout(
+            [512, 24, 1, 4, 32],
+            [768, 32, 32, 393216, 1],
+            get_device_dtype(torch.float32),
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                PropArg(
+                    x_dep,
+                    FixedLayout(
+                        torch.device("cpu"),
+                        torch.float32,
+                        [4, 512, 12, 64],
+                        [393216, 768, 64, 1],
+                    ),
+                    [fp32_source],
+                ),
+                y,
+                output,
+                out_dep,
+                contraction,
+                M,
+                N,
+            )
+        )
+
+    def test_flat_dense_projection_rejects_true_bmm(self):
+        """A rank-3 output and per-batch weight retain genuine BMM geometry."""
+        batch, m, generated, contraction = sympy.symbols(
+            "batch m generated contraction", integer=True, nonnegative=True
+        )
+        B, M, N, K = 4, 512, 768, 768
+        ranges = (B, M, N, K)
+        x_dep = MemoryDep(
+            "x",
+            M * K * batch + K * m + contraction,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        y_dep = MemoryDep(
+            "y",
+            K * N * batch + N * contraction + generated,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        out_dep = MemoryDep(
+            "out",
+            M * N * batch + N * m + generated,
+            (batch, m, generated, contraction),
+            ranges,
+        )
+        x_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, K], [M * K, K, 1]
+        )
+        y_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, K, N], [K * N, N, 1]
+        )
+        output = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, N], [M * N, N, 1]
+        )
+        source = SpyreTensorLayout(
+            [12, M, B, 64],
+            [64, K, M * K, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [12, K, B, 64],
+            [64, N, K * N, 1],
+            get_device_dtype(torch.float16),
+        )
+
+        result = _flat_dense_projection_x_layout(
+            PropArg(x_dep, x_host, [source]),
+            PropArg(y_dep, y_host, [weight]),
+            output,
+            out_dep,
+            contraction,
+            M,
+            N,
+        )
+
+        self.assertIsNone(result)
 
 
 class TestTilingExprToDeviceExpr(TestCase):

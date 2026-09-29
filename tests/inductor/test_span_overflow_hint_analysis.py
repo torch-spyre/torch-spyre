@@ -53,7 +53,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import compare_with_cpu  # noqa: E402
+from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -2530,7 +2530,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -2559,7 +2559,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -3096,7 +3096,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + m, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=4_194_304),
@@ -3138,7 +3138,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[m, k, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=2),
@@ -3831,7 +3831,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value={m: 0, n: 1},
             ),
             patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._device_coordinates_for_span",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.device_coordinates",
                 return_value=[k, m, n],
             ),
             patch(
@@ -4235,7 +4235,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -4292,9 +4292,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 "_output_symbol_to_dim",
                 return_value={d0: 0, d1: 1, d2: 2, d3: 3, d4: 4},
             ),
-            patch.object(
-                soha, "_device_coordinates_for_span", return_value=device_coords
-            ),
+            patch.object(soha, "device_coordinates", return_value=device_coords),
         ):
             d1_only_infos = soha._input_span_infos_controlled_by_output_dims(
                 op,
@@ -4364,7 +4362,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -5058,7 +5056,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "MAX_SPAN_BYTES", 1024),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
-            patch.object(soha, "_device_coordinates_for_span", return_value=[m + k, k]),
+            patch.object(soha, "device_coordinates", return_value=[m + k, k]),
         ):
             enabled_infos = soha._input_span_infos_controlled_by_output_dims(
                 op, max_cores=1
@@ -5276,7 +5274,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k0, 2 * m + k1, k1],
             ),
         ):
@@ -5321,7 +5319,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k, sympy.Mod(3 * h, 64), n],
             ),
         ):
@@ -5675,7 +5673,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             patch(self._PLAN_PATCH, _forced_span_plan_on_dim1(5, 20)),
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *args)
         self.assertTrue(source_codes)
@@ -5948,7 +5946,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x, y)
 
@@ -5986,7 +5984,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x)
 
@@ -6051,7 +6049,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
                 return_value=fake_plan,
@@ -6108,7 +6106,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
                 "plan_span_overflow_tile",
@@ -6178,7 +6176,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
                 "plan_span_overflow_tile",
@@ -6270,7 +6268,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, auto_sources = run_and_get_code(
                 torch.compile(auto_fn, dynamic=False), x, y
@@ -6293,7 +6291,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         with (
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
-            patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, manual_sources = run_and_get_code(
                 torch.compile(manual_hint_fn, dynamic=False), x, y
@@ -6313,7 +6311,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
     Every test class above this one either mocks out kernel launch/compile
     (``patch(_LAUNCH_JOBPLAN)``, ``patch(_PREPARE_KERNEL)``,
-    ``patch("subprocess.run")``) or inspects internal Python state directly.
+    ``mock_backend_compiler()``) or inspects internal Python state directly.
     Those are valuable and cheap, and prove the *decision* to join is made
     correctly -- but none of them prove the resulting shared loop nest
     actually *executes* correctly on hardware. A join could be structurally
@@ -7225,6 +7223,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             with (
                 patch(_LAUNCH_JOBPLAN),
                 patch(_PREPARE_KERNEL),
-                patch("subprocess.run"),
+                mock_backend_compiler(),
             ):
                 run_and_get_code(cfn, x)
