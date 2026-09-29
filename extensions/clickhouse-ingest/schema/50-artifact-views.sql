@@ -29,26 +29,27 @@ SELECT
 FROM artifacts AS r
 GROUP BY r.artifact_id;
 
--- Tag -> the artifact it points at NOW, one row per (tag, component, arch). is_rolling is
--- emergent (ever pointed at more than one artifact), never stored.
+-- Tag -> the artifact it points at NOW, one row per (tag, component, arch, artifact_name).
+-- is_rolling is emergent (ever pointed at more than one artifact), never stored.
 CREATE VIEW IF NOT EXISTS v_tag_resolution AS
 SELECT
     t.tag                              AS tag,
     any(t.tag_family)                  AS tag_family,
     a.component                        AS component,
     if(a.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', a.arch) AS arch,
+    a.artifact_name                    AS artifact_name,
     argMax(t.artifact_id, t.ts)        AS artifact_id,
     max(t.ts)                          AS resolved_ts,
     count()                            AS promotion_count,
-    uniqExact(t.artifact_id) > 1       AS is_rolling  -- within this (component, arch) slot
+    uniqExact(t.artifact_id) > 1       AS is_rolling  -- within this (component, arch, artifact_name) slot
 FROM artifact_tags AS t
 INNER JOIN v_artifacts AS a ON a.artifact_id = t.artifact_id
-GROUP BY tag, component, arch;
+GROUP BY tag, component, arch, artifact_name;
 
 -- The tag picker: one row per tag, so the UI lists channels without resolving each. arch_list
 -- is an array since a dated tag spans all three platforms. is_rolling is OR-ed per
--- (component, arch) slot, not a tag-wide uniqExact -- a dated tag legitimately holds one
--- artifact per component, so a tag-wide count would mark every bundle tag rolling.
+-- (component, arch, artifact_name) slot, not a tag-wide uniqExact -- a dated tag legitimately
+-- holds one artifact per component variant, so a coarser count would mark every bundle tag rolling.
 CREATE VIEW IF NOT EXISTS v_tag_list AS
 SELECT
     t.tag                          AS tag,
@@ -65,17 +66,19 @@ FROM
 (
     -- ifNull: an unjoined row is NULL under a reader's join_use_nulls=1, and a NULL slot key
     -- would pool every unjoined row into one slot.
+    -- arch is canonicalized here too, matching v_tag_resolution, so amd64/x86_64 share one slot.
     SELECT at.tag AS tag, at.tag_family AS tag_family, at.artifact_id AS artifact_id,
            at.ts AS ts,
            ifNull(a.component, '') AS component,
-           ifNull(a.arch, '')      AS arch,
+           if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')) AS arch,
            uniqExact(at.artifact_id) OVER (
                PARTITION BY at.tag,
-                            -- (component, arch) when joined, else the artifact itself.
+                            -- (component, arch, artifact_name) when joined, else the artifact itself.
                             if(ifNull(a.component, '') = '',
                                toString(at.artifact_id),
                                ifNull(a.component, '')),
-                            ifNull(a.arch, ''))
+                            if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')),
+                            ifNull(a.artifact_name, ''))
                AS slot_artifacts
     FROM artifact_tags AS at
     LEFT JOIN v_artifacts AS a ON a.artifact_id = at.artifact_id

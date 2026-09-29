@@ -742,6 +742,18 @@ class CostParams:
     # whether a matmul's non-replicated operand reads share the ceiling was not
     # measured (every row here read a replicated operand), so those keep mm_bw_read.
     mm_replicated_read_gbps_per_core: float = 2.3
+    # PARTITIONED matmul reads with no reuse (replication == 1, and every element
+    # feeds one multiply-accumulate -- a decode projection's weight): the bytes
+    # cross the bus once, so ``_fused_hbm_bytes`` charges them at the shared peak,
+    # but each core streams only its own slice. An EFFECTIVE per-core rate, not a
+    # measured hardware ceiling: with c reading cores the read is priced at
+    # min(peak, c * rate). 150/32 -- the peak shared equally by all 32 cores -- is
+    # a modeling choice. Coverage: FP16 decode projections (M = 1) at 22 and 25
+    # active cores land within about 3% of it (a 403.7 MB vocabulary projection
+    # on 22 cores, a fused MLP whose gate/up weights span 25 cores), and a
+    # 16-core projection on an older SDK ran about 15% faster than it predicts;
+    # below 16 cores it is unmeasured. See ``_partitioned_operand_read_excess``.
+    mm_partitioned_read_gbps_per_core: float = 150.0 / 32
     # DEFAULT-LAYOUT BMM slow compute rate (cat 4). A batched matmul whose BOTH rank-3
     # operands carry the COMPILER-DEFAULT [0,1,2] device tile order -- the batch dim B
     # sits just inside the stick (device pos -2) -- runs the systolic array at a much
@@ -1398,6 +1410,95 @@ def _shared_operand_read_excess(ops: list, p: "CostParams"):
                 * op.dtype_bytes
                 * (_matmul_multicast_penalty(arg.replication) - 1)
                 / p.bw_peak_gbps
+            )
+            if arg.is_graph_boundary:
+                external[arg.name] = (
+                    _max_traffic(external[arg.name], excess)
+                    if arg.name in external
+                    else excess
+                )
+            else:
+                total += excess
+    return total + sum(external.values())
+
+
+def _is_single_pass(op) -> bool:
+    """Whether ``op``'s extracted features record one untiled pass: a loop trip
+    of 1, no tiled dim, and no argument re-read or re-written across iterations.
+    This reflects the recorded features only -- the extractor maps a loop count it
+    cannot resolve to 1 -- not a proof that the IR has no loop."""
+    return (
+        op.loop_trip == 1
+        and not op.tiles_output_dim
+        and not op.tiles_reduction_dim
+        and all(a.loop_factor == 1 for a in op.args)
+    )
+
+
+def _partitioned_operand_read_excess(ops: list, p: "CostParams"):
+    """Extra delivery time when too few cores stream a partitioned matmul operand.
+
+    The base memory term charges an operand's bytes B at the shared peak. When a
+    matmul splits a non-replicated operand across its cores, each core streams
+    only its own slice, priced at the effective ``mm_partitioned_read_gbps_per_core``;
+    with too few cores the read takes B / (cores * rate). Add only the excess over
+    B / peak -- the same form ``_store_core_excess_ns`` uses for writes. Physical
+    bytes are unchanged, and the excess is zero once the cores reach the peak.
+
+    Scope follows the measurements (decode projections, 22-25 active cores):
+
+    * Every op in the bundle is single-pass by its extracted features
+      (``_is_single_pass``). Looped work (coarse-tiled attention, nested tiles)
+      has its own read pricing and shares the bundle's memory and overlap terms,
+      so a bundle with any looped op keeps its previous price whole.
+    * The operand is partitioned (``replication == 1``). A replicated operand has
+      its own per-core model (``_replicated_operand_reads``). A replication that
+      is a solver symbol gets this term exactly where it resolves to 1 -- the
+      complement of ``ArgTraffic.replicated_hbm_elems`` -- so the co-optimizer's
+      expression equals the committed-path price at every candidate.
+    * The operand is not reused: every element feeds one multiply-accumulate
+      (``matmul_macs <= elems``), i.e. a decode projection streaming its weight.
+      With row reuse the operand's delivery rate has not been measured.
+
+    Resident operands vanish through ``hbm_elems``; a graph input read by several
+    ops of the bundle is charged once, by the same ``max`` rule as
+    ``_fused_hbm_bytes``.
+    """
+    rate = p.mm_partitioned_read_gbps_per_core
+    if rate <= 0 or not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
+    for op in ops:
+        if not op.is_matmul:
+            continue
+        for arg in op.args:
+            # A MAC count that is unknown (0) or symbolic does not prove the
+            # operand unreused, so it keeps the old price.
+            if (
+                arg.role != "input"
+                or _is_sym(op.matmul_macs, arg.elems)
+                or not 0 < op.matmul_macs <= arg.elems
+            ):
+                continue
+            if (
+                isinstance(arg.replication, sympy.Basic)
+                and arg.replication.free_symbols
+            ):
+                partitioned = sympy.Piecewise(
+                    (1, sympy.Eq(arg.replication, 1)), (0, True)
+                )
+            elif arg.replication == 1:
+                partitioned = 1
+            else:
+                continue
+            # The operand's own bytes on the branch where it is partitioned. The
+            # 0/1 gate goes inside the Max: CP-SAT multiplies it into the small
+            # reciprocal-split variables there, rather than into the Max's wide
+            # integerized result, which can pass the solver's product bound.
+            b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
+            excess = _max_traffic(
+                0, partitioned * (b / (op.cores * rate) - b / p.bw_peak_gbps)
             )
             if arg.is_graph_boundary:
                 external[arg.name] = (
@@ -2145,7 +2246,13 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # Apply the same subsequent bandwidth derates as the base and replica reads.
     # Both matmul models use this input-delivery cost. The bundled model's
     # separate output-tile reread estimate is unchanged, not recalibrated here.
-    mem = mem + rep_ns + _shared_operand_read_excess(ops, p)
+    # A partitioned operand streamed by too few cores is likewise slower to deliver.
+    mem = (
+        mem
+        + rep_ns
+        + _shared_operand_read_excess(ops, p)
+        + _partitioned_operand_read_excess(ops, p)
+    )
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
     # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
@@ -2517,6 +2624,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             f"     indirect-store core limit: +{store_extra / 1000:.2f} us "
             "(before bandwidth adjustments and compute overlap)"
+        )
+    partitioned_extra = _partitioned_operand_read_excess(ops, p)
+    if partitioned_extra:
+        lines.append(
+            f"     partitioned-read core limit: +{partitioned_extra / 1000:.2f} us "
+            f"({p.mm_partitioned_read_gbps_per_core:g} GB/s per reading core; "
+            "before compute overlap)"
         )
     restickify_extra = _transport_dma_excess_ns(ops, p)
     if restickify_extra:

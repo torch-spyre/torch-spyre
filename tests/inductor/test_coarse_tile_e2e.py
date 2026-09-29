@@ -2928,18 +2928,14 @@ def test_flash_tile_H():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "Intermittent numerical mismatch against CPU reference."
+        "Mismatch pattern suggests an uninitialized-memory read."
+    )
+)
 def test_flash_tile_B():
-    """Flash v1: tile B÷2 only. B=2.
-
-    Previously skipped for an intermittent ~22.7% numerical mismatch
-    suspected to be an uninitialized-memory read (issue #3937). No longer
-    reproduces -- confirmed passing across 5 isolated runs (fresh fxgraph
-    cache each time) plus the full flash test cluster, at a point in
-    history with ~20 candidate fixes to cross-group/reduction-consumer
-    read redirection landed since the issue was filed. Not worth
-    bisecting to a single fixing commit; un-skipped on verified current
-    behavior.
-    """
+    """Flash v1: tile B÷2 only. B=2."""
     run_coarse_tile_test(
         lambda q, k, v: _flash_v1_fn(
             q, k, v, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2

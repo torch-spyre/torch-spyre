@@ -1410,6 +1410,7 @@ def main():
     total_benchmarks = 0
     parsed_benchmarks = 0
     total_kernels = 0
+    v2_failed_files = []
 
     # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
     # files under one run_id, so a per-file write would report only the first shard's verdict.
@@ -1705,6 +1706,7 @@ def main():
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
             except Exception as _v2_err:
+                v2_failed_files.append(xml_path.name)
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
                     file=sys.stderr,
@@ -1723,6 +1725,13 @@ def main():
     print(f"  Test cases ingested:  {total_cases}")
     print(f"  Benchmarks ingested:  {total_benchmarks}")
     print(f"  Kernels ingested:     {total_kernels}")
+    # Repeated here because the per-file warning goes to stderr, where the console
+    # interleaves it far from the file it belongs to.
+    if v2_failed_files:
+        print(
+            f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
+            + ", ".join(v2_failed_files)
+        )
     _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
 
 
