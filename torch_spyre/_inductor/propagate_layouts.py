@@ -543,12 +543,7 @@ def _conversion_layouts(
     sticks of the coarser grid that the conversion writes are
     ``insert_staggered_ea_padding``'s to add.
     """
-    try:
-        in_stick_expr = device_coordinates(stl, dep, None)[-1]
-    except Unsupported:
-        # Staggered-EA candidate whose physical stick depth differs from
-        # elems_per_stick — not a valid input for this conversion path.
-        return []
+    in_stick_expr = device_coordinates(stl, dep, None)[-1]
     if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
         return []
 
