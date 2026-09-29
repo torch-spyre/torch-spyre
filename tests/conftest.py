@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import sys
 from pathlib import Path
 import yaml
 import pytest
@@ -27,25 +28,42 @@ from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 _MAX_XFAIL_REASON_LEN = 300
 
 
-_RAS_HARDWARE_ERROR = re.compile(r'"category"\s*:\s*"hardware"')
+# The runtime raises a RAS error as a RuntimeError whose message IS its JSON record (there is
+# no typed exception), so match that record's shape rather than any text mentioning it.
+_RAS_HARDWARE_ERROR = re.compile(
+    r'^\s*\{(?=.*"category"\s*:\s*"hardware")(?=.*"name"\s*:\s*"RAS::)', re.DOTALL
+)
+_STREAM_ERROR = "StreamError"
+# nodeid of the first test whose report observed StreamError. The flag flips asynchronously,
+# so that test is where the fault was SEEN, not necessarily what caused it.
+_FAULT_SEEN: dict = {"nodeid": None}
 
 
 class SpyreDeviceFault(Exception):
     """A prior test left the device in an error state; this test cannot run."""
 
 
-def _is_device_fault(excinfo) -> bool:
-    """True when a test's exception is a device fault rather than a test outcome."""
-    if excinfo.errisinstance(SpyreDeviceFault):
-        return True
-    if _RAS_HARDWARE_ERROR.search(str(excinfo.value)):
-        return True
+def _device_in_stream_error() -> bool:
+    """True when the runtime reports StreamError.
+
+    Without an importable, working _C there is no device to fault, so this reads False
+    there; the RAS-message match in _is_device_fault is the part that works on every build.
+    """
     try:
         from torch_spyre import _C  # noqa: PLC0415
 
         return _C.get_device_state() == _C.SpyreDeviceState.StreamError
-    except ImportError:
+    except Exception:
         return False
+
+
+def _is_device_fault(excinfo) -> bool:
+    """True when a test's exception is a device fault rather than a test outcome."""
+    if excinfo.errisinstance(SpyreDeviceFault):
+        return True
+    return excinfo.errisinstance(RuntimeError) and bool(
+        _RAS_HARDWARE_ERROR.match(str(excinfo.value))
+    )
 
 
 def _extract_failure_message(rep):
@@ -76,13 +94,32 @@ def _extract_failure_message(rep):
 def pytest_runtest_makereport(item, call):
     outcome = yield
     rep = outcome.get_result()
-    # A device fault is never an expected failure: an xfail (OOT or pytest's own,
-    # which also rewrites setup errors) would otherwise let a faulted run exit 0.
+    # A device fault is never an expected failure. This hookwrapper runs around pytest's
+    # skipping plugin, so its xfail rewrite (which also covers setup errors) has already
+    # happened and is undone here; test_device_error_skip pins that ordering end to end.
     device_fault = call.excinfo is not None and _is_device_fault(call.excinfo)
+    if (
+        call.when == "call"
+        and _FAULT_SEEN["nodeid"] is None
+        and _device_in_stream_error()
+    ):
+        # Covers a test that passed or XPASSed while the device faulted. Only the first
+        # observer: later tests error in setup rather than being judged by global state.
+        _FAULT_SEEN["nodeid"] = item.nodeid
+        device_fault = True
     if device_fault:
         rep.outcome = "failed"
         if hasattr(rep, "wasxfail"):
             del rep.wasxfail
+        # A pass has no longrepr and a skip's is a (path, lineno, msg) tuple; neither
+        # renders as a failure in the summary or the JUnit <failure> element.
+        if rep.longrepr is None:
+            rep.longrepr = (
+                f"Device entered {_STREAM_ERROR} during this test"
+                " — a process restart is required"
+            )
+        elif isinstance(rep.longrepr, tuple):
+            rep.longrepr = str(rep.longrepr[2])
     if call.when == "call":
         fn = getattr(item, "function", None) or getattr(item, "obj", None)
 
@@ -543,6 +580,21 @@ def pytest_report_teststatus(report, config):
     return None
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """Exit non-zero on a fault no test observed (it flipped after the last report).
+
+    Per process: under xdist this runs in each worker, whose exit status the controller
+    does not propagate, so there only the per-test checks above apply.
+    """
+    if exitstatus == pytest.ExitCode.OK and _device_in_stream_error():
+        print(
+            f"\n[device-fault] device ended the session in {_STREAM_ERROR};"
+            " failing the run",
+            file=sys.stderr,
+        )
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if not config.getoption("--show-skipped"):
         return
@@ -583,20 +635,11 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     """
     # A hardware fault flips the shutdown flag asynchronously, so the faulting test
     # can pass and only a later test's setup sees it; the error lands there instead.
-    try:
-        from torch_spyre import _C  # noqa: PLC0415
-
-        state = _C.get_device_state()
-        if state == _C.SpyreDeviceState.StreamError:
-            raise SpyreDeviceFault(
-                f"Device is in error state ({state.name})"
-                " — a process restart is required"
-            )
-        # SpyreDeviceState.NotInitialized → proceed (runtime not started yet)
-        # SpyreDeviceState.Ok             → proceed
-    except ImportError:
-        # torch_spyre._C not built or not installed — nothing to check.
-        pass
+    if _device_in_stream_error():
+        raise SpyreDeviceFault(
+            f"Device is in error state ({_STREAM_ERROR})"
+            " — a process restart is required"
+        )
 
     if "requires_spyre_profiler" in item.keywords:
         use_profiler = os.environ.get("USE_SPYRE_PROFILER") == "1"
