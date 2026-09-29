@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS test_case_runs
 
     -- Per-execution incidentals; run-scoped data belongs on artifact_results, test-scoped on test_cases.tags.
     props        Map(LowCardinality(String), String),
+    -- Run-context tags this execution carried (testtype__<tier>, platform__<arch>): tier
+    -- membership is a fact of the run, and a shared test_case_id row cannot hold every tier's set.
+    tags         Array(LowCardinality(String)),
     audit_uuid      UUID DEFAULT generateUUIDv7(),
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 
