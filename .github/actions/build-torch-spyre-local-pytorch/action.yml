@@ -7,7 +7,6 @@ inputs:
   torch_spyre_dir:
     description: Path to the checked-out torch-spyre directory
     required: false
-    type: string
     default: torch-spyre
 
 outputs:

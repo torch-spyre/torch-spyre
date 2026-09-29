@@ -70,6 +70,7 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
+    "completed_producer_cores": "tuple[int, ...]",
     "debug_handle": "DebugHandle | None",
 }
 _EXPECTED_TENSOR_ARG_SCHEMA = {
@@ -277,6 +278,10 @@ def _canonical_spec(spec: object) -> object:
         ):
             result["core_id_to_work_slice"] = _canonical_value(
                 spec.core_id_to_work_slice
+            )
+        if spec.completed_producer_cores:
+            result["completed_producer_cores"] = _canonical_value(
+                spec.completed_producer_cores
             )
         return result
     if isinstance(spec, LoopSpec):

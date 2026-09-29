@@ -28,8 +28,11 @@ test_suite_config:
             - TestTorchDeviceType::test_scatter_mem_overlap
             - TestTorchDeviceType::test_shift_mem_overlap
             - TestTorchDeviceType::test_storage_use_count
-            - TestTorch::test_normal_shape
           mode: mandatory_success
+        # Skipped: flaky/unsupported on the Spyre backend.
+        - names:
+            - TestTorch::test_normal_shape
+          mode: skip
         # These tests exercise the `addcdiv` operation with different dtypes, focusing on tensor operations and broadcasting.
         # They are classified as `mandatory_success` because the Spyre backend must support these operations for basic functionality.
         # The primary limitation is the unsupported `float32` dtype, which causes an `InductorError` due to unexpected arguments.

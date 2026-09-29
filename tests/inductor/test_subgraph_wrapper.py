@@ -88,7 +88,7 @@ def _make_ftl_buffer(name="buf0", host_size=(64, 64)):
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(
-        torch.device("cpu"),
+        torch.device("spyre"),
         torch.float16,
         [Integer(s) for s in host_size],
         [Integer(s) for s in strides],
@@ -179,6 +179,7 @@ class TestSpyreSubgraphWrapper(unittest.TestCase):
 
         self.assertIn("spyre_empty_with_layout(", line)
         self.assertIn("SpyreTensorLayout(", line)
+        self.assertIn("device=torch.device('spyre')", line)
         self.assertNotIn("empty_strided", line)
 
     def test_subgraph_patches_own_sizevars_but_not_header(self):

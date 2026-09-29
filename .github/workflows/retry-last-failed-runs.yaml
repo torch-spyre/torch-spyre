@@ -1,0 +1,104 @@
+name: retry-last-failed-runs
+
+# Manual dispatch: fetch the last N failed runs of a given workflow and
+# retry the failed jobs on each (via `gh run rerun --failed`), same
+# mechanism as retry-failed-tests.yaml but self-serve for an arbitrary
+# workflow/count instead of the automatic single-retry-per-run hookup on
+# tests/tests-nightly.
+run-name: >-
+  Retry last ${{ github.event.inputs.count }} failed run(s) of
+  ${{ github.event.inputs.workflow_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      workflow_name:
+        description: >-
+          Workflow file name or display name to look up failed runs for
+          (e.g. "tests" or "torch_spyre_tests.yaml"), as accepted by
+          `gh run list --workflow`.
+        required: true
+        type: string
+      count:
+        description: >-
+          Number of most recent failed runs of that workflow to fetch and
+          retry.
+        required: true
+        type: string
+        default: '1'
+
+concurrency:
+  group: >-
+    retry-last-failed-runs-${{ github.event.inputs.workflow_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write # required by `gh run list` / `gh run rerun`
+
+jobs:
+  retry:
+    name: Retry last failed runs
+    # Cardless pool (like push-to-clickhouse.yaml's ingest job and
+    # retry-failed-tests.yaml) -- only calls the GitHub API.
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    steps:
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Fetch and retry last failed runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: ${{ github.event.inputs.workflow_name }}
+          COUNT: ${{ github.event.inputs.count }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${COUNT}" =~ ^[0-9]+$ ]] || [ "${COUNT}" -lt 1 ]; then
+            echo "::error::count must be a positive integer, got '${COUNT}'"
+            exit 1
+          fi
+
+          echo "Looking up the last ${COUNT} failed run(s) of '${WORKFLOW_NAME}'..."
+          RUN_IDS=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "${WORKFLOW_NAME}" \
+            --status failure \
+            --limit "${COUNT}" \
+            --json databaseId \
+            --jq '.[].databaseId')
+
+          if [ -z "${RUN_IDS}" ]; then
+            echo "::warning::No failed runs found for workflow '${WORKFLOW_NAME}'"
+            exit 0
+          fi
+
+          echo "Found runs:"
+          echo "${RUN_IDS}"
+
+          while IFS= read -r RUN_ID; do
+            [ -z "${RUN_ID}" ] && continue
+            echo "Retrying failed jobs on run ${RUN_ID}..."
+            gh run rerun "${RUN_ID}" --repo "${{ github.repository }}" --failed
+          done <<< "${RUN_IDS}"
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "### Retry Last Failed Runs Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Workflow | ${{ github.event.inputs.workflow_name }} |"
+            echo "| Count requested | ${{ github.event.inputs.count }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

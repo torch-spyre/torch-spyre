@@ -26,12 +26,14 @@ import torch_spyre._inductor.core_mapping as core_mapping_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor.codegen.opspec_utils import per_core_extent
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
 )
 from torch_spyre._inductor.core_mapping import (
+    aligned_split_keeps_blocks,
     core_mappings_equal,
     core_to_slice_mapping,
     derive_core_mapping,
@@ -63,17 +65,52 @@ from torch_spyre._inductor.views import (
         DataFormats.BFLOAT16,
     ],
 )
-def test_partition_span_uses_device_storage_geometry(dtype):
+def test_partition_lx_size_uses_device_storage_geometry(dtype):
     eps = dtype.elems_per_stick()
     size = [8, 4, eps]
-    # Inner-row splitting leaves gaps: 8 rows, first 2 of 4 sticks per row.
-    # The last accessed stick is 7*4+1, so the span is 30 complete sticks.
+    # Either split stores 16 complete sticks locally; whole-tensor row gaps
+    # do not occupy LX. The native size helper also accounts for packed dtypes.
+    expected = core_mapping_module.get_device_size_in_bytes([16, eps], dtype)
+    assert core_mapping_module.partition_lx_size_bytes(size, dtype, {1: 2}) == expected
+    assert core_mapping_module.partition_lx_size_bytes(size, dtype, {0: 2}) == expected
+
+
+@pytest.mark.parametrize(
+    "size,splits,expected",
+    [
+        ([4, 512, 2, 8, 64], {1: 16, 2: 2}, 131072),
+        ([4, 512, 2, 8, 64], {1: 32}, 131072),
+        ([8, 1, 2, 128, 64], {0: 8, 2: 2, 3: 2}, 8192),
+        ([8, 1, 2, 128, 64], {2: 2}, 131072),
+    ],
+)
+def test_partition_lx_size_matches_codegen(size, splits, expected):
+    # BMM producer/consumer and K-page broadcast: use the same per-core
+    # extents that codegen supplies, not the full-tensor address span.
+    coords = list(sympy.symbols(f"dim_0:{len(size) - 1}")) + [sympy.S.Zero]
+    arg = TensorArg(True, 0, DataFormats.SEN169_FP16, size, coords, {"lx": 0})
+    local, _ = per_core_extent(arg, {coords[axis]: n for axis, n in splits.items()})
     assert (
-        core_mapping_module.partition_physical_span_bytes(size, dtype, {1: 2}) == 3840
+        core_mapping_module.partition_lx_size_bytes(size, arg.device_dtype, splits)
+        == (core_mapping_module.get_device_size_in_bytes(local, arg.device_dtype))
+        == expected
     )
-    assert (
-        core_mapping_module.partition_physical_span_bytes(size, dtype, {0: 2}) == 2048
-    )
+
+
+@pytest.mark.parametrize(
+    "size,splits",
+    [
+        ([8, 4, 64], {1: 3}),
+        ([8, 4, 32], {}),
+        ([8, 4, 64], {2: 2}),
+        ([8, 0, 64], {}),
+    ],
+)
+def test_partition_lx_size_rejects_unsupported_storage(size, splits):
+    with pytest.raises(ValueError):
+        core_mapping_module.partition_lx_size_bytes(
+            size, DataFormats.SEN169_FP16, splits
+        )
 
 
 _CORE_ID = sympy.Symbol("core_id")
@@ -255,6 +292,28 @@ def test_late_partition_mapping_repeats_contiguous_owners():
     assert _mapping_coordinates(mapping, (head,), 32) == [
         (core // 8,) for core in range(32)
     ]
+
+
+@pytest.mark.parametrize(
+    ("split", "bases", "keeps_blocks"),
+    [
+        # d0 < 6 cut into its repeat period (2, innermost) and count (3).
+        (1, (2, 3), True),
+        (3, (2, 3), True),
+        (6, (2, 3), True),
+        # gcd(2, 3) leaves the count whole and splits the period: core 0
+        # would own rows {0, 2, 4}.
+        (2, (2, 3), False),
+        # A partial split of the outermost segment keeps blocks.
+        (2, (2, 4), True),
+        (4, (4, 3), False),
+        (6, (4, 3), True),
+        # Nothing absorbs a factor of 5.
+        (5, (2, 3), False),
+    ],
+)
+def test_aligned_split_keeps_blocks(split, bases, keeps_blocks):
+    assert aligned_split_keeps_blocks(split, bases) is keeps_blocks
 
 
 @pytest.mark.parametrize(
@@ -990,7 +1049,7 @@ def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
     assert not partial and representable == (flat_split <= 8)
     if representable:
         assert (
-            core_mapping_module.partition_physical_span_bytes(
+            core_mapping_module.partition_lx_size_bytes(
                 prep.device_size, DataFormats.SEN169_FP16, dict(view.work_slice_dims)
             )
             > 0

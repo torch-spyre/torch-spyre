@@ -160,6 +160,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=_valid_inplace_parents(b, chosen[b.name]),
                     residency_reason=_residency_reason(b, chosen[b.name]),
+                    lifetime_start_override=b.lifetime_start_override,
                     lifetime_end_override=b.lifetime_end_override,
                 )
                 for b in buffers_list
@@ -192,6 +193,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         t_search = time.perf_counter() - t1
 
         n_paths = math.prod(len(b.core_divisions) for b in buffers_list)
+
         winner = {
             b.name: b.core_divisions[best_chosen[b.name]].label
             for b in variable_buffers

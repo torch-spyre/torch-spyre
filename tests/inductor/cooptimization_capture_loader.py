@@ -67,9 +67,10 @@ class CapturedGraph:
 
 def _cd(d: dict) -> CoreDivision:
     # Keys serialize as strings; the real substrate keys them by int stride.
+    output = {int(k): v for k, v in d["output_splits"].items()}
+    reduction = {int(k): v for k, v in d["reduction_splits"].items()}
     return CoreDivision(
-        output_splits={int(k): v for k, v in d["output_splits"].items()},
-        reduction_splits={int(k): v for k, v in d["reduction_splits"].items()},
+        splits={**output, **reduction}, reduction_syms=frozenset(reduction)
     )
 
 

@@ -1,0 +1,52 @@
+test_suite_config:
+  labels: [unit, regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestDataTransfer::test_bf16_compiled_round_trip
+            - TestDataTransfer::test_roundtrip_cpu_fp32_spyre_fp16_cpu
+            - TestDataTransfer::test_roundtrip_cpu_fp16_spyre_fp32_cpu
+            - TestDataTransfer::test_roundtrip_cpu_bf16_spyre_fp32_cpu
+            - TestDataTransfer::test_h2d_with_simultaneous_dtype_conversion
+            - TestDataTransfer::test_compiled_copy_inplace_fp16
+            - TestDataTransfer::test_compiled_copy_fp16_workaround
+            - TestDataTransfer::test_cross_device_copy_with_dtype_coercion_value_check
+            - TestDataTransfer::test_h2d_fp32_to_bool_dtype_conversion
+            - TestDataTransfer::test_int64_in_range_value_preserved
+            - TestDataTransfer::test_int64_out_of_range_truncates_no_exception
+            - TestDataTransfer::test_int64_warning_fires_once_per_session
+          mode: mandatory_success
+
+        - names:
+            - TestUnsupportedGates::test_h2d_copy_fp64_raises_error
+          mode: mandatory_success
+
+        # SKIP #2205 — compiled D2H fp32→fp16: DL16_TO_FP32 arrangement; copy_tensor rejects invalid sizes/stride map
+        - names:
+            - TestDataTransfer::test_compiled_d2h_fp32_to_fp16
+          mode: skip
+
+        # SKIP #2205 #1482 — eager .float()/.half() shortcuts on Spyre tensor
+        - names:
+            - TestDataTransfer::test_float_half_methods_on_spyre_tensor
+          mode: skip
+
+        # SKIP #2852 — cross-dtype copy_() fp32→fp16: no STL candidate for IEEE_FP32→SEN169_FP16
+        - names:
+            - TestDataTransfer::test_compiled_copy_cross_dtype_fp32_to_fp16
+          mode: skip
+
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: int8
+      - name: int16
+      - name: int32
+      - name: int64
+      - name: uint8
+      - name: bool

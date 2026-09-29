@@ -122,8 +122,8 @@ def _hash(specs, use_symbols: bool = False):
 
     with (
         patch(
-            "torch_spyre.execution.kernel_cache._get_dxp_version",
-            return_value="test-dxp-1.0",
+            "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+            return_value="test-backend-1.0",
         ),
         patch(
             "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
@@ -408,19 +408,77 @@ class TestDebugHandleStripped(unittest.TestCase):
         self.assertNotIn("debug_handle_", result["0_add"]["dscs_"][0]["add"])
 
 
+# frontend_pool_allocation flag is hashed
+class TestFrontendPoolAllocationHashed(unittest.TestCase):
+    """frontend_pool_allocation changes both the bundle signature (pool
+    base-address as first MLIR input) and the .run() ABI (tensor_id offset).
+    A kernel compiled with the flag off must never be served to a runner built
+    with the flag on, and vice-versa — so the flag must be part of the key.
+    """
+
+    def _hash_with_flag(self, flag: bool):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        op = _make_op_spec()
+        with (
+            patch(
+                "torch_spyre.execution.kernel_cache._get_dxp_version",
+                return_value="test-dxp-1.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                return_value="test-spyre-0.0",
+            ),
+            patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            patch(
+                "torch_spyre._inductor.config.frontend_pool_allocation",
+                flag,
+            ),
+        ):
+            return compute_specs_hash([op], kernel_name="pool_alloc_test")
+
+    def test_flag_off_vs_on_produce_different_hashes(self):
+        """Off-vs-on must yield different cache keys to prevent a kernel
+        compiled without the pool parameter being silently reused when the
+        flag is later enabled (which would shift all tensor IDs by one)."""
+        h_off = self._hash_with_flag(False)
+        h_on = self._hash_with_flag(True)
+
+        self.assertNotEqual(
+            h_off,
+            h_on,
+            "frontend_pool_allocation=False and True must produce different "
+            "hashes — the flag changes the bundle signature and .run() ABI.",
+        )
+
+    def test_same_flag_value_produces_same_hash(self):
+        """Two compilations with the same flag value and identical ops must
+        still hit the cache (no spurious misses introduced by the change)."""
+        self.assertEqual(
+            self._hash_with_flag(False),
+            self._hash_with_flag(False),
+            "Same flag value must produce the same hash.",
+        )
+        self.assertEqual(
+            self._hash_with_flag(True),
+            self._hash_with_flag(True),
+            "Same flag value must produce the same hash.",
+        )
+
+
 # Version strings affect hash (environment independence guard)
 class TestVersionStringsHashed(unittest.TestCase):
-    """Changing any version string (torch, torch_spyre, dxp) must change the hash."""
+    """Changing any version string (torch, torch_spyre, backend) changes the hash."""
 
-    def _hash_with_versions(self, dxp_ver: str, spyre_ver: str):
+    def _hash_with_versions(self, backend_ver: str, spyre_ver: str):
         from torch_spyre.execution.kernel_cache import compute_specs_hash
         from unittest.mock import patch
 
         op = _make_op_spec()
         with (
             patch(
-                "torch_spyre.execution.kernel_cache._get_dxp_version",
-                return_value=dxp_ver,
+                "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
+                return_value=backend_ver,
             ),
             patch(
                 "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
@@ -430,10 +488,10 @@ class TestVersionStringsHashed(unittest.TestCase):
         ):
             return compute_specs_hash([op], kernel_name="ver_test")
 
-    def test_dxp_version_change_changes_hash(self):
+    def test_backend_compiler_version_change_changes_hash(self):
         h1 = self._hash_with_versions("1.0.0", "0.0.1")
         h2 = self._hash_with_versions("2.0.0", "0.0.1")
-        self.assertNotEqual(h1, h2, "dxp version change must change the hash.")
+        self.assertNotEqual(h1, h2, "backend version change must change the hash.")
 
     def test_torch_spyre_version_change_changes_hash(self):
         h1 = self._hash_with_versions("1.0.0", "0.0.1")

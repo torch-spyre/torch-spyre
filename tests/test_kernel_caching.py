@@ -78,6 +78,7 @@ class TestCacheMissOnColdStart(unittest.TestCase):
 class TestCacheArtifactCompleteness(unittest.TestCase):
     REQUIRED = [
         "bundle.mlir",
+        "symbol_kinds.json",
         os.path.join("spyreCodeDir", "init_binary.bin"),
         os.path.join("spyreCodeDir", "spyrecode.json"),
     ]
@@ -127,6 +128,8 @@ class TestPartialCacheEntryTreatedAsMiss(unittest.TestCase):
                 f.write("fake bundle")
             with open(os.path.join(fake_dir, "sdsc_0.json"), "w") as f:
                 f.write("{}")
+            with open(os.path.join(fake_dir, "symbol_kinds.json"), "w") as f:
+                f.write("[]")
             with open(
                 os.path.join(fake_dir, "spyreCodeDir", "spyrecode.json"), "w"
             ) as f:
@@ -250,9 +253,9 @@ class TestAtomicCommit(unittest.TestCase):
                     tmp_dir = allocate_compile_dir(fake_key)
                     # Populate it with the minimal required artifacts.
                     os.makedirs(os.path.join(tmp_dir, "spyreCodeDir"), exist_ok=True)
-                    for name in ["bundle.mlir", "sdsc_0.json"]:
+                    for name in ["bundle.mlir", "sdsc_0.json", "symbol_kinds.json"]:
                         with open(os.path.join(tmp_dir, name), "w") as f:
-                            f.write("content")
+                            f.write("[]")
                     for name in ["init_binary.bin", "spyrecode.json"]:
                         with open(
                             os.path.join(tmp_dir, "spyreCodeDir", name), "wb"

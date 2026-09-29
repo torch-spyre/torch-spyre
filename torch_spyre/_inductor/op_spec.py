@@ -369,6 +369,9 @@ class OpSpec:
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
+    # Producer cores holding finished reduction values. Other producer cores
+    # must not be exposed as holders to the ordinary LX copy machinery.
+    completed_producer_cores: tuple[int, ...] = ()
 
 
 # --- Module-level constant tensor cache --------------------------------------

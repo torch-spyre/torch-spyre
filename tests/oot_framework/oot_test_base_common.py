@@ -947,7 +947,8 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         if _tags_to_write:
             _cfg = os.environ.get(ENV_TEST_CONFIG, "")
             if _cfg:
-                _sidecar = _cfg + ".markers.json"
+                # Per process: xdist workers and card-parallel shards write concurrently.
+                _sidecar = f"{_cfg}.markers.{os.getpid()}.json"
                 _existing_tags: dict = {}
                 try:
                     with open(_sidecar) as _sf:

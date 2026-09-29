@@ -300,7 +300,6 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
                 name="int64",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.uint8, lambda: torch.tensor(10, dtype=torch.uint8), None),
@@ -669,6 +668,25 @@ class TestSpyre(TestCase):
             torch.tensor([[5, 6, 7, 8]] * 3, dtype=torch.float16),
         )
 
+        data = [
+            [float(i) for i in range(0, 20)],
+            [float(i) for i in range(20, 40)],
+            [float(i) for i in range(40, 60)],
+            [float(i) for i in range(60, 80)],
+        ]
+
+        # Slice then expand to original sizes: destination sizes == source sizes
+        # exercises the edge case where the device tensor sizes and dma_sizes
+        # have the same number of elements yet the sizes represent a expanded
+        # slice and the dma_sizes represent the original data.
+        base = torch.tensor(data, dtype=torch.float16, device="spyre")
+        sliced_expanded = base[1:2].expand(4, 20)
+        self.assertEqual(sliced_expanded.storage_offset(), 20)
+        self.assertEqual(
+            sliced_expanded.cpu(),
+            torch.tensor([data[1]] * 4, dtype=torch.float16),
+        )
+
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
         logical values, not over-DMA the parent's full allocation."""
@@ -903,6 +921,131 @@ class TestSpyre(TestCase):
             ElementArrangement.STANDARD,
         )
         torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    def test_h2d_copy_to_sliced_destination(self, sizes):
+        """H2D to a slice (e.g. t[:2]) must write to the slice's logical
+        value."""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
+
+        slice_sizes = [2, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[:2] = y
+        self.assertEqual(x.cpu()[:2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[2:3] = y
+        self.assertEqual(x.cpu()[2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3] = y
+        self.assertEqual(x.cpu()[3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, :2] = y
+        self.assertEqual(x.cpu()[3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3] = y
+        self.assertEqual(x.cpu()[3, 3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = []
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":

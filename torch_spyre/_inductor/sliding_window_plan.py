@@ -24,6 +24,7 @@ from dataclasses import dataclass
 # Elements per 128-byte stick at fp16. At float32 a stick holds 32 and the
 # alignment reasoning here does not carry.
 STICK = 64
+MAX_QUERY_BLOCK = 512
 
 
 def default_buffer_origin(seqlen_kv: int, cache_capacity: int) -> int:
@@ -153,9 +154,9 @@ class SlidingWindowPlan:
     def read_start_logical(self, qi: int) -> int:
         """``read_start`` converted back to a logical coordinate.
 
-        ``window_band_mask`` needs this, not ``read_start``: its row side is
-        logical, so the column side must be too for ``delta = row - column``
-        to mean anything. A no-op whenever ``buffer_origin`` is 0.
+        A logical-coordinate mask needs this, not ``read_start``: its row and
+        column sides must use the same coordinate space. A no-op whenever
+        ``buffer_origin`` is 0.
         """
         return self.read_start(qi) + self.buffer_origin
 
@@ -233,16 +234,27 @@ def _required_width(
     return _ceil_stick(widest)
 
 
-def query_blocking(seqlen_q: int) -> tuple[int, int]:
+def query_blocking(seqlen_q: int, max_query_block: int = STICK) -> tuple[int, int]:
     """Block size and padded query length — one decision, so returned together.
 
     Decode takes a single-row block and no padding: padding one row to a full
-    block would be 64x the work for one row of output. The caller pads at the
+    block would be 64x the work for one row of output. Prefill uses the largest
+    stick-aligned divisor of the padded query length up to ``max_query_block``.
+    This lets a full-cache scan amortize its HOP over a 512-row chunk while a
+    narrow static window retains fine-grained placement. The caller pads at the
     FRONT (see spyre_sliding_window_attention).
     """
     if seqlen_q == 1:
         return 1, 1
-    return STICK, _ceil_stick(seqlen_q)
+    padded_seqlen_q = _ceil_stick(seqlen_q)
+    # Production callers pass STICK or MAX_QUERY_BLOCK; keep the helper
+    # bounded defensively if a future caller requests a larger block.
+    max_query_block = min(max_query_block, MAX_QUERY_BLOCK)
+    largest_candidate = min(padded_seqlen_q, max_query_block)
+    for q_block in range(largest_candidate, STICK - 1, -STICK):
+        if padded_seqlen_q % q_block == 0:
+            return q_block, padded_seqlen_q
+    return STICK, padded_seqlen_q
 
 
 def rejection_reason(
@@ -412,47 +424,3 @@ def plan_sliding_window(
         cache_capacity=cache_capacity,
         buffer_origin=buffer_origin,
     )
-
-
-def band_valid_start(valid_start: list[int] | None) -> list[int] | None:
-    """The ``valid_start`` the band must actually apply, or None when it masks nothing.
-
-    A caller with no left padding passes zeros rather than tracking whether it has
-    any; collapsing that to None here is what keeps the band broadcast over batch
-    and keeps ``block_is_fully_attended``'s skip available.
-    """
-    if not valid_start or max(valid_start) <= 0:
-        return None
-    return list(valid_start)
-
-
-def band_batch(valid_start: list[int] | None) -> int:
-    """Leading dimension of the band: 1 unless the threshold differs per sequence.
-
-    The band is ``q_block x buffer_width`` per distinct threshold, so a uniform one
-    stays a single broadcast row rather than one copy per batch entry.
-    """
-    effective = band_valid_start(valid_start)
-    if effective is None or min(effective) == max(effective):
-        return 1
-    return len(effective)
-
-
-def check_valid_start(
-    valid_start: list[int] | None, batch: int, cache_seqlen: int
-) -> str | None:
-    """Why this ``valid_start`` is invalid, or None.
-
-    Strings not exceptions, matching ``check_window_read`` -- this module stays
-    free of torch and of the backend's error classes. Batch is a tensor property,
-    so this cannot live in ``rejection_reason``, which answers placement questions
-    from integers alone.
-    """
-    if valid_start is None:
-        return None
-    if len(valid_start) != batch:
-        return f"valid_start has {len(valid_start)} entries for a batch of {batch}"
-    for entry in valid_start:
-        if entry < 0 or entry > cache_seqlen:
-            return f"valid_start={entry} outside [0, cache_seqlen={cache_seqlen}]"
-    return None

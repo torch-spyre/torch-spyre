@@ -66,7 +66,7 @@ class CandidateDivisionTest(TestCase):
         """SA feature extraction neither encodes nor mutates Scheduler transport."""
         m, n, kk = sympy.symbols("m n kk")
         op = object()
-        division = CoreDivision(output_splits={m: 8}, reduction_splits={kk: 2})
+        division = CoreDivision(splits={m: 8, kk: 2}, reduction_syms=frozenset({kk}))
         expected = {m: 8, n: 1, kk: 2}
         with patch(
             "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
@@ -178,7 +178,7 @@ class SymbolicTiledFeatureTest(TestCase):
 
     #: One residency symbol PER BUFFER NAME, matching ``LifetimeBoundBuffer.sym_is_lx``
     #: (plan_solver.py) and how ``dump_cost_model.extract_op_features`` looks each arg's
-    #: own buffer name up in the co-optimizer's ``is_lx`` map (dump_cost_model.py:700) --
+    #: own buffer name up in the co-optimizer's buffer map --
     #: two different buffers get two DIFFERENT symbols, not one shared symbol.
     @staticmethod
     def _sym_is_lx(name: str) -> sympy.Symbol:
@@ -436,9 +436,9 @@ class SymbolicMatmulSplitCostTest(TestCase):
     #: ``Max(1, split)`` to ``split`` (so ``_SympyExprToCpSat._inv_sym`` still sees a
     #: BARE symbol under the reciprocal), and it lets ``expand_log`` split
     #: ``log(a/split)``.
-    M_SPLIT = sympy.Symbol("output_split_buf5_i0", integer=True, positive=True)
-    N_SPLIT = sympy.Symbol("output_split_buf5_i1", integer=True, positive=True)
-    K_SPLIT = sympy.Symbol("reduction_split_buf5_r0", integer=True, positive=True)
+    M_SPLIT = sympy.Symbol("split_buf5_i0", integer=True, positive=True)
+    N_SPLIT = sympy.Symbol("split_buf5_i1", integer=True, positive=True)
+    K_SPLIT = sympy.Symbol("split_buf5_r0", integer=True, positive=True)
     IS_LX = sympy.Symbol("is_lx_buf5", integer=True, nonnegative=True)
 
     #: The candidate splits a ``CoreDivisionBuffer`` would offer, which the CP-SAT
@@ -538,6 +538,19 @@ class SymbolicMatmulSplitCostTest(TestCase):
         self.assertEqual({m, n, k}, {self.M_SPLIT, self.N_SPLIT, self.K_SPLIT})
         self.assertFalse(getattr(b, "free_symbols", set()))
 
+    def test_single_batch_and_broadcast_inputs_use_shared_weight_cost(self):
+        from torch_spyre._inductor.cost_model import _matmul_axes_for_split_cost
+
+        mm = self._matmul()
+        self.assertTrue(_matmul_axes_for_split_cost(mm)[-1])
+        bmm = dataclasses.replace(mm, out_elems=4 * mm.out_elems)
+        self.assertFalse(_matmul_axes_for_split_cost(bmm)[-1])
+        inputs = [dataclasses.replace(a) for a in bmm.args]
+        inputs[-1].broadcast = True
+        self.assertTrue(
+            _matmul_axes_for_split_cost(dataclasses.replace(bmm, args=inputs))[-1]
+        )
+
     def test_a_symbolic_split_matmul_builds_a_cost_expression(self):
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
         self.assertEqual(
@@ -551,9 +564,10 @@ class SymbolicMatmulSplitCostTest(TestCase):
     def test_the_symbolic_split_cost_expression_linearizes(self):
         """Run the REAL CP-SAT converter, not a structural proxy.
 
-        ``sym_map`` mirrors ``CpSatLayoutSolver._minimize_cost_expr``: the split
-        variable, plus the ``_buffer_``/``_raw_`` entries ``_print_Symbol`` needs to
-        tabulate the ``log2_``/``inv_`` aux variables over the candidate divisions.
+        ``sym_map``/``buffer_map`` mirror ``CpSatLayoutSolver._minimize_cost_expr``:
+        the split variable in ``sym_map``, plus a ``buffer_map`` entry
+        ``_print_Symbol`` needs to tabulate the ``log2_``/``inv_`` aux variables over
+        the candidate divisions.
         """
         import types
 
@@ -568,19 +582,20 @@ class SymbolicMatmulSplitCostTest(TestCase):
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
         model = cp_model.CpModel()
         sym_map: dict = {}
+        buffer_map: dict = {}
         for sym in (self.M_SPLIT, self.N_SPLIT, self.K_SPLIT):
             sym_map[sym.name] = model.new_int_var_from_domain(
                 cp_model.Domain.FromValues(list(self.RAW_SPLITS)), sym.name
             )
-            sym_map[f"_buffer_{sym.name}"] = types.SimpleNamespace(
+            buffer = types.SimpleNamespace(
                 division=model.new_int_var(
                     0, len(self.RAW_SPLITS) - 1, f"div_{sym.name}"
                 )
             )
-            sym_map[f"_raw_{sym.name}"] = list(self.RAW_SPLITS)
+            buffer_map[sym.name] = (buffer, list(self.RAW_SPLITS))
         sym_map[self.IS_LX.name] = model.new_bool_var(self.IS_LX.name)
 
-        cp_cost = _SympyExprToCpSat(model, sym_map).convert(expr)
+        cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
         # A constant would mean the objective collapsed rather than linearized.
         self.assertNotIsInstance(cp_cost, (int, float))
         model.minimize(cp_cost)

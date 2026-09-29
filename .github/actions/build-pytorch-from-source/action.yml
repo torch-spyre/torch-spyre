@@ -9,12 +9,10 @@ inputs:
   torch_spyre_dir:
     description: Path to the checked-out torch-spyre directory (its .venv is created/reused for this build)
     required: false
-    type: string
     default: torch-spyre
   pytorch_dir:
     description: Path to the pre-cloned pytorch directory (sibling of torch_spyre_dir)
     required: false
-    type: string
     default: pytorch
 
 outputs:

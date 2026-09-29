@@ -50,8 +50,6 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
-from typing import Optional
-
 import sympy
 import torch
 from sympy import Expr
@@ -63,7 +61,6 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
-    TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -75,12 +72,15 @@ from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
     concretize_index,
+    device_coordinates,
     find_reduction_var,
+    find_fx_node,
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
     _is_compact_node,
     lower_pad_sequence,
+    patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -102,18 +102,6 @@ def round_up_to_stick(cur_size: int, dtype: torch.dtype) -> int:
     return cur_size + compute_padding(cur_size, dtype)
 
 
-def _patch_env(graph_lowering) -> None:
-    """Add view nodes (ReinterpretView) to env from name_to_users."""
-    env: dict = {}
-    for tbs in graph_lowering.name_to_users.values():
-        for tb in tbs:
-            if not tb.data.origins:
-                continue
-            tb_fx_node = list(tb.data.origins)[0]
-            env[tb_fx_node] = tb
-    graph_lowering.env.update(env)
-
-
 def _move_ops_before(
     operations: list[Operation], new_ops: list[Operation], anchor: Operation
 ) -> None:
@@ -128,34 +116,6 @@ def _move_ops_before(
     idx = operations.index(anchor)
     for i, o in enumerate(new_ops):
         operations.insert(idx + i, o)
-
-
-def _find_arg_fx_node(arg_name: str) -> Optional[torch.fx.Node]:
-    """Return the FX node whose lowered TensorBox has the given buffer name.
-
-    Buffer names are unique, but a single buffer can be reached through
-    multiple FX nodes that present it at different sizes.  For example,
-    mm_to_bmm_pass inserts an unsqueeze/reshape so the matmul inner_fn
-    indexes x as 3D [1, M, K] even though the underlying buffer is 2D
-    [M, K].  Both FX nodes lower to a TensorBox whose get_name() returns
-    the same buffer name, but with different get_size() results.
-
-    Returns the first candidate (the base buffer, with no view applied), or
-    None if no candidate exists -- e.g. a coarse_tile read-copy buffer (see
-    coarse_tile.py's _insert_one_read_copy), which is synthesized purely at
-    the IR level after FX lowering completed and so has no FX-graph
-    counterpart at all.
-    """
-    graph_lowering = V.graph
-    _patch_env(graph_lowering)
-    candidates = [
-        fx_node
-        for fx_node, tb in graph_lowering.env.items()
-        if isinstance(fx_node, torch.fx.Node)
-        and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
-    ]
-    return candidates[0] if candidates else None
 
 
 class _PaddedLoadHandler(WrapperHandler):
@@ -384,7 +344,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
-        y_fx_node = _find_arg_fx_node(y_name)
+        patch_env(V.graph)
+        y_fx_node = find_fx_node(y_name, V.graph)
 
         # No orig_stl: this pass runs before stickification, so the new ops keep
         # host FixedLayouts and propagate_spyre_tensor_layouts lays them out.
@@ -419,12 +380,6 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 # --------------------------------------------------------------------------- #
 # insert_restickify_padding                                                   #
 # --------------------------------------------------------------------------- #
-
-
-def _device_coords(stl: SpyreTensorLayout, dep) -> list[Expr]:
-    """Return device-space coordinate expressions for ``dep`` against ``stl``."""
-    index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(stl.device_size, stl.stride_map, dep.ranges, index)
 
 
 def _write_dep(op):
@@ -475,7 +430,7 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
     # identifies the dim.  A symbol whose range spans more than one tile can
     # appear split across several coordinates (e.g. v // 64 in one, v % 64 in
     # another); the outermost (lowest-index) one is the governing dim.
-    device_coords = _device_coords(stl, write_dep)
+    device_coords = device_coordinates(stl, write_dep)
     for dim in range(len(device_coords) - 1):
         if sym in device_coords[dim].free_symbols:
             return dim
@@ -487,7 +442,7 @@ def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     or None if it has none (e.g. a symbol-free size-1 stick, or a scalar /
     zero-dim layout with no coords at all).
     """
-    device_coords = _device_coords(stl, dep)
+    device_coords = device_coordinates(stl, dep)
     if not device_coords:
         return None
     # A coefficient or offset on the coordinate doesn't add free symbols, so
@@ -521,8 +476,8 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     if in_dep is None:
         return False
 
-    in_coords = _device_coords(in_layout.device_layout, in_dep)
-    out_coords = _device_coords(out_layout.device_layout, _write_dep(op))
+    in_coords = device_coordinates(in_layout.device_layout, in_dep)
+    out_coords = device_coordinates(out_layout.device_layout, _write_dep(op))
     # A scalar / zero-dim layout has no coordinates, so it can't be a restickify.
     if not in_coords or not out_coords:
         return False
@@ -661,7 +616,138 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
+def _compute_digits(coord, ranges) -> list[tuple[int, sympy.Symbol]]:
+    syms = coord.free_symbols
+    if len(syms) < 2:
+        return []
+
+    residual = sympy.expand(coord)
+    digits: list[tuple[int, sympy.Symbol]] = []
+    for sym in syms:
+        if sym not in ranges:
+            return []
+        coeff_expr = residual.coeff(sym)
+        if coeff_expr.free_symbols or coeff_expr.is_integer is not True:
+            return []
+        coeff = concretize_expr(coeff_expr)
+        if coeff <= 0:
+            return []
+        digits.append((coeff, sym))
+        residual -= coeff_expr * sym
+
+    # A numeric constant is a slice offset and does not change contiguity.
+    if residual.free_symbols or not residual.is_number:
+        return []
+
+    return sorted(digits, key=lambda item: item[0])
+
+
+def _is_dense_flattened_coordinate(digits, ranges) -> bool:
+    """Return whether ``coord`` densely flattens two or more loop dimensions.
+
+    ``host_coordinates`` normally returns one loop symbol per host dimension.
+    A view may instead split one physical host dimension into several logical
+    dimensions, for example ``128 * head + feature`` for a ``[H, 128]`` view of
+    one ``H * 128`` projection dimension.  That is still a unit-stride,
+    contiguous traversal of the host dimension: ordering the symbols from the
+    innermost coefficient outwards must produce the mixed-radix strides
+    ``1, size(inner), size(inner) * size(next), ...``.
+
+    Reject nonlinear expressions and gapped or overlapping flattenings.  They need
+    the same re-base copy as an ordinary strided input.
+    """
+    if not digits:
+        return False
+    expected = 1
+    for coeff, sym in digits:
+        if coeff != expected:
+            return False
+        expected *= concretize_expr(ranges[sym])
+    return True
+
+
+def _is_nonoverlapping_aligned_stick_coordinate(
+    digits, coord, ranges, stick_sym, dtype
+) -> bool:
+    """Return whether ``coord`` gives each outer index a disjoint stick window.
+
+    Coarse tiling can narrow an inner range without changing its outer physical
+    stride, for example ``512 * batch + tile_sequence`` with a 256-element tile.
+    That is not dense, but it is safe for a restickify when the inner symbol is
+    unit-stride and every outer coefficient leaves enough room for the padded
+    span of all lower-order symbols.
+    """
+    if not digits:
+        return False
+    syms = coord.free_symbols
+    if stick_sym not in syms:
+        return False
+
+    stick_extent = concretize_expr(ranges[stick_sym])
+    if compute_padding(stick_extent, dtype) != 0:
+        return False
+
+    if digits[0] != (1, stick_sym):
+        return False
+
+    span = stick_extent
+    for coeff, sym in digits[1:]:
+        if coeff < span:
+            return False
+        span += coeff * (concretize_expr(ranges[sym]) - 1)
+    return True
+
+
+def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
+    """Return the allocation extent needed for a restickify read window.
+
+    A view can split one physical input dimension into several logical loop
+    dimensions, so the physical coordinate may be a dense mixed-radix sum such
+    as ``64 * batch + sequence``.  The restickify reads a whole stick starting
+    at each outer digit's base.  Account for the last such base, then round only
+    the innermost (unit-stride) stick digit's extent.
+    """
+    syms = coord.free_symbols
+    if stick_sym not in syms:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick symbol {stick_sym} is absent "
+            f"from input coordinate {coord}"
+        )
+    if len(syms) == 1:
+        # Preserve the existing one-symbol behavior, including coordinates
+        # split across host dimensions with FloorDiv/Mod expressions.
+        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
+        return slice_offset + round_up_to_stick(
+            concretize_expr(ranges[stick_sym]), dtype
+        )
+
+    digits = _compute_digits(coord, ranges)
+    is_dense = _is_dense_flattened_coordinate(digits, ranges)
+    has_disjoint_stick_windows = _is_nonoverlapping_aligned_stick_coordinate(
+        digits, coord, ranges, stick_sym, dtype
+    )
+    if not is_dense and not has_disjoint_stick_windows:
+        raise Unsupported(
+            f"insert_restickify_padding: input coordinate {coord} is not a "
+            "dense flattening or a set of non-overlapping stick windows"
+        )
+
+    stick_extent = concretize_expr(ranges[stick_sym])
+    if not has_disjoint_stick_windows:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick extent {stick_extent} in "
+            f"dense flattened input coordinate {coord} requires a re-base copy"
+        )
+
+    max_slice_start = coord.subs(stick_sym, 0)
+    for sym in syms - {stick_sym}:
+        max_slice_start = max_slice_start.subs(sym, concretize_expr(ranges[sym]) - 1)
+    return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
+
+
+def _assert_input_paddable(
+    op: ComputedBuffer, in_dep, in_layout, out_stick_sym
+) -> list[sympy.Expr]:
     """Raise ``Unsupported`` for restickify inputs outside what the stick-boundary
     bump supports, classifying each input dim's read by its coordinate.
 
@@ -680,12 +766,19 @@ def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
         syms = coord.free_symbols
         if not syms:  # degenerate size-1 host dim, nothing to slice
             continue
-        assert len(syms) == 1, (
-            f"insert_restickify_padding: host dim {i} of {op.get_name()} "
-            f"(coord {coord}) carries multiple free symbols -- an interleaved "
-            f"index this pass's per-dim strided/sliced classification cannot "
-            f"read; a restickify input must not reach this shape"
-        )
+        if len(syms) > 1:
+            digits = _compute_digits(coord, in_dep.ranges)
+            if _is_dense_flattened_coordinate(
+                digits, in_dep.ranges
+            ) or _is_nonoverlapping_aligned_stick_coordinate(
+                digits, coord, in_dep.ranges, out_stick_sym, in_layout.dtype
+            ):
+                continue
+            raise Unsupported(
+                f"insert_restickify_padding: host dim {i} of {op.get_name()} "
+                f"(coord {coord}) is neither dense nor a set of "
+                "non-overlapping stick windows"
+            )
         sym = next(iter(syms))
         # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
         # tail.  A broadcast (coeff 0) is read from the device layout, not this
@@ -695,6 +788,7 @@ def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
                 f"insert_restickify_padding: strided input on host dim "
                 f"{i} of {op.get_name()} (coord {coord}) is not supported"
             )
+    return in_host_coords
 
 
 def lower_identity_clone(
@@ -796,8 +890,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     new_stick_dim = None
     padded_dim_size = None
     if not size1:
-        _assert_input_paddable(op, in_dep, in_layout)
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        in_host_coords = _assert_input_paddable(op, in_dep, in_layout, out_stick_sym)
         new_stick_dim = _host_dim_carrying_sym(in_host_coords, out_stick_sym)
         assert new_stick_dim is not None, (
             f"restickify padding: no input host dim carries new-stick symbol "
@@ -805,15 +898,14 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         )
         dtype = in_layout.dtype
         coord = in_host_coords[new_stick_dim]
-        syms = coord.free_symbols
-        assert len(syms) == 1
-        sym = next(iter(syms))
-        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
-        slice_size = concretize_expr(in_dep.ranges[sym])
-        device_dim = _device_dim_carrying_sym(in_layout.device_layout, in_dep, sym)
+        device_dim = _device_dim_carrying_sym(
+            in_layout.device_layout, in_dep, out_stick_sym
+        )
         assert device_dim is not None
         dim_size = concretize_expr(in_layout.device_layout.device_size[device_dim])
-        padded_dim_size = slice_offset + round_up_to_stick(slice_size, dtype)
+        padded_dim_size = _restickify_input_required_extent(
+            coord, in_dep.ranges, out_stick_sym, dtype
+        )
         if padded_dim_size <= dim_size:
             return
 
@@ -827,7 +919,8 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         device = in_buf.get_device()
         if device is None:
             return
-        in_fx_node = _find_arg_fx_node(in_dep.name)
+        patch_env(V.graph)
+        in_fx_node = find_fx_node(in_dep.name, V.graph)
         if in_fx_node is None:
             raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
         clone_buf, new_ops = lower_identity_clone(

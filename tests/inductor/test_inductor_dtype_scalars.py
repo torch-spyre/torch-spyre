@@ -561,20 +561,39 @@ class TestNegativeScalarOperations:
 
         assert result.shape == x.shape
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1740
-    # AttributeError: 'UnimplementedOp' object has no attribute 'iteration_space'
-    @pytest.mark.xfail(
-        reason="backend: Negative base with fractional power not implemented"
+    # DLFloat16 draws no distinction between -inf and NaN: both are the word
+    # ``0xFFFF``, which converts to -inf on the way to the host, so ``isnan``
+    # there is False. The marker rides on the parameter rather than the body so
+    # the assertion is reached, and an eventual pass is reported as an xpass.
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            pytest.param(torch.float32, id="fp32"),
+            pytest.param(
+                torch.float16,
+                id="fp16",
+                marks=pytest.mark.xfail(
+                    reason="float16 device NaN converts to -inf on the way to "
+                    "the host, so the NaN is not observable there"
+                ),
+            ),
+        ],
     )
-    def test_negative_power_nan_result(self, execution_mode):
-        """Negative base with fractional power -> NaN."""
+    def test_negative_power_nan_result(self, execution_mode, dtype):
+        """Negative base with fractional power -> NaN, and a valid base unaffected."""
 
         def neg_power(x):
             return x**-0.5
 
-        x = torch.tensor([-1.0, -2.0, -3.0], device=DEVICE)
+        # 4.0 is a valid base, guarding against a blanket non-finite result.
+        x = torch.tensor([-1.0, -2.0, -3.0, 4.0], dtype=dtype, device=DEVICE)
         result = _run_spyre(execution_mode, neg_power, x)
-        assert torch.isnan(result).all()
+
+        # Checked on the host: ``aten::isnan`` has no Spyre kernel.
+        host = result.cpu()
+        assert torch.isnan(host[:3]).all()
+        assert host[3] == pytest.approx(0.5, abs=1e-3)
+        assert result.shape == x.shape
 
     @pytest.mark.parametrize(
         "dtype,scalar,expected_behavior",
@@ -817,3 +836,45 @@ class TestNegativeScalarOperations:
         assert any(
             kw in error_msg.lower() for kw in ["device", "layout", "cpu", "spyre"]
         )
+
+    def test_chained_fp16_fp32_scalar_ops(self, execution_mode):
+        """((x + s) * s) / s scalar chain: fp16 stays fp16 with Python float scalars."""
+
+        def fp16_scalar_chain(x):
+            y = x + 0.5
+            y = y * 2.0
+            return y / 4.0
+
+        x = cached_randn((4, 64))
+        assert fp16_scalar_chain(x).dtype == torch.float16
+        _compare_modes(execution_mode, fp16_scalar_chain, x, atol=0.1, rtol=0.1)
+
+    def test_bf16_tensor_fp32_scalar_implicit_promotion(self, execution_mode):
+        """bf16 tensor + Python float scalar: bf16 stays bf16 (Python scalars don't promote)."""
+
+        def bf16_fp32_add(x):
+            return x + 1.0
+
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        result = _run_spyre(execution_mode, bf16_fp32_add, x)
+        expected = x + 1.0
+        assert result.cpu().dtype == torch.bfloat16
+        assert torch.allclose(
+            result.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+        )
+
+    def test_inplace_fp16_add_fp32_scalar_dtype_unchanged(self, execution_mode):
+        """in-place fp16 += fp32_scalar must preserve fp16 dtype and produce correct values."""
+
+        def inplace_add(x):
+            x += 1.0
+            return x
+
+        x = cached_randn((4, 64))
+        original_dtype = x.dtype
+        result = _run_spyre(execution_mode, inplace_add, x)
+        assert result.dtype == original_dtype, (
+            f"in-place add changed dtype: {original_dtype} -> {result.dtype}"
+        )
+        expected = x + torch.ones_like(x)
+        assert torch.allclose(result.cpu(), expected, atol=0.1, rtol=0.1)

@@ -8,19 +8,16 @@ inputs:
   torch_spyre_dir:
     description: Path to the pre-cloned torch-spyre directory
     required: false
-    type: string
     default: torch-spyre
   pytorch_dir:
     description: Path to clone the pytorch directory to
     required: false
-    type: string
     default: pytorch
   sha:
     description: |
       Exact PyTorch commit SHA to check out. If set, takes precedence over
       the pyproject.toml-derived release branch below.
     required: false
-    type: string
     default: ''
 
 runs:
