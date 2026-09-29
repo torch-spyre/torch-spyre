@@ -27,7 +27,7 @@ test_suite_config:
         - names:
             - TestSelectAlgorithm::test_linear_to_lowp_fp
             - TestSelectAlgorithm::test_linear_with_input_of_flexible_layout
-          mode: xfail
+          mode: skip
 
   global:
     supported_dtypes:

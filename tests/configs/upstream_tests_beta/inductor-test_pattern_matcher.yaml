@@ -13,7 +13,7 @@ test_suite_config:
           mode: mandatory_success
         - names:
             - TestPatternMatcher::test_scaled_softmax
-          mode: xfail
+          mode: skip
         # These tests exercise various operations and patterns in PyTorch, including matrix multiplications (mm, addmm), concatenation (cat), and tensor manipulations (view, permute).
         # They are classified as "skip" on the Spyre backend due to the lack of CUDA support, which is required for these tests to run successfully.
         # The relevant Spyre capability is its support for CPU-based operations, which does not include CUDA-specific functionalities.

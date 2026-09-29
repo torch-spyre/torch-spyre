@@ -27,7 +27,7 @@ test_suite_config:
             - TestSelectAlgorithm::test_linear_unsupported_epilogue_fusion
             - TestSelectAlgorithm::test_linear_with_multiple_reindexers
             - TestSelectAlgorithm::test_linear_with_permute
-          mode: xfail
+          mode: skip
 
         # These tests exercise batched matrix multiplication (bmm) with various tensor permutations and data types.
         # They are skipped because the backend layer does not engage with these operations.

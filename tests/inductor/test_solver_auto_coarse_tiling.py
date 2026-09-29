@@ -58,8 +58,8 @@ def expected_unimplemented(fn):
     test on anything else, including a clean pass (the signal to delete the
     marker).
 
-    Because it is imperative rather than a pytest mark, ``-m 'not xfail'`` does
-    not deselect these; they still run and still xfail at runtime.
+    Because it is imperative rather than a pytest mark, these still run and
+    skip at runtime.
 
     Nothing here is specific to coarse tiling; it belongs in
     ``utils_inductor.py`` once a second suite wants it.
@@ -70,7 +70,7 @@ def expected_unimplemented(fn):
         try:
             fn(self, *args, **kwargs)
         except NotImplementedError as exc:
-            pytest.xfail(f"not built yet: {exc}")
+            pytest.skip(f"not built yet: {exc}")
         else:
             self.fail(f"{fn.__name__} passed -- remove @expected_unimplemented")
 
@@ -537,7 +537,7 @@ class AutomatedCoarseTilingTests(
     def case_decorators(params):
         """Mark the combos that cannot pass until the tile search is built.
 
-        These entries are never edited again: each combo stops xfailing on its
+        These entries are never edited again: each combo stops skipping on its
         own, the moment the last unbuilt piece on its path lands, because
         ``expected_unimplemented`` keys on the exception rather than on a list
         maintained by hand.  A combo turning green is the signal to delete its

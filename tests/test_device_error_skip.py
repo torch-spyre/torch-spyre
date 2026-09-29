@@ -326,6 +326,12 @@ class TestDeviceFaultSession(TestCase):
                 text=True,
                 cwd=d,
             )
+            if not xml.exists():
+                self.fail(
+                    f"child pytest exited {proc.returncode} without writing "
+                    f"{xml.name}\n--- stdout ---\n{proc.stdout[-4000:]}"
+                    f"\n--- stderr ---\n{proc.stderr[-4000:]}"
+                )
             outcomes = {}
             for case in ET.parse(xml).getroot().iter("testcase"):
                 kinds = [

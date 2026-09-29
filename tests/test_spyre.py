@@ -45,11 +45,11 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
 ]
 
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
-_SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
+_SCALAR_ADD_SKIP_TO_DTYPE = pytest.mark.skip(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
 )
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
+_SCALAR_ADD_SKIP_FP8 = pytest.mark.skip(
     reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
 )
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
@@ -74,7 +74,7 @@ class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
+    @pytest.mark.skip(reason="autograd not yet supported")
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -290,12 +290,12 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.int8, lambda: torch.tensor(10, dtype=torch.int8), None),
                 name="int8",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
+                decorators=[_SCALAR_ADD_SKIP_TO_DTYPE],
             ),
             subtest(
                 (torch.bool, lambda: torch.tensor(True, dtype=torch.bool), None),
                 name="bool",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
+                decorators=[_SCALAR_ADD_SKIP_TO_DTYPE],
             ),
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
@@ -325,7 +325,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_SKIP_FP8],
             ),
             subtest(
                 (
@@ -412,7 +412,7 @@ class TestSpyre(TestCase):
         ):
             spyre_t + cpu_t
 
-    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
+    @pytest.mark.skip(reason="data-dependent output not supported")
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")

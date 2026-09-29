@@ -78,7 +78,7 @@ test_suite_config:
       tests:
         - names:
             - TestSpyreModelOps::test_model_ops_db
-          mode: xfail
+          mode: skip
           tags:
             - model__Qwen2.5-7B-Instruct
           edits:

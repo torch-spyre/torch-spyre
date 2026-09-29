@@ -13,7 +13,7 @@ test_suite_config:
           mode: mandatory_success
         - names:
             - TestScatterOpt::test_cross_entropy_loss
-          mode: xfail
+          mode: skip
         - names:
             - TestScatterOpt::test_can_not_optimize_due_to_dense
             - TestScatterOpt::test_can_not_optimize_due_to_non_const

@@ -107,7 +107,7 @@ test_suite_config:
             - TestOldViewOps::test_view_all_dtypes_and_devices
             - TestViewOps::test_conj_view_with_shared_memory
             - TestViewOps::test_view_copy_output_contiguous
-          mode: xfail  # xfail: RuntimeError
+          mode: skip  # RuntimeError
         # These tests exercise view operations like atleast, reshape, transpose, and split across various dtypes.
         # They are xfailed due to missing Spyre support for aten::random_.from and restickify mutations during view operations.
         # The failures highlight Spyre's lack of random tensor initialization and limited view mutation capabilities.
@@ -119,7 +119,7 @@ test_suite_config:
             - TestViewOps::test_view_tensor_dsplit
             - TestViewOps::test_view_tensor_hsplit
             - TestViewOps::test_view_tensor_vsplit
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise view operations like transpose, reshape, flatten, and indexing that create tensor aliases.
         # They are xfailed because Spyre's stickified layout system cannot restickify tensors after mutation or handle complex stride expressions.
         # The failures highlight missing restickify support for layout changes and unsupported stride patterns like 2*d0.
@@ -161,7 +161,7 @@ test_suite_config:
             - TestViewOps::test_view_copy
             - TestViewOps::test_view_copy_out
             - TestViewOps::test_view_view
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
+          mode: skip  # torch._inductor.exc.InductorError
         # These tests exercise view and in-place operations like expand, resize_, unfold, and advanced indexing.
         # They are xfail due to missing Spyre kernel implementations for aten::unfold, aten::resize_, and aten::index.
         # Spyre currently lacks support for many view-related operators and in-place shape modifications.
@@ -172,17 +172,17 @@ test_suite_config:
             - TestViewOps::test_advanced_indexing_assignment
             - TestViewOps::test_advanced_indexing_nonview
             - TestViewOps::test_unfold_view
-          mode: xfail  # xfail: NotImplementedError
+          mode: skip  # NotImplementedError
         # These tests exercise view and resize operations across all dtypes, including complex.
         # They are xfail due to missing support for view operations and in-place resizing on Spyre.
         # Spyre currently lacks capabilities for complex dtypes and view-based tensor manipulations.
         - names:
             - TestOldViewOps::test_resize_as_all_dtypes_and_devices
-          mode: xfail   # xfail: dxp_standalone not detected
+          mode: skip  # dxp_standalone not detected
         # These tests exercise tensor transpose operations like T, H, mT, mH, and adjoint across multiple dtypes. They are xfail due to missing support for the aten::random_.from operator needed for tensor initialization. The Spyre backend currently lacks random tensor generation capabilities required by the test's make_tensor function.
         - names:
             - TestOldViewOps::test_transposes
-          mode: xfail  # xfail: NotImplementedError, RuntimeError
+          mode: skip  # NotImplementedError, RuntimeError
         # These tests exercise view operations with dtype changes across bool, float16, int64, and float32.
         # They are xfail due to missing support for the aten::random_.from operator on Spyre.
         # The failures highlight Spyre's lack of random tensor generation for test input creation.

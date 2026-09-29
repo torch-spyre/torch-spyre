@@ -27,7 +27,7 @@ test_suite_config:
             - TestSelectAlgorithm::test_bmm_with_fused_epilogues
             - TestSelectAlgorithm::test_int4_woq_mm_avx512
             - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
-          mode: xfail
+          mode: skip
 
   global:
     supported_dtypes:

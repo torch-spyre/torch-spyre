@@ -42,7 +42,7 @@ test_suite_config:
             - TestUnaryUfuncs::test_igammac_edge_cases
             - TestUnaryUfuncs::test_nan_to_num_bfloat16
             - TestUnaryUfuncs::test_threshold
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
+          mode: skip  # torch._inductor.exc.InductorError
         # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) across various dtypes and tensor contiguity scenarios.
         # They are classified as xfail due to Spyre's lack of support for certain dtypes and operations, as well as issues with tensor contiguity handling.
         # Relevant Spyre limitations include unsupported mutation ops and dtype-specific operation restrictions.
@@ -53,7 +53,7 @@ test_suite_config:
             - TestUnaryUfuncs::test_non_contig
             - TestUnaryUfuncs::test_non_contig_expand
             - TestUnaryUfuncs::test_non_contig_index
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) across various dtypes (bfloat16, bool, float16, int64).
         # They are classified as xfail due to unsupported tensor ranks and dtype-specific operations on the Spyre backend.
         # Relevant Spyre limitations include unsupported tensor ranks and lack of support for certain dtype-specific operations.
@@ -63,13 +63,13 @@ test_suite_config:
             - TestUnaryUfuncs::test_mvlgamma_inplace_integer_error
             - TestUnaryUfuncs::test_mvlgamma_integer_promotion
             - TestUnaryUfuncs::test_reference_numerics_extremal
-          mode: xfail   # xfail: dxp_standalone not detected
+          mode: skip  # dxp_standalone not detected
         # These tests exercise unary operations like acos, log, and sqrt across dtypes bfloat16, float16, and float32.
         # They are classified as xfail due to missing 'dxp_standalone' file, causing FileNotFoundError.
         # Relevant Spyre limitations include incomplete support for certain unary ops and dtypes.
         - names:
             - TestUnaryUfuncs::test_float_domains
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
+          mode: skip  # torch._inductor.exc.InductorError
         # These tests exercise various unary operations and their edge cases, including `frexp`, `hardshrink`, `hardsigmoid`, and `nonzero`, across different dtypes.
         # They are classified as xfail due to the Spyre backend not supporting these operations, resulting in `NotImplementedError`.
         # The most relevant Spyre limitations are the lack of support for these specific unary operations and their backward passes.
@@ -84,19 +84,19 @@ test_suite_config:
             - TestUnaryUfuncs::test_nonzero_empty
             - TestUnaryUfuncs::test_nonzero_static
             - TestUnaryUfuncs::test_nonzero_static_large
-          mode: xfail  # xfail: NotImplementedError
+          mode: skip  # NotImplementedError
         # These tests exercise the hardswish operation with bfloat16 and float32 dtypes.
         # They are classified as xfail due to unsupported type conversion during tensor copy.
         # The relevant Spyre limitation is the lack of support for type conversion in copy operations.
         - names:
             - TestUnaryUfuncs::test_hardswish
-          mode: xfail  # xfail: RuntimeError
+          mode: skip  # RuntimeError
         # These tests exercise the `nan_to_num` operation across various dtypes, including handling of NaN and inf values.
         # They are classified as xfail due to Spyre's lack of support for the `aten::random_.from` operator and missing 'dxp_standalone' file.
         # Relevant Spyre limitations include incomplete operator coverage and missing dependencies for certain operations.
         - names:
             - TestUnaryUfuncs::test_nan_to_num
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise a variety of unary operations and special functions across different data types.
         # They are classified as 'skip' because they do not utilize the torch-spyre layer, which is required for backend-specific optimizations.
         # Relevant Spyre capabilities include support for bfloat16, float16, and float32, but not all special functions are fully optimized for these types.

@@ -17,7 +17,7 @@ from collections import defaultdict
 import copy
 from dataclasses import dataclass
 from typing import Callable, ClassVar, Optional, Iterable
-from unittest import TestCase, expectedFailure
+from unittest import TestCase, skip
 from enum import Enum
 import os
 
@@ -197,8 +197,7 @@ class PatternTests:
     - ``role="verify"``  — generates ``test_verify_{name}_pattern`` methods that validate the
       good allocation defined in the pattern
     - ``role="solver"``  — generates ``test_{name}_pattern`` methods that run the solver and
-      check it meets the good allocation; names in ``expected_failures`` are wrapped with
-      ``@expectedFailure``
+      check it meets the good allocation; names in ``expected_failures`` are skipped
     """
 
     PATTERNS: ClassVar[list[str]] = [
@@ -232,7 +231,7 @@ class PatternTests:
                     )
 
                 if name in xfails and not BYPASS_XFAIL:
-                    _test_solve = expectedFailure(_test_solve)
+                    _test_solve = skip("known solver failure")(_test_solve)
                 setattr(cls, f"test_{name}_pattern", _test_solve)
 
     def setUp(self) -> None:

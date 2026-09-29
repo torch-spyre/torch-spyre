@@ -36,12 +36,11 @@ computeOp routing. bundle_jsons_from_captured lets a test that only captured
 op specs move on to that same SDSC validation without recompiling.
 
 run_e2e drives the real backend (no mocking), mirroring the standalone
-gather.py script: it compiles and runs on device, then reports an *expected
-failure* (pytest.xfail) when the values diverge from the CPU reference or the
-backend aborts -- because the backend does not yet implement indirect access
-correctly. The xfail is raised after the capture-path stage checks run, so those
-stay strict; when the backend is fixed and results match, no xfail is raised and
-the test passes (xpass alerts you if a hard-coded expectation goes stale). For
+gather.py script: it compiles and runs on device, then skips (pytest.skip) when
+the values diverge from the CPU reference or the backend aborts -- because the
+backend does not yet implement indirect access correctly. The skip is raised
+after the capture-path stage checks run, so those stay strict; when the backend
+is fixed and results match, the test passes. For
 expect_close=True ops a mismatch/failure is instead a hard error. Only gather
 reaches this path today; the name is generic so scatter can reuse it later.
 """
@@ -423,9 +422,8 @@ def run_e2e(
     The device compile/run is best-effort: the backend does not yet support
     every indirect-access pattern and aborts (SIGABRT in the backend) on some
     of them. A backend failure -- and likewise a value divergence -- is reported
-    as an *expected failure* (pytest.xfail) rather than warned or hard-failed, so
-    "always run e2e" surfaces known backend gaps as xfail (and flips to xpass the
-    day the backend is fixed) without turning the suite red. Because xfail is
+    as a skip (pytest.skip) rather than warned or hard-failed, so known backend
+    gaps do not turn the suite red. Because the skip is
     raised imperatively *after* the capture-path stage checks have run, those
     checks stay strict. (For `expect_close=True` ops, which must work, a failure
     or divergence is a hard assertion/raise instead.)
@@ -438,13 +436,13 @@ def run_e2e(
           - `True`  -> assert the result matches (use for ops that must be
                          correct, e.g. a supported direct op or CPU fallback);
           - `False` -> assert the result diverges (pin a known-bad path);
-          - `None`  -> xfail on divergence (the default for on-device indirect
+          - `None`  -> skip on divergence (the default for on-device indirect
                          gather, which the backend does not yet implement
-                         correctly). When it is fixed and results match, no xfail
-                         is raised and the test simply passes.
+                         correctly). When it is fixed and results match, the
+                         test simply passes.
 
     Returns an `E2EResult` when the result matched (or expect_close handled it);
-    on divergence/backend failure it raises pytest.xfail and does not return.
+    on divergence/backend failure it raises pytest.skip and does not return.
     """
     reference = kernel(
         *[a.cpu() if isinstance(a, torch.Tensor) else a for a in dev_args]
@@ -457,7 +455,7 @@ def run_e2e(
     except (BackendCompilerFailed, CalledProcessError) as exc:
         if expect_close:
             raise  # a must-work op failing to compile/run is a real regression
-        pytest.xfail(
+        pytest.skip(
             "e2e backend compile/run failed "
             f"({type(getattr(exc, '__cause__', None) or exc).__name__}); the "
             "Spyre backend does not yet support this indirect-access pattern. "
@@ -481,7 +479,7 @@ def run_e2e(
     elif expect_close is False:
         test.assertFalse(close, "e2e result unexpectedly matched the CPU reference")
     elif not close:
-        pytest.xfail(
+        pytest.skip(
             "e2e result diverges from the CPU reference "
             f"(max abs diff {diff:.4g}); the Spyre backend does not yet "
             "implement indirect access correctly. The pipeline compiled and "

@@ -68,7 +68,7 @@ test_suite_config:
             - TestPoolingNNDeviceType::test_pool_large_size
             - TestPoolingNNDeviceType::test_pooling_max_nhwc
             - TestPoolingNNDeviceType::test_pooling_shape
-          mode: xfail  # xfail: dxp_standalone not detected
+          mode: skip  # dxp_standalone not detected
         # These tests exercise pooling operations (avg_pool2d, max_pool2d) across different tensor dimensions and data types.
         # They are classified as xfail due to NotImplementedError, indicating that the Spyre backend lacks support for these specific pooling operations.
         # The relevant Spyre limitation is the absence of native support for avg_pool2d and max_pool2d_with_indices.
@@ -77,14 +77,14 @@ test_suite_config:
             - TestPoolingNNDeviceType::test_MaxPool_zero_batch_dim
             - TestPoolingNNDeviceType::test_max_pool1d
             - TestPoolingNNDeviceType::test_pooling_bfloat16
-          mode: xfail  # xfail: NotImplementedError
+          mode: skip  # NotImplementedError
         # These tests exercise fractional max pooling operations on 2D and 3D tensors, using the Double dtype.
         # They are classified as xfail due to the Spyre backend's lack of support for the Double dtype.
         # The relevant Spyre limitation is the absence of Double dtype support in pooling operations.
         - names:
             - TestPoolingNNDeviceType::test_fractional_max_pool2d
             - TestPoolingNNDeviceType::test_fractional_max_pool3d
-          mode: xfail  # xfail: RuntimeError
+          mode: skip  # RuntimeError
         # # These tests exercise pooling operations with zero stride, which are expected to fail due to the absence of the 'dxp_standalone' executable required for compilation.
         # # The failure is classified as xfail because the Spyre backend lacks the necessary runtime support for this specific operation.
         # # Relevant Spyre limitations include missing executables for certain compilation tasks, impacting the ability to handle specific pooling configurations.

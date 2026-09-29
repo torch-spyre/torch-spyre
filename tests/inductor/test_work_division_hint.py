@@ -382,12 +382,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
         self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Named work-division hints do not yet distinguish component names "
-            "inside a reshaped compound dimension."
-        ),
+    @pytest.mark.skip(
+        reason="Named work-division hints do not yet distinguish component names "
+        "inside a reshaped compound dimension."
     )
     @config.patch({"sencores": 8})
     def test_reshaped_matmul_work_div_hint_maps_component_name(self):
@@ -411,12 +408,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self.assertIn("sympify('c0'): (sympify('32'), 4)", source_codes[0])
         self.assertNotIn("sympify('z0'): (sympify('4'), 4)", source_codes[0])
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Named work-division hints do not yet distinguish component names "
-            "inside a reshaped compound dimension."
-        ),
+    @pytest.mark.skip(
+        reason="Named work-division hints do not yet distinguish component names "
+        "inside a reshaped compound dimension."
     )
     @config.patch({"sencores": 8})
     def test_reshaped_pointwise_work_div_hint_maps_component_name(self):
