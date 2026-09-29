@@ -461,7 +461,7 @@ def test_cache_miss_async_runner_gets_16char_prefix():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -517,7 +517,7 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
-        spyre_config.patch({"async_dxp_compile": False, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(async_compile_mod, "compute_specs_hash", return_value=cache_key),
         patch.object(async_compile_mod, "get_cached_kernel_dir", return_value=None),
         patch.object(
@@ -533,7 +533,7 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
         ),
-        patch.object(compiler, "_submit_dxp", return_value=None),
+        patch.object(compiler, "_submit_backend_compile", return_value=None),
         patch.object(
             async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
         ),
@@ -567,7 +567,7 @@ def test_cache_disabled_async_runner_gets_8char_uuid():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": False}),
+        spyre_config.patch({"spyre_kernel_cache": False}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -617,13 +617,13 @@ def test_cache_disabled_sync_runner_gets_8char_uuid():
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
-        spyre_config.patch({"async_dxp_compile": False, "spyre_kernel_cache": False}),
+        spyre_config.patch({"spyre_kernel_cache": False}),
         patch.object(async_compile_mod, "generate_bundle"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
         ),
-        patch.object(compiler, "_submit_dxp", return_value=None),
+        patch.object(compiler, "_submit_backend_compile", return_value=None),
         patch.object(
             async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
         ),

@@ -303,7 +303,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
         # sdsc_bundle_dir_prefix selection:
-        # cached path  — first 16 characterss of cache_key, a base32-encoded
+        # cached path  — first 16 characters of cache_key, a base32-encoded
         #                SHA-256 digest (80 bits of entropy); prefix
         #                collision across distinct kernels is possible but
         #                negligible in practice (birthday bound ~2^40 kernels).

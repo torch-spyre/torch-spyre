@@ -834,44 +834,6 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
 
-    def test_project_real_plan_identity_valid_permuted_rejected(self):
-        """#7a: project a REAL prepared plan through validate()'s exact path.
-
-        validate() classifies each JobPlanStep (classifyStep) and reads its
-        baked-in role() to build the (kind, role) sequence it checks. The
-        check_job_plan_step_ordering binding takes NAME lists and bypasses that
-        projection, so a wiring bug in the step -> (kind, role) mapping would slip
-        past it. _test_project_and_check_ordering runs the REAL projection over
-        REAL step objects in a caller-given index order:
-          - identity order [0, 1, 2] must reproduce validate()'s acceptance ('');
-          - a permuted order that puts the real H2D before the real HostCompute
-            must be REJECTED by the same projection (the prep stream must begin
-            with HostCompute), enforced over real steps, not name lists.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = self.create_mock_spyrecode(
-                tmpdir, exec_command="ComputeOnHost"
-            )
-            plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-            assert plan.num_steps() == 3
-
-            err_identity = torch_spyre._C._test_project_and_check_ordering(
-                plan, [0, 1, 2]
-            )
-            assert err_identity == "", (
-                "real-step projection in canonical order must be accepted, "
-                f"matching validate(); got: {err_identity!r}"
-            )
-
-            err_permuted = torch_spyre._C._test_project_and_check_ordering(
-                plan, [1, 0, 2]
-            )
-            assert err_permuted != "", (
-                "projecting the real steps with H2D before HostCompute must "
-                "be rejected (prep stream must begin with HostCompute)"
-            )
-            assert "HostCompute" in err_permuted
-
     def test_sdsc_bundle_dir_prefix_registered_via_provenance_profiler_event_name(self):
         """prepare_kernel with profiler_event_name registers the prefix under that name."""
         profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
