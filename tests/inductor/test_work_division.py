@@ -30,9 +30,17 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch._inductor.utils import fresh_cache
 from torch.utils._sympy.functions import ModularIndexing
 
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_dtype,
+)
+from torch_spyre._inductor import passes
+from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
@@ -41,7 +49,7 @@ from torch_spyre._inductor.constants import (
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
-from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
+from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
@@ -1440,24 +1448,6 @@ class TestFinalMappingConstraints(unittest.TestCase):
 
         self.assertEqual(result.blocked, {ki})
 
-    def test_depthwise_conv_does_not_block_trailing_group_dim(self):
-        kh, kw, group = (_isym(name) for name in ("kh", "kw", "group"))
-        op = _computed_buffer(
-            (8,),
-            name="depthwise_conv",
-            reduction_type=DEPTHWISE_CONV2D_OP,
-            reduction_ranges=(3, 3, 4),
-        )
-        result = reduction_window_blocked_vars(
-            _make_context(
-                op,
-                self._PLACEHOLDER_TD,
-                reduction_vars=[kh, kw, group],
-            )
-        )
-
-        self.assertEqual(result.blocked, {kh, kw})
-
     def test_conv_spatial_and_window_blocks_compose(self):
         mb, out, i, j, channel, ki = (
             _isym(name) for name in ("mb", "out", "i", "j", "channel", "ki")
@@ -1532,6 +1522,138 @@ class TestFinalMappingConstraints(unittest.TestCase):
         )
 
         self.assertEqual(result.blocked, {old_stick})
+
+
+class TestDepthwiseConvWindowBlocked(unittest.TestCase):
+    """End-to-end: a depthwise conv's kernel window must stay unsplit.
+
+    SuperDSC rejects a ki/kj split for every conv, and the scheduler transport
+    cannot even carry one to it: the depthwise input read indexes the output
+    position (window offsets live in conv_params), so a window split has no
+    read coefficient and is dropped. The work-division guard is what keeps the
+    solver from pricing a plan that cannot run.
+    """
+
+    _X_SHAPE = (1, 64, 32, 32)
+    _W_SHAPE = (64, 1, 3, 3)
+
+    @staticmethod
+    def _conv(x, w):
+        return torch.conv2d(x, w, None, stride=(1, 1), groups=x.shape[1])
+
+    def _inputs(self):
+        """CPU inputs and their device copies, both with channel as the stick."""
+        fp16 = get_device_dtype(torch.float16)
+        x = torch.randn(self._X_SHAPE, dtype=torch.float16)
+        w = torch.randn(self._W_SHAPE, dtype=torch.float16)
+        x_dev = x.to(
+            device_layout=SpyreTensorLayout(
+                [32, 32, 1, 1, 64], [1, 32, -1, 65536, 1024], fp16
+            )
+        )
+        w_dev = w.to(
+            device_layout=SpyreTensorLayout([3, 3, 1, 1, 64], [1, 3, -1, 9, 9], fp16)
+        )
+        return x, w, x_dev, w_dev
+
+    def _compile_depthwise(self):
+        """Compile and run the depthwise conv, recording each (ctx, result) of
+        reduction_window_blocked_vars on it. Returns the device output, the
+        CPU reference, and the recorded pairs."""
+        captured = []
+        real_window = work_division_constraints.reduction_window_blocked_vars
+
+        def window(ctx):
+            result = real_window(ctx)
+            if getattr(ctx.op.data, "reduction_type", None) == DEPTHWISE_CONV2D_OP:
+                captured.append((ctx, result))
+            return result
+
+        x, w, x_dev, w_dev = self._inputs()
+        torch._dynamo.reset()
+        with fresh_cache():
+            with patch.object(
+                work_division_constraints, "reduction_window_blocked_vars", window
+            ):
+                out = torch.compile(self._conv)(x_dev, w_dev).cpu()
+        self.assertTrue(captured, "depthwise conv never reached work division")
+        return out, self._conv(x, w), captured
+
+    @staticmethod
+    def _kernel_window(ctx):
+        """The vars only the weight read indexes: the kernel window."""
+        write_vars = op_read_writes(ctx.op).writes
+        write_syms = set().union(*(d.index.free_symbols for d in write_vars))
+        read_syms = set().union(
+            *(d.index.free_symbols for d in op_read_writes(ctx.op).reads)
+        )
+        return {v for v in read_syms - write_syms if v in ctx.it_space}
+
+    def test_blocks_exactly_the_kernel_window(self):
+        out, ref, captured = self._compile_depthwise()
+        for ctx, result in captured:
+            window = self._kernel_window(ctx)
+            self.assertEqual(sorted(int(ctx.it_space[v]) for v in window), [3, 3])
+            self.assertEqual(result.blocked, window)
+            # The channel stick dim sits first in reduction_vars (the output
+            # stick is excluded from its coordinate vars) but is not reduced
+            # over; a positional reduction_vars[:2] would block it and kh,
+            # leaving kw free.
+            channel = ctx.reduction_vars[0]
+            self.assertNotIn(channel, window)
+            self.assertNotIn(channel, result.blocked)
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.1)
+
+    def test_unblocked_window_split_is_dropped_before_codegen(self):
+        """What the guard prevents: permit (and force) a kh split, and the
+        committed plan cannot be carried to codegen."""
+        forced = {}
+        committed = {}
+        real_window = work_division_constraints.reduction_window_blocked_vars
+        real_finalize = passes.finalize_work_division_for_scheduler
+
+        def force_kh_split(ctx):
+            if getattr(ctx.op.data, "reduction_type", None) != DEPTHWISE_CONV2D_OP:
+                return real_window(ctx)
+            kh = min(self._kernel_window(ctx), key=str)
+            forced["kh"] = kh
+            return ConstraintResult(allowed_splits={kh: frozenset({3})})
+
+        def finalize(graph):
+            for op in graph.operations:
+                data = getattr(op, "data", None)
+                if getattr(data, "reduction_type", None) == DEPTHWISE_CONV2D_OP:
+                    committed.update(op.iteration_space_ownership.work_slices)
+            real_finalize(graph)
+
+        x, w, x_dev, w_dev = self._inputs()
+        torch._dynamo.reset()
+        with (
+            fresh_cache(),
+            patch.object(
+                work_division_constraints,
+                "reduction_window_blocked_vars",
+                force_kh_split,
+            ),
+            patch.object(passes, "finalize_work_division_for_scheduler", finalize),
+        ):
+            with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
+                out = torch.compile(self._conv)(x_dev, w_dev).cpu()
+        ref = self._conv(x, w)
+        kh = forced["kh"]
+        self.assertEqual(committed[kh], 3)
+        self.assertTrue(
+            any(
+                "lossy work-division scheduler transport" in line
+                and f"reduction:{kh}=absent" in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
+        # The dropped split leaves numerics intact -- the op simply runs on
+        # fewer cores than the solver priced -- which is why only the guard,
+        # not a numeric test, keeps this plan out.
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.1)
 
 
 class TestQfp8wtConstraints(unittest.TestCase):

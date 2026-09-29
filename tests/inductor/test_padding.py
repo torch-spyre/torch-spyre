@@ -44,6 +44,7 @@ from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.padding import (
+    _compute_digits,
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
     _restickify_input_required_extent,
@@ -64,17 +65,19 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
         head, feature = sympy.symbols("head feature", integer=True)
         ranges = {head: 16, feature: 128}
 
-        self.assertTrue(_is_dense_flattened_coordinate(128 * head + feature, ranges))
-        self.assertTrue(
-            _is_dense_flattened_coordinate(128 * head + feature + 7, ranges)
-        )
+        digits = _compute_digits(128 * head + feature, ranges)
+        self.assertTrue(_is_dense_flattened_coordinate(digits, ranges))
+        digits = _compute_digits(128 * head + feature + 7, ranges)
+        self.assertTrue(_is_dense_flattened_coordinate(digits, ranges))
 
     def test_gapped_coordinate_is_not_dense(self) -> None:
         head, feature = sympy.symbols("head feature", integer=True)
         ranges = {head: 16, feature: 128}
 
-        self.assertFalse(_is_dense_flattened_coordinate(256 * head + feature, ranges))
-        self.assertFalse(_is_dense_flattened_coordinate(head + 32 * feature, ranges))
+        digits = _compute_digits(256 * head + feature, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
+        digits = _compute_digits(head + 32 * feature, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
 
     def test_dense_flattened_required_extent(self) -> None:
         batch, sequence = sympy.symbols("batch sequence", integer=True)
@@ -111,27 +114,35 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
         coord = 512 * batch + sequence
         ranges = {batch: 4, sequence: 256}
 
-        self.assertFalse(_is_dense_flattened_coordinate(coord, ranges))
+        digits = _compute_digits(coord, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
         self.assertTrue(
             _is_nonoverlapping_aligned_stick_coordinate(
-                coord, ranges, sequence, torch.float16
+                digits, coord, ranges, sequence, torch.float16
             )
         )
         self.assertEqual(
             _restickify_input_required_extent(coord, ranges, sequence, torch.float16),
             1792,
         )
+
+        coord = 510 * batch + sequence
+        digits = _compute_digits(coord, ranges)
         self.assertFalse(
             _is_nonoverlapping_aligned_stick_coordinate(
-                510 * batch + sequence,
+                digits,
+                coord,
                 {batch: 4, sequence: 255},
                 sequence,
                 torch.float16,
             )
         )
+        coord = 128 * batch + sequence
+        digits = _compute_digits(coord, ranges)
         self.assertFalse(
             _is_nonoverlapping_aligned_stick_coordinate(
-                128 * batch + sequence,
+                digits,
+                coord,
                 ranges,
                 sequence,
                 torch.float16,

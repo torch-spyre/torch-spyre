@@ -30,6 +30,7 @@ ops that share a spec.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 
 import sympy
@@ -38,6 +39,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
@@ -47,6 +49,8 @@ from ..wsr.coarse_tile import (
 )
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
+
+logger = get_inductor_logger("scratchpad.coarse_tiling")
 
 
 def tile_spec_to_dim_hints(
@@ -115,6 +119,83 @@ def tile_spec_to_dim_hints(
             )
         )
     return hints
+
+
+@dataclasses.dataclass(frozen=True)
+class PrescribedRegion:
+    """The ops one outermost ``for_each_tile`` loop covers.
+
+    ``for_each_tile`` loops are authoritative: their axes, nesting and trip
+    counts are the user's, so no compiler tiling may re-tile an op inside one.
+
+    ``start``/``stop`` bound the region in ``graph.operations`` (``stop`` is
+    exclusive), and ``names`` holds every operation name in that slice.
+    ``unstamped`` names the ones no loop level stamped.  Lowering can place an
+    op that runs once, outside the loop, between the loop's body ops (the
+    buffer a map loop writes its tiles into, for one), and a later pass can
+    insert an op inside the loop without copying its metadata.  Both are held
+    with the region: tiling either would start a loop group in the middle of
+    the user's loop.
+    """
+
+    loop_group_id: int
+    start: int
+    stop: int
+    names: frozenset[str]
+    unstamped: tuple[str, ...]
+
+
+def _is_spliced(op: Operation) -> bool:
+    """Whether ``splice_while_loops`` stamped ``op`` as part of a loop level.
+
+    ``_stamp_direct_loop_info`` appends a ``DimHint`` with ``loop_var_range``
+    set to every op of each level; no other tiling source sets that field
+    (see ``loop_var_ranges_from_dim_hints`` in pass_utils.py).
+    """
+    return getattr(op, "loop_info", None) is not None and any(
+        h.loop_var is not None and h.loop_var_range is not None
+        for h in getattr(op, "dim_hints", None) or []
+    )
+
+
+def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion]:
+    """Every ``for_each_tile`` region in ``operations``, in operation order.
+
+    A region is seeded by the spliced ops sharing an outermost
+    ``loop_group_id``, and extends over every op between the first and last of
+    them.  Membership is by position rather than by attribute alone, so an op
+    sitting between the loop's body ops is covered whether or not a loop level
+    stamped it.
+    """
+    spans: dict[int, list[int]] = {}
+    for pos, op in enumerate(operations):
+        if not _is_spliced(op):
+            continue
+        outer = op.loop_info.loop_group_id[0]  # type: ignore[attr-defined]
+        span = spans.setdefault(outer, [pos, pos])
+        span[1] = pos
+    regions: list[PrescribedRegion] = []
+    for group_id, (first, last) in sorted(spans.items(), key=lambda kv: kv[1][0]):
+        members = operations[first : last + 1]
+        unstamped = tuple(
+            op.get_operation_name() for op in members if not _is_spliced(op)
+        )
+        if unstamped:
+            logger.debug(
+                "for_each_tile region %d also holds %s, which no loop level stamped",
+                group_id,
+                ", ".join(unstamped),
+            )
+        regions.append(
+            PrescribedRegion(
+                loop_group_id=group_id,
+                start=first,
+                stop=last + 1,
+                names=frozenset(op.get_operation_name() for op in members),
+                unstamped=unstamped,
+            )
+        )
+    return regions
 
 
 def derive_tiling_groups(
@@ -197,6 +278,26 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         groups_specs = derive_tiling_groups(graph, self._choices)
         if not groups_specs:
             return
+        # A for_each_tile region's tiling is the user's and already stamped;
+        # re-tiling one of its ops would overwrite that op's dim_hints and
+        # loop_info.  Candidate selection is expected to hold region ops
+        # untiled, so reaching this is a bug upstream of the pass.
+        region_ops = {
+            name
+            for region in prescribed_regions(graph.operations)
+            for name in region.names
+        }
+        for group_ops, spec in groups_specs:
+            clash = [
+                op.get_operation_name()
+                for op in group_ops
+                if op.get_operation_name() in region_ops
+            ]
+            if clash:
+                raise Unsupported(
+                    f"coarse tiling: {spec} would re-tile {', '.join(clash)}, "
+                    "which a for_each_tile loop already tiles."
+                )
         # Both bases are derived off the graph *before* this pass stamps any of
         # its own hints/groups, so pre-existing (hint-driven) ids are avoided
         # and the ids this pass mints increase monotonically.

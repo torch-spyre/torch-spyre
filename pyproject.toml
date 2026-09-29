@@ -7,14 +7,17 @@ requires = [
     "jinja2",
     "ninja",
     "numpy",
+    "packaging",
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
+    "setuptools_scm>=10",
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "wheel"
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path  = ["."]
 
 [project]
 name = "torch_spyre"
@@ -48,7 +51,6 @@ dynamic = ["version"]
 # against is `tools/ktir-mlir-frontend.pin`, which explains the rest.
 
 [project.optional-dependencies]
-safetensors = ["safetensors>=0.8.0"]
 # ortools is now a base dependency (on wheel-supported arches) since layout_solver
 # defaults to "cpsat" -- see `dependencies` above. This extra is kept as a no-op
 # alias so existing `--extra cpsat` / `.[cpsat]` call sites (e.g. spyre-frameworks'
@@ -64,16 +66,21 @@ build = [ # no-isolation build
     "jinja2",
     "ninja",
     "numpy",
+    "packaging",
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
+    # The wheel build is non-isolated (`uv build --no-build-isolation`), so
+    # [build-system].requires is never installed -- setuptools_scm has to be in
+    # this extra, and in uv.lock, or the version falls back to 0.0.0 and
+    # version_file is silently never written.
+    "setuptools_scm>=10",
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "wheel"
 ]
 test = [
     "pytest~=9.0",
-    "safetensors>=0.8.0",
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
 #    "torch_sendnn",        # must be installed manually
@@ -96,8 +103,17 @@ package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so"] }
 exclude = ["tests*", "extensions*"]  # glob patterns: the trailing * also excludes tests.* / extensions.* subpackages, not just the bare top-level name
 
 [tool.setuptools.dynamic]
-version = {attr = "torch_spyre.version.__version__"}  # any module attribute compatible with ast.literal_eval
 readme = {file = ["README.rst", "USAGE.rst"]}
+
+[tool.setuptools_scm]
+# _version.py is written at build time by setuptools_scm
+version_file = "torch_spyre/_version.py"
+version_scheme = "semver-pep440-release-branch"
+local_scheme   = "_versioning:ci_local_scheme"
+
+[tool.ruff.lint.per-file-ignores]
+"build_backend.py" = ["F401", "F403", "E402"]
+"_versioning.py" = ["F401"]
 
 [tool.ruff]
 line-length = 88

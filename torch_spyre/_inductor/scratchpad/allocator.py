@@ -101,7 +101,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
-    counted_loop_lifetime_end_overrides,
+    counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
@@ -945,6 +945,7 @@ class ScratchpadAllocator:
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
         lx_views: dict[str, PerCoreView],
+        lifetime_start_overrides: Optional[dict[str, int]] = None,
         lifetime_end_overrides: Optional[dict[str, int]] = None,
     ) -> list[LifetimeBoundBuffer]:
         """Build one :class:`LifetimeBoundBuffer` per buffer, barred or not.
@@ -960,6 +961,7 @@ class ScratchpadAllocator:
         :meth:`_input_residency_reason` and their footprint is computed
         here rather than read off ``mem_usage`` (which covers ops only).
         """
+        lifetime_start_overrides = lifetime_start_overrides or {}
         lifetime_end_overrides = lifetime_end_overrides or {}
         buffers: list[LifetimeBoundBuffer] = []
         for output_name, info in mem_usage.items():
@@ -983,6 +985,7 @@ class ScratchpadAllocator:
                         in_place.get(output_name, []), lifetime_end_overrides
                     ),
                     residency_reason=reasons.get(output_name),
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     lx_view=lx_views.get(output_name),
                 )
@@ -1016,6 +1019,7 @@ class ScratchpadAllocator:
                     first_use_is_read=True,
                     in_place_parents=[],
                     residency_reason=reason,
+                    lifetime_start_override=lifetime_start_overrides.get(input_name),
                     lifetime_end_override=lifetime_end_overrides.get(input_name),
                     lx_view=lx_views.get(input_name),
                 )
@@ -1192,7 +1196,9 @@ class ScratchpadAllocator:
         t0 = time.perf_counter()
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         ncores, ncores_reasons, lx_views = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
@@ -1239,6 +1245,7 @@ class ScratchpadAllocator:
             ncores=ncores,
             ncores_reasons=ncores_reasons,
             lx_views=lx_views,
+            lifetime_start_overrides=lifetime_start_overrides,
             lifetime_end_overrides=lifetime_end_overrides,
         )
         if lx_relayout_plans:
@@ -1275,6 +1282,8 @@ class ScratchpadAllocator:
             return
         for buffer in buffers:
             buffer.uses = [2 * use + 1 for use in buffer.uses]
+            if buffer.lifetime_start_override is not None:
+                buffer.lifetime_start_override *= 2
             if buffer.lifetime_end_override is not None:
                 buffer.lifetime_end_override *= 2
 
@@ -1288,6 +1297,7 @@ class ScratchpadAllocator:
 
         for source_entries in entries_by_source.values():
             source = source_entries[0][0]
+            original_start = source.lifetime_start_override
             original_end = source.lifetime_end_override
             transfer_ticks = []
             for _, plan, original_ticks in source_entries:
@@ -1312,6 +1322,7 @@ class ScratchpadAllocator:
                         _LX_ALLOCATION_GRANULARITY_BYTES,
                     ),
                     [transfer_tick, *consumer_ticks],
+                    lifetime_start_override=original_start,
                     lifetime_end_override=destination_end,
                     lx_view=plan.destination_view,
                 )
@@ -1323,6 +1334,7 @@ class ScratchpadAllocator:
             # last transfer still needs the original source through the loop.
             remaining_reads = source.uses[0 if source.first_use_is_read else 1 :]
             if not any(use > max(transfer_ticks) for use in remaining_reads):
+                source.lifetime_start_override = None
                 source.lifetime_end_override = None
 
     def _allocated_lx_relayout_sources(
@@ -2750,7 +2762,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.name: self._op_inputs_good_for_lx_inplace(op) for op in graph.operations
         }
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        _, lifetime_end_overrides = counted_loop_lifetime_overrides(graph)
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
@@ -2835,7 +2847,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
         self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -2908,6 +2922,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         parents=[],
                         cd_parent_matches={},
                         residency_reason=None,
+                        lifetime_start_override=lifetime_start_overrides.get(
+                            input_name
+                        ),
                         lifetime_end_override=lifetime_end_overrides.get(input_name),
                         boundary=BufferType.Input,
                     )
@@ -3026,6 +3043,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cd_parent_matches=cd_parent_matches,
                     cd_parent_relayouts=cd_parent_relayouts,
                     residency_reason=residency_reason,
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     boundary=BufferType.Output
                     if output_name in graph_output_names
