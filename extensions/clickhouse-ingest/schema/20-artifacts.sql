@@ -138,13 +138,14 @@ CREATE TABLE IF NOT EXISTS artifact_results
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 
 
-    -- Closes a v1 defect where image names leaked into test_type. Not an Enum: an unknown value
-    -- would throw on insert instead of needing an ALTER, and Enum declaration order would silently
-    -- reorder tier_satisfies()'s ladder comparisons.
-    CONSTRAINT chk_test_type   CHECK test_type   IN
-        ('smoke','unit','integration','regression','trunk','perf'),
     CONSTRAINT chk_state       CHECK state       IN ('passed','failed','error','running'),
     CONSTRAINT chk_result_kind CHECK result_kind IN ('functional','performance','image'),
+    -- Closes a v1 defect where image names leaked into test_type. Not an Enum: an unknown value
+    -- would throw on insert instead of needing an ALTER, and Enum declaration order would silently
+    -- reorder tier_satisfies()'s ladder comparisons. fvt/svt are spyre-test-framework's stages,
+    -- each its own leg. Declared last: migrations/005 re-adds it and the server appends it.
+    CONSTRAINT chk_test_type   CHECK test_type   IN
+        ('smoke','unit','integration','regression','trunk','perf','fvt','svt','capability'),
 
     -- run_id can't lead the sort key (reads want "this artifact's verdicts" first), so this index
     -- covers the reverse direction; built inline since ALTER...ADD INDEX registers but builds nothing.

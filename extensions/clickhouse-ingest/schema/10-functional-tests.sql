@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS test_case_runs
     -- Run-context tags this execution carried (testtype__<tier>, platform__<arch>): tier
     -- membership is a fact of the run, and a shared test_case_id row cannot hold every tier's set.
     tags         Array(LowCardinality(String)),
+    -- Numbers the test recorded as `metric.<name>` JUnit properties (latency, cpu time, scores).
+    -- Per execution, so on the run row; strings go to props as `result.<name>`.
+    measurements Map(LowCardinality(String), Float64),
     audit_uuid      UUID DEFAULT generateUUIDv7(),
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 

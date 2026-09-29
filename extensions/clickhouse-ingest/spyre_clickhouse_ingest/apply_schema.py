@@ -67,6 +67,10 @@ class SchemaApplier:
     ADDS = re.compile(
         r"\bADD\s+(?:COLUMN|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
     )
+    # A migration replaces a CHECK by DROP + ADD CONSTRAINT; the live table still has the old one.
+    ADDS_CONSTRAINT = re.compile(
+        r"\bADD\s+CONSTRAINT\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
+    )
     LEDGER = "schema_migrations"
     LEDGER_DDL = (
         "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
@@ -177,11 +181,25 @@ class SchemaApplier:
         ).result_rows
         return {mid: chk for mid, chk in rows}
 
+    @staticmethod
+    def without_constraints(sql: str, names: set) -> str:
+        """A single-line CREATE with the named CONSTRAINT ... CHECK clauses removed."""
+        for n in names:
+            sql = re.sub(
+                rf",\s*CONSTRAINT\s+`?{re.escape(n)}`?\s+CHECK\s.*?"
+                r"(?=,\s*(?:CONSTRAINT|INDEX|PROJECTION)\s|\)\s*ENGINE\b)",
+                "",
+                sql,
+            )
+        return sql
+
     @classmethod
-    def differs(cls, client, obj: SchemaObject, stored: str, db: str) -> str:
-        """'' when `stored` matches the file, else a short unified diff of the two."""
-        want = cls.canonical(client, obj.sql, db)
-        have = cls.canonical(client, stored, db)
+    def differs(
+        cls, client, obj: SchemaObject, stored: str, db: str, ignore=frozenset()
+    ) -> str:
+        """'' when `stored` matches the file (less `ignore` constraints), else a short diff."""
+        want = cls.without_constraints(cls.canonical(client, obj.sql, db), ignore)
+        have = cls.without_constraints(cls.canonical(client, stored, db), ignore)
         if want == have:
             return ""
         split = lambda s: s.replace(", ", ",\n").splitlines()  # noqa: E731
@@ -191,14 +209,16 @@ class SchemaApplier:
         return "\n".join(list(diff)[:40])
 
     @classmethod
-    def pending_adds(cls, pending: list) -> dict:
-        """table -> column/index names that pending migrations ADD."""
+    def pending_adds(cls, pending: list, pattern=None) -> dict:
+        """table -> column/index (or, given ADDS_CONSTRAINT, constraint) names pending migrations ADD."""
         out: dict = {}
         for p in pending:
             for stmt in cls.statements(p.read_text()):
                 m = cls.ALTER.match(stmt)
                 if m:
-                    out.setdefault(m.group(1), set()).update(cls.ADDS.findall(stmt))
+                    out.setdefault(m.group(1), set()).update(
+                        (pattern or cls.ADDS).findall(stmt)
+                    )
         return out
 
     @classmethod
@@ -219,6 +239,7 @@ class SchemaApplier:
         objs = [o for path, text in files for o in cls.objects(path, text)]
         pending = [p for p in migrations if p.name not in done]
         added = cls.pending_adds(pending)
+        replaced = cls.pending_adds(pending, cls.ADDS_CONSTRAINT)
         steps = []
         for o in objs:
             if o.kind == "view":
@@ -237,8 +258,9 @@ class SchemaApplier:
                         if not re.search(rf"\b{n}\b", stored)
                     }
                     before = cls.without(o, missing)
-                    resolved = before is not o and not cls.differs(
-                        client, before, stored, db
+                    ignore = replaced.get(o.name, set())
+                    resolved = (before is not o or bool(ignore)) and not cls.differs(
+                        client, before, stored, db, ignore
                     )
                     steps.append(("migrates" if resolved else "drift", o.name, diff))
         steps += [("migrate", p.name, "") for p in pending]
