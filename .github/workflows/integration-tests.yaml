@@ -213,6 +213,7 @@ jobs:
       CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml

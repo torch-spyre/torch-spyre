@@ -101,7 +101,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
-    counted_loop_lifetime_end_overrides,
+    counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
@@ -114,7 +114,11 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.loop_info import CarriedReductionRecord, LoopCarryRecord
+from torch_spyre._inductor.loop_info import (
+    CarriedReductionRecord,
+    LoopCarryRecord,
+    ReadCopyElisionRecord,
+)
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -168,12 +172,25 @@ _LX_TRACKER_CAPACITY_BYTES = (
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
 
-def _safe_in_place_parents(
-    parents: Sequence[str], lifetime_end_overrides: dict[str, int]
-) -> list[str]:
-    """Drop handoffs from parents that remain live through a counted loop."""
+def _handoff_child_start(
+    name: str,
+    lifetimes: dict[str, list[int]],
+    lifetime_start_overrides: dict[str, int],
+) -> int:
+    """First tick of ``name`` as an in-place child, widened to a loop's start."""
+    first = lifetimes[name][0]
+    return min(first, lifetime_start_overrides.get(name, first))
 
-    return [parent for parent in parents if parent not in lifetime_end_overrides]
+
+def _handoff_parent_end(
+    name: str,
+    lifetimes: dict[str, list[int]],
+    lifetime_end_overrides: dict[str, int],
+) -> int:
+    """Inclusive last tick of ``name`` as an in-place parent, widened to a loop's
+    end (the override is exclusive)."""
+    last = lifetimes[name][-1]
+    return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
 def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
@@ -941,6 +958,7 @@ class ScratchpadAllocator:
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
         lx_views: dict[str, PerCoreView],
+        lifetime_start_overrides: Optional[dict[str, int]] = None,
         lifetime_end_overrides: Optional[dict[str, int]] = None,
     ) -> list[LifetimeBoundBuffer]:
         """Build one :class:`LifetimeBoundBuffer` per buffer, barred or not.
@@ -956,6 +974,7 @@ class ScratchpadAllocator:
         :meth:`_input_residency_reason` and their footprint is computed
         here rather than read off ``mem_usage`` (which covers ops only).
         """
+        lifetime_start_overrides = lifetime_start_overrides or {}
         lifetime_end_overrides = lifetime_end_overrides or {}
         buffers: list[LifetimeBoundBuffer] = []
         for output_name, info in mem_usage.items():
@@ -975,10 +994,9 @@ class ScratchpadAllocator:
                     # to a consumer's in_place_parents, which would otherwise mutate
                     # this list inside the shared ``in_place`` dict (matches the copy
                     # in ``_build_cd_bound_buffers``).
-                    in_place_parents=_safe_in_place_parents(
-                        in_place.get(output_name, []), lifetime_end_overrides
-                    ),
+                    in_place_parents=list(in_place.get(output_name, [])),
                     residency_reason=reasons.get(output_name),
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     lx_view=lx_views.get(output_name),
                 )
@@ -1012,6 +1030,7 @@ class ScratchpadAllocator:
                     first_use_is_read=True,
                     in_place_parents=[],
                     residency_reason=reason,
+                    lifetime_start_override=lifetime_start_overrides.get(input_name),
                     lifetime_end_override=lifetime_end_overrides.get(input_name),
                     lx_view=lx_views.get(input_name),
                 )
@@ -1026,10 +1045,9 @@ class ScratchpadAllocator:
             # consumer is a built candidate with matching per-core size, device
             # layout, a pointwise producer, and no core-division mismatch is there
             # anything safe to merge.
-            if reason is not None or input_name in lifetime_end_overrides:
+            if reason is not None:
                 continue
-            last_use = uses[-1]
-            consumer_op = graph.operations[last_use]
+            consumer_op = graph.operations[uses[-1]]
             consumer = built_by_name.get(consumer_op.name)
             if consumer is None or input_name in consumer.in_place_parents:
                 continue
@@ -1050,8 +1068,12 @@ class ScratchpadAllocator:
                 parent_size_per_core=clone_size,
                 child_device_layout=consumer_layout.device_layout,
                 parent_device_layout=input_layout.device_layout,
-                child_start=lifetimes[consumer_op.name][0],
-                parent_end=last_use,
+                child_start=_handoff_child_start(
+                    consumer_op.name, lifetimes, lifetime_start_overrides
+                ),
+                parent_end=_handoff_parent_end(
+                    input_name, lifetimes, lifetime_end_overrides
+                ),
                 child_core_div_mismatch=mem_usage[consumer_op.name][
                     "core_div_mismatch"
                 ],
@@ -1083,7 +1105,10 @@ class ScratchpadAllocator:
         - matching device layout (so the storage can alias);
         - single handoff tick (``parent_end == child_start``: the same op that reads
           the parent as its last use writes the child), the invariant the solvers'
-          in-place relaxation relies on (see ``_check_in_place_relationships``);
+          in-place relaxation relies on (see ``_check_in_place_relationships``).
+          Callers pass ticks widened by counted-loop lifetime overrides
+          (``_handoff_child_start`` / ``_handoff_parent_end``), so a buffer kept
+          live across a loop never qualifies;
         - matching per-core footprint and no core-division mismatch on the child.
 
         With ``division_invariant`` the last condition (per-core size + core-div) is
@@ -1130,6 +1155,8 @@ class ScratchpadAllocator:
         mem_usage: dict,
         lifetimes: dict[str, list[int]],
         reasons: dict[str, Optional[str]],
+        lifetime_start_overrides: dict[str, int],
+        lifetime_end_overrides: dict[str, int],
     ) -> dict[str, list[str]]:
         """In-place reuse candidates: ``buf -> [inputs whose slot it may take]``.
 
@@ -1148,7 +1175,9 @@ class ScratchpadAllocator:
                 continue
             if reasons.get(buf_name) is not None or not lifetimes.get(buf_name):
                 continue
-            out_start = lifetimes[buf_name][0]
+            out_start = _handoff_child_start(
+                buf_name, lifetimes, lifetime_start_overrides
+            )
             out_ten_layout = graph.get_buffer(buf_name).get_layout().device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
@@ -1165,7 +1194,9 @@ class ScratchpadAllocator:
                     child_device_layout=out_ten_layout,
                     parent_device_layout=in_ten_layout,
                     child_start=out_start,
-                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    parent_end=_handoff_parent_end(
+                        input_buf, lifetimes, lifetime_end_overrides
+                    ),
                     child_core_div_mismatch=info["core_div_mismatch"],
                 ):
                     allow_inplace[buf_name].append(input_buf)
@@ -1188,7 +1219,9 @@ class ScratchpadAllocator:
         t0 = time.perf_counter()
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         ncores, ncores_reasons, lx_views = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
@@ -1225,7 +1258,14 @@ class ScratchpadAllocator:
             planned_lx_buffers=planned_lx_buffers,
             lx_relayout_plans=lx_relayout_plans,
         )
-        in_place = self._determine_in_place(graph, mem_usage, lifetimes, reasons)
+        in_place = self._determine_in_place(
+            graph,
+            mem_usage,
+            lifetimes,
+            reasons,
+            lifetime_start_overrides,
+            lifetime_end_overrides,
+        )
         buffers = self._build_bound_buffers(
             graph,
             in_place,
@@ -1235,6 +1275,7 @@ class ScratchpadAllocator:
             ncores=ncores,
             ncores_reasons=ncores_reasons,
             lx_views=lx_views,
+            lifetime_start_overrides=lifetime_start_overrides,
             lifetime_end_overrides=lifetime_end_overrides,
         )
         if lx_relayout_plans:
@@ -1271,6 +1312,8 @@ class ScratchpadAllocator:
             return
         for buffer in buffers:
             buffer.uses = [2 * use + 1 for use in buffer.uses]
+            if buffer.lifetime_start_override is not None:
+                buffer.lifetime_start_override *= 2
             if buffer.lifetime_end_override is not None:
                 buffer.lifetime_end_override *= 2
 
@@ -1284,6 +1327,7 @@ class ScratchpadAllocator:
 
         for source_entries in entries_by_source.values():
             source = source_entries[0][0]
+            original_start = source.lifetime_start_override
             original_end = source.lifetime_end_override
             transfer_ticks = []
             for _, plan, original_ticks in source_entries:
@@ -1308,6 +1352,7 @@ class ScratchpadAllocator:
                         _LX_ALLOCATION_GRANULARITY_BYTES,
                     ),
                     [transfer_tick, *consumer_ticks],
+                    lifetime_start_override=original_start,
                     lifetime_end_override=destination_end,
                     lx_view=plan.destination_view,
                 )
@@ -1319,6 +1364,7 @@ class ScratchpadAllocator:
             # last transfer still needs the original source through the loop.
             remaining_reads = source.uses[0 if source.first_use_is_read else 1 :]
             if not any(use > max(transfer_ticks) for use in remaining_reads):
+                source.lifetime_start_override = None
                 source.lifetime_end_override = None
 
     def _allocated_lx_relayout_sources(
@@ -2210,10 +2256,78 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         in_place = self._determine_in_place_division_invariant(graph)
-        buffers = self._build_cd_bound_buffers(
-            graph, in_place, self._division_map(graph)
+        divisions = self._division_map(graph, allow_deferred_read_candidates=True)
+        pending = {
+            op.name: op
+            for op in graph.operations
+            if hasattr(op, "_read_copy_elision_record")
+            and is_restickify_op(op, graph)
+            and divisions[op.name] != [_fixed_core_division(op)]
+        }
+        while True:
+            buffers = self._build_cd_bound_buffers(graph, in_place, divisions)
+            if not pending:
+                return buffers
+            pricing = {
+                op.get_name(): op for op in self._pricing_operations(graph, buffers)
+            }
+            rejected = [
+                name
+                for name, op in pending.items()
+                if pricing.get(name) is op
+                or not self._direct_read_candidates_priced(
+                    pricing.get(name), divisions[name], buffers
+                )
+            ]
+            if not rejected:
+                return buffers
+            for name in rejected:
+                op = pending.pop(name)
+                fixed = _fixed_core_division(op)
+                assert fixed.cores_used <= config.sencores, (
+                    f"{name}: fixed direct-read division over the "
+                    f"{config.sencores}-core budget"
+                )
+                divisions[name] = _legal_fixed_division(
+                    op, [fixed], "unproved or unpriced direct read"
+                )
+            # Menus affect input clones and relayouts. Rebuild their actual
+            # allocation context and recheck the remaining expanded reads.
+            # Rejection is monotonic, so this terminates after at most one pin
+            # per deferred read, without changing the graph or the late proof.
+
+    @staticmethod
+    def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
+        from torch_spyre._inductor.cost_model import transport_dma_cost_available
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        if op is None or not any(buf.name == op.get_name() for buf in buffers):
+            return False
+        is_lx = {buf.name: buf.sym_is_lx for buf in buffers}
+        return all(
+            transport_dma_cost_available(
+                extract_op_features(op, _work_slices(op, division), is_lx=is_lx),
+                _COST_PARAMS,
+            )
+            for division in divisions
         )
-        return buffers
+
+    @staticmethod
+    def _pricing_operations(graph, buffers):
+        from torch_spyre._inductor.read_copy_elision import (
+            project_transport_read_copies,
+        )
+
+        return project_transport_read_copies(
+            graph,
+            {buf.name: [cd.splits for cd in buf.core_divisions] for buf in buffers},
+            relayout_sources={
+                buf.relayout_parent
+                for buf in buffers
+                if isinstance(buf, RelayoutCopyBuffer)
+            },
+        )
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
@@ -2222,6 +2336,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # lookup is against this same whole-graph map, and rebuilding it per op
         # turns an O(buffers) cost into O(ops * buffers) on the full graph.
         default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
+        pricing_ops = self._pricing_operations(graph, solver.buffers)
+        pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -2235,8 +2351,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if output_name not in bufmap:
                 continue
+            if output_name not in pricing_by_name:
+                continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap, default_is_lx
+                graph,
+                output_name,
+                bufmap,
+                default_is_lx,
+                op=pricing_by_name[output_name],
             )
 
         from torch_spyre._inductor.cost_model import predict_bundles
@@ -2275,7 +2397,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         bundle_terms: list = []
         try:
             bundle_terms = predict_bundles(
-                graph.operations, op_features, params=_COST_PARAMS
+                pricing_ops, op_features, params=_COST_PARAMS
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2310,9 +2432,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ):
                 cost_expr = cost_expr + copy.cost_term()
         result = solver.plan_layout_and_core_divisions(cost_expr)
-        assert not any(buffer.lx_relayout_plans for buffer in result), (
-            "CoOptimizingAllocator does not support LX relayout"
-        )
+        if any(buffer.lx_relayout_plans for buffer in result):
+            raise AssertionError("CoOptimizingAllocator does not support LX relayout")
         if config.dump_cost_expr_file and cost_expr is not None:
             # The objective as solved: its terms, the chosen symbol values and
             # the evaluated prices, for the summarize-sdsc skill.
@@ -2360,7 +2481,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers, is_lx):
+    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
@@ -2374,7 +2495,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        op = graph.get_buffer(output_name)
+        op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
@@ -2475,7 +2596,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert isinstance(solver, CoreDivisionLayoutSolver)
         return solver.spill_reasons
 
-    def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
+    def _division_map(
+        self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
+    ) -> dict[str, list[CoreDivision]]:
         """Per-op core-division candidates for the joint-division solve.
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
@@ -2535,6 +2658,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
                 reason = "offset slice read"
+            elif (
+                is_restickify_op(op, graph)
+                and hasattr(op, "_read_copy_elision_record")
+                and not (
+                    allow_deferred_read_candidates
+                    and config.read_copy_elision
+                    and isinstance(op._read_copy_elision_record, ReadCopyElisionRecord)
+                )
+            ):
+                # The preparation path may provisionally enumerate ordinary
+                # legal candidates, but retains them only after proving and
+                # pricing the direct read in the actual allocation context.
+                # Other callers and unrecognized records keep the fixed pin.
+                reason = "deferred direct graph-input read"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)
@@ -2655,7 +2792,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.name: self._op_inputs_good_for_lx_inplace(op) for op in graph.operations
         }
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
@@ -2666,7 +2805,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             out_layout = graph.get_buffer(buf_name).layout
             if not hasattr(out_layout, "device_layout"):
                 continue
-            out_start = lifetimes[buf_name][0]
+            out_start = _handoff_child_start(
+                buf_name, lifetimes, lifetime_start_overrides
+            )
             out_ten_layout = out_layout.device_layout
             for input_buf in info["op_inputs"]:
                 # Graph inputs / constants now appear in ``op_inputs`` but are not
@@ -2674,8 +2815,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # solver's ``_check_in_place_relationships`` would fail to resolve
                 # them). Skip them, matching the base allocator's guard.
                 if input_buf not in mem_usage or not lifetimes[input_buf]:
-                    continue
-                if input_buf in lifetime_end_overrides:
                     continue
                 in_layout = graph.get_buffer(input_buf).layout
                 if not hasattr(in_layout, "device_layout"):
@@ -2694,7 +2833,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     child_device_layout=out_ten_layout,
                     parent_device_layout=in_ten_layout,
                     child_start=out_start,
-                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    parent_end=_handoff_parent_end(
+                        input_buf, lifetimes, lifetime_end_overrides
+                    ),
                     division_invariant=True,
                 ):
                     allow_inplace[buf_name].append(input_buf)
@@ -2740,7 +2881,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
         self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -2813,6 +2956,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         parents=[],
                         cd_parent_matches={},
                         residency_reason=None,
+                        lifetime_start_override=lifetime_start_overrides.get(
+                            input_name
+                        ),
                         lifetime_end_override=lifetime_end_overrides.get(input_name),
                         boundary=BufferType.Input,
                     )
@@ -2825,9 +2971,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             residency_reason = residency_by_buf[output_name]
 
             buf_divisions = divisions[output_name]
-            parents = _safe_in_place_parents(
-                in_place.get(output_name, []), lifetime_end_overrides
-            )
+            parents = list(in_place.get(output_name, []))
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
             cd_parent_matches = self._cd_parent_matches(
@@ -2894,8 +3038,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # clone, so they are skipped.
             out_layout = graph.get_buffer(output_name).layout
             for clone_name in last_consumer_clones.get(output_name, []):
-                if clone_name in lifetime_end_overrides:
-                    continue
                 if clone_name in parents:
                     continue
                 clone_layout = graph.get_buffer(clone_name).layout
@@ -2910,8 +3052,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     parent_name=clone_name,
                     child_device_layout=out_layout.device_layout,
                     parent_device_layout=clone_layout.device_layout,
-                    child_start=uses[0],
-                    parent_end=lifetimes[clone_name][-1],
+                    child_start=_handoff_child_start(
+                        output_name, lifetimes, lifetime_start_overrides
+                    ),
+                    parent_end=_handoff_parent_end(
+                        clone_name, lifetimes, lifetime_end_overrides
+                    ),
                     division_invariant=True,
                 ):
                     parents.append(clone_name)
@@ -2931,6 +3077,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cd_parent_matches=cd_parent_matches,
                     cd_parent_relayouts=cd_parent_relayouts,
                     residency_reason=residency_reason,
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     boundary=BufferType.Output
                     if output_name in graph_output_names
@@ -3592,9 +3739,10 @@ def select_allocator() -> ScratchpadAllocator:
       instance. ``"simulated_annealing"`` is served by
       :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
       Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
-      only when ortools is available) is used directly; every other factory is
-      wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
-      search of all the core division options.
+      only when ortools is available) is used directly; every other factory
+      would need to be wrapped in an :class:`ExhaustiveSearchSolver` that does
+      an exhaustive search of all the core division options -- allowed only
+      when ``allow_exhaustive_search`` is set, else this raises ``ValueError``.
 
     The annealer is deliberately not wrapped in :class:`ExhaustiveSearchSolver`:
     that wrapper solves the layout once per enumerated division candidate, so
@@ -3645,6 +3793,20 @@ def select_allocator() -> ScratchpadAllocator:
         # core-division-capable when the factory may be a plain function (the
         # ortools-availability-aware cpsat factory) rather than a solver class.
         if not isinstance(solver_cls([], size), CoreDivisionLayoutSolver):
+            if not config.allow_exhaustive_search:
+                raise ValueError(
+                    f"co_optimizing_lx_planning=True with layout_solver="
+                    f"'{config.layout_solver}' has no core-division-capable "
+                    "solver to co-optimize with (this requires layout_solver="
+                    "'cpsat' with ortools installed, or "
+                    "layout_solver='simulated_annealing'); the only way to "
+                    "proceed is to fall back to ExhaustiveSearchSolver, an "
+                    "expensive DFS over core-division candidates. Set "
+                    "allow_exhaustive_search=True (or "
+                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback, or "
+                    "set co_optimizing_lx_planning=False (or "
+                    "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
+                )
             return CoOptimizingAllocator(
                 layout_planning=functools.partial(
                     ExhaustiveSearchSolver, inner_factory=solver_cls

@@ -94,12 +94,6 @@ def _reorder_stl(
         )
         return stl
 
-    # Workaround for issue #4695: the backend mishandles layouts where a
-    # non-stick dim has been swapped into a size-1 slot.  Skip the reorder
-    # when the target slot is already size-1.
-    if device_size[slot] == 1:
-        return stl
-
     # Only move dims from outside (before outer_stick) into the slot,
     # and only if the largest outside dim is bigger than what's already there.
     # Exclude dims with constant (zero free-symbol) coordinates — these are

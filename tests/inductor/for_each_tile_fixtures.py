@@ -93,6 +93,115 @@ def split_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return final
 
 
+def split_k_caller_init_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose init is a CALLER tensor (a graph input, not an in-graph fill).
+
+    Carry ownership: the accumulator must not overwrite acc0 in place.
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=acc0)
+    return final
+
+
+def split_k_transposed_caller_init_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose carry init is a TRANSPOSED VIEW of a caller tensor.
+
+    ``acc0`` is ``[N, M]``; the carry value is ``acc0.t()`` (a ReinterpretView,
+    zero offset, full span). The pre-loop ownership copy is therefore a view
+    copy: copy the backing storage identity-wise, present the transposed view,
+    preserve values and leave ``acc0`` untouched (#4838).
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=acc0.t())
+    return final
+
+
+def split_k_transposed_caller_init_two_carries_fn(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two carries: ``a`` starts from ``acc0.t()``; ``b`` adds ``a``'s old value.
+
+    ``b`` reads ``a``'s pre-trip value, so besides its pre-loop ownership copy
+    ``a`` needs an in-loop snapshot (a write-after-read hazard). Both copies
+    must copy the caller's storage and keep the transpose (#4838).
+    """
+
+    def body(carry, ops):
+        a, b = carry
+        x_tile, y_tile = ops
+        return (a + x_tile @ y_tile, b + a), None
+
+    init = acc0.t()
+    (a, b), _ = for_each_tile(
+        body,
+        (X, Y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=(init, torch.zeros_like(init)),
+    )
+    return a, b
+
+
+def split_k_transposed_caller_init_two_carries_reference(
+    X: torch.Tensor, Y: torch.Tensor, acc0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager float reference for split_k_transposed_caller_init_two_carries_fn."""
+    a = acc0.t().float()
+    b = torch.zeros_like(a)
+    for k in range(0, X.shape[1], 64):
+        b = b + a
+        a = a + X[:, k : k + 64].float() @ Y[k : k + 64].float()
+    return a, b
+
+
+def split_k_private_transposed_init_fn(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """split_K whose carry init is a TRANSPOSED VIEW of an in-graph fill.
+
+    The backing storage is compiler-created scratch, so ownership must keep the
+    single-buffer (zero-copy) accumulator path even though the carry value is a
+    permuted view (#4838 private-view case).
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    init = torch.zeros(N, M, device=X.device, dtype=X.dtype)
+    final, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init.t())
+    return final
+
+
+def two_loops_shared_init_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Two split-K reductions sharing ONE in-graph `init` buffer.
+
+    Ownership: each loop must get its own initial value, so the two
+    accumulators must not write the same buffer.
+    """
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    init = torch.zeros(M, N, device=X.device, dtype=X.dtype)
+    a, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init)
+    b, _ = for_each_tile(body, (X, Y), dims=(-1, 0), tile_size=64, init=init)
+    return a + b
+
+
 def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Nested case: outer for_each_tile maps M; inner for_each_tile carries K.
 
@@ -122,6 +231,53 @@ def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
 
     _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
+
+
+def nested_two_inner_loops_shared_init_fn(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Two inner loops sharing ONE fill made in the outer M loop's body.
+
+    The nested form of two_loops_shared_init_fn: the fill has two readers, so
+    it is private to neither inner loop, and splicing each inner loop inserts
+    a pre-loop copy of it (#4838). Each copy sits inside the outer loop's
+    body: it must run on every outer trip, and never inside its inner loop.
+    Only the first inner loop reads the outer M tile; the second tiles the
+    loop-invariant ``Y``, so no outer tile has two sibling consumers (#4581).
+    """
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+
+        def k_body(acc, inner_ops):
+            x_k_tile, y_k_tile = inner_ops
+            return acc + x_k_tile @ y_k_tile, None
+
+        def row_body(acc, inner_ops):
+            (y_rows,) = inner_ops
+            return acc + y_rows, None
+
+        init = torch.zeros(x_tile.shape[0], N, device=X.device, dtype=X.dtype)
+        a, _ = for_each_tile(
+            k_body, (x_tile, y_whole), dims=(-1, 0), tile_size=64, init=init
+        )
+        b, _ = for_each_tile(row_body, (y_whole,), dims=(0,), tile_size=64, init=init)
+        return None, a + b
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
+def nested_two_inner_loops_shared_init_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager float reference for nested_two_inner_loops_shared_init_fn.
+
+    Every outer M tile gets ``X_tile @ Y`` from the first inner loop, plus the
+    sum of ``Y``'s 64-row blocks from the second, both started from zeros.
+    """
+    y_blocks = Y.float().reshape(-1, 64, Y.shape[1]).sum(0)
+    return X.float() @ Y.float() + y_blocks.repeat(X.shape[0] // 64, 1)
 
 
 def nested_split_m_then_k_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
@@ -685,6 +841,12 @@ def online_softmax_fn(
     return acc / denom
 
 
+# Half of LQ (128): the outer loop must make more than one trip to actually
+# exercise nesting, so this is deliberately narrower than SOFTMAX_TILE_SIZE
+# (128, the inner loop's K/V tile size) rather than equal to it.
+NESTED_SOFTMAX_OUTER_TILE_SIZE = 64
+
+
 def nested_online_softmax_fn(
     Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
 ) -> torch.Tensor:
@@ -698,10 +860,21 @@ def nested_online_softmax_fn(
         body,
         (Q,),
         dims=(0,),
-        tile_size=64,
+        tile_size=NESTED_SOFTMAX_OUTER_TILE_SIZE,
         out_dim=0,
     )
     return out
+
+
+def nested_online_softmax_reference(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+) -> torch.Tensor:
+    """Eager reference for nested_online_softmax_fn: per-row-tile online softmax."""
+    rows = []
+    for start in range(0, Q.shape[0], NESTED_SOFTMAX_OUTER_TILE_SIZE):
+        q_tile = Q[start : start + NESTED_SOFTMAX_OUTER_TILE_SIZE]
+        rows.append(online_softmax_reference(q_tile, K, V))
+    return torch.cat(rows, dim=0)
 
 
 def batched_online_softmax_fn(
@@ -982,7 +1155,7 @@ def paged_gather_fn(
 def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
     pf, qf = pages.float(), q.float()
-    acc = torch.zeros(PAGE_LQ, PAGE_HS)
+    acc = torch.zeros(q.shape[0], PAGE_HS)
     for p in PAGE_ORDER:
         page = pf[p]
         acc = acc + (qf @ page.transpose(0, 1)) @ page
@@ -1059,6 +1232,63 @@ def paged_gather_kv_reference(
     return acc
 
 
+# Half of PAGE_LQ (32): like NESTED_SOFTMAX_OUTER_TILE_SIZE above, chosen so
+# the outer loop makes more than one trip.
+NESTED_GATHER_OUTER_TILE_SIZE = PAGE_LQ // 2
+
+
+def paged_gather_nested_fn(
+    pages: torch.Tensor, table: torch.Tensor, q: torch.Tensor
+) -> torch.Tensor:
+    """Nested case: outer for_each_tile maps Q rows; inner gathers one page
+    per trip (Kind.GATHER nested inside another for_each_tile level).
+
+    Each outer Q-tile re-runs the full inner paged-gather loop over every
+    block in the table, mirroring how paged attention would tile queries
+    while still visiting every KV page per query tile. The inner body is
+    paged_gather_fn's own gather-mode body (tiled block table, invariant
+    page pool, one page per trip via a POINT read of the page index) --
+    see paged_gather_fn's docstring for the coarse-tiling mechanics that
+    read exercises on its own; here it additionally has to survive being
+    re-spliced once per outer trip.
+    """
+
+    def outer_body(_, outer_tiles):
+        (q_tile,) = outer_tiles
+        q_tile_rows = q_tile.shape[0]
+
+        def inner_body(acc, inner_tiles):
+            table_row, pages_all, q_whole = inner_tiles
+            page_idx = table_row[0, 0:1]
+            page = pages_all.index_select(0, page_idx).squeeze(0)
+            scores = q_whole @ page.transpose(0, 1)
+            return acc + scores @ page, None
+
+        acc0 = torch.zeros(q_tile_rows, PAGE_HS, device=q.device, dtype=q.dtype)
+        final, _ = for_each_tile(
+            inner_body,
+            (table, pages, q_tile),
+            dims=(0, None, None),
+            tile_size=1,
+            init=acc0,
+        )
+        return None, final
+
+    _, out = for_each_tile(
+        outer_body, (q,), dims=(0,), tile_size=NESTED_GATHER_OUTER_TILE_SIZE, out_dim=0
+    )
+    return out
+
+
+def paged_gather_nested_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    rows = []
+    for start in range(0, q.shape[0], NESTED_GATHER_OUTER_TILE_SIZE):
+        end = start + NESTED_GATHER_OUTER_TILE_SIZE
+        rows.append(paged_gather_reference(pages, q[start:end]))
+    return torch.cat(rows, dim=0)
+
+
 @contextlib.contextmanager
 def _post_grad_graphs():
     """Capture each post-grad graph right after decompose_scan_to_while_loop runs.
@@ -1109,3 +1339,30 @@ def capture_post_grad_while_loop(
     )
     assert found, "expected a while_loop node in the post-grad graph"
     return out, gm
+
+
+def consumed_row_inputs() -> tuple[torch.Tensor]:
+    """A tiny int/float block table whose tiled dim is CONSUMED by the body.
+
+    table[2, 32] tiled along dim 0 (tile_size 1); the body reads the whole
+    consumed row (``tiles[0][0, :]``), so the marker's tiled axis is sliced to
+    a constant. The marker's own read index over the flat table is
+    ``e + 32 * u0`` with ``range(e) == 32`` -- the exact coefficient
+    coincidence (coeff(u0)=32 == coeff(e)*range(e)=1*32) that makes
+    lookup_marker_dim falsely resolve a surviving tiled position for a
+    consumed axis.
+    """
+    table = torch.arange(2 * 32, dtype=torch.float16).reshape(2, 32)
+    return (table,)
+
+
+def consumed_row_fn(table: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over table's dim 0; the tile axis is consumed in-body."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(acc, tiles):
+        return acc + tiles[0][0, :], None
+
+    acc0 = torch.zeros_like(table[0])
+    final, _ = for_each_tile(body, (table,), dims=(0,), tile_size=1, init=acc0)
+    return final

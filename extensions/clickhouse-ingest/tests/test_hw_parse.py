@@ -106,3 +106,18 @@ def test_counts_are_read_through_the_module_level_patterns(monkeypatch):
     )
     assert records[0]["tests_passed"] == 0
     assert records[0]["tests_failed"] == 4
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "3_test _ Test Spyre.txt",
+        "3_test  Test Spyre.txt",
+        "3_test_Test Spyre.txt",
+        "3_run-tests _ Test Spyre.txt",
+        "3_run-tests_Test Spyre.txt",
+        "3_Test Spyre.txt",
+    ],
+)
+def test_caller_job_prefix_is_stripped_whatever_its_separator(filename):
+    assert hw_parse.SuiteFilenames.from_filename(filename) == ("Test Spyre", False)

@@ -160,6 +160,68 @@ def test_no_summary_yields_zero_counts():
     assert (rec["tests_passed"], rec["tests_failed"], rec["tests_error"]) == (0, 0, 0)
 
 
+# ── attempt slicing ───────────────────────────────────────────────────────────────────────
+
+ECHO = "\x1b[36;1m"
+
+
+def test_the_echoed_step_script_opens_no_phantom_attempt():
+    from spyre_clickhouse_ingest.hw_parse import parse_log
+
+    log = "\n".join(
+        [
+            f'2026-09-25T19:42:27.1Z {ECHO}echo "=== Attempt 1/2: Suite A ==="\x1b[0m',
+            f'2026-09-25T19:42:27.1Z {ECHO}  echo "=== Attempt 1 PASSED ==="\x1b[0m',
+            "2026-09-25T19:42:28.0Z === Attempt 1/2: Suite A ===",
+            "2026-09-25T19:42:29.0Z collected 60 items",
+            "2026-09-25T19:48:46.0Z === Attempt 1 PASSED ===",
+        ]
+    )
+    records = parse_log(log, run_id="1", suite_hint="S")
+    assert [(r["attempt"], r["tests_collected"]) for r in records] == [(1, 60)]
+
+
+def test_a_stall_retry_banner_is_its_own_attempt():
+    from spyre_clickhouse_ingest.hw_parse import parse_log
+
+    log = "\n".join(
+        [
+            "=== Attempt 1/2: Suite A ===",
+            "=== Attempt 1 FAILED (exit=137) ===",
+            "=== Attempt 2/2 (stall retry, device-open try 1/3): Suite A ===",
+            "=== Attempt 2 FAILED (exit=137) — leaving further retry to the pod-level retry",
+        ]
+    )
+    records = parse_log(log, run_id="1", suite_hint="S")
+    assert [(r["attempt"], r["suite_name"]) for r in records] == [
+        (1, "Suite A"),
+        (2, "Suite A"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "3_Detect integration-test label.txt",
+        "5_Derive artifact identity.txt",
+        "12_test  Collect suites for.txt",
+        "test  Resolve test durations pin.txt",
+        "Aggregate coverage.txt",
+        "Integration test result.txt",
+    ],
+)
+def test_ci_plumbing_jobs_are_not_suites(filename):
+    from spyre_clickhouse_ingest.hw_parse import _suite_from_filename
+
+    assert _suite_from_filename(filename) is None
+
+
+def test_a_suite_named_test_keeps_its_name():
+    from spyre_clickhouse_ingest.hw_parse import _suite_from_filename
+
+    assert _suite_from_filename("9_Test Masked Ops.txt") == ("Test Masked Ops", False)
+
+
 # ── ingest ────────────────────────────────────────────────────────────────────────────────
 
 

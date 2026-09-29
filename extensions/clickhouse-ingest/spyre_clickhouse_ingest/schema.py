@@ -24,13 +24,19 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
-)
-# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
-# TEST_TYPE_VALUES, not a subset of it.
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
+# Which capability analysis produced a capability_runs row; also the test_type of a
+# result_kind='capability' verdict.
 CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+# spyre-test-framework's stages, each its own leg.
+SUITE_STAGE_VALUES = frozenset(
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
+)
+TEST_TYPE_VALUES = (
+    frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+    | SUITE_STAGE_VALUES
+    | CAPABILITY_TYPE_VALUES
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
 # capability_runs.status: not_implemented is unsupported, not a skipped test.
 CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
@@ -41,6 +47,7 @@ CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 # since id12 is a hash INPUT to artifact_id. A reader resolves it via props['id12'].
 DEP_ENTRY_SEP = "@"
 DEP_BASE_PREFIX = "base="
+IDENTITY_LOOKUP_CHUNK = 2000
 
 
 class SchemaError(ValueError):
@@ -137,12 +144,15 @@ class Table:
         if not cls.identity:
             raise SchemaError(f"{cls.name} has no identity column")
         ids = [str(k) for k in rows]
+        # Chunked: the ids travel as one HTTP form field, and ClickHouse rejects a field over
+        # http_max_field_value_size (128 KiB) -- a 12k-case merged junit is ~470 KiB.
         known = {
             str(r[0])
+            for i in range(0, len(ids), IDENTITY_LOOKUP_CHUNK)
             for r in client.query(
                 f"SELECT {cls.identity} FROM {cls.qualified(db)} "
                 f"WHERE {cls.identity} IN {{ids:Array(UUID)}}",
-                parameters={"ids": ids},
+                parameters={"ids": ids[i : i + IDENTITY_LOOKUP_CHUNK]},
             ).result_rows
         }
         fresh = [v for k, v in rows.items() if str(k) not in known]

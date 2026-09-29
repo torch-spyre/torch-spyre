@@ -365,6 +365,99 @@ def _row_split(op, default: int, work_slices=None) -> int:
         return default
 
 
+def _contiguous_device_run(coords, dims, iteration_space, work_slices):
+    """Elements in a core's contiguous input run, or None if not provable.
+
+    Flatten the *device* access, not the host index. Adjacent stick-plane and
+    stick coordinates cancel back into an affine index; a real transpose within
+    the stick planes does not, and is deliberately left unmodelled. Walking the
+    affine axes from stride one outward coalesces an axis only when every inner
+    axis is unsplit and fully contiguous. Candidate splits may be symbolic.
+    """
+    from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+
+    index = sum(c * math.prod(dims[i + 1 :]) for i, c in enumerate(coords))
+    index = sympy.sympify(index).replace(FloorDiv, lambda a, b: sympy.floor(a / b))
+    index = index.replace(
+        ModularIndexing, lambda a, b, c: sympy.Mod(sympy.floor(a / b), c)
+    )
+    index = sympy.expand(
+        index.replace(sympy.Mod, lambda a, b: a - b * sympy.floor(a / b))
+    )
+    axes = []
+    remainder = index
+    for symbol, size in iteration_space.items():
+        stride = index.coeff(symbol)
+        if (
+            not stride.is_Integer
+            or stride <= 0
+            or not sympy.sympify(size).is_Integer
+            or size <= 0
+        ):
+            return None
+        axes.append((int(stride), symbol, int(size)))
+        remainder -= stride * symbol
+    if remainder.free_symbols or not remainder.is_Integer:
+        return None
+    axes.sort(key=lambda a: a[0])
+    if not axes or axes[0][0] != 1:
+        return None
+    run, extent = sympy.Integer(1), 1
+    inner_whole = sympy.true
+    for stride, symbol, size in axes:
+        if stride != extent:
+            break
+        split = work_slices.get(symbol, 1)
+        # Once an inner dimension is split, outer axes introduce gaps.
+        run = sympy.Piecewise(
+            (sympy.Integer(extent) * size / split, inner_whole), (run, True)
+        )
+        inner_whole = sympy.And(inner_whole, sympy.Eq(split, 1))
+        extent *= size
+    return run
+
+
+def _transport_read_geometry(op, work_slices=None):
+    """(per-core input run in bytes, elements per invocation), else unknown.
+
+    The calibrated transports have an affine DL16 device read, with or without
+    a stick-axis swap. Do not mistake logical order, unavailable ownership, another
+    device dtype, or a non-affine gather for that physical access pattern.
+    """
+    try:
+        from torch._inductor.virtualized import V
+        from torch_spyre._C import DataFormats
+
+        from .pass_utils import device_coordinates
+
+        if (
+            work_slices is None
+            and getattr(op, "iteration_space_ownership", None) is None
+            and not getattr(op, "op_it_space_splits", None)
+        ):
+            return None, None
+        rw = op.get_read_writes()
+        if len(rw.reads) != 1 or len(rw.writes) != 1:
+            return None, None
+        read, write = next(iter(rw.reads)), next(iter(rw.writes))
+        src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
+        dst = _real_layout(op.get_layout()).device_layout
+        if any(dl.device_dtype != DataFormats.SEN169_FP16 for dl in (src, dst)):
+            return None, None
+        it_space = iteration_space_from_op(op)
+        src_coords = device_coordinates(src, read, None, op=op)
+        slices = _work_slices(op, write.index, read.index, it_space, work_slices)
+        run = _contiguous_device_run(src_coords, src.device_size, it_space, slices)
+        if run is None:
+            return None, None
+        return run * op.get_dtype().itemsize, math.prod(
+            int(size) for size in it_space.values()
+        )
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        logger.debug("transport geometry unavailable", exc_info=True)
+        return None, None
+
+
 def _matmul_features(
     op,
     out_elems: int,
@@ -999,6 +1092,23 @@ def extract_op_features(
 
     _rl = _relayout_features(op, out_dims)
 
+    hbm_pattern = "" if is_matmul else _hbm_pattern(op, is_reduction, out_dims)
+    # A staging copy still issues the source DMA even if it is later elided into
+    # its consumer. Price its physical read during planning too, not only the
+    # final restickify's rewritten access. Arithmetic/unary compute ops are not
+    # part of this transport calibration.
+    try:
+        is_transport = (
+            data is not None
+            and not is_reduction
+            and set(data.inner_fn_opcount().used_ops) == {"load"}
+        )
+    except (AttributeError, TypeError):
+        is_transport = False
+    transport_read_run_bytes, transport_tile_elems = (
+        _transport_read_geometry(op, work_slices) if is_transport else (None, None)
+    )
+
     features = OpFeatures(
         name=_op_name(op),
         is_reduction=is_reduction,
@@ -1019,7 +1129,9 @@ def extract_op_features(
         matmul_b_bytes=matmul_b_bytes,
         matmul_m_split=matmul_m_split,
         matmul_n_split=matmul_n_split,
-        hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        hbm_pattern=hbm_pattern,
+        transport_read_run_bytes=transport_read_run_bytes,
+        transport_tile_elems=transport_tile_elems,
         is_lx_relayout=_rl[0],
         relayout_run_elems=_rl[1],
         relayout_split=_rl[2],

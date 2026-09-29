@@ -14,21 +14,27 @@
 
 """IR-level / mocked-IR unit tests for WhileLoop -> for_each_tile lowering.
 
-No Spyre device or backend compiler is required. Covers four areas, each
+No Spyre device or backend compiler is required. Covers five areas, each
 in its own class group:
-  1. An eager-mode sanity check that the nested for_each_tile fixture's
-     reference implementation matches plain matmul (TestNestedForEach
-     TileFixture).
+  1. Eager-mode sanity checks for fixture reference implementations: the
+     nested for_each_tile fixture against plain matmul
+     (TestNestedForEachTileFixture), and paged_gather_reference's row-count
+     handling for Q-tiles shorter than the full sequence
+     (TestPagedGatherReference).
   2. while_loop_bridge's generic while_loop -> coarse-tile-group bridge:
      CarryBinding/carry_bindings_for and splice_while_loop's buffer
      transplant, carry/xs-leaf read redirection, and mutated-carry
      re-read guard, exercised against hand-built mocks
      (TestCarryBindingsFor, TestSpliceWhileLoop).
-  3. for_each_tile_lowering's splice_while_loops pass and try_prove_
+  3. Per-trip indirect-index safety: SpyreKernel's sub-stick advance
+     refusal (TestIndirectIndexStepGuard) and pass_utils.per_trip_index's
+     splice trip-counter pin (TestPerTripIndex), both against hand-built
+     synthetic inputs.
+  4. for_each_tile_lowering's splice_while_loops pass and try_prove_
      for_each_tile shape prover, exercised against real ir.WhileLoop
      nodes built by lowering the vendored fixtures through GraphLowering
      (TestSpliceWhileLoops, TestTryProveForEachTile).
-  4. Pass-pipeline registration: splice_while_loops runs first, ahead of
+  5. Pass-pipeline registration: splice_while_loops runs first, ahead of
      every other pre-scheduling pass (TestPassPipelineRegistration).
 
 For end-to-end compilation + numerical correctness against a CPU
@@ -43,13 +49,22 @@ import torch
 from torch._inductor.virtualized import V
 
 from for_each_tile_fixtures import (
+    PAGE_HS,
+    PAGE_LQ,
     capture_post_grad_while_loop,
     matmul_inputs,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
+    nested_two_inner_loops_shared_init_fn,
+    paged_gather_inputs,
+    paged_gather_reference,
+    split_k_caller_init_fn,
     split_k_fn,
+    split_k_private_transposed_init_fn,
+    split_k_transposed_caller_init_fn,
     split_m_elementwise_fn,
     split_m_fn,
+    two_loops_shared_init_fn,
 )
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
@@ -76,6 +91,23 @@ class TestNestedForEachTileFixture(unittest.TestCase):
         (X, Y), expected = matmul_inputs()
         actual = nested_split_m_then_k_fn(X, Y)
         torch.testing.assert_close(actual, expected, atol=self.ATOL, rtol=self.RTOL)
+
+
+class TestPagedGatherReference(unittest.TestCase):
+    """Regression test for paged_gather_reference's row-count fix.
+
+    paged_gather_reference used to hardcode PAGE_LQ as the accumulator's row
+    count instead of deriving it from q.shape[0], so it crashed (rather than
+    silently mismatching) as soon as a caller -- e.g. paged_gather_nested_
+    reference, tiling Q into narrower row-tiles -- passed a Q shorter than
+    the full sequence.
+    """
+
+    def test_accepts_q_tile_shorter_than_page_lq(self):
+        pages, _, q = paged_gather_inputs()
+        q_tile = q[: PAGE_LQ // 2]
+        out = paged_gather_reference(pages, q_tile)
+        self.assertEqual(out.shape, (PAGE_LQ // 2, PAGE_HS))
 
 
 class TestCarryBindingsFor(unittest.TestCase):
@@ -141,6 +173,112 @@ class TestCarryBindingsFor(unittest.TestCase):
         bindings = carry_bindings_for(while_op)
 
         self.assertEqual(bindings, [])
+
+
+class TestIndirectIndexStepGuard(unittest.TestCase):
+    """_check_indirect_index_step refuses a sub-stick per-trip index advance."""
+
+    def _arg(self, expr):
+        from torch_spyre._C import DataFormats
+        from torch_spyre._inductor.op_spec import TensorArg
+
+        return TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=DataFormats.SENUINT32,
+            device_size=[4],
+            device_coordinates=[],
+            allocation={},
+            device_tile_advance_expr=expr,
+        )
+
+    def test_sub_stick_step_is_refused(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+        from torch_spyre._inductor.views import UnalignedStickSplit
+
+        level = sympy.Symbol("L0")
+        with self.assertRaises(UnalignedStickSplit):
+            SpyreKernel._check_indirect_index_step(None, self._arg(2 * level))
+
+    def test_whole_stick_step_is_allowed(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        level = sympy.Symbol("L0")
+        # B's [trips, 32] rows: one int32 stick; C's one-stick-per-entry: 32*E.
+        SpyreKernel._check_indirect_index_step(None, self._arg(32 * level))
+        SpyreKernel._check_indirect_index_step(None, self._arg(96 * level))
+
+    def test_no_advance_is_allowed(self):
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        SpyreKernel._check_indirect_index_step(None, self._arg(None))
+
+
+class TestPerTripIndex(unittest.TestCase):
+    """``per_trip_index`` pins a spliced loop's trip counter to zero.
+
+    A spliced ``for_each_tile`` loop writes its trip counter ``u0`` into
+    addresses (e.g. ``d0 + 32*u0``). It describes the address advance from
+    one trip to the next, not an in-tile iteration axis; codegen already
+    applies the advance once and pins ``u0`` to zero in the base
+    coordinates. ``per_trip_index`` is that pin, shared with the layout
+    passes. The device-level regression (a real multi-trip vector page
+    gather) lives in ``test_for_each_tile_e2e.py::TestForEachTileTripRangesE2E``.
+    """
+
+    class _Hint:
+        def __init__(self, loop_var, loop_var_range):
+            self.loop_var = loop_var
+            self.loop_var_range = loop_var_range
+
+    class _FakeOp:
+        def __init__(self, hints):
+            self.dim_hints = hints
+
+    def _u0(self):
+        import sympy
+
+        return sympy.Symbol("u0", integer=True)
+
+    def test_no_hints_returns_index_unchanged(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        d0 = sympy.Symbol("d0")
+        self.assertEqual(per_trip_index(self._FakeOp([]), d0), d0)
+        self.assertEqual(per_trip_index(None, d0), d0)
+
+    def test_pins_splice_var_to_zero(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        out = per_trip_index(self._FakeOp([self._Hint(u0, 4)]), d0 + 32 * u0)
+        self.assertEqual(out, d0)
+        self.assertEqual(out.free_symbols, {d0})
+
+    def test_input_expression_not_mutated(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        idx = d0 + 32 * u0
+        per_trip_index(self._FakeOp([self._Hint(u0, 4)]), idx)
+        self.assertEqual(idx, d0 + 32 * u0)
+
+    def test_hint_without_range_is_ignored(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        idx = d0 + 32 * u0
+        self.assertEqual(per_trip_index(self._FakeOp([self._Hint(u0, None)]), idx), idx)
 
 
 class TestSpliceWhileLoop(unittest.TestCase):
@@ -495,6 +633,439 @@ def _find_while_loop_ir_op(fn, args):
     return while_ops[0]
 
 
+class TestCarryRealInputOwnership(unittest.TestCase):
+    """The in-place-guard predicate on real IR buffers (no device)."""
+
+    def _computed(self, name, size=(2, 3), stride=(3, 1)):
+        from torch._inductor import ir
+
+        data = mock.MagicMock(spec=ir.Pointwise)
+        data.ranges = list(size)
+        op = ir.ComputedBuffer(
+            name=name,
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, list(size), list(stride)
+            ),
+            data=data,
+        )
+        op.operation_name = name
+        return op
+
+    def _graph(self, ops, inputs=(), outputs=(), never_reuse=()):
+        class _G:
+            def __init__(self):
+                self.operations = list(ops)
+                self.graph_inputs = {n: None for n in inputs}
+                self.never_reuse_buffers = set(never_reuse)
+
+            def get_output_names(self):
+                return list(outputs)
+
+        return _G()
+
+    def test_private_in_graph_buffer_is_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+        self.assertTrue(
+            bridge._carry_real_input_is_private(self._graph([buf]), object(), buf, 0)
+        )
+
+    def test_graph_input_is_not_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf], inputs=["carry_buf"]), object(), buf, 0
+            )
+        )
+
+    def _view(self, storage, size, stride, offset=0):
+        from torch._inductor import ir
+
+        return ir.ReinterpretView(
+            data=ir.StorageBox(storage),
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, list(size), list(stride), offset
+            ),
+        )
+
+    def test_aliased_view_of_graph_input_is_not_owned(self):
+        """Ownership resolves the storage; a view of a graph input is not."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage")
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([storage], inputs=["carry_storage"]),
+                object(),
+                ir.TensorBox(view),
+                0,
+            )
+        )
+
+    def test_view_of_private_storage_is_owned(self):
+        """A view of compiler-created scratch is owned (zero-copy), not copied
+        (the #4838 SDPA case)."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage")
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertTrue(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), object(), ir.TensorBox(view), 0
+            )
+        )
+
+    def test_storage_shared_with_loop_operand_is_not_owned(self):
+        """This loop may use the storage only through this carry's own slot."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_buf")
+
+        class _While:
+            carried_inputs = [storage]
+            additional_inputs = [storage]
+
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), _While(), storage, 0
+            )
+        )
+
+    def test_full_span_relayout_accepts_dense_permutation(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertTrue(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_full_span_relayout_accepts_sympy_integer_layouts(self):
+        """Real Inductor layouts use sympy.Integer; the predicate needs Python
+        ints, so the proof must concretize before calling it."""
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float32,
+            [sympy.Integer(64), sympy.Integer(256)],
+            [sympy.Integer(256), sympy.Integer(1)],
+            sympy.Integer(0),
+        )
+        view = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float32,
+            [sympy.Integer(256), sympy.Integer(64)],
+            [sympy.Integer(1), sympy.Integer(256)],
+            sympy.Integer(0),
+        )
+        self.assertTrue(bridge._is_full_span_relayout(view, storage))
+
+    def test_symbolic_layout_values_are_not_full_span(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        symbol = sympy.Symbol("s0", integer=True, positive=True)
+        for field, value in (
+            ("size", [symbol, 2]),
+            ("stride", [1, symbol]),
+            ("offset", 64 * symbol),
+        ):
+            with self.subTest(field=field):
+                view = self._view(storage, [3, 2], [1, 3])
+                setattr(view.layout, field, value)
+                self.assertFalse(
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+                )
+
+    def test_non_integer_layout_values_are_not_full_span(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        for value in (sympy.Rational(13, 4), sympy.oo, sympy.nan):
+            with self.subTest(value=value):
+                view = self._view(storage, [3, 2], [1, 3])
+                view.layout.size[0] = value
+                self.assertFalse(
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+                )
+
+    def test_malformed_layout_raises(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        with self.assertRaises(AttributeError):
+            bridge._is_full_span_relayout(object(), storage.layout)
+        view = self._view(storage, [3, 2], [1, 3])
+        view.layout.offset = object()
+        with self.assertRaises(sympy.SympifyError):
+            bridge._is_full_span_relayout(view.layout, storage.layout)
+
+    def test_full_span_relayout_surfaces_density_check_errors(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        for error in (AssertionError, RuntimeError, TypeError, ValueError):
+            with (
+                self.subTest(error=error),
+                mock.patch(
+                    "torch._prims_common._is_non_overlapping_and_dense_or_false",
+                    side_effect=error("density proof defect"),
+                ),
+            ):
+                with self.assertRaisesRegex(error, "density proof defect"):
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+
+    def test_offset_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 4], [4, 1], offset=1)
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_overlapping_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(2, 1))
+        view = self._view(storage, [2, 2], [1, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_zero_stride_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 4], [1, 0])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_holed_backing_is_not_full_span(self):
+        """A dense view over a holed/overlapping backing must not qualify:
+        the logical element copy never writes the hole addresses the view
+        would read."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(3, 1))
+        view = self._view(storage, [2, 2], [2, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_offset_backing_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(2, 1))
+        storage.layout.offset = 1
+        view = self._view(storage, [2, 2], [2, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_rank_changing_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(6,), stride=(1,))
+        view = self._view(storage, [2, 3], [3, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_copy_source_resolves_full_span_view_and_plain_buffer(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        got_storage, got_layout = bridge._copy_source_and_view(ir.TensorBox(view))
+        self.assertIs(got_storage, storage)
+        self.assertEqual(list(got_layout.size), [3, 2])
+        got_storage2, got_layout2 = bridge._copy_source_and_view(storage)
+        self.assertIs(got_storage2, storage)
+        self.assertIsNone(got_layout2)
+
+    def test_materialize_carry_copy_of_view_is_identity_plus_view(self):
+        """The caller-view copy is one identity copy of the storage, the carry
+        target a view over it, with empty origins and the input untouched."""
+        import types
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        while_op = types.SimpleNamespace(get_name=lambda: "while_op")
+        graph = self._graph([while_op])
+        graph.name_to_op = {}
+        graph.name_to_buffer = {}
+        graph.buffers = []
+        graph.qualify_name = lambda n: n
+        binding = types.SimpleNamespace(scratch_name="carry0", carry_index=0)
+
+        class _SizeVars:
+            def statically_known_true(self, expr):
+                return False
+
+            def statically_known_equals(self, a, b):
+                return a == b
+
+            def guard_or_false(self, expr):
+                return False
+
+        class _Graph:
+            sizevars = _SizeVars()
+
+        with V.set_graph_handler(_Graph()):
+            target = bridge._materialize_carry_copy(
+                graph, while_op, ir.TensorBox(view), binding
+            )
+        self.assertIsInstance(target, ir.ReinterpretView)
+        self.assertEqual(list(target.layout.size), [3, 2])
+        self.assertEqual(list(target.layout.stride), [1, 3])
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(len(copies), 1)
+        # identity copy of the backing storage (nonsquare, same size/stride),
+        # empty origins
+        self.assertEqual(list(copies[0].layout.size), [2, 3])
+        self.assertEqual(list(copies[0].layout.stride), [3, 1])
+        self.assertEqual(list(copies[0].data.ranges), [2, 3])
+        self.assertFalse(copies[0].origins)
+
+    def test_copy_source_refuses_unprovable_view(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 2], [4, 1], offset=1)
+        with self.assertRaises(bridge.Unsupported):
+            bridge._copy_source_and_view(ir.TensorBox(view))
+
+    def test_snapshot_of_view_copies_storage_and_preserves_direct_view(self):
+        import types
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        placeholder = ir.InputBuffer(name="carry_placeholder", layout=view.layout)
+        producer = self._computed("carry_update", size=(3, 2), stride=(1, 3))
+        reader = types.SimpleNamespace(inputs=[placeholder])
+        graph = self._graph([])
+        graph.name_to_op = {}
+        graph.name_to_buffer = {}
+        graph.buffers = []
+        graph.qualify_name = lambda name: name
+        graph.sizevars = types.SimpleNamespace(
+            statically_known_true=lambda expr: False,
+            statically_known_equals=lambda a, b: a == b,
+            guard_or_false=lambda expr: False,
+        )
+        with V.set_graph_handler(graph):
+            body = bridge._snapshot_carry_placeholder(
+                graph,
+                "carry_placeholder",
+                "carry_update",
+                ir.TensorBox(view),
+                [reader],
+                [producer, reader],
+            )
+
+        snapshot = body[0]
+        self.assertEqual(body[1:], [producer, reader])
+        self.assertEqual(list(snapshot.layout.size), [2, 3])
+        self.assertEqual(list(snapshot.layout.stride), [3, 1])
+        self.assertFalse(snapshot.origins)
+        target = reader.inputs[0]
+        self.assertIsInstance(target, ir.ReinterpretView)
+        self.assertEqual(list(target.layout.size), [3, 2])
+        self.assertEqual(list(target.layout.stride), [1, 3])
+        self.assertIs(bridge._storage_buffer(target), snapshot)
+
+    def test_copy_source_refuses_lazy_view(self):
+        """A lazy PermuteView/SliceView reports the BACKING layout from
+        get_layout(), so accepting it as backing identity would drop the
+        transform; only a ReinterpretView is accepted."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        lazy = mock.MagicMock(spec=ir.BaseView)
+        self.assertFalse(isinstance(lazy, ir.ReinterpretView))
+        with self.assertRaises(bridge.Unsupported):
+            bridge._copy_source_and_view(lazy)
+
+    def test_storage_name_of_scalar_constant_is_none(self):
+        """ShapeAsConstantBuffer/NoneAsConstantBuffer are IRNodes, not Buffers,
+        and their get_name() raises; scalars must yield None, not crash."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        self.assertIsNone(bridge._storage_name(ir.NoneAsConstantBuffer()))
+        self.assertIsNone(bridge._storage_name(ir.ShapeAsConstantBuffer(expr=1)))
+
+    def test_scalar_additional_input_does_not_crash_scan(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_buf")
+
+        class _While:
+            carried_inputs = [storage]
+            additional_inputs = [ir.NoneAsConstantBuffer()]
+
+        self.assertTrue(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), _While(), storage, 0
+            )
+        )
+
+    def test_unknown_reader_is_not_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+
+        class _BadReader:
+            def get_read_writes(self):
+                raise RuntimeError("cannot statically read this op")
+
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf, _BadReader()]), object(), buf, 0
+            )
+        )
+
+    def test_other_reader_is_not_owned(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor.dependencies import MemoryDep
+
+        buf = self._computed("carry_buf")
+
+        class _Reader:
+            def __init__(self, dep):
+                self._dep = dep
+
+            def get_read_writes(self):
+                return mock.Mock(reads=[self._dep], writes=set())
+
+        dep = MemoryDep("carry_buf", sympy.Symbol("d0"), (2,), ())
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf, _Reader(dep)]), object(), buf, 0
+            )
+        )
+
+
 class TestSpliceWhileLoops(unittest.TestCase):
     def _run_graph(self, fn, args):
         """Lower fn(*args) through a fresh GraphLowering and return it.
@@ -519,11 +1090,21 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 break
         assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
 
+        # Lowered on the captured graph's OWN placeholders, not on `args`:
+        # dynamo/AOT order the post-grad graph's placeholders by nothing the
+        # caller controls (e.g. a fixture that visits acc0.t() before the tiled
+        # operands gets arg0=acc0), so feeding `args` positionally binds inputs
+        # to the wrong placeholders and blows up in lowering on a shape
+        # mismatch. Fake tensors are what the real Inductor pipeline runs
+        # GraphLowering on anyway (same pattern as TestConsumeTileDimMarkers).
+        placeholders = [
+            node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"
+        ]
         graph = GraphLowering(
-            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+            gm, example_inputs=placeholders, shape_env=fake_mode.shape_env
         )
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
-            graph.run(*args)
+            graph.run(*placeholders)
         return graph
 
     def test_map_mode_group_gets_loop_info(self):
@@ -556,6 +1137,166 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
                 self.assertIsNone(info.propagation)
+
+    def test_private_in_graph_fill_keeps_single_buffer(self):
+        """A compiler-owned in-graph `torch.zeros` fill is not copied."""
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertFalse(
+            copies, "a private in-graph fill must keep the single-buffer path"
+        )
+
+    def test_caller_init_gets_private_pre_loop_copy(self):
+        """A caller tensor used as init gets one private pre-loop copy, and no
+        graph input is left as an in-place mutation target."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        acc0 = torch.zeros_like(ref)
+        graph = self._run_graph(split_k_caller_init_fn, (X, Y, acc0))
+        input_names = set(graph.graph_inputs.keys())
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(
+            len(copies), 1, "caller-owned init must get exactly one pre-loop copy"
+        )
+        mutators = [
+            op
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        ]
+        self.assertTrue(mutators, "expected an in-place accumulator")
+        copy_idx = graph.operations.index(copies[0])
+        for op in mutators:
+            self.assertLess(
+                copy_idx,
+                graph.operations.index(op),
+                "the pre-loop copy must precede the in-place accumulator",
+            )
+            self.assertNotIn(
+                op.layout.get_buffer().get_name(),
+                input_names,
+                "no graph input may be used as an in-place mutation target",
+            )
+
+    def test_private_transposed_init_keeps_single_buffer(self):
+        """A permuted view of compiler-created scratch must not be copied
+        (#4838: private storage stays zero-copy)."""
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_private_transposed_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertFalse(
+            copies, "a private permuted-view init must keep the single-buffer path"
+        )
+
+    def test_transposed_caller_init_gets_private_view_copy(self):
+        """A transposed view init must splice via one identity storage copy and
+        leave the caller's graph input unmutated (regression: #4838)."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        acc0 = torch.randn(ref.shape[1], ref.shape[0])  # [N, M], nonzero
+        graph = self._run_graph(split_k_transposed_caller_init_fn, (X, Y, acc0))
+        input_names = set(graph.graph_inputs.keys())
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)  # must not raise
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(
+            len(copies), 1, "transposed caller init must get one pre-loop copy"
+        )
+        # the copy is an identity copy of the backing storage (acc0 [N, M]),
+        # with empty origins
+        self.assertEqual(list(copies[0].layout.size), [64, 256])
+        self.assertEqual(list(copies[0].layout.stride), [256, 1])
+        self.assertFalse(copies[0].origins)
+        mutators = [
+            op
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        ]
+        self.assertTrue(mutators, "expected an in-place accumulator")
+        for op in mutators:
+            self.assertNotIn(
+                op.layout.get_buffer().get_name(),
+                input_names,
+                "no graph input may be used as an in-place mutation target",
+            )
+
+    def test_two_loops_sharing_init_get_independent_buffers(self):
+        """Two loops sharing one in-graph init must not write the same buffer."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(two_loops_shared_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertGreaterEqual(
+            len(copies), 1, "a shared init must be copied for the second loop"
+        )
+        targets = {
+            op.layout.get_buffer().get_name()
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        }
+        self.assertGreaterEqual(
+            len(targets),
+            2,
+            "the two loops must accumulate into distinct buffers (independent init)",
+        )
 
     def test_carry_mode_group_gets_loop_info(self):
         from torch._inductor import ir
@@ -743,6 +1484,471 @@ class TestSpliceWhileLoops(unittest.TestCase):
                     for op, _identity in identities
                 ),
                 "the full-cache exact-stride copy remained inside the loop",
+            )
+
+    def test_nested_noncontiguous_input_materialization_streams_one_tile(self):
+        """Nested head/Lk maps compose into one direct graph-input read."""
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr import for_each_tile
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_load,
+            splice_while_loops,
+        )
+
+        def nested_tile_sequence(x):
+            x = x.contiguous()
+
+            def head_body(_, head_operands):
+                (x_head,) = head_operands
+
+                def sequence_body(_, sequence_operands):
+                    (x_tile,) = sequence_operands
+                    return None, x_tile * 2
+
+                _, head_out = for_each_tile(
+                    sequence_body,
+                    (x_head,),
+                    dims=(3,),
+                    tile_size=64,
+                    out_dim=3,
+                )
+                return None, head_out
+
+            _, out = for_each_tile(
+                head_body,
+                (x,),
+                dims=(0,),
+                tile_size=1,
+                out_dim=0,
+            )
+            return out
+
+        backing = torch.randn(4, 2, 1, 320, 128)
+        prefix = backing[:, :, :, :256, :]
+        graph = self._run_graph(nested_tile_sequence, (prefix,))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+            identities = [
+                (op, identity)
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and (identity := _identity_load(op)) is not None
+            ]
+            input_copies = [
+                (op, identity)
+                for op, identity in identities
+                if identity[0] in graph.graph_input_names
+            ]
+            self.assertEqual(len(input_copies), 1)
+            input_copy, (source_name, _source_index, _identity_indices) = input_copies[
+                0
+            ]
+
+            direct_readers = [
+                op
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and hasattr(op, "_read_copy_elision_record")
+                and op._read_copy_elision_record.copy_name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_readers), 1)
+            direct_reader = direct_readers[0]
+            direct_record = direct_reader._read_copy_elision_record
+            self.assertTrue(
+                direct_reader.data.origins,
+                "rewriting the nested identity erased its FX provenance",
+            )
+            self.assertEqual(direct_record.copy_name, input_copy.get_name())
+            self.assertEqual(direct_record.source_name, source_name)
+
+            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(
+                direct_record.direct_tiled_dims_per_level,
+                ((), ((3, 64),)),
+            )
+            self.assertEqual(
+                direct_record.direct_squeezed_advance_per_level,
+                (((81920, 1),), ()),
+            )
+            self.assertEqual(
+                direct_reader.loop_info.squeezed_advance_per_read,
+                [[[(65536, 1)], []]],
+            )
+
+            self.assertFalse(
+                any(
+                    op is not input_copy and identity[0] == input_copy.get_name()
+                    for op, identity in identities
+                ),
+                "an intermediate head-tile identity survived chain contraction",
+            )
+
+            direct_reads = [
+                dep
+                for dep in direct_reader.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_reads), 1)
+
+    def test_nested_invariant_input_materialization_streams_one_tile(self):
+        """An outer-invariant input can still advance in the inner loop."""
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_load,
+            splice_while_loops,
+        )
+
+        def nested_tile_sequence(q, x):
+            x = x.contiguous()
+
+            def query_body(_, query_operands):
+                _q_tile, x_whole = query_operands
+
+                def sequence_body(_, sequence_operands):
+                    (x_tile,) = sequence_operands
+                    return None, x_tile * 2
+
+                _, sequence_out = for_each_tile(
+                    sequence_body,
+                    (x_whole,),
+                    dims=(3,),
+                    tile_size=64,
+                    out_dim=3,
+                )
+                return None, sequence_out + _q_tile
+
+            _, out = for_each_tile(
+                query_body,
+                (q, x),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=0,
+            )
+            return out
+
+        backing = torch.randn(2, 1, 1, 320, 128)
+        prefix = backing[:, :, :, :256, :]
+        query = torch.randn(prefix.shape)
+        graph = self._run_graph(nested_tile_sequence, (query, prefix))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+            identities = [
+                (op, identity)
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and (identity := _identity_load(op)) is not None
+            ]
+            input_copies = [
+                (op, identity)
+                for op, identity in identities
+                if identity[0] in graph.graph_input_names
+                and list(op.layout.size) == [2, 1, 1, 256, 128]
+            ]
+            self.assertEqual(len(input_copies), 1)
+            input_copy, (source_name, _source_index, _identity_indices) = input_copies[
+                0
+            ]
+
+            direct_readers = [
+                op
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and hasattr(op, "_read_copy_elision_record")
+                and op._read_copy_elision_record.copy_name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_readers), 1)
+            direct_reader = direct_readers[0]
+            direct_record = direct_reader._read_copy_elision_record
+            self.assertEqual(direct_record.copy_name, input_copy.get_name())
+            self.assertEqual(direct_record.source_name, source_name)
+            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(
+                direct_record.direct_tiled_dims_per_level,
+                ((), ((3, 64),)),
+            )
+            self.assertEqual(
+                direct_record.direct_squeezed_advance_per_level,
+                ((), ()),
+            )
+
+            self.assertFalse(
+                any(
+                    op is not input_copy and identity[0] == input_copy.get_name()
+                    for op, identity in identities
+                ),
+                "an intermediate sequence-tile identity survived chain contraction",
+            )
+
+    def test_identity_chain_loop_advance_proof_handles_outer_invariant(self):
+        import sympy
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_chain_has_valid_loop_advances,
+        )
+
+        outer, inner, element = sympy.symbols(
+            "outer inner element", integer=True, nonnegative=True
+        )
+        producer = mock.Mock(
+            layout=ir.FixedLayout(
+                torch.device("cpu"),
+                torch.float32,
+                size=[2, 256],
+                stride=[256, 1],
+            )
+        )
+        reader = mock.Mock()
+        reader.get_name.return_value = "reader"
+        reader.loop_info = CoarseTileInfo(
+            loop_group_id=(0, 1),
+            loop_count=[2, 4],
+            loop_tiled_dims=[[], [0]],
+            tiled_dims_per_read=[[[], [(0, 64)]]],
+        )
+        graph = mock.Mock()
+        graph.try_get_buffer.side_effect = {"root": producer}.get
+        loop_by_group = {0: (outer, sympy.Integer(2)), 1: (inner, sympy.Integer(4))}
+
+        reader.get_read_writes.return_value = mock.Mock(
+            reads=[
+                MemoryDep(
+                    "root",
+                    64 * inner + element,
+                    (element,),
+                    (256,),
+                )
+            ]
+        )
+        self.assertTrue(
+            _identity_chain_has_valid_loop_advances(
+                graph, ["root"], reader, loop_by_group
+            )
+        )
+
+        reader.get_read_writes.return_value = mock.Mock(
+            reads=[
+                MemoryDep(
+                    "root",
+                    256 * outer + 64 * inner + element,
+                    (element,),
+                    (256,),
+                )
+            ]
+        )
+        self.assertFalse(
+            _identity_chain_has_valid_loop_advances(
+                graph, ["root"], reader, loop_by_group
+            )
+        )
+
+    def test_identity_recognition_declines_an_untraceable_pointwise(self):
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _identity_load
+
+        def unsupported_inner(_index):
+            raise RuntimeError("not executable by the identity recorder")
+
+        op = ir.ComputedBuffer(
+            name="not_an_identity",
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, size=[4], stride=[1]
+            ),
+            data=ir.Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                inner_fn=unsupported_inner,
+                ranges=[4],
+            ),
+        )
+
+        self.assertIsNone(_identity_load(op))
+
+    def test_identity_chain_declines_a_flat_slice_offset(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j = sympy.symbols("i j", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, 4],
+                    [4, 1],
+                    [8, 1],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "constant offset"):
+            handler.load("staged", 4 * i + j + 1)
+
+    def test_identity_chain_declines_a_symbolic_flat_slice_offset(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j, width = sympy.symbols("i j width", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, width],
+                    [width, 1],
+                    [2 * width, 1],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "constant offset"):
+            handler.load("staged", width * i + j + width)
+
+    def test_identity_chain_declines_ambiguous_stride_mapping(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j = sympy.symbols("i j", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, 4],
+                    [4, 4],
+                    [8, 4],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous full_stride"):
+            handler.load("staged", 4 * i)
+
+    def test_identity_contraction_requires_every_reader_to_be_covered(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _prune_unsafe_identity_selections,
+        )
+
+        selection = (0, sympy.Integer(64), True)
+        descendant = (0, sympy.S.Zero, False)
+        identity_sources = {"root": "input", "pass_through": "root"}
+        advancing_reads = {
+            "root": {("advancing_consumer", "advancing_read")},
+            "pass_through": {("terminal_consumer", "terminal_read")},
+        }
+        covered_readers = {
+            "root": {
+                ("advancing_consumer", "advancing_read"),
+                ("pass_through", "identity_read"),
+            },
+            "pass_through": {("terminal_consumer", "terminal_read")},
+        }
+
+        self.assertEqual(
+            _prune_unsafe_identity_selections(
+                {"root": selection, "pass_through": descendant},
+                identity_sources,
+                covered_readers,
+                advancing_reads,
+            ),
+            {"root": selection, "pass_through": descendant},
+        )
+
+        readers_with_uncovered_use = {
+            name: set(readers) for name, readers in covered_readers.items()
+        }
+        readers_with_uncovered_use["root"].add(
+            ("advancing_consumer", "second_uncovered_read")
+        )
+        self.assertEqual(
+            _prune_unsafe_identity_selections(
+                {"root": selection, "pass_through": descendant},
+                identity_sources,
+                readers_with_uncovered_use,
+                advancing_reads,
+            ),
+            {},
+        )
+
+    def test_inner_pre_loop_copy_belongs_to_enclosing_loop_only(self):
+        """Reset the inner carry once per enclosing trip, outside the inner loop."""
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(nested_two_inner_loops_shared_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+        copies = [
+            op for op in graph.operations if "while_loop_carry_copy_" in op.get_name()
+        ]
+        # The first inner loop spliced copies the shared fill. The second may
+        # then own the fill outright: a copy of a pure fill inlines the fill
+        # rather than reading it, so the copy is not a second reader.
+        self.assertTrue(
+            [op for op in copies if len(op.get_size()) == 2],
+            "the shared fill must be copied before an inner loop",
+        )
+        for op in copies:
+            info = getattr(op, "loop_info", None)
+            self.assertIsNotNone(
+                info, f"{op.get_name()} is not a member of the enclosing loop"
+            )
+            self.assertEqual(
+                info.loop_group_id,
+                (0,),
+                f"{op.get_name()} must run once per outer trip, "
+                "not inside the inner loop",
             )
 
 
@@ -1036,6 +2242,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             _body_loop_var,
             _consume_tile_dim_markers,
             _stacking_carry_indices,
+            lookup_marker_dim,
             try_prove_for_each_tile,
         )
         from torch_spyre._inductor.wsr.while_loop_bridge import (
@@ -1103,7 +2310,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             )
             consumer_name = consumer_before.get_name()
 
-            _consume_tile_dim_markers(group_ops, graph.operations)
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
 
             new_consumer = next(
                 op for op in graph.operations if op.get_name() == consumer_name
@@ -1151,27 +2358,40 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
 
-    def test_marker_with_two_computed_buffer_consumers_maps_both(self):
-        """Paged attention's shape: one marker, two ComputedBuffer consumers.
+            # This is a RETAINED-axis consumer, so its post-inline read must
+            # still be registered in marker_map -- the simplified classifier
+            # must not pass by dropping every inlined read. Its mapped dep is
+            # the post-inline read of the marker's own input, and lookup
+            # resolves a real retained position (not None).
+            mapped_names = {name for name, _dep in marker_map}
+            self.assertIn(
+                consumer_name,
+                mapped_names,
+                "a retained-axis consumer's post-inline read must still be "
+                "registered in marker_map",
+            )
+            mapped_dep = next(dep for name, dep in marker_map if name == consumer_name)
+            self.assertEqual(mapped_dep.name, marker_input_name)
+            self.assertIsNotNone(
+                lookup_marker_dim(new_consumer, loop_var),
+                "the retained axis must still resolve to a tiled position",
+            )
+
+    def test_marker_with_two_computed_buffer_consumers_retain_advances(self):
+        """Paged attention's shape: one marker, two ComputedBuffer consumers,
+        BOTH slicing (consuming) the marker's tiled axis.
 
         paged_gather_kv_fn slices one page index out of the tiled block table
         and hands it to two ``index_select``s (K's page and V's), so the
         table's single dim=0 marker has two consuming reads, both
-        inline-branch shaped. This is the same supported multi-consumer shape
-        softmax_row_tiled_fn reaches through torch.softmax's amax/sub
-        siblings, pinned here at the IR level rather than only end to end,
-        and on a marker that carries a real per-trip advance.
-
-        Asserts more than "it no longer raises". Each consumer must get its
-        OWN map entry (dropping either silently loses that op's tiled-dim
-        provenance), each post-inline read must still carry the marker's own
-        per-trip advance term with the marker's own coefficient (the
-        silent-wrong-numerics regression
-        test_marker_inlined_preserves_advance_term_on_computed_buffer_
-        consumer pins for one consumer -- composing the transform into the
-        first consumer and merely renaming past the second would satisfy a
-        weaker check), and the marker must end up erased, since every one of
-        its consumers took the inline branch.
+        inline-branch shaped. A consumed axis is not entered into marker_map,
+        so the map holds neither consumer -- the two consumers are found
+        directly in the replaced group_ops instead. The contract this pins is
+        that BOTH replaced consumers keep the marker's own per-trip advance
+        term composed into their post-inline read (the silent-wrong-numerics
+        regression test_marker_inlined_preserves_advance_term_on_computed_
+        buffer_consumer pins for one consumer), and that the marker ends up
+        erased, since every consumer took the inline branch.
         """
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
@@ -1262,29 +2482,50 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
             marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
 
-        mapped_names = {name for name, _dep in marker_map}
-        self.assertEqual(
-            mapped_names,
-            consumer_names,
-            "every consumer of the marker must get its own map entry",
-        )
-        self.assertEqual(set(marker_map.values()), {0})
+            # Each replaced consumer's post-inline read, read while the graph
+            # handler is live (get_read_writes needs it).
+            consumer_reads = {}
+            for name in consumer_names:
+                op = next(o for o in group_ops if o.get_name() == name)
+                consumer_reads[name] = [
+                    d
+                    for d in op.get_read_writes().reads
+                    if isinstance(d, MemoryDep) and d.name == marker_input_name
+                ]
 
-        for (name, dep), _dim in marker_map.items():
+        # Both replaced consumers remain in the group.
+        self.assertTrue(
+            consumer_names <= {o.get_name() for o in group_ops},
+            "both replaced consumers must remain in group_ops",
+        )
+
+        # A consumed (sliced) marker axis leaves a pure-constant coordinate, so
+        # neither consumer is entered into marker_map.
+        mapped_names = {name for name, _dep in marker_map}
+        self.assertFalse(
+            mapped_names & consumer_names,
+            "a consumed (sliced) marker axis must not be entered into "
+            f"marker_map; got entries for {sorted(mapped_names & consumer_names)}",
+        )
+
+        # Both consumers still exist in the replaced group and each keeps
+        # exactly one post-inline read of the marker's input carrying the
+        # marker's own per-trip advance coefficient -- composing the transform
+        # into the first consumer and merely renaming past the second would
+        # satisfy a weaker check.
+        for name, reads in consumer_reads.items():
             self.assertEqual(
-                dep.name,
-                marker_input_name,
-                f"{name}'s mapped dep must name the marker's own upstream "
-                "input, i.e. be the post-inline read",
+                len(reads),
+                1,
+                f"{name} must have exactly one post-inline read of the "
+                f"marker's input; got {reads!r}",
             )
             self.assertEqual(
-                dep.index.coeff(loop_var),
+                reads[0].index.coeff(loop_var),
                 marker_own_index.coeff(loop_var),
-                f"{name}'s post-inline read lost or altered the marker's "
-                f"own per-trip advance term ({loop_var}) -- got "
-                f"{dep.index!r}, marker's own index is {marker_own_index!r}. "
-                "Every consumer must have the marker's real coordinate "
-                "transform composed in, not just the first one.",
+                f"{name}'s post-inline read lost or altered the marker's own "
+                f"per-trip advance term ({loop_var}) -- got {reads[0].index!r}, "
+                f"marker's own index is {marker_own_index!r}.",
             )
 
         self.assertEqual(
@@ -2036,6 +3277,71 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "keeps its marker materialized rather than erasing it)",
         )
 
+    def test_gather_mode_nested_resolves_correctly(self):
+        """Kind.GATHER nested inside another for_each_tile splices cleanly.
+
+        paged_gather_nested_fn wraps an outer map over Q-row-tiles around
+        paged_gather_fn's own gather-mode body (tiled block table, invariant
+        page pool, one page gathered per trip via a POINT read of the page
+        index -- see paged_gather_fn's docstring). Every prior nested
+        fixture in this file nests Kind.SLICE loops inside each other; this
+        is the first to nest a Kind.GATHER loop, which resolves its own
+        tile_dim_marker via a point read rather than a sliced-tensor read.
+        Asserts both WhileLoop ops (outer map, inner gather) are fully
+        spliced -- same shape, and same snapshot-before-DCE requirement, as
+        test_nested_for_each_tile_markers_resolve_correctly's check for the
+        Kind.SLICE-in-Kind.SLICE case (see that test's docstring for why a
+        live post-compile read of graph.operations cannot distinguish
+        "spliced correctly" from "splicing was a no-op and DCE pruned the
+        orphaned WhileLoop as unrelated dead code").
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+        from torch._inductor import ir
+
+        import torch_spyre._inductor.passes as passes_mod
+        from for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            paged_gather_inputs,
+            paged_gather_nested_fn,
+        )
+
+        pages, table, q = paged_gather_inputs()
+        pages = pages.to(DEVICE_NAME)
+        table = table.to(DEVICE_NAME)
+        q = q.to(DEVICE_NAME)
+
+        captured = {}
+        original_splice_while_loops = passes_mod.splice_while_loops
+
+        def capturing_splice_while_loops(graph):
+            result = original_splice_while_loops(graph)
+            # No captured["graph"] here (unlike the sibling
+            # test_nested_for_each_tile_markers_resolve_correctly): this test
+            # only checks that both WhileLoops were spliced, not marker
+            # survival, so it has no later use for the graph reference.
+            captured["operations"] = list(graph.operations)
+            return result
+
+        passes_mod.splice_while_loops = capturing_splice_while_loops
+        try:
+            capture_post_grad_while_loop(paged_gather_nested_fn, (pages, table, q))
+        finally:
+            passes_mod.splice_while_loops = original_splice_while_loops
+
+        self.assertIn(
+            "operations", captured, "splice_while_loops was never called/captured"
+        )
+        remaining_while_ops = [
+            op for op in captured["operations"] if isinstance(op, ir.WhileLoop)
+        ]
+        self.assertEqual(
+            remaining_while_ops,
+            [],
+            "expected both nesting levels (outer map, inner gather) to be "
+            "fully spliced",
+        )
+
     def test_triple_nested_stardep_outer_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at the outer level: marker
         splicing/resolution completes correctly and the fixture compiles
@@ -2451,7 +3757,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
-        from tests.inductor.utils_inductor import cached_xavier, dl16_round
+        from utils_inductor import cached_xavier, dl16_round
 
         torch._dynamo.reset()
         X = cached_xavier((256, 256))
@@ -2465,6 +3771,207 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         actual = compiled(X.to(DEVICE_NAME), Y.to(DEVICE_NAME))
         torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_nested_online_softmax_value_correct(self):
+        """Map-outer/carry-inner nesting with a multi-leaf carry compiles and
+        produces numerically correct output end to end.
+
+        nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
+        own 3-leaf (m, denom, acc) carry over K/V tiles -- previously only
+        exercised by test_nested_late_created_ops_inherit_ancestor_loop_info
+        (loop_info/marker propagation on mocked IR, no device compile, no
+        numerics). This closes that gap: same dl16-rounded-reference,
+        xavier-input methodology as test_carry_mode_online_softmax
+        (test_for_each_tile_e2e.py), since the inner loop is exactly that
+        fixture's carry recurrence, just re-run once per outer Q-tile.
+        """
+        import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import (
+            D,
+            LK,
+            LQ,
+            nested_online_softmax_fn,
+            nested_online_softmax_reference,
+        )
+        from utils_inductor import cached_xavier, dl16_round
+
+        torch._dynamo.reset()
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        expected = nested_online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        compiled = torch.compile(
+            nested_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        actual = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_consumed_marker_axis_does_not_resolve_tiled_position(self):
+        """A tile axis consumed at its consumer must not be stamped loop_tiled.
+
+        consumed_row_fn slices the tiled block table's dim 0 to a constant, so the
+        inlined flat-table read is ``e + 32*u0`` -- the coefficient coincidence that
+        used to make lookup_marker_dim call the entries axis tiled. Real lowering,
+        CPU-only: consume the marker, stamp the real group, then assert the entries
+        axis is not loop_tiled and the read's own per-trip advance is exactly one
+        ``(32, 1)`` pair.
+        """
+        import sympy
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        from for_each_tile_fixtures import consumed_row_fn, consumed_row_inputs
+
+        graph = self._run_graph(consumed_row_fn, consumed_row_inputs())
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        res = try_prove_for_each_tile(while_op)
+        self.assertTrue(res.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=res.trip_count
+            )
+            _consume_tile_dim_markers(group_ops, graph.operations)
+            _stamp_direct_loop_info(group_ops, loop_var, res.trip_count, group_idx=0)
+
+            # The real inlined flat-table read carries the 32*u0 per-trip advance.
+            consumers = []
+            for op in group_ops:
+                reads = [
+                    dep
+                    for dep in op.get_read_writes().reads
+                    if isinstance(dep, MemoryDep)
+                ]
+                for read_idx, dep in enumerate(reads):
+                    if dep.index.coeff(loop_var) == 32:
+                        consumers.append((op, read_idx))
+
+        self.assertTrue(consumers, "no read carries the 32*u0 per-trip advance")
+        for op, read_idx in consumers:
+            info = getattr(op, "loop_info", None)
+            self.assertIsNotNone(info, "the consumer was not stamped")
+            loop_tiled = [pos for level in info.loop_tiled_dims for pos in level]
+            self.assertNotIn(
+                0,
+                loop_tiled,
+                "the consumed marker's entries axis must not be stamped loop_tiled",
+            )
+            tiled_entries = [
+                entry for level in info.tiled_dims_per_read[read_idx] for entry in level
+            ]
+            self.assertEqual(
+                tiled_entries,
+                [],
+                "the consumed read must carry no tiled_dims_per_read entry",
+            )
+            advances = [
+                pair
+                for level in info.squeezed_advance_per_read[read_idx]
+                for pair in level
+            ]
+            self.assertEqual(
+                advances,
+                [(sympy.Integer(32), sympy.Integer(1))],
+                "the read's own per-trip advance must be exactly one (32, 1) pair",
+            )
+
+    def test_consumed_read_does_not_hide_a_retained_read(self):
+        """A consumed mapped read must not hide a SECOND retained mapped read on the
+        same op.
+
+        Minimal IR (this class's established mock-IR convention): one op reads two
+        markers -- X consumed (its marker axis was sliced to a constant, so the
+        production lowering omits it from marker_map) and Y retained. marker_map
+        therefore holds only Y, and lookup_marker_dim must resolve Y (position 1),
+        not X's coincidental position. This pins the lookup contract; it is not
+        required to fail on pristine main.
+        """
+        import sympy
+
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _MARKER_MAPS,
+            clear_marker_maps,
+            lookup_marker_dim,
+        )
+
+        u0 = sympy.Symbol("u0")
+        v0 = sympy.Symbol("v0")
+        w0 = sympy.Symbol("w0")
+
+        # X: consumed-first read; coefficient coincidence 3*u0 on v0's axis.
+        x_dep = MemoryDep(
+            name="x_buf",
+            index=v0 + 3 * u0,
+            var_names=(v0,),
+            size=(sympy.Integer(3),),
+        )
+        # Y: retained read; advances on w0's own axis.
+        y_dep = MemoryDep(
+            name="y_buf",
+            index=w0 + u0,
+            var_names=(w0,),
+            size=(sympy.Integer(1),),
+        )
+        out_dep = MemoryDep(
+            name="out_buf",
+            index=sympy.Symbol("d0"),
+            var_names=(sympy.Symbol("d0"),),
+            size=(sympy.Integer(1),),
+        )
+
+        op = mock.Mock(spec=["get_read_writes", "get_name", "data"])
+        op.get_name.return_value = "mixed_op"
+        op.data = mock.Mock(spec=[])  # not a Reduction
+        rw = mock.Mock()
+        rw.reads = [x_dep, y_dep]
+        rw.writes = {out_dep}
+        op.get_read_writes.return_value = rw
+
+        operations = ["sentinel_operations_list"]
+        clear_marker_maps()
+        self.addCleanup(clear_marker_maps)
+        # Production omits the consumed X read from marker_map; only Y is present.
+        _MARKER_MAPS[id(operations)] = {("mixed_op", y_dep): 0}
+
+        graph = mock.Mock(spec=["operations"])
+        graph.operations = operations
+
+        with mock.patch.object(coarse_tile_mod, "op_out_coords", return_value=[v0, w0]):
+            with V.set_graph_handler(graph):
+                result = lookup_marker_dim(op, u0)
+
+        self.assertEqual(
+            result,
+            (1, False),
+            "expected lookup_marker_dim to skip the consumed X read and "
+            "resolve the retained Y read (position 1); got the consumed X "
+            "position or None instead",
+        )
 
 
 class TestStampDirectLoopInfo(unittest.TestCase):

@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from unittest.mock import patch as mock_patch
 
+import pytest
 import regex as re
 import torch
 from sympy import Integer
@@ -33,14 +34,13 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-import pytest
+from utils_inductor import mock_backend_compiler
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.hbm_pool_planning import Allocator, hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
-from utils_inductor import mock_backend_compiler
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -312,7 +312,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         that would silently drift if _compute_size_bytes's stick-alignment
         changes for unrelated reasons.
         """
-        from torch_spyre._inductor.constants import SEGMENT_SIZE
+        from torch_spyre._inductor.constants import MAX_REGION_SIZE
         from torch_spyre._inductor.hbm_pool_planning import (
             Allocator,
             _compute_size_bytes,
@@ -327,7 +327,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
         hbm_pool_planning([bundle])
 
-        expected_alloc = Allocator(SEGMENT_SIZE)
+        expected_alloc = Allocator(MAX_REGION_SIZE)
         # buf0's live range ends at "mid" (step 1), buf1's starts there --
         # sorted by (start, end, name) as in the real implementation,
         # buf0 allocates first.

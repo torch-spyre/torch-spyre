@@ -136,16 +136,6 @@ lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
 
-# Submit independent backend-compiler kernel compilations to Inductor's
-# subprocess pool and resolve them together at the generated wrapper's
-# async_compile.wait() barrier. This is opt-in while the parallel path is
-# evaluated on full model compiles.
-async_backend_compile: bool = os.getenv("SPYRE_ASYNC_BACKEND_COMPILE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
@@ -285,11 +275,23 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 #
 # For "cpsat" and "simulated_annealing" the value names a solver *family* whose
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
-# solvers that same flag instead wraps them in ExhaustiveSearchSolver.
+# solvers, co-optimization instead requires wrapping them in
+# ExhaustiveSearchSolver -- see ``allow_exhaustive_search`` below, which gates
+# that wrapping.
 
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
+
+# co_optimizing_lx_planning requires a layout_solver whose solver is natively
+# core-division-capable ("cpsat" with ortools installed, or
+# "simulated_annealing"). Every other combination -- "greedy"/"bestfit"/
+# "firstfit", or "cpsat" without ortools -- can only participate in
+# co-optimization by wrapping the placement-only solver in
+# ExhaustiveSearchSolver, an expensive DFS over core-division candidates.
+# That is opt-in: select_allocator() raises ValueError for such a combination
+# unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
+allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
 
 # Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
 # lexicographic and re-solves the same model up to three times (residency, then

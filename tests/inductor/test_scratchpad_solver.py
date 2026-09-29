@@ -23,6 +23,7 @@ import sys
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 
 import sympy
 from unittest import TestCase
@@ -35,6 +36,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    solved_bindings,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
@@ -1193,6 +1195,25 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
     solver_class = CpSatLayoutSolver
 
+    def test_symbolic_reciprocal_core_count_selects_the_faster_candidate(self):
+        buf = CoreDivisionBuffer(
+            "reduction_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={"b": 1, "h": 4, "q": 2}),
+                CoreDivision(splits={"b": 2, "h": 4, "q": 4}),
+            ],
+            residency_reason="no consumer reads it from LX",
+        )
+        cost = sympy.Integer(32_000) / buf.sym_cores
+        (result,) = self.solver_class(
+            [buf], size=1 << 20, alignment=1
+        ).plan_layout_and_core_divisions(cost)
+
+        self.assertEqual(result.chosen_division, 1)
+        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
         # child.start_time + 1) with whole-only divisions and capacity for just
@@ -1652,17 +1673,31 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(self._domain_of(model, name), (3, 24))
 
     def test_inverse_scale_falls_back_past_cap(self):
-        # 7 * 11 * 13 = 1001 fits under the cap and stays exact; 7 * 11 * 17 =
-        # 1309 does not, so the default scale and its rounding return.
+        # 7 * 11 * 13 = 1001 fits under the cap and stays exact. 7 * 11 * 17 =
+        # 1309 does not, so the fallback covers 7 and 17 and rounds 11, taking
+        # 5 * 7 * 17 = 595 over the narrower 7 * 17 = 119 because the wider
+        # scale leaves 11 a smaller remainder.
         a = sympy.Symbol("split_a", integer=True, positive=True)
-        _, model = self._pinned_split_cost(1 / a, {"split_a": [1, 7, 11, 13]}, 0)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (77, 1001))
-        got, model = self._pinned_split_cost(1000 / a, {"split_a": [1, 7, 11, 17]}, 1)
+        under_cap_values = [1, 7, 11, 13]
+        lcm_scale = 7 * 11 * 13
+        _, model = self._pinned_split_cost(1 / a, {"split_a": under_cap_values}, 0)
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"), (lcm_scale // 13, lcm_scale)
+        )
+
+        over_cap_values = [1, 7, 11, 17]
+        fallback_scale = 5 * 7 * 17
+        numerator = 1000
+        pinned = over_cap_values.index(7)
+        got, model = self._pinned_split_cost(
+            numerator / a, {"split_a": over_cap_values}, pinned
+        )
         self.assertEqual(
             self._domain_of(model, "inv_split_a"),
-            (_CORE_INV_SCALE // 17, _CORE_INV_SCALE),
+            (fallback_scale // 17, fallback_scale),
         )
-        self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
+        # 7 divides the fallback scale, so the pinned division is priced exactly.
+        self.assertAlmostEqual(got, numerator / 7)
 
     @staticmethod
     def _lin_max_operand_sizes(model):
@@ -2011,6 +2046,118 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat inv-scale tests need ortools")
+class TestInvScale(TestCase):
+    """``_SympyExprToCpSat._inv_scale`` picks the fixed-point scale of an
+    ``inv_<split>`` variable. Its only consumer, ``_print_Symbol``, derives the
+    variable's domain from ``[scale // v for v in raw]`` and constrains it with
+    a truncating ``add_division_equality``, so a scale that is too small for the
+    candidate values does not fail — it silently flattens the reciprocal term in
+    the objective. These tests pin what the choice guarantees: every power-of-two
+    division stays exact, no reciprocal collapses onto 0, whatever the scale
+    does not divide it still rounds to within a few percent, and among scales
+    that tie on both counts the narrowest wins, since these feed products
+    bounded by ``_MAX_PRODUCT_BOUND``."""
+
+    # Candidate divisions come from each axis's divisors (capped at the core
+    # count), so a buffer's values are divisor-closed sets and their products,
+    # with one entry per enumerated division — hence the repeats.
+    EXACT = {
+        "powers of two": [1, 2, 4, 8, 16, 32],
+        "divisors of 24": [1, 2, 3, 4, 6, 8, 12, 24],
+        "repeated": [1, 2, 2, 4, 4, 4, 8],
+    }
+    FALLBACK = {
+        "divisors of 32, 9 and 7": [1, 2, 4, 8, 16, 32, 3, 9, 7],
+        "their 3D grid": [
+            a * b * c
+            for a in (1, 2, 4, 8, 16, 32)
+            for b in (1, 3, 9)
+            for c in (1, 7)
+            if a * b * c <= 32
+        ],
+        "every factor to 32": list(range(1, 33)),
+        "coprime tail": [8, 3, 5, 7, 11, 13],
+        # Nothing to anchor on: no power of two past 1, and no two of these
+        # fit under the cap together with the third.
+        "odd primes": [1, 3, 19, 29],
+    }
+
+    # The cap bounds this: a value v rounds to (scale % v) / scale, and v is at
+    # most the core count, so a scale near _CORE_INV_SCALE cannot be far off.
+    MAX_ERROR = Fraction(1, 25)
+
+    @staticmethod
+    def _scale(raw):
+        conv = _SympyExprToCpSat(cp_model.CpModel(), {}, {"s": (None, list(raw))})
+        return conv._inv_scale("s")
+
+    @staticmethod
+    def _max_error(raw, scale):
+        """Worst relative error of the fixed-point reciprocal ``scale // v``."""
+        return max(Fraction(scale % v, scale) for v in set(raw))
+
+    def test_no_values_falls_back_to_the_constant(self):
+        conv = _SympyExprToCpSat(cp_model.CpModel(), {}, {"empty": (None, ())})
+        self.assertEqual(conv._inv_scale("empty"), _CORE_INV_SCALE)
+        self.assertEqual(conv._inv_scale("absent"), _CORE_INV_SCALE)
+        self.assertEqual(self._scale([1, 0, 4]), _CORE_INV_SCALE)
+
+    def test_exact_lcm_when_it_fits(self):
+        for label, raw in self.EXACT.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertEqual(scale, math.lcm(*raw))
+                self.assertFalse([v for v in raw if scale % v])
+
+    def test_fallback_keeps_every_reciprocal_nonzero(self):
+        # min(values) == 0 would let the solver treat a division as free.
+        for label, raw in self.FALLBACK.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertGreater(math.lcm(*raw), _CORE_INV_SCALE)
+                self.assertLessEqual(scale, _CORE_INV_SCALE)
+                self.assertGreaterEqual(min(scale // v for v in raw), 1)
+
+    def test_powers_of_two_stay_exact(self):
+        # Anchoring on the largest power of two present keeps every smaller one
+        # exact too, on both paths.
+        for label, raw in {**self.EXACT, **self.FALLBACK}.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                pow2 = [v for v in set(raw) if not v & (v - 1)]
+                self.assertFalse([v for v in pow2 if scale % v])
+
+    def test_fallback_rounds_what_it_cannot_divide(self):
+        for label, raw in self.FALLBACK.items():
+            with self.subTest(label):
+                self.assertLessEqual(
+                    self._max_error(raw, self._scale(raw)), self.MAX_ERROR
+                )
+
+    def test_fallback_covers_candidates_before_it_rounds_well(self):
+        # 840 = 8 * 3 * 5 * 7 divides all but 11 and 13. 1008 rounds every
+        # value to within 1/144 -- a better worst case than 840's 1/105 -- but
+        # divides only 8 and 7, so the count decides first and 840 wins.
+        raw = self.FALLBACK["coprime tail"]
+        scale = self._scale(raw)
+        self.assertEqual(scale, 840)
+        self.assertEqual([v for v in raw if scale % v], [11, 13])
+        self.assertLess(self._max_error(raw, 1008), self._max_error(raw, scale))
+
+    def test_fallback_takes_the_narrowest_of_the_equally_good(self):
+        # 288 = 32 * 9 divides every candidate but 7, which no multiple of 32
+        # under the cap reaches. 864 divides the same values and rounds 7 to
+        # the same 1/288, so both keys tie and the narrower scale wins: these
+        # multiply into products capped at _MAX_PRODUCT_BOUND.
+        raw = self.FALLBACK["divisors of 32, 9 and 7"]
+        scale = self._scale(raw)
+        self.assertEqual(scale, 288)
+        self.assertEqual([v for v in raw if scale % v], [7])
+        self.assertEqual([v for v in raw if 864 % v], [7])
+        self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
 
 
 if __name__ == "__main__":

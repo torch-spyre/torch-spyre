@@ -17,7 +17,13 @@
 import sys
 
 from . import schema
-from .identity import BenchmarkId, CapabilityId, CaseId, DerivedId, GhaArtifactId
+from .identity import (
+    ArtifactIdentity,
+    BenchmarkId,
+    CapabilityId,
+    CaseId,
+    DerivedId,
+)
 
 
 class RunWriter:
@@ -338,10 +344,20 @@ class CapabilityWriter(RunWriter):
 
 
 class ArtifactWriter:
-    """The GHA leg's own artifact row and its verdict, written as one call."""
+    """Artifacts, how to fetch them, the tags naming them, and the verdicts on them."""
 
     artifact_table = schema.Artifacts
+    ref_table = schema.ArtifactRefs
+    tag_table = schema.ArtifactTags
     result_table = schema.ArtifactResults
+
+    # kind -> (method, ref_kind) of the address artifact_refs records.
+    REF_SHAPE = {
+        "image": ("container-pull", "pullspec"),
+        "rpm": ("dnf", "glob"),
+        "wheel": ("pip", "url"),
+        "generic": ("download", "url"),
+    }
 
     @classmethod
     def artifact_recorded(cls, client, db: str, artifact_id: str) -> bool:
@@ -357,6 +373,19 @@ class ArtifactWriter:
         )
 
     @classmethod
+    def tag_recorded(cls, client, db: str, tag: str, artifact_id: str) -> bool:
+        """Does this tag already point at this artifact? (Also a plain MergeTree.)"""
+        return (
+            cls.tag_table.count_rows(
+                client,
+                db,
+                "tag = {tag:String} AND artifact_id = {artifact_id:UUID}",
+                {"tag": tag, "artifact_id": artifact_id},
+            )
+            > 0
+        )
+
+    @classmethod
     def result_recorded(
         cls,
         client,
@@ -366,14 +395,18 @@ class ArtifactWriter:
         result_kind: str,
         test_type: str,
     ) -> bool:
-        """Has this verdict landed? Scoped by the sort key: one run reports N tiers."""
+        """Has this verdict landed? Scoped by the sort key: one run reports N tiers.
+
+        A `running` row is a pre-dispatch SEED (Jenkins writes it before the leg starts), not
+        a recorded verdict -- it must not block the leg's own terminal insert at the same key.
+        """
         return (
             cls.result_table.count_rows(
                 client,
                 db,
                 "artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
                 "AND result_kind = {result_kind:String} "
-                "AND test_type = {test_type:String}",
+                "AND test_type = {test_type:String} AND state != 'running'",
                 {
                     "artifact_id": artifact_id,
                     "run_id": run_id,
@@ -383,6 +416,135 @@ class ArtifactWriter:
             )
             > 0
         )
+
+    @classmethod
+    def insert_artifact(
+        cls,
+        client,
+        db: str,
+        identity: ArtifactIdentity,
+        *,
+        origin: str = "built",
+        sources=(),
+        identity_deps=(),
+        context_deps=(),
+        props=None,
+        tags=(),
+    ) -> str:
+        """Record `identity` once, its fetch address, and each (tag, family, props) in `tags`.
+
+        Returns the artifact_id, or '' when the identity is incomplete. Every step is
+        existence-checked, so a re-run adds nothing.
+        """
+        aid = identity.artifact_id
+        if not aid:
+            print(
+                f"  [warn] v2: artifact skipped -- identity incomplete: {identity}",
+                file=sys.stderr,
+            )
+            return ""
+        if not cls.artifact_recorded(client, db, aid):
+            row: schema.ArtifactRow = {
+                "artifact_id": aid,
+                "component": DerivedId.norm(identity.component),
+                "arch": identity.arch,
+                "kind": identity.kind,
+                "artifact_name": identity.artifact_name,
+                "origin": origin,
+                "identity_deps": [d for d in identity_deps if d],
+                "context_deps": [d for d in context_deps if d],
+                # Tuple order (repo, git_ref, git_sha) -- what the covered-tier join reads.
+                "sources": [tuple(s) for s in sources if any(s)],
+                "props": cls._props(
+                    {
+                        "id12": identity.id12,
+                        "artifact_name": identity.artifact_name,
+                        "ref": identity.ref,
+                        **dict(identity.inputs),
+                        **(props or {}),
+                    }
+                ),
+            }
+            cls.artifact_table.insert(client, [row], db=db)
+        method, ref_kind = cls.REF_SHAPE[identity.kind]
+        if identity.ref:
+            # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
+            ref_row: schema.ArtifactRefRow = {
+                "artifact_id": aid,
+                "method": method,
+                "ref_kind": ref_kind,
+                "index_uri": cls._index_uri(identity.ref),
+                "ref": identity.ref,
+                "content_digest": identity.content_digest,
+                "props": cls._props({"id12": identity.id12}),
+            }
+            cls.ref_table.insert(client, [ref_row], db=db)
+        for tag, family, tag_props in tags:
+            if not tag or cls.tag_recorded(client, db, tag, aid):
+                continue
+            tag_row: schema.ArtifactTagRow = {
+                "tag": tag,
+                "tag_family": family,
+                "artifact_id": aid,
+                "refs": [(method, ref_kind, cls._index_uri(identity.ref), identity.ref)]
+                if identity.ref
+                else [],
+                "published_refs": [],
+                "props": cls._props({"id12": identity.id12, **(tag_props or {})}),
+            }
+            cls.tag_table.insert(client, [tag_row], db=db)
+        return aid
+
+    @classmethod
+    def insert_result(
+        cls,
+        client,
+        db: str,
+        *,
+        artifact_id: str,
+        run_id: str,
+        test_type: str,
+        state: str,
+        arch: str,
+        result_kind: str = "",
+        duration_s: float = 0.0,
+        props=None,
+    ) -> bool:
+        """One verdict of one leg on one artifact; refuses a partial key, skips a repeat."""
+        aid, rid, a = (
+            DerivedId.norm(artifact_id),
+            DerivedId.norm(run_id),
+            DerivedId.arch(arch),
+        )
+        kind = result_kind or (
+            "performance"
+            if test_type == "perf"
+            else "capability"
+            if test_type in schema.CAPABILITY_TYPE_VALUES
+            else "functional"
+        )
+        if not (aid and rid and a):
+            print(
+                f"  [warn] v2: artifact result skipped -- artifact_id={aid or '<blank>'} "
+                f"run_id={rid or '<blank>'} arch={a or '<blank>'}",
+                file=sys.stderr,
+            )
+            return False
+        if cls.result_recorded(client, db, aid, rid, kind, test_type):
+            return True
+        result_row: schema.ArtifactResultRow = {
+            "artifact_id": aid,
+            "run_id": rid,
+            "result_kind": kind,
+            "test_type": test_type,
+            "state": state,
+            # Where it RAN; kept apart from artifacts.arch by design.
+            "arch": a,
+            "duration_s": float(duration_s or 0.0),
+            "props": cls._props(props or {}),
+        }
+        cls.result_table.insert(client, [result_row], db=db)
+        return True
 
     @classmethod
     def insert_gha_result(
@@ -396,7 +558,7 @@ class ArtifactWriter:
         run_id: str,
         test_type: str,
         state: str,
-        result_kind: str = "functional",
+        result_kind: str = "",
         duration_s: float = 0.0,
         base_artifact_id: str = "",
         installed: str = "",
@@ -418,83 +580,67 @@ class ArtifactWriter:
             )
             return False
 
+        base = DerivedId.norm(base_artifact_id)
         # aid == base means the leg ran the image UNCHANGED, so the artifact is the
         # one the orchestrator already recorded, and our own row would be a duplicate.
-        if aid != DerivedId.norm(base_artifact_id) and not cls.artifact_recorded(
-            client, db, aid
-        ):
+        if aid != base and not cls.artifact_recorded(client, db, aid):
+            identity = ArtifactIdentity.from_gha(comp, base, installed, a)
+            # Keyed on the caller's id: the record it came from is the authority.
             cls.artifact_table.insert(
                 client,
                 [
-                    cls._artifact_row(
-                        aid,
-                        comp,
-                        a,
-                        base_artifact_id,
-                        installed,
-                        repo,
-                        git_ref,
-                        git_sha,
-                        run_url,
-                    )
+                    {
+                        "artifact_id": aid,
+                        "component": comp,
+                        "arch": a,
+                        "kind": "image",
+                        # The hashed name, not a display string.
+                        "artifact_name": base,
+                        # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
+                        "origin": "built",
+                        "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"]
+                        if base
+                        else [],
+                        "context_deps": [],
+                        "sources": [(repo, git_ref, git_sha)]
+                        if (repo or git_ref or git_sha)
+                        else [],
+                        "props": cls._props(
+                            {
+                                # The digest GhaArtifactId put in the id12 slot.
+                                "id12": identity.id12,
+                                **dict(identity.inputs),
+                                "run_url": run_url,
+                                "source": "gha",
+                            }
+                        ),
+                    }
                 ],
                 db=db,
             )
-
-        if cls.result_recorded(client, db, aid, rid, result_kind, test_type):
-            return True
-
-        result_row: schema.ArtifactResultRow = {
-            "artifact_id": aid,
-            "run_id": rid,
-            "result_kind": result_kind,
-            "test_type": test_type,
-            "state": state,
-            # Where it RAN; kept apart from artifacts.arch by design.
-            "arch": a,
-            "duration_s": float(duration_s or 0.0),
-            "props": {
-                k: v for k, v in {"run_url": run_url, "source": "gha"}.items() if v
-            },
-        }
-        cls.result_table.insert(client, [result_row], db=db)
-        return True
+        return cls.insert_result(
+            client,
+            db,
+            artifact_id=aid,
+            run_id=rid,
+            test_type=test_type,
+            state=state,
+            arch=a,
+            result_kind=result_kind,
+            duration_s=duration_s,
+            props={"run_url": run_url, "source": "gha"},
+        )
 
     @staticmethod
-    def _artifact_row(
-        aid, comp, arch, base_artifact_id, installed, repo, git_ref, git_sha, run_url
-    ) -> "schema.ArtifactRow":
-        """The artifacts row for a GHA leg; hash inputs stay readable beside the id."""
-        base = DerivedId.norm(base_artifact_id)
-        row: schema.ArtifactRow = {
-            "artifact_id": aid,
-            "component": comp,
-            "arch": arch,
-            "kind": "image",
-            # The hashed name, not a display string.
-            "artifact_name": base,
-            # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
-            "origin": "built",
-            "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"] if base else [],
-            "context_deps": [],
-            # Tuple order (repo, git_ref, git_sha) -- what the covered-tier join reads.
-            "sources": [(repo, git_ref, git_sha)]
-            if (repo or git_ref or git_sha)
-            else [],
-            "props": {
-                k: v
-                for k, v in {
-                    # The digest GhaArtifactId put in the id12 slot.
-                    "id12": GhaArtifactId.installed_digest(installed),
-                    "base_artifact_id": base,
-                    "installed": (installed or "").strip(),
-                    "run_url": run_url,
-                    "source": "gha",
-                }.items()
-                if v
-            },
-        }
-        return row
+    def _props(values: dict) -> dict:
+        """String-valued props with the empty ones dropped."""
+        return {k: str(v) for k, v in values.items() if v not in ("", None)}
+
+    @staticmethod
+    def _index_uri(ref: str) -> str:
+        """The registry/index host a ref names, '' when it names none."""
+        head = (ref or "").split("://", 1)[-1]
+        return head.split("/", 1)[0] if "/" in head else ""
 
 
 # Function API, kept so installed consumers import one definition, not a copy.
@@ -507,3 +653,5 @@ insert_capabilities = CapabilityWriter.insert
 artifact_already_recorded = ArtifactWriter.artifact_recorded
 artifact_result_already_recorded = ArtifactWriter.result_recorded
 insert_gha_artifact_result = ArtifactWriter.insert_gha_result
+insert_artifact = ArtifactWriter.insert_artifact
+insert_artifact_result = ArtifactWriter.insert_result
