@@ -41,6 +41,7 @@ CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 # since id12 is a hash INPUT to artifact_id. A reader resolves it via props['id12'].
 DEP_ENTRY_SEP = "@"
 DEP_BASE_PREFIX = "base="
+IDENTITY_LOOKUP_CHUNK = 2000
 
 
 class SchemaError(ValueError):
@@ -137,12 +138,15 @@ class Table:
         if not cls.identity:
             raise SchemaError(f"{cls.name} has no identity column")
         ids = [str(k) for k in rows]
+        # Chunked: the ids travel as one HTTP form field, and ClickHouse rejects a field over
+        # http_max_field_value_size (128 KiB) -- a 12k-case merged junit is ~470 KiB.
         known = {
             str(r[0])
+            for i in range(0, len(ids), IDENTITY_LOOKUP_CHUNK)
             for r in client.query(
                 f"SELECT {cls.identity} FROM {cls.qualified(db)} "
                 f"WHERE {cls.identity} IN {{ids:Array(UUID)}}",
-                parameters={"ids": ids},
+                parameters={"ids": ids[i : i + IDENTITY_LOOKUP_CHUNK]},
             ).result_rows
         }
         fresh = [v for k, v in rows.items() if str(k) not in known]
