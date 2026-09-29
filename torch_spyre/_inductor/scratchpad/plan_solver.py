@@ -76,7 +76,7 @@ class LifetimeBoundBuffer:
     would let such a buffer pass as an in-place parent.
 
     ``start_time`` and ``end_time`` are convenience properties derived from
-    ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
+    ``uses`` and widened by optional counted-loop lifetime overrides.
     """
 
     name: str
@@ -88,9 +88,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
-    # Optional exclusive lifetime end for storage reused by a counted loop.
-    # Keep this separate from ``uses``: it changes address overlap, but must not
-    # manufacture a read or inflate residency/spill benefit.
+    # Optional lifetime bounds for storage reused by a counted loop. Keep these
+    # separate from ``uses``: they change address overlap, but must not
+    # manufacture reads or inflate residency/spill benefit.
+    lifetime_start_override: Optional[int] = None
     lifetime_end_override: Optional[int] = None
     # Buffers that must be placed atomically with this one. Despite the name,
     # this is one-to-many: only the group root carries the complete partner list.
@@ -119,6 +120,11 @@ class LifetimeBoundBuffer:
             f"buffer {self.name} has uses={self.uses}, which is not strictly "
             "increasing; uses carries one distinct index per accessing operation"
         )
+        if self.lifetime_start_override is not None and self.uses:
+            assert self.lifetime_start_override <= self.uses[0], (
+                f"buffer {self.name} has lifetime_start_override="
+                f"{self.lifetime_start_override} after nominal start {self.uses[0]}"
+            )
         if self.lifetime_end_override is not None and self.uses:
             assert self.lifetime_end_override >= self.uses[-1] + 1, (
                 f"buffer {self.name} has lifetime_end_override="
@@ -143,7 +149,9 @@ class LifetimeBoundBuffer:
 
     @property
     def start_time(self) -> int:
-        return self.uses[0]
+        nominal = self.uses[0]
+        override = self.lifetime_start_override
+        return min(nominal, override if override is not None else nominal)
 
     @property
     def end_time(self) -> int:

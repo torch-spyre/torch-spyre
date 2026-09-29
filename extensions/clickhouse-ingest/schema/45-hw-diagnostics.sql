@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS hw_failure_diagnostics
     `stall_max_secs` UInt32,
     -- external_run_id (this row's identity hash input) and run_url; kept here rather than
     -- requiring the run to be resolved first.
-    `props` Map(LowCardinality(String), String)
+    `props` Map(LowCardinality(String), String),
+    `audit_uuid`      UUID DEFAULT generateUUIDv7(),
+    `audit_timestamp` DateTime64(3) DEFAULT now64(3)
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ingested_at)

@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import types
 
 import sympy
+import torch
 from torch._inductor.dependencies import MemoryDep, WeakDep
+from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+from torch._inductor.virtualized import V
 
 import torch_spyre._inductor.pass_utils as pass_utils
 
@@ -65,3 +69,43 @@ def test_late_operation_registration_does_not_reuse_a_removed_slot():
     assert graph.operations[-1] is inserted
     assert graph.name_to_op["op3"] is old_ops[3]
     assert graph.name_to_op["op4"] is inserted
+
+
+def test_replace_computed_buffer_body_preserves_body_origins():
+    """A dataclass body rewrite must retain the FX provenance used by layouts."""
+
+    def inner_fn(index):
+        return index[0]
+
+    old_data = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inner_fn=inner_fn,
+        ranges=[4],
+    )
+    old_origin = object()
+    replacement_origin = object()
+    old_data.origins.add(old_origin)
+    new_data = dataclasses.replace(old_data, inner_fn=inner_fn)
+    new_data.origins.add(replacement_origin)
+    op = ComputedBuffer(
+        name="buf0",
+        layout=FixedLayout(torch.device("cpu"), torch.float32, [4], [1]),
+        data=old_data,
+    )
+    op.operation_name = "op0"
+    graph = types.SimpleNamespace(
+        name_to_buffer={"buf0": op},
+        name_to_op={"op0": op},
+    )
+    operations = [op]
+
+    with V.set_graph_handler(graph):
+        replacement = pass_utils.replace_computed_buffer_body(
+            op,
+            new_data,
+            operations,
+            pass_name="test",
+        )
+
+    assert set(replacement.data.origins) == {old_origin, replacement_origin}

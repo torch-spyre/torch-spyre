@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS capabilities
 
     component     LowCardinality(String),
     -- Which analysis: model_ops | model_support -- the axis v1 put in the table name. Named
-    -- test_type (artifact_results' 'capability' tier covers the family; these are within it).
+    -- test_type, as on artifact_results, where their verdicts carry result_kind 'capability'.
     -- Constrained by convention, not CHECK, so a new analysis can start writing unedited.
     test_type     LowCardinality(String),
 
@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS capabilities
     -- The signature distinguishing two variants of one operation (input shapes/dtypes). Hashed
     -- into capability_id, so it cannot drift from the identity it defines.
     props         Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_component CHECK component != '',
     CONSTRAINT chk_test_type CHECK test_type != '',
@@ -87,6 +90,9 @@ CREATE TABLE IF NOT EXISTS capability_runs
     fail_reason   LowCardinality(String) DEFAULT '',
 
     props         Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_status CHECK status IN ('passed','failed','not_implemented')
 )

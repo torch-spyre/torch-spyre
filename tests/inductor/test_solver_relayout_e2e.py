@@ -352,6 +352,44 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("fragments", [8, 10])
+def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
+    """Keep an eight-way LX gather; replan a ten-way gather through HBM.
+
+    Gemma's row/column producer feeding a row-only matmul operand used to
+    reach Deeptools with ten mandatory L3LU bound-register candidates. The
+    hints reproduce that geometry without forcing the solver's match table.
+    """
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    observed = _Observed(monkeypatch, force=False)
+    width = fragments * 256
+
+    def fn(x, w):
+        with spyre_hint(work_div={"M": 2, "K": fragments}):
+            hidden = -x
+        with spyre_hint(work_div={"M": 2, "N": fragments}):
+            return torch.mm(hidden, w)
+
+    torch.manual_seed(123)
+    hx = torch.randn(256, width, dtype=torch.float16) * 0.1
+    hw = torch.randn(width, width, dtype=torch.float16) * 0.1
+    for name, size in (("M", 256), ("K", width), ("N", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(hx.to("spyre"), ["M", "K"])
+    w = _pnd.name_tensor_dims(hw.to("spyre"), ["K", "N"])
+    with config.patch(_COOPT):
+        out = torch.compile(fn, fullgraph=True, dynamic=False)(x, w)
+
+    if fragments == 8:
+        observed.assert_emitted_in_lx(expected_plans=1)
+    else:
+        observed.assert_nothing_emitted()
+        assert observed.committed == []
+    torch.testing.assert_close(out.cpu(), fn(hx, hw), rtol=2e-2, atol=2e-2)
+
+
 def _prices_replicated_reads() -> bool:
     """Whether the cost model charges a replicated matmul operand per replica core
     (#4454). Without it the demoted bmm's re-read of a broadcast operand is priced

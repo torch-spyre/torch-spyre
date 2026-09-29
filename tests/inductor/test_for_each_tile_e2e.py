@@ -52,11 +52,18 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 
 import functools
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    PrescribedRegion,
+    prescribed_regions,
+)
 
 from for_each_tile_fixtures import (
     B,
@@ -83,8 +90,12 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
+    nested_online_softmax_fn,
+    nested_online_softmax_reference,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
+    nested_two_inner_loops_shared_init_fn,
+    nested_two_inner_loops_shared_init_reference,
     online_softmax_fn,
     online_softmax_reference,
     paged_gather_fn,
@@ -92,10 +103,16 @@ from for_each_tile_fixtures import (
     paged_gather_kv_fn,
     paged_gather_kv_inputs,
     paged_gather_kv_reference,
+    paged_gather_nested_fn,
+    paged_gather_nested_reference,
     paged_gather_reference,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
+    split_k_caller_init_fn,
     split_k_fn,
+    split_k_transposed_caller_init_fn,
+    split_k_transposed_caller_init_two_carries_fn,
+    split_k_transposed_caller_init_two_carries_reference,
     split_m_fn,
     triple_nested_stardep_inner_fn,
     triple_nested_stardep_inner_reference,
@@ -106,7 +123,7 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from tests.inductor.utils_inductor import cached_randn, cached_xavier, dl16_round
+from utils_inductor import cached_randn, cached_xavier, dl16_round
 
 
 def _with_dynamo_reset(test_fn):
@@ -234,6 +251,90 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    @staticmethod
+    def _exact_split_k_operands(acc0_shape):
+        """Small-integer operands whose split-K sums stay exact.
+
+        X and Y are 0/1 and acc0 is 0..3, so every partial sum is an integer
+        of at most K + 3 = 259: exact in the device's fp16 (SEN169, 10
+        significant bits) and across the H2D/D2H round trip. The reference is
+        therefore exact, and a wrong or reused accumulator shows up as a
+        mismatch rather than as rounding.
+        """
+        g = torch.Generator().manual_seed(0)
+        X = torch.randint(0, 2, (M, K), generator=g).half()
+        Y = torch.randint(0, 2, (K, N), generator=g).half()
+        acc0 = torch.randint(0, 4, acc0_shape, generator=g).half()
+        return X, Y, acc0
+
+    def _assert_exact_twice_inputs_unchanged(self, fn, inputs, refs):
+        """Two calls with the same inputs: both exact, every input unchanged.
+
+        If an accumulator wrote into a caller's init (#4838), that input
+        changes and the second call starts from the first call's result.
+        ``refs`` holds one exact reference per output. Each result is brought
+        to the host before the next call, so the second call cannot overwrite
+        the first result's memory.
+        """
+        on_device = [t.to(DEVICE_NAME) for t in inputs]
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        for _ in range(2):
+            outs = compiled(*on_device)
+            outs = outs if isinstance(outs, tuple) else (outs,)
+            self.assertEqual(len(outs), len(refs))
+            for out, ref in zip(outs, refs):
+                torch.testing.assert_close(out.cpu().float(), ref, atol=0.0, rtol=0.0)
+        for before, after in zip(inputs, on_device):
+            self.assertTrue(torch.equal(after.cpu(), before), "a caller input changed")
+
+    def test_carry_mode_split_k_caller_init(self):
+        """#4838: a caller-owned init is copied, never accumulated into."""
+        X, Y, acc0 = self._exact_split_k_operands((M, N))
+        ref = acc0.float() + X.float() @ Y.float()
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_caller_init_fn, (X, Y, acc0), (ref,)
+        )
+
+    def test_carry_mode_split_k_transposed_caller_init(self):
+        """#4838: a transposed view of a caller init is copied as its storage.
+
+        acc0 is [N, M] and the carry starts from acc0.t() ([M, N], not
+        square), so a copy that dropped the transpose, or wrote through to
+        the caller's buffer, fails the exact comparison.
+        """
+        X, Y, acc0 = self._exact_split_k_operands((N, M))
+        ref = acc0.t().float() + X.float() @ Y.float()
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_transposed_caller_init_fn, (X, Y, acc0), (ref,)
+        )
+
+    def test_carry_mode_split_k_transposed_caller_init_old_value_reader(self):
+        """#4838: the transposed caller init's old value has another reader.
+
+        ``b`` adds ``a``'s pre-trip value, so ``a`` needs an in-loop snapshot
+        on top of its pre-loop copy; both must copy the caller's storage and
+        keep the transpose. Every sum is an integer of at most 396 (``b``
+        adds four values of at most 3 + 64 * trip), so the check is exact.
+        """
+        X, Y, acc0 = self._exact_split_k_operands((N, M))
+        refs = split_k_transposed_caller_init_two_carries_reference(X, Y, acc0)
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_transposed_caller_init_two_carries_fn, (X, Y, acc0), refs
+        )
+
+    def test_nested_inner_loops_share_one_init(self):
+        """#4838: an inner loop's pre-loop copy re-runs on every outer trip.
+
+        Both inner loops start from one fill made in the outer loop's body, so
+        the first one gets a pre-loop copy. If that copy ran once instead of on
+        every outer trip, later outer trips would start from a stale sum.
+        """
+        X, Y, _ = self._exact_split_k_operands((M, N))
+        ref = nested_two_inner_loops_shared_init_reference(X, Y)
+        self._assert_exact_twice_inputs_unchanged(
+            nested_two_inner_loops_shared_init_fn, (X, Y), (ref,)
         )
 
     def test_carry_mode_online_softmax(self):
@@ -693,6 +794,341 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+    def test_nested_online_softmax(self):
+        """Map-outer/carry-inner nesting with a multi-leaf carry.
+
+        nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
+        own 3-leaf (m, denom, acc) carry over K/V tiles -- unlike
+        test_batched_map_over_online_softmax_carry (which stages full K/V
+        buffers in the outer loop and tiles Lk in the inner one), this
+        fixture re-runs the ENTIRE online-softmax recurrence, including its
+        own K/V tiling, once per outer Q-tile: the nesting wraps a full
+        inner for_each_tile call rather than sharing one carry-tiling level
+        across both loops.
+        """
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = nested_online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        compiled = torch.compile(
+            nested_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+
+class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
+    """Kind.GATHER nested inside another for_each_tile level.
+
+    paged_gather_fn/paged_gather_kv_fn (TestForEachTileE2E) exercise
+    Kind.GATHER but only as a single loop level. paged_gather_nested_fn
+    wraps an outer map over Q-row-tiles around that same gather-mode body
+    (tiled block table, invariant page pool, one page gathered per trip),
+    the shape paged attention would want with an outer query tile.
+    """
+
+    ATOL = 1e-2
+    RTOL = 1e-2
+
+    def test_gather_mode_nested_paged_pages(self):
+        _, table, _ = paged_gather_inputs()
+        pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
+        q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=1)
+        ref = paged_gather_nested_reference(
+            dl16_round(pages.float()), dl16_round(q.float())
+        )
+
+        compiled = torch.compile(
+            paged_gather_nested_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+
+class _CollectRegions(CustomPreSchedulingPasses):
+    """Pre-scheduling pipeline that records the graph's regions once it is done."""
+
+    operations: list = []
+    regions: list[PrescribedRegion] = []
+
+    def __call__(self, graph) -> None:
+        super().__call__(graph)
+        cls = type(self)
+        cls.operations = list(graph.operations)
+        cls.regions = prescribed_regions(graph.operations)
+
+
+class TestPrescribedRegionsE2E(_DynamoResetTestCase):
+    """``prescribed_regions`` on real spliced graphs.
+
+    A region is every op between the first and last op one outermost
+    ``for_each_tile`` loop stamped.  These tests compile the loop and read the
+    regions off the graph at the end of the pre-scheduling pipeline.
+    """
+
+    def _compile(self, fn, *args):
+        _CollectRegions.operations = []
+        _CollectRegions.regions = []
+        with patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions):
+            torch.compile(fn, backend="inductor", fullgraph=True)(*args)
+        return _CollectRegions.operations, _CollectRegions.regions
+
+    def _assert_region_is_whole(self, operations, region) -> None:
+        """The region is exactly its loop: every op the loop stamped is inside
+        it, and every op inside it is either stamped by that loop or listed as
+        unstamped."""
+        members = operations[region.start : region.stop]
+        self.assertEqual({op.get_operation_name() for op in members}, set(region.names))
+        for op in members:
+            name = op.get_operation_name()
+            if name in region.unstamped:
+                continue
+            self.assertEqual(
+                op.loop_info.loop_group_id[0],
+                region.loop_group_id,
+                f"{name} is stamped by another loop than its region's",
+            )
+        outside = operations[: region.start] + operations[region.stop :]
+        strays = [
+            op.get_operation_name()
+            for op in outside
+            if getattr(op, "loop_info", None) is not None
+            and op.loop_info.loop_group_id[0] == region.loop_group_id
+        ]
+        self.assertFalse(strays, f"{strays} belong to the loop but lie outside it")
+
+    def test_single_loop_leaves_later_ops_outside(self):
+        """An op after the loop is not in the loop's region."""
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+
+        def fn(a, b):
+            return add_tiled_fn(a, b, 128) * 2.0
+
+        operations, regions = self._compile(fn, A.to(DEVICE_NAME), B.to(DEVICE_NAME))
+
+        self.assertEqual(len(regions), 1, regions)
+        (region,) = regions
+        self._assert_region_is_whole(operations, region)
+        after = operations[region.stop :]
+        self.assertTrue(after, "the multiply after the loop disappeared")
+        self.assertFalse(
+            [
+                op.get_operation_name()
+                for op in after
+                if op.get_operation_name() in region.names
+            ]
+        )
+
+    def test_nested_loops_form_one_region(self):
+        """An inner loop is part of its outer loop's region, not a region of its own."""
+        X = cached_xavier((256, 256))
+        Y = cached_xavier((256, 64), differentiation=1)
+
+        operations, regions = self._compile(
+            nested_split_m_then_k_fn, X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        )
+
+        self.assertEqual(len(regions), 1, regions)
+        (region,) = regions
+        self._assert_region_is_whole(operations, region)
+        depths = {
+            len(op.loop_info.loop_count)
+            for op in operations[region.start : region.stop]
+            if op.get_operation_name() not in region.unstamped
+        }
+        self.assertIn(2, depths, "no op in the region carries both loop levels")
+
+    def test_sibling_loops_form_separate_regions(self):
+        """Two loops one after the other give two regions, in order."""
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+
+        def fn(a, b):
+            return add_tiled_fn(add_tiled_fn(a, b, 128), b, 128)
+
+        operations, regions = self._compile(fn, A.to(DEVICE_NAME), B.to(DEVICE_NAME))
+
+        self.assertEqual(len(regions), 2, regions)
+        first, second = regions
+        self.assertLessEqual(first.stop, second.start)
+        self.assertNotEqual(first.loop_group_id, second.loop_group_id)
+        for region in regions:
+            self._assert_region_is_whole(operations, region)
+
+
+# --- trip-range vector gather (loop-trip ranges reach coordinate queries) -----
+
+TRIP_POOL, TRIP_E, TRIP_SIZE, TRIP_HS, TRIP_LQ = 64, 4, 32, 64, 32
+
+
+def trip_range_build(trips, e):
+    pages = (
+        torch.pow(torch.tensor(2.0), (torch.arange(TRIP_POOL) % 8).float()) / 64.0
+    ).to(torch.float16)
+    pages = (
+        pages.reshape(TRIP_POOL, 1, 1)
+        .expand(TRIP_POOL, TRIP_SIZE, TRIP_HS)
+        .contiguous()
+    )
+    q = torch.full((TRIP_LQ, TRIP_HS), 1.0 / 64.0, dtype=torch.float16)
+    table = torch.zeros(trips, 32, dtype=torch.int32)
+    for t in range(trips):
+        for j in range(e):
+            table[t, j] = (t * e + j) % TRIP_POOL
+    return pages, table, q
+
+
+def trip_range_ref(pages, q, ids):
+    pf, qf = pages.float(), q.float()
+    acc = torch.zeros(TRIP_LQ, TRIP_HS)
+    for p in ids:
+        page = pf[int(p)]
+        acc = acc + (qf @ page.T) @ page
+    return acc
+
+
+def trip_range_fn(e):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pages, table, q):
+        def body(acc, tiles):
+            table_row, pages_all, q_whole = tiles
+            idx = table_row[0, 0:e]
+            pages_v = pages_all.index_select(0, idx)
+            scores = torch.matmul(q_whole.unsqueeze(0), pages_v.transpose(-2, -1))
+            out = torch.matmul(scores, pages_v)
+            return acc + out.sum(0), None
+
+        acc0 = torch.zeros(TRIP_LQ, TRIP_HS, dtype=q.dtype, device=q.device)
+        final, _ = for_each_tile(
+            body, (table, pages, q), dims=(0, None, None), tile_size=1, init=acc0
+        )
+        return final
+
+    return fn
+
+
+class TestForEachTileTripRangesE2E(_DynamoResetTestCase):
+    """A VECTOR page gather per trip (vs paged_gather_fn's point read).
+
+    On the base this fails at trips >= 2 with ``indirect symbol u0 not found in
+    indirect_sizes``; with the fix it passes and the output is neither the first
+    group repeated nor the advance applied twice.
+    """
+
+    ATOL = 1e-3
+    RTOL = 1e-3
+
+    def test_multi_trip_vector_page_gather(self):
+        e = TRIP_E
+        for trips in (1, 2, 4):
+            with self.subTest(trips=trips):
+                # Reset per case: without it Dynamo generalizes the fixed trip
+                # counts across subtests and the for_each_tile splice is skipped.
+                torch._dynamo.reset()
+                pages, table, q = trip_range_build(trips, e)
+                ids = [int(table[t, j]) for t in range(trips) for j in range(e)]
+                want = trip_range_ref(pages, q, ids)
+                compiled = torch.compile(
+                    trip_range_fn(e), backend="inductor", fullgraph=True
+                )
+                out = (
+                    compiled(
+                        pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME)
+                    )
+                    .cpu()
+                    .float()
+                )
+                assert torch.isfinite(out).all()
+                torch.testing.assert_close(out, want, atol=self.ATOL, rtol=self.RTOL)
+                if trips >= 2:
+                    rep_first = trip_range_ref(
+                        pages,
+                        q,
+                        [int(table[0, j]) for _ in range(trips) for j in range(e)],
+                    )
+                    adv_twice = trip_range_ref(
+                        pages,
+                        q,
+                        [
+                            int(table[(2 * t) % trips, j])
+                            for t in range(trips)
+                            for j in range(e)
+                        ],
+                    )
+                    assert (out - rep_first).abs().max().item() > 1e-2
+                    assert (out - adv_twice).abs().max().item() > 1e-2
+
+
+# --- sub-stick for_each_tile indirect-index advance (issue #4835) -----------
+
+
+def substick_gather_fn(pool, ids, init):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pool, ids, init):
+        def body(carry, tiles):
+            tile_ids, whole_pool = tiles
+            return (carry[0] + whole_pool[tile_ids],), None
+
+        (acc,), _ = for_each_tile(
+            body, (ids, pool), dims=(0, None), tile_size=SUBSTICK_TILE, init=(init,)
+        )
+        return acc
+
+    return fn(pool, ids, init)
+
+
+SUBSTICK_POOL, SUBSTICK_WIDTH, SUBSTICK_TRIPS, SUBSTICK_TILE = 256, 128, 4, 2
+
+
+class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
+    """A ``for_each_tile`` whose per-trip indirect-index advance is narrower
+    than one physical stick must be refused at compile time, not silently
+    compiled to a wrong answer.
+
+    ``ids`` is an int32 tile-advancing (``Kind.SLICE``) operand tiled with
+    ``tile_size=SUBSTICK_TILE=2``; each trip therefore advances the index
+    tensor's device stick coordinate by 2 int32 elements, well inside a
+    single 32-element stick. Before the ``UnalignedStickSplit`` guard added
+    by PR #4829, ``SpyreKernel`` computed this sub-stick advance as if it
+    were whole-stick, repeating the first tile's gather on every subsequent
+    trip. #4829's own regression coverage of that guard
+    (``TestIndirectIndexStepGuard`` in test_for_each_tile_lowering.py) only
+    exercises it via a synthetic CPU ``sympy`` expression; no test compiles
+    an actual sub-stick advance on device. This test closes that gap: it
+    asserts that compiling ``substick_gather_fn`` raises the documented
+    ``UnalignedStickSplit`` failure (surfaced through the wrapping
+    ``InductorError``) instead of returning a plausible-looking wrong
+    answer. See issue #4835 and the parent issue #4828.
+    """
+
+    def test_substick_indirect_advance_is_refused(self):
+        import pytest
+        from torch._inductor.exc import InductorError
+
+        ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
+        pool = torch.randn(SUBSTICK_POOL, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+        init = torch.zeros(SUBSTICK_TILE, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+
+        compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
+        with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
+            compiled(pool, ids, init)
 
 
 if __name__ == "__main__":

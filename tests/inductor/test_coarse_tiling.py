@@ -2234,6 +2234,21 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
+    def test_refuses_to_overwrite_existing_loop_info(self):
+        """An op that already carries loop_info -- a for_each_tile loop, say --
+        is not re-tiled: coarse_tile raises rather than replace the record."""
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)):
+            tiled_op, _, operations = _make_full_buffer_read_fixture()
+            before = tiled_op.loop_info
+            self.assertIsNotNone(before)
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            with self.assertRaises(Unsupported) as ctx:
+                coarse_tile_post_stickify(_graph(operations), groups)
+            self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
+            self.assertIs(tiled_op.loop_info, before)
+
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
@@ -2247,6 +2262,9 @@ class TestCoarseTile(unittest.TestCase):
             tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
             self.assertEqual(len(full_deps), 1)
             full_buf_name = full_deps[0].name
+            # The fixture pre-stamps loop_info for the read-copy tests; here
+            # coarse_tile does the stamping, and refuses to overwrite a stamp.
+            tiled_op.loop_info = None
 
             groups = [([tiled_op], [(0, Integer(8))])]
             coarse_tile_post_stickify(_graph(operations), groups)
@@ -2288,8 +2306,10 @@ class TestCoarseTile(unittest.TestCase):
         from collections import namedtuple
 
         from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
             counted_loop_lifetime_end_overrides,
         )
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
 
         _dep = namedtuple("_dep", ["name"])
 
@@ -2308,31 +2328,126 @@ class TestCoarseTile(unittest.TestCase):
         _stub_read_writes(body_writer, reads=["arg1"], writes=["internal"])
         reader_x = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_x")
         _stub_read_writes(reader_x, reads=["crossing"], writes=["reader_x_out"])
+        carry_update = _make_hinted_op(_make_pointwise([Integer(16)]), "carry_update")
+        _stub_read_writes(carry_update, reads=["carry"], writes=["carry_update"])
+        carry_update._loop_carry_record = LoopCarryRecord("carry", "carry_update")
         reader_i = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_i")
         _stub_read_writes(reader_i, reads=["internal"], writes=["reader_i_out"])
 
-        operations = [crossing, body_writer, reader_x, reader_i]
+        operations = [crossing, body_writer, reader_x, carry_update, reader_i]
         coarse_tile_post_stickify(
             _graph(operations),
-            [([body_writer, reader_x, reader_i], [(0, Integer(4))])],
+            [([body_writer, reader_x, carry_update, reader_i], [(0, Integer(4))])],
         )
 
-        # The loop body stays ops 1..3: nothing was inserted, the op outside
+        # The loop body stays ops 1..4: nothing was inserted, the op outside
         # the group was not stamped, and the group ops carry the loop id.
-        self.assertEqual(len(operations), 4)
+        self.assertEqual(len(operations), 5)
         self.assertFalse(hasattr(crossing, "loop_info"))
         self.assertEqual(reader_i.loop_info.loop_group_id, (0,))
 
         overrides = counted_loop_lifetime_end_overrides(
-            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
         )
 
         # Values born before the loop and read inside it -- the computed
         # buffer ``crossing`` and the graph input ``arg1`` -- live through
-        # the loop's textual end (exclusive index 4).  ``internal`` is born
+        # the loop's textual end (exclusive index 5).  ``internal`` is born
         # and consumed inside the loop: no extension.  ``arg0`` is only read
-        # outside the loop: no extension.
-        self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
+        # outside the loop: no extension. Only the compiler-tagged carry starts
+        # at the loop boundary; ordinary crossing values keep their first read.
+        self.assertEqual(overrides, {"crossing": 5, "arg1": 5, "carry": 5})
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
+        )
+        self.assertEqual(starts, {"carry": 1})
+        self.assertEqual(ends, {"crossing": 5, "arg1": 5, "carry": 5})
+
+    def test_counted_loop_protects_start_of_value_read_after_the_loop(self):
+        """A crossing value read after the loop still needs its start widened.
+
+        Its nominal end already covers the loop, so the end override is not
+        required -- but its first in-loop read can fall after the loop's start,
+        leaving a loop-local born earlier disjoint from it under plain liveness.
+        Sharing one LX address then lets the next iteration's write of that local
+        clobber the value before the next iteration reads it. This is why the
+        start bound is decided independently of the end bound, and for every
+        crossing value rather than only a tagged carry.
+        """
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        class _Dep:
+            def __init__(self, name):
+                self.name = name
+
+            def __hash__(self):
+                return hash(self.name)
+
+            def __eq__(self, other):
+                return self.name == other.name
+
+        def _op(name, reads, writes, loop=None):
+            rw = SimpleNamespace(
+                reads={_Dep(n) for n in reads}, writes={_Dep(n) for n in writes}
+            )
+            op = SimpleNamespace(name=name)
+            op.get_read_writes = lambda rw=rw: rw
+            op.get_operation_name = lambda n=name: n
+            op.get_name = lambda n=name: n
+            if loop is not None:
+                op.loop_info = SimpleNamespace(loop_group_id=loop)
+            return op
+
+        # Loop is indices 1..4. ``local`` lives [1, 3); ``v`` is first read at 3,
+        # inside the loop, and again at 5, after it -- so its nominal end already
+        # clears the loop end and only the start needs widening.
+        operations = [
+            _op("pre", ["arg0"], ["pre"]),
+            _op("local_w", ["arg1"], ["local"], loop=(0,)),
+            _op("local_r", ["local"], ["r1"], loop=(0,)),
+            _op("v_r", ["v"], ["r2"], loop=(0,)),
+            _op("filler", ["sink"], ["r3"], loop=(0,)),
+            _op("post", ["v"], ["r4"]),
+        ]
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "v", "sink"],
+            )
+        )
+        self.assertEqual(starts.get("v"), 1)
+        self.assertNotIn("v", ends)
+
+        def interval(name, uses):
+            buffer = LifetimeBoundBuffer(
+                name=name,
+                size=64,
+                uses=uses,
+                first_use_is_read=True,
+                in_place_parents=[],
+                lifetime_start_override=starts.get(name),
+                lifetime_end_override=ends.get(name),
+            )
+            return buffer.start_time, buffer.end_time
+
+        v_start, v_end = interval("v", [3, 5])
+        local_start, local_end = interval("local", [1, 2])
+        self.assertEqual((v_start, v_end), (1, 6))
+        self.assertTrue(
+            v_start < local_end and local_start < v_end,
+            "the crossing value must overlap the loop-local it could be aliased with",
+        )
 
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
@@ -6075,6 +6190,70 @@ class TestReadCopyElisionProof(unittest.TestCase):
         with self.assertRaises(Exception):
             record.copy_name = "other"
 
+    def test_graph_output_copy_is_not_elided(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer],
+            get_output_names=lambda: ["copy0"],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer])
+
+    def test_non_memory_dependency_prevents_copy_elision(self):
+        from torch._inductor.dependencies import StarDep
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer.get_read_writes.return_value.reads = []
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        star_reader = MagicMock()
+        star_reader.get_read_writes.return_value.reads = [StarDep("copy0")]
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer, star_reader],
+            get_output_names=lambda: [],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer, star_reader])
+
     def test_local_bounds_are_measured_in_source_elements(self):
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _affine_bounds
@@ -9571,6 +9750,90 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             self.assertFalse(
                 hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
             )
+
+
+class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
+    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+
+    A region spans every op between the first and last op one outermost loop
+    stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
+    stamped and any op sitting between them unstamped.  The pass must raise
+    before it touches the graph.
+    """
+
+    _SPEC = TileSpec((TileAxis(0, 4),))
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _bare(self, name):
+        op = _make_op(_make_pointwise([Integer(256)]), name)
+        op._test_out_coords = [Symbol("c0")]
+        op.dim_hints = []
+        return op
+
+    def _stamped(self, name):
+        """An op stamped the way ``_stamp_direct_loop_info`` stamps a loop body
+        op: ``loop_info`` plus a DimHint carrying the trip count."""
+        op = self._bare(name)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
+        )
+        op.dim_hints = [
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=Symbol("u0"),
+                is_reduction=False,
+                loop_var_range=2,
+            )
+        ]
+        return op
+
+    def _state(self, ops):
+        return [
+            (list(op.dim_hints), getattr(op, "loop_info", None), list(op.data.ranges))
+            for op in ops
+        ]
+
+    def test_refuses_op_the_loop_stamped(self):
+        ops = [self._stamped("op0"), self._stamped("op1")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_refuses_unstamped_op_inside_the_loop(self):
+        """op1 has no ``loop_info``; only its position puts it in the loop."""
+        ops = [self._stamped("op0"), self._bare("op1"), self._stamped("op2")]
+        before = self._state(ops)
+        with self.assertRaisesRegex(
+            Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
+        ):
+            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertEqual(self._state(ops), before)
+
+    def test_tiles_op_after_the_loop(self):
+        ops = [self._stamped("op0"), self._bare("op1")]
+        loop_before = self._state(ops[:1])
+        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
+        self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
+        self.assertEqual(ops[1].data.ranges[0], Integer(64))
+        self.assertEqual(self._state(ops[:1]), loop_before)
 
 
 if __name__ == "__main__":

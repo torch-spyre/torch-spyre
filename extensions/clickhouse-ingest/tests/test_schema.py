@@ -23,6 +23,7 @@ from spyre_clickhouse_ingest.schema import (
     ARTIFACTS,
     BENCHMARK_RUNS,
     BENCHMARKS,
+    IDENTITY_LOOKUP_CHUNK,
     STATUS_VALUES,
     TABLES,
     TEST_CASE_RUNS,
@@ -40,12 +41,14 @@ class FakeClient:
         self.known = list(known)
         self.inserts = []
         self.queries = []
+        self.params = []
 
     def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names, database))
 
     def query(self, sql, parameters=None):
         self.queries.append(sql)
+        self.params.append(parameters)
         asked = set(parameters["ids"])
 
         class R:
@@ -278,6 +281,27 @@ def test_identity_dedup_writes_nothing_when_all_are_known():
         == 0
     )
     assert c.inserts == []
+
+
+def test_identity_lookup_is_chunked_under_the_http_field_limit():
+    ids = [f"id-{i}" for i in range(2 * IDENTITY_LOOKUP_CHUNK + 1)]
+    c = FakeClient(known=[ids[0], ids[-1]])
+    rows = {
+        i: {
+            "test_case_id": i,
+            "component": "c",
+            "classname": "k",
+            "name": i,
+            "tags": [],
+        }
+        for i in ids
+    }
+    assert insert_identities(c, TEST_CASES, rows) == len(ids) - 2
+    assert [len(p["ids"]) for p in c.params] == [
+        IDENTITY_LOOKUP_CHUNK,
+        IDENTITY_LOOKUP_CHUNK,
+        1,
+    ]
 
 
 def test_identity_dedup_on_a_fact_table_is_a_programming_error():
