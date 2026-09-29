@@ -1047,19 +1047,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 def _pad_num_sticks(
     layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
 ) -> FixedTiledLayout:
-    """Grow ``layout`` to ``new_num_sticks`` sticks of capacity along its stick dim.
+    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks.
 
-    A num-sticks dim that already spans several sticks is sized up in place: the
-    stick variable's count lands on it, so its step stays live.
-
-    A single stick has no count dim to grow.  Its num-sticks dim steps the same
-    host distance as the dim outside it -- a row shorter than a stick puts the next
-    row less than a stick away -- and several outer dims may equally have
-    coordinate 0.  The capacity therefore comes from a prepended outermost gap dim
-    with ``stride_map`` -1, the device ``_pad_elided_dim`` uses: it names no host
-    step, so the runtime's unique-step rule never sees it, and being outermost it
-    is unambiguous to codegen, which binds the stick variable's count to it before
-    alignment (``_restore_stick_pair_dim`` in spyre_kernel).
+    A dim holding several sticks is sized up in place.  A single stick has no dim
+    of its own to grow, as it may share a host step with the dim outside it, so an
+    outermost gap dim with ``stride_map`` -1 is prepended instead, as in
+    ``_pad_elided_dim``.  Codegen binds the stick count to that gap dim
+    (``_restore_stick_pair_dim`` in spyre_kernel).
     """
     stl = layout.device_layout
     if stl.device_size[num_sticks_dim] != 1:
@@ -1086,21 +1080,15 @@ def _pad_downcast_input(
     in_layout: FixedTiledLayout,
     graph: GraphLowering,
 ) -> None:
-    """Grow a downcast's input to the capacity its output spans.
+    """Grow a downcast's input to cover every input stick its output reads.
 
-    A downcast gathers several input sticks into one output stick: a pair of
-    32-slot FP32 sticks into one 64-element FP16 stick, a pair of FP16 sticks into
-    one 128-element FP8 stick.  The output is sized in whole sticks, so an input
-    whose live elements end inside a group would leave the last output stick
-    reading past the input's allocation: 96 FP32 elements occupy 3 FP32 sticks but
-    2 FP16 sticks, whose 128 slots need 4 FP32 sticks behind them, and 192 FP16
-    elements likewise need 4 FP16 sticks behind their 2 FP8 sticks.
+    A downcast packs several input sticks into one output stick: two FP32 sticks
+    per FP16 stick, two FP16 sticks per FP8 stick.  The output is sized in whole
+    sticks, so an input ending inside a group is read past its allocation: 96 FP32
+    elements occupy 3 sticks, but their 2 FP16 sticks read 4.
 
-    The producer's output is padded in place; a graph input has no producer, so
-    it is cloned and the clone padded (``_clone_input_for_padding``).  Only the
-    device layout changes, and the host size stays put: the input's num-sticks
-    dim, found from its coordinates by ``stick_dims``, grows, or a gap dim is
-    prepended when it holds one stick (``_pad_num_sticks``).
+    A producer's output is padded in place; a graph input is cloned first
+    (``_clone_input_for_padding``).
     """
     in_stl = in_layout.device_layout
     out_stl = out_layout.device_layout
@@ -1152,29 +1140,16 @@ def _pad_upcast_output(
 ) -> None:
     """Grow an upcast output to cover whole sticks of the input dtype.
 
-    An upcast spreads one input stick across several output sticks: one 64-element
-    FP16 stick staggers across a *pair* of 32-slot FP32 sticks, and one
-    128-element FP8 stick converts into two FP16 sticks.  The hardware writes
-    the whole group, so the buffer spans all of it as soon as its stick-dim
-    extent passes the first output stick of a group.  That is true of the conversion's own
-    output and, for the FP32 stagger, equally of any pointwise op downstream
-    that keeps the arrangement: the op is ordinary by name and dtype, but its
-    elements are still split across the pair, so it needs the same capacity.
-    The FP8 conversion's FP16 output is sequential, so its consumers read only
-    the sticks their live elements occupy and need nothing.
-
-    ``rescale_stl_for_dtype`` and the dense conversion layout size an output by
-    the sticks its live elements occupy, so the room for the rest of the group
-    is added here.
-
-    Only the device layout changes, and the host size stays put: the num-sticks
-    dim, found from the op's write coordinates by ``stick_dims``, grows, or a gap
-    dim is prepended when it holds one stick (``_pad_num_sticks``).
+    An upcast writes one input stick across several output sticks: an FP16 stick
+    staggers across a pair of FP32 sticks, and an FP8 stick converts into two FP16
+    sticks.  The hardware writes the whole group, but layout propagation sizes the
+    output by the sticks its live elements occupy.  An op downstream that keeps the
+    ``DL16_TO_FP32`` arrangement writes whole pairs the same way.
 
     Args:
         op: The buffer to grow.
         layout: ``op``'s layout.
-        source_eps: Elements per stick of the dtype its value was upcast from.
+        source_eps: Elements per stick of the dtype upcast from.
     """
     stl = layout.device_layout
 
@@ -1208,35 +1183,21 @@ def _pad_upcast_output(
 def insert_staggered_ea_padding(graph: GraphLowering) -> None:
     """Pad the side of a typecast with fewer elements per stick, and what it feeds.
 
-    A conversion that changes the elements per stick maps one stick of the dtype
-    with more onto several sticks of the dtype with fewer: one FP16 stick's
-    elements stagger across a pair of FP32 sticks, and one FP8 stick holds the
-    elements of two FP16 sticks.  The hardware converts whole sticks, so a
-    conversion either way reaches every stick of the group
-    even when the live elements fill only part of it.  Layout propagation sizes an
-    output by the sticks those live elements occupy, so the extra capacity is
-    added here, on the one buffer that needs it, rather than propagated into
-    every downstream consumer.
+    A typecast maps one stick of the dtype with more elements per stick onto
+    several sticks of the other: an FP16 stick staggers across a pair of FP32
+    sticks, and an FP8 stick holds two FP16 sticks.  The hardware converts whole
+    sticks, but layout propagation sizes a buffer by the sticks its live elements
+    occupy, so the rest of the group is added here.
 
-    Two kinds of op need it:
+    - An op with a ``DL16_TO_FP32`` output, the FP16 -> FP32 upcast or an op
+      downstream that keeps the arrangement, pads its output.
+    - Any other typecast, found by comparing the elements per stick of its input
+      and output, pads the side with fewer: a downcast its input, an upcast its
+      output.  Converting a staggered input back yields a ``STANDARD`` output, so
+      the arrangement alone would miss it.
 
-    - Any op with a ``DL16_TO_FP32`` output, which keeps its elements split
-      across FP32 stick pairs: the FP16 -> FP32 upcast that stamps the
-      arrangement, and every op downstream that keeps it.  It pads its output
-      (``_pad_upcast_output``); for a downstream op the arrangement is the only
-      signal its name and dtypes leave.  A downcast output needs nothing
-      downstream, since it fills whole sticks.
-    - Any other typecast, on its side with fewer elements per stick: a downcast
-      pads its input (``_pad_downcast_input``), an upcast its output
-      (``_pad_upcast_output``).  Both are found by comparing the elements per
-      stick of the input and the output, not by arrangement: converting a
-      staggered input back, as ``DL16_TO_FP32`` to FP16 or ``FP32_TO_DL16`` to
-      FP32, yields a ``STANDARD`` output, yet codegen still converts whole sticks
-      (``conversion_stick_grid`` in op_spec).
-
-    Padding touches only ``device_size``, never the host size or ``stride_map``, so
-    later passes see the tensor unchanged and codegen's backGap path covers the
-    resulting gap.
+    Padding touches only ``device_size``, never the host size or ``stride_map``,
+    and codegen's backGap path covers the resulting gap.
     """
     fp16_eps = DataFormats.SEN169_FP16.elems_per_stick()
     for op in list(graph.operations):
@@ -1267,7 +1228,9 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
             continue
         in_eps = in_layout.device_layout.device_size[-1]
         out_eps = out_stl.device_size[-1]
+
         if in_eps < out_eps:
+            # Downcasts, from any arrangement: FP32 -> FP16, FP16 -> FP8.
             _pad_downcast_input(op, out_layout, in_dep, in_buf, in_layout, graph)
         elif in_eps > out_eps:
             # Upcasts to STANDARD, missed above: FP8 -> FP16, FP32_TO_DL16 -> FP32.
