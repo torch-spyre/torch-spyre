@@ -78,7 +78,7 @@ test_suite_config:
       tests:
         - names:
             - TestSpyreModelOps::test_model_ops_db
-          mode: skip
+          mode: xfail
           tags:
             - model__Meta-Llama-3.1-8B-Instruct
           edits:
