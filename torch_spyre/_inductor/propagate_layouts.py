@@ -521,10 +521,10 @@ def _conversion_layouts(
 ) -> list[SpyreTensorLayout]:
     """Output STLs of a dtype conversion that changes the stick depth.
 
-    The input stick must start on a stick boundary. For an fp16<->fp32
-    conversion (a staggered EA on either side) the output keeps that stick, on
-    the host dim walking the same variable, so each input stick maps onto
-    output sticks without a restickify:
+    The input stick must start on a stick boundary. The output keeps that
+    stick, on the host dim walking the same variable, so each input stick maps
+    onto output sticks without a restickify. This holds for every such
+    conversion alike: fp16<->fp32 (a staggered EA on either side) and fp8->fp16.
 
     - Reading the input exactly as it writes the output, the conversion
       inherits the input's device layout, rescaled for the new stick depth. That
@@ -539,10 +539,9 @@ def _conversion_layouts(
       would misaddress the output. It offers no restickify alternatives, so the
       output keeps the input's stick.
 
-    Any other conversion (e.g. fp8->fp16 after qfp8ch) rebuilds a dense layout
-    from the output host size with the stick on the last dim.  It holds only the
-    sticks the live elements reach; the whole sticks of the coarser grid that
-    the conversion writes are ``insert_staggered_ea_padding``'s to add.
+    Either layout holds only the sticks the live elements reach; the whole
+    sticks of the coarser grid that the conversion writes are
+    ``insert_staggered_ea_padding``'s to add.
     """
     try:
         in_stick_expr = device_coordinates(stl, dep, None)[-1]
@@ -557,13 +556,6 @@ def _conversion_layouts(
     out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-
-    if out_ea not in STAGGERED_EAS and input_ea not in STAGGERED_EAS:
-        return [
-            SpyreTensorLayout(
-                c_size, c_stride, output.dtype, list(range(len(c_size))), out_ea
-            )
-        ]
 
     if not _convert_reads_whole_input(in_layout, output, dep, output_dep):
         # TODO: offer the restickify candidates a whole read gets, so a consumer
