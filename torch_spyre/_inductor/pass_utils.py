@@ -197,7 +197,7 @@ def stick_dims(
     and then the coordinates cannot identify ``sd_outer_dim``: every size-1 host
     dim has a zero coordinate too. The outermost zero-coordinate dim is taken
     instead, which is where ``compute_restickify_target_layout`` places the count
-    of such a stick and where ``_grow_num_sticks`` prepends one.
+    of such a stick and where ``_pad_num_sticks`` prepends one.
     """
     if not device_coords:
         return None, None

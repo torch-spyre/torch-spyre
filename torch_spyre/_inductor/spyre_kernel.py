@@ -1880,7 +1880,7 @@ def _restore_stick_pair_dim(op_spec, grid_eps: int) -> None:
     e.g. fp32 against fp16 or fp16 against fp8, spans a stick pair per coarse
     stick. When its count dim held one stick, padding prepends an outermost gap
     dim of ``grid_eps // elems_per_stick`` sticks with coordinate 0
-    (``_grow_num_sticks``). Left alone, align_tensors splits the lane into
+    (``_pad_num_sticks``). Left alone, align_tensors splits the lane into
     ``floor(s/eps)`` and ``Mod(s, eps)`` on a new size-1 outer axis, and the gap
     dim becomes a separate zero-coordinate dim with a back gap, so the SDSC
     counts the pair's second stick twice. Writing the split onto the gap dim
