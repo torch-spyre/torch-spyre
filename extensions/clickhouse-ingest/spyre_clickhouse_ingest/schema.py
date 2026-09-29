@@ -24,13 +24,19 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
-)
-# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
-# TEST_TYPE_VALUES, not a subset of it.
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "image", "capability"})
+# Which capability analysis produced a capability_runs row; also the test_type of a
+# result_kind='capability' verdict.
 CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+# spyre-test-framework's stages, each its own leg.
+SUITE_STAGE_VALUES = frozenset(
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-dynamic"}
+)
+TEST_TYPE_VALUES = (
+    frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+    | SUITE_STAGE_VALUES
+    | CAPABILITY_TYPE_VALUES
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
 # capability_runs.status: not_implemented is unsupported, not a skipped test.
 CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
