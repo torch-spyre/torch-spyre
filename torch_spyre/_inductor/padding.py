@@ -1052,8 +1052,8 @@ def _pad_num_sticks(
     A dim holding several sticks is sized up in place.  A single stick has no dim
     of its own to grow, as it may share a host step with the dim outside it, so an
     outermost gap dim with ``stride_map`` -1 is prepended instead, as in
-    ``_pad_elided_dim``.  Codegen binds the stick count to that gap dim
-    (``_restore_stick_pair_dim`` in spyre_kernel).
+    ``_pad_elided_dim``.  Codegen binds the stick index to that gap dim
+    (``_adjust_for_staggered_ea`` in spyre_kernel).
     """
     stl = layout.device_layout
     if stl.device_size[num_sticks_dim] != 1:
@@ -1196,8 +1196,9 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
       output.  Converting a staggered input back yields a ``STANDARD`` output, so
       the arrangement alone would miss it.
 
-    Padding touches only ``device_size``, never the host size or ``stride_map``,
-    and codegen's backGap path covers the resulting gap.
+    Padding never touches the host size.  Growing a dim in place changes only
+    ``device_size``, and codegen's backGap path covers the gap; a prepended gap dim
+    instead has ``stride_map`` -1, and codegen binds the stick index to it.
     """
     fp16_eps = DataFormats.SEN169_FP16.elems_per_stick()
     for op in list(graph.operations):

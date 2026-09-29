@@ -86,7 +86,6 @@ from .op_spec import (
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
-    conversion_stick_grid,
 )
 from .op_spec_validation import validate_op_specs
 from torch_spyre._inductor.provenance import build_debug_handle
@@ -1851,55 +1850,86 @@ def _check_relayout_boundary(
         )
 
 
-def _round_stick_range_to_grid(op_spec, grid_eps: int) -> None:
-    """Round each stick var's range up to whole sticks of a conversion's grid.
+def _has_staggered_ea(op_spec: OpSpec) -> bool:
+    """Whether this op reads or writes a staggered arrangement, as padding decides.
 
-    A conversion between two stick grids converts whole sticks of the coarser
-    one (``conversion_stick_grid``), and ``insert_staggered_ea_padding`` sizes
-    every operand to hold them, so the op iterates the padded extent, not the
-    live one: 192 FP16 elements convert as 256 on the FP8 grid.  Rounding before
-    align_tensors keeps the range whole in every operand's sticks, so the stick
-    count align re-intersects the committed split with is a multiple of the one
-    work division planned it on, whichever operand it counts.
+    Mirrors ``insert_staggered_ea_padding``: a typecast, one input and one output
+    differing in elements per stick, or an op writing a DL16_TO_FP32 value.  A
+    reduction is never a typecast: it keeps its input dtype, and a separate
+    pointwise op converts the result.
     """
-    for arg in op_spec.args:
-        lane = arg.device_coordinates[-1]
-        if len(lane.free_symbols) != 1:
-            continue
-        (sym,) = lane.free_symbols
-        if sym not in op_spec.iteration_space:
-            continue
-        extent, split = op_spec.iteration_space[sym]
-        op_spec.iteration_space[sym] = (CeilDiv(extent, grid_eps) * grid_eps, split)
+    if not op_spec.args:
+        return False
+    in_arg, out_arg = op_spec.args[0], op_spec.args[-1]
+    in_eps = in_arg.device_size[-1]
+    out_eps = out_arg.device_size[-1]
+    is_typecast = (
+        not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps != out_eps
+    )
+    return is_typecast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
 
 
-def _restore_stick_pair_dim(op_spec, grid_eps: int) -> None:
-    """Bind a sub-stick lane's stick index to its gap dim before align_tensors.
+def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
+    """Make an op with a staggered arrangement iterate whole sticks.
 
-    On a conversion's coarse grid (``grid_eps`` lanes per stick) a finer operand,
-    e.g. fp32 against fp16 or fp16 against fp8, spans a stick pair per coarse
-    stick. When its count dim held one stick, padding prepends an outermost gap
-    dim of ``grid_eps // elems_per_stick`` sticks with coordinate 0
-    (``_pad_num_sticks``). Left alone, align_tensors splits the lane into
-    ``floor(s/eps)`` and ``Mod(s, eps)`` on a new size-1 outer axis, and the gap
-    dim becomes a separate zero-coordinate dim with a back gap, so the SDSC
-    counts the pair's second stick twice. Writing the split onto the gap dim
-    here gives align the same structure as a multi-stick count dim.
+    ``insert_staggered_ea_padding`` pads such an op's buffers to whole sticks, but
+    the op's iteration space still spans only the live elements.  This rounds the
+    range of each stick var up to match, and binds the stick index of an operand
+    padded through a gap dim to that dim.
+
+    Runs before ``align_tensors``, which re-intersects the split work division
+    planned with each stick var's stick count on the first operand.  On an
+    unrounded range the two can share no factor, e.g. 96 FP32 elements are 3 FP32
+    sticks against a 2-way split of 2 FP16 sticks.  The op then drops to one core
+    on that dim, disagreeing with its LX owners, which demotes them to HBM.
     """
+    # A typecast converts whole sticks of its side with more elements per stick.
+    max_eps = max(arg.device_size[-1] for arg in op_spec.args)
+    if any(
+        arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+        for arg in op_spec.args
+    ):
+        # A DL16_TO_FP32 value spreads each FP16 stick over an FP32 stick pair, so
+        # an op whose operands are all FP32 still iterates whole FP16 sticks.
+        max_eps = max(max_eps, DataFormats.SEN169_FP16.elems_per_stick())
+
+    rounded_stick_vars = set()
     for arg in op_spec.args:
         coords = list(arg.device_coordinates)
-        lane = coords[-1]
-        eps = arg.device_dtype.elems_per_stick()
-        if eps >= grid_eps or len(lane.free_symbols) != 1:
-            continue
-        (sym,) = lane.free_symbols
-        if any(sym in sympy.sympify(c).free_symbols for c in coords[:-1]):
-            continue
-        if coords[0] != 0 or arg.device_size[0] != grid_eps // eps:
-            continue
-        coords[0] = sympy.floor(lane / eps)
-        coords[-1] = sympy.Mod(lane, eps)
-        arg.device_coordinates = coords
+        stick_coord = coords[-1]
+        if not stick_coord.free_symbols:
+            continue  # A broadcast or size-1 stick dim has no stick var.
+        # The stick-expression check upstream admits only one stick var.
+        assert len(stick_coord.free_symbols) == 1, stick_coord
+        (stick_var,) = stick_coord.free_symbols
+        # Round the stick var's extent up to whole sticks of the side with more
+        # elements per stick, e.g. 96 -> 128 for an FP32 <-> FP16 typecast.
+        if stick_var in op_spec.iteration_space and stick_var not in rounded_stick_vars:
+            extent, split = op_spec.iteration_space[stick_var]
+            op_spec.iteration_space[stick_var] = (
+                CeilDiv(extent, max_eps) * max_eps,
+                split,
+            )
+            rounded_stick_vars.add(stick_var)
+
+        # When the stick var spans a single stick of an operand, that stick has no
+        # num-sticks dim of its own to grow, so ``_pad_num_sticks`` holds the
+        # padded stick group in a new outermost "gap dim" (``stride_map`` -1, no
+        # host elements) with coordinate 0.  The stick var spans the whole group,
+        # so split it: the stick index goes to the gap dim, the offset within the
+        # stick stays innermost.  Otherwise align treats the gap dim as a separate
+        # back gap, and the SDSC counts the group's second stick twice.
+        eps = arg.device_size[-1]
+        has_gap_dim = (
+            eps < max_eps and coords[0] == 0 and arg.device_size[0] == max_eps // eps
+        )
+        stick_var_only_innermost = not any(
+            stick_var in c.free_symbols for c in coords[:-1]
+        )
+        if has_gap_dim and stick_var_only_innermost:
+            coords[0] = sympy.floor(stick_coord / eps)
+            coords[-1] = sympy.Mod(stick_coord, eps)
+            arg.device_coordinates = coords
 
 
 def simplify_op_spec(
@@ -1916,9 +1946,11 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
-    if (grid_eps := conversion_stick_grid(op_spec)) is not None:
-        _round_stick_range_to_grid(op_spec, grid_eps)
-        _restore_stick_pair_dim(op_spec, grid_eps)
+
+    if _has_staggered_ea(op_spec):
+        # Iterate whole sticks before align_tensors re-intersects the planned split
+        # with the first operand's stick count, so the split and LX placement survive.
+        _adjust_for_staggered_ea(op_spec)
 
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
