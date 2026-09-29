@@ -27,6 +27,27 @@ from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 _MAX_XFAIL_REASON_LEN = 300
 
 
+_RAS_HARDWARE_ERROR = re.compile(r'"category"\s*:\s*"hardware"')
+
+
+class SpyreDeviceFault(Exception):
+    """A prior test left the device in an error state; this test cannot run."""
+
+
+def _is_device_fault(excinfo) -> bool:
+    """True when a test's exception is a device fault rather than a test outcome."""
+    if excinfo.errisinstance(SpyreDeviceFault):
+        return True
+    if _RAS_HARDWARE_ERROR.search(str(excinfo.value)):
+        return True
+    try:
+        from torch_spyre import _C  # noqa: PLC0415
+
+        return _C.get_device_state() == _C.SpyreDeviceState.StreamError
+    except ImportError:
+        return False
+
+
 def _extract_failure_message(rep):
     """One-line summary of the exception/skip reason behind `rep`."""
     # rep.longrepr is an ExceptionRepr (has .reprcrash.message) for a real
@@ -55,6 +76,13 @@ def _extract_failure_message(rep):
 def pytest_runtest_makereport(item, call):
     outcome = yield
     rep = outcome.get_result()
+    # A device fault is never an expected failure: an xfail (OOT or pytest's own,
+    # which also rewrites setup errors) would otherwise let a faulted run exit 0.
+    device_fault = call.excinfo is not None and _is_device_fault(call.excinfo)
+    if device_fault:
+        rep.outcome = "failed"
+        if hasattr(rep, "wasxfail"):
+            del rep.wasxfail
     if call.when == "call":
         fn = getattr(item, "function", None) or getattr(item, "obj", None)
 
@@ -98,7 +126,7 @@ def pytest_runtest_makereport(item, call):
             (m for m in getattr(fn, "pytestmark", []) if m.name == "xfail"),
             None,
         )
-        if xfail_mark is not None:
+        if xfail_mark is not None and not device_fault:
             strict = xfail_mark.kwargs.get("strict", False)
             if rep.skipped or rep.failed:
                 reason = _extract_failure_message(rep)
@@ -549,23 +577,18 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     Skip tests marked with @pytest.mark.requires_spyre_profiler when the
     Spyre profiler is not available.
 
-    Also skips any test when the device has entered an error state from a
-    previous test. This check runs before every test so that a single
-    hardware fault does not cascade into a wall of misleading FAILED results.
+    Also errors every test once the device has entered an error state from a
+    previous test: one clear reason per test instead of misleading FAILED results,
+    and never a skip, which reads as "not applicable" and let a faulted run exit 0.
     """
-    # Skip if the device is in an error state from a prior test failure.
-    # NOTE: This hook only guarantees that tests running AFTER a device fault are
-    # cleanly SKIPPED — it does NOT guarantee the faulting test itself is the one
-    # that FAILS. A hardware fault flips the shutdown flag asynchronously, so it may
-    # not be visible until a later test's setup; the faulting test can pass and a
-    # later test gets skipped instead. Attributing the failure to the triggering
-    # test is out of scope here (tracked separately).
+    # A hardware fault flips the shutdown flag asynchronously, so the faulting test
+    # can pass and only a later test's setup sees it; the error lands there instead.
     try:
         from torch_spyre import _C  # noqa: PLC0415
 
         state = _C.get_device_state()
         if state == _C.SpyreDeviceState.StreamError:
-            pytest.skip(
+            raise SpyreDeviceFault(
                 f"Device is in error state ({state.name})"
                 " — a process restart is required"
             )

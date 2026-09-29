@@ -15,12 +15,12 @@
 # Owner(s): ["module: stream"]
 
 """
-Tests for the device-error-state skip mechanism.
+Tests for the device-error-state mechanism.
 
 - TestStreamErrorBindings: unit-tests the typed _C.SpyreStreamError /
   _C.SpyreDeviceState enums and the associated query functions.
-- TestDeviceErrorSkipIntegration: calls the conftest hook directly to verify
-  skip behaviour without spawning subprocesses.
+- TestDeviceErrorSkipIntegration: calls the conftest hooks directly to verify
+  that a faulted device errors every later test, without spawning subprocesses.
 
 Usage: ``python test_device_error_skip.py`` or ``pytest test_device_error_skip.py``
 """
@@ -45,6 +45,8 @@ assert _spec is not None and _spec.loader is not None, (
 _tests_conftest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tests_conftest)  # type: ignore[union-attr]
 pytest_runtest_setup = _tests_conftest.pytest_runtest_setup
+SpyreDeviceFault = _tests_conftest.SpyreDeviceFault
+_is_device_fault = _tests_conftest._is_device_fault
 
 
 class TestStreamErrorBindings(TestCase):
@@ -154,7 +156,7 @@ class TestStreamErrorBindings(TestCase):
 class TestDeviceErrorSkipIntegration(TestCase):
     """
     Calls pytest_runtest_setup() directly with a mock item to verify the
-    skip hook.
+    device-state hook.
     """
 
     def _make_item(self, keywords=()):
@@ -178,32 +180,60 @@ class TestDeviceErrorSkipIntegration(TestCase):
         ):
             pytest_runtest_setup(self._make_item())
 
-    def test_faulted_device_skips(self):
-        """When device state is StreamError every hook call must skip."""
+    def test_faulted_device_errors_instead_of_skipping(self):
+        """When device state is StreamError every hook call must error, never skip."""
         with patch.object(
             _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
         ):
             for _ in range(3):
-                with self.assertRaises(pytest.skip.Exception):
+                with self.assertRaises(SpyreDeviceFault):
                     pytest_runtest_setup(self._make_item())
 
     def test_skip_message_contains_device_is_in_error_state(self):
-        """The skip reason must contain 'Device is in error state'."""
+        """The error must contain 'Device is in error state'."""
         with patch.object(
             _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
         ):
-            with self.assertRaises(pytest.skip.Exception) as ctx:
+            with self.assertRaises(SpyreDeviceFault) as ctx:
                 pytest_runtest_setup(self._make_item())
         self.assertIn("Device is in error state", str(ctx.exception))
 
     def test_skip_message_contains_error_class_name(self):
-        """The skip reason must name the error class (e.g. 'StreamError')."""
+        """The error must name the error class (e.g. 'StreamError')."""
         with patch.object(
             _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
         ):
-            with self.assertRaises(pytest.skip.Exception) as ctx:
+            with self.assertRaises(SpyreDeviceFault) as ctx:
                 pytest_runtest_setup(self._make_item())
         self.assertIn("StreamError", str(ctx.exception))
+
+    def _excinfo(self, exc):
+        try:
+            raise exc
+        except type(exc):
+            return pytest.ExceptionInfo.from_current()
+
+    def test_ras_hardware_error_is_a_device_fault(self):
+        """A RAS hardware error must never be absorbed by an xfail, even on a healthy device."""
+        ras = RuntimeError(
+            '{"action":"information","category":"hardware","code":"0x7b1b",'
+            '"name":"RAS::RUNTIMESCHEDULER::ComputeHardwareError"}'
+        )
+        with patch.object(_C, "get_device_state", return_value=_C.SpyreDeviceState.Ok):
+            self.assertTrue(_is_device_fault(self._excinfo(ras)))
+
+    def test_failure_on_a_faulted_device_is_a_device_fault(self):
+        with patch.object(
+            _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
+        ):
+            self.assertTrue(_is_device_fault(self._excinfo(RuntimeError("boom"))))
+
+    def test_ordinary_failure_is_not_a_device_fault(self):
+        """An unsupported-op error on a healthy device stays eligible for xfail."""
+        with patch.object(_C, "get_device_state", return_value=_C.SpyreDeviceState.Ok):
+            self.assertFalse(
+                _is_device_fault(self._excinfo(RuntimeError("Unsupported: flip")))
+            )
 
     def test_import_error_does_not_block_test(self):
         """If torch_spyre._C is not importable the hook must silently pass."""
