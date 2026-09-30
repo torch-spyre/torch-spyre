@@ -245,6 +245,8 @@ _RAS = (
 _SESSION_CONFTEST = f"""
 import importlib.util, sys
 sys.path.append({str(_CONFTEST_PATH.parent)!r})
+# torch first: importing torch_spyre first makes torch's backend autoload re-enter it half-initialized.
+import torch
 from torch_spyre import _C
 STATE = {{"s": _C.SpyreDeviceState.Ok}}
 _C.get_device_state = lambda: STATE["s"]
