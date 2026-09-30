@@ -14,6 +14,7 @@
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -22,6 +23,7 @@ from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from typing import Any, cast
 
 import torch
+import sympy
 from torch._inductor.async_compile import AsyncCompile, get_compile_threads
 from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.compile_worker.subproc_pool import SubprocException
@@ -32,7 +34,9 @@ from torch_spyre._inductor.op_spec import (
     LoopSpec,
     OpSpec,
     UnimplementedOp,
+    distinct_symbolic_counts,
     find_unimplemented,
+    iter_loop_specs,
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
@@ -57,8 +61,148 @@ logger = get_inductor_logger("sdsc_compile")
 # both the bundle and the KTIR path. It bounds a wedged compiler -- which would
 # otherwise block torch.compile forever with no diagnostic -- rather than
 # policing slowness: both finish in well under a second on a small kernel.
-# Raise it if a large bundle legitimately needs longer.
+# SPYRE_BACKEND_COMPILE_TIMEOUT_S overrides it when a large bundle legitimately
+# needs longer; 0 removes the bound entirely.
 _COMPILE_TIMEOUT_S = 60.0
+_TIMEOUT_ENV = "SPYRE_BACKEND_COMPILE_TIMEOUT_S"
+
+
+def compile_timeout_s(default: float) -> float | None:
+    """Return the compile-stage timeout in seconds, or ``None`` for unbounded.
+
+    Read per call rather than at import so the knob can be set for a single
+    compile, and so a value that cannot be parsed is reported against the
+    compile that needed it.
+
+    Args:
+        default: The stage's own ceiling, used when the environment is unset.
+
+    Returns:
+        The effective ceiling, or ``None`` when bounding is disabled.
+
+    Raises:
+        ValueError: The environment variable is set to a non-number.
+    """
+    raw = os.environ.get(_TIMEOUT_ENV)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{_TIMEOUT_ENV}={raw!r} is not a number") from None
+    return value if value > 0 else None
+
+
+def variant_wait_timeout_s() -> float | None:
+    """How long a thread waits for another thread's variant compile.
+
+    Deliberately longer than the compile's own ceiling: the owning thread spends
+    time in bundle generation before the bounded backend-compile stage, and a
+    waiter that gave up first would report a timeout against a compile that is
+    still making progress.
+    """
+    timeout = compile_timeout_s(_COMPILE_TIMEOUT_S)
+    return None if timeout is None else timeout * 2
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+    proc.wait()
+
+
+def _run_reaped(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Run ``cmd`` to completion with captured text output.
+
+    Like ``subprocess.run(capture_output=True, text=True, check=True)``, except
+    that a timeout kills the child's whole process group: ``subprocess.run``
+    kills only the direct child, so a backend compiler's own subprocesses would
+    survive the timeout still holding the compile dir. Starting a new session
+    makes the child a process-group leader, which is what lets the group be
+    signalled as one.
+
+    Raises:
+        subprocess.TimeoutExpired: ``timeout`` elapsed; the group was killed.
+        subprocess.CalledProcessError: The command exited non-zero.
+    """
+    with subprocess.Popen(
+        cmd,
+        env=env,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            raise
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode, cmd, output=stdout, stderr=stderr
+            )
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _symbolic_loop_counts(specs) -> list[LoopSpec]:
+    return [loop for loop in iter_loop_specs(specs) if loop.count.free_symbols]
+
+
+def specialize_loop_count(specs, loop_count: int):
+    """Return ``specs`` with every symbolic loop count replaced by ``loop_count``.
+
+    Only the ``LoopSpec`` spine is rebuilt; every other spec object is shared
+    with the symbolic original, and therefore between the variants of different
+    counts. That is safe because the counts differ in loop control alone --
+    memory geometry is planned from ``max_count`` and is identical across
+    variants -- and because per-variant compilation reads these specs without
+    writing to them: ``parse_op_spec`` builds its own SDSC args, and asserts that
+    it was handed unassigned work divisions. If that assert ever fires from this
+    path, the sharing is what to look at first.
+
+    Args:
+        specs: The finalized specs of a symbolic kernel.
+        loop_count: Trips to specialize for.
+
+    Returns:
+        A new spec list whose symbolic counts are concrete.
+
+    Raises:
+        TypeError: ``loop_count`` is not an int.
+        ValueError: ``loop_count`` is not positive, or exceeds ``max_count``.
+    """
+    if isinstance(loop_count, bool) or not isinstance(loop_count, int):
+        raise TypeError(f"loop_count must be a positive int, got {loop_count!r}")
+    if loop_count <= 0:
+        raise ValueError(f"loop_count must be positive, got {loop_count}")
+
+    def specialize(spec):
+        if not isinstance(spec, LoopSpec):
+            return spec
+        count = spec.count
+        if count.free_symbols:
+            # Only a symbolic count is bound to loop_count; a concrete nested
+            # loop keeps its own trip count and is not bounded by max_count.
+            if spec.max_count is not None and loop_count > spec.max_count:
+                raise ValueError(
+                    f"loop_count {loop_count} exceeds traced maximum {spec.max_count}"
+                )
+            count = sympy.Integer(loop_count)
+        return LoopSpec(
+            count=count,
+            body=[specialize(item) for item in spec.body],
+            max_count=spec.max_count,
+        )
+
+    return [specialize(spec) for spec in specs]
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -188,22 +332,16 @@ def _run_backend_compiler(
         os.path.join(compile_dir, "bundle.mlir"),
     ]
 
+    timeout = compile_timeout_s(_COMPILE_TIMEOUT_S)
     with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
         try:
-            # capture_output: dbo-opt is an MLIR *-opt tool, so it prints the
-            # transformed module to stdout as a matter of course.
+            # Output is captured: dbo-opt is an MLIR *-opt tool, so it prints
+            # the transformed module to stdout as a matter of course.
             # ``dxp_standalone -d`` did not, which is why nothing captured it
             # before -- left uncaptured, every kernel dumps its whole bundle
             # module into the user's terminal.  Capturing also makes the
             # compiler's own diagnostics available to the error paths below.
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=env,
-                timeout=_COMPILE_TIMEOUT_S,
-            )
+            proc = _run_reaped(cmd, env=env, timeout=timeout)
             # The KTIR path (#3651) reports that dbo-opt can exit 0 having
             # written nothing, so treat the artifact -- not the return code --
             # as the success condition. Not independently confirmed for the
@@ -218,7 +356,8 @@ def _run_backend_compiler(
         except subprocess.TimeoutExpired as exc:
             # Would otherwise land in the broad handler below, which collects
             # correctly but re-raises a TimeoutExpired whose message says
-            # nothing about which knob relaxes it.
+            # nothing about which knob relaxes it. The compile dir is left in
+            # place for the caller's failure path to preserve.
             try_collect(
                 exc,
                 logger=logger,
@@ -227,8 +366,9 @@ def _run_backend_compiler(
                 code_dir=compile_dir,
             )
             raise RuntimeError(
-                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
-                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+                f"dbo-opt timed out after {timeout}s compiling {kernel_name}; "
+                f"raise or disable the bound with {_TIMEOUT_ENV} (0 disables "
+                f"it).\ncommand: {' '.join(cmd)}"
             ) from exc
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -416,6 +556,38 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
+        symbolic_loops = _symbolic_loop_counts(finalized_specs)
+        if symbolic_loops:
+            counts = distinct_symbolic_counts(finalized_specs)
+            if len(counts) != 1:
+                raise ValueError(
+                    "one kernel cannot yet contain independently dynamic "
+                    f"loop counts: {sorted(map(str, counts))}"
+                )
+            if any(loop.max_count is None for loop in symbolic_loops):
+                raise ValueError("a symbolic LoopSpec.count requires max_count")
+            return SpyreSDSCKernelRunner(
+                kernel_name,
+                None,
+                kernel_provenance=kernel_provenance,
+                specs=finalized_specs,
+                pool_size=pool_size,
+            )
+
+        return self._sdsc_concrete(
+            kernel_name,
+            finalized_specs,
+            pool_size,
+            kernel_provenance,
+        )
+
+    def _sdsc_concrete(
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec],
+        pool_size: int,
+        kernel_provenance,
+    ):
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
@@ -514,7 +686,25 @@ class SpyreAsyncCompile(AsyncCompile):
         ``dbo-opt``, which writes a ``spyreCodeDir`` in the same layout the
         bundle path produces, so the result is loaded and launched by the same
         ``SpyreSDSCKernelRunner``.
+
+        Raises:
+            NotImplementedError: Any loop count in ``specs`` is symbolic. The
+                SDSC path defers those to a per-count variant compile; this
+                emitter has no equivalent, and a symbolic count would have to
+                reach the kernel as an argument the way a dynamic view dim does.
         """
+        # Reported before the device prerequisites: those are a misconfiguration
+        # the caller can fix, this one is a capability the emitter does not have,
+        # so naming it first saves fixing an environment for a path that cannot
+        # run the kernel anyway. codegen/ktir.py rejects a symbolic count too,
+        # but only once it is deep in emission with no idea what selected it.
+        if _symbolic_loop_counts(specs):
+            raise NotImplementedError(
+                f"OpSpec->KTIR: {kernel_name} has a symbolic loop trip count, "
+                "which the KTIR emitter does not implement; compile it with the "
+                "SDSC emitter (TORCH_SPYRE_KTIR=0)"
+            )
+
         # Upfront, before anything is emitted: what device execution needs is a
         # matter of configuration, so there is no reason to emit first.
         _check_ktir_device_prerequisites()
@@ -583,6 +773,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # problem to fix in the shell, not something to paper over per-child --
         # and a child-only path stopped being separable once a process commits
         # to one backend for its lifetime via ``ktir_emitter``.
+        timeout = compile_timeout_s(_COMPILE_TIMEOUT_S)
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 proc = subprocess.run(
@@ -590,7 +781,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     capture_output=True,
                     text=True,
                     check=True,
-                    timeout=_COMPILE_TIMEOUT_S,
+                    timeout=timeout,
                 )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
@@ -613,8 +804,8 @@ class SpyreAsyncCompile(AsyncCompile):
                     code_dir=output_dir,
                 )
                 raise RuntimeError(
-                    f"OpSpec->KTIR: dbo-opt timed out after "
-                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"OpSpec->KTIR: dbo-opt timed out after {timeout}s; raise or "
+                    f"disable the bound with {_TIMEOUT_ENV} (0 disables it).\n"
                     f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:

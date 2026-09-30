@@ -413,6 +413,8 @@ class LoopSpec:
 
     Attributes:
         count: Trip count of the loop. May be a symbolic shape expression.
+        max_count: Concrete planning extent for a symbolic count. ``None`` for
+            an ordinary concrete loop.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
 
@@ -427,6 +429,43 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    max_count: int | None = None
+
+
+def iter_loop_specs(specs):
+    """Yield every LoopSpec in ``specs``, nested ones included."""
+    for item in specs:
+        if isinstance(item, LoopSpec):
+            yield item
+            yield from iter_loop_specs(item.body)
+
+
+def distinct_symbolic_counts(specs) -> list[Expr]:
+    """Symbolic loop counts of one kernel, deduplicated by value.
+
+    A kernel is launched with a single ``loop_count=`` argument, so both codegen
+    and the compiler have to decide whether two symbolic counts are the same
+    count -- and they have to decide it the same way, or one rejects a kernel
+    the other happily emitted. Counts written differently but always equal
+    (``s0`` versus ``2 * s0 / 2``) are one count here.
+
+    Args:
+        specs: The op and loop specs of a single kernel.
+
+    Returns:
+        One representative per distinct symbolic count, in traversal order.
+    """
+    distinct: list[Expr] = []
+    for loop in iter_loop_specs(specs):
+        count = loop.count
+        if not getattr(count, "free_symbols", None):
+            continue
+        if any(
+            count == seen or sympify(count - seen).simplify() == 0 for seen in distinct
+        ):
+            continue
+        distinct.append(count)
+    return distinct
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

@@ -165,6 +165,14 @@ class TestLoopSpecTripCount(unittest.TestCase):
             "Identical LoopSpec (same count, same body) must produce the same hash.",
         )
 
+    def test_planning_max_does_not_change_concrete_variant_hash(self):
+        loop_a = _make_loop_spec(count=4)
+        loop_b = _make_loop_spec(count=4)
+        loop_a.max_count = 8
+        loop_b.max_count = 16
+
+        self.assertEqual(_hash([loop_a]), _hash([loop_b]))
+
     def test_nested_loop_count_is_hashed(self):
         """Hash must differ if inner loop count changes even when outer matches."""
         from torch_spyre._inductor.op_spec import LoopSpec

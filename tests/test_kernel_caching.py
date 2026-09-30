@@ -115,7 +115,54 @@ class TestCacheArtifactCompleteness(unittest.TestCase):
                 )
 
 
+def _seed_kernel_dir(path: str, *, complete: bool = True) -> None:
+    """Write the artifacts of a compiled kernel into ``path``.
+
+    With ``complete=False``, ``spyreCodeDir/init_binary.bin`` is left out -- the
+    shape a compile killed mid-write leaves behind.
+    """
+    os.makedirs(os.path.join(path, "spyreCodeDir"), exist_ok=True)
+    for name in ["bundle.mlir", "sdsc_0.json"]:
+        with open(os.path.join(path, name), "w") as f:
+            f.write("content")
+    with open(os.path.join(path, "symbol_kinds.json"), "w") as f:
+        f.write("[]")
+    names = ["spyrecode.json"] + (["init_binary.bin"] if complete else [])
+    for name in names:
+        with open(os.path.join(path, "spyreCodeDir", name), "wb") as f:
+            f.write(b"content")
+
+
 class TestPartialCacheEntryTreatedAsMiss(unittest.TestCase):
+    def test_commit_quarantines_an_incomplete_entry_and_promotes_ours(self):
+        """An incomplete entry is never repaired by the reader, so committing must.
+
+        Left in place it is permanent: readers miss it and recompile, then every
+        writer discards its complete bundle in favour of the broken directory.
+        """
+        with fresh_cache():
+            cache_root = get_cache_root_dir()
+            key = "c" + "d" * 63
+            cached_dir = os.path.join(cache_root, key)
+            _seed_kernel_dir(cached_dir, complete=False)
+
+            tmp_dir = allocate_compile_dir(key)
+            _seed_kernel_dir(tmp_dir)
+
+            self.assertEqual(commit_compile_dir(tmp_dir, key), cached_dir)
+            self.assertEqual(get_cached_kernel_dir(key), cached_dir)
+
+            quarantined = [
+                name
+                for name in os.listdir(os.path.join(cache_root, "failed"))
+                if name.startswith(f"{key}.corrupt.")
+            ]
+            self.assertEqual(
+                len(quarantined),
+                1,
+                f"Expected the incomplete entry to be quarantined, found {quarantined}",
+            )
+
     def test_partial_write_does_not_produce_cache_hit(self):
         """A directory missing spyreCodeDir/init_binary.bin must be a cache miss."""
         with fresh_cache():

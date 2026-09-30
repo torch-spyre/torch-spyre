@@ -432,6 +432,76 @@ def compute_specs_hash(
     return cache_key
 
 
+def _missing_artifacts(kernel_dir: str) -> list[str]:
+    """Return the required artifacts absent from ``kernel_dir``.
+
+    One definition of a usable entry for both the read and the commit path: a
+    committer that trusted an entry the reader rejects is how an incomplete
+    directory becomes permanent -- readers miss it forever, and every writer
+    discards a good bundle in its favour.
+
+    Args:
+        kernel_dir: A candidate cache entry, which need not exist.
+
+    Returns:
+        The missing paths, ``sdsc_N.json`` standing for "no sdsc json at all".
+        Empty when the entry is complete.
+    """
+    if not os.path.isdir(kernel_dir):
+        return [kernel_dir, *_REQUIRED_ARTIFACTS]
+
+    missing = [
+        p
+        for p in _REQUIRED_ARTIFACTS
+        if not os.path.isfile(os.path.join(kernel_dir, p))
+    ]
+    has_sdsc = any(
+        f.startswith("sdsc_") and f.endswith(".json")
+        for f in os.listdir(kernel_dir)
+        if os.path.isfile(os.path.join(kernel_dir, f))
+    )
+    if not has_sdsc:
+        missing.append("sdsc_N.json")
+    return missing
+
+
+def _quarantine_incomplete_entry(cached_dir: str, missing: list[str]) -> bool:
+    """Move an unusable cache entry aside so a complete one can replace it.
+
+    Args:
+        cached_dir: The entry to move.
+        missing: What it lacks, for the log line.
+
+    Returns:
+        Whether ``cached_dir`` is now free to be written.
+    """
+    failed_root = os.path.join(get_cache_root_dir(), "failed")
+    dest = os.path.join(
+        failed_root, f"{os.path.basename(cached_dir)}.corrupt.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        os.makedirs(failed_root, exist_ok=True)
+        os.rename(cached_dir, dest)
+    except FileNotFoundError:
+        # Another process quarantined it first; the path is free either way.
+        return True
+    except OSError:
+        logger.warning(
+            "Could not quarantine incomplete cache entry %s (missing %s)",
+            cached_dir,
+            missing,
+            exc_info=True,
+        )
+        return False
+    logger.warning(
+        "Quarantined incomplete cache entry %s (missing %s) to %s",
+        cached_dir,
+        missing,
+        dest,
+    )
+    return True
+
+
 def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     """Return the cached kernel directory if all required artifacts are present.
 
@@ -446,27 +516,11 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
         logger.info("Cache MISS: No cached kernel found for key %s", cache_key)
         return None
 
-    missing = [
-        p
-        for p in _REQUIRED_ARTIFACTS
-        if not os.path.isfile(os.path.join(cached_dir, p))
-    ]
+    missing = _missing_artifacts(cached_dir)
     if missing:
         logger.info(
             "Cache MISS: Cached dir exists but missing artifacts %s for key %s",
             missing,
-            cache_key,
-        )
-        return None
-
-    has_sdsc = any(
-        f.startswith("sdsc_") and f.endswith(".json")
-        for f in os.listdir(cached_dir)
-        if os.path.isfile(os.path.join(cached_dir, f))
-    )
-    if not has_sdsc:
-        logger.info(
-            "Cache MISS: No sdsc_N.json files found in cached dir for key %s",
             cache_key,
         )
         return None
@@ -500,25 +554,58 @@ def allocate_compile_dir(cache_key: str) -> str:
 def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     """Atomically promote tmp_dir to <cache_root>/<cache_key>/.
 
-    If another process already committed the same key, discards the temp dir
-    and reuses the existing entry. Returns the final cache dir.
+    If another process already committed a *complete* entry for the same key,
+    discards the temp dir and reuses it. An incomplete entry -- a partial write
+    from a killed process -- is quarantined and replaced by ours: the reader
+    misses on it, so leaving it in place would make every future process
+    recompile and then throw its good bundle away.
+
+    Args:
+        tmp_dir: A complete compile dir from :func:`allocate_compile_dir`.
+        cache_key: The key to promote it under.
+
+    Returns:
+        A usable code directory: the cache entry, or ``tmp_dir`` itself if the
+        entry could not be claimed.
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
 
     if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy.
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
-        return cached_dir
+        missing = _missing_artifacts(cached_dir)
+        if not missing:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+            return cached_dir
+        if not _quarantine_incomplete_entry(cached_dir, missing):
+            logger.warning(
+                "Cache entry %s is incomplete and could not be moved aside; "
+                "using the uncommitted compile dir %s instead",
+                cached_dir,
+                tmp_dir,
+            )
+            return tmp_dir
 
     try:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
+        return cached_dir
     except OSError:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        pass
 
+    # Lost the race between the check above and the rename.
+    missing = _missing_artifacts(cached_dir)
+    if missing:
+        logger.warning(
+            "Could not commit %s to %s and that entry is unusable (missing %s); "
+            "using the uncommitted compile dir",
+            tmp_dir,
+            cached_dir,
+            missing,
+        )
+        return tmp_dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
     return cached_dir
 
 

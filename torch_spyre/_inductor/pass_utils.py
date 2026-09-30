@@ -334,9 +334,12 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
     """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
     A bound is usable iff it is a positive concrete
     ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
-    values all return ``None``.
+    values all return ``None``. An expression whose symbols have no recorded
+    range has no bound either, which ``bound_sympy`` reports as ``None``.
     """
     vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    if vr is None:
+        return None
     if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
         return int(vr.upper)
     return None

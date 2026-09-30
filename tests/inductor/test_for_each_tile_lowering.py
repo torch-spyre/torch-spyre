@@ -42,9 +42,11 @@ reference, see test_for_each_tile_e2e.py.
 """
 
 import operator
+import types
 import unittest
 from unittest import mock
 
+import sympy
 import torch
 from torch._inductor.virtualized import V
 
@@ -1953,6 +1955,35 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_dynamic_index_expr_bound_is_accepted(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _extract_trip_count,
+        )
+
+        bound = sympy.Symbol("s0", integer=True, positive=True)
+
+        class Data:
+            dtype = torch.bool
+
+            @staticmethod
+            def get_size():
+                return []
+
+            @staticmethod
+            def inner_fn(_):
+                step = V.ops.load("step", 0)
+                count = V.ops.index_expr(bound, torch.int64)
+                return V.ops.lt(step, count)
+
+        op = mock.Mock()
+        op.data = Data()
+        cond_graph = mock.Mock()
+        cond_graph.graph_inputs = {"step": mock.Mock()}
+        cond_graph.graph_outputs = [mock.Mock()]
+        cond_graph.operations = [op]
+
+        self.assertEqual(_extract_trip_count(cond_graph), bound)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
@@ -1980,6 +2011,127 @@ class TestTryProveForEachTile(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertTrue(result.reason)
+
+
+class TestTripCountBounds(unittest.TestCase):
+    """A symbolic trip count is only usable when ShapeEnv bounds it both ways.
+
+    The upper bound becomes the loop's planning extent and therefore its memory
+    geometry, so accepting an unbounded count would let a runtime count exceed
+    the buffers traced for it; the lower bound has to reach 1 because every
+    specialized variant runs its body at least once.
+    """
+
+    def setUp(self):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        self.shape_env = ShapeEnv()
+        self.symbol = sympy.Symbol("s0", integer=True, positive=True)
+        self.graph = types.SimpleNamespace(
+            sizevars=types.SimpleNamespace(shape_env=self.shape_env)
+        )
+
+    def _reason(self, trip_count):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _trip_count_decline_reason,
+        )
+
+        with V.set_graph_handler(self.graph):
+            return _trip_count_decline_reason(trip_count)
+
+    def _with_range(self, lower, upper):
+        from torch.utils._sympy.value_ranges import ValueRanges
+
+        self.shape_env.var_to_range[self.symbol] = ValueRanges(
+            sympy.Integer(lower), sympy.Integer(upper)
+        )
+        return self.symbol
+
+    def test_accepts_a_mark_dynamic_bounded_count(self):
+        self.assertIsNone(self._reason(self._with_range(2, 8)))
+
+    def test_declines_a_count_with_no_finite_upper_bound(self):
+        reason = self._reason(self.symbol)
+
+        self.assertIn("finite", reason)
+        self.assertIn("mark_dynamic", reason)
+
+    def test_declines_a_count_that_may_be_zero(self):
+        self.assertIn("provably >= 1", self._reason(self._with_range(0, 8)))
+
+    def test_declines_an_unbacked_count(self):
+        unbacked = self.shape_env.create_unbacked_symint().node.expr
+
+        self.assertIn("unbacked", self._reason(unbacked))
+
+    def test_declines_a_non_positive_concrete_count(self):
+        self.assertIn("not positive", self._reason(sympy.Integer(0)))
+
+    def test_accepts_a_concrete_count(self):
+        self.assertIsNone(self._reason(sympy.Integer(4)))
+
+
+class TestUnhandledWhileLoopIsReported(unittest.TestCase):
+    def test_a_declined_while_loop_raises_rather_than_surviving_the_pass(self):
+        """No later pass lowers a WhileLoop; it must not reach them.
+
+        propagate_layouts, work_division and propagate_named_dims each log
+        "unhandled node type" and skip the node, so a loop left in the graph
+        loses its writes and the kernel returns its output buffer untouched --
+        a wrong answer with a warning rather than an error.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        while_op = mock.Mock(spec=ir.WhileLoop)
+        while_op.cond_subgraph = None
+        graph = mock.Mock()
+        graph.operations = [while_op]
+
+        with self.assertRaises(Unsupported) as caught:
+            splice_while_loops(graph)
+
+        self.assertIn("cannot lower to a counted loop", str(caught.exception))
+        self.assertIn("no cond_subgraph.graph", str(caught.exception))
+
+    def test_a_symbolic_count_with_stacking_carries_is_declined(self):
+        """A stacked output is sized from the planning extent, not the count.
+
+        Splicing this would size the stack for the maximum trip count while a
+        smaller runtime count fills only a prefix, publishing an uninitialized
+        tail. Map mode's concrete count keeps its stacking carries.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor import errors
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        while_op = mock.Mock(spec=ir.WhileLoop)
+        graph = mock.Mock()
+        graph.operations = [while_op]
+        count = sympy.Symbol("s0", integer=True, positive=True)
+
+        with (
+            mock.patch.object(
+                lowering,
+                "try_prove_for_each_tile",
+                return_value=lowering.ProverResult(accepted=True, trip_count=count),
+            ),
+            mock.patch.object(
+                lowering, "_body_loop_var", return_value=sympy.Symbol("u0")
+            ),
+            mock.patch.object(
+                lowering, "_stacking_carry_indices", return_value=frozenset({1})
+            ),
+            self.assertRaises(errors.Unsupported) as caught,
+        ):
+            lowering.splice_while_loops(graph)
+
+        self.assertIn("stacks its output through carries [1]", str(caught.exception))
 
 
 class TestPassPipelineRegistration(unittest.TestCase):

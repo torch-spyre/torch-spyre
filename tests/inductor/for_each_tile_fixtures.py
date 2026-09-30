@@ -1103,17 +1103,25 @@ INT32_ELEMS_PER_STICK = 32
 PAGE_ORDER = (5, 2, 7, 0)
 
 
-def paged_gather_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def paged_gather_inputs(
+    num_blocks: int = PAGE_BLOCKS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(pages, block table, query) for paged attention's in-body page gather.
 
     The table mirrors what spyre-inference's paged attention passes: one
-    stick-wide int32 row per active block, page index at column 0.
+    stick-wide int32 row per active block, page index at column 0. The table's
+    height is the walk's trip count, so ``num_blocks`` is how a caller varies
+    the count while everything else stays fixed.
+
+    Args:
+        num_blocks: Rows in the block table, at most ``len(PAGE_ORDER)``.
     """
+    assert num_blocks <= len(PAGE_ORDER), "PAGE_ORDER has no page for every row"
     torch.manual_seed(0)
     pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
     q = torch.randn(PAGE_LQ, PAGE_HS, dtype=torch.float16)
-    table = torch.zeros(PAGE_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-    for i, page in enumerate(PAGE_ORDER):
+    table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    for i, page in enumerate(PAGE_ORDER[:num_blocks]):
         table[i, 0] = page
     return pages, table, q
 
@@ -1152,11 +1160,13 @@ def paged_gather_fn(
     return final
 
 
-def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+def paged_gather_reference(
+    pages: torch.Tensor, q: torch.Tensor, num_blocks: int = PAGE_BLOCKS
+) -> torch.Tensor:
     """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
     pf, qf = pages.float(), q.float()
     acc = torch.zeros(q.shape[0], PAGE_HS)
-    for p in PAGE_ORDER:
+    for p in PAGE_ORDER[:num_blocks]:
         page = pf[p]
         acc = acc + (qf @ page.transpose(0, 1)) @ page
     return acc

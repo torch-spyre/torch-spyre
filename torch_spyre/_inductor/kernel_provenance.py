@@ -94,6 +94,7 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    "max_count": "int | None",
 }
 
 
@@ -285,11 +286,14 @@ def _canonical_spec(spec: object) -> object:
             )
         return result
     if isinstance(spec, LoopSpec):
-        return {
+        result = {
             "kind": "loop",
             "count": _canonical_value(spec.count),
             "body": [_canonical_spec(child) for child in spec.body],
         }
+        if spec.max_count is not None:
+            result["max_count"] = spec.max_count
+        return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
 
