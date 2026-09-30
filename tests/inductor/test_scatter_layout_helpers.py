@@ -35,6 +35,7 @@ from torch_spyre._inductor.enforce_indirect_access_layout import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.pass_utils import is_sparse_stl
 
 
 class TestDimOrderCompliance(unittest.TestCase):
@@ -177,6 +178,21 @@ class TestBuildRequiredStl(unittest.TestCase):
         self.assertEqual(required_stl.device_size[1], 2)
         # Stick stays at end
         self.assertEqual(required_stl.device_size[3], 1)
+
+    def test_indirect_on_stick_dim_builds_sparse_layout(self):
+        """A 1-D table indexed on its stick dim gets a sparse layout."""
+        original_stl = SpyreTensorLayout(
+            device_size=[2, 64],
+            stride_map=[64, 1],
+            device_dtype=get_device_dtype(torch.float16),
+        )
+        required_stl = _build_required_stl(
+            original_stl, indirect_device_pos=1, indexed_dim_size=100
+        )
+
+        self.assertEqual(required_stl.device_size, [100, 1, 64])
+        self.assertEqual(required_stl.stride_map, [1, -1, -1])
+        self.assertTrue(is_sparse_stl(required_stl))
 
 
 class TestDenseScatterSourceStl(unittest.TestCase):

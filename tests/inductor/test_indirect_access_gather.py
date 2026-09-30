@@ -523,6 +523,25 @@ class _GatherScenarios:
             lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC
         )
 
+    def _gather_1d_table(self, n):
+        """t[idx] on a 1-D table: the indexed dim is the stick dim itself, so
+        the relayout must give each element its own stick for every index,
+        including those past the first stick, to be reachable."""
+        t = self.to_spyre((torch.arange(n) % 257).to(torch.float16))
+        idx = torch.tensor([0, 1, 63, 64, 65, n - 2, n - 1], dtype=torch.int64)
+        idx = idx.to("spyre")
+        self.name_dims(t, {"N": n})
+        self.name_dims(idx, {"P": 7})
+        self._stage_and_e2e(
+            lambda t, i: t[i], t, idx, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
+    def test_gather_1d_table_multistick(self):
+        self._gather_1d_table(256)
+
+    def test_gather_1d_table_partial_stick(self):
+        self._gather_1d_table(100)
+
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
         x, i = self._xi(P=32)

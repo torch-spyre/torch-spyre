@@ -199,15 +199,66 @@ def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bo
     return compliant
 
 
+def _stick_host_dim_size(layout: FixedTiledLayout) -> int:
+    """Return the size of the host dim that the device stick walks."""
+    stick_stride = layout.device_layout.stride_map[-1]
+    sizes = [
+        int(size)
+        for size, stride in zip(layout.size, layout.stride)
+        if stride == stick_stride and size != 1
+    ]
+    if len(sizes) > 1:
+        # TODO: resolve the stick host dim among several same-stride host dims.
+        raise Unsupported(
+            f"indirect access on the stick dim: ambiguous stick host dim in {layout}"
+        )
+    return sizes[0] if sizes else 1
+
+
+def _build_sparse_stl(
+    value_stl: SpyreTensorLayout, indexed_dim_size: int
+) -> SpyreTensorLayout:
+    """Build a sparse STL of the indexed stick dim, with that dim outermost.
+
+    Used when the indirect coordinate is the stick coordinate itself (e.g. a
+    gather from a 1-D table), which a rotation cannot move outermost. A sparse
+    layout holds one element per stick (see is_sparse_stl): the indexed dim
+    becomes the outermost device dim over its host size, and the count and
+    stick slots carry no host step (``stride_map`` -1). The stick-split dim is
+    dropped and the other non-stick dims keep their order.
+    """
+    device_size = list(value_stl.device_size)
+    stride_map = list(value_stl.stride_map)
+    stick_stride = stride_map[-1]
+    elems_per_stick = value_stl.elems_per_stick()
+    others = [
+        i
+        for i in range(len(device_size) - 1)
+        if stride_map[i] != stick_stride * elems_per_stick
+    ]
+    return SpyreTensorLayout(
+        device_size=[indexed_dim_size]
+        + [device_size[i] for i in others]
+        + [1, elems_per_stick],
+        stride_map=[stick_stride] + [stride_map[i] for i in others] + [-1, -1],
+        device_dtype=value_stl.device_dtype,
+    )
+
+
 def _build_required_stl(
     value_stl: SpyreTensorLayout,
     indirect_device_pos: int,
+    indexed_dim_size: int | None = None,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0.
+    """Build a new STL with the indirect coordinate moved to device position 0.
 
     Takes the current device layout and rotates it so the indirect coordinate
     (at indirect_device_pos) moves to position 0, while keeping the stick
     (at position -1) at the end. Returns a new STL with the rotated layout.
+
+    When the indirect coordinate is the stick coordinate, the layout is
+    rebuilt as a sparse layout instead (see _build_sparse_stl);
+    ``indexed_dim_size``, the host size of the indexed dim, is then required.
     """
     device_size = list(value_stl.device_size)
     stride_map = list(value_stl.stride_map)
@@ -217,6 +268,12 @@ def _build_required_stl(
     # If indirect is already at position 0, no change needed
     if indirect_device_pos == 0:
         return value_stl
+
+    if indirect_device_pos == stick_pos:
+        assert indexed_dim_size is not None, (
+            "indirect access on the stick dim needs the indexed host dim size"
+        )
+        return _build_sparse_stl(value_stl, indexed_dim_size)
 
     # Rotate: move indirect_device_pos to position 0, keep stick at end
     order = (
@@ -586,7 +643,11 @@ def _insert_mutation_relayout_copy(
         )
     assert write_stride_idx is not None
     output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    required_stl = _build_required_stl(
+        output_stl,
+        output_indirect_pos,
+        _stick_host_dim_size(_output_real_layout(mutation_op)),
+    )
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -954,7 +1015,9 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
 
             # Rotate the device layout to put the indirect coordinate at position 0
             indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-            required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            required_stl = _build_required_stl(
+                value_stl, indirect_device_pos, _stick_host_dim_size(value_layout)
+            )
 
             if _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
                 _rewrite_producer_layout(value_buf, required_stl)
