@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 """
-Parse the raw GHA job logs of the model-ops suites (a trunk `tests` run) and produce:
+Parse raw GHA job logs produced by the model-ops-tests workflow and produce:
 
   1. model_ops_log.txt  – cleaned, concatenated plain-text log (one file per run)
   2. <out>.json         – structured per-variant records ready for ClickHouse

@@ -14,8 +14,7 @@
 
 """What a model-ops test declares as its capability verdict (JUnit `capability.*` properties).
 
-The op naming and shape rules are parse_model_ops_logs.py's, so a verdict names the same
-operation and inputs as the log parser did.
+The op naming and shape rules are the log parser's, so capability ids carry over from it.
 """
 
 import json
@@ -38,7 +37,7 @@ _TORCH_DTYPE = re.compile(r"^torch\.\w+$")
 
 
 def normalize_op(op: str) -> str:
-    """parse_model_ops_logs._normalize_op_name: one name for aliases of one op."""
+    """One name for aliases of one op."""
     if not op:
         return op
     op = op.replace("nn_", "nn.").replace("functional_", "functional.")
@@ -126,5 +125,5 @@ def capability_properties(
         "capability.tag": variant,
     }
     if sig["input_strides"]:
-        props["capability.input_strides"] = json.dumps(sig["input_strides"])
+        props["capability.prop.input_strides"] = json.dumps(sig["input_strides"])
     return {k: v for k, v in props.items() if v}

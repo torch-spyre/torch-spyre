@@ -585,6 +585,7 @@ class TestSpyreModelOps(TestCase):
         finally:
             fallbacks = set()
             for w in caught:
+                # v1 model-ops: delete once the dashboard reads v2 capabilities
                 warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
                 m = re.match(r"(aten\.\S+) is falling back", str(w.message))
                 if m and issubclass(w.category, FallbackWarning):
@@ -595,7 +596,7 @@ class TestSpyreModelOps(TestCase):
                     self,
                     {
                         "capability.backend": "cpu" if ran and fallbacks else "spyre",
-                        "capability.fallback_ops": " ".join(sorted(fallbacks)),
+                        "capability.prop.fallback_ops": " ".join(sorted(fallbacks)),
                     },
                 )
             torch._dynamo.reset()

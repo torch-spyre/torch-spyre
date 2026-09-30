@@ -1,3 +1,4 @@
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 name: Ingest model-ops capability logs into ClickHouse
 description: >
   Download the model-ops job logs from a GHA run, parse them for operation-support variants
@@ -11,13 +12,12 @@ description: >
 inputs:
   gha-run-id:
     description: >
-      Numeric GitHub Actions run ID of the trunk `tests` run whose model-ops job logs are
-      analysed. Only its "Model Ops Tests / <config>" jobs are downloaded.
+      Numeric GitHub Actions run ID of the nightly run whose job logs are analysed. This
+      downloads only jobs named "model-ops / ...", which parse_model_ops_logs.py's own
+      \bSpyre\b filter cannot tell apart from same-worded regression-matrix job names.
     required: true
   workflow-name:
-    description: >
-      Workflow name recorded on the v1 rows; the default keeps them continuous with the
-      model-ops-tests workflow the suites used to run in.
+    description: Name of the triggering workflow, recorded against the rows.
     required: false
     default: model-ops-tests
   branch:
@@ -28,24 +28,6 @@ inputs:
     description: Commit sha recorded against the rows.
     required: false
     default: ''
-  component:
-    description: Component whose suite this is.
-    required: false
-    default: torch-spyre
-  arch:
-    description: >
-      Arch of the ANALYSED legs, never $(uname -m) (which would report the ingest runner);
-      arch is a run_id hash input, so a wrong value derives an id that joins nothing.
-    required: false
-    default: x86_64
-  jenkins-run-key:
-    description: Jenkins externalizable id ('folder/job#123'), when Jenkins dispatched this leg.
-    required: false
-    default: ''
-  schema:
-    description: Which schema generation to write -- v1 | v2 | both.
-    required: false
-    default: v1
   gh-token:
     description: Token `gh api` uses to list and download job logs.
     required: true
@@ -83,10 +65,6 @@ inputs:
     default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
-    required: false
-    default: ''
-  clickhouse-db-v2:
-    description: Schema-v2 database. Empty makes the v2 write a no-op.
     required: false
     default: ''
 
@@ -135,9 +113,13 @@ runs:
       if: steps.gate.outputs.configured == 'true'
       uses: ./.github/actions/setup-gh-cli
 
-    # Only the model-ops suite jobs, renamed to the suite names already stored in v1: the
-    # parser derives suite_name from the log's filename, i.e. the job name. A pod-level retry
-    # replaces its first attempt; a config with no stored suite is left out.
+    # Only the model-ops jobs, and strip the reusable-workflow prefix: the triggering run is
+    # the whole nightly, whose regression jobs also carry a "Spyre" token, enough to pass the
+    # parser's own \bSpyre\b filter and land as fake model-ops suites, so this selects on the
+    # caller's job id (exact) rather than the "Spyre" substring. The name is reduced to the
+    # suite alone -- a reusable workflow reports "<caller-job-id> / <job name>", and the
+    # parser derives suite_name from that verbatim, so leaving the prefix on would break
+    # continuity with every row already stored under the un-prefixed suite name.
     - name: Download job logs
       if: steps.gate.outputs.configured == 'true'
       shell: bash
@@ -174,39 +156,25 @@ runs:
             --paginate \
             -f per_page=100 \
             --jq '.jobs[]
-                  | select(.name | test(" / Model Ops Tests / "))
-                  | {id: .id, name: .name}' \
+                  | select(.name | startswith("model-ops / "))
+                  | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
           > /tmp/jobs.jsonl
         }
         retry list_jobs
+
+        if [ ! -s /tmp/jobs.jsonl ]; then
+          echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."
+        fi
 
         python3 - << 'PYEOF'
         import os
 
         from spyre_clickhouse_ingest.gha_logs import download_job_logs_or_die, load_jobs
 
-        SUITES = {
-            "gpt-oss-20b": "GPT OSS 20B",
-            "granite-3.3-8b-instruct-fms": "Granite 3.3 8B Instruct FMS",
-            "granite-3.3-8b-instruct": "Granite 3.3 8B Instruct",
-            "granite-4.1-8b": "Granite 4.1 8B",
-            "meta-llama-3.1-8b-instruct": "Meta Llama 3.1 8B Instruct",
-            "ministral-3-14b-instruct-2512": "Ministral 3 14B Instruct 2512",
-            "mistral-small-3.2-24b-instruct-2506": "Mistral Small 3.2 24B Instruct 2506",
-            "gemma-4-26b-a4b-it": "Gemma 4 26B A4B IT",
-            "gemma-4-12b-it": "Gemma 4 12B Instruct",
-            "qwen2.5-7b-instruct": "Qwen 2.5 7B",
-        }
-        picked = {}
-        for job in sorted(load_jobs("/tmp/jobs.jsonl"), key=lambda j: j["id"]):
-            config = job["name"].split(" / ")[-1].removesuffix(" (pod-level retry)")
-            suite = SUITES.get(config.lower())
-            if suite:
-                picked[suite] = {"id": job["id"], "name": f"{suite} Spyre"}
-        if not picked:
-            print(f"[info] no model-ops suite jobs in run {os.environ['RUN_ID']}.")
         download_job_logs_or_die(
-            list(picked.values()), repo=os.environ["REPO"], out_dir="raw_logs"
+            load_jobs("/tmp/jobs.jsonl"),
+            repo=os.environ["REPO"],
+            out_dir="raw_logs",
         )
         PYEOF
 
@@ -274,7 +242,6 @@ runs:
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}
-        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
         RUN_ID: ${{ inputs.gha-run-id }}
       run: |
         set -euo pipefail
@@ -282,18 +249,9 @@ runs:
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
-        # --trigger-type is the RUN's test_type (a run_id hash input), not the capability
-        # analysis name -- the writer passes 'model_ops' for that itself.
         python3 "${ROOT}/.github/scripts/ingest_model_ops.py" \
           --json-file       "${JSON_FILE}" \
           --workflow        "${{ inputs.workflow-name }}" \
           --branch          "${{ inputs.branch }}" \
           --sha             "${{ inputs.sha }}" \
-          --run-id          "${RUN_ID}" \
-          --schema          "${{ inputs.schema }}" \
-          --component       "${{ inputs.component }}" \
-          --arch            "${{ inputs.arch }}" \
-          --gha-run-id      "${RUN_ID}" \
-          --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
-          --trigger-type    capability
+          --run-id          "${RUN_ID}"

@@ -889,7 +889,11 @@ def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_pa
 
 def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
     def case(status, name="aten.mm"):
-        props = [("capability.test_type", "model_ops"), ("capability.name", name)]
+        props = [
+            ("capability.test_type", "model_ops"),
+            ("capability.subject", "m"),
+            ("capability.name", name),
+        ]
         return {"status": status, "duration_s": 1.5, "properties": props}
 
     legs: dict = {}
@@ -898,3 +902,17 @@ def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
     ingest._capability_legs(legs, "r1", cases)
     assert legs == {("r1", "model_ops"): {"failed": 1, "total": 2, "duration_s": 3.0}}
     assert [t for _, t, _ in ingest._admitted_legs(legs)] == ["model_ops"]
+
+
+def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
+    # The verdicts themselves are written by insert_test_results; only the leg needs the id.
+    legs: dict = {}
+    props = [
+        ("capability.test_type", "model_ops"),
+        ("capability.subject", "m"),
+        ("capability.name", "aten.mm"),
+    ]
+    ingest._capability_legs(legs, _RUN_ID, [{"status": "passed", "properties": props}])
+    c = _ArtifactClient()
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert legs and c.inserts == []

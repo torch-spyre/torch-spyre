@@ -44,6 +44,7 @@ from spyre_clickhouse_ingest import (
     insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
+    capability_declaration,
     cases_already_ingested,
     drop_older_case_attempts,
     benchmarks_already_ingested,
@@ -1255,19 +1256,11 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
     The verdicts themselves land in capability_runs; this is what ties them to the artifact.
     """
     for case in cases:
-        decl = {
-            k: str(v)
-            for k, v in case.get("properties", []) or []
-            if k.startswith("capability.")
-        }
-        test_type = decl.get("capability.test_type", "")
-        if (
-            not (test_type and decl.get("capability.name"))
-            or case.get("status") == "skipped"
-        ):
+        decl, _ = capability_declaration(case)
+        if not decl or case.get("status") == "skipped":
             continue
         acc = legs.setdefault(
-            (run_id, test_type), {"failed": 0, "total": 0, "duration_s": 0.0}
+            (run_id, decl["test_type"]), {"failed": 0, "total": 0, "duration_s": 0.0}
         )
         acc["total"] += 1
         acc["failed"] += case.get("status") in ("failed", "error")

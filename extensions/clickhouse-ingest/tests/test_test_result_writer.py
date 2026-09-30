@@ -182,7 +182,9 @@ def test_a_declared_capability_is_written_alongside_the_outcome():
 
     c = FakeClient()
     cases = [
-        _declared("a", backend="cpu", **{"capability.fallback_ops": "aten.mul.Tensor"}),
+        _declared(
+            "a", backend="cpu", **{"capability.prop.fallback_ops": "aten.mul.Tensor"}
+        ),
         _declared("b", status="xfail"),
         _declared("c", status="error"),
         _declared("d", status="skipped"),
@@ -263,3 +265,68 @@ def test_every_batch_of_one_type_lands_when_the_file_is_new():
     )
     written = [r for t, rows, _ in c.inserts if t == CAPABILITY_RUNS.name for r in rows]
     assert len(written) == 2
+
+
+def _without(case, key):
+    case["properties"] = [p for p in case["properties"] if p[0] != key]
+    return case
+
+
+def test_an_incomplete_or_conflicting_declaration_is_skipped_and_counted(capsys):
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    conflicting = _declared("e")
+    conflicting["properties"].append(("capability.name", "torch.add"))
+    blank = _without(_declared("c"), "capability.name")
+    blank["properties"].append(("capability.name", " "))
+    cases = [
+        _without(_declared("a"), "capability.subject"),
+        _without(_declared("b"), "capability.test_type"),
+        blank,
+        conflicting,
+        _declared("ok"),
+    ]
+    c = FakeClient()
+    # The outcomes still land; only the verdicts are withheld.
+    assert insert_test_results(c, "db", "torch-spyre", RUN, cases, "a.xml") == 5
+    assert [r["props"]["test_name"] for r in _rows(c, CAPABILITY_RUNS)] == ["ok"]
+    err = capsys.readouterr().err
+    assert "1 capability declaration(s) with no capability.subject" in err
+    assert "1 capability declaration(s) with no capability.test_type" in err
+    assert "1 capability declaration(s) with no capability.name" in err
+    assert "1 capability declaration(s) with conflicting capability.name" in err
+
+
+def test_unknown_capability_keys_are_reported_and_dropped(capsys):
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    case = _declared("a", **{"capability.fallback_ops": "x", "capability.sig.": "y"})
+    c = FakeClient()
+    insert_test_results(c, "db", "torch-spyre", RUN, [case], "a.xml")
+    (run,) = _rows(c, CAPABILITY_RUNS)
+    assert "fallback_ops" not in run["props"]
+    err = capsys.readouterr().err
+    assert "unknown key capability.fallback_ops" in err
+    assert "unknown key capability.sig." in err
+
+
+def test_a_case_without_capability_properties_declares_nothing():
+    from spyre_clickhouse_ingest import capability_declaration
+
+    assert capability_declaration(_case("plain")) == (None, "")
+    assert capability_declaration({"properties": None}) == (None, "")
+
+
+def test_a_reingested_retry_replaces_rather_than_adds_verdicts():
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    # Attempt 2 of a file whose attempt-1 verdicts landed: they are deleted, then rewritten.
+    c = FakeClient(run_count=3)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    assert any(s.startswith("DELETE FROM db.capability_runs") for s, _ in c.commands)
+    c.run_count = 0
+    insert_test_results(
+        c, "db", "torch-spyre", RUN, [_declared("a")], "a.xml", attempt=2
+    )
+    (run,) = _rows(c, CAPABILITY_RUNS)
+    assert run["props"]["run_attempt"] == "2"

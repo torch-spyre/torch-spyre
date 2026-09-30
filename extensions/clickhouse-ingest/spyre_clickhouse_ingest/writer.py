@@ -15,6 +15,7 @@
 """The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
 import math
+from collections import Counter
 import sys
 
 from . import schema
@@ -25,6 +26,50 @@ from .identity import (
     CaseId,
     DerivedId,
 )
+
+
+CAPABILITY_PREFIX = "capability."
+# A declaration without all three names no capability; it is skipped, never guessed.
+CAPABILITY_REQUIRED = ("test_type", "subject", "name")
+
+
+def capability_declaration(case: dict) -> tuple:
+    """(declaration, problem) from a case's `capability.*` JUnit properties.
+
+    The contract: `test_type`, `subject`, `name` (required) and `backend` are scalars;
+    `sig.<k>` is hashed into capability_id; `tag` repeats; `prop.<k>` lands in the verdict's
+    props. Any other key is reported in `unknown` and dropped. A case declaring no
+    `capability.*` property gives (None, ""); one missing a required key or giving a scalar
+    two values gives (None, <problem>).
+    """
+    decl = {"sig": {}, "tags": [], "props": {}, "unknown": [], "backend": ""}
+    scalars: dict = {}
+    seen = False
+    for pname, pvalue in case.get("properties", []) or []:
+        if not pname.startswith(CAPABILITY_PREFIX):
+            continue
+        seen = True
+        key, value = pname[len(CAPABILITY_PREFIX) :], str(pvalue).strip()
+        field, _, sub = key.partition(".")
+        if field in CAPABILITY_REQUIRED + ("backend",) and not sub:
+            if scalars.setdefault(field, value) != value:
+                return None, f"conflicting {CAPABILITY_PREFIX}{field}"
+        elif field == "sig" and sub:
+            decl["sig"][sub] = value
+        elif field == "prop" and sub:
+            decl["props"][sub] = value
+        elif key == "tag":
+            if value:
+                decl["tags"].append(value)
+        else:
+            decl["unknown"].append(f"unknown key {pname}")
+    if not seen:
+        return None, ""
+    missing = [k for k in CAPABILITY_REQUIRED if not scalars.get(k)]
+    if missing:
+        return None, "no " + "/".join(CAPABILITY_PREFIX + k for k in missing)
+    decl.update(scalars)
+    return decl, ""
 
 
 class RunWriter:
@@ -181,11 +226,12 @@ class TestResultWriter(RunWriter):
             return 0
         ident_rows, run_rows = {}, []
         verdicts: dict[tuple, list] = {}
+        problems: Counter = Counter()
         skipped = ignored = 0
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
-            cls._capability(c, run_tags, attempt, verdicts)
+            cls._capability(c, run_tags, attempt, verdicts, problems)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -247,6 +293,8 @@ class TestResultWriter(RunWriter):
                     shard=source_file,
                 )
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
+        for problem, n in sorted(problems.items()):
+            cls._warn(n, f"capability declaration(s) with {problem}")
         cls._warn(
             ignored,
             "property value(s) ignored -- not tag, metric.*, result.* or capability.*",
@@ -263,32 +311,21 @@ class TestResultWriter(RunWriter):
     }
 
     @classmethod
-    def _capability(cls, case: dict, run_tags, attempt: int, verdicts: dict) -> None:
-        """Add the case's `capability.*` verdict, if it declares one, to `verdicts`.
+    def _capability(
+        cls, case: dict, run_tags, attempt: int, verdicts: dict, problems: Counter
+    ) -> None:
+        """Add the case's `capability.*` verdict, if it declares a valid one, to `verdicts`.
 
         Keyed by (test_type, arch, sig keys): one CapabilityWriter batch hashes one key set.
-        `capability.sig.<k>` is hashed into capability_id, in sorted key order;
-        `capability.tag` is repeatable; any other `capability.<k>` lands in the run's props.
         """
-        decl: dict = {}
-        sig: dict = {}
-        tags: list = []
-        props = {"test_name": case.get("name", "")}
-        for pname, pvalue in case.get("properties", []) or []:
-            if not pname.startswith("capability."):
-                continue
-            key, value = pname[len("capability.") :], str(pvalue)
-            if key.startswith("sig."):
-                sig[key[len("sig.") :]] = value
-            elif key == "tag":
-                tags.append(value)
-            elif key in ("test_type", "subject", "name", "backend"):
-                decl[key] = value
-            elif key:
-                props[key] = value
+        decl, problem = capability_declaration(case)
+        problems.update(decl["unknown"] if decl else [])
+        if problem:
+            problems[problem] += 1
         status = cls._VERDICT.get(case.get("status", ""))
-        if not (status and decl.get("name")):
+        if not (decl and status):
             return
+        props = {"test_name": case.get("name", ""), **decl["props"]}
         if attempt:
             props["run_attempt"] = str(attempt)
         arch = next(
@@ -299,15 +336,15 @@ class TestResultWriter(RunWriter):
             ),
             "",
         )
-        key = (decl.get("test_type", ""), arch, tuple(sorted(sig)))
+        key = (decl["test_type"], arch, tuple(sorted(decl["sig"])))
         verdicts.setdefault(key, []).append(
             {
-                "subject": decl.get("subject", ""),
+                "subject": decl["subject"],
                 "name": decl["name"],
                 "status": status,
-                "backend": decl.get("backend", ""),
-                "disc": sig,
-                "tags": tags,
+                "backend": decl["backend"],
+                "disc": decl["sig"],
+                "tags": decl["tags"],
                 "props": {k: v for k, v in props.items() if v},
             }
         )

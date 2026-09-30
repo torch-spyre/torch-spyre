@@ -81,10 +81,13 @@ What a case's JUnit properties become:
 | `capability.sig.<k>` | `capability.sig.input_shapes=["[1,2]"]` | `capabilities.props`, hashed (sorted by key) |
 | `capability.backend` | `capability.backend=cpu` | `capability_runs.backend` |
 | `capability.tag` (repeatable) | `capability.tag=torch.mul.1` | `capabilities.tags` |
-| any other `capability.<k>` | `capability.fallback_ops=aten.mul.Tensor` | `capability_runs.props[k]` |
+| `capability.prop.<k>` | `capability.prop.fallback_ops=aten.mul.Tensor` | `capability_runs.props[k]` |
+| any other `capability.<k>` | `capability.fallback_ops=x` | dropped, counted in a `[warn]` |
 | anything else | `single_input_index` | ignored, counted in a `[warn]` |
 
-A case carrying `capability.name` also writes one `capability_runs` verdict from its outcome:
+A case declaring `capability.test_type`, `.subject` and `.name` (all three required; one
+missing, or a scalar given two values, skips the verdict with a `[warn]`) also writes one
+`capability_runs` verdict from its outcome:
 passed/xpass → `passed`, failed/error → `failed`, xfail → `not_implemented`; a skipped case
 writes none. `arch` is the run's `platform__` tag and `shard` is the source file, so the
 verdicts share the outcomes' dedup and re-run replacement.
