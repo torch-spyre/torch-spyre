@@ -23,6 +23,7 @@ from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
     FP8_2D_STICK_OPS,
+    POOL_OPS,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
@@ -1396,7 +1397,8 @@ def generate_sdsc(
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
-                    if str(dim) not in sdsc_spec.window_dims
+                    if sdsc_spec.opfunc not in POOL_OPS
+                    or str(dim) not in sdsc_spec.window_dims
                 },
                 # Window dims (ki/kj) are not real dims of any tensor for pool
                 # operations and hence should not be emitted
@@ -1404,7 +1406,8 @@ def generate_sdsc(
                     core: {
                         dim: slc
                         for dim, slc in slices.items()
-                        if dim not in sdsc_spec.window_dims
+                        if sdsc_spec.opfunc not in POOL_OPS
+                        or dim not in sdsc_spec.window_dims
                     }
                     for core, slices in core_id_to_wk_slice.items()
                 },

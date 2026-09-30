@@ -2595,7 +2595,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         window_sdsc_fields = _avgpool_sdsc_fields(
             sdsc_iteration_space,
             op_spec.op_info.get("conv_params", {}),
-            work_slices,
         )
     else:
         window_sdsc_fields = {}
