@@ -24,6 +24,8 @@ Tests all 4 conversion cases:
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
 """
 
+import math
+
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
@@ -193,22 +195,41 @@ def test_fp32_to_fp16_restoration(device, fp16):
     print("✓ FP32→FP16 restoration (DL16_TO_FP32 → STANDARD) works")
 
 
+# Shapes used by both bidirectional roundtrip tests.
+# [4, 128]: stick-aligned (128 = 2 fp16 sticks of 64).
+# [4, 96] and [5, 4, 96]: sub-stick (96 = 1.5 fp16 sticks; the last is partial).
+# [2, 3, 5] and [2, 3, 1]: extents inside the first half-stick, where the live
+# elements fit one FP32 stick but the stagger still reaches the pair, so the
+# widening conversion's capacity comes from insert_staggered_ea_padding rather
+# than from the extent itself.  [2, 3, 1] also exercises the sentinel stick dim.
+_ROUNDTRIP_SHAPES = [
+    pytest.param((4, 128), id="aligned_4x128"),
+    pytest.param((4, 96), id="substick_4x96"),
+    pytest.param((5, 4, 96), id="substick_5x4x96"),
+    pytest.param((2, 3, 5), id="substick_2x3x5"),
+    pytest.param((2, 3, 1), id="substick_2x3x1"),
+]
+
+
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp16_start(device, fp16):
-    """Test FP16→FP32→FP16 roundtrip."""
+def test_bidirectional_roundtrip_fp16_start(device, shape, fp16):
+    """Test FP16→FP32→FP16 roundtrip for stick-aligned and sub-stick shapes."""
+    torch._dynamo.reset()
 
     @torch.compile
     def fn(x):
         # FP16(STANDARD) → FP32(DL16_TO_FP32) → FP16(STANDARD)
         x_fp32 = x.to(torch.float32)
-        return x_fp32.to(dtype=fp16)
+        # Without an op in between, inductor folds the pair into an FP16 copy.
+        return (x_fp32 * 2.0).to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = fn(x)
 
     # Verify final EA is STANDARD
@@ -221,13 +242,15 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp32_start(device, fp16):
-    """Test FP32→FP16→FP32 roundtrip."""
+def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
+    """Test FP32→FP16→FP32 roundtrip for stick-aligned and sub-stick shapes."""
+    torch._dynamo.reset()
 
     @torch.compile
     def fn(x):
@@ -235,7 +258,7 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
         x_fp16 = x.to(dtype=fp16)
         return x_fp16.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = fn(x)
 
     # Verify final EA is STANDARD
@@ -297,37 +320,56 @@ def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
     torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-2, atol=1e-2)
 
 
-# An op consuming an upcast FP32 value before the downcast back, on stick lengths
-# that end inside a stick. The upcast value is staggered: each FP16 stick spans a
-# pair of FP32 sticks. Padding the conversions is enough while work division
-# leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
-# is a whole number of pairs; (68,) is the unsplit case.
-_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
-# Here work division splits the stick dim and the round-up ends in the middle of
-# a pair, so the pair's second stick is left to no core.
-# TODO: make work division handle staggered FP32, splitting the stick dim by
-# whole stick pairs.
-_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
+def _upcast_consumed(x):
+    return x.to(torch.float32) + 0.0
+
+
+def _downcast(x):
+    return x.to(torch.float16)
 
 
 @pytest.mark.parametrize(
-    "shape",
+    "fn, dtype",
     [
-        *_PARTIAL_STICK_UPCAST_PASS,
-        *[
-            pytest.param(
-                shape,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason="TODO: size work division for an upcast value by whole "
-                    "stick pairs, so the last pair's second stick is processed",
-                ),
-            )
-            for shape in _PARTIAL_STICK_UPCAST_NEEDS_PAIRS
-        ],
+        pytest.param(_upcast_consumed, torch.float16, id="fp16_to_fp32"),
+        pytest.param(_downcast, torch.float32, id="fp32_to_fp16"),
     ],
-    ids=str,
 )
+def test_conversion_on_size1_stick_dim_stays_in_its_buffer(fn, dtype):
+    """A conversion of an (n, 1) tensor accesses its FP32 stick pair once.
+
+    Each row's element sits in a stick of its own, and the FP32 side is padded
+    to a stick pair on a dim of its own. Access beyond the buffer is invisible in
+    the values, as only the first FP32 stick holds an element, but faults the
+    device once it leaves mapped memory; 704 rows, with the pair as the last
+    buffer of the HBM pool, are enough for that.
+    """
+    torch._dynamo.reset()
+    x = (torch.randint(-64, 64, (704, 1)) / 8).to(dtype)
+    result = torch.compile(fn)(x.to(DEVICE_NAME))
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
+
+
+# An op consuming an upcast FP32 value before the downcast back, on stick lengths
+# that end inside a stick. The upcast value is staggered: each FP16 stick spans a
+# pair of FP32 sticks. (68,) leaves the stick dim unsplit; in (232,), (1000,),
+# (4, 100) and (4, 104) the stick dim rounded up to FP32 sticks is a whole number
+# of pairs; in the rest, work division splits the stick dim where the round-up
+# ends in the middle of a pair, so it has to split by whole pairs.
+_PARTIAL_STICK_UPCAST_SHAPES = [
+    (68,),
+    (232,),
+    (1000,),
+    (4, 100),
+    (4, 104),
+    (196,),
+    (4100,),
+    (4, 68),
+    (4, 196),
+]
+
+
+@pytest.mark.parametrize("shape", _PARTIAL_STICK_UPCAST_SHAPES, ids=str)
 def test_upcast_consumed_on_partial_stick(shape):
     """An op between an FP16 -> FP32 -> FP16 round trip keeps every element.
 
@@ -343,6 +385,118 @@ def test_upcast_consumed_on_partial_stick(shape):
     x = (torch.randint(-64, 64, shape) / 8).to(torch.float16)
     result = torch.compile(fn)(x.to("spyre"))
     torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
+
+
+# A staggered FP32 value spans two sticks per FP16 stick, so an extent that is
+# not a whole FP16 stick leaves the second one partly live.  Cover the sub-stick
+# extents (below one FP16 stick) and the half-stick multiples, where the wide
+# side needs an odd number of FP32 sticks rounded up to the pair.
+_CONSUMED_WIDE_EXTENTS = [1, 5, 31, 32, 33, 63, 96]
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("extent", _CONSUMED_WIDE_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_consumed_wide_value_keeps_both_staggered_sticks(device, extent, fp16):
+    """A consumer between two conversions covers both sticks of a staggered pair.
+
+    Unlike the roundtrips above, the wide value is read by an op rather than
+    converted straight back, so the pair of FP32 sticks holding one FP16 stick
+    has to survive into that op's own iteration.  An op reaching only the first
+    stick drops half the elements, interleaved through the extent rather than
+    left in a tail, which a bare roundtrip cannot show: with nothing consuming
+    the wide value the pair of casts folds to an identity and no conversion
+    reaches the device at all.
+    """
+    torch._dynamo.reset()
+
+    def fn(x):
+        return (x.to(torch.float32) * 2.0).to(dtype=fp16)
+
+    x = torch.randn(2, 3, extent, device=device, dtype=fp16)
+    result = torch.compile(fn)(x)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    assert_val(fn, x, result)
+
+
+@pytest.mark.parametrize("rows", [4, 8], ids=lambda n: f"rows{n}")
+def test_widened_slice_cast_to_int32_gathers_rows(rows):
+    """A one-stick slice of a widened value, cast to INT32, indexes a gather.
+
+    This is how MoE expert routing builds its gather indices: each expert id is
+    broadcast across an FP16 stick, widened, and sliced to one FP32 stick.  The
+    INT32 cast reads the staggered FP32 value but writes an unstaggered output,
+    one stick per row, which it must fill without reaching into the next row.
+    """
+    torch._dynamo.reset()
+
+    def fn(widened, table):
+        index = widened.to(torch.float32)[..., :32].to(torch.int32)[..., 0]
+        return table[index]
+
+    ids = (torch.arange(rows) * 7 + 3) % 64
+    widened = ids.to(torch.float16)[None, :, None].expand(1, rows, 64).contiguous()
+    table = (torch.arange(64 * 128) % 257).reshape(64, 128).to(torch.float16)
+    result = torch.compile(fn, dynamic=False)(
+        widened.to(DEVICE_NAME), table.to(DEVICE_NAME)
+    )
+
+    torch.testing.assert_close(result.cpu(), table[ids][None], rtol=0, atol=0)
+
+
+# Extents a single FP16 stick holds but a single FP32 stick does not, bracketed by
+# the ones on either side that fit (32) or fill (64) the FP16 stick.
+_NARROWED_EXTENTS = [5, 32, 33, 48, 63, 64, 96]
+
+
+def _narrow_then_widen_eager(x, fp16):
+    return x.to(dtype=fp16).to(torch.float32)
+
+
+def _narrow_consume_widen(x, fp16):
+    return (x.to(dtype=fp16) * 2.0).to(torch.float32)
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape_prefix", [(4,), (2, 3)], ids=["4xn", "2x3xn"])
+@pytest.mark.parametrize("extent", _NARROWED_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fn, mode",
+    [
+        pytest.param(_narrow_then_widen_eager, "eager", id="eager"),
+        pytest.param(_narrow_consume_widen, "compile", id="compile_consumed"),
+    ],
+)
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_narrowed_value_widens_into_every_fp32_stick(
+    device, shape_prefix, extent, fn, mode, fp16
+):
+    """Widening a narrowed value returns the elements past the first FP32 stick.
+
+    An FP16 stick holding more than 32 elements widens into two FP32 sticks, both
+    holding host elements, so the STANDARD result has to map the second one to
+    the host rather than leave it as unaddressed capacity.  Eager casts run as
+    separate conversions; the compiled case consumes the narrowed value before
+    widening it.  The values are integers exact in every format involved,
+    so a dropped element shows as a mismatch instead of hiding in the tolerance.
+    """
+    torch._dynamo.reset()
+    shape = (*shape_prefix, extent)
+    host = (torch.arange(math.prod(shape)) % 257).reshape(shape).to(torch.float32)
+
+    result = _run(fn, host.to(device), fp16, mode=mode)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    torch.testing.assert_close(result.cpu(), fn(host, fp16), rtol=0, atol=0)
 
 
 def _stagger_fn(x, fp16):
@@ -442,6 +596,142 @@ def test_fp16_to_fp32_on_qkv_slice(shape, part):
 
     torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.03)
     assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+
+
+def test_fp16_to_fp32_on_heads_view_input_reads_as_a_slice():
+    """An upcast of a heads view of fused QKV lays out every head.
+
+    Eager decode passes q as ``qkv[:, :256].view(1, 2, 128)``, which keeps qkv's
+    device layout: one device dim holds all 12 fp16 sticks, at ``2*head +
+    floor(elem/64)``. The view reads as a slice, so the output gets its own
+    heads dim rather than a rescale of qkv's.
+    """
+
+    def fn(q):
+        x32 = q.float()
+        # The multiply keeps inductor from folding the round trip into an FP16 copy.
+        return (x32 * 3.0).half(), x32
+
+    qkv = torch.randn(1, 768, dtype=torch.float16)
+    expected, _ = fn(qkv[:, :256].view(1, 2, 128))
+    result, upcast = torch.compile(fn)(qkv.to(DEVICE_NAME)[:, :256].view(1, 2, 128))
+
+    torch.testing.assert_close(result.cpu(), expected, atol=0.005, rtol=0.005)
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+    assert list(get_spyre_tensor_layout(upcast).device_size) == [1, 4, 2, 32]
+
+
+@pytest.mark.parametrize("tokens", [16, 40])
+def test_eager_upcast_of_a_stick_with_no_dim_counting_its_sticks(tokens):
+    """An eager upcast of a hidden state with its stick on the token dim compiles.
+
+    A TP=2 decode hands RMSNorm a ``[tokens, 4096]`` value laid out as
+    ``[4096, 64]``/``[1, 4096]``: the tokens on the stick, and no device dim to
+    count its sticks, so the upcast builds its layout as for a slice. 40 tokens
+    take two fp32 sticks. The host transfer rejects that stride map, so the layout
+    is allocated on the device directly and only the layout is checked.
+    """
+    from torch_spyre._C import (
+        SpyreTensorLayout,
+        get_device_dtype,
+        spyre_empty_with_layout,
+    )
+
+    layout = SpyreTensorLayout(
+        [4096, 64],
+        [1, 4096],
+        get_device_dtype(torch.float16),
+        ElementArrangement.STANDARD,
+    )
+    hidden = spyre_empty_with_layout(
+        (tokens, 4096),
+        (4096, 1),
+        torch.float16,
+        layout,
+        device=torch.device(DEVICE_NAME),
+    )
+
+    upcast = hidden.to(torch.float32)
+
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+    assert get_spyre_tensor_layout(upcast).stride_map[-1] == upcast.stride(0)
+
+
+@pytest.mark.parametrize("start", [0, 1024], ids=lambda n: f"start{n}")
+def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
+    """A sliced staggered upcast puts its stick where the input's stick lands.
+
+    Transposing the column slice moves the input's stick dim to output dim 0,
+    which is not the output's last dim.
+    """
+    torch._dynamo.reset()
+    tokens, width = 8, 256
+
+    def fn(x):
+        x32 = x[:, start : start + width].t().float()
+        return (x32 * x32).sum(0).to(x.dtype), x32
+
+    x = torch.randn(tokens, 1536, dtype=torch.float16)
+    expected, _ = fn(x)
+    result, upcast = torch.compile(fn, dynamic=False)(x.to(DEVICE_NAME))
+
+    torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.01)
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+    assert get_spyre_tensor_layout(upcast).stride_map[-1] == upcast.stride(0)
+
+
+def _downcast_stick_slice(start, stop):
+    def fn(a, b):
+        return (b.float() * 2)[:, 0, start:stop].half() + a
+
+    return fn
+
+
+@pytest.mark.parametrize(
+    "start, extent", [(0, 64), (64, 128)], ids=["first_pair", "second_pair"]
+)
+def test_downcast_of_one_stick_slice_reads_the_stick_pair(start, extent):
+    """A downcast of a one-FP32-stick slice reads both sticks of its pair.
+
+    The staggered value already holds whole pairs, so no gap dim is added: the
+    pair lives on the num-sticks dim.  The slice's host range fits one FP32
+    stick, but the downcast iterates a whole FP16 stick, spread over the pair.
+    The size-2 outer dim selected by ``[:, 0]`` is a host dim, not the pair.
+    """
+    torch._dynamo.reset()
+    fn = _downcast_stick_slice(start, start + 32)
+    a = torch.randn(4, 32, dtype=torch.float16)
+    b = torch.randn(4, 2, extent, dtype=torch.float16)
+    result = torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+    torch.testing.assert_close(result.cpu(), fn(a, b), rtol=0.005, atol=0.005)
+
+
+def test_downcast_of_slice_starting_inside_a_stick_pair_is_unsupported():
+    """A slice starting at the pair's second FP32 stick fails loudly."""
+    torch._dynamo.reset()
+    fn = _downcast_stick_slice(32, 64)
+    a = torch.randn(4, 32, dtype=torch.float16)
+    b = torch.randn(4, 2, 64, dtype=torch.float16)
+    with pytest.raises(Exception, match="starting at stick 1, inside a stick pair"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+
+def test_downcast_of_view_stepping_one_stick_is_unsupported():
+    """A downcast whose outer host dim steps one FP32 stick fails loudly.
+
+    Each FP16 output stick takes one row of that dim, while a stick pair spans
+    two rows.
+    """
+    torch._dynamo.reset()
+
+    def fn(a, b):
+        return (b.float() * 2).view(4, 4, 32)[:, 0:2, :].half() + a
+
+    a = torch.randn(4, 2, 32, dtype=torch.float16)
+    b = torch.randn(4, 128, dtype=torch.float16)
+    with pytest.raises(Exception, match="starting at a varying stick"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
 
 
 # ---------------------------------------------------------------------------

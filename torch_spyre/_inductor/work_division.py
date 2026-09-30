@@ -445,7 +445,12 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        stl = td.layout.device_layout
+        elems_per_stick = stl.elems_per_stick()
+        if stl.element_arrangement == ElementArrangement.DL16_TO_FP32:
+            # A DL16_TO_FP32 tensor interleaves its elements across a stick pair,
+            # so the pair is the unit that cannot be split.
+            elems_per_stick *= 2
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 

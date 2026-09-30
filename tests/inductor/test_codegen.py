@@ -47,6 +47,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -1014,3 +1015,42 @@ class TestConversionPaddingAcrossStickWidths(InductorTestCase):
                 (stick,) = sdsc_spec.padding
                 self.assertEqual(sdsc_spec.iteration_space[stick], 64)
                 self.assertEqual(sdsc_spec.padding[stick], 63)
+
+
+class TestStaggeredFp32Consumer(InductorTestCase):
+    """An op that keeps the staggered arrangement iterates the whole stick pair.
+
+    A widened FP32 value spans a pair of FP32 sticks per FP16 stick, so an op
+    whose operands both carry the arrangement covers both sticks of the pair.
+    """
+
+    def test_staggered_output_covers_the_stick_pair(self):
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 32), row, sympy.Mod(lane, 32)]
+        iteration_space = {row: (sympy.Integer(4), 1), lane: (sympy.Integer(32), 1)}
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=arg_index,
+                    device_dtype=DataFormats.IEEE_FP32,
+                    device_size=[2, 4, 32],
+                    device_coordinates=coords,
+                    allocation={"hbm": address},
+                    element_arrangement=ElementArrangement.DL16_TO_FP32,
+                    stride_map=[32, 64, 1],
+                )
+                for arg_index, (is_input, address) in enumerate(
+                    [(True, 0), (False, 0x100000)]
+                )
+            ],
+            op_info={},
+        )
+        simplify_op_spec(spec)
+        sdsc_spec, _ = parse_op_spec(spec)
+        sizes = sorted(int(size) for size in sdsc_spec.iteration_space.values())
+        self.assertEqual(sizes, [4, 64])

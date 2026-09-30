@@ -34,6 +34,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import CeilDiv
 from torch._inductor.virtualized import V
 
 
@@ -854,6 +855,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
             kernel_local=kernel_local,
+            stride_map=list(tensor.layout.device_layout.stride_map),
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1849,6 +1851,176 @@ def _check_relayout_boundary(
         )
 
 
+def _has_staggered_ea(op_spec: OpSpec) -> bool:
+    """Whether this op reads or writes a staggered arrangement, as padding decides.
+
+    Mirrors ``insert_staggered_ea_padding``: a typecast, one input and one output
+    differing in elements per stick, or an op writing a DL16_TO_FP32 value.  A
+    reduction is never a typecast: it keeps its input dtype, and a separate
+    pointwise op converts the result.
+    """
+    if not op_spec.args:
+        return False
+    in_arg, out_arg = op_spec.args[0], op_spec.args[-1]
+    in_eps = in_arg.device_size[-1]
+    out_eps = out_arg.device_size[-1]
+    is_typecast = (
+        not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps != out_eps
+    )
+    return is_typecast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+
+
+def _holds_stick_pair(arg: TensorArg, max_eps: int) -> bool:
+    """Whether ``arg`` keeps a stick pair on the gap dim ``_pad_num_sticks`` prepends."""
+    return (
+        arg.device_size[-1] < max_eps
+        and arg.stride_map is not None
+        and arg.stride_map[0] == -1
+        and arg.device_size[0] > 1
+    )
+
+
+def _add_size1_stick_var(op_spec: OpSpec, max_eps: int) -> None:
+    """Give a size-1 stick dim a stick var, so its stick pair can be bound.
+
+    A size-1 stick dim has no loop var, so no operand's stick coordinate names
+    one and the pair's gap dim stays unbound.  SDSC codegen would then pad the
+    stick dim to a whole wide stick, spanning the pair, and treat the unbound gap
+    dim as a back gap besides: the pair counted twice, the access overruns the
+    buffer.  The new var spans one stick of the side with more elements per
+    stick; it is given to the operands holding the pair and, for a typecast, to
+    both operands.  Other operands are broadcasts and keep their constant stick
+    coordinate.
+    """
+    if any(arg.device_coordinates[-1].free_symbols for arg in op_spec.args):
+        return
+    pair_args = [arg for arg in op_spec.args if _holds_stick_pair(arg, max_eps)]
+    if not pair_args:
+        return
+    is_typecast = (
+        not op_spec.is_reduction
+        and len(op_spec.args) == 2
+        and len({arg.device_size[-1] for arg in op_spec.args}) == 2
+    )
+    targets = op_spec.args if is_typecast else pair_args
+    stick_var = next(
+        sym
+        for idx in itertools.count()
+        if (sym := sympy.Symbol(f"st{idx}")) not in op_spec.iteration_space
+    )
+    op_spec.iteration_space[stick_var] = (sympy.Integer(max_eps), 1)
+    for arg in targets:
+        arg.device_coordinates = [*arg.device_coordinates[:-1], stick_var]
+
+
+def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
+    """Make an op with a staggered arrangement iterate whole sticks.
+
+    ``insert_staggered_ea_padding`` pads such an op's buffers to whole sticks, but
+    the op's iteration space still spans only the live elements.  This rounds the
+    range of each stick var up to match, and binds the stick index of an operand
+    with fewer elements per stick to the dim holding its stick pair.
+
+    Runs before ``align_tensors``, which re-intersects the split work division
+    planned with each stick var's stick count on the first operand.  On an
+    unrounded range the two can share no factor, e.g. 96 FP32 elements are 3 FP32
+    sticks against a 2-way split of 2 FP16 sticks.  The op then drops to one core
+    on that dim, disagreeing with its LX owners, which demotes them to HBM.
+    """
+    # A typecast converts whole sticks of its side with more elements per stick.
+    max_eps = max(arg.device_size[-1] for arg in op_spec.args)
+    if any(
+        arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+        for arg in op_spec.args
+    ):
+        # A DL16_TO_FP32 value spreads each FP16 stick over an FP32 stick pair, so
+        # an op whose operands are all FP32 still iterates whole FP16 sticks.
+        max_eps = max(max_eps, DataFormats.SEN169_FP16.elems_per_stick())
+    _add_size1_stick_var(op_spec, max_eps)
+
+    rounded_stick_vars = set()
+    for arg in op_spec.args:
+        coords = list(arg.device_coordinates)
+        stick_coord = coords[-1]
+        if not stick_coord.free_symbols:
+            # A broadcast or size-1 stick dim has no stick var.
+            continue
+        # The stick-expression check upstream admits only one stick var.
+        assert len(stick_coord.free_symbols) == 1, stick_coord
+        (stick_var,) = stick_coord.free_symbols
+        # Round the stick var's extent up to whole sticks of the side with more
+        # elements per stick, e.g. 96 -> 128 for an FP32 <-> FP16 typecast.
+        if stick_var in op_spec.iteration_space and stick_var not in rounded_stick_vars:
+            extent, split = op_spec.iteration_space[stick_var]
+            op_spec.iteration_space[stick_var] = (
+                CeilDiv(extent, max_eps) * max_eps,
+                split,
+            )
+            rounded_stick_vars.add(stick_var)
+
+        eps = arg.device_size[-1]
+        if eps == max_eps:
+            # The rounded stick var spans exactly one of the operand's sticks.
+            continue
+        if any(stick_var in c.free_symbols for c in coords[:-1]):
+            # Indexing already puts the stick index on an outer dim, as for a read
+            # of whole pairs.
+            continue
+        # Every supported typecast halves or doubles the elements per stick.
+        assert max_eps == 2 * eps, (max_eps, arg)
+
+        # Find the dim holding the pair, to take the stick index.
+        stride_map, size = arg.stride_map, arg.device_size
+        assert stride_map is not None, arg
+        if stride_map[0] == -1 and size[0] > 1:
+            # The gap dim ``_pad_num_sticks`` prepends when the num-sticks dim holds
+            # a single stick.  A size-1 dim with ``stride_map`` -1 is an elided
+            # host dim instead.
+            stick_index_dim = 0
+        else:
+            # The num-sticks dim, which steps the host by one stick.  Of the padded
+            # operands, only a read of one stick of a wider buffer gets here, e.g.
+            # ``x32[..., 64:96]``; a read of more sticks already indexes this dim.
+            stick_stride = eps * stride_map[-1]
+            candidate_dims = [
+                d
+                for d in range(len(size) - 1)
+                if stride_map[d] == stick_stride and size[d] > 1
+            ]
+            if len(candidate_dims) != 1:
+                # TODO: bind an operand whose stick pair is on no single dim,
+                # e.g. one that padding left alone or with a folded num-sticks dim.
+                raise Unsupported(
+                    f"staggered read with no unique num-sticks dim {candidate_dims}: "
+                    f"{arg}"
+                )
+            (stick_index_dim,) = candidate_dims
+        stick_index_offset = coords[stick_index_dim]
+        if not stick_index_offset.is_Integer:
+            # TODO: support a pair whose position varies over the iteration.
+            raise Unsupported(
+                f"staggered read starting at a varying stick {stick_index_offset}: {arg}"
+            )
+        if stick_index_offset % 2 != 0:
+            # TODO: support a slice starting at the second stick of a pair, e.g.
+            # ``x32[..., 32:64]``, unlike ``64:96``; its lanes run into the next
+            # pair.
+            raise Unsupported(
+                f"staggered read starting at stick {stick_index_offset}, inside a stick "
+                f"pair: {arg}"
+            )
+        assert size[stick_index_dim] >= stick_index_offset + 2, arg
+
+        # The rounded stick var spans a pair of the operand's sticks, so its stick
+        # coordinate becomes two: the stick index, on the dim holding the pair, and
+        # the offset within the stick, innermost.  Otherwise lanes past the first
+        # stick read beyond it, and a gap dim is left for align to treat as a
+        # separate back gap.
+        coords[stick_index_dim] = stick_index_offset + sympy.floor(stick_coord / eps)
+        coords[-1] = sympy.Mod(stick_coord, eps)
+        arg.device_coordinates = coords
+
+
 def simplify_op_spec(
     op_spec,
     indirect_sizes=None,
@@ -1863,6 +2035,11 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
+
+    if _has_staggered_ea(op_spec):
+        # Iterate whole sticks before align_tensors re-intersects the planned split
+        # with the first operand's stick count, so the split and LX placement survive.
+        _adjust_for_staggered_ea(op_spec)
 
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,

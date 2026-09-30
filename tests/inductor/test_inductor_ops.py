@@ -454,63 +454,6 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.bfloat16, torch.float32]
-    for dst in [torch.float16, torch.float32]
-    if src != dst
-    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
-]
-
-# Explicit round trips that pass on a stick ending inside a stick; the rest of the
-# unaligned shapes need the consumer of the upcast value padded to whole stick
-# pairs (see test_upcast_consumed_on_partial_stick). The implicit round
-# trip still hits an unsupported op on these shapes.
-_ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
-_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
-]
-
-# Further round-trip cases that now pass on every config. They differ between the
-# add and copy variants, so each variant gets its own expect_fail list. The implicit
-# variant is the same as the shared implicit list minus its own passing cases.
-_ROUND_TRIP_ADD_NOW_PASSING = {
-    "bfloat16_to_float16_4x16",
-    "bfloat16_to_float16_4x32",
-    "bfloat16_to_float16_4x63",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "bfloat16_to_float32_4x63",
-    "float16_to_float32_4x63",
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
-    "bfloat16_to_float32_4x16",
-    "float16_to_float32_4x16",
-}
-_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
-    "float32_to_float16_4x16",
-    "float32_to_float16_4x63",
-}
-TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_ADD_NOW_PASSING
-]
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
-    case
-    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
-    if case not in _ROUND_TRIP_COPY_NOW_PASSING
-]
-TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
-    case
-    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
-    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
-]
-
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
 TO_DTYPE_REDUCTION_PARAMS_SETS = {
@@ -5876,7 +5819,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6093,7 +6035,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -6101,7 +6042,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",
