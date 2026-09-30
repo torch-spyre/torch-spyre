@@ -546,7 +546,14 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--json-file", required=True, help="Path to JSON from parse_model_ops_logs.py"
+        "--json-file", default="", help="Path to JSON from parse_model_ops_logs.py"
+    )
+    parser.add_argument(
+        "--junit-xml",
+        nargs="*",
+        default=[],
+        metavar="XML",
+        help="Model-ops JUnit reports; the v2 verdicts come from these, not --json-file",
     )
     parser.add_argument(
         "--workflow", default="model-ops-tests", help="GHA workflow name"
@@ -585,28 +592,25 @@ def main() -> None:
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
 
     # ── Load JSON ────────────────────────────────────────────────────────────
-    json_path = Path(args.json_file)
-    if not json_path.exists():
-        print(f"[error] File not found: {json_path}", file=sys.stderr)
-        sys.exit(1)
-
-    with open(json_path) as fh:
-        records = json.load(fh)
-
-    if not records:
-        print("[info] JSON file contains no records — nothing to ingest.")
+    records = []
+    if args.json_file:
+        json_path = Path(args.json_file)
+        if not json_path.exists():
+            print(f"[error] File not found: {json_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(json_path) as fh:
+            records = json.load(fh) or []
+        # Filter out records without a valid suite_name
+        records = [
+            r
+            for r in records
+            if r.get("suite_name", "").strip() and not r["suite_name"].startswith(".")
+        ]
+        print(f"[info] Loaded {len(records)} suite record(s) from {json_path.name}")
+    args.write_v1 = args.write_v1 and bool(records)
+    if not records and not (args.write_v2 and args.junit_xml):
+        print("[info] No records to ingest.")
         sys.exit(0)
-    # Filter out records without a valid suite_name
-    records = [
-        r
-        for r in records
-        if r.get("suite_name", "").strip() and not r["suite_name"].startswith(".")
-    ]
-    if not records:
-        print("[info] No valid records after filtering — nothing to ingest.")
-        sys.exit(0)
-
-    print(f"[info] Loaded {len(records)} suite record(s) from {json_path.name}")
 
     # ── Connect ──────────────────────────────────────────────────────────────
     print(
@@ -702,7 +706,14 @@ def main() -> None:
                     ):
                         print(f"[info] v2: run_id={run_id} model_ops already ingested")
                     else:
-                        results = _v2_capability_results(records)
+                        if args.junit_xml:
+                            from model_ops_junit import capability_results
+
+                            results = [
+                                r for x in args.junit_xml for r in capability_results(x)
+                            ]
+                        else:
+                            results = _v2_capability_results(records)
                         n = insert_capabilities(
                             client,
                             v2db,
