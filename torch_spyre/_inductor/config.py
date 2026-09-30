@@ -332,5 +332,12 @@ _cpsat_warn_on_cost_expr: bool = True
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+# Serialize cache commits and require a ready sentinel before treating a kernel
+# as cached. Use this when TORCHINDUCTOR_CACHE_DIR is shared across concurrent
+# processes on a network filesystem (e.g., PVC-mounted NFS across CI pods).
+# Without this flag the cache uses the fast, single-client POSIX rename path.
+spyre_kernel_cache_shared: bool = (
+    os.environ.get("SPYRE_KERNEL_CACHE_SHARED", "0") == "1"
+)
 
 install_config_module(sys.modules[__name__])
