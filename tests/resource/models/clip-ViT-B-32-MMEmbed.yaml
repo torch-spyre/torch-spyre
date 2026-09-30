@@ -1,0 +1,1187 @@
+model: clip-ViT-B-32
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.to.1
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 3, 224, 224]
+          stride: [150528, 50176, 224, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L209 in forward, code: patch_embeds
+      = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]'
+    marks: fp32operation
+    kwmap:
+      dtype: torch.float16
+  - name: torch.conv2d.1
+    op: torch.conv2d
+    inputs:
+      - tensor:
+          shape: [1, 3, 224, 224]
+          stride: [150528, 50176, 224, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 3, 32, 32]
+          stride: [3072, 1024, 32, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - value: null
+      - value: (32, 32)
+      - value: (0, 0)
+      - value: (1, 1)
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L209 in forward, code: patch_embeds
+      = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]'
+    marks: constant
+  - name: torch.flatten.1
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 768, 7, 7]
+          stride: [37632, 49, 7, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L210 in forward, code: patch_embeds
+      = patch_embeds.flatten(2).transpose(1, 2)'
+    marks: constant
+  - name: torch.transpose.1
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 768, 49]
+          stride: [37632, 49, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L210 in forward, code: patch_embeds
+      = patch_embeds.flatten(2).transpose(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.1
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 1
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L212 in forward, code: class_embeds
+      = self.class_embedding.expand(batch_size, 1, -1)'
+    marks: constant
+  - name: torch.cat.1
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 1, 768]
+            stride: [768, 768, 1]
+            storage_offset: 0
+            dtype: torch.float16
+            device: cuda:0
+            init: rand
+          - shape: [1, 49, 768]
+            stride: [37632, 1, 49]
+            storage_offset: 0
+            dtype: torch.float16
+            device: cuda:0
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L213 in forward, code: embeddings
+      = torch.cat([class_embeds, patch_embeds], dim=1)'
+    kwmap:
+      dim: 1
+  - name: torch.nn.functional.embedding.1
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 50]
+          stride: [50, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 50
+      - tensor:
+          shape: [50, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L217 in forward, code: embeddings
+      = embeddings + self.position_embedding(self.position_ids)'
+    marks: constant
+  - name: torch.add.1
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L217 in forward, code: embeddings
+      = embeddings + self.position_embedding(self.position_ids)'
+  - name: torch.nn.functional.layer_norm.1
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (768,)
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1.0e-05
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L642 in forward, code: hidden_states
+      = self.pre_layrnorm(hidden_states)'
+    marks: constant
+  - name: torch.nn.functional.linear.1
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L309 in forward, code: queries
+      = self.q_proj(hidden_states)'
+  - name: torch.Tensor.view.1
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (1, 50, -1, 64)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L313 in forward, code: queries
+      = queries.view(hidden_shape).transpose(1, 2)'
+    marks: constant
+  - name: torch.transpose.2
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 50, 12, 64]
+          stride: [38400, 768, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L313 in forward, code: queries
+      = queries.view(hidden_shape).transpose(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.1
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 12, 50, 64]
+          stride: [38400, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 12, 50, 64]
+          stride: [38400, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 12, 50, 64]
+          stride: [38400, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    kwmap:
+      attn_mask: None
+      dropout_p: 0.0
+      scale: 0.125
+      is_causal: false
+  - name: torch.transpose.3
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 12, 50, 64]
+          stride: [38400, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.1
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 50, 12, 64]
+          stride: [38400, 768, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+  - name: torch.reshape.1
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 50, 12, 64]
+          stride: [38400, 768, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (1, 50, -1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L332 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.2
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L332 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+  - name: torch.nn.functional.linear.2
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L347 in forward, code: hidden_states
+      = self.fc1(hidden_states)'
+  - name: torch.mul.1
+    op: torch.mul
+    inputs:
+      - value: 1.702
+      - tensor:
+          shape: [1, 50, 3072]
+          stride: [153600, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+    marks: constant
+  - name: torch.sigmoid.1
+    op: torch.sigmoid
+    inputs:
+      - tensor:
+          shape: [1, 50, 3072]
+          stride: [153600, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+  - name: torch.mul.2
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 50, 3072]
+          stride: [153600, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 50, 3072]
+          stride: [153600, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+  - name: torch.nn.functional.linear.3
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 50, 3072]
+          stride: [153600, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 3072]
+          stride: [3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L349 in forward, code: hidden_states
+      = self.fc2(hidden_states)'
+  - name: torch.getitem.1
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 50, 768]
+          stride: [38400, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - py: (0,)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L650 in forward, code: pooled_output
+      = last_hidden_state[:, 0, :]'
+    marks: constant
+  - name: torch.nn.functional.layer_norm.2
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [1, 768]
+          stride: [38400, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (768,)
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1.0e-05
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L651 in forward, code: pooled_output
+      = self.post_layernorm(pooled_output)'
+    marks: constant
+  - name: torch.nn.functional.linear.4
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L751 in get_image_features, code:
+      vision_outputs.pooler_output = self.visual_projection(pooled_output)'
+    marks: constant
+  - name: torch.Tensor.view.2
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: -1
+      - value: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L539 in forward, code: input_ids
+      = input_ids.view(-1, input_shape[-1])'
+    marks: constant
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 77]
+          stride: [77, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), slice(None, 8, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L248 in forward, code: position_ids
+      = self.position_ids[:, :seq_length]'
+    marks: constant
+  - name: torch.nn.functional.embedding.2
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 49408
+      - tensor:
+          shape: [49408, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L251 in forward, code: inputs_embeds
+      = self.token_embedding(input_ids)'
+    marks: constant
+  - name: torch.nn.functional.embedding.3
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 8]
+          stride: [77, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 77
+      - tensor:
+          shape: [77, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L253 in forward, code: position_embeddings
+      = self.position_embedding(position_ids)'
+    marks: constant
+  - name: torch.add.2
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L254 in forward, code: embeddings
+      = inputs_embeds + position_embeddings'
+  - name: torch.to.2
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L824 in _preprocess_mask_arguments, code: attention_mask
+      = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)'
+    kwmap:
+      device: cuda:0
+      dtype: torch.bool
+  - name: torch.arange.1
+    op: torch.arange
+    inputs:
+      - value: 3
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L507 in sdpa_mask, code: batch_arange = torch.arange(batch_size,
+      device=device)'
+    marks: constant
+    kwmap:
+      device: cuda:0
+  - name: torch.add.3
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [8]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L509 in sdpa_mask, code: q_arange = torch.arange(q_length,
+      device=device) + q_offset'
+    marks: constant
+  - name: torch.getitem.3
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, None, None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L364 in _non_vmap_expansion_sdpa, code: batch_indices
+      = batch_indices[:, None, None, None]'
+    marks: constant
+  - name: torch.getitem.4
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [8]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - py: (None, None, slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L366 in _non_vmap_expansion_sdpa, code: q_indices
+      = q_indices[None, None, :, None]'
+    marks: constant
+  - name: torch.new_ones.1
+    op: torch.new_ones
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 1]
+          stride: [8, 8, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: ()
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L54 in and_mask, code: result = q_idx.new_ones((),
+      dtype=torch.bool)'
+    marks: constant
+    kwmap:
+      dtype: torch.bool
+  - name: torch.le.1
+    op: torch.le
+    inputs:
+      - tensor:
+          shape: [1, 1, 1, 8]
+          stride: [8, 8, 8, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [1, 1, 8, 1]
+          stride: [8, 8, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L80 in causal_mask_function, code: return kv_idx
+      <= q_idx'
+  - name: torch.to.3
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 8]
+          stride: [64, 64, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks: constant
+  - name: torch.bitwise_and.1
+    op: torch.bitwise_and
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor:
+          shape: [1, 1, 8, 8]
+          stride: [64, 64, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+  - name: torch.getitem.5
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor_list:
+          - shape: [3, 1, 1, 1]
+            stride: [1, 1, 1, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 3
+          - shape: [1, 1, 1, 8]
+            stride: [8, 8, 8, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L177 in inner_mask, code: return padding_mask[batch_idx,
+      kv_idx]'
+    marks: constant
+  - name: torch.to.4
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 1, 1, 8]
+          stride: [8, 8, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks: constant
+  - name: torch.bitwise_and.2
+    op: torch.bitwise_and
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 8]
+          stride: [64, 64, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor:
+          shape: [3, 1, 1, 8]
+          stride: [8, 8, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+  - name: torch.Tensor.expand.2
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [3, 1, 8, 8]
+          stride: [64, 64, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: 3
+      - value: -1
+      - value: 8
+      - value: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L518 in sdpa_mask, code: attention_mask = attention_mask.expand(batch_size,
+      -1, q_length, kv_length)'
+    marks: constant
+  - name: torch.nn.functional.layer_norm.3
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (512,)
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1.0e-05
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L370 in forward, code: hidden_states
+      = self.layer_norm1(hidden_states)'
+    marks: constant
+  - name: torch.nn.functional.linear.5
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L309 in forward, code: queries
+      = self.q_proj(hidden_states)'
+  - name: torch.Tensor.view.3
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (3, 8, -1, 64)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L313 in forward, code: queries
+      = queries.view(hidden_shape).transpose(1, 2)'
+    marks: constant
+  - name: torch.transpose.4
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 512, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L313 in forward, code: queries
+      = queries.view(hidden_shape).transpose(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.2
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    kwmap:
+      attn_mask:
+        tensor:
+          shape: [3, 1, 8, 8]
+          stride: [64, 64, 8, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      dropout_p: 0.0
+      scale: 0.125
+      is_causal: false
+  - name: torch.transpose.5
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.3
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 512, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+  - name: torch.reshape.2
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [3, 8, 8, 64]
+          stride: [4096, 512, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (3, 8, -1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L332 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.4
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L332 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+  - name: torch.add.4
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L376 in forward, code: hidden_states
+      = residual + hidden_states'
+  - name: torch.nn.functional.linear.6
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [2048, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [2048]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L347 in forward, code: hidden_states
+      = self.fc1(hidden_states)'
+  - name: torch.mul.3
+    op: torch.mul
+    inputs:
+      - value: 1.702
+      - tensor:
+          shape: [3, 8, 2048]
+          stride: [16384, 2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+    marks: constant
+  - name: torch.sigmoid.2
+    op: torch.sigmoid
+    inputs:
+      - tensor:
+          shape: [3, 8, 2048]
+          stride: [16384, 2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+  - name: torch.mul.4
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [3, 8, 2048]
+          stride: [16384, 2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3, 8, 2048]
+          stride: [16384, 2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L123 in forward, code: return input * torch.sigmoid(1.702
+      * input)'
+  - name: torch.nn.functional.linear.7
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3, 8, 2048]
+          stride: [16384, 2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512, 2048]
+          stride: [2048, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L349 in forward, code: hidden_states
+      = self.fc2(hidden_states)'
+  - name: torch.to.5
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L570 in forward, code: input_ids.to(dtype=torch.int,
+      device=last_hidden_state.device).argmax(dim=-1),'
+    kwmap:
+      dtype: torch.int32
+      device: cuda:0
+  - name: torch.argmax.1
+    op: torch.argmax
+    inputs:
+      - tensor:
+          shape: [3, 8]
+          stride: [8, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L570 in forward, code: input_ids.to(dtype=torch.int,
+      device=last_hidden_state.device).argmax(dim=-1),'
+    kwmap:
+      dim: -1
+  - name: torch.getitem.6
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3, 8, 512]
+          stride: [4096, 512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor_list:
+          - shape: [3]
+            stride: [1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 3
+          - shape: [3]
+            stride: [1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L568 in forward, code: pooled_output
+      = last_hidden_state['
+    marks: constant
+  - name: torch.nn.functional.linear.8
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [512, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/clip/modeling_clip.py#L713 in get_text_features, code:
+      text_outputs.pooler_output = self.text_projection(pooled_output)'
+    marks: constant
