@@ -97,7 +97,6 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
-    stick_dims,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -428,9 +427,9 @@ def rescale_stl_for_dtype(
     """Rescale a device layout across a conversion that changes the elements per stick.
 
     Keeps every device dim of ``stl`` and resizes only the stick (the last device
-    dim) and the num-sticks dim, both found by ``stick_dims`` from ``dep``'s
-    coordinates. ``dep`` must read the input exactly as the conversion writes its
-    output; a slice of a wider buffer would keep that buffer's ``stride_map``.
+    dim) and the num-sticks dim, both found from ``dep``'s coordinates. ``dep``
+    must read the input exactly as the conversion writes its output; a slice of a
+    wider buffer would keep that buffer's ``stride_map``.
 
     The num-sticks dim's size and ``stride_map`` entry come from the input layout,
     except in two cases the input does not record: a split into more sticks counts
@@ -460,37 +459,47 @@ def rescale_stl_for_dtype(
         dep: The conversion's access to that tensor.
     """
     out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
+    out_device_size = [*stl.device_size[:-1], out_eps]
     out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
     device_coords = device_coordinates(stl, dep, None)
-    stick_host_dim, num_sticks_dim = stick_dims(
-        host_coordinates(host_layout, dep, None), device_coords
-    )
-    stick_vars = device_coords[-1].free_symbols if device_coords else set()
-    if stick_vars and (stick_host_dim is None or num_sticks_dim is None):
-        # TODO: a stick coordinate with a variable but no dim to count its sticks
-        # has not been seen; resizing the stick alone could drop elements.
-        raise Unsupported(
-            f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
-            f"for {dep}"
-        )
-    if stick_host_dim is None or num_sticks_dim is None:
+    stick_coord = device_coords[-1] if device_coords else sympy.S.Zero
+    stick_vars = stick_coord.free_symbols
+    if not stick_vars:
         # A stick holding one element (a size-1 or sparse stick dim) needs no more
         # sticks at any number of elements per stick.
         return SpyreTensorLayout(
             out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
         )
 
-    in_sticks = stl.device_size[num_sticks_dim]
-    in_eps = stl.device_size[-1]
-    elem_step = stl.stride_map[-1]
-    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
-    if device_coords[num_sticks_dim].free_symbols - stick_vars:
+    stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
+    outer_coords = device_coords[:-1]
+    num_sticks_dim = next(
+        (d for d, c in enumerate(outer_coords) if c.free_symbols & stick_vars), None
+    )
+    if num_sticks_dim is None:
+        # A stick dim no longer than one stick never wraps into an outer dim, so
+        # the outermost zero coordinate holds its count: ``[1, 64]`` reads at
+        # ``[0, 0, d0]``.
+        num_sticks_dim = next(
+            (d for d, c in enumerate(outer_coords) if c == sympy.S.Zero), None
+        )
+    if stick_host_dim is None or num_sticks_dim is None:
+        # TODO: a stick coordinate with a variable but no dim to count its sticks
+        # has not been seen; resizing the stick alone could drop elements.
+        raise Unsupported(
+            f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
+            f"for {dep}"
+        )
+    if outer_coords[num_sticks_dim].free_symbols - stick_vars:
         raise Unsupported(
             f"num-sticks dim {num_sticks_dim} of {list(stl.device_size)} "
             f"{list(stl.stride_map)} folds other host dims for {dep}"
         )
+
+    in_sticks = stl.device_size[num_sticks_dim]
+    in_eps = stl.device_size[-1]
+    elem_step = stl.stride_map[-1]
+    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
 
     if out_eps < in_eps:
         # Splitting sticks, where the last input stick may be part-filled:
@@ -502,18 +511,18 @@ def rescale_stl_for_dtype(
 
     if out_sticks > 1:
         # The dim steps one output stick: 40 fp16 elements -> 2 fp32, entry 32.
-        entry = out_eps * elem_step
+        stride_map_entry = out_eps * elem_step
     elif in_sticks == 1:
         # A single stick's entry never enters an address, so it is kept:
         # 20 fp16 elements in 1 stick -> 1 fp32 stick, entry 20.
-        entry = stl.stride_map[num_sticks_dim]
+        stride_map_entry = stl.stride_map[num_sticks_dim]
     else:
         # Sticks merged into one, whose entry is the host dim size, as
         # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
-        entry = host_dim_size * elem_step
+        stride_map_entry = host_dim_size * elem_step
 
     out_device_size[num_sticks_dim] = out_sticks
-    out_stride_map[num_sticks_dim] = entry
+    out_stride_map[num_sticks_dim] = stride_map_entry
     return SpyreTensorLayout(
         out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
     )

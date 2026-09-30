@@ -53,6 +53,7 @@ M=1 (decode phase) correctly.
 import sympy
 import torch
 from sympy import Expr
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import ceildiv
 from torch._inductor.ir import (
@@ -84,9 +85,8 @@ from .pass_utils import (
     patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
-    stick_dims,
 )
-from .views import compute_coordinates
+from .views import compute_coordinates, matching_dim
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -1072,6 +1072,35 @@ def _pad_num_sticks(
     )
 
 
+def _num_sticks_dim(layout: FixedTiledLayout, dep: MemoryDep) -> int | None:
+    """The device dim of ``layout`` that steps the sticks ``dep`` accesses.
+
+    The outermost device dim whose coordinate carries the stick coordinate's
+    variable, as ``rescale_stl_for_dtype`` finds it. A stick dim no longer than
+    one stick never wraps into an outer dim, and every size-1 host dim has a zero
+    coordinate too, so the outermost zero-coordinate dim is taken instead, which
+    is where ``_pad_num_sticks`` prepends one. None when no device dim can hold
+    the count, or when the stick coordinate has a variable but no host dim
+    matches it.
+    """
+    device_coords = device_coordinates(layout.device_layout, dep, None)
+    if not device_coords:
+        return None
+    stick_coord = device_coords[-1]
+    stick_vars = stick_coord.free_symbols
+    host_coords = host_coordinates(layout, dep, None)
+    if stick_vars and matching_dim(host_coords, stick_coord) is None:
+        return None
+    outer_coords = device_coords[:-1]
+    for dim, coord in enumerate(outer_coords):
+        if coord.free_symbols & stick_vars:
+            return dim
+    for dim, coord in enumerate(outer_coords):
+        if coord == sympy.S.Zero:
+            return dim
+    return None
+
+
 def _pad_downcast_input(
     op: ComputedBuffer,
     out_layout: FixedTiledLayout,
@@ -1093,14 +1122,8 @@ def _pad_downcast_input(
     in_stl = in_layout.device_layout
     out_stl = out_layout.device_layout
     out_dep = _write_dep(op)
-    _, in_num_sticks_dim = stick_dims(
-        host_coordinates(in_layout, in_dep, None),
-        device_coordinates(in_stl, in_dep, None),
-    )
-    _, out_num_sticks_dim = stick_dims(
-        host_coordinates(out_layout, out_dep, None),
-        device_coordinates(out_stl, out_dep, None),
-    )
+    in_num_sticks_dim = _num_sticks_dim(in_layout, in_dep)
+    out_num_sticks_dim = _num_sticks_dim(out_layout, out_dep)
     if in_num_sticks_dim is None or out_num_sticks_dim is None:
         return
 
@@ -1154,9 +1177,7 @@ def _pad_upcast_output(
     stl = layout.device_layout
 
     dep = _write_dep(op)
-    _, num_sticks_dim = stick_dims(
-        host_coordinates(layout, dep, None), device_coordinates(stl, dep, None)
-    )
+    num_sticks_dim = _num_sticks_dim(layout, dep)
     if num_sticks_dim is None:
         return
     out_eps = stl.device_size[-1]

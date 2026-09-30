@@ -173,54 +173,6 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def stick_dims(
-    host_coords: list[Expr], device_coords: list[Expr]
-) -> tuple[int | None, int | None]:
-    """Identify the stick dim of an access and the device dim counting its sticks.
-
-    Returns ``(sd, sd_outer_dim)``: the stick's host dim, which the innermost
-    device dim walks, and its num-sticks dim, the device dim that steps the
-    sticks along it. ``sd`` is None for a stick
-    holding one element (a size-1 or sparse stick dim), whose coordinate has no
-    variable. Both are None when no device dim can hold the count, or when the
-    stick coordinate has a variable but no host dim matches it.
-
-    Both come from the access's coordinates rather than from positions or
-    ``stride_map`` values, because a layout ``compute_restickify_target_layout``
-    commits need not keep ``sd_outer_dim`` in its conventional slot, and a
-    ``stride_map`` entry cannot tell a stick pitch from a host extent that happens
-    to equal one.
-
-    ``sd`` is the host dim whose coordinate matches the stick coordinate, and
-    ``sd_outer_dim`` the outermost device dim whose coordinate carries the stick
-    variable. A stick dim no longer than one stick never wraps into an outer dim,
-    and then the coordinates cannot identify ``sd_outer_dim``: every size-1 host
-    dim has a zero coordinate too. The outermost zero-coordinate dim is taken
-    instead, which is where ``compute_restickify_target_layout`` places the count
-    of such a stick and where ``_pad_num_sticks`` prepends one.
-    """
-    if not device_coords:
-        return None, None
-    stick_coord = device_coords[-1]
-    outer_coords = device_coords[:-1]
-    stick_vars = stick_coord.free_symbols
-
-    sd = None
-    if stick_vars:
-        sd = matching_dim(host_coords, stick_coord)
-        if sd is None:
-            return None, None
-
-    for dim, coord in enumerate(outer_coords):
-        if coord.free_symbols & stick_vars:
-            return sd, dim
-    # One stick deep: see the docstring for why the outermost zero wins.
-    for dim, coord in enumerate(outer_coords):
-        if coord == sympy.S.Zero:
-            return sd, dim
-    return None, None
-
-
 def op_read_writes(op: Operation) -> ReadWrites:
     """``op.get_read_writes()`` memoized on the op instance.
 
@@ -2262,12 +2214,20 @@ def compute_restickify_target_layout(
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd, old_sd_outer_dim = stick_dims(ic, idc)
-    if old_sd is None or old_sd_outer_dim is None:
+    old_sd = matching_dim(ic, idc[-1])
+    if old_sd is None:
         return None
+    old_stick_expr = idc[-1]
     old_stride_map = list(stl.stride_map)
+    old_var = next(iter(old_stick_expr.free_symbols))
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
+    old_sd_outer_dim = next(
+        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
+        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+    )
+    if old_sd_outer_dim is None:
+        return None
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
     if not candidates:
         return None
