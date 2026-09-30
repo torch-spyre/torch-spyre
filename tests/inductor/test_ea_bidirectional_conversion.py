@@ -197,8 +197,7 @@ def test_fp32_to_fp16_restoration(device, fp16):
 
 # Shapes used by both bidirectional roundtrip tests.
 # [4, 128]: stick-aligned (128 = 2 fp16 sticks of 64).
-# [4, 96]:  sub-stick (96 = 1.5 fp16 sticks; last stick is partially filled).
-# [5, 4, 96]:  sub-stick (96 = 1.5 fp16 sticks; last stick is partially filled).
+# [4, 96] and [5, 4, 96]: sub-stick (96 = 1.5 fp16 sticks; the last is partial).
 # [2, 3, 5] and [2, 3, 1]: extents inside the first half-stick, where the live
 # elements fit one FP32 stick but the stagger still reaches the pair, so the
 # widening conversion's capacity comes from insert_staggered_ea_padding rather
@@ -227,7 +226,8 @@ def test_bidirectional_roundtrip_fp16_start(device, shape, fp16):
     def fn(x):
         # FP16(STANDARD) → FP32(DL16_TO_FP32) → FP16(STANDARD)
         x_fp32 = x.to(torch.float32)
-        return x_fp32.to(dtype=fp16)
+        # Without an op in between, inductor folds the pair into an FP16 copy.
+        return (x_fp32 * 2.0).to(dtype=fp16)
 
     x = torch.randn(shape, device=device, dtype=fp16)
     result = fn(x)
@@ -315,7 +315,6 @@ def test_widened_slice_cast_to_int32_gathers_rows(rows):
     broadcast across an FP16 stick, widened, and sliced to one FP32 stick.  The
     INT32 cast reads the staggered FP32 value but writes an unstaggered output,
     one stick per row, which it must fill without reaching into the next row.
-    ``TestStaggeredFp32Consumer`` in test_codegen pins the iteration itself.
     """
     torch._dynamo.reset()
 
@@ -369,8 +368,8 @@ def test_narrowed_value_widens_into_every_fp32_stick(
     An FP16 stick holding more than 32 elements widens into two FP32 sticks, both
     holding host elements, so the STANDARD result has to map the second one to
     the host rather than leave it as unaddressed capacity.  Eager casts run as
-    separate conversions, and a compiled pair needs an op between them to reach
-    the device at all.  The values are integers exact in every format involved,
+    separate conversions; the compiled case consumes the narrowed value before
+    widening it.  The values are integers exact in every format involved,
     so a dropped element shows as a mismatch instead of hiding in the tolerance.
     """
     torch._dynamo.reset()
@@ -489,6 +488,7 @@ def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
     Transposing the column slice moves the input's stick dim to output dim 0,
     which is not the output's last dim.
     """
+    torch._dynamo.reset()
     tokens, width = 8, 256
 
     def fn(x):
@@ -501,6 +501,7 @@ def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
 
     torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.01)
     assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+    assert get_spyre_tensor_layout(upcast).stride_map[-1] == upcast.stride(0)
 
 
 def _downcast_stick_slice(start, stop):

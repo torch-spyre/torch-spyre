@@ -838,12 +838,12 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_rescale_for_dtype_scales_a_folded_num_sticks_dim(self):
         """A num-sticks dim that also steps the stick dim's outer host dims keeps
-        every stick it holds. Two heads of a padded head_dim read from a
-        ``[1, 768]`` buffer lay their whole-stick rows end to end on one device
-        dim, so its coordinate is ``2*d0 + floor(d1/64)``. Sizing it from the
-        head_dim extent alone gives four fp32 sticks, one head, and the second
-        head is never converted; its twelve fp16 sticks widen to twenty-four fp32
-        sticks instead. Needs no device.
+        every stick it holds. Six heads of a 128-element head_dim, read from a
+        ``[1, 768]`` buffer, lay their whole-stick rows end to end on one device
+        dim, so its coordinate is ``2*head + floor(elem/64)``. Sizing it from the
+        head_dim extent alone gives four fp32 sticks, one head, and the other
+        heads are never converted; its twelve fp16 sticks widen to twenty-four
+        fp32 sticks instead. Needs no device.
         """
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
@@ -852,7 +852,7 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout(
             [12, 1, 64], [64, -1, 1], fp16, ElementArrangement.STANDARD
         )
-        host_size = [1, 2, 128]
+        host_size = [1, 6, 128]
         out = rescale_stl_for_dtype(
             stl,
             torch.float32,
@@ -992,8 +992,8 @@ class TestSpyreTensorLayout(TestCase):
     def test_fp32_to_dl16_output_partial_stick(self):
         """FP32_TO_DL16: 3 fp32 sticks -> 2 fp16 sticks (issue #3999).
 
-        The output-side ceil division is the existing correct behavior.
-        Verify it is preserved: 3*32=96 elements -> ceil(96/64)=2 fp16 sticks.
+        The output rounds up to whole fp16 sticks: 3*32=96 elements ->
+        ceil(96/64)=2 fp16 sticks.
         """
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
@@ -1171,6 +1171,7 @@ class TestSpyreTensorLayout(TestCase):
     def _staggered_fp32_op(self, device_size, stride_map, host_size):
         """A mock ComputedBuffer with a DL16_TO_FP32 output."""
         import unittest.mock as mock
+        from torch._inductor.ir import ComputedBuffer
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.ir import FixedTiledLayout
 
@@ -1191,9 +1192,7 @@ class TestSpyreTensorLayout(TestCase):
         rw = mock.MagicMock()
         rw.writes = [_dep("buf_staggered", host_size)]
         op.get_read_writes.return_value = rw
-        op.__class__ = __import__(
-            "torch._inductor.ir", fromlist=["ComputedBuffer"]
-        ).ComputedBuffer
+        op.__class__ = ComputedBuffer
         op.get_layout.return_value = layout
         op.layout = layout
         op.get_name.return_value = "buf_staggered"
@@ -1218,13 +1217,8 @@ class TestSpyreTensorLayout(TestCase):
         # The added stick holds no host element, so the gap dim steps nothing.
         self.assertEqual(list(padded.device_layout.stride_map), [-1, 5, -1, 1])
 
-    def test_pad_upcast_output_covers_an_intermediate_consumer(self):
-        """An intermediate pointwise op inherits the arrangement, so it needs the pair.
-
-        Its elements are split across both sticks once the extent passes the first
-        32 slots, and its own name and dtypes say nothing about that, so the
-        arrangement it carries is what earns it the padding.
-        """
+    def test_pad_upcast_output_rounds_a_partial_pair_up(self):
+        """A stick-stepped dim ending inside a stick pair grows to the whole pair."""
         from torch_spyre._inductor.padding import _pad_upcast_output
 
         op = self._staggered_fp32_op([3, 1, 32], [32, -1, 1], [1, 96])
