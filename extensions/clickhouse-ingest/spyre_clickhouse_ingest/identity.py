@@ -167,10 +167,11 @@ class CaseId(DerivedId):
         """The test's uuid, or '' with no component/name; classname may be blank."""
         if not cls.complete(component, name):
             return ""
+        # name keeps its case: sibling tests can differ only by case (upstream test_T / test_t).
         return cls.hash(
             cls.norm(component),
             cls.norm(classname),
-            cls.norm(name),
+            str(name).strip(),
             cls.tag_part(tags),
         )
 
