@@ -123,6 +123,8 @@ def capability_properties(
         "capability.sig.input_shapes": json.dumps(sig["input_shapes"]),
         "capability.sig.input_dtypes": json.dumps(sig["input_dtypes"]),
         "capability.tag": variant,
+        # The test overrides this once the op runs; a failure before that is a Spyre verdict.
+        "capability.backend": "spyre",
     }
     if sig["input_strides"]:
         props["capability.prop.input_strides"] = json.dumps(sig["input_strides"])

@@ -86,6 +86,7 @@ def test_capability_properties(cap):
         "capability.sig.input_shapes": '["[1,2]"]',
         "capability.sig.input_dtypes": '["torch.bfloat16"]',
         "capability.tag": "torch.mul.1",
+        "capability.backend": "spyre",
         "capability.prop.input_strides": '["[2,1]"]',
     }
     # Only torch.* operations are capabilities.
@@ -98,7 +99,6 @@ def test_properties_satisfy_the_ingest_contract(cap):
     props = cap.capability_properties(
         "torch.mul", "m-1", "torch.mul.1", [_tensor([1, 2], stride=[2, 1])]
     )
-    props["capability.backend"] = "spyre"
     props["capability.prop.fallback_ops"] = ""
     decl, problem = capability_declaration({"properties": list(props.items())})
     assert problem == "" and decl["unknown"] == []
