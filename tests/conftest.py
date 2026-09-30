@@ -19,7 +19,11 @@ import pytest
 import regex as re
 
 import shared_config
-from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
+from oot_framework.oot_test_utilities import (
+    _RUNTIME_PROPS,
+    _RUNTIME_SHAPES,
+    _RUNTIME_TAGS,
+)
 
 
 # Cap on the failure message folded into wasxfail (see _extract_failure_message):
@@ -88,6 +92,9 @@ def pytest_runtest_makereport(item, call):
 
         if shapes:
             rep._spyre_shapes = shapes
+
+        # The teardown report copies item.user_properties, and junitxml writes it.
+        item.user_properties.extend(_RUNTIME_PROPS.pop(method_name, {}).items())
 
         # Rewrite SKIPPED/FAILED -> XFAIL for unittest.TestCase methods marked
         # xfail by OOT config. pytest.mark.xfail is ignored by the unittest runner

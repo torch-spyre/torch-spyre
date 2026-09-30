@@ -7,6 +7,7 @@ oot_test_utilities.py -- Utility functions for the OOT PyTorch test framework.
 from __future__ import annotations
 
 import ast
+import json
 import platform as _platform
 import os
 import sys
@@ -426,6 +427,42 @@ Utility for printing per-test tags at run time alongside PASS/FAIL output.
 _RUNTIME_TAGS: Dict[str, List[str]] = {}
 # To store method_name -> formatted shape/stride string set during test execution
 _RUNTIME_SHAPES: Dict[str, str] = {}
+# method_name -> JUnit properties the test recorded; conftest attaches them to the item
+_RUNTIME_PROPS: Dict[str, Dict[str, str]] = {}
+
+
+def record_results(test_instance: Any, **results: Any) -> None:
+    """Record `result.<name>` JUnit properties for the running test (non-str as JSON)."""
+    props = _RUNTIME_PROPS.setdefault(test_instance._testMethodName, {})
+    for name, value in results.items():
+        props[f"result.{name}"] = value if isinstance(value, str) else json.dumps(value)
+
+
+def _input_args_record(input_args: List[Any]) -> List[Dict[str, Any]]:
+    """The facts _format_input_args_shapes prints, as JSON-ready dicts."""
+    from .oot_test_config_models import (
+        InputArgPy,
+        InputArgTensor,
+        InputArgTensorList,
+        InputArgValue,
+    )
+
+    def _tensor(spec: Any) -> Dict[str, Any]:
+        return {"shape": spec.shape, "dtype": spec.dtype, "stride": spec.stride}
+
+    out: List[Dict[str, Any]] = []
+    for arg in input_args or []:
+        if isinstance(arg, InputArgTensor):
+            out.append({"tensor": _tensor(arg.tensor)})
+        elif isinstance(arg, InputArgTensorList):
+            out.append({"tensor_list": [_tensor(s) for s in arg.tensor_list]})
+        elif isinstance(arg, InputArgValue):
+            out.append({"value": arg.value})
+        elif isinstance(arg, InputArgPy):
+            out.append({"py": arg.py})
+        else:
+            out.append({"type": type(arg).__name__})
+    return out
 
 
 def _format_input_args_shapes(input_args: List[Any]) -> str:
