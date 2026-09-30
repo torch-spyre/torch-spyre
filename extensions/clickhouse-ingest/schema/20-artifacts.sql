@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     artifact_id UUID,                       -- WHAT was tested: immutable identity, never a tag
     run_id      UUID,                       -- joins the test/benchmark run for case detail
 
-    result_kind LowCardinality(String),     -- functional | performance | image
+    result_kind LowCardinality(String),     -- functional | performance | capability
     test_type   LowCardinality(String),     -- the tier ladder, constrained below
     state       LowCardinality(String),     -- passed | failed | error | running
     arch        LowCardinality(String),     -- where it RAN; may differ from artifacts.arch
@@ -138,13 +138,19 @@ CREATE TABLE IF NOT EXISTS artifact_results
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 
 
+    CONSTRAINT chk_state       CHECK state       IN ('passed','failed','error','running'),
+    -- capability: the model_ops/model_support analyses, whose per-capability rows live in
+    -- capability_runs. This and chk_test_type are declared last, in this order: migrations/005
+    -- re-adds both and the server appends them.
+    CONSTRAINT chk_result_kind CHECK result_kind IN
+        ('functional','performance','capability'),
     -- Closes a v1 defect where image names leaked into test_type. Not an Enum: an unknown value
     -- would throw on insert instead of needing an ALTER, and Enum declaration order would silently
-    -- reorder tier_satisfies()'s ladder comparisons.
+    -- reorder tier_satisfies()'s ladder comparisons. The fvt*/svt* values are spyre-test-framework's
+    -- stages, each its own leg; model_ops/model_support are result_kind 'capability'.
     CONSTRAINT chk_test_type   CHECK test_type   IN
-        ('smoke','unit','integration','regression','trunk','perf'),
-    CONSTRAINT chk_state       CHECK state       IN ('passed','failed','error','running'),
-    CONSTRAINT chk_result_kind CHECK result_kind IN ('functional','performance','image'),
+        ('smoke','unit','integration','regression','trunk','perf',
+         'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic','model_ops','model_support'),
 
     -- run_id can't lead the sort key (reads want "this artifact's verdicts" first), so this index
     -- covers the reverse direction; built inline since ALTER...ADD INDEX registers but builds nothing.

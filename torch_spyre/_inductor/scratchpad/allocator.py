@@ -172,12 +172,25 @@ _LX_TRACKER_CAPACITY_BYTES = (
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
 
-def _safe_in_place_parents(
-    parents: Sequence[str], lifetime_end_overrides: dict[str, int]
-) -> list[str]:
-    """Drop handoffs from parents that remain live through a counted loop."""
+def _handoff_child_start(
+    name: str,
+    lifetimes: dict[str, list[int]],
+    lifetime_start_overrides: dict[str, int],
+) -> int:
+    """First tick of ``name`` as an in-place child, widened to a loop's start."""
+    first = lifetimes[name][0]
+    return min(first, lifetime_start_overrides.get(name, first))
 
-    return [parent for parent in parents if parent not in lifetime_end_overrides]
+
+def _handoff_parent_end(
+    name: str,
+    lifetimes: dict[str, list[int]],
+    lifetime_end_overrides: dict[str, int],
+) -> int:
+    """Inclusive last tick of ``name`` as an in-place parent, widened to a loop's
+    end (the override is exclusive)."""
+    last = lifetimes[name][-1]
+    return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
 def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
@@ -981,9 +994,7 @@ class ScratchpadAllocator:
                     # to a consumer's in_place_parents, which would otherwise mutate
                     # this list inside the shared ``in_place`` dict (matches the copy
                     # in ``_build_cd_bound_buffers``).
-                    in_place_parents=_safe_in_place_parents(
-                        in_place.get(output_name, []), lifetime_end_overrides
-                    ),
+                    in_place_parents=list(in_place.get(output_name, [])),
                     residency_reason=reasons.get(output_name),
                     lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
@@ -1034,10 +1045,9 @@ class ScratchpadAllocator:
             # consumer is a built candidate with matching per-core size, device
             # layout, a pointwise producer, and no core-division mismatch is there
             # anything safe to merge.
-            if reason is not None or input_name in lifetime_end_overrides:
+            if reason is not None:
                 continue
-            last_use = uses[-1]
-            consumer_op = graph.operations[last_use]
+            consumer_op = graph.operations[uses[-1]]
             consumer = built_by_name.get(consumer_op.name)
             if consumer is None or input_name in consumer.in_place_parents:
                 continue
@@ -1058,8 +1068,12 @@ class ScratchpadAllocator:
                 parent_size_per_core=clone_size,
                 child_device_layout=consumer_layout.device_layout,
                 parent_device_layout=input_layout.device_layout,
-                child_start=lifetimes[consumer_op.name][0],
-                parent_end=last_use,
+                child_start=_handoff_child_start(
+                    consumer_op.name, lifetimes, lifetime_start_overrides
+                ),
+                parent_end=_handoff_parent_end(
+                    input_name, lifetimes, lifetime_end_overrides
+                ),
                 child_core_div_mismatch=mem_usage[consumer_op.name][
                     "core_div_mismatch"
                 ],
@@ -1091,7 +1105,10 @@ class ScratchpadAllocator:
         - matching device layout (so the storage can alias);
         - single handoff tick (``parent_end == child_start``: the same op that reads
           the parent as its last use writes the child), the invariant the solvers'
-          in-place relaxation relies on (see ``_check_in_place_relationships``);
+          in-place relaxation relies on (see ``_check_in_place_relationships``).
+          Callers pass ticks widened by counted-loop lifetime overrides
+          (``_handoff_child_start`` / ``_handoff_parent_end``), so a buffer kept
+          live across a loop never qualifies;
         - matching per-core footprint and no core-division mismatch on the child.
 
         With ``division_invariant`` the last condition (per-core size + core-div) is
@@ -1138,6 +1155,8 @@ class ScratchpadAllocator:
         mem_usage: dict,
         lifetimes: dict[str, list[int]],
         reasons: dict[str, Optional[str]],
+        lifetime_start_overrides: dict[str, int],
+        lifetime_end_overrides: dict[str, int],
     ) -> dict[str, list[str]]:
         """In-place reuse candidates: ``buf -> [inputs whose slot it may take]``.
 
@@ -1156,7 +1175,9 @@ class ScratchpadAllocator:
                 continue
             if reasons.get(buf_name) is not None or not lifetimes.get(buf_name):
                 continue
-            out_start = lifetimes[buf_name][0]
+            out_start = _handoff_child_start(
+                buf_name, lifetimes, lifetime_start_overrides
+            )
             out_ten_layout = graph.get_buffer(buf_name).get_layout().device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
@@ -1173,7 +1194,9 @@ class ScratchpadAllocator:
                     child_device_layout=out_ten_layout,
                     parent_device_layout=in_ten_layout,
                     child_start=out_start,
-                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    parent_end=_handoff_parent_end(
+                        input_buf, lifetimes, lifetime_end_overrides
+                    ),
                     child_core_div_mismatch=info["core_div_mismatch"],
                 ):
                     allow_inplace[buf_name].append(input_buf)
@@ -1235,7 +1258,14 @@ class ScratchpadAllocator:
             planned_lx_buffers=planned_lx_buffers,
             lx_relayout_plans=lx_relayout_plans,
         )
-        in_place = self._determine_in_place(graph, mem_usage, lifetimes, reasons)
+        in_place = self._determine_in_place(
+            graph,
+            mem_usage,
+            lifetimes,
+            reasons,
+            lifetime_start_overrides,
+            lifetime_end_overrides,
+        )
         buffers = self._build_bound_buffers(
             graph,
             in_place,
@@ -2762,7 +2792,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.name: self._op_inputs_good_for_lx_inplace(op) for op in graph.operations
         }
         lifetimes = calculate_liveness(graph)
-        _, lifetime_end_overrides = counted_loop_lifetime_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
@@ -2773,7 +2805,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             out_layout = graph.get_buffer(buf_name).layout
             if not hasattr(out_layout, "device_layout"):
                 continue
-            out_start = lifetimes[buf_name][0]
+            out_start = _handoff_child_start(
+                buf_name, lifetimes, lifetime_start_overrides
+            )
             out_ten_layout = out_layout.device_layout
             for input_buf in info["op_inputs"]:
                 # Graph inputs / constants now appear in ``op_inputs`` but are not
@@ -2781,8 +2815,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # solver's ``_check_in_place_relationships`` would fail to resolve
                 # them). Skip them, matching the base allocator's guard.
                 if input_buf not in mem_usage or not lifetimes[input_buf]:
-                    continue
-                if input_buf in lifetime_end_overrides:
                     continue
                 in_layout = graph.get_buffer(input_buf).layout
                 if not hasattr(in_layout, "device_layout"):
@@ -2801,7 +2833,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     child_device_layout=out_ten_layout,
                     parent_device_layout=in_ten_layout,
                     child_start=out_start,
-                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    parent_end=_handoff_parent_end(
+                        input_buf, lifetimes, lifetime_end_overrides
+                    ),
                     division_invariant=True,
                 ):
                     allow_inplace[buf_name].append(input_buf)
@@ -2937,9 +2971,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             residency_reason = residency_by_buf[output_name]
 
             buf_divisions = divisions[output_name]
-            parents = _safe_in_place_parents(
-                in_place.get(output_name, []), lifetime_end_overrides
-            )
+            parents = list(in_place.get(output_name, []))
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
             cd_parent_matches = self._cd_parent_matches(
@@ -3006,8 +3038,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # clone, so they are skipped.
             out_layout = graph.get_buffer(output_name).layout
             for clone_name in last_consumer_clones.get(output_name, []):
-                if clone_name in lifetime_end_overrides:
-                    continue
                 if clone_name in parents:
                     continue
                 clone_layout = graph.get_buffer(clone_name).layout
@@ -3022,8 +3052,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     parent_name=clone_name,
                     child_device_layout=out_layout.device_layout,
                     parent_device_layout=clone_layout.device_layout,
-                    child_start=uses[0],
-                    parent_end=lifetimes[clone_name][-1],
+                    child_start=_handoff_child_start(
+                        output_name, lifetimes, lifetime_start_overrides
+                    ),
+                    parent_end=_handoff_parent_end(
+                        clone_name, lifetimes, lifetime_end_overrides
+                    ),
                     division_invariant=True,
                 ):
                     parents.append(clone_name)

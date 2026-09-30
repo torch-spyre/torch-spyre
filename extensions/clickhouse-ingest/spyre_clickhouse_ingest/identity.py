@@ -17,6 +17,9 @@
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
+
+import regex as re
 
 from .junit import RunCoordinates
 
@@ -24,9 +27,33 @@ ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 
 ID_SEP = "|"
 
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_HEX12 = re.compile(r"[0-9a-f]{12}")
+
 # The component stamped on rows when the caller names none. A DEFAULT, not a constant: a
 # test cell may run another component's suite, and component is a hash input.
 COMPONENT_DEFAULT = "torch-spyre"
+
+# Tag namespaces that say where/when a test ran (arch, test type, cadence), not what it is.
+# Never hashed, so one test keeps one id across arches and test types; stored per run. A
+# deny-list: an unclassified namespace can only leave an id split, never merge two tests.
+RUN_CONTEXT_TAG_NAMESPACES = frozenset({"platform", "testtype", "cadence"})
+
+# Tag namespaces that carry a measured value (`refcoverage__48/48`): not membership at all, so
+# neither hashed nor tagged -- stored as props['result.<ns>'].
+RESULT_TAG_NAMESPACES = frozenset({"refcoverage"})
+
+# Bare tags older emitters wrote, mapped to their namespaced form; migrations/006 applies the
+# same map to history.
+LEGACY_TAG_ALIASES = {
+    "nightly": "cadence__nightly",
+    "weekly": "cadence__weekly",
+    "fvt": "testtype__fvt",
+    "svt": "testtype__svt",
+    "spyre-inference": "domain__spyre-inference",
+    "spyre-backend": "domain__spyre-backend",
+    "torch-spyre": "domain__torch-spyre",
+}
 
 # Full-metadata identity record, one per component layer (each Containerfile overwrites its
 # own). Preferred read path.
@@ -63,6 +90,30 @@ class DerivedId:
     def complete(cls, *values) -> bool:
         """True when every required field is non-blank; a blank one refuses the id."""
         return all(cls.norm(v) for v in values)
+
+    @staticmethod
+    def canon_tag(tag) -> str:
+        """A legacy bare tag in its namespaced form (lowercase); any other tag unchanged."""
+        return LEGACY_TAG_ALIASES.get(DerivedId.norm(tag), tag)
+
+    @staticmethod
+    def namespace(tag) -> str:
+        return DerivedId.norm(DerivedId.canon_tag(tag)).split("__", 1)[0]
+
+    @classmethod
+    def split_tags(cls, tags) -> tuple:
+        """(identity tags, run-context tags, result props) -- what a test is, where it ran,
+        and values it measured."""
+        ident, ctx, results = set(), set(), {}
+        for t in (cls.canon_tag(x) for x in (tags or []) if cls.norm(x)):
+            ns = cls.namespace(t)
+            if ns in RESULT_TAG_NAMESPACES:
+                results[f"result.{ns}"] = t.split("__", 1)[1] if "__" in t else ""
+            elif ns in RUN_CONTEXT_TAG_NAMESPACES:
+                ctx.add(t)
+            else:
+                ident.add(t)
+        return sorted(ident), sorted(ctx), results
 
     @classmethod
     def tag_part(cls, tags) -> str:
@@ -105,6 +156,11 @@ class RunId(DerivedId):
 
 class CaseId(DerivedId):
     """Content identity of a test, so the same test reconciles across runs."""
+
+    @classmethod
+    def tag_part(cls, tags) -> str:
+        """Only the identity tags: run-context and result tags never reach the hash."""
+        return super().tag_part(cls.split_tags(tags)[0])
 
     @classmethod
     def derive(cls, component: str, classname: str, name: str, tags) -> str:
@@ -217,6 +273,137 @@ class GhaArtifactId(ArtifactId):
         )
 
 
+@dataclass(frozen=True)
+class ArtifactIdentity:
+    """The four hash inputs of an artifact, plus how to fetch it, from any way it is named.
+
+    Every constructor reduces to `ArtifactId.derive`, so an image named by digest here and the
+    same bytes recorded by another writer under the same four fields share one artifact_id.
+    """
+
+    component: str
+    artifact_name: str
+    id12: str
+    arch: str
+    kind: str = "image"
+    ref: str = ""
+    content_digest: str = ""
+    # Hash inputs kept readable beside the opaque id (e.g. base_artifact_id, installed).
+    inputs: tuple = ()
+
+    @property
+    def artifact_id(self) -> str:
+        return ArtifactId.derive(
+            self.component, self.artifact_name, self.id12, self.arch
+        )
+
+    @classmethod
+    def from_image(
+        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+    ) -> "ArtifactIdentity":
+        """`<repo>[:tag]@sha256:<hex>` of ONE arch's image, the per-arch leaf digest.
+
+        By default the digest is the identity: right for producers that record an image by
+        digest. A producer that names it otherwise (the Jenkins orchestrator hashes its own
+        inputs into id12 and uses its config name) is matched by passing those three fields.
+        """
+        repo, _, digest = (ref or "").strip().partition("@")
+        if not _SHA256.fullmatch(
+            digest.removeprefix("sha256:")
+        ) or not digest.startswith("sha256:"):
+            raise ValueError(f"image ref needs an @sha256:<64 hex> digest: {ref!r}")
+        if id12 and not _HEX12.fullmatch(id12):
+            raise ValueError(f"id12 must be 12 hex characters: {id12!r}")
+        repo_name = repo.rsplit("/", 1)[-1].split(":", 1)[0]
+        return cls(
+            component=component or re.sub(r"-(devel|dev)$", "", repo_name),
+            artifact_name=name or repo_name,
+            id12=id12 or digest[7:19],
+            arch=DerivedId.arch(arch),
+            kind="image",
+            ref=f"{repo}@{digest}",
+            content_digest=digest,
+        )
+
+    @classmethod
+    def from_generic(
+        cls, url: str, sha256: str, component: str, arch: str, name: str = ""
+    ) -> "ArtifactIdentity":
+        """A downloadable file or folder; id12 is its content sha256, never its address."""
+        digest = DerivedId.norm(sha256).removeprefix("sha256:")
+        if not url or not _SHA256.fullmatch(digest):
+            raise ValueError(
+                f"generic artifact needs <url>#<64-hex sha256>: {url!r}#{sha256!r}"
+            )
+        return cls(
+            component=component,
+            artifact_name=name or url.rstrip("/").rsplit("/", 1)[-1],
+            id12=digest[:12],
+            arch=DerivedId.arch(arch),
+            kind="generic",
+            ref=url,
+            content_digest=f"sha256:{digest}",
+        )
+
+    @classmethod
+    def from_gha(
+        cls, component: str, base_artifact_id: str, installed: str, arch: str
+    ) -> "ArtifactIdentity":
+        """A GHA leg: its delta installed onto a prebaked image (see GhaArtifactId)."""
+        base = DerivedId.norm(base_artifact_id)
+        return cls(
+            component=component,
+            artifact_name=base,
+            id12=GhaArtifactId.installed_digest(installed),
+            arch=DerivedId.arch(arch),
+            kind="image",
+            inputs=(
+                ("base_artifact_id", base),
+                ("installed", (installed or "").strip()),
+            ),
+        )
+
+    @classmethod
+    def parse(cls, spec: str, arch: str, component: str) -> "ArtifactIdentity | None":
+        """`image:<ref@digest>`, `generic:<url>#<sha256>`, or the GHA record
+        `<artifact_id>|<base_artifact_id>|<installed>`; None for a bare id with no inputs.
+
+        image/generic take `;component=`, `;name=` and (image) `;id12=` overrides. Without
+        one, an image names its own component: `component` is the caller's, the suite's
+        owner, and one component's suite routinely runs in another component's image.
+        """
+        spec = (spec or "").strip()
+        kind, _, rest = spec.partition(":")
+        if kind in ("image", "generic"):
+            ref, *opts = rest.split(";")
+            over = dict(o.split("=", 1) for o in opts if "=" in o)
+            unknown = set(over) - (
+                {"component", "name", "id12"}
+                if kind == "image"
+                else {"component", "name"}
+            )
+            if unknown or len(over) != len(opts):
+                raise ValueError(f"unknown or malformed {kind} option(s) in {spec!r}")
+            if kind == "image":
+                return cls.from_image(
+                    ref,
+                    arch,
+                    over.get("component", ""),
+                    over.get("name", ""),
+                    over.get("id12", ""),
+                )
+            url, sep, sha = ref.rpartition("#")
+            if not sep:
+                raise ValueError(f"generic artifact needs <url>#<sha256>: {spec!r}")
+            return cls.from_generic(
+                url, sha, over.get("component") or component, arch, over.get("name", "")
+            )
+        parts = [p.strip() for p in spec.split(ID_SEP)] + ["", ""]
+        if not parts[1]:
+            return None
+        return cls.from_gha(component, parts[1], parts[2], arch)
+
+
 class CapabilityId(DerivedId):
     """Content identity of one (subject, capability) pair; `backend` is not hashed."""
 
@@ -276,9 +463,11 @@ run_id_of = RunId.derive
 run_id_for = RunId.for_args
 case_id_for = CaseId.derive
 tags_for_case = CaseId.tags_for
+split_case_tags = CaseId.split_tags
 artifact_id_for = ArtifactId.derive
 base_artifact_id = ArtifactId.from_image
 gha_artifact_id = GhaArtifactId.derive
+artifact_identity = ArtifactIdentity.parse
 installed_digest = GhaArtifactId.installed_digest
 capability_id_for = CapabilityId.derive
 benchmark_id_for = BenchmarkId.derive

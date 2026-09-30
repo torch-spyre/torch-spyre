@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS capabilities
 
     component     LowCardinality(String),
     -- Which analysis: model_ops | model_support -- the axis v1 put in the table name. Named
-    -- test_type (artifact_results' 'capability' tier covers the family; these are within it).
+    -- test_type, as on artifact_results, where their verdicts carry result_kind 'capability'.
     -- Constrained by convention, not CHECK, so a new analysis can start writing unedited.
     test_type     LowCardinality(String),
 

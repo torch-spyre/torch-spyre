@@ -2449,6 +2449,64 @@ class TestCoarseTile(unittest.TestCase):
             "the crossing value must overlap the loop-local it could be aliased with",
         )
 
+    def test_counted_loop_ignores_hoisted_extern_kernel_loop_info(self):
+        """A loop-body constant hoisted to the graph head is not in the loop.
+
+        ``dedup_and_promote_constants`` moves every ``SpyreConstantFallback`` to
+        the front of ``graph.operations`` but leaves its ``loop_info``. The
+        scheduler only groups SchedulerNodes into counted loops, so the extern
+        kernel runs once before the loop. Counting it as a loop member would
+        start the loop at index 0 and widen the start of every value born before
+        the real loop, breaking in-place handoffs such as ``buf5 -> buf6``.
+        """
+        from types import SimpleNamespace
+
+        from torch._inductor.ir import ExternKernel
+
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        class _Dep:
+            def __init__(self, name):
+                self.name = name
+
+            def __hash__(self):
+                return hash(self.name)
+
+            def __eq__(self, other):
+                return self.name == other.name
+
+        class _HoistedConstant(ExternKernel):
+            pass
+
+        def _op(name, reads, writes, loop=None, cls=None):
+            rw = SimpleNamespace(
+                reads={_Dep(n) for n in reads}, writes={_Dep(n) for n in writes}
+            )
+            op = SimpleNamespace() if cls is None else cls.__new__(cls)
+            op.get_read_writes = lambda rw=rw: rw
+            if loop is not None:
+                op.loop_info = SimpleNamespace(loop_group_id=loop)
+            return op
+
+        # The loop is really indices 3..4; ``const`` at 0 still carries its
+        # loop-body ``loop_info``. ``child`` is born before the loop, in place
+        # over ``parent``, and is read inside the loop.
+        operations = [
+            _op("const", [], ["const"], loop=(0,), cls=_HoistedConstant),
+            _op("parent", ["arg0"], ["parent"]),
+            _op("child", ["parent"], ["child"]),
+            _op("body", ["child", "const"], ["body"], loop=(0,)),
+            _op("tail", ["body"], ["tail"], loop=(0,)),
+        ]
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(operations=operations, graph_input_names=["arg0"])
+        )
+        self.assertEqual(starts, {})
+        # The constant is born outside the loop and read on every iteration.
+        self.assertEqual(ends, {"child": 5, "const": 5})
+
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
         both reading the same full InputBuffer at the same index must end

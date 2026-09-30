@@ -24,13 +24,19 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
-)
-# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
-# TEST_TYPE_VALUES, not a subset of it.
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
+# Which capability analysis produced a capability_runs row; also the test_type of a
+# result_kind='capability' verdict.
 CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+# spyre-test-framework's stages, each its own leg.
+SUITE_STAGE_VALUES = frozenset(
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
+)
+TEST_TYPE_VALUES = (
+    frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+    | SUITE_STAGE_VALUES
+    | CAPABILITY_TYPE_VALUES
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
 # capability_runs.status: not_implemented is unsupported, not a skipped test.
 CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
@@ -188,7 +194,7 @@ class TestCaseRow(TypedDict):
 
 
 class TestCases(Table):
-    """Test identity: one row per (component, classname, name, tags)."""
+    """Test identity: one row per (component, classname, name, identity tags)."""
 
     name = "test_cases"
     columns = ("test_case_id", "component", "classname", "name", "tags")
@@ -205,10 +211,12 @@ class TestCaseRunRow(TypedDict):
     duration_s: float
     fail_message: str
     props: dict[str, str]
+    tags: list[str]
+    measurements: dict[str, float]
 
 
 class TestCaseRuns(Table):
-    """One test's outcome in one run; props carries the source_file discriminator."""
+    """One test's outcome in one run: run-context tags, recorded measurements and results."""
 
     name = "test_case_runs"
     columns = (
@@ -219,6 +227,8 @@ class TestCaseRuns(Table):
         "duration_s",
         "fail_message",
         "props",
+        "tags",
+        "measurements",
     )
     required = ("component",)
     enums = (("status", STATUS_VALUES),)

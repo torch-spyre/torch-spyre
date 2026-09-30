@@ -58,8 +58,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
-    const uint64_t dmva = std::get<Dmva>(device_address_).value;
-    auto segment_id = flex::dmvaToSegmentId(dmva);
+    const uint64_t device_ptr = std::get<Dmva>(device_address_).value;
+    const auto [segment_id, segment_offset, segment_type] =
+        flex::decodeDevicePointer(device_ptr);
     TORCH_CHECK(segment_id < ctx.inputs_outputs.size(),
                 "D2H tensor-segment lookup out of range: segment ", segment_id,
                 " but only ", ctx.inputs_outputs.size(),
@@ -69,7 +70,6 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     TORCH_CHECK(tensor_address.chunks().size() == 1,
                 "Tensor address must have 1 chunk");
     const auto& base_chunk = tensor_address.chunks()[0];
-    uint64_t segment_offset = dmva - (segment_id << flex::SEGMENT_SIZE_BITS);
     TORCH_CHECK(segment_offset + size_ <= tensor_address.total_size(),
                 "D2H transfer out of bounds: offset ", segment_offset,
                 " + size ", size_, " exceeds tensor allocation size ",
