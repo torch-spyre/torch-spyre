@@ -431,11 +431,11 @@ _RUNTIME_SHAPES: Dict[str, str] = {}
 _RUNTIME_PROPS: Dict[str, Dict[str, str]] = {}
 
 
-def record_results(test_instance: Any, **results: Any) -> None:
-    """Record `result.<name>` JUnit properties for the running test (non-str as JSON)."""
-    props = _RUNTIME_PROPS.setdefault(test_instance._testMethodName, {})
-    for name, value in results.items():
-        props[f"result.{name}"] = value if isinstance(value, str) else json.dumps(value)
+def record_properties(test_instance: Any, props: Dict[str, Any]) -> None:
+    """Record JUnit properties for the running test (non-str values as JSON)."""
+    recorded = _RUNTIME_PROPS.setdefault(test_instance._testMethodName, {})
+    for name, value in props.items():
+        recorded[name] = value if isinstance(value, str) else json.dumps(value)
 
 
 def _input_args_record(input_args: List[Any]) -> List[Dict[str, Any]]:

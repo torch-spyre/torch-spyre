@@ -118,7 +118,8 @@ class TestResultWriter(RunWriter):
         source_file: str,
         attempt: int,
     ) -> None:
-        """Delete this file's rows from attempts before `attempt`, so a re-run replaces them."""
+        """Delete this file's outcomes and capability verdicts from attempts before
+        `attempt`, so a re-run replaces them."""
         if not (attempt and source_file):
             return
         where = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
@@ -128,13 +129,20 @@ class TestResultWriter(RunWriter):
             "sf": source_file,
             "attempt": attempt,
         }
-        if not cls.fact_table.count_rows(client, db, where, params):
-            return
-        client.command(
-            f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
-            parameters=params,
-        )
-        cls._rebuild_counters(client, db, run_id, component)
+        if cls.fact_table.count_rows(client, db, where, params):
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
+                parameters=params,
+            )
+            cls._rebuild_counters(client, db, run_id, component)
+        # The file's capability verdicts are scoped by shard = source_file.
+        verdicts = where.replace("props['source_file']", "props['shard']")
+        capability_runs = CapabilityWriter.fact_table
+        if capability_runs.count_rows(client, db, verdicts, params):
+            client.command(
+                f"DELETE FROM {capability_runs.qualified(db)} WHERE {verdicts}",
+                parameters=params,
+            )
 
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
@@ -172,10 +180,12 @@ class TestResultWriter(RunWriter):
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
+        verdicts: dict[tuple, list] = {}
         skipped = ignored = 0
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
+            cls._capability(c, run_tags, attempt, verdicts)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -215,20 +225,104 @@ class TestResultWriter(RunWriter):
             }
             run_rows.append(run_row)
         written = cls._flush(client, db, ident_rows, run_rows)
+        # Checked before any batch is written, so a type's second batch is not refused.
+        landed = {
+            t
+            for t in {k[0] for k in verdicts}
+            if CapabilityWriter.already_ingested(
+                client, db, run_id, component, t, shard=source_file
+            )
+        }
+        for (test_type, arch, disc_keys), results in verdicts.items():
+            if test_type not in landed:
+                CapabilityWriter.insert(
+                    client,
+                    db,
+                    component,
+                    run_id,
+                    test_type,
+                    results,
+                    arch=arch,
+                    disc_keys=disc_keys,
+                    shard=source_file,
+                )
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
-        cls._warn(ignored, "property value(s) ignored -- not tag, metric.* or result.*")
+        cls._warn(
+            ignored,
+            "property value(s) ignored -- not tag, metric.*, result.* or capability.*",
+        )
         return written
+
+    # A case's outcome as a capability verdict; a skipped case gave none.
+    _VERDICT = {
+        "passed": "passed",
+        "xpass": "passed",
+        "failed": "failed",
+        "error": "failed",
+        "xfail": "not_implemented",
+    }
+
+    @classmethod
+    def _capability(cls, case: dict, run_tags, attempt: int, verdicts: dict) -> None:
+        """Add the case's `capability.*` verdict, if it declares one, to `verdicts`.
+
+        Keyed by (test_type, arch, sig keys): one CapabilityWriter batch hashes one key set.
+        `capability.sig.<k>` is hashed into capability_id, in sorted key order;
+        `capability.tag` is repeatable; any other `capability.<k>` lands in the run's props.
+        """
+        decl: dict = {}
+        sig: dict = {}
+        tags: list = []
+        props = {"test_name": case.get("name", "")}
+        for pname, pvalue in case.get("properties", []) or []:
+            if not pname.startswith("capability."):
+                continue
+            key, value = pname[len("capability.") :], str(pvalue)
+            if key.startswith("sig."):
+                sig[key[len("sig.") :]] = value
+            elif key == "tag":
+                tags.append(value)
+            elif key in ("test_type", "subject", "name", "backend"):
+                decl[key] = value
+            elif key:
+                props[key] = value
+        status = cls._VERDICT.get(case.get("status", ""))
+        if not (status and decl.get("name")):
+            return
+        if attempt:
+            props["run_attempt"] = str(attempt)
+        arch = next(
+            (
+                t.split("__", 1)[1]
+                for t in run_tags
+                if CaseId.namespace(t) == "platform"
+            ),
+            "",
+        )
+        key = (decl.get("test_type", ""), arch, tuple(sorted(sig)))
+        verdicts.setdefault(key, []).append(
+            {
+                "subject": decl.get("subject", ""),
+                "name": decl["name"],
+                "status": status,
+                "backend": decl.get("backend", ""),
+                "disc": sig,
+                "tags": tags,
+                "props": {k: v for k, v in props.items() if v},
+            }
+        )
 
     @staticmethod
     def _recorded(case: dict) -> tuple:
         """(measurements, result props, count ignored) from the case's JUnit properties.
 
         `metric.<name>` must be a finite number and lands in measurements under `<name>`;
-        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for.
+        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for,
+        `capability.*` by _capability.
         """
         measured, recorded, ignored = {}, {}, 0
         for pname, pvalue in case.get("properties", []) or []:
-            if pname == "tag" or "__" in pname:
+            if pname == "tag" or "__" in pname or pname.startswith("capability."):
                 continue
             if pname.startswith("metric.") and len(pname) > len("metric."):
                 try:

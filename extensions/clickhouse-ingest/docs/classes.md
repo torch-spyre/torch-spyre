@@ -77,7 +77,17 @@ What a case's JUnit properties become:
 | any other `tag` | `op__torch_mul` | `test_cases.tags`, hashed into `test_case_id` |
 | `metric.<name>`, a finite number | `metric.latency_ms=41.5` | `test_case_runs.measurements['latency_ms']` |
 | `result.<name>` | `result.backend=cpu` | `test_case_runs.props['result.backend']` |
+| `capability.test_type` / `.subject` / `.name` | `capability.name=torch.mul` | `capabilities`, hashed into `capability_id` |
+| `capability.sig.<k>` | `capability.sig.input_shapes=["[1,2]"]` | `capabilities.props`, hashed (sorted by key) |
+| `capability.backend` | `capability.backend=cpu` | `capability_runs.backend` |
+| `capability.tag` (repeatable) | `capability.tag=torch.mul.1` | `capabilities.tags` |
+| any other `capability.<k>` | `capability.fallback_ops=aten.mul.Tensor` | `capability_runs.props[k]` |
 | anything else | `single_input_index` | ignored, counted in a `[warn]` |
+
+A case carrying `capability.name` also writes one `capability_runs` verdict from its outcome:
+passed/xpass → `passed`, failed/error → `failed`, xfail → `not_implemented`; a skipped case
+writes none. `arch` is the run's `platform__` tag and `shard` is the source file, so the
+verdicts share the outcomes' dedup and re-run replacement.
 
 Bare tags older emitters wrote are read as their namespaced form (`LEGACY_TAG_ALIASES`:
 `nightly` → `cadence__nightly`, `fvt` → `testtype__fvt`, `torch-spyre` → `domain__torch-spyre`).
@@ -113,8 +123,9 @@ capability verdict or a benchmark measurement gets *compared across*, not part
 of what identifies the subject.
 
 **Use cases.**
-- `ingest_model_ops.py` (torch-spyre) derives `CapabilityId`s for
-  `test_type="model_ops"` — "does this build support op X".
+- `TestResultWriter` derives `CapabilityId`s for any JUnit case that declares
+  `capability.*` properties — torch-spyre's model-ops suites, `test_type="model_ops"`:
+  "does this build support op X".
 - `capability_write.py` (hf-adapters) derives them for
   `test_type="model_support"` — "does this Hub checkpoint run on backend Y" —
   the two share one table pair (`capabilities`/`capability_runs`) and are told
@@ -260,8 +271,9 @@ CapabilityWriter.insert(client, db, component, run_id, test_type, results, arch=
 ```
 
 **Use case.** Two genuinely different producers share this one writer:
-`ingest_model_ops.py` (torch-spyre, `test_type="model_ops"`) and
-`capability_write.py` (hf-adapters, `test_type="model_support"`). Both pass a
+`TestResultWriter`, for JUnit cases carrying `capability.*` properties (torch-spyre's
+model-ops suites, `test_type="model_ops"`), and `capability_write.py` (hf-adapters,
+`test_type="model_support"`). Both pass a
 `shard` when the caller fans out over parallel workers — scoping the dedup
 check per shard is what stops the *first* shard to flush from making every
 other shard look already-ingested.

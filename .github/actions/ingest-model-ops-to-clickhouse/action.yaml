@@ -11,9 +11,8 @@ description: >
 inputs:
   gha-run-id:
     description: >
-      Numeric GitHub Actions run ID of the nightly run whose job logs are analysed. This
-      downloads only jobs named "model-ops / ...", which parse_model_ops_logs.py's own
-      \bSpyre\b filter cannot tell apart from same-worded regression-matrix job names.
+      Numeric GitHub Actions run ID of the model-ops-tests run whose job logs are analysed.
+      Only its "<suite> Spyre" jobs are downloaded.
     required: true
   workflow-name:
     description: >
@@ -136,13 +135,9 @@ runs:
       if: steps.gate.outputs.configured == 'true'
       uses: ./.github/actions/setup-gh-cli
 
-    # Only the model-ops jobs, and strip the reusable-workflow prefix: the triggering run is
-    # the whole nightly, whose regression jobs also carry a "Spyre" token, enough to pass the
-    # parser's own \bSpyre\b filter and land as fake model-ops suites, so this selects on the
-    # caller's job id (exact) rather than the "Spyre" substring. The name is reduced to the
-    # suite alone -- a reusable workflow reports "<caller-job-id> / <job name>", and the
-    # parser derives suite_name from that verbatim, so leaving the prefix on would break
-    # continuity with every row already stored under the un-prefixed suite name.
+    # Only the model-ops suite jobs, selected by the " Spyre" suffix that
+    # model_ops_tests.yaml gives them: the parser derives suite_name from the job name
+    # verbatim, so that is also what keeps continuity with the suite names already stored.
     - name: Download job logs
       if: steps.gate.outputs.configured == 'true'
       shell: bash
@@ -179,14 +174,14 @@ runs:
             --paginate \
             -f per_page=100 \
             --jq '.jobs[]
-                  | select(.name | startswith("model-ops / "))
-                  | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
+                  | select(.name | endswith(" Spyre"))
+                  | {id: .id, name: .name}' \
           > /tmp/jobs.jsonl
         }
         retry list_jobs
 
         if [ ! -s /tmp/jobs.jsonl ]; then
-          echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."
+          echo "[info] no model-ops suite jobs in run ${RUN_ID}."
         fi
 
         python3 - << 'PYEOF'

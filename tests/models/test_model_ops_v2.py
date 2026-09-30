@@ -44,11 +44,13 @@ from oot_framework.oot_test_constants import ENV_TEST_CONFIG
 from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
 from oot_framework.oot_test_utilities import (
     print_test_tags_oot,
-    record_results,
+    record_properties,
     _format_input_args_shapes,
     _input_args_record,
     _RUNTIME_SHAPES,
+    _RUNTIME_TAGS,
 )
+from model_ops_capability import capability_properties
 from op_registry import OP_REGISTRY, OpAdapter
 import shared_config
 from torch_spyre.ops.fallbacks import FallbackWarning
@@ -408,14 +410,22 @@ class TestSpyreModelOps(TestCase):
             pytest.skip(f"No inputs specified for op {op_name!r}")
 
         # Only a test that got past the filters and dedupe above carries a verdict.
-        record_results(
-            self,
-            op=op_name,
+        capability = capability_properties(
+            op_name,
+            subject=next(
+                (
+                    t[len("model__") :]
+                    for t in _RUNTIME_TAGS.get(method_name, op.op_tags)
+                    if t.startswith("model__")
+                ),
+                "",
+            ),
             variant=next(
                 (t for t in reversed(op.op_tags) if t.startswith("torch.")), ""
             ),
             args=_input_args_record(ops_item.sample_inputs_func.args),
         )
+        record_properties(self, capability)
 
         # Config values — sourced entirely from TestEntry / OpsNamedItem
         seed: Optional[int] = op.seed
@@ -543,6 +553,7 @@ class TestSpyreModelOps(TestCase):
         # per process; every caught warning is re-issued so the summary is unchanged.
         fn = adapter.fn
         caught: List[warnings.WarningMessage] = []
+        ran = False
         try:
             with torch.no_grad(), warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", FallbackWarning)
@@ -570,6 +581,7 @@ class TestSpyreModelOps(TestCase):
                 case_name=method_name,
                 description=description,
             )
+            ran = True
         finally:
             fallbacks = set()
             for w in caught:
@@ -577,11 +589,15 @@ class TestSpyreModelOps(TestCase):
                 m = re.match(r"(aten\.\S+) is falling back", str(w.message))
                 if m and issubclass(w.category, FallbackWarning):
                     fallbacks.add(m.group(1))
-            record_results(
-                self,
-                backend="cpu" if fallbacks else "spyre",
-                fallback_ops=" ".join(sorted(fallbacks)),
-            )
+            # Only an op that ran says where it ran; one that failed is a verdict on Spyre.
+            if capability:
+                record_properties(
+                    self,
+                    {
+                        "capability.backend": "cpu" if ran and fallbacks else "spyre",
+                        "capability.fallback_ops": " ".join(sorted(fallbacks)),
+                    },
+                )
             torch._dynamo.reset()
 
 

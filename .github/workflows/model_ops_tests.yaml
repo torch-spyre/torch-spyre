@@ -80,7 +80,8 @@ jobs:
           retention-days: 5
 
   model-ops-tests:
-    name: ${{ matrix.suite.name }}
+    # " Spyre" is how ingest-model-ops-to-clickhouse picks the suite jobs whose logs it parses.
+    name: ${{ matrix.suite.name }} Spyre
     needs: build
     runs-on:
       - x86_64

@@ -154,3 +154,112 @@ def test_no_attempt_keeps_first_write_wins_for_verdicts():
     c = FakeClient(run_count=1)
     assert _verdict(c, 0)
     assert c.commands == []
+
+
+def _declared(name, status="passed", backend="spyre", **extra):
+    props = [
+        ("tag", "platform__ppc64le"),
+        ("capability.test_type", "model_ops"),
+        ("capability.subject", "m-1"),
+        ("capability.name", "torch.mul"),
+        ("capability.sig.input_shapes", '["[1,2]"]'),
+        ("capability.sig.input_dtypes", '["torch.bfloat16"]'),
+        ("capability.backend", backend),
+        ("capability.tag", "torch.mul.1"),
+        *extra.items(),
+    ]
+    return {"classname": "T", "name": name, "status": status, "properties": props}
+
+
+def _rows(client, table):
+    (_, rows, cols) = next(i for i in client.inserts if i[0] == table.name)
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def test_a_declared_capability_is_written_alongside_the_outcome():
+    from spyre_clickhouse_ingest.identity import CapabilityId
+    from spyre_clickhouse_ingest.schema import CAPABILITIES, CAPABILITY_RUNS
+
+    c = FakeClient()
+    cases = [
+        _declared("a", backend="cpu", **{"capability.fallback_ops": "aten.mul.Tensor"}),
+        _declared("b", status="xfail"),
+        _declared("c", status="error"),
+        _declared("d", status="skipped"),
+        _case("plain"),
+    ]
+    assert (
+        insert_test_results(c, "db", "torch-spyre", RUN, cases, "a.xml", attempt=2) == 5
+    )
+    runs = {r["props"]["test_name"]: r for r in _rows(c, CAPABILITY_RUNS)}
+    assert sorted(runs) == ["a", "b", "c"]
+    assert (runs["a"]["status"], runs["a"]["backend"]) == ("passed", "cpu")
+    assert runs["b"]["status"] == "not_implemented"
+    assert runs["c"]["status"] == "failed"
+    assert runs["a"]["arch"] == "ppc64le" and runs["a"]["test_type"] == "model_ops"
+    assert runs["a"]["props"] == {
+        "test_name": "a",
+        "fallback_ops": "aten.mul.Tensor",
+        "run_attempt": "2",
+        "shard": "a.xml",
+    }
+    (ident,) = _rows(c, CAPABILITIES)
+    assert ident["tags"] == ["torch.mul.1"]
+    # Sig keys hash sorted, so the order a test records them in cannot mint a new id.
+    assert ident["capability_id"] == CapabilityId.derive(
+        "torch-spyre",
+        "model_ops",
+        "m-1",
+        "torch.mul",
+        {"input_dtypes": '["torch.bfloat16"]', "input_shapes": '["[1,2]"]'},
+        ("input_dtypes", "input_shapes"),
+    )
+    # capability.* is routed, so it neither lands in props nor counts as ignored.
+    assert not [k for p in _run_props(c) for k in p if k.startswith("capability.")]
+
+
+def test_capability_properties_are_not_reported_as_ignored(capsys):
+    insert_test_results(
+        FakeClient(), "db", "torch-spyre", RUN, [_declared("a")], "a.xml"
+    )
+    assert "ignored" not in capsys.readouterr().err
+
+
+def test_verdicts_already_landed_for_the_file_are_not_rewritten():
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    c = FakeClient(run_count=1)
+    insert_test_results(c, "db", "torch-spyre", RUN, [_declared("a")], "a.xml")
+    assert not [i for i in c.inserts if i[0] == CAPABILITY_RUNS.name]
+    sql, params = c.queries[-1]
+    assert "props['shard'] = {shard:String}" in sql and params["shard"] == "a.xml"
+
+
+def test_older_attempts_drop_the_files_capability_verdicts_too():
+    c = FakeClient(run_count=5)
+    drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
+    sql, params = c.commands[-1]
+    assert sql.startswith("DELETE FROM db.capability_runs")
+    assert "props['shard'] = {sf:String}" in sql and "< {attempt:UInt32}" in sql
+    assert params["sf"] == "a.xml"
+
+
+def test_every_batch_of_one_type_lands_when_the_file_is_new():
+    from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
+
+    class Landing(FakeClient):
+        def insert(self, table, rows, column_names=None, database=None):
+            super().insert(table, rows, column_names, database)
+            if table == CAPABILITY_RUNS.name:
+                self.run_count = 1  # the first batch is now visible to a dedup query
+
+    other_sig = _declared("b")
+    other_sig["properties"] = [
+        p for p in other_sig["properties"] if p[0] != "capability.sig.input_dtypes"
+    ]
+    c = Landing()
+    insert_test_results(
+        c, "db", "torch-spyre", RUN, [_declared("a"), other_sig], "a.xml"
+    )
+    written = [r for t, rows, _ in c.inserts if t == CAPABILITY_RUNS.name for r in rows]
+    assert len(written) == 2
