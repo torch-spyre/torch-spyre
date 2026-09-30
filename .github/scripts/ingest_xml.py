@@ -921,14 +921,20 @@ def parse_test_xml(xml_path: Path):
     except ValueError:
         triggered_at = datetime.now(UTC)
 
-    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins.
-    by_key = {}
+    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
+    # and the earlier attempts are kept only as its result.reruns count.
+    by_key: dict = {}
+    seen: Counter = Counter()
     for tc in suite.findall(".//testcase"):
-        by_key[(tc.get("classname", ""), tc.get("name", ""))] = tc
+        key = (tc.get("classname", ""), tc.get("name", ""))
+        by_key[key] = tc
+        seen[key] += 1
     raw_cases = []
-    for tc in by_key.values():
+    for key, tc in by_key.items():
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
+        if seen[key] > 1:
+            properties = [*properties, ("result.reruns", str(seen[key] - 1))]
         op_name, dtype, platform = extract_op_dtype_platform(
             tc.get("name", ""), properties
         )
@@ -1200,7 +1206,10 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             "       cr.tags, cr.measurements "
             f"FROM {runs} AS cr "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
-            "  AND has(cr.tags, concat('testtype__', {tier:String}))",
+            "  AND has(cr.tags, concat('testtype__', {tier:String})) "
+            # A case this run already holds keeps its own outcome: one outcome per case.
+            f"  AND cr.test_case_id NOT IN (SELECT test_case_id FROM {runs} "
+            "      WHERE run_id = {run_id:UUID} AND component = {component:String})",
             parameters={
                 "run_id": run_id,
                 "src": src_run,

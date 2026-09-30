@@ -125,6 +125,17 @@ class TestResultWriter(RunWriter):
         "component = {component:String} AND run_id = {run_id:UUID}"
         " AND props['source_file'] = {sf:String}"
     )
+    # One outcome per (run_id, test_case_id) -- the counters sum rows. When a run holds a case
+    # twice, an executed row beats a reused copy, a later attempt an earlier one, then the worse
+    # outcome wins; migration 007 applies the same order to rows already written.
+    SEVERITY = {
+        "skipped": 1,
+        "xfail": 2,
+        "passed": 3,
+        "xpass": 4,
+        "error": 5,
+        "failed": 6,
+    }
 
     @classmethod
     def already_ingested(
@@ -277,6 +288,9 @@ class TestResultWriter(RunWriter):
                 "measurements": measured,
             }
             run_rows.append(run_row)
+        run_rows, superseded = cls._one_per_case(
+            client, db, component, run_id, run_rows
+        )
         written = cls._flush(client, db, ident_rows, run_rows)
         # Checked before any batch is written, so a type's second batch is not refused.
         landed = {
@@ -299,6 +313,19 @@ class TestResultWriter(RunWriter):
                     disc_keys=disc_keys,
                     shard=source_file,
                 )
+        if superseded:
+            # After the insert, so a failed insert never loses the outcome it would replace.
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND audit_uuid IN {uuids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "uuids": superseded,
+                },
+            )
+            cls._rebuild_counters(client, db, run_id, component)
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
         for problem, n in sorted(problems.items()):
             cls._warn(n, f"capability declaration(s) with {problem}")
@@ -356,6 +383,51 @@ class TestResultWriter(RunWriter):
                 "props": {k: v for k, v in props.items() if v},
             }
         )
+    @classmethod
+    def _rank(cls, run_id: str, status: str, props: dict) -> tuple:
+        ran_in = props.get("ran_in", "")
+        return (
+            ran_in in ("", str(run_id)),
+            int(props.get("run_attempt") or 0),
+            cls.SEVERITY.get(status, 0),
+        )
+
+    @classmethod
+    def _one_per_case(cls, client, db: str, component: str, run_id: str, rows: list):
+        """(rows to insert, audit_uuids they supersede): one outcome per case in the run."""
+        best: dict = {}
+        for r in rows:
+            prev = best.get(r["test_case_id"])
+            if prev is None or cls._rank(run_id, r["status"], r["props"]) > cls._rank(
+                run_id, prev["status"], prev["props"]
+            ):
+                best[r["test_case_id"]] = r
+        ids = list(best)
+        held: dict = {}
+        for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
+            for tcid, uuid, status, ran_in, attempt in client.query(
+                "SELECT test_case_id, audit_uuid, status, props['ran_in'], "
+                f"props['run_attempt'] FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND test_case_id IN {ids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
+                },
+            ).result_rows:
+                rank = cls._rank(
+                    run_id, status, {"ran_in": ran_in, "run_attempt": attempt}
+                )
+                top, uuids = held.get(str(tcid), ((), []))
+                held[str(tcid)] = (max(top, rank), uuids + [str(uuid)])
+        keep, superseded = [], []
+        for tcid, r in best.items():
+            top, uuids = held.get(str(tcid), ((), []))
+            if cls._rank(run_id, r["status"], r["props"]) > top:
+                keep.append(r)
+                superseded += uuids
+        return keep, superseded
 
     @staticmethod
     def _recorded(case: dict) -> tuple:
