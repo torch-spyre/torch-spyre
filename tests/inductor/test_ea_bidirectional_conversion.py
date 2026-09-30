@@ -503,6 +503,60 @@ def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
     assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
 
 
+def _downcast_stick_slice(start, stop):
+    def fn(a, b):
+        return (b.float() * 2)[:, 0, start:stop].half() + a
+
+    return fn
+
+
+@pytest.mark.parametrize(
+    "start, extent", [(0, 64), (64, 128)], ids=["first_pair", "second_pair"]
+)
+def test_downcast_of_one_stick_slice_reads_the_stick_pair(start, extent):
+    """A downcast of a one-FP32-stick slice reads both sticks of its pair.
+
+    The staggered value already holds whole pairs, so no gap dim is added: the
+    pair lives on the num-sticks dim.  The slice's host range fits one FP32
+    stick, but the downcast iterates a whole FP16 stick, spread over the pair.
+    The size-2 outer dim selected by ``[:, 0]`` is a host dim, not the pair.
+    """
+    torch._dynamo.reset()
+    fn = _downcast_stick_slice(start, start + 32)
+    a = torch.randn(4, 32, dtype=torch.float16)
+    b = torch.randn(4, 2, extent, dtype=torch.float16)
+    result = torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+    torch.testing.assert_close(result.cpu(), fn(a, b), rtol=0.005, atol=0.005)
+
+
+def test_downcast_of_slice_starting_inside_a_stick_pair_is_unsupported():
+    """A slice starting at the pair's second FP32 stick fails loudly."""
+    torch._dynamo.reset()
+    fn = _downcast_stick_slice(32, 64)
+    a = torch.randn(4, 32, dtype=torch.float16)
+    b = torch.randn(4, 2, 64, dtype=torch.float16)
+    with pytest.raises(Exception, match="starting at stick 1, inside a stick pair"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+
+def test_downcast_of_view_stepping_one_stick_is_unsupported():
+    """A downcast whose outer host dim steps one FP32 stick fails loudly.
+
+    Each FP16 output stick takes one row of that dim, while a stick pair spans
+    two rows.
+    """
+    torch._dynamo.reset()
+
+    def fn(a, b):
+        return (b.float() * 2).view(4, 4, 32)[:, 0:2, :].half() + a
+
+    a = torch.randn(4, 2, 32, dtype=torch.float16)
+    b = torch.randn(4, 128, dtype=torch.float16)
+    with pytest.raises(Exception, match="starting at a varying stick"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+
 # ---------------------------------------------------------------------------
 # Eager-path unit tests
 # ---------------------------------------------------------------------------

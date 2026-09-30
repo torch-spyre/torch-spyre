@@ -987,6 +987,7 @@ class TestStaggeredFp32Consumer(InductorTestCase):
                     device_coordinates=coords,
                     allocation={"hbm": 0},
                     element_arrangement=ElementArrangement.DL16_TO_FP32,
+                    stride_map=[32, 64, 1],
                 ),
                 TensorArg(
                     is_input=False,
@@ -997,6 +998,7 @@ class TestStaggeredFp32Consumer(InductorTestCase):
                     device_coordinates=coords,
                     allocation={"hbm": 0x100000},
                     element_arrangement=out_ea,
+                    stride_map=[32, 64, 1],
                 ),
             ],
             op_info={},

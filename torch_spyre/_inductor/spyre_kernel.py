@@ -855,6 +855,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
             kernel_local=kernel_local,
+            stride_map=list(tensor.layout.device_layout.stride_map),
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1875,7 +1876,7 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
     ``insert_staggered_ea_padding`` pads such an op's buffers to whole sticks, but
     the op's iteration space still spans only the live elements.  This rounds the
     range of each stick var up to match, and binds the stick index of an operand
-    padded through a gap dim to that dim.
+    with fewer elements per stick to the dim holding its stick pair.
 
     Runs before ``align_tensors``, which re-intersects the split work division
     planned with each stick var's stick count on the first operand.  On an
@@ -1898,7 +1899,8 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
         coords = list(arg.device_coordinates)
         stick_coord = coords[-1]
         if not stick_coord.free_symbols:
-            continue  # A broadcast or size-1 stick dim has no stick var.
+            # A broadcast or size-1 stick dim has no stick var.
+            continue
         # The stick-expression check upstream admits only one stick var.
         assert len(stick_coord.free_symbols) == 1, stick_coord
         (stick_var,) = stick_coord.free_symbols
@@ -1912,24 +1914,67 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
             )
             rounded_stick_vars.add(stick_var)
 
-        # When the stick var spans a single stick of an operand, that stick has no
-        # num-sticks dim of its own to grow, so ``_pad_num_sticks`` holds the
-        # padded stick group in a new outermost "gap dim" (``stride_map`` -1, no
-        # host elements) with coordinate 0.  The stick var spans the whole group,
-        # so split it: the stick index goes to the gap dim, the offset within the
-        # stick stays innermost.  Otherwise align treats the gap dim as a separate
-        # back gap, and the SDSC counts the group's second stick twice.
         eps = arg.device_size[-1]
-        has_gap_dim = (
-            eps < max_eps and coords[0] == 0 and arg.device_size[0] == max_eps // eps
-        )
-        stick_var_only_innermost = not any(
-            stick_var in c.free_symbols for c in coords[:-1]
-        )
-        if has_gap_dim and stick_var_only_innermost:
-            coords[0] = sympy.floor(stick_coord / eps)
-            coords[-1] = sympy.Mod(stick_coord, eps)
-            arg.device_coordinates = coords
+        if eps == max_eps:
+            # The rounded stick var spans exactly one of the operand's sticks.
+            continue
+        if any(stick_var in c.free_symbols for c in coords[:-1]):
+            # Indexing already puts the stick index on an outer dim, as for a read
+            # of whole pairs.
+            continue
+        # Every supported typecast halves or doubles the elements per stick.
+        assert max_eps == 2 * eps, (max_eps, arg)
+
+        # Find the dim holding the pair, to take the stick index.
+        stride_map, size = arg.stride_map, arg.device_size
+        assert stride_map is not None, arg
+        if stride_map[0] == -1 and size[0] > 1:
+            # The gap dim ``_pad_num_sticks`` prepends when the num-sticks dim holds
+            # a single stick.  A size-1 dim with ``stride_map`` -1 is an elided
+            # host dim instead.
+            stick_index_dim = 0
+        else:
+            # The num-sticks dim, which steps the host by one stick.  Of the padded
+            # operands, only a read of one stick of a wider buffer gets here, e.g.
+            # ``x32[..., 64:96]``; a read of more sticks already indexes this dim.
+            stick_stride = eps * stride_map[-1]
+            candidate_dims = [
+                d
+                for d in range(len(size) - 1)
+                if stride_map[d] == stick_stride and size[d] > 1
+            ]
+            if len(candidate_dims) != 1:
+                # TODO: bind an operand whose stick pair is on no single dim,
+                # e.g. one that padding left alone or with a folded num-sticks dim.
+                raise NotImplementedError(
+                    f"staggered read with no unique num-sticks dim {candidate_dims}: "
+                    f"{arg}"
+                )
+            (stick_index_dim,) = candidate_dims
+        stick_index_offset = coords[stick_index_dim]
+        if not stick_index_offset.is_Integer:
+            # TODO: support a pair whose position varies over the iteration.
+            raise NotImplementedError(
+                f"staggered read starting at a varying stick {stick_index_offset}: {arg}"
+            )
+        if stick_index_offset % 2 != 0:
+            # TODO: support a slice starting at the second stick of a pair, e.g.
+            # ``x32[..., 32:64]``, unlike ``64:96``; its lanes run into the next
+            # pair.
+            raise NotImplementedError(
+                f"staggered read starting at stick {stick_index_offset}, inside a stick "
+                f"pair: {arg}"
+            )
+        assert size[stick_index_dim] >= stick_index_offset + 2, arg
+
+        # The rounded stick var spans a pair of the operand's sticks, so its stick
+        # coordinate becomes two: the stick index, on the dim holding the pair, and
+        # the offset within the stick, innermost.  Otherwise lanes past the first
+        # stick read beyond it, and a gap dim is left for align to treat as a
+        # separate back gap.
+        coords[stick_index_dim] = stick_index_offset + sympy.floor(stick_coord / eps)
+        coords[-1] = sympy.Mod(stick_coord, eps)
+        arg.device_coordinates = coords
 
 
 def simplify_op_spec(
