@@ -53,6 +53,8 @@ class SchemaApplier:
     )
     # A file that belongs in a different database (e.g. otel) applies only when named.
     EXPLICIT = re.compile(r"^--\s*APPLY:\s*explicit\b", re.IGNORECASE | re.MULTILINE)
+    # A migration written to be repeated, e.g. to re-key rows that stale writers keep producing.
+    RERUNNABLE = re.compile(r"^--\s*RERUNNABLE\b", re.IGNORECASE | re.MULTILINE)
     CREATE = re.compile(
         r"^CREATE\s+(MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
         re.IGNORECASE,
@@ -324,6 +326,15 @@ class SchemaApplier:
                 steps.append(("recreate", o.name, o.file))
         return steps
 
+    @classmethod
+    def rerun(cls, client, path: Path) -> None:
+        """Run a migration again; refused unless it is marked `-- RERUNNABLE`."""
+        text = path.read_text()
+        if not cls.RERUNNABLE.search(text):
+            raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
+        for stmt in cls.statements(text):
+            client.command(stmt)
+
 
 SCHEMA_DIR = SchemaApplier.schema_dir()
 
@@ -360,6 +371,11 @@ def main() -> None:
         action="store_true",
         help="Print what an apply would change; exit 1 if anything would, 2 on drift",
     )
+    mode.add_argument(
+        "--rerun",
+        metavar="MIGRATION",
+        help="Run one -- RERUNNABLE migration again (e.g. 006_case_id_without_run_context.sql)",
+    )
     args = parser.parse_args()
 
     if not SchemaApplier.sql_files(args.schema_dir):
@@ -383,6 +399,11 @@ def main() -> None:
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
     print(f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}")
+
+    if args.rerun:
+        SchemaApplier.rerun(client, args.schema_dir / "migrations" / args.rerun)
+        print(f"[info] reran {args.rerun} on {db}")
+        return
 
     if args.check:
         steps = SchemaApplier.plan(client, db, files, migrations)

@@ -258,3 +258,16 @@ def test_repo_schema_parses_as_create_only():
     d = SchemaApplier.schema_dir()
     for path, text in SchemaApplier.selected_files(d, include=["80-otel.sql"]):
         assert SchemaApplier.objects(path, text)
+
+
+def test_rerun_repeats_only_a_rerunnable_migration(tmp_path):
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE},
+        {"001_x.sql": "SELECT 1", "002_y.sql": "-- RERUNNABLE\nSELECT 2"},
+    )
+    server = FakeServer()
+    SchemaApplier.rerun(server, d / "migrations" / "002_y.sql")
+    assert server.log == ["SELECT 2"]
+    with pytest.raises(ValueError, match="RERUNNABLE"):
+        SchemaApplier.rerun(server, d / "migrations" / "001_x.sql")

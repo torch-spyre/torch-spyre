@@ -60,12 +60,27 @@ orchestrator.
 ```python
 CaseId.derive(component, classname, name, tags)   # -> uuid, or "" without component/name
 CaseId.tags_for(case)                              # JUnit <properties> -> tags array
+CaseId.split_tags(tags)                            # -> (identity tags, run-context tags, result props)
 ```
 
 **Use case.** `TestResultWriter.insert` (see [writer.py](#writerpy)) calls
 this once per JUnit `<testcase>` so the *same test* — same component,
-classname, name, tags — reconciles across every run that ever exercised it,
-regardless of which CI system or architecture ran it this time.
+classname, name, identity tags — reconciles across every run that ever exercised it,
+regardless of which CI system, architecture or test type ran it this time.
+
+What a case's JUnit properties become:
+
+| property | example | lands in |
+|---|---|---|
+| `tag` in `RUN_CONTEXT_TAG_NAMESPACES` (`platform`, `testtype`, `cadence`) | `testtype__svt` | `test_case_runs.tags`, not hashed |
+| `tag` in `RESULT_TAG_NAMESPACES` (`refcoverage`) | `refcoverage__48/48` | `test_case_runs.props['result.refcoverage']` |
+| any other `tag` | `op__torch_mul` | `test_cases.tags`, hashed into `test_case_id` |
+| `metric.<name>`, a finite number | `metric.latency_ms=41.5` | `test_case_runs.measurements['latency_ms']` |
+| `result.<name>` | `result.backend=cpu` | `test_case_runs.props['result.backend']` |
+| anything else | `single_input_index` | ignored, counted in a `[warn]` |
+
+Bare tags older emitters wrote are read as their namespaced form (`LEGACY_TAG_ALIASES`:
+`nightly` → `cadence__nightly`, `fvt` → `testtype__fvt`, `torch-spyre` → `domain__torch-spyre`).
 
 ### `ArtifactId(DerivedId)` / `GhaArtifactId(ArtifactId)` — identity of a built thing
 

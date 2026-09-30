@@ -1185,22 +1185,21 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             continue
         # Only the cases carrying this tier's tag: the covering run may have executed a
         # wider set, and importing all of it would credit this tier with foreign cases.
-        cases = schema_model.TEST_CASES.qualified(db)
         client.command(
             f"INSERT INTO {runs} "
-            "(run_id, test_case_id, component, status, duration_s, fail_message, props) "
+            "(run_id, test_case_id, component, status, duration_s, fail_message, props, tags, "
+            "measurements) "
             "SELECT {run_id:UUID}, cr.test_case_id, cr.component, cr.status, cr.duration_s, "
             # mapContains rather than a bare lookup: an older row predating ran_in has no
             # such key, and defaulting it to the SOURCE run keeps that row honest instead of
             # silently claiming this run executed it.
             "       cr.fail_message, "
             "       mapUpdate(cr.props, map('ran_in', "
-            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))) "
+            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))), "
+            "       cr.tags, cr.measurements "
             f"FROM {runs} AS cr "
-            f"INNER JOIN {cases} AS c ON c.test_case_id = cr.test_case_id "
-            "     AND c.component = cr.component "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
-            "  AND has(c.tags, concat('testtype__', {tier:String}))",
+            "  AND has(cr.tags, concat('testtype__', {tier:String}))",
             parameters={
                 "run_id": run_id,
                 "src": src_run,

@@ -45,10 +45,9 @@ import urllib.request
 # markers; those never denote a tier and must not suppress execution.
 TIER_LABELS = ("smoke", "unit", "integration", "regression", "trunk")
 
-# test_cases.tags are NAMESPACED (`testtype__trunk`, not `trunk`) -- the same
-# namespace__value form the pytest tags use, which also carries op__ and dtype__ tags
-# on the same array. Matching the bare tier name finds nothing, and a no-match is
-# indistinguishable from "nothing covered", so this prefix is load-bearing.
+# test_case_runs.tags are NAMESPACED (`testtype__trunk`, not `trunk`) -- the same
+# namespace__value form the pytest tags use. Matching the bare tier name finds nothing, and a
+# no-match is indistinguishable from "nothing covered", so this prefix is load-bearing.
 TIER_TAG_PREFIX = "testtype__"
 
 # Membership is read from the declared label sets, never inferred from a ladder:
@@ -73,8 +72,7 @@ INNER JOIN (
     FROM {db}.artifacts
     ARRAY JOIN sources AS s
 ) AS a ON a.artifact_id = ar.artifact_id
-INNER JOIN {db}.test_cases AS c USING (test_case_id)
-ARRAY JOIN c.tags AS tag
+ARRAY JOIN r.tags AS tag
 WHERE a.git_sha = {{commit_sha:String}}
   AND ar.arch = {{arch:String}}
   AND ar.state IN ('passed', 'failed')

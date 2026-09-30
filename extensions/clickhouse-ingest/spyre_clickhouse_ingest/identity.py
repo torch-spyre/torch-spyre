@@ -34,6 +34,27 @@ _HEX12 = re.compile(r"[0-9a-f]{12}")
 # test cell may run another component's suite, and component is a hash input.
 COMPONENT_DEFAULT = "torch-spyre"
 
+# Tag namespaces that say where/when a test ran (arch, test type, cadence), not what it is.
+# Never hashed, so one test keeps one id across arches and test types; stored per run. A
+# deny-list: an unclassified namespace can only leave an id split, never merge two tests.
+RUN_CONTEXT_TAG_NAMESPACES = frozenset({"platform", "testtype", "cadence"})
+
+# Tag namespaces that carry a measured value (`refcoverage__48/48`): not membership at all, so
+# neither hashed nor tagged -- stored as props['result.<ns>'].
+RESULT_TAG_NAMESPACES = frozenset({"refcoverage"})
+
+# Bare tags older emitters wrote, mapped to their namespaced form; migrations/006 applies the
+# same map to history.
+LEGACY_TAG_ALIASES = {
+    "nightly": "cadence__nightly",
+    "weekly": "cadence__weekly",
+    "fvt": "testtype__fvt",
+    "svt": "testtype__svt",
+    "spyre-inference": "domain__spyre-inference",
+    "spyre-backend": "domain__spyre-backend",
+    "torch-spyre": "domain__torch-spyre",
+}
+
 # Full-metadata identity record, one per component layer (each Containerfile overwrites its
 # own). Preferred read path.
 SPYRE_ARTIFACT_JSON_FILE = "/home/senuser/spyre_artifact.json"
@@ -69,6 +90,30 @@ class DerivedId:
     def complete(cls, *values) -> bool:
         """True when every required field is non-blank; a blank one refuses the id."""
         return all(cls.norm(v) for v in values)
+
+    @staticmethod
+    def canon_tag(tag) -> str:
+        """A legacy bare tag in its namespaced form (lowercase); any other tag unchanged."""
+        return LEGACY_TAG_ALIASES.get(DerivedId.norm(tag), tag)
+
+    @staticmethod
+    def namespace(tag) -> str:
+        return DerivedId.norm(DerivedId.canon_tag(tag)).split("__", 1)[0]
+
+    @classmethod
+    def split_tags(cls, tags) -> tuple:
+        """(identity tags, run-context tags, result props) -- what a test is, where it ran,
+        and values it measured."""
+        ident, ctx, results = set(), set(), {}
+        for t in (cls.canon_tag(x) for x in (tags or []) if cls.norm(x)):
+            ns = cls.namespace(t)
+            if ns in RESULT_TAG_NAMESPACES:
+                results[f"result.{ns}"] = t.split("__", 1)[1] if "__" in t else ""
+            elif ns in RUN_CONTEXT_TAG_NAMESPACES:
+                ctx.add(t)
+            else:
+                ident.add(t)
+        return sorted(ident), sorted(ctx), results
 
     @classmethod
     def tag_part(cls, tags) -> str:
@@ -111,6 +156,11 @@ class RunId(DerivedId):
 
 class CaseId(DerivedId):
     """Content identity of a test, so the same test reconciles across runs."""
+
+    @classmethod
+    def tag_part(cls, tags) -> str:
+        """Only the identity tags: run-context and result tags never reach the hash."""
+        return super().tag_part(cls.split_tags(tags)[0])
 
     @classmethod
     def derive(cls, component: str, classname: str, name: str, tags) -> str:
@@ -413,6 +463,7 @@ run_id_of = RunId.derive
 run_id_for = RunId.for_args
 case_id_for = CaseId.derive
 tags_for_case = CaseId.tags_for
+split_case_tags = CaseId.split_tags
 artifact_id_for = ArtifactId.derive
 base_artifact_id = ArtifactId.from_image
 gha_artifact_id = GhaArtifactId.derive
