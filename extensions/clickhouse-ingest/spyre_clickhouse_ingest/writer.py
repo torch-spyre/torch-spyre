@@ -125,9 +125,11 @@ class TestResultWriter(RunWriter):
         "component = {component:String} AND run_id = {run_id:UUID}"
         " AND props['source_file'] = {sf:String}"
     )
-    # One outcome per (run_id, test_case_id) -- the counters sum rows. When a run holds a case
-    # twice, an executed row beats a reused copy, a later attempt an earlier one, then the worse
-    # outcome wins; migration 007 applies the same order to rows already written.
+    # One outcome per (run_id, test_case_id) -- the counters sum rows. Within one source file a
+    # repeat is a retry, so the later write wins (later attempt, then later audit_uuid). Across
+    # files the rows are separate executions: an executed row beats a reused copy, a later
+    # attempt an earlier one, then the worse status wins -- so a test that ran beats a skip.
+    # Migration 007 applies the same rules to rows already written.
     SEVERITY = {
         "skipped": 1,
         "xfail": 2,
@@ -383,31 +385,33 @@ class TestResultWriter(RunWriter):
                 "props": {k: v for k, v in props.items() if v},
             }
         )
+
     @classmethod
-    def _rank(cls, run_id: str, status: str, props: dict) -> tuple:
-        ran_in = props.get("ran_in", "")
-        return (
-            ran_in in ("", str(run_id)),
-            int(props.get("run_attempt") or 0),
-            cls.SEVERITY.get(status, 0),
+    def _beats(cls, run_id: str, new: dict, held: dict) -> bool:
+        """Does `new` (a row about to be written, so the later write) replace `held`?"""
+        if held["ran_in"] not in ("", str(run_id)):
+            return True
+        attempt = int(new["props"].get("run_attempt") or 0)
+        held_attempt = int(held["run_attempt"] or 0)
+        if held["source_file"] == new["props"].get("source_file", ""):
+            return attempt >= held_attempt
+        return (attempt, cls.SEVERITY.get(new["status"], 0)) > (
+            held_attempt,
+            cls.SEVERITY.get(held["status"], 0),
         )
 
     @classmethod
     def _one_per_case(cls, client, db: str, component: str, run_id: str, rows: list):
         """(rows to insert, audit_uuids they supersede): one outcome per case in the run."""
-        best: dict = {}
-        for r in rows:
-            prev = best.get(r["test_case_id"])
-            if prev is None or cls._rank(run_id, r["status"], r["props"]) > cls._rank(
-                run_id, prev["status"], prev["props"]
-            ):
-                best[r["test_case_id"]] = r
-        ids = list(best)
+        # One file's rows: a case repeated within it keeps its last row.
+        latest = {r["test_case_id"]: r for r in rows}
+        ids = list(latest)
         held: dict = {}
         for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
-            for tcid, uuid, status, ran_in, attempt in client.query(
+            for tcid, uuid, status, ran_in, attempt, source_file in client.query(
                 "SELECT test_case_id, audit_uuid, status, props['ran_in'], "
-                f"props['run_attempt'] FROM {cls.fact_table.qualified(db)} "
+                "props['run_attempt'], props['source_file'] "
+                f"FROM {cls.fact_table.qualified(db)} "
                 "WHERE component = {component:String} AND run_id = {run_id:UUID} "
                 "AND test_case_id IN {ids:Array(UUID)}",
                 parameters={
@@ -416,17 +420,21 @@ class TestResultWriter(RunWriter):
                     "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
                 },
             ).result_rows:
-                rank = cls._rank(
-                    run_id, status, {"ran_in": ran_in, "run_attempt": attempt}
+                held.setdefault(str(tcid), []).append(
+                    {
+                        "audit_uuid": str(uuid),
+                        "status": status,
+                        "ran_in": ran_in,
+                        "run_attempt": attempt,
+                        "source_file": source_file,
+                    }
                 )
-                top, uuids = held.get(str(tcid), ((), []))
-                held[str(tcid)] = (max(top, rank), uuids + [str(uuid)])
         keep, superseded = [], []
-        for tcid, r in best.items():
-            top, uuids = held.get(str(tcid), ((), []))
-            if cls._rank(run_id, r["status"], r["props"]) > top:
+        for tcid, r in latest.items():
+            rows_held = held.get(str(tcid), [])
+            if all(cls._beats(run_id, r, h) for h in rows_held):
                 keep.append(r)
-                superseded += uuids
+                superseded += [h["audit_uuid"] for h in rows_held]
         return keep, superseded
 
     @staticmethod

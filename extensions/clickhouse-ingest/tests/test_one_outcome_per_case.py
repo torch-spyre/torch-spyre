@@ -26,7 +26,7 @@ TCID = CaseId.derive("torch-spyre", "T", "test_x", [])
 
 
 class HeldClient:
-    """A client whose run already holds `held`: [(status, ran_in, run_attempt), ...]."""
+    """A client whose run already holds `held`: [(status, ran_in, run_attempt, source_file)]."""
 
     def __init__(self, held=()):
         self.held = list(held)
@@ -39,8 +39,8 @@ class HeldClient:
         rows = []
         if "audit_uuid" in sql:
             rows = [
-                (TCID, f"00000000-0000-7000-8000-00000000000{i}", st, ran_in, att)
-                for i, (st, ran_in, att) in enumerate(self.held)
+                (TCID, f"00000000-0000-7000-8000-00000000000{i}", *h)
+                for i, h in enumerate(self.held)
             ]
 
         class R:
@@ -56,6 +56,13 @@ def _case(status, name="test_x"):
     return {"classname": "T", "name": name, "status": status, "properties": []}
 
 
+def _write(c, *statuses, source_file="b.xml", attempt=0):
+    cases = [_case(s) for s in statuses]
+    return insert_test_results(
+        c, "db", "torch-spyre", RUN, cases, source_file, attempt=attempt
+    )
+
+
 def _written(c):
     return [
         dict(zip(cols, r))["status"]
@@ -69,9 +76,9 @@ def _deleted(c):
     return [p["uuids"] for sql, p in c.commands if "audit_uuid IN" in sql]
 
 
-def test_a_worse_outcome_replaces_the_held_one_and_recounts():
-    c = HeldClient([("passed", RUN, "")])
-    insert_test_results(c, "db", "torch-spyre", RUN, [_case("failed")], "b.xml")
+def test_across_files_a_worse_outcome_replaces_the_held_one_and_recounts():
+    c = HeldClient([("passed", RUN, "", "a.xml")])
+    _write(c, "failed")
     assert _written(c) == ["failed"]
     assert _deleted(c) == [["00000000-0000-7000-8000-000000000000"]]
     assert any(
@@ -79,36 +86,44 @@ def test_a_worse_outcome_replaces_the_held_one_and_recounts():
     )
 
 
-def test_a_better_or_equal_outcome_is_not_written_again():
+def test_across_files_a_better_or_equal_outcome_is_not_written_again():
     for held in ("failed", "passed"):
-        c = HeldClient([(held, RUN, "")])
-        assert (
-            insert_test_results(c, "db", "torch-spyre", RUN, [_case("passed")], "b.xml")
-            == 0
-        )
+        c = HeldClient([(held, RUN, "", "a.xml")])
+        assert _write(c, "passed") == 0
         assert c.commands == []
 
 
+def test_across_files_a_test_that_ran_beats_a_skip():
+    c = HeldClient([("skipped", RUN, "", "a.xml")])
+    _write(c, "passed")
+    assert _written(c) == ["passed"] and _deleted(c)
+    c = HeldClient([("passed", RUN, "", "a.xml")])
+    assert _write(c, "skipped") == 0
+
+
+def test_within_a_file_the_later_write_wins_even_when_better():
+    # A retry of the same file: its pass supersedes the earlier failure.
+    c = HeldClient([("failed", RUN, "", "b.xml")])
+    _write(c, "passed")
+    assert _written(c) == ["passed"] and _deleted(c)
+
+
 def test_an_executed_outcome_replaces_a_reused_copy_even_when_better():
-    c = HeldClient([("failed", OTHER, "")])
-    insert_test_results(c, "db", "torch-spyre", RUN, [_case("passed")], "b.xml")
+    c = HeldClient([("failed", OTHER, "", "b.xml")])
+    _write(c, "passed")
     assert _written(c) == ["passed"] and _deleted(c)
 
 
-def test_a_later_attempt_replaces_a_worse_earlier_one():
-    c = HeldClient([("failed", RUN, "1")])
-    insert_test_results(
-        c, "db", "torch-spyre", RUN, [_case("passed")], "b.xml", attempt=2
-    )
+def test_a_later_attempt_replaces_a_worse_earlier_one_in_another_file():
+    c = HeldClient([("failed", RUN, "1", "a.xml")])
+    _write(c, "passed", attempt=2)
     assert _written(c) == ["passed"] and _deleted(c)
 
 
-def test_a_case_twice_in_one_batch_is_written_once_worst_first():
+def test_a_case_repeated_in_one_batch_keeps_its_last_row():
     c = HeldClient()
-    insert_test_results(
-        c, "db", "torch-spyre", RUN, [_case("passed"), _case("error"), _case("skipped")]
-    )
-    assert _written(c) == ["error"] and c.commands == []
+    _write(c, "failed", "error", "passed")
+    assert _written(c) == ["passed"] and c.commands == []
 
 
 def test_migration_007_ranks_statuses_as_the_writer_does():

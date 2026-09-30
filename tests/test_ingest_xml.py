@@ -917,6 +917,7 @@ def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
     ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
     assert legs and c.inserts == []
 
+
 def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
     # pytest-rerunfailures' shape: each failed attempt is a bare repeat of the testcase.
     path = tmp_path / "suite.xml"
