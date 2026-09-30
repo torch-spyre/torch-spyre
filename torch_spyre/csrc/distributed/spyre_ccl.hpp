@@ -29,6 +29,10 @@
 
 #include "module.h"
 
+namespace spyre {
+void clear_retained_work_schedules();
+}  // namespace spyre
+
 namespace c10d {
 
 /***********************************************

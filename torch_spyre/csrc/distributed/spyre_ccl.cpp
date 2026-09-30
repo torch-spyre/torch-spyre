@@ -57,6 +57,7 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
 }
 
 SpyreCCLBackend::~SpyreCCLBackend() {
+  spyre::clear_retained_work_schedules();
   spyre_comms::finalize_library();
 }
 
