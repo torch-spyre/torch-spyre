@@ -62,11 +62,19 @@ SELECT
     uniqExactIf(capability_id, status = 'passed' AND backend = 'spyre') AS distinct_spyre_enabled,
     uniqExactIf(capability_id, status = 'not_implemented')            AS distinct_not_implemented,
     uniqExactIf(capability_id, status = 'passed' AND backend = 'cpu') AS distinct_cpu_fallback,
-    -- Share of the model's verdicts that run on spyre (the Model Enablement page's progress):
-    -- not_implemented and CPU fallbacks count in the total; undetermined gave no verdict.
-    if(countIf(status != 'undetermined') = 0, 0,
-       round(100.0 * countIf(status = 'passed' AND backend = 'spyre')
-             / countIf(status != 'undetermined'), 2))                AS spyre_pass_rate
+    -- Share of the subject's distinct names (ops) fully on spyre, in v1's buckets: a name with
+    -- both spyre passes and not_implemented variants is mixed; failed/undetermined count nowhere.
+    -- Reproduced v1's se/(se+ni+cf+sf) on all 10 suites of a nightly.
+    length(arrayIntersect(groupUniqArrayIf(name, status = 'passed' AND backend != 'cpu'),
+                          groupUniqArrayIf(name, status = 'not_implemented')))
+                                                                     AS names_mixed,
+    uniqExactIf(name, status = 'passed' AND backend != 'cpu') - names_mixed AS names_on_spyre,
+    uniqExactIf(name, status = 'not_implemented') - names_mixed      AS names_not_implemented,
+    uniqExactIf(name, status = 'passed' AND backend = 'cpu')          AS names_cpu_fallback,
+    if(names_on_spyre + names_not_implemented + names_cpu_fallback + names_mixed = 0, 0,
+       round(100.0 * names_on_spyre
+             / (names_on_spyre + names_not_implemented + names_cpu_fallback + names_mixed), 2))
+                                                                     AS spyre_op_rate
 FROM v_capability_results
 GROUP BY run_id, component, test_type, subject;
 
