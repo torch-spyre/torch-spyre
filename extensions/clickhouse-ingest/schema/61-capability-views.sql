@@ -55,6 +55,7 @@ SELECT
     countIf(status = 'passed' AND backend = 'cpu')                    AS cpu_fallback,
     countIf(status = 'failed' AND backend = 'spyre')                  AS spyre_failed,
     countIf(status = 'failed')                                        AS failed_any_backend,
+    countIf(status = 'undetermined')                                  AS undetermined,
     -- Distinct CAPABILITIES, not verdicts: one operation on three backends is one capability --
     -- the number "how many ops does this model exercise" wants.
     uniqExact(capability_id)                                         AS distinct_capabilities,
@@ -63,9 +64,10 @@ SELECT
     uniqExactIf(capability_id, status = 'passed' AND backend = 'cpu') AS distinct_cpu_fallback,
     -- Support rate over what was attempted on spyre: not_implemented is excluded from the
     -- denominator (not a failure to fix), and guarded against a zero denominator.
-    if(countIf(backend = 'spyre') = 0, 0,
+    -- undetermined is excluded too: the test broke before the op was tried.
+    if(countIf(backend = 'spyre' AND status != 'undetermined') = 0, 0,
        round(100.0 * countIf(status = 'passed' AND backend = 'spyre')
-             / countIf(backend = 'spyre'), 2))                       AS spyre_pass_rate
+             / countIf(backend = 'spyre' AND status != 'undetermined'), 2)) AS spyre_pass_rate
 FROM v_capability_results
 GROUP BY run_id, component, test_type, subject;
 
@@ -88,7 +90,7 @@ INNER JOIN v_capability_results AS spy
         ON  spy.run_id        = cpu.run_id
         AND spy.capability_id = cpu.capability_id
 WHERE cpu.backend = 'cpu'   AND cpu.status = 'passed'
-  AND spy.backend = 'spyre' AND spy.status != 'passed';
+  AND spy.backend = 'spyre' AND spy.status NOT IN ('passed', 'undetermined');
 
 
 -- Per-capability history across runs: is an operation newly supported, or newly broken.
@@ -106,6 +108,7 @@ SELECT
     countIf(status = 'passed')                 AS runs_passed,
     countIf(status = 'not_implemented')         AS runs_not_implemented,
     countIf(status = 'failed')                 AS runs_failed,
+    countIf(status = 'undetermined')           AS runs_undetermined,
     min(ts)                                    AS first_seen,
     max(ts)                                    AS last_seen,
     -- argMax over ts, not any(): a badge showing the latest verdict must not show a stale pass.

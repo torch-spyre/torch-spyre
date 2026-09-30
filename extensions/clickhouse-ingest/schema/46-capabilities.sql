@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS capability_runs
     audit_timestamp DateTime64(3) DEFAULT now64(3),
 
 
-    CONSTRAINT chk_status CHECK status IN ('passed','failed','not_implemented')
+    CONSTRAINT chk_status CHECK status IN ('passed','failed','not_implemented','undetermined')
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)

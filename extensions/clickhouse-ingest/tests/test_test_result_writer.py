@@ -188,16 +188,19 @@ def test_a_declared_capability_is_written_alongside_the_outcome():
         _declared("b", status="xfail"),
         _declared("c", status="error"),
         _declared("d", status="skipped"),
+        _declared("f", status="failed"),
         _case("plain"),
     ]
     assert (
-        insert_test_results(c, "db", "torch-spyre", RUN, cases, "a.xml", attempt=2) == 5
+        insert_test_results(c, "db", "torch-spyre", RUN, cases, "a.xml", attempt=2) == 6
     )
     runs = {r["props"]["test_name"]: r for r in _rows(c, CAPABILITY_RUNS)}
-    assert sorted(runs) == ["a", "b", "c"]
+    assert sorted(runs) == ["a", "b", "c", "f"]
     assert (runs["a"]["status"], runs["a"]["backend"]) == ("passed", "cpu")
     assert runs["b"]["status"] == "not_implemented"
-    assert runs["c"]["status"] == "failed"
+    # An <error> is a broken setup/teardown: no verdict, but not silently dropped either.
+    assert runs["c"]["status"] == "undetermined"
+    assert runs["f"]["status"] == "failed"
     assert runs["a"]["arch"] == "ppc64le" and runs["a"]["test_type"] == "model_ops"
     assert runs["a"]["props"] == {
         "test_name": "a",

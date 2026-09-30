@@ -38,8 +38,11 @@ TEST_TYPE_VALUES = (
     | CAPABILITY_TYPE_VALUES
 )
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
-# capability_runs.status: not_implemented is unsupported, not a skipped test.
-CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
+# capability_runs.status: not_implemented is unsupported, not a skipped test; undetermined is a
+# test that broke before giving a verdict.
+CAPABILITY_STATUS_VALUES = frozenset(
+    {"passed", "failed", "not_implemented", "undetermined"}
+)
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 

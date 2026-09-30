@@ -313,7 +313,8 @@ class TestResultWriter(RunWriter):
         "passed": "passed",
         "xpass": "passed",
         "failed": "failed",
-        "error": "failed",
+        # pytest reports a test-body exception as <failure>; <error> is a broken setup/teardown.
+        "error": "undetermined",
         "xfail": "not_implemented",
     }
 

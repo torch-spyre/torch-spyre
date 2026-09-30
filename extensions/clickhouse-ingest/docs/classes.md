@@ -88,8 +88,8 @@ What a case's JUnit properties become:
 A case declaring `capability.test_type`, `.subject` and `.name` (all three required; one
 missing, or a scalar given two values, skips the verdict with a `[warn]`) also writes one
 `capability_runs` verdict from its outcome:
-passed/xpass → `passed`, failed/error → `failed`, xfail → `not_implemented`; a skipped case
-writes none. `arch` is the run's `platform__` tag and `shard` is the source file, so the
+passed/xpass → `passed`, failed → `failed`, xfail → `not_implemented`, error (pytest's
+broken setup/teardown) → `undetermined`; a skipped case writes none. `arch` is the run's `platform__` tag and `shard` is the source file, so the
 verdicts share the outcomes' dedup and re-run replacement.
 
 Bare tags older emitters wrote are read as their namespaced form (`LEGACY_TAG_ALIASES`:
