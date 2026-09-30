@@ -492,14 +492,14 @@ def rescale_stl_for_dtype(
     )
 
 
-def _conversion_layouts(
+def _typecast_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     dep: MemoryDep,
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """Output STLs of a dtype conversion that changes the stick depth.
+    """Output STLs of a typecast that changes the elements per stick.
 
     One candidate per source layout of the input: the input as it stands and,
     where it can be restickified, the input restickified onto each other dim.
@@ -725,7 +725,7 @@ def _single_arg_op_layout(
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
-            return _conversion_layouts(output, output_dep, dep, in_layout, stl)
+            return _typecast_layouts(output, output_dep, dep, in_layout, stl)
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].

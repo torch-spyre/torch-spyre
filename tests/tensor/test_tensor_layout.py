@@ -900,7 +900,7 @@ class TestSpyreTensorLayout(TestCase):
         (test_pad_fp8_to_fp16_output_to_whole_fp8_sticks). Needs no device."""
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.propagate_layouts import (
-            _conversion_layouts,
+            _typecast_layouts,
             rescale_stl_for_dtype,
         )
 
@@ -918,7 +918,7 @@ class TestSpyreTensorLayout(TestCase):
                 _host_layout(torch.float16, [4, extent]),
                 _dep("x", [4, extent]),
             )
-            [out] = _conversion_layouts(
+            [out] = _typecast_layouts(
                 _host_layout(torch.float16, [4, extent]),
                 _dep("y", [4, extent]),
                 _dep("x", [4, extent]),
@@ -940,7 +940,7 @@ class TestSpyreTensorLayout(TestCase):
         import sympy
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.propagate_layouts import _conversion_layouts
+        from torch_spyre._inductor.propagate_layouts import _typecast_layouts
 
         fp16 = get_device_dtype(torch.float16)
         stl = SpyreTensorLayout(
@@ -948,7 +948,7 @@ class TestSpyreTensorLayout(TestCase):
         )
         d0, d1 = (sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in (0, 1))
         sliced_read = MemoryDep("x", 128 * d0 + d1 + 32, (d0, d1), (64, 64))
-        [out] = _conversion_layouts(
+        [out] = _typecast_layouts(
             _host_layout(torch.float32, [64, 64]),
             _dep("y", [64, 64]),
             sliced_read,
