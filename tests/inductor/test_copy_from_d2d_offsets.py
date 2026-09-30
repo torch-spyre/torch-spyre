@@ -178,7 +178,7 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
 
     permute and select work (the offset fix carries them), and so does a
     stepped slice since issue #4050 fixed strided stick-tile coordinates.
-    transpose cases are skipped: they fail in the Spyre
+    transpose cases are marked expectedFailure: they fail in the Spyre
     restickify layout pass ("no mechanism to resolve stick incompatibility" /
     "scatter elements from one stick to multiple sticks"), NOT in offset
     handling. Verified to fail identically on the pre-fix baseline (offset==0
@@ -188,13 +188,13 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
     Tracked for the follow-up PR.
     """
 
-    @unittest.skip("restickify cannot resolve the transposed stick layout")
+    @unittest.expectedFailure
     def test_transpose_clone(self):
         x = torch.arange(4 * 64, dtype=DTYPE, device=DEVICE).reshape(4, 64)
         out = x.t().clone()  # (64, 4), non-contiguous
         torch.testing.assert_close(out.cpu(), x.cpu().t())
 
-    @unittest.skip("restickify cannot resolve the transposed stick layout")
+    @unittest.expectedFailure
     def test_transpose_then_offset_clone(self):
         """Transpose AND a nonzero offset along the transposed dim."""
         x = torch.arange(4 * 64, dtype=DTYPE, device=DEVICE).reshape(4, 64)
@@ -229,7 +229,7 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
         out = x[1::2].clone()  # rows 1,3,5,7 ; offset=64, stride[0]=128
         torch.testing.assert_close(out.cpu(), x.cpu()[1::2])
 
-    @unittest.skip("restickify cannot resolve the transposed stick layout")
+    @unittest.expectedFailure
     def test_transpose_varying_offsets_loop(self):
         """Multiple distinct offsets on a transposed view in one process."""
         x = torch.arange(8 * 64, dtype=DTYPE, device=DEVICE).reshape(8, 64)

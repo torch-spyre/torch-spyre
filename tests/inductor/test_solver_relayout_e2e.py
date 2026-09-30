@@ -408,8 +408,9 @@ def _prices_replicated_reads() -> bool:
         "gather",
         pytest.param(
             "broadcast",
-            marks=pytest.mark.skipif(
+            marks=pytest.mark.xfail(
                 not _prices_replicated_reads(),
+                strict=True,
                 reason="broadcast admission needs #4454's replicated-read pricing",
             ),
         ),

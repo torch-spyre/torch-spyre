@@ -33,7 +33,7 @@ test_suite_config:
             - TestViewOps::test_view_tensor_vsplit
             - TestViewOps::test_reshape
             - TestOldViewOps::test_transpose_invalid
-          mode: skip
+          mode: xfail
           # segmentation faults with @onlyNativeDeviceTypes
         - names:
             - TestViewOps::test_view_as_complex
@@ -53,7 +53,7 @@ test_suite_config:
         #######################################################################
         - names:
             - TestViewOps::test_maybe_view_chunk_cat
-          mode: skip
+          mode: xfail
         #######################################################################
         - names: # Tests that pass with extra dtypes allowed
             - TestViewOps::test_conj_self
@@ -131,7 +131,7 @@ test_suite_config:
             - TestOldViewOps::test_resize_as_all_dtypes_and_devices   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730 
             - TestOldViewOps::test_transposes   # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
             - TestOldViewOps::test_view_all_dtypes_and_devices   # RuntimeError: Spyre backend does not support dtype Double https://github.com/torch-spyre/torch-spyre/issues/1228
-          mode: skip
+          mode: xfail
         - names:
             # ------------------ Tests that are recently seg faulting moved from xfail to here ------------------
             # Aborts pytest process (heap corruption in spyre_aware_repr) - cannot xfail
@@ -185,3 +185,5 @@ test_suite_config:
           - name: int64
       - name: mul
       - name: sub
+      - name: gcd
+        force_xfail: true

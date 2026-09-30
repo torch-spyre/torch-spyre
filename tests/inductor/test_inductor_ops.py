@@ -1031,7 +1031,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # exp miscompiles on an unaligned trailing extent (issue #3799);
             # the same extent passes through a mul chain in test_pow_int.
-            "skip": [
+            "expect_fail": [
                 "0.3_fp16_2d_unaligned",
                 "2.5_fp16_2d_unaligned",
             ],
@@ -1105,7 +1105,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 64), differentiation=3, dtype=torch.float16),
                 ),
             },
-            "skip": ["fp32_enabled"],
+            "expect_fail": ["fp32_enabled"],
         },
         ("test_einsum", "test_mm_relaxed"): {
             "ops_dict": {
@@ -1531,7 +1531,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_reduce_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
-            "skip": [
+            "expect_fail": [
                 "mean_fp16_3d_dim_2",
                 "mean_fp16_3d_dim_neg1",
                 "mean_fp32_3d_dim_2",
@@ -1738,7 +1738,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((1, 1),),
                 ]
             ),
-            "skip": ["49159x4096"],
+            "expect_fail": ["49159x4096"],
         },
         # Reversal along a non-stick dim works; the stick (last) dim needs a
         # gather along the stick dimension, which the backend cannot do, and
@@ -1760,7 +1760,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
                 "1d_stick": ([0], cached_randn((256,))),
             },
-            "skip": ["2d_dim_1_stick", "1d_stick"],
+            "expect_fail": ["2d_dim_1_stick"],
+            "device_fault": {
+                "1d_stick": "RAS::RUNTIMESCHEDULER::ComputeHardwareError (0x7b1b) leaves "
+                "the card in StreamError",
+            },
         },
         ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
@@ -1869,7 +1873,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((769, 4096, 64), abs=True),
                 ),
             },
-            "skip": [
+            "expect_fail": [
                 "large_dim_0_1",
                 "large_dim_0_1_nopad",
                 "large_dim_0_2",
@@ -2694,7 +2698,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "tuple": (((64, 64)), 1024.0),
                 "size": (torch.Size([64, 128]), 1024.0),
             },
-            "skip": ["value_2"],
+            "expect_fail": ["value_2"],
         },
         (
             "test_dropout_functional",
@@ -3151,7 +3155,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros((256,), dtype=torch.float16),
                 ),
             },
-            "skip": ["eval_mode"],
+            "expect_fail": ["eval_mode"],
         },
         # TODO: TorchInductor compilation failure in the Spyre lowering pass —
         # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
@@ -3163,7 +3167,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,), dtype=torch.float16),
                 ),
             },
-            "skip": ["8_groups"],
+            "expect_fail": ["8_groups"],
         },
         # beta is a Python constant folded into the traced graph. beta=2 stays
         # on the log branch; beta=50 pushes most elements past the threshold;
@@ -3476,7 +3480,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int_true": (torch.tensor([1], dtype=torch.int64),),
                 "int_false": (torch.tensor([0], dtype=torch.int64),),
             },
-            "skip": ["float32_true", "float32_false", "negative_true"],
+            "expect_fail": ["float32_true", "float32_false", "negative_true"],
         },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
@@ -3580,7 +3584,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
-            "skip": ["mha_decode", "gqa_decode"],
+            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
@@ -3731,7 +3735,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # reference numerics enough to push an already-marginal fp16
             # accumulation over the line. Same class as the cases xfailed in
             # commit 3a2d482. amax on the same shape passes, so target sum only.
-            "skip": ["sum_3d128_01"],
+            "expect_fail": ["sum_3d128_01"],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -4095,7 +4099,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            "skip": [
+            "expect_fail": [
                 "fp32_3d_dim_neg1",
             ],
             "param_sets": {
@@ -4300,7 +4304,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            "skip": [
+            "expect_fail": [
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
@@ -4471,7 +4475,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((67, 256), dtype=torch.float32),
                 ),
             },
-            "skip": [
+            "expect_fail": [
                 "fp16_3d_dim_2",
                 "fp16_3d_dim_neg1",
                 "fp32_2d_dim_0",
@@ -5205,12 +5209,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
-            "skip": TO_DTYPE_OP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "skip": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -5427,7 +5431,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "skip": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -5435,7 +5439,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "skip": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",
@@ -5451,7 +5455,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             # Mixed-EA inputs with a non-broadcast stick (> 1 element) are
             # rejected at compile time regardless of alignment, so these run
-            # live (no skip) and the test body asserts the compile raises.
+            # live (no xfail) and the test body asserts the compile raises.
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_INVALID_PARAMS_SETS,
         },
         (
@@ -5552,11 +5556,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # bmm-decomposed path (see the test_conv2d param sets, e.g.
             # 1x3x64_ksize3_pad1).  8x64_ksize3_pad1 was a passing test_conv2d
             # case before depthwise gained its own lowering, so it is kept here
-            # as a skip to record the capability change.  Removing just the
-            # lowering guard makes the compile reach the backend and abort
-            # (SIGABRT), so this tracks "depthwise + padding does not work end
-            # to end", not only the guard.
-            "skip": ["8x64_ksize3_pad1"],
+            # as an xfail to record the capability change rather than letting it
+            # vanish from the suite.  It is strict (see ParameterizedTestMeta and
+            # the XPASS rewrite in tests/conftest.py), so if padding support
+            # lands this flips to a CI failure instead of the gap staying
+            # invisible.
+            #
+            # Caveat, measured: xfail asserts only *that* the case fails, not
+            # that padding is the reason.  Removing just the lowering guard does
+            # not make it XPASS -- the compile then reaches the backend and
+            # aborts (SIGABRT), which is the runtime support the
+            # guard's own message refers to.  So this entry tracks "depthwise +
+            # padding does not work end to end"; a message-asserting negative
+            # test would additionally pin *where* it is rejected.
+            "expect_fail": ["8x64_ksize3_pad1"],
             "param_sets": {
                 "1x64_ksize3": (
                     cached_randn((1, 64, 32, 32)),
@@ -5578,8 +5591,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
                     [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
                 ),
-                # Same shape/layouts as 8x64_ksize3, padding=(1, 1): skipped, see
-                # the note above.  The layouts are inherited from the
+                # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
+                # the expect_fail note above.  The layouts are inherited from the
                 # zero-padding case, which passes with them.
                 "8x64_ksize3_pad1": (
                     cached_randn((8, 64, 128, 128)),
@@ -7094,11 +7107,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.count_nonzero on "
-        "floating inputs yet (stable error signature: Unsupported: "
-        "unexpected argument Constant(value=0.0, dtype=torch.float16) to "
-        "notequal)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.count_nonzero on "
+            "floating inputs yet (stable error signature: Unsupported: "
+            "unexpected argument Constant(value=0.0, dtype=torch.float16) to "
+            "notequal)"
+        ),
+        strict=True,
     )
     def test_count_nonzero_float_dim0_known_xfail(self):
         x = cached_randn((67, 256))
@@ -7108,10 +7124,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.count_nonzero on "
-        "bool inputs yet (stable error signature: Unsupported: unexpected "
-        "argument PointwiseOp(op='to_dtype', ...) to reduction lowering)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.count_nonzero on "
+            "bool inputs yet (stable error signature: Unsupported: unexpected "
+            "argument PointwiseOp(op='to_dtype', ...) to reduction lowering)"
+        ),
+        strict=True,
     )
     def test_count_nonzero_bool_dim0_known_xfail(self):
         x = torch.tensor(
@@ -7130,10 +7149,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend hits an internal lowering bug for "
-        "torch.logsumexp (stable error signature: InductorError: "
-        "IndexError: list index out of range)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.logsumexp (stable error signature: InductorError: "
+            "IndexError: list index out of range)"
+        ),
+        strict=True,
     )
     def test_logsumexp_keepdim0_known_xfail(self):
         x = cached_randn((67, 256), scale=0.1)
@@ -7143,10 +7165,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend hits an internal lowering bug for "
-        "torch.nanmean (stable error signature: InductorError: IndexError: "
-        "list index out of range)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.nanmean (stable error signature: InductorError: IndexError: "
+            "list index out of range)"
+        ),
+        strict=True,
     )
     def test_nanmean_all_dims_known_xfail(self):
         x = torch.tensor(
@@ -7159,10 +7184,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend hits an internal lowering bug for "
-        "torch.nansum (stable error signature: InductorError: IndexError: "
-        "list index out of range)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend hits an internal lowering bug for "
+            "torch.nansum (stable error signature: InductorError: IndexError: "
+            "list index out of range)"
+        ),
+        strict=True,
     )
     def test_nansum_all_dims_known_xfail(self):
         x = torch.tensor(
@@ -7175,10 +7203,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.std yet (stable "
-        "error signature: InductorError: TypeError: "
-        "'UnimplementedOp' object is not subscriptable)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.std yet (stable "
+            "error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
     )
     def test_std_dim0_known_xfail(self):
         x = cached_randn((67, 256), dtype=torch.float32)
@@ -7186,10 +7217,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.std(x, dim=0, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.var yet (stable "
-        "error signature: InductorError: TypeError: "
-        "'UnimplementedOp' object is not subscriptable)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.var yet (stable "
+            "error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
     )
     def test_var_dim0_known_xfail(self):
         x = cached_randn((67, 256), dtype=torch.float32)
@@ -7197,10 +7231,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.var(x, dim=0, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.std_mean yet "
-        "(stable error signature: InductorError: TypeError: "
-        "'UnimplementedOp' object is not subscriptable)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.std_mean yet "
+            "(stable error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
     )
     def test_std_mean_dim0_known_xfail(self):
         x = cached_randn((67, 256), dtype=torch.float32)
@@ -7208,10 +7245,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.std_mean(x, dim=0, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.var_mean yet "
-        "(stable error signature: InductorError: TypeError: "
-        "'UnimplementedOp' object is not subscriptable)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.var_mean yet "
+            "(stable error signature: InductorError: TypeError: "
+            "'UnimplementedOp' object is not subscriptable)"
+        ),
+        strict=True,
     )
     def test_var_mean_dim0_known_xfail(self):
         x = cached_randn((67, 256), dtype=torch.float32)
@@ -7219,19 +7259,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.var_mean(x, dim=0, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.cumprod yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::cumprod.out' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cumprod yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::cumprod.out' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_cumprod_dim0_known_xfail(self):
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(lambda x: torch.cumprod(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.logcumsumexp yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::_logcumsumexp' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.logcumsumexp yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_logcumsumexp' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_logcumsumexp_dim0_known_xfail(self):
         x = cached_randn((67, 256), scale=0.1)
@@ -7239,28 +7285,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.logcumsumexp(x, dim=0), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.cummax yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::_cummax_helper' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cummax yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_cummax_helper' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_cummax_dim0_known_xfail(self):
         x = unique_randn_along_dim((67, 256), dim=0)
         self.compare_with_cpu(lambda x: torch.cummax(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.cummin yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::_cummin_helper' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.cummin yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::_cummin_helper' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_cummin_dim0_known_xfail(self):
         x = unique_randn_along_dim((67, 256), dim=0)
         self.compare_with_cpu(lambda x: torch.cummin(x, dim=0), x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.quantile yet "
-        "(stable error signature: InductorError: Unsupported: unexpected "
-        "argument PointwiseOp(op='to_dtype', ...) to mul)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.quantile yet "
+            "(stable error signature: InductorError: Unsupported: unexpected "
+            "argument PointwiseOp(op='to_dtype', ...) to mul)"
+        ),
+        strict=True,
     )
     def test_quantile_q050_dim0_known_xfail(self):
         x = cached_randn((67, 256), dtype=torch.float32)
@@ -7270,10 +7325,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.nanquantile yet "
-        "(stable error signature: InductorError: IndexError: list index "
-        "out of range)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.nanquantile yet "
+            "(stable error signature: InductorError: IndexError: list index "
+            "out of range)"
+        ),
+        strict=True,
     )
     def test_nanquantile_q050_dim0_known_xfail(self):
         x = torch.tensor(
@@ -7291,10 +7349,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.median yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.median yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_median_dim1_known_xfail(self):
         x = unique_randn_along_dim((67, 71, 256), dim=1)
@@ -7302,10 +7363,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.median(x, dim=1, keepdim=False), x, run_eager=False
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.nanmedian yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.nanmedian yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::median.dim_values' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_nanmedian_dim0_known_xfail(self):
         x = torch.tensor(
@@ -7322,10 +7386,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="Spyre compiled backend does not support torch.mode yet "
-        "(stable error signature: NotImplementedError: Could not run "
-        "'aten::mode' with arguments from the 'spyre' backend)"
+    @pytest.mark.xfail(
+        reason=(
+            "Spyre compiled backend does not support torch.mode yet "
+            "(stable error signature: NotImplementedError: Could not run "
+            "'aten::mode' with arguments from the 'spyre' backend)"
+        ),
+        strict=True,
     )
     def test_mode_dim1_known_xfail(self):
         x = torch.tensor(
@@ -7408,7 +7475,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "(torch-spyre GitHub)"
             )
         if variant == "vit_attention_cls_token":
-            pytest.skip(
+            pytest.xfail(
                 "Issue #543 (eager): aten::_reshape_alias not implemented in eager mode; "
                 "Issue #1731 (compiled): Spyre SIGABRT in fused_bmm_transpose compilation "
                 "(torch-spyre GitHub)"
@@ -7422,7 +7489,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
             and execution_mode == "eager"
         ):
-            pytest.skip(
+            pytest.xfail(
                 "Issue #543: aten::_reshape_alias not implemented in eager mode "
                 "(torch-spyre GitHub)"
             )
@@ -7835,7 +7902,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # RuntimeError: Error: In-device copy not implemented.
         # ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1381
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="spyre__fill_scalar crashes with SIGBUS in eager mode - in-device copy not implemented"
             )
 
@@ -9011,9 +9078,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
-    @pytest.mark.skip(
-        reason="RESTICKIFY_OP does not support FP32 dtype "
-        "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.IEEE_FP32)"
+    @pytest.mark.xfail(
+        reason=(
+            "RESTICKIFY_OP does not support FP32 dtype "
+            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.IEEE_FP32)"
+        ),
+        strict=True,
     )
     def test_restickify_fp32_unsupported_xfail(self):
         """Verify RESTICKIFY_OP correctly rejects FP32 dtype.
@@ -9031,9 +9101,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.skip(
-        reason="RESTICKIFY_OP does not support INT64 dtype "
-        "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.INT32)"
+    @pytest.mark.xfail(
+        reason=(
+            "RESTICKIFY_OP does not support INT64 dtype "
+            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.INT32)"
+        ),
+        strict=True,
     )
     def test_restickify_int64_unsupported_xfail(self):
         """Verify RESTICKIFY_OP correctly rejects INT64 dtype.

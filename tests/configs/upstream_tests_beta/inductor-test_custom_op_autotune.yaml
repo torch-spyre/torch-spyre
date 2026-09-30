@@ -18,7 +18,7 @@ test_suite_config:
         # The relevant Spyre limitation is the inability to handle custom modules during the import process for certain operations.
         - names:
             - TestCustomOpAutoTune::test_range_based_static_shape_no_cond_dispatch
-          mode: skip  # UNKNOWN
+          mode: xfail  # xfail: UNKNOWN
 
   global:
     supported_dtypes:

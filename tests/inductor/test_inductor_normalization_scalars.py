@@ -56,12 +56,12 @@ class TestNormalizationScalarOperations:
 
         # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.skip(
+            pytest.xfail(
                 reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
-            pytest.skip(
+            pytest.xfail(
                 reason="Variance (aten::var.correction) operation not implemented"
             )
 
@@ -77,7 +77,7 @@ class TestNormalizationScalarOperations:
     # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_layernorm_affine(self, execution_mode):
         """Last-dim layernorm with gamma/beta (affine)."""
-        pytest.skip(
+        pytest.xfail(
             "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
         )
 
@@ -112,7 +112,7 @@ class TestNormalizationScalarOperations:
 
         # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.skip(
+            pytest.xfail(
                 reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
             )
 
@@ -198,7 +198,7 @@ class TestNormalizationScalarOperations:
     # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_rmsnorm_with_weight(self, execution_mode):
         """Test RMSNorm with learnable weight parameter."""
-        pytest.skip(
+        pytest.xfail(
             "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
         )
 
@@ -248,7 +248,7 @@ class TestNormalizationScalarOperations:
         )
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1531
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="Square root operation on float32 (IEEE_FP32) not supported"
     )
     def test_batchnorm_identity_running_stats_1d(self, execution_mode):
@@ -266,7 +266,7 @@ class TestNormalizationScalarOperations:
         _compare_modes(execution_mode, batchnorm_1d_inference, x, atol=1e-4, rtol=1e-3)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="Spyre: Broadcasting size-1 dimensions - cannot map stick expr to host dimension"
     )
     def test_batchnorm_identity_affine_2d(self, execution_mode):
@@ -305,12 +305,12 @@ class TestNormalizationScalarOperations:
         """Test GroupNorm with various group counts and dtypes."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1722
         if dtype == torch.float32:
-            pytest.skip(
+            pytest.xfail(
                 reason="view() + mean() triggers Cannot satisfy hardware memory span limit without splitting reduction dimensions."
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
-            pytest.skip(
+            pytest.xfail(
                 reason="Variance (aten::var.correction) operation not implemented"
             )
 
@@ -333,7 +333,7 @@ class TestNormalizationScalarOperations:
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1722
     def test_groupnorm_affine(self, execution_mode):
         """Test GroupNorm with affine transformation."""
-        pytest.skip(
+        pytest.xfail(
             "view() + mean() triggers Cannot satisfy hardware memory span limit without splitting reduction dimensions."
         )
 
@@ -363,12 +363,12 @@ class TestNormalizationScalarOperations:
         """Test 2D InstanceNorm with epsilon constant."""
         # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.skip(
+            pytest.xfail(
                 reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
-            pytest.skip(
+            pytest.xfail(
                 reason="Variance (aten::var.correction) operation not implemented"
             )
 
@@ -384,7 +384,7 @@ class TestNormalizationScalarOperations:
         _compare_modes(execution_mode, instancenorm, x, atol=tol[0], rtol=tol[1])
 
     # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
     )
     def test_instancenorm_1d(self, execution_mode):
@@ -401,7 +401,7 @@ class TestNormalizationScalarOperations:
         _compare_modes(execution_mode, instancenorm_1d, x, atol=1e-4, rtol=1e-3)
 
     # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
     )
     def test_instancenorm_3d(self, execution_mode):
@@ -420,7 +420,7 @@ class TestNormalizationScalarOperations:
     # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_instancenorm_affine(self, execution_mode):
         """Test InstanceNorm with affine transformation."""
-        pytest.skip(
+        pytest.xfail(
             "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
         )
 
@@ -467,12 +467,12 @@ class TestModelScalarOperations:
         """``matmul(Q,K^T) / sqrt(d_k)`` — scaled dot-product logits only (no V); several (batch, heads, seq) configs."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1730
         if seq == 1024 and execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason="Assertion Error: Numerical mismatch (45-48% elements) for seq=1024"
             )
         scale = 1.0 / math.sqrt(d_k)
@@ -487,7 +487,7 @@ class TestModelScalarOperations:
         _compare_modes(execution_mode, scaled_qk_logits, q, k, atol=1e-1, rtol=1e-1)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="Variance (aten::var.correction) operation not implemented"
     )
     def test_layernorm_last_dim_eps1e12(self, execution_mode):
@@ -563,12 +563,12 @@ class TestModelScalarOperations:
         """``matmul(A,B^T) * 0.125`` — bilinear logits with a scalar scale."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1731
         elif execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason=(
                     "Spyre: backend compiler SIGABRT in fused_bmm_transpose compilation"
                 )
@@ -634,7 +634,7 @@ class TestModelScalarOperations:
         _compare_modes(execution_mode, power_of_2_scale, x, atol=1e-3, rtol=1e-2)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.skip(reason="Round (aten::round.out) operation not implemented")
+    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
     def test_symmetric_quantization(self, execution_mode):
         """Symmetric quantization: round(x / scale) * scale."""
 
@@ -647,7 +647,7 @@ class TestModelScalarOperations:
         _compare_modes(execution_mode, symmetric_quant, x, atol=0.1, rtol=1e-3)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.skip(reason="Round (aten::round.out) operation not implemented")
+    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
     def test_asymmetric_quantization(self, execution_mode):
         """Test asymmetric quantization pattern."""
 
@@ -675,7 +675,7 @@ class TestModelScalarOperations:
         """Stable log-sum-exp (``max`` + ``log`` + ``sum(exp)``), not ``torch.logsumexp``."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/453
         if execution_mode == "eager":
-            pytest.skip(reason="Max (aten::max.dim_max) operation not implemented")
+            pytest.xfail(reason="Max (aten::max.dim_max) operation not implemented")
 
         def log_sum_exp(x):
             max_val = torch.max(x, dim=-1, keepdim=True)[0]
@@ -700,7 +700,7 @@ class TestModelScalarOperations:
         )
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1387
-    @pytest.mark.skip(reason="Clamp (aten::clamp) operation not implemented")
+    @pytest.mark.xfail(reason="Clamp (aten::clamp) operation not implemented")
     def test_quantization_scale_int8(self, execution_mode):
         """Test INT8 quantization with scale factor."""
 

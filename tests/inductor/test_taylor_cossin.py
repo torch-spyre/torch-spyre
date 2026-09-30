@@ -549,8 +549,9 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
 
 @pytest.mark.parametrize("dtype, tol", _UPCAST_DTYPES)
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
-@pytest.mark.skip(
-    reason="#2818: fp32->fp16/bf16 cast is wrong when ceil(size[-1]/32) is odd"
+@pytest.mark.xfail(
+    reason="#2818: fp32->fp16/bf16 cast is wrong when ceil(size[-1]/32) is odd",
+    strict=False,  # some odd-stick shapes raise, others return wrong values
 )
 def test_low_precision_odd_stick_count_xfail(op_name, dtype, tol):
     """Pin the #2818 exposure of the fp32 upcast at an odd fp32-stick count.

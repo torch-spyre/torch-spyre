@@ -90,7 +90,7 @@ test_suite_config:
             - TestAsArray::test_copy_from_buffer
             - TestAsArray::test_copy_from_numpy
             - TestBufferProtocol::test_non_writable_buffer
-          mode: skip  # NotImplementedError, TypeError
+          mode: xfail  # xfail: NotImplementedError, TypeError
         # # These tests exercise the `aten::random_.from` operator with various dtypes, including bfloat16 and int64.
         # # They are classified as xfail due to the Spyre backend not supporting the `aten::random_.from` operator.
         # # The primary limitation is the lack of support for this operator in the Spyre backend.
@@ -103,13 +103,13 @@ test_suite_config:
         - names:
             - TestAsArray::test_alias_from_tensor
             - TestAsArray::test_copy_from_dlpack
-          mode: skip  # NotImplementedError, RuntimeError
+          mode: xfail  # xfail: NotImplementedError, RuntimeError
         # These tests exercise tensor copying operations across various dtypes, including unsupported ones like bfloat16 and bool.
         # They are classified as xfail due to Spyre's lack of support for certain dtypes and operators, such as 'aten::random_.from'.
         # Relevant Spyre limitations include missing support for specific dtypes and operators, leading to NotImplementedError and InductorError.
         - names:
             - TestAsArray::test_copy_tensor
-          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise tensor creation and manipulation operations across various dtypes and memory formats.
         # They are classified as xfail due to unsupported dtypes (Double, ComplexHalf, ComplexFloat) and memory formats (ChannelsLast).
         # Relevant Spyre limitations include incomplete dtype support and restricted memory format handling.
@@ -130,7 +130,7 @@ test_suite_config:
             - TestTensorCreation::test_tensor_from_sequence
             - TestTensorCreation::test_torch_complex
             - TestTensorCreation::test_torch_polar
-          mode: skip  # RuntimeError
+          mode: xfail  # xfail: RuntimeError
         # These tests exercise various tensor creation and manipulation operations, including concatenation, stacking, and random tensor generation.
         # They are classified as xfail due to unsupported operations and data types, as well as missing dependencies like 'dxp_standalone'.
         # Relevant Spyre limitations include unsupported stick expressions, data formats, and missing executable files.
@@ -154,13 +154,13 @@ test_suite_config:
             - TestTensorCreation::test_hstack_column_stack
             - TestTensorCreation::test_vander_types
             - TestTensorCreation::test_vstack_row_stack
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise the buffer protocol with various dtypes, including bool, float16, float32, and int64.
         # They are classified as xfail due to NotImplementedError and TorchRuntimeError, indicating missing or unsupported ops.
         # The relevant Spyre limitations include lack of support for 'aten::random_.from' and fake tensor operations.
         - names:
             - TestBufferProtocol::test_shared_buffer
-          mode: skip  # NotImplementedError, torch._dynamo.exc.TorchRuntimeError
+          mode: xfail  # xfail: NotImplementedError, torch._dynamo.exc.TorchRuntimeError
         # These tests exercise various tensor creation and manipulation operations, including random number generation, concatenation, and tensor shape operations.
         # They are classified as xfail on the Spyre backend due to missing or unimplemented operators, such as `resize_`, `random_`, and `linspace.out`.
         # The most relevant Spyre limitations include the lack of support for certain tensor operations and the need for additional hooks to be registered and implemented.
@@ -205,7 +205,7 @@ test_suite_config:
             - TestTensorCreation::test_tensor_factories_empty
             - TestTensorCreation::test_zeros
             - TestTensorCreation::test_zeros_out
-          mode: skip  # NotImplementedError
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise tensor creation and manipulation operations, including random number generation, concatenation, and type conversion.
         # They are classified as xfail due to unsupported data types (e.g., bfloat16, float16) and memory formats (e.g., ChannelsLast) on the Spyre backend.
         # Relevant Spyre limitations include lack of support for certain dtypes and memory formats, as well as missing ops like dxp_standalone.
@@ -223,7 +223,7 @@ test_suite_config:
             - TestTensorCreation::test_meshgrid_ij_indexing_is_default
             - TestTensorCreation::test_tensor_ctor_device_inference
             - TestTensorCreation::test_torch_complex_same_dtype_error
-          mode: skip  # dxp_standalone not detected
+          mode: xfail   # xfail: dxp_standalone not detected
         # # These tests exercise the `meshgrid` operation with various indexing options and tensor shapes.
         # # They are classified as xfail due to multiple sub-assertion failures in comparing PyTorch and NumPy results.
         # # The relevant Spyre capability is the `meshgrid` operation, which currently fails to match NumPy's behavior.
@@ -235,7 +235,7 @@ test_suite_config:
         # Relevant Spyre limitations include device type handling and dtype downcasting warnings.
         - names:
             - TestTensorCreation::test_new_tensor_device
-          mode: skip  # AssertionError
+          mode: xfail  # xfail: AssertionError
         # These tests exercise various tensor creation and manipulation operations, including tensor copying, device handling, and dtype inference.
         # They are classified as "skip" on the Spyre backend due to unsupported CUDA operations and missing CUDA library dependencies.
         # Relevant Spyre limitations include lack of CUDA support and unsupported dtypes like bfloat16 and float16 for certain operations.

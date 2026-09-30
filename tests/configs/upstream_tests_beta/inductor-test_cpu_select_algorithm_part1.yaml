@@ -25,7 +25,7 @@ test_suite_config:
             - TestSelectAlgorithm::test_aoti_linear
             - TestSelectAlgorithm::test_int8_woq_mm_concat
             - TestSelectAlgorithm::test_local_and_global_accumulator
-          mode: skip
+          mode: xfail
 
   global:
     supported_dtypes:

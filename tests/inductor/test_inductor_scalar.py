@@ -30,7 +30,7 @@ class TestTensorScalarCoreArithmetic:
         torch.manual_seed(0xAFFE)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1545
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
         reason="Spyre backend does not support dtype ComplexFloat (torch.complex64)"
     )
     def test_complex64_add_mul_div_python_complex_scalars(self, execution_mode):
@@ -56,7 +56,7 @@ class TestTensorScalarCoreArithmetic:
         )
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-    @pytest.mark.skip(reason="Spyre backend does not support dtype Double (FP64)")
+    @pytest.mark.xfail(reason="Spyre backend does not support dtype Double (FP64)")
     def test_fp16_fp32_tensors_fp32_literal_and_fp64_scalar_tensor(
         self, execution_mode
     ):
@@ -115,7 +115,7 @@ class TestTensorScalarCoreArithmetic:
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: 'RuntimeError: In-device copy (.clone()) not implemented'"
             )
 
@@ -172,12 +172,12 @@ class TestSdpaScalarHyperparameters:
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
         elif execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
             )
         b, h, s, d = (
@@ -217,12 +217,12 @@ class TestSdpaScalarHyperparameters:
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
         elif execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
             )
         b, h, s, d = (
@@ -262,7 +262,7 @@ class TestSdpaScalarHyperparameters:
         """SDPA with ``dropout(attn, p=0.1, training=False)`` — scalar dropout probability."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
 
@@ -292,7 +292,7 @@ class TestSdpaScalarHyperparameters:
         """SDPA: divide logits by ``(sqrt(d_k) * temperature)`` with scalar ``temperature=2.0``."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
 
@@ -327,7 +327,7 @@ class TestSdpaScalarHyperparameters:
         """
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: In-device copy not implemented (required for MQA operations)"
             )
 
@@ -360,12 +360,12 @@ class TestSdpaScalarHyperparameters:
         """SDPA: local window via ``masked_fill(..., -inf)``; ``window_size=32`` sets mask support."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1482
         elif execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason="Spyre backend does not support type conversion yet during copy."
             )
 
@@ -402,7 +402,7 @@ class TestSdpaScalarHyperparameters:
         """SDPA with Q seq len ≠ KV seq len (scalar ``1/sqrt(d_k)`` scaling only)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
 
@@ -430,7 +430,7 @@ class TestSdpaScalarHyperparameters:
         """SDPA: Q, K, V all from one tensor ``x`` (scalar ``1/sqrt(d_k)``)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
 
@@ -455,12 +455,12 @@ class TestSdpaScalarHyperparameters:
         """SDPA: causal mask via ``triu`` + ``masked_fill(..., -inf)``."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
         elif execution_mode == "compiled":
-            pytest.skip(
+            pytest.xfail(
                 reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
             )
 
@@ -495,7 +495,7 @@ class TestSdpaScalarHyperparameters:
         """SDPA: add scalar ``0.1`` to all attention logits before softmax."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.skip(
+            pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
             )
 

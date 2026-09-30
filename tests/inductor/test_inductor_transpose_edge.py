@@ -83,7 +83,7 @@ class TestTransposeEdge:
 
     # --- Dtypes ---
 
-    @pytest.mark.skip(reason="Issue #1545: Complex dtype not supported on Spyre")
+    @pytest.mark.xfail(reason="Issue #1545: Complex dtype not supported on Spyre")
     def test_transpose_complex_dtype(self, execution_mode):
         x = torch.randn((64, 128), dtype=torch.complex64)
         _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)
@@ -198,7 +198,7 @@ class TestTransposeEdge:
     # --- Materialized copy after transpose (#1859) ---
     def test_transpose_then_clone(self, execution_mode):
         if execution_mode == "eager":
-            pytest.skip("Issue #1859: SIGABRT on transpose+clone bundle generation.")
+            pytest.xfail("Issue #1859: SIGABRT on transpose+clone bundle generation.")
         x = cached_randn((72, 91), dtype=torch.float16)
         _compare_mode(execution_mode, lambda t: t.transpose(0, 1).clone(), x)
 
@@ -296,8 +296,8 @@ class TestTransposeDeviceSemantics:
         ref = (x_ref.transpose(1, 3) * 2.0) + 1.0
         assert torch.allclose(out.cpu(), ref, rtol=1e-2, atol=5e-3)
 
-    @pytest.mark.skip(
-        reason="Issue #2006: SpyreKernel.store() rejects Constant scalar in pointwise mul."
+    @pytest.mark.xfail(
+        reason="Issue #2006: SpyreKernel.store() rejects Constant scalar in pointwise mul.",
     )
     def test_compile_with_operations_after_transpose(self):
         @torch.compile

@@ -38,7 +38,7 @@ test_suite_config:
             - TestEmbeddingNNDeviceType::test_embedding_max_norm_device
             - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD
             - TestEmbeddingNNDeviceType::test_embedding_padding_idx
-          mode: skip  # dxp_standalone not detected
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise embedding and embedding bag operations across various dtypes and tensor configurations.
         # They are classified as 'skip' on the Spyre backend because they do not engage the torch-spyre layer, indicating they bypass Spyre-specific optimizations or capabilities.
         # The most relevant Spyre limitations include unsupported dtypes like Double, which caused a failure in the test_embedding_dense_grad.

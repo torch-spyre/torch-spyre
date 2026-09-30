@@ -624,7 +624,7 @@ class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
     ATOL = 0.1
     RTOL = 0.1
 
-    @unittest.skip("sub-stick nested inner tile unsupported")
+    @unittest.expectedFailure
     def test_nested_add_outer_row_inner_col_small(self):
         """Nested tiling with a sub-stick (2-element) inner column tile.
 

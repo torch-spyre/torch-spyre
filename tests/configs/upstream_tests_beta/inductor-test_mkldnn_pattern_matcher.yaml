@@ -15,7 +15,7 @@ test_suite_config:
             - TestPatternMatcherGeneric::test_conv3d_binary_broadcast_shapes
             - TestPatternMatcherGeneric::test_conv_transpose2d_unary
             - TestPatternMatcherGeneric::test_conv_transpose3d_unary
-          mode: skip  # dxp_standalone not detected
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise 2D and 3D convolution operations with binary and unary tensor behaviors.
         # They are classified as xfail due to unsupported coordinate expressions in the Spyre backend.
         # The relevant Spyre limitation is the inability to handle complex coordinate expressions in tensor operations.
@@ -24,7 +24,7 @@ test_suite_config:
             - TestPatternMatcherGeneric::test_conv2d_unary
             - TestPatternMatcherGeneric::test_conv3d_binary
             - TestPatternMatcherGeneric::test_conv3d_unary
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         - names:
             - TestDynamicPatternMatcher::test_linear_input_non_contiguous_3D_wo_bias
             - TestDynamicPatternMatcher::test_linear_input_non_contiguous_3D_wo_bias_dynamic_shapes

@@ -10,7 +10,7 @@ test_suite_config:
           mode: mandatory_success
         - names:
             - TestStandaloneInductor::test_inductor_via_export1
-          mode: skip  # RuntimeError
+          mode: xfail  # xfail: RuntimeError
         - names:
             - TestStandaloneInductor::test_inductor_generate_debug_compile
             - TestStandaloneInductor::test_inductor_generate_debug_symbol

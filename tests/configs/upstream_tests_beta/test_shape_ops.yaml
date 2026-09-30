@@ -31,13 +31,13 @@ test_suite_config:
             - TestShapeOps::test_diag
             - TestShapeOps::test_diagonal
             - TestShapeOps::test_rot90
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise the diagonal op on multi-dimensional float32 tensors, including non-contiguous cases.
         # They are xfail due to a missing .numpy() method for Spyre device tensors, causing a TypeError.
         # The Spyre backend lacks direct tensor-to-numpy conversion, requiring explicit CPU copying.
         - names:
             - TestShapeOps::test_diagonal_multidim
-          mode: skip  # TypeError
+          mode: xfail  # xfail: TypeError
         # These tests exercise shape manipulation ops like flip, movedim, and trace across various dtypes.
         # They are xfailed due to missing Spyre support for complex index expressions and reduction ops like sum.
         # The failures highlight Spyre's limited support for non-linear memory access patterns and certain data formats.
@@ -46,7 +46,7 @@ test_suite_config:
             - TestShapeOps::test_movedim
             - TestShapeOps::test_movedim_invalid
             - TestShapeOps::test_trace
-          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise shape manipulation ops like flip, nonzero, and unfold across various dtypes.
         # They are xfail due to missing Spyre kernel implementations for aten::flip, aten::nonzero, and aten::unfold.
         # The failures highlight Spyre's limited support for view-like and indexing operations on the device.
@@ -62,7 +62,7 @@ test_suite_config:
             - TestShapeOps::test_unfold_all_devices_and_dtypes
             - TestShapeOps::test_unfold_backward_errors
             - TestShapeOps::test_unfold_scalars
-          mode: skip  # NotImplementedError
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise shape operations like flip, nonzero, tolist, and unbind across various dtypes and tensor sizes.
         # They are classified as skip because they do not engage the torch-spyre layer, often due to unsupported dtypes or host-side operations.
         # Spyre's limited dtype support and lack of certain shape op implementations are most relevant here.

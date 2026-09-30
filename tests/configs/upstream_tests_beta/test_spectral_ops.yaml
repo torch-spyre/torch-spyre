@@ -28,7 +28,7 @@ test_suite_config:
             - TestFFT::test_fftn_round_trip
             - TestFFT::test_hfftn
             - TestFFT::test_ihfftn
-          mode: skip  # RuntimeError
+          mode: xfail  # xfail: RuntimeError
         # These tests exercise FFT operations and related tensor manipulations, including input modifications and frequency shifts.
         # They are classified as xfail due to missing 'dxp_standalone' executable and unsupported DeviceCopy operations with FixedTiledLayout.
         # Relevant Spyre limitations include incomplete support for certain tensor layouts and missing external dependencies.
@@ -36,7 +36,7 @@ test_suite_config:
             - TestFFT::test_fft_input_modification
             - TestFFT::test_fftfreq_numpy
             - TestFFT::test_fftshift_frequencies
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise FFT operations with various dtypes and tensor behaviors.
         # They are classified as xfail due to unsupported dtypes (Half, ComplexFloat) and missing operators (e.g., 'aten::_fft_r2c').
         # The most relevant Spyre limitations are the lack of support for complex dtypes and certain FFT operators.
@@ -44,13 +44,13 @@ test_suite_config:
             - TestFFT::test_fft_round_trip
             - TestFFT::test_fft_type_promotion
             - TestFFT::test_reference_1d
-          mode: skip  # NotImplementedError, RuntimeError
+          mode: xfail  # xfail: NotImplementedError, RuntimeError
         # These tests exercise the `fftshift` operation on tensors with `float32` dtype, which relies on the `aten::roll` operator.
         # They are classified as `xfail` because the `aten::roll` operator is not implemented on the Spyre backend.
         # This highlights a limitation in Spyre's operator coverage, specifically missing support for tensor manipulation ops.
         - names:
             - TestFFT::test_fftshift_numpy
-          mode: skip  # NotImplementedError
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise the Short-Time Fourier Transform (STFT) and Inverse STFT (ISTFT) operations, focusing on windowing and complex tensor requirements.
         # They are classified as 'skip' because they do not engage the torch-spyre layer, which is responsible for handling device-specific operations.
         # The relevance of these tests is limited due to Spyre's current focus on other operations and data types.

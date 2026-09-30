@@ -38,7 +38,7 @@ test_suite_config:
             - TestFxGraphCacheHashing::test_hash_custom_partitioner_fn
             - TestFxGraphCacheHashing::test_hash_private_config_changes
             - TestFxGraphCacheHashing::test_hash_var_to_hint_override
-          mode: skip  # UNKNOWN
+          mode: xfail  # xfail: UNKNOWN
         # These tests exercise the hashing and caching mechanisms in PyTorch, including custom passes and keyword arguments.
         # They are classified as xfail due to mismatched sequence lengths and string comparisons, indicating issues with Spyre's handling of these mechanisms.
         # Relevant Spyre limitations include incomplete support for certain tensor operations and potential discrepancies in runtime behavior.
@@ -47,7 +47,7 @@ test_suite_config:
             - TestFxGraphCacheHashing::test_hash_custom_passes
             - TestFxGraphCacheHashing::test_hash_kwargs
             - TestPyCodeCache::test_editable_cached_wrapper
-          mode: skip  # AssertionError
+          mode: xfail  # xfail: AssertionError
         # These tests primarily focus on caching mechanisms and error handling in PyTorch, which do not directly interact with the torch-spyre layer.
         # They are classified as 'skip' because they do not require the Spyre backend for execution.
         # Relevant Spyre capabilities include support for various dtypes and ops, but these tests do not leverage those features.

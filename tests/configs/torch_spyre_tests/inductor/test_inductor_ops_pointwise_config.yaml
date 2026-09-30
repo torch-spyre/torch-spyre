@@ -16,7 +16,7 @@ test_suite_config:
             - ops__inductor-pointwise
         - names:
             # Wrapper methods with broken implementation (call methods without _spyre suffix)
-            # Skipped so they don't cause CI to fail
+            # Marked as xfail so they don't cause CI to fail
             - TestOps::test_scalar_comparison
             - TestOps::test_eq_scalar_constant_float
             - TestOps::test_eq_scalar_constant_int
@@ -26,7 +26,7 @@ test_suite_config:
             - TestOps::test_eq_scalar_constant_zero
             - TestOps::test_eq_scalar_multidim
             - TestOps::test_eq_scalar_vs_tensor_comparison
-          mode: skip
+          mode: xfail
           tags:
             - ops__inductor-pointwise
 

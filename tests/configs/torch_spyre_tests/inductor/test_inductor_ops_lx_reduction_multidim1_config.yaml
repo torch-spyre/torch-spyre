@@ -5,7 +5,7 @@
 # Auto-split of test_inductor_ops_lx_planning.py, mirroring the
 # test_inductor_ops.py config sharding. The full (non-truncated) test
 # set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
-# (see .github/workflows/_test_matrix.yaml). The skip lists below are
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
 # the source of truth for known LX-planning failures (the in-file .py
 # skip-lists were removed as duplicates).
 test_suite_config:

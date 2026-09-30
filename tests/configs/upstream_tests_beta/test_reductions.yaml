@@ -131,7 +131,7 @@ test_suite_config:
             - TestReductions::test_var_unbiased
             - TestReductions::test_var_vs_numpy
             - TestReductions::test_dim_multi_unsupported
-          mode: skip  # NotImplementedError
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise reduction operations like sum, mean, min, max, mode, and median across various dtypes and tensor layouts.
         # They are xfailed due to missing Spyre support for key ops like mean on fp32, sum on int64, and handling of noncontiguous strides.
         # The failures highlight Spyre's limited reduction op support and its strict stick-layout constraints for memory access patterns.
@@ -166,7 +166,7 @@ test_suite_config:
             - TestReductions::test_sum_all
             - TestReductions::test_sum_noncontig_lowp
             - TestReductions::test_sum_vs_numpy
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise reduction operations like argmin, argmax, all, any, sum, prod, nansum, and count_nonzero across various dtypes.
         # They are xfail due to missing Spyre kernel support for these ops and unsupported stick expression patterns in the inductor.
         # The failures highlight missing reduction kernels and the Spyre backend's constraints on tensor shape expressions.
@@ -181,7 +181,7 @@ test_suite_config:
             - TestReductions::test_identity_prod
             - TestReductions::test_identity_sum
             - TestReductions::test_nansum
-          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise reduction ops like mean, sum, min, max, and mode across various dtypes and tensor ranks.
         # They are xfail due to Spyre's 64-dimension limit, lack of double dtype support, and missing type conversion during copy.
         # The relevant limitations are the max tensor rank of 64, unsupported dtypes like double and int16, and incomplete copy semantics.
@@ -191,13 +191,13 @@ test_suite_config:
             - TestReductions::test_minmax_illegal_dtype
             - TestReductions::test_mode_boolean
             - TestReductions::test_mode_wrong_dtype
-          mode: skip  # RuntimeError
+          mode: xfail  # xfail: RuntimeError
         # These tests exercise the mean reduction op with out-of-bounds dimension indices.
         # They are xfail due to a TorchRuntimeError during fake tensor creation for invalid dims.
         # This highlights a limitation in Spyre's graph compilation for error handling paths.
         - names:
             - TestReductions::test_dim_offbounds_mean
-          mode: skip  # torch._dynamo.exc.TorchRuntimeError
+          mode: xfail  # xfail: torch._dynamo.exc.TorchRuntimeError
         # These tests exercise reduction operations like sum, mean, max, and histc across bfloat16, float16, float32, and int64 dtypes.
         # They are xfailed because Spyre lacks support for many reduction ops and the histc function entirely.
         # The failures highlight missing Spyre kernels for reductions and the dxp_standalone compiler tool.
@@ -240,17 +240,17 @@ test_suite_config:
             - TestReductions::test_reference_masked_masked_var
             - TestReductions::test_tensor_compare_ops_argmax_argmix_kthvalue_dim_empty
             - TestReductions::test_warn_invalid_degrees_of_freedom
-          mode: skip  # dxp_standalone not detected
+          mode: xfail  #  # xfail: dxp_standalone not detected
         # These tests exercise reduction operations like sum, prod, all, any, and count_nonzero across bfloat16, float16, float32, bool, and int64 dtypes. They are xfail due to missing aten::random_.from support and Spyre's inductor limitation with unexpected stick expressions like 2*d0. The failures highlight missing random tensor initialization and constraints on dimension expressions in the Spyre backend.
         - names:
             - TestReductions::test_identity
-          mode: skip  # NotImplementedError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise the nanmean reduction op with nan_policy='omit' across bfloat16, float16, and float32 dtypes.
         # They are xfail due to an Inductor error from an unsupported stick expression in the generated kernel.
         # This reveals a limitation in Spyre's codegen for handling certain tensor dimension expressions in reduction patterns.
         - names:
             - TestReductions::test_nan_policy_omit_nanmean
-          mode: skip  # torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise reduction operations like sum, mean, var, std, logsumexp, prod, cumsum, and cumprod across various dtypes and tensor shapes.
         # They are classified as skip because the torch-spyre layer does not support many of these reduction ops, particularly logsumexp and complex reductions.
         # Spyre's limited op support for reductions and missing bfloat16/float16 handling for large tensors are the relevant limitations.

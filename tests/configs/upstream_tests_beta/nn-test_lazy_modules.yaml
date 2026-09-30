@@ -10,7 +10,7 @@ test_suite_config:
         # This failure highlights a limitation in Spyre's support for lazy module initialization.
         - names:
             - TestLazyModules::test_materialize_device
-          mode: skip  # AttributeError
+          mode: xfail  # xfail: AttributeError
         # These tests exercise various lazy initialization and state management functionalities in PyTorch modules, including batch normalization, convolution, instance normalization, and linear layers.
         # They are classified as 'skip' on the Spyre backend because the tests do not specify a device argument, which is required for proper execution on the Spyre device.
         # The most relevant Spyre capabilities are the support for various dtypes and ops, but the tests' lack of device specification prevents them from being executed on the Spyre device.

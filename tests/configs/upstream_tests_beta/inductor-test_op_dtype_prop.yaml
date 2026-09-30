@@ -10,7 +10,7 @@ test_suite_config:
         # The Spyre backend's limitation in handling CUDA-specific operations is the key issue.
         - names:
             - TestCase::test_constant
-          mode: skip  # RuntimeError
+          mode: xfail  # xfail: RuntimeError
         # These tests exercise various operations and data types, including mixed precision and dtype-aware codegen.
         # They are classified as 'skip' because they do not engage the torch-spyre layer, primarily due to CUDA dependency.
         # The relevant Spyre limitation is the lack of CUDA support, which is required for these tests to execute properly.

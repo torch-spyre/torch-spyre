@@ -1139,10 +1139,14 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     @staticmethod
     def case_decorators(params):
         """The greedy plans are prescribed exactly; CP-SAT is expected to differ,
-        so skip its combos."""
+        so mark its combos ``expectedFailure`` (and skip when ortools is absent
+        since the joint CP-SAT path needs it)."""
         if params["solver_method"] == "cpsat":
             return [
-                unittest.skip("CP-SAT plans differ from the prescribed greedy plans")
+                unittest.expectedFailure,
+                unittest.skipUnless(
+                    _HAS_ORTOOLS, "joint CP-SAT prescribed xfail needs ortools"
+                ),
             ]
         return []
 
