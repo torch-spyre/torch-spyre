@@ -43,6 +43,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.utils import ceildiv
 from torch._inductor.virtualized import V
 
 from . import config
@@ -381,33 +382,39 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _convert_reads_whole_input(
+def _can_rescale_input_stl(
     in_layout: FixedLayout,
     output: FixedLayout,
     dep: MemoryDep,
     output_dep: MemoryDep,
+    stl: SpyreTensorLayout,
 ) -> bool:
-    """Whether a dtype conversion traverses its input exactly as it writes its output.
+    """Whether a conversion's output can take ``stl``, its input's layout, rescaled.
 
-    Only then may the conversion inherit the input buffer's
-    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
-    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
-    part of the fused QKV projection into a fresh, narrower per-head buffer --
-    the inherited row span belongs to the input buffer while the elements land
-    in a buffer with a different row stride. ``compute_coordinates`` then folds
-    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
-    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
-    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
-    representable but addresses the wrong sticks (``a == 1``, silently wrong
-    results). Mirrors the identical-access test the general convert path uses,
-    minus the element-width condition -- rescaling the stick depth is exactly
-    what this path is for.
+    ``rescale_stl_for_dtype`` keeps every device dim of ``stl``, so the conversion
+    must traverse its input exactly as it writes its output, and ``stl`` must lay
+    out only what it reads. Two reads fail that and take the sliced path:
+
+    - A slice of a wider buffer, e.g. Gemma's ``q_norm``/``k_norm`` upcast of part
+      of the fused QKV projection. The inherited row span belongs to the input
+      buffer while the elements land in a narrower one. ``compute_coordinates``
+      folds that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+      ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+      normalization grammar (``a != 1``, a codegen-time hard error) or addresses
+      the wrong sticks (``a == 1``, silently wrong results). The size, index and
+      host-coordinate checks catch it, mirroring the identical-access test of the
+      general convert path minus the element-width condition.
+    - A view keeping a wider buffer's layout, which can pass all of those: eager
+      decode passes q as ``qkv[:, :256].view(1, 2, 128)``, whose device dim steps
+      both heads and sticks, at ``2*head + floor(elem/64)``. A device coordinate
+      over more than one host var catches it.
     """
     return (
         list(in_layout.size) == list(output.size)
         and dep.index == output_dep.index
         and host_coordinates(in_layout, dep, None)
         == host_coordinates(output, output_dep, None)
+        and all(len(c.free_symbols) <= 1 for c in device_coordinates(stl, dep, None))
     )
 
 
@@ -418,23 +425,32 @@ def rescale_stl_for_dtype(
     host_layout: FixedLayout,
     dep: MemoryDep,
 ) -> SpyreTensorLayout:
-    """Rescale a device layout across a conversion that changes the stick depth.
+    """Rescale a device layout across a conversion that changes the elements per stick.
 
     Keeps every device dim of ``stl`` and resizes only the stick (the last device
     dim) and the num-sticks dim, both found by ``stick_dims`` from ``dep``'s
     coordinates. ``dep`` must read the input exactly as the conversion writes its
     output; a slice of a wider buffer would keep that buffer's ``stride_map``.
 
-    The new stick count comes from the input layout, except where the input does
-    not record it. Splitting sticks (fp16 into fp32) counts from the host extent,
-    so 65 fp16 elements take three fp32 sticks, not four, unless the num-sticks
-    dim also folds outer host dims and so steps only whole input sticks. Merging
-    into a single output stick (fp32 into fp16) writes the host extent as the
-    dim's ``stride_map`` entry, as ``dim_map_to_stride_map`` does.
+    The num-sticks dim's size and ``stride_map`` entry come from the input layout,
+    except in two cases the input does not record: a split into more sticks counts
+    from the host dim size, and a merge into a single stick takes the host dim
+    size as its entry. For example, with a contiguous stick dim::
+
+        conversion    host dim size  in sticks, entry    out sticks, entry
+        fp32 -> fp16  20             1, 20               1, 20  (kept)
+        fp32 -> fp16  50             2, 32               1, 50  (host dim size)
+        fp32 -> fp16  96             3, 32               2, 64
+        fp16 -> fp32  40             1, 40               2, 32
+        fp16 -> fp32  65             2, 64               3, 32  (not 4)
 
     The layout holds only the sticks the live elements reach; the rest of the
     stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
     growing it here would follow the value into every consumer of this STL.
+
+    Raises ``Unsupported`` for a num-sticks dim that folds other host dims, whose
+    host dim size does not bound it; ``_can_rescale_input_stl`` sends such a
+    read down the sliced path.
 
     Args:
         stl: Input device layout to rescale.
@@ -459,36 +475,47 @@ def rescale_stl_for_dtype(
             f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
             f"for {dep}"
         )
-    # A stick holding one element (a size-1 or sparse stick dim) has as many
-    # sticks at any depth.
-    if stick_host_dim is not None and num_sticks_dim is not None:
-        in_sticks = stl.device_size[num_sticks_dim]
-        in_eps = stl.device_size[-1]
-        elem_step = stl.stride_map[-1]
-        host_extent = concretize_expr(host_layout.size[stick_host_dim])
+    if stick_host_dim is None or num_sticks_dim is None:
+        # A stick holding one element (a size-1 or sparse stick dim) needs no more
+        # sticks at any number of elements per stick.
+        return SpyreTensorLayout(
+            out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+        )
 
-        # General case: the input sticks redistribute into output sticks, which
-        # the dim steps by the output pitch.
-        in_elems = in_sticks * in_eps
-        out_device_size[num_sticks_dim] = (in_elems + out_eps - 1) // out_eps
-        out_stride_map[num_sticks_dim] = out_eps * elem_step
+    in_sticks = stl.device_size[num_sticks_dim]
+    in_eps = stl.device_size[-1]
+    elem_step = stl.stride_map[-1]
+    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
+    if device_coords[num_sticks_dim].free_symbols - stick_vars:
+        raise Unsupported(
+            f"num-sticks dim {num_sticks_dim} of {list(stl.device_size)} "
+            f"{list(stl.stride_map)} folds other host dims for {dep}"
+        )
 
-        folds_outer_dims = bool(device_coords[num_sticks_dim].free_symbols - stick_vars)
-        if out_eps < in_eps and not folds_outer_dims:
-            # Splitting sticks: the last input stick may fill only part of them.
-            out_device_size[num_sticks_dim] = (host_extent + out_eps - 1) // out_eps
-        if out_device_size[num_sticks_dim] == 1:
-            if in_sticks == 1:
-                # A single stick's entry never enters an address.
-                out_stride_map[num_sticks_dim] = stl.stride_map[num_sticks_dim]
-            else:
-                # Merged into a single output stick: the host extent, not a pitch.
-                out_stride_map[num_sticks_dim] = host_extent * elem_step
+    if out_eps < in_eps:
+        # Splitting sticks, where the last input stick may be part-filled:
+        # 65 fp16 elements in 2 sticks -> 3 fp32 sticks, not 4.
+        out_sticks = ceildiv(host_dim_size, out_eps)
+    else:
+        # Whole input sticks merge (or keep their width): 3 fp32 sticks -> 2 fp16.
+        out_sticks = ceildiv(in_sticks * in_eps, out_eps)
+
+    if out_sticks > 1:
+        # The dim steps one output stick: 40 fp16 elements -> 2 fp32, entry 32.
+        entry = out_eps * elem_step
+    elif in_sticks == 1:
+        # A single stick's entry never enters an address, so it is kept:
+        # 20 fp16 elements in 1 stick -> 1 fp32 stick, entry 20.
+        entry = stl.stride_map[num_sticks_dim]
+    else:
+        # Sticks merged into one, whose entry is the host dim size, as
+        # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
+        entry = host_dim_size * elem_step
+
+    out_device_size[num_sticks_dim] = out_sticks
+    out_stride_map[num_sticks_dim] = entry
     return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
+        out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
     )
 
 
@@ -507,9 +534,10 @@ def _typecast_layouts(
     input whose stick starts at a slice offset. The optimizer inserts the
     restickify on the input edge.
 
-    A read of the whole input rescales the source (``rescale_stl_for_dtype``),
-    keeping all its device dims. A slice of a wider buffer cannot, since the
-    source's ``stride_map`` steps through the wider buffer: it builds the layout
+    A read that can take the source's layout (``_can_rescale_input_stl``)
+    rescales it (``rescale_stl_for_dtype``), keeping all its device dims. A slice
+    of a wider buffer cannot, since the source's ``stride_map`` steps through the
+    wider buffer: it builds the layout
     from the output's host size with the source's stick dim instead, which may
     reorder the non-stick device dims. The conversion works on whole sticks, so a
     slice skips a source whose stick it starts mid-stick.
@@ -526,7 +554,6 @@ def _typecast_layouts(
         out_ea = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    reads_whole_input = _convert_reads_whole_input(in_layout, output, dep, output_dep)
     out_coords = host_coordinates(output, output_dep, None)
 
     sources = [stl]
@@ -553,7 +580,7 @@ def _typecast_layouts(
     layouts: list[SpyreTensorLayout] = []
     for source_stl in sources:
         candidate: SpyreTensorLayout | None
-        if reads_whole_input:
+        if _can_rescale_input_stl(in_layout, output, dep, output_dep, source_stl):
             # Keeps every device dim of the source; only the stick depth and
             # the num-sticks count change.
             # TODO: support slices in rescale_stl_for_dtype, so a sliced read

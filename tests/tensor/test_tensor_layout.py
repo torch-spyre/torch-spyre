@@ -836,32 +836,58 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(scalar_out.device_size), [1, 32])
         self.assertEqual(list(scalar_out.stride_map), [-1, -1])
 
-    def test_rescale_for_dtype_scales_a_folded_num_sticks_dim(self):
-        """A num-sticks dim that also steps the stick dim's outer host dims keeps
-        every stick it holds. Six heads of a 128-element head_dim, read from a
-        ``[1, 768]`` buffer, lay their whole-stick rows end to end on one device
-        dim, so its coordinate is ``2*head + floor(elem/64)``. Sizing it from the
-        head_dim extent alone gives four fp32 sticks, one head, and the other
-        heads are never converted; its twelve fp16 sticks widen to twenty-four
-        fp32 sticks instead. Needs no device.
+    def test_rescale_for_dtype_rejects_a_folded_num_sticks_dim(self):
+        """A num-sticks dim that also steps other host dims is not bounded by the
+        stick dim's host size. q read as ``[1, 2, 128]`` heads from qkv's
+        ``[1, 768]`` layout lays the heads end to end on one device dim, at
+        ``2*head + floor(elem/64)``; sizing it from head_dim would convert one
+        head. Needs no device.
         """
         from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
-        stl = SpyreTensorLayout(
+        qkv_stl = SpyreTensorLayout(
             [12, 1, 64], [64, -1, 1], fp16, ElementArrangement.STANDARD
         )
-        host_size = [1, 6, 128]
-        out = rescale_stl_for_dtype(
-            stl,
-            torch.float32,
-            ElementArrangement.STANDARD,
-            _host_layout(torch.float16, host_size),
-            _dep("buf", host_size),
+        host_size = [1, 2, 128]
+        with self.assertRaises(Unsupported):
+            rescale_stl_for_dtype(
+                qkv_stl,
+                torch.float32,
+                ElementArrangement.STANDARD,
+                _host_layout(torch.float16, host_size),
+                _dep("buf", host_size),
+            )
+
+    def test_convert_of_a_folded_heads_view_reads_as_a_slice(self):
+        """A heads view keeping qkv's layout reads as a slice, though its host
+        size and index match the output's; the heads view's own layout reads
+        whole. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import (
+            _can_rescale_input_stl,
         )
-        self.assertEqual(list(out.device_size), [24, 1, 32])
-        self.assertEqual(list(out.stride_map), [32, -1, 1])
+
+        fp16 = get_device_dtype(torch.float16)
+        host_size = [1, 2, 128]
+        in_layout = _host_layout(torch.float16, host_size)
+        output = _host_layout(torch.float32, host_size)
+        dep, output_dep = _dep("buf", host_size), _dep("out", host_size)
+        qkv_stl = SpyreTensorLayout(
+            [12, 1, 64], [64, -1, 1], fp16, ElementArrangement.STANDARD
+        )
+        heads_stl = SpyreTensorLayout(
+            [1, 2, 2, 64], [-1, 64, 128, 1], fp16, ElementArrangement.STANDARD
+        )
+        self.assertFalse(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, qkv_stl)
+        )
+        self.assertTrue(
+            _can_rescale_input_stl(in_layout, output, dep, output_dep, heads_stl)
+        )
 
     def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
         """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:

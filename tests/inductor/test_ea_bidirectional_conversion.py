@@ -481,6 +481,29 @@ def test_fp16_to_fp32_on_qkv_slice(shape, part):
     assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
 
 
+def test_fp16_to_fp32_on_heads_view_input_reads_as_a_slice():
+    """An upcast of a heads view of fused QKV lays out every head.
+
+    Eager decode passes q as ``qkv[:, :256].view(1, 2, 128)``, which keeps qkv's
+    device layout: one device dim holds all 12 fp16 sticks, at ``2*head +
+    floor(elem/64)``. The view reads as a slice, so the output gets its own
+    heads dim rather than a rescale of qkv's.
+    """
+
+    def fn(q):
+        x32 = q.float()
+        # The multiply keeps inductor from folding the round trip into an FP16 copy.
+        return (x32 * 3.0).half(), x32
+
+    qkv = torch.randn(1, 768, dtype=torch.float16)
+    expected, _ = fn(qkv[:, :256].view(1, 2, 128))
+    result, upcast = torch.compile(fn)(qkv.to(DEVICE_NAME)[:, :256].view(1, 2, 128))
+
+    torch.testing.assert_close(result.cpu(), expected, atol=0.005, rtol=0.005)
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+    assert list(get_spyre_tensor_layout(upcast).device_size) == [1, 4, 2, 32]
+
+
 @pytest.mark.parametrize("start", [0, 1024], ids=lambda n: f"start{n}")
 def test_fp16_to_fp32_on_transposed_slice_keeps_input_stick(start):
     """A sliced staggered upcast puts its stick where the input's stick lands.
