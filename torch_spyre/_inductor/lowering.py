@@ -151,7 +151,11 @@ def register_fallback_over_decomp(fallback_ops):
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
             if (
-                overload in lowering.decompositions
+                (
+                    overload in lowering.decompositions
+                    or bool(torch._decomp
+                        .get_decompositions([overload]))
+                )
                 and overload not in lowering.lowerings
             ):
                 lowering.make_fallback(overload, override_decomp=True)
