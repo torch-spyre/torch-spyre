@@ -85,6 +85,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "element_arrangement": "ElementArrangement",
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
+    "stride_map": "list[int] | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -334,6 +335,8 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
     # keep the exact key they had before this field existed.
     if arg.kernel_local:
         result["kernel_local"] = True
+    # stride_map is left out: it only guides binding the coordinates, so its
+    # effect is already in device_coordinates.
     return result
 
 
