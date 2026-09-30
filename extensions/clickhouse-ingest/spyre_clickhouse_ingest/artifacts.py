@@ -181,7 +181,7 @@ def write_batch(client, db: str, batch: dict) -> dict:
             batch_identity(e["artifact"]),
             e.get("tag", ""),
             e.get("tag_family", ""),
-            ref=e.get("ref", ""),
+            ref=e.get("ref") or None,
             props=e.get("props"),
         )
     for e in batch.get("results", []):

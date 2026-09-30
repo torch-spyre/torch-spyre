@@ -340,3 +340,18 @@ def test_a_misspelled_batch_key_is_refused_before_anything_is_written():
     ):
         write_batch(c, "db", batch)
     assert c.inserts == []
+
+
+def test_a_tag_entry_without_a_ref_names_the_artifacts_own():
+    from spyre_clickhouse_ingest.artifacts import write_batch
+    from spyre_clickhouse_ingest.schema import ArtifactTags
+
+    for entry in ({}, {"ref": ""}):
+        c = FakeClient()
+        write_batch(
+            c,
+            "db",
+            {"tags": [{"artifact": NODE, "tag": "t", "tag_family": "f", **entry}]},
+        )
+        (tag,) = _rows(c, ArtifactTags)
+        assert [r[3] for r in tag["refs"]] == [NODE["ref"]], entry
