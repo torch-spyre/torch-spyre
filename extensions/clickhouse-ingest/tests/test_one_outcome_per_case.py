@@ -14,9 +14,7 @@
 
 """A run holds one outcome per case, so run_case_counters (which sums rows) counts it once."""
 
-import re
-
-from spyre_clickhouse_ingest import CaseId, TestResultWriter, insert_test_results
+from spyre_clickhouse_ingest import CaseId, insert_test_results
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR
 from spyre_clickhouse_ingest.schema import TEST_CASE_RUNS
 
@@ -39,7 +37,7 @@ class HeldClient:
         rows = []
         if "audit_uuid" in sql:
             rows = [
-                (TCID, f"00000000-0000-7000-8000-00000000000{i}", *h)
+                (TCID, f"00000000-0000-7000-8000-00000000000{i}", h[0], 0.0, "", *h[1:])
                 for i, h in enumerate(self.held)
             ]
 
@@ -76,24 +74,43 @@ def _deleted(c):
     return [p["uuids"] for sql, p in c.commands if "audit_uuid IN" in sql]
 
 
-def test_across_files_a_worse_outcome_replaces_the_held_one_and_recounts():
-    c = HeldClient([("passed", RUN, "", "a.xml")])
-    _write(c, "failed")
-    assert _written(c) == ["failed"]
+def test_a_newer_attempt_of_the_file_replaces_the_older_and_recounts():
+    c = HeldClient([("failed", RUN, "1", "b.xml")])
+    _write(c, "passed", attempt=2)
+    assert _written(c) == ["passed"]
     assert _deleted(c) == [["00000000-0000-7000-8000-000000000000"]]
     assert any(
         sql.startswith("INSERT INTO db.run_case_counters") for sql, _ in c.commands
     )
 
 
-def test_across_files_a_better_or_equal_outcome_is_not_written_again():
-    for held in ("failed", "passed"):
-        c = HeldClient([(held, RUN, "", "a.xml")])
-        assert _write(c, "passed") == 0
-        assert c.commands == []
+def test_an_older_attempt_arriving_late_is_not_written():
+    c = HeldClient([("passed", RUN, "2", "b.xml")])
+    assert _write(c, "failed", attempt=1) == 0
+    assert c.commands == []
 
 
-def test_across_files_a_test_that_ran_beats_a_skip():
+def test_an_exact_copy_is_not_written_again():
+    c = HeldClient([("passed", RUN, "", "b.xml")])
+    assert _write(c, "passed") == 0
+    assert c.commands == []
+
+
+def test_differing_outcomes_in_one_attempt_of_a_file_both_stay():
+    # test_T_spyre / test_t_spyre share an id until ids keep the name's case.
+    c = HeldClient([("xfail", RUN, "", "b.xml")])
+    _write(c, "passed")
+    assert _written(c) == ["passed"] and _deleted(c) == []
+
+
+def test_executed_outcomes_from_different_files_both_stay():
+    # hf-adapters' base and _adapter configs run one entry name with different parameters.
+    c = HeldClient([("passed", RUN, "", "a.xml")])
+    _write(c, "failed")
+    assert _written(c) == ["failed"] and _deleted(c) == []
+
+
+def test_an_executed_outcome_replaces_a_skip_from_another_file():
     c = HeldClient([("skipped", RUN, "", "a.xml")])
     _write(c, "passed")
     assert _written(c) == ["passed"] and _deleted(c)
@@ -101,34 +118,18 @@ def test_across_files_a_test_that_ran_beats_a_skip():
     assert _write(c, "skipped") == 0
 
 
-def test_within_a_file_the_later_write_wins_even_when_better():
-    # A retry of the same file: its pass supersedes the earlier failure.
-    c = HeldClient([("failed", RUN, "", "b.xml")])
-    _write(c, "passed")
-    assert _written(c) == ["passed"] and _deleted(c)
-
-
-def test_an_executed_outcome_replaces_a_reused_copy_even_when_better():
+def test_an_executed_outcome_replaces_a_reused_copy_even_in_the_same_file():
     c = HeldClient([("failed", OTHER, "", "b.xml")])
     _write(c, "passed")
     assert _written(c) == ["passed"] and _deleted(c)
 
 
-def test_a_later_attempt_replaces_a_worse_earlier_one_in_another_file():
-    c = HeldClient([("failed", RUN, "1", "a.xml")])
-    _write(c, "passed", attempt=2)
-    assert _written(c) == ["passed"] and _deleted(c)
-
-
-def test_a_case_repeated_in_one_batch_keeps_its_last_row():
+def test_one_batch_keeps_differing_repeats_and_drops_exact_ones():
     c = HeldClient()
-    _write(c, "failed", "error", "passed")
-    assert _written(c) == ["passed"] and c.commands == []
+    _write(c, "xfail", "passed", "passed")
+    assert _written(c) == ["xfail", "passed"] and c.commands == []
 
 
-def test_migration_007_ranks_statuses_as_the_writer_does():
-    sql = (SCHEMA_DIR / "migrations" / "007_one_outcome_per_case.sql").read_text()
-    names, ranks = re.search(r"\[('skipped'[^\]]*)\],\s*\[([^\]]*)\]", sql).groups()
-    order = dict(zip(re.findall(r"'(\w+)'", names), map(int, ranks.split(","))))
-    assert order == TestResultWriter.SEVERITY
+def test_migration_009_is_rerunnable():
+    sql = (SCHEMA_DIR / "migrations" / "009_one_outcome_per_case.sql").read_text()
     assert sql.startswith("-- RERUNNABLE")
