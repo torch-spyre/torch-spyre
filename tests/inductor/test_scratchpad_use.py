@@ -1786,6 +1786,32 @@ class TestInplaceEdgeGate(unittest.TestCase):
                     )
                 )
 
+    def test_counted_loop_overrides_block_handoff(self):
+        """A buffer kept live across a counted loop cannot hand off in place.
+
+        The parent's last use and the child's first use abut at tick 5, but a
+        loop-widened parent end or child start moves one of them off that tick.
+        """
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+            _handoff_child_start,
+            _handoff_parent_end,
+        )
+
+        lifetimes = {"p": [2, 5], "c": [5, 7]}
+        for label, starts, ends, expected in (
+            ("no overrides", {}, {}, True),
+            ("parent live through the loop", {}, {"p": 9}, False),
+            ("child widened to the loop start", {"c": 0}, {}, False),
+        ):
+            with self.subTest(label):
+                kwargs = {
+                    **self._base_kwargs(),
+                    "child_start": _handoff_child_start("c", lifetimes, starts),
+                    "parent_end": _handoff_parent_end("p", lifetimes, ends),
+                }
+                self.assertIs(ScratchpadAllocator._inplace_edge_ok(**kwargs), expected)
+
 
 class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
     """Plain in-place mutations compile under the co-optimizing greedy path

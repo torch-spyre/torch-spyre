@@ -124,6 +124,12 @@ def counted_loop_lifetime_overrides(
     """
 
     def group_path(op: Operation) -> tuple[int, ...]:
+        # Mirror scheduler._loop_group_id: only SchedulerNodes join a counted
+        # loop. An extern kernel keeps its loop_info (e.g. a loop-body constant
+        # that dedup_and_promote_constants hoisted to the graph head) but runs
+        # once, outside the loop.
+        if isinstance(op, ExternKernel):
+            return ()
         return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
 
     loop_start: dict[tuple[int, ...], int] = {}

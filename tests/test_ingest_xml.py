@@ -792,6 +792,54 @@ def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
     assert row["artifact_id"] == _AID
 
 
+def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    (res,) = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert (res["test_type"], res["result_kind"]) == ("model_ops", "capability")
+
+
+def test_a_named_image_is_registered_tagged_and_judged(ingest):
+    # --artifact names what a Jenkins leg ran; the verdict lands on that image, tagged.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
+    image = "registry.example.com/team/hf-adapters-devel@sha256:" + "ab" * 32
+    args = _args(
+        artifact_id="",
+        artifact=f"image:{image}",
+        platform="s390x",
+        jenkins_run_key="job#1",
+        run_url="https://ci.example.com/job/1/",
+        tag=["release-2026-09-22"],
+        tag_family="release",
+    )
+    ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    assert (art["component"], art["artifact_name"], art["props"]["id12"]) == (
+        "hf-adapters",
+        "hf-adapters-devel",
+        "ab" * 6,
+    )
+    assert [t["tag"] for t in rows["artifact_tags"]] == ["release-2026-09-22"]
+    (res,) = rows["artifact_results"]
+    assert (res["artifact_id"], res["test_type"], res["state"]) == (
+        art["artifact_id"],
+        "svt",
+        "passed",
+    )
+    assert res["props"] == {
+        "run_url": "https://ci.example.com/job/1/",
+        "source": "jenkins",
+    }
+
+
 def test_no_artifact_id_writes_nothing(ingest):
     # Any image baked before the id was stamped: cases land, nothing claims an artifact.
     c = _ArtifactClient()

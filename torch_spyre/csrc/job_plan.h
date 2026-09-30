@@ -469,7 +469,7 @@ class JobPlanStepCompute final : public JobPlanStep {
    *
    * @param program_address The program's FULL device allocation. flex bounds
    * the segment-7 translation to its total_size() (the real Allocate
-   * footprint), never SEGMENT_SIZE.
+   * footprint).
    * @param bind_io_addresses Whether to bind the compute operation with inputs
    * and outputs addresses
    * @param bootstrap_offset Offset within the program allocation where
@@ -538,7 +538,13 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    pipeline_barrier_ = false;  // host-compute is overlap-eligible
+    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
+    // per-stream FIFO like every other op; overlap with device compute comes
+    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
+    // its barrier. The inline synchronize() it triggers only drains S_prep, so
+    // it never blocks device compute on S_dev.
+    role_ = StreamRole::Prep;
+
     // Create the host compute handle at construction time.
     // This will internally create the fast_plan for deeptools.
     handle_ = flex::createHostComputeHandle(std::move(hcm));

@@ -36,6 +36,12 @@ inputs:
     description: Numeric GitHub Actions run id, used as the dedup key.
     required: false
     default: ''
+  run-attempt:
+    description: >
+      GitHub run attempt the XMLs came from. Set, a re-run's cases replace the earlier
+      attempt's in v2; empty (default) keeps first-write-wins.
+    required: false
+    default: ''
   artifact-id:
     description: >
       artifact_id of what the leg ACTUALLY RAN, derived by derive-gha-artifact-id on the
@@ -268,6 +274,7 @@ runs:
         COMPONENT_IN: ${{ inputs.component }}
         ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
         REPOSITORY_IN: ${{ inputs.repository }}
+        RUN_ATTEMPT_IN: ${{ inputs.run-attempt }}
       run: |
         source .venv/bin/activate
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
@@ -301,6 +308,12 @@ runs:
           echo "::warning::ingest script predates --artifact-id; no artifact row will be" \
                "written for this run (id was ${ARTIFACT_ID_IN})."
         fi
+        # Same --help probe: a prebaked image may carry a script predating --run-attempt.
+        ATTEMPT_ARGS=()
+        if [ -n "${RUN_ATTEMPT_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--run-attempt"; then
+          ATTEMPT_ARGS=(--run-attempt "${RUN_ATTEMPT_IN}")
+        fi
         python3 "${INGEST_SCRIPT}" \
           --xml-dir "${{ inputs.xml-dir }}" \
           --workflow "${{ inputs.workflow }}" \
@@ -311,4 +324,4 @@ runs:
           --triggered-at "${{ inputs.triggered-at }}" \
           --pr-number "${{ inputs.pr-number }}" \
           --trigger-type "${{ inputs.trigger-type }}" \
-          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}" "${ARTIFACT_ARGS[@]}"
+          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}" "${ARTIFACT_ARGS[@]}" "${ATTEMPT_ARGS[@]}"

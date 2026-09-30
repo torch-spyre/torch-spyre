@@ -85,9 +85,12 @@ jobs:
     # Read via the composite action: a merge_group payload carries no
     # pull_request object, so the inline labels expression never matched in the
     # queue and this rebuilt/retested every queued entry.
+    # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      needs.changes.outputs.integration_labeled != 'true'
+      needs.changes.outputs.integration_labeled != 'true' &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
+      github.event_name != 'merge_group'
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
     # for the test jobs.
