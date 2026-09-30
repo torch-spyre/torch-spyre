@@ -69,6 +69,9 @@ Rules this implies:
   `migrations/002_*`.
 - A file marked `-- APPLY: explicit` applies only with `--include <file>`, for DDL that belongs to
   a different database. None is marked today.
+- A migration marked `-- RERUNNABLE` is written to be repeated, and `--rerun <file>` runs it
+  again after its ledger entry, e.g. `006_*` to re-key ids that writers on an older image still
+  mint.
 - Every fact and dimension table carries `audit_uuid` (UUIDv7) and `audit_timestamp`
   (DateTime64(3)), as every v1 table does: a stable per-row identity, and an insert time fine
   enough to order rows written within the same second. Exporter-owned (`otel_*`), upstream-shaped

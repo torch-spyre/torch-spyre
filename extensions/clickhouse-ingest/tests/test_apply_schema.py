@@ -180,6 +180,31 @@ def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
     ]
 
 
+def test_a_constraint_a_pending_migration_replaces_is_not_drift(tmp_path):
+    new = (
+        "CREATE TABLE IF NOT EXISTS {} (\n    a String,\n"
+        "    CONSTRAINT chk_a CHECK a IN ('x', 'y')\n) ENGINE = MergeTree ORDER BY a"
+    )
+    old = "CREATE TABLE {} ( a String, CONSTRAINT chk_a CHECK a IN ('x') ) ENGINE = MergeTree ORDER BY a"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": new.format("t"), "20-u.sql": new.format("u")},
+        {
+            "001_chk.sql": "ALTER TABLE t DROP CONSTRAINT IF EXISTS chk_a;\n"
+            "ALTER TABLE t ADD CONSTRAINT chk_a CHECK a IN ('x', 'y')"
+        },
+    )
+    # u's CHECK differs too, but no migration replaces it.
+    server = FakeServer({"t": old.format("t"), "u": old.format("u")})
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps] == [
+        ("migrates", "t"),
+        ("drift", "u"),
+        ("migrate", "001_chk.sql"),
+    ]
+
+
 def test_an_addition_the_live_table_already_has_is_not_left_out(tmp_path):
     d = _schema(
         tmp_path,
@@ -233,3 +258,16 @@ def test_repo_schema_parses_as_create_only():
     d = SchemaApplier.schema_dir()
     for path, text in SchemaApplier.selected_files(d, include=["80-otel.sql"]):
         assert SchemaApplier.objects(path, text)
+
+
+def test_rerun_repeats_only_a_rerunnable_migration(tmp_path):
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE},
+        {"001_x.sql": "SELECT 1", "002_y.sql": "-- RERUNNABLE\nSELECT 2"},
+    )
+    server = FakeServer()
+    SchemaApplier.rerun(server, d / "migrations" / "002_y.sql")
+    assert server.log == ["SELECT 2"]
+    with pytest.raises(ValueError, match="RERUNNABLE"):
+        SchemaApplier.rerun(server, d / "migrations" / "001_x.sql")

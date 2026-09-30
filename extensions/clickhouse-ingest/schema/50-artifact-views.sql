@@ -66,17 +66,18 @@ FROM
 (
     -- ifNull: an unjoined row is NULL under a reader's join_use_nulls=1, and a NULL slot key
     -- would pool every unjoined row into one slot.
+    -- arch is canonicalized here too, matching v_tag_resolution, so amd64/x86_64 share one slot.
     SELECT at.tag AS tag, at.tag_family AS tag_family, at.artifact_id AS artifact_id,
            at.ts AS ts,
            ifNull(a.component, '') AS component,
-           ifNull(a.arch, '')      AS arch,
+           if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')) AS arch,
            uniqExact(at.artifact_id) OVER (
                PARTITION BY at.tag,
                             -- (component, arch, artifact_name) when joined, else the artifact itself.
                             if(ifNull(a.component, '') = '',
                                toString(at.artifact_id),
                                ifNull(a.component, '')),
-                            ifNull(a.arch, ''),
+                            if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')),
                             ifNull(a.artifact_name, ''))
                AS slot_artifacts
     FROM artifact_tags AS at

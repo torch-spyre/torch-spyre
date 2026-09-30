@@ -61,6 +61,16 @@ outputs:
 runs:
   using: composite
   steps:
+    # The ARC runner images ship no gh, and a caller may run this before any step installs it.
+    - name: Check for gh
+      id: gh
+      shell: bash
+      run: echo "present=$(command -v gh >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup the GitHub CLI
+      if: steps.gh.outputs.present != 'true'
+      uses: ./.github/actions/setup-gh-cli
+
     - name: Recover ${{ inputs.artifact-name }}
       id: recover
       shell: bash
@@ -82,9 +92,12 @@ runs:
           exit 1
         }
         retry() {
-          local i
+          local i rc
           for i in 1 2 3; do
             "$@" && return 0
+            rc=$?
+            # A missing command (127) fails identically on every attempt.
+            [ "$rc" -eq 127 ] && return 1
             [ "$i" -lt 3 ] && sleep $((i * 5))
           done
           return 1

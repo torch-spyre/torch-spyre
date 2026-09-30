@@ -86,11 +86,6 @@ static TransferDirection parse_transfer_direction(const std::string& dirn_str) {
   return TransferDirection::Unknown;
 }
 
-// Program segment boundaries for validation
-static const uint64_t prog_offset_base = flex::PROG_OFFSET_BASE;
-static const uint64_t prog_offset_limit =
-    flex::PROG_OFFSET_BASE + flex::SEGMENT_SIZE;
-
 /**
  * @brief Helper to compute CompositeAddress with offset from device_addr for
  * program
@@ -102,22 +97,22 @@ static flex::CompositeAddress compute_offset_address(
   TORCH_CHECK(job_allocation.chunks().size() == 1,
               "job_allocation must have 1 chunk");
 
+  const auto [segment_id, segment_offset, segment_type] =
+      flex::decodeDevicePointer(dev_ptr);
   // Validate device pointer is within program segment bounds
-  TORCH_CHECK(dev_ptr >= prog_offset_base && dev_ptr < prog_offset_limit,
-              "Device pointer 0x", std::hex, dev_ptr,
-              " is out of program segment bounds [0x", prog_offset_base, ", 0x",
-              prog_offset_limit, ")");
+  TORCH_CHECK(segment_type == flex::MemoryType::Program, "Device pointer 0x",
+              std::hex, dev_ptr, " has memory type ",
+              static_cast<int>(segment_type),
+              " but must be in segment 7 (Program) for ComputeOnDevice");
 
-  // Calculate offset
-  uint64_t offset = dev_ptr - prog_offset_base;
   if (size == 0) {
-    size = job_allocation.total_size() - offset;
+    size = job_allocation.total_size() - segment_offset;
   }
 
   // Get the first chunk and add offset to its address
   const auto& base_chunk = job_allocation.chunks()[0];
   flex::LogicalAddress offset_addr(base_chunk.addr.region_id,
-                                   base_chunk.addr.offset + offset);
+                                   base_chunk.addr.offset + segment_offset);
   flex::Chunk offset_chunk(offset_addr, size, base_chunk.domain_id);
   return flex::CompositeAddress(offset_chunk);
 }
@@ -367,23 +362,25 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
            std::to_string(step_idx);
   }
 
+  const auto [segment_id, segment_offset, segment_type] =
+      flex::decodeDevicePointer(job_bin_ptr);
+
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in
   // segment 7 and derive the offset of that entry point within the program
   // allocation (0 when the binary starts at the allocation base).
-  TORCH_CHECK(
-      job_bin_ptr >= prog_offset_base && job_bin_ptr < prog_offset_limit,
-      "job_bin_ptr 0x", std::hex, job_bin_ptr,
-      " is out of program segment bounds [0x", prog_offset_base, ", 0x",
-      prog_offset_limit, ")");
-  uint64_t bootstrap_offset = job_bin_ptr - prog_offset_base;
+  TORCH_CHECK(segment_type == flex::MemoryType::Program, "job_bin_ptr 0x",
+              std::hex, job_bin_ptr, " has memory type ",
+              static_cast<int>(segment_type), ", expected type ",
+              static_cast<int>(flex::MemoryType::Program),
+              " (Program segment)");
 
   // Hand flex the program's FULL allocation as a non-owning descriptor over the
   // same chunk (the owning CompositeAddress stays in job_allocation_, which is
   // later moved into the JobPlan and outlives this step). flex bounds the
   // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
-  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically if/when
-  // deeptools grows the Allocate, requiring no further change here.
+  // -- instead of the 16GB MAX_REGION_SIZE. The size grows automatically
+  // if/when deeptools grows the Allocate, requiring no further change here.
   TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
               "job_allocation must have 1 chunk");
   TORCH_CHECK(
@@ -391,9 +388,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
       "ComputeOnDevice program allocation must be populated (size > 0)");
   flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
 
-  return std::make_unique<JobPlanStepCompute>(
-      std::move(program_address), bind_io_addresses_, bootstrap_offset,
-      std::move(name));
+  return std::make_unique<JobPlanStepCompute>(std::move(program_address),
+                                              bind_io_addresses_,
+                                              segment_offset, std::move(name));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
@@ -592,7 +589,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       // If device_ptr is in segment 7, calculate CompositeAddress and store it
       // in JobPlanStepH2D. If device_ptr is in tensor segments, store
       // device_ptr
-      if (flex::dmvaToSegmentId(device_ptr) == flex::PROG_SEGMENT) {
+      const auto segment_type =
+          std::get<2>(flex::decodeDevicePointer(device_ptr));
+      if (segment_type == flex::MemoryType::Program) {
         // Compute CompositeAddress with offset from device_addr
         flex::CompositeAddress comp_addr = compute_offset_address(
             job_allocation_.at(0), device_ptr, transfer_size);
