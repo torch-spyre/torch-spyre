@@ -795,12 +795,12 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(rescaled(4, 128).stride_map), [64, 128, 1])
 
     def test_rescale_for_dtype_leaves_a_sub_stick_dim_alone(self):
-        """A num-sticks stride below the input stick depth marks a stick dim
-        shorter than one stick: the entry is the host extent, not a stick step,
-        and the dim already counts the single stick that extent occupies.
+        """A num-sticks stride below the input's elements per stick marks a stick
+        dim shorter than one stick: the entry is the host extent, not a stick
+        step, and the dim already counts the single stick that extent occupies.
         Rescaling it would claim stepping the host tensor does not have, which
-        the layout validator rejects, so only the stick depth changes. The extra
-        capacity a widening conversion needs is added by
+        the layout validator rejects, so only the elements per stick change. The
+        extra capacity a widening conversion needs is added by
         ``insert_staggered_ea_padding``, which pads the one buffer that needs it
         rather than sending a grown dim into every downstream consumer.
 
@@ -844,7 +844,6 @@ class TestSpyreTensorLayout(TestCase):
         head. Needs no device.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
@@ -852,7 +851,7 @@ class TestSpyreTensorLayout(TestCase):
             [12, 1, 64], [64, -1, 1], fp16, ElementArrangement.STANDARD
         )
         host_size = [1, 2, 128]
-        with self.assertRaises(Unsupported):
+        with self.assertRaises(AssertionError):
             rescale_stl_for_dtype(
                 qkv_stl,
                 torch.float32,
@@ -1159,8 +1158,8 @@ class TestSpyreTensorLayout(TestCase):
 
         The conversion writes each fp8 stick as two fp16 sticks, so 192 elements
         (2 fp8 sticks) take 4 fp16 sticks although the live elements reach 3. The
-        output is STANDARD, so the pass reaches it by the stick depths it spans
-        rather than by an arrangement.
+        output is STANDARD, so the pass reaches it by the elements per stick on
+        either side rather than by an arrangement.
         """
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.padding import insert_staggered_ea_padding

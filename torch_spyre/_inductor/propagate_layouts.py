@@ -447,9 +447,9 @@ def rescale_stl_for_dtype(
     stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
     growing it here would follow the value into every consumer of this STL.
 
-    Raises ``Unsupported`` for a num-sticks dim that folds other host dims, whose
-    host dim size does not bound it; ``_can_rescale_input_stl`` sends such a
-    read down the sliced path.
+    Every device dim must read at most one host dim, as ``_can_rescale_input_stl``
+    ensures; a num-sticks dim folding other host dims is not bounded by its host
+    dim size.
 
     Args:
         stl: Input device layout to rescale.
@@ -473,6 +473,7 @@ def rescale_stl_for_dtype(
 
     stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
     outer_coords = device_coords[:-1]
+    assert all(len(c.free_symbols) <= 1 for c in outer_coords), (stl, dep)
     num_sticks_dim = next(
         (d for d, c in enumerate(outer_coords) if c.free_symbols & stick_vars), None
     )
@@ -489,11 +490,6 @@ def rescale_stl_for_dtype(
         raise Unsupported(
             f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
             f"for {dep}"
-        )
-    if outer_coords[num_sticks_dim].free_symbols - stick_vars:
-        raise Unsupported(
-            f"num-sticks dim {num_sticks_dim} of {list(stl.device_size)} "
-            f"{list(stl.stride_map)} folds other host dims for {dep}"
         )
 
     in_sticks = stl.device_size[num_sticks_dim]
@@ -546,10 +542,10 @@ def _typecast_layouts(
     A read that can take the source's layout (``_can_rescale_input_stl``)
     rescales it (``rescale_stl_for_dtype``), keeping all its device dims. A slice
     of a wider buffer cannot, since the source's ``stride_map`` steps through the
-    wider buffer: it builds the layout
-    from the output's host size with the source's stick dim instead, which may
-    reorder the non-stick device dims. The conversion works on whole sticks, so a
-    slice skips a source whose stick it starts mid-stick.
+    wider buffer: it builds the layout from the output's host size with the
+    source's stick dim instead, which may reorder the non-stick device dims. The
+    conversion works on whole sticks, so a slice skips a source whose stick it
+    starts mid-stick.
 
     Either layout holds only the sticks the live elements reach;
     ``insert_staggered_ea_padding`` adds the rest.
@@ -590,8 +586,8 @@ def _typecast_layouts(
     for source_stl in sources:
         candidate: SpyreTensorLayout | None
         if _can_rescale_input_stl(in_layout, output, dep, output_dep, source_stl):
-            # Keeps every device dim of the source; only the stick depth and
-            # the num-sticks count change.
+            # Keeps every device dim of the source; only the elements per stick
+            # and the num-sticks count change.
             # TODO: support slices in rescale_stl_for_dtype, so a sliced read
             # keeps the source's device dims too. Alternatively drop this
             # branch: the host-size layout below is correct for whole reads
