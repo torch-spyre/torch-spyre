@@ -867,9 +867,9 @@ def _avgpool_sdsc_fields(
         # totalSize_ is the real input extent, which the window span only equals
         # when the windows tile it exactly.  With stride > kernel the span
         # UNDERRUNS the input (k=4 s=6 on 8: span 4 of 8), and the unread
-        # remainder must be declared as unneededPad_ -- a known-good SendNN SDSC
-        # for that shape emits totalSize_=8, unneededPad_=4.  Fall back to the
-        # span when the lowering supplied no extent (older callers, conv paths).
+        # remainder must be declared as unneededPad_ (there: totalSize_=8,
+        # unneededPad_=4).  Fall back to the span when the lowering supplied no
+        # extent (older callers, conv paths).
         in_declared = pool_params.get(f"in_{'h' if spatial == 'i' else 'w'}")
         in_size = span
         if isinstance(in_declared, int) and in_declared > span:
@@ -890,12 +890,11 @@ def _avgpool_sdsc_fields(
 
     # Per-core variant.  ``dataStageParam_[*].ss_/el_.paddingSizes_`` describes ONE
     # core's slice, so totalSize_ there must be that core's input extent, not the
-    # whole axis.  The in-tree golden fixture
-    # deeptools/ddc/ddl_templates/test/sdsc_maxpool.json is unambiguous: N_ carries
-    # totalSize_ 22 while the per-core ss_ carries 15 -- the span of the 7 outputs
-    # one core owns ((7-1)*1+9), not the full 22.  Emitting the full extent per
-    # core makes the descriptor internally inconsistent with the per-core output
-    # count and the elem_arr factor derived from it.
+    # whole axis: e.g. a 22-wide axis split so each core owns 7 outputs of a k=9
+    # s=1 window carries totalSize_ 22 globally but 15 ((7-1)*1+9) per core.
+    # Emitting the full extent per core makes the descriptor internally
+    # inconsistent with the per-core output count and the elem_arr factor derived
+    # from it.
     padding_sizes_per_core: dict = {}
     if dim_splits and any(
         int(dim_splits.get(Symbol(sp), 1)) > 1 for sp in padding_sizes
@@ -909,8 +908,7 @@ def _avgpool_sdsc_fields(
             s_ = int(entry["stride_"])
             k_ = int(iteration_space.get(Symbol(entry["windowDim_"]), 1))
             span_pc = (out_pc - 1) * s_ + k_
-            # Match the convention in the SendNN reference for a split strided
-            # pool (maxpool_sltk, 1x64x16x16 k4 s5, i split 3 ways):
+            # A split strided pool (e.g. 1x64x16x16 k4 s5, i split 3 ways) gives
             #   pc i: padFront_=-1 padBack_=-1 totalSize_=6 unneededPad_=2
             # The slack is CARRIED per core, not zeroed, and totalSize_ is the
             # span PLUS that slack (4 + 2 = 6) -- not the bare span.  The -1
@@ -1376,13 +1374,11 @@ def _create_sdsc_tensors(
         # Reinstated unit output-spatial dims (see the pool 1x1 block in
         # parse_op_spec) are absent from the tensor's device_coordinates because
         # the buffer genuinely has no extent > 1 there.  They must still appear in
-        # layoutDimOrder_: the backend maps a window dim by resolving its
-        # nonPaddedDim to a spatial dim and looking that up in ss_.paddingSizes_
-        # (ddl_conversion.cpp:2535), and a spatial dim missing from the DDL layout
-        # can never be mapped.  They are ordinary size-1 data dims, NOT reductions
-        # -- a known-good SendNN SDSC for this shape gives every dim scale_ 1 and
-        # tags i/j padded_fullspan_wunneeded -- so insert them here, ahead of
-        # Step 2, rather than letting them fall into reduced_dims (scale -1).
+        # layoutDimOrder_: each window dim is mapped through its spatial dim's
+        # paddingSizes_ entry, so a spatial dim missing from the layout leaves its
+        # window dim unmappable.  They are ordinary size-1 data dims (scale_ 1),
+        # NOT reductions, so insert them here, ahead of Step 2, rather than letting
+        # them fall into reduced_dims (scale -1).
         if unit_spatial_dims and not (
             has_indirect_access and i in index_tensor_indices
         ):
@@ -1587,8 +1583,8 @@ def _create_sdsc_tensors(
                 # paddingSizes_ entry declares totalSize_ (the real extent) and
                 # unneededPad_ (the unread slack), so the device-vs-iteration gap
                 # is already described.  A 1x1 pool output made this visible --
-                # dev extent 8 against iteration extent 1 emitted backGap 7 on
-                # both axes where a known-good SendNN SDSC emits none.  Only the
+                # dev extent 8 against iteration extent 1 emitted a spurious
+                # backGap 7 on both axes, where none belongs.  Only the
                 # dims that actually carry a window entry are suppressed; a pool's
                 # other dims (mb/out) keep the normal backGap.
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
@@ -2155,11 +2151,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # ``i`` and/or ``j`` while ``ki``/``kj`` survive (they are the kernel
     # extents).  ``_align_pool_dim_labels`` faithfully reports that, but the SDSC
     # still needs the spatial dims: ``paddingSizes_`` keys its window entries by
-    # them, and the backend maps each window dim by looking its spatial dim up in
-    # ``ss_.paddingSizes_`` (ddl_conversion.cpp), aborting with "[Error in
+    # them, and each window dim is mapped through its spatial dim's
+    # ``paddingSizes_`` entry, so compilation aborts with "[Error in
     # dimension-mapping] Unknown primary dimension kind found for a window
-    # dimension" when it is absent.  A known-good SendNN SDSC for this shape
-    # keeps them as ``i_: 1, j_: 1`` with full paddingSizes_, so match that.
+    # dimension" when it is absent.  Keep them as ``i_: 1, j_: 1`` with full
+    # paddingSizes_.
     #
     # Restored in canonical POOL_DIM_LABELS order so the SDSC dim order stays
     # ``mb, i, j, out, ki, kj``; unsplit and owned at slice 0, like every other
@@ -2491,14 +2487,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
     pool_params_out: dict = {}
     if is_pool and op_spec.op_info:
-        pool_params_out = dict(op_spec.op_info.get("constants", {}))
+        # Pool geometry lives under pool_params (like conv_params); "constants"
+        # carries only the SDSC-level op constants.
+        pool_params_out = dict(op_spec.op_info.get("pool_params", {}))
+        pool_constants = op_spec.op_info.get("constants", {})
         # ``nmap`` is avgpool's window-mean multiplier.  maxpoolfwd is a pure
         # window max with no normalization and requires ``opConsts_ == {}``, so
         # emit nmap only when the lowering actually supplied a scaling factor.
         # Keyed on the declared constant rather than on the opfunc string, so a
         # future pool op opts in by what it declares.
-        if "scaling_factor" in pool_params_out:
-            constants = {"nmap": pool_params_out["scaling_factor"]}
+        if "scaling_factor" in pool_constants:
+            constants = {"nmap": pool_constants["scaling_factor"]}
         else:
             constants = {}
     else:

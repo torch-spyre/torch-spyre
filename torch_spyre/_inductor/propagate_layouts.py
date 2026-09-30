@@ -67,7 +67,6 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
-    POOL_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -212,19 +211,8 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     return device_dtype
 
 
-def _compute_dim_order(stick_dim, size, coords, canonical: bool = False):
-    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling.
-
-    ``canonical=True`` skips the size-one demotion and returns host order with the
-    stick moved innermost.  Windowed reductions need this: the demotion relocates
-    a dim whose coordinate was simplified away, and because ``SpyreTensorLayout``
-    fills device slots innermost-outward that relocated dim consumes a real slot
-    and shifts H/W -- silently transposing the output's spatial axes relative to
-    the input's, so the pooling window is applied to the wrong axis.
-
-    """
-    if canonical:
-        return [d for d in range(len(size)) if d != stick_dim] + [stick_dim]
+def _compute_dim_order(stick_dim, size, coords):
+    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
     dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
     dim_order += [stick_dim]
@@ -262,13 +250,7 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr,
-    output,
-    output_dep,
-    c_size,
-    c_stride,
-    dtype=None,
-    canonical_dim_order: bool = False,
+    stick_expr, output, output_dep, c_size, c_stride, dtype=None
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -486,16 +468,6 @@ def _qfp8wt_stl(
     )
 
 
-def _is_windowed_reduction(op: Operation) -> bool:
-    """True for a pool, whose output spatial slot order must stay canonical.
-
-    Conv2d and depthwise conv have their own layout handlers; pools reach the
-    generic single-arg path, so the canonical-order requirement is applied there.
-    """
-    data = getattr(op, "data", None)
-    return isinstance(data, Reduction) and data.reduction_type in POOL_OPS
-
-
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -541,15 +513,7 @@ def _single_arg_op_layout(
         ):
             # Try to preserve input layout
             out_stl = _output_stl_from_stick_expr(
-                x_stick_expr,
-                output,
-                output_dep,
-                c_size,
-                c_stride,
-                out_dtype_for_layout,
-                # A windowed reduction must not have its spatial slots reordered
-                # by the size-one demotion (see _compute_dim_order).
-                canonical_dim_order=_is_windowed_reduction(op),
+                x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
             )
             if out_stl is not None:
                 return [out_stl]
@@ -586,11 +550,6 @@ def _single_arg_op_layout(
                     c_stride,
                     out_stick_dim,
                     out_dtype_for_layout,
-                    # A windowed reduction must not have its spatial slots
-                    # reordered by the size-one demotion (see
-                    # _compute_dim_order): the window would then be applied to
-                    # the transposed axis.
-                    canonical_dim_order=_is_windowed_reduction(op),
                 )
                 if out_stl is not None:
                     layouts.append(out_stl)

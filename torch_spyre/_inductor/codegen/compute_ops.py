@@ -1303,17 +1303,17 @@ def generate_sdsc(
             # extent only when the windows tile it exactly.  When stride > kernel
             # the span UNDERRUNS the declared extent (k=4 s=6 on 8: span 4 of 8),
             # and on an unsplit axis the coordinate fold must still expose the
-            # whole extent -- a known-good SendNN SDSC for that shape emits
-            # elem_arr_0 factor 8, not 4, alongside totalSize_ 8.  Exposing only
-            # the span there reads a short extent and returns elements from the
-            # wrong window.  Only widen when unsplit: with nsplits > 1 the span is
-            # deliberately the per-core read (see _coord_core_stride).
+            # whole extent -- elem_arr_0 factor 8, not 4, alongside totalSize_ 8.
+            # Exposing only the span there reads a short extent and returns
+            # elements from the wrong window.  Only widen when unsplit: with
+            # nsplits > 1 the span is deliberately the per-core read (see
+            # _coord_core_stride).
             # elem_arr_0 must expose the extent this stage addresses, which is
-            # the window span PLUS any declared slack -- the SendNN reference for
-            # a split strided pool (maxpool_sltk, 1x64x16x16 k4 s5, i split 3)
-            # emits elem_arr_0 factor 6 = span 4 + unneededPad_ 2, not the bare
-            # span.  Exposing only the span reads a short extent per core and
-            # returns elements from the wrong window.
+            # the window span PLUS any declared slack -- for a split strided pool
+            # (e.g. 1x64x16x16 k4 s5, i split 3 ways) that is elem_arr_0 factor
+            # 6 = span 4 + unneededPad_ 2, not the bare span.  Exposing only the
+            # span reads a short extent per core and returns elements from the
+            # wrong window.
             declared = int(ps.get("totalSize_", span))
             if nsplits == 1:
                 return max(span, declared)

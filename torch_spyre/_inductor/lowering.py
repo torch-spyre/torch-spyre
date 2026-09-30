@@ -840,7 +840,7 @@ def _lower_pool2d(
     stride,
     padding,
     *,
-    extra_constants=None,
+    constants=None,
 ):
     """Build a windowed 2D pooling ``SpyreReduction`` for ``op``.
 
@@ -905,7 +905,7 @@ def _lower_pool2d(
             "correct when both spatial output extents exceed 1."
         )
 
-    constants = {
+    pool_params = {
         "kernel_h": kH,
         "kernel_w": kW,
         "stride_h": sH,
@@ -920,7 +920,10 @@ def _lower_pool2d(
         "in_h": H_in,
         "in_w": W_in,
     }
-    constants.update(extra_constants or {})
+    op_info = {
+        "constants": dict(constants or {}),
+        "pool_params": pool_params,
+    }
 
     def inner_fn(index, reduction_index):
         n, c, ho, wo = index
@@ -938,7 +941,7 @@ def _lower_pool2d(
         inner_fn=inner_fn,
         ranges=[N, C, H_out, W_out],
         reduction_ranges=[kH, kW],
-        op_info={"constants": constants},
+        op_info=op_info,
     )
     result.realize()
     return result
@@ -976,7 +979,7 @@ def lower_avg_pool2d(
         (pH, pW),
         # scaling_factor is the window mean multiplier; codegen emits it as the
         # `nmap` opConst.
-        extra_constants={"scaling_factor": 1.0 / (kH * kW)},
+        constants={"scaling_factor": 1.0 / (kH * kW)},
     )
     if result is None:
         # Degenerate k==1 window (see _lower_pool2d).  Spyre has no eager

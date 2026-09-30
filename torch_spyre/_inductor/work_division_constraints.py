@@ -450,28 +450,20 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     op_info = getattr(ctx.op.data, "op_info", None)
     if not isinstance(op_info, dict):
         return ConstraintResult()
+    # Convs record their geometry under conv_params, pools under pool_params; the
+    # same reasoning applies to both: a strided spatial split produces incorrect
+    # per-core addressing.
     conv_params = op_info.get("conv_params")
     is_conv_op = isinstance(conv_params, dict)
-    if not is_conv_op:
-        # Pools record their geometry under "constants", not "conv_params", so
-        # they never reached this block -- yet the same reasoning applies: a
-        # strided pool's spatial split produces the same incorrect per-core
-        # addressing.
-        pool_params = op_info.get("constants")
-        if not isinstance(pool_params, dict) or "stride_w" not in pool_params:
-            return ConstraintResult()
-        conv_params = {
-            "stride_h": pool_params.get("stride_h", 1),
-            "stride_w": pool_params.get("stride_w", 1),
-        }
-    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
-    # conv2d (#3284) records it as stride_h/stride_w. Accept either spelling so
-    # the strided-spatial-split block covers both direct-conv paths.
-    if not isinstance(conv_params, dict):
+    window_params = conv_params if is_conv_op else op_info.get("pool_params")
+    if not isinstance(window_params, dict):
         return ConstraintResult()
 
-    stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
-    stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
+    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
+    # conv2d (#3284) and the pools record it as stride_h/stride_w. Accept either
+    # spelling so the strided-spatial-split block covers every windowed path.
+    stride_i = window_params.get("stride_i", window_params.get("stride_h", 1))
+    stride_j = window_params.get("stride_j", window_params.get("stride_w", 1))
     if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
         return ConstraintResult()
 
