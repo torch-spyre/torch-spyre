@@ -18,13 +18,13 @@
     python -m spyre_clickhouse_ingest.artifacts release <manifest.json>
 
 A release manifest is JSON:
-    {"name": "<release name>", "date": "YYYY-MM-DD",
+    {"name": "<release name>", "date": "YYYY-MM-DD", "family": "<tag family of name>",
      "sources": [{"repo": "...", "ref": "v0.5.0-rc.1", "sha": "<40 hex>"}],
      "images": [{"ref": "<registry>/<repo>:<tag>@sha256:<per-arch digest>", "arch": "s390x"}],
      "generic": [{"url": "https://...", "sha256": "<hex>", "arch": "x86_64",
                   "component": "spyre-runtimes"}]}
-Every artifact is tagged with the release's name and `release-<date>` (family `release`),
-plus the rolling `release` pointer.
+Every artifact is tagged with the release's name (in `family`, default `release`), plus
+`release-<date>` and the rolling `release` pointer (both family `release`).
 """
 
 import argparse
@@ -61,7 +61,7 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
     ]
     tag_props = {"run_url": run_url, "source": "release"}
     tags = [
-        (name, RELEASE_FAMILY, tag_props),
+        (name, manifest.get("family") or RELEASE_FAMILY, tag_props),
         (f"release-{date}", RELEASE_FAMILY, tag_props),
         ("release", RELEASE_FAMILY, tag_props),
     ]
