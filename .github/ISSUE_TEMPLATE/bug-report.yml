@@ -1,7 +1,7 @@
 name: Bug Report
 description: Report a bug encountered while using Torch Spyre
 labels:
-  - type/bug
+  - bug
 body:
   - type: markdown
     attributes:

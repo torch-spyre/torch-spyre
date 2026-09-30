@@ -168,6 +168,33 @@ def test_insert_writes_artifact_ref_and_tag_once():
     assert not _rows(again, ARTIFACTS) and not _rows(again, ARTIFACT_TAGS)
 
 
+def test_a_release_names_itself_in_its_own_family():
+    from spyre_clickhouse_ingest.artifacts import register_release
+
+    manifest = {
+        "name": "ci-cd-tech-preview-v1",
+        "date": "2026-09-22",
+        "images": [{"ref": IMAGE, "arch": "s390x"}],
+    }
+    tagged = {}
+    for family in (None, "ci-cd-tech-preview"):
+        c = FakeClient()
+        register_release(c, "db", {**manifest, "family": family})
+        tagged[family] = sorted(
+            (t["tag"], t["tag_family"]) for t in _rows(c, ARTIFACT_TAGS)
+        )
+    assert tagged[None] == [
+        ("ci-cd-tech-preview-v1", "release"),
+        ("release", "release"),
+        ("release-2026-09-22", "release"),
+    ]
+    assert tagged["ci-cd-tech-preview"] == [
+        ("ci-cd-tech-preview-v1", "ci-cd-tech-preview"),
+        ("release", "release"),
+        ("release-2026-09-22", "release"),
+    ]
+
+
 def test_result_kind_follows_the_test_type():
     from spyre_clickhouse_ingest import insert_artifact_result
     from spyre_clickhouse_ingest.schema import ARTIFACT_RESULTS
