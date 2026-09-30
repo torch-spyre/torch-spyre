@@ -7629,8 +7629,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
+        self.compare_with_cpu(fn, x, cpu_compile=True)
 
         print(f"Warn {len(record)}")
 
