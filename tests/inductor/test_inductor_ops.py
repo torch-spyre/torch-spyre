@@ -7631,8 +7631,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, cpu_compile=True)
 
-        print(f"Warn {len(record)}")
-
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
         def fn(device=None):
