@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parse raw GHA job logs produced by the model-ops-tests workflow and produce:
+Parse the raw GHA job logs of the model-ops suites (a trunk `tests` run) and produce:
 
   1. model_ops_log.txt  – cleaned, concatenated plain-text log (one file per run)
   2. <out>.json         – structured per-variant records ready for ClickHouse

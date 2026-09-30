@@ -7,7 +7,6 @@ on:
     workflows:
       - model-module-tests
       - upstream-pytorch-tests
-      - model-ops-tests
       - tests # covers torch spyre tests
       - integration-tests # amd64 arch_override dispatch target from spyre-frameworks
       # to add more workflows
@@ -19,7 +18,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
+        description: Workflow name (model-module-tests | upstream-tests | tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
       component:
@@ -275,7 +274,7 @@ jobs:
       # along are simply ignored.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # page, and a run with more jobs than that (e.g. the tests /
       # integration-tests matrices) silently lost every artifact past the
       # first page, with no error — rows just never showed up in ClickHouse.
       # `--paginate` applies `--jq` per page and concatenates the filtered

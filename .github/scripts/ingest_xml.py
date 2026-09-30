@@ -1249,6 +1249,31 @@ def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
         acc["total"] += measured
 
 
+def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
+    """A leg per `capability.test_type` the cases declare, beside the run's functional one.
+
+    The verdicts themselves land in capability_runs; this is what ties them to the artifact.
+    """
+    for case in cases:
+        decl = {
+            k: str(v)
+            for k, v in case.get("properties", []) or []
+            if k.startswith("capability.")
+        }
+        test_type = decl.get("capability.test_type", "")
+        if (
+            not (test_type and decl.get("capability.name"))
+            or case.get("status") == "skipped"
+        ):
+            continue
+        acc = legs.setdefault(
+            (run_id, test_type), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += 1
+        acc["failed"] += case.get("status") in ("failed", "error")
+        acc["duration_s"] += float(case.get("duration_s", 0) or 0)
+
+
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
     """Write the artifact and one artifact_results row per (run_id, tier) of this leg."""
     if not legs or not v2db or not (args.artifact_id or _opt(args, "artifact")):
@@ -1834,6 +1859,7 @@ def main():
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
                 print(

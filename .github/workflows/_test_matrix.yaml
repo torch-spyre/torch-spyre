@@ -245,6 +245,7 @@ jobs:
             tests/oot_framework/utils/filter_configs.py
             .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
+            .github/suite_test_flags.yaml
           sparse-checkout-cone-mode: false
 
       - name: Filter configs by TEST_TYPE
@@ -332,6 +333,7 @@ jobs:
               --test-type "${RAW_TEST_TYPE}" \
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
+              --flags-map .github/suite_test_flags.yaml \
               --format matrix-json)
           else
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
@@ -339,6 +341,7 @@ jobs:
               --test-type "${RAW_TEST_TYPE}" \
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
+              --flags-map .github/suite_test_flags.yaml \
               --format matrix-json)
           fi
 
@@ -672,7 +675,7 @@ jobs:
           # checkout (default 'torch-spyre') + its local '.venv'.
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ inputs.extra_test_flags }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
@@ -1315,7 +1318,7 @@ jobs:
             matrix.suite.config) }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ inputs.extra_test_flags }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |

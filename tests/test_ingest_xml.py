@@ -885,3 +885,16 @@ def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_pa
     assert by_name["test_a"]["duration_s"] == 3.0
     assert run["total_tests"] == 3
     assert run["failed"] == 0
+
+
+def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
+    def case(status, name="aten.mm"):
+        props = [("capability.test_type", "model_ops"), ("capability.name", name)]
+        return {"status": status, "duration_s": 1.5, "properties": props}
+
+    legs: dict = {}
+    plain = {"status": "passed", "properties": [("tag", "op__mm")]}
+    cases = [case("xfail"), case("failed"), case("skipped"), case("passed", ""), plain]
+    ingest._capability_legs(legs, "r1", cases)
+    assert legs == {("r1", "model_ops"): {"failed": 1, "total": 2, "duration_s": 3.0}}
+    assert [t for _, t, _ in ingest._admitted_legs(legs)] == ["model_ops"]

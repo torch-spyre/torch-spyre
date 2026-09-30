@@ -11,13 +11,13 @@ description: >
 inputs:
   gha-run-id:
     description: >
-      Numeric GitHub Actions run ID of the model-ops-tests run whose job logs are analysed.
-      Only its "<suite> Spyre" jobs are downloaded.
+      Numeric GitHub Actions run ID of the trunk `tests` run whose model-ops job logs are
+      analysed. Only its "Model Ops Tests / <config>" jobs are downloaded.
     required: true
   workflow-name:
     description: >
-      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
-      input) -- e.g. 'model-ops-tests'.
+      Workflow name recorded on the v1 rows; the default keeps them continuous with the
+      model-ops-tests workflow the suites used to run in.
     required: false
     default: model-ops-tests
   branch:
@@ -135,9 +135,9 @@ runs:
       if: steps.gate.outputs.configured == 'true'
       uses: ./.github/actions/setup-gh-cli
 
-    # Only the model-ops suite jobs, selected by the " Spyre" suffix that
-    # model_ops_tests.yaml gives them: the parser derives suite_name from the job name
-    # verbatim, so that is also what keeps continuity with the suite names already stored.
+    # Only the model-ops suite jobs, renamed to the suite names already stored in v1: the
+    # parser derives suite_name from the log's filename, i.e. the job name. A pod-level retry
+    # replaces its first attempt; a config with no stored suite is left out.
     - name: Download job logs
       if: steps.gate.outputs.configured == 'true'
       shell: bash
@@ -174,25 +174,39 @@ runs:
             --paginate \
             -f per_page=100 \
             --jq '.jobs[]
-                  | select(.name | endswith(" Spyre"))
+                  | select(.name | test(" / Model Ops Tests / "))
                   | {id: .id, name: .name}' \
           > /tmp/jobs.jsonl
         }
         retry list_jobs
-
-        if [ ! -s /tmp/jobs.jsonl ]; then
-          echo "[info] no model-ops suite jobs in run ${RUN_ID}."
-        fi
 
         python3 - << 'PYEOF'
         import os
 
         from spyre_clickhouse_ingest.gha_logs import download_job_logs_or_die, load_jobs
 
+        SUITES = {
+            "gpt-oss-20b": "GPT OSS 20B",
+            "granite-3.3-8b-instruct-fms": "Granite 3.3 8B Instruct FMS",
+            "granite-3.3-8b-instruct": "Granite 3.3 8B Instruct",
+            "granite-4.1-8b": "Granite 4.1 8B",
+            "meta-llama-3.1-8b-instruct": "Meta Llama 3.1 8B Instruct",
+            "ministral-3-14b-instruct-2512": "Ministral 3 14B Instruct 2512",
+            "mistral-small-3.2-24b-instruct-2506": "Mistral Small 3.2 24B Instruct 2506",
+            "gemma-4-26b-a4b-it": "Gemma 4 26B A4B IT",
+            "gemma-4-12b-it": "Gemma 4 12B Instruct",
+            "qwen2.5-7b-instruct": "Qwen 2.5 7B",
+        }
+        picked = {}
+        for job in sorted(load_jobs("/tmp/jobs.jsonl"), key=lambda j: j["id"]):
+            config = job["name"].split(" / ")[-1].removesuffix(" (pod-level retry)")
+            suite = SUITES.get(config.lower())
+            if suite:
+                picked[suite] = {"id": job["id"], "name": f"{suite} Spyre"}
+        if not picked:
+            print(f"[info] no model-ops suite jobs in run {os.environ['RUN_ID']}.")
         download_job_logs_or_die(
-            load_jobs("/tmp/jobs.jsonl"),
-            repo=os.environ["REPO"],
-            out_dir="raw_logs",
+            list(picked.values()), repo=os.environ["REPO"], out_dir="raw_logs"
         )
         PYEOF
 

@@ -1,13 +1,13 @@
 name: push-model-ops-logs-to-clickhouse
 
-# Feeds the v1 model_ops tables from the model-ops-tests job logs, until the dashboard reads
-# v2. The v2 capability verdicts are not written here: the suites record them as JUnit
-# capability.* properties, which push-to-clickhouse ingests with the rest of the run.
+# Feeds the v1 model_ops tables from the model-ops job logs of a trunk `tests` run, until the
+# dashboard reads v2. The v2 capability verdicts are not written here: the suites record them
+# as JUnit capability.* properties, which push-to-clickhouse ingests with the rest of the run.
 # Also runs manually, to re-ingest a historical run by its ID.
 on:
   workflow_run:
     workflows:
-      - model-ops-tests
+      - tests
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -34,7 +34,9 @@ jobs:
     timeout-minutes: 15
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion != 'cancelled'
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.conclusion != 'cancelled')
 
     env:
       # The arch of the ANALYSED leg, not of this ingest job. See the note in
@@ -42,7 +44,6 @@ jobs:
       LEG_ARCH: x86_64
 
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
-      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name      || 'model-ops-tests' }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
 
@@ -61,7 +62,6 @@ jobs:
         uses: ./.github/actions/ingest-model-ops-to-clickhouse
         with:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
-          workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           arch: ${{ env.LEG_ARCH }}
@@ -112,7 +112,6 @@ jobs:
             echo "### Model-Ops ClickHouse Ingest Summary"
             echo "| Key | Value |"
             echo "|---|---|"
-            echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
             echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
             echo "| Branch              | ${TRIGGERING_BRANCH} |"
             echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"

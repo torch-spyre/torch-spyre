@@ -89,13 +89,13 @@ Currently called by torch-spyre and spyre-inference only — see
 
 Downloads model-ops job logs, parses them for operation-support variants
 (`parse_model_ops_logs.py`), and inserts them (`ingest_model_ops.py`) into the
-v1 `model_ops_*` tables. It reads only the `<suite> Spyre` jobs. The v2
+v1 `model_ops_*` tables. It reads only the `Model Ops Tests / <config>` jobs of a trunk `tests` run. The v2
 `capabilities`/`capability_runs` verdicts come from the suites' JUnit
 `capability.*` properties instead, through `ingest-xml-to-clickhouse`.
 
 | Key input | Purpose |
 |---|---|
-| `gha-run-id` (required) | `model-ops-tests` run to analyse. |
+| `gha-run-id` (required) | trunk `tests` run to analyse. |
 | `schema` | `v1` / `v2` / `both`. |
 
 Outputs: `json-file`, `log-file`, `has-variant-data` — the ingest step is
@@ -178,9 +178,9 @@ action (it isn't log-driven), but it dual-writes through the exact same
 
 | Workflow | Triggers | Calls |
 |---|---|---|
-| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `model-ops-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
+| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
 | `push-hw-diagnostics-to-clickhouse.yaml` | same `workflow_run` set | `ingest-hw-diagnostics-to-clickhouse` |
-| `push-model-ops-logs-to-clickhouse.yaml` | `model-ops-tests` run completion | `ingest-model-ops-to-clickhouse` (v1 only) |
+| `push-model-ops-logs-to-clickhouse.yaml` | `tests` run completion (push to `main`) | `ingest-model-ops-to-clickhouse` (v1 only) |
 | `push-pytorch-dispatch-to-clickhouse.yaml` | `repository_dispatch` from pytorch/pytorch's CRCR relay | `ingest-pytorch-dispatch-to-clickhouse` |
 
 `derive-gha-artifact-id` runs earlier, inside the test-execution workflow
