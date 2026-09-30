@@ -502,7 +502,16 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
-            expect_fail = cases.get("expect_fail", [])
+            # expect_fail entries may be plain strings or (key, reason) tuples.
+            # Build a dict mapping key -> reason (None when no reason given) for O(1)
+            # lookup and to preserve the reason string in the xfail marker.
+            _expect_fail_raw = cases.get("expect_fail", [])
+            expect_fail = {
+                (e if isinstance(e, str) else e[0]): (
+                    None if isinstance(e, str) else e[1]
+                )
+                for e in _expect_fail_raw
+            }
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -529,20 +538,29 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
-                        # An expect_fail entry may target either the bare param
-                        # key (xfails every op for that shape) or the specific
-                        # ``{op_name}_{test_case}`` combination (xfails just that
-                        # op), so a single op can be marked without affecting the
-                        # others sharing the shape.
+                        # An expect_fail entry may target either the bare param key (xfails
+                        # every op for that shape) or the specific ``{op_name}_{test_case}``
+                        # combination (xfails just that op), so a single op can be marked
+                        # without affecting the others sharing the shape. When the entry is a
+                        # (key, reason) tuple the reason string is forwarded to pytest.mark.xfail;
+                        # plain string entries get a generic fallback reason.
                         op_case = f"{op_name}_{test_case}"
                         op_case_match = op_case in expect_fail
                         if test_case in expect_fail or op_case_match:
-                            marked = op_case if op_case_match else test_case
+                            matched_key = op_case if op_case_match else test_case
+                            _reason = expect_fail[matched_key]
+                            reason = (
+                                _reason
+                                if _reason
+                                else f"Expected fail for {matched_key}"
+                            )
                             namespace[test_name] = pytest.mark.xfail(
-                                reason=f"Expected fail for {marked}", strict=True
+                                reason=reason, strict=True
                             )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
+                    # expect_fail entries may be plain strings or (key, reason) tuples;
+                    # the reason is forwarded to pytest.mark.xfail when present.
                     def make_test(_base_func, _params):
                         @functools.wraps(_base_func)
                         def test(self):
@@ -563,8 +581,12 @@ class ParameterizedTestMeta(type):
                     )
                     namespace[test_name] = make_test(base_func, params)
                     if test_case in expect_fail:
+                        _reason = expect_fail[test_case]
+                        reason = (
+                            _reason if _reason else f"Expected fail for {test_case}"
+                        )
                         namespace[test_name] = pytest.mark.xfail(
-                            reason=f"Expected fail for {test_case}", strict=True
+                            reason=reason, strict=True
                         )(namespace[test_name])
 
             # Remove base function if parameterized
