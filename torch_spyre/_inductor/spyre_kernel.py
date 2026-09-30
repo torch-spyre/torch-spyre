@@ -1946,7 +1946,7 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
             if len(candidate_dims) != 1:
                 # TODO: bind an operand whose stick pair is on no single dim,
                 # e.g. one that padding left alone or with a folded num-sticks dim.
-                raise NotImplementedError(
+                raise Unsupported(
                     f"staggered read with no unique num-sticks dim {candidate_dims}: "
                     f"{arg}"
                 )
@@ -1954,14 +1954,14 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
         stick_index_offset = coords[stick_index_dim]
         if not stick_index_offset.is_Integer:
             # TODO: support a pair whose position varies over the iteration.
-            raise NotImplementedError(
+            raise Unsupported(
                 f"staggered read starting at a varying stick {stick_index_offset}: {arg}"
             )
         if stick_index_offset % 2 != 0:
             # TODO: support a slice starting at the second stick of a pair, e.g.
             # ``x32[..., 32:64]``, unlike ``64:96``; its lanes run into the next
             # pair.
-            raise NotImplementedError(
+            raise Unsupported(
                 f"staggered read starting at stick {stick_index_offset}, inside a stick "
                 f"pair: {arg}"
             )
