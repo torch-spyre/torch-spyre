@@ -27,7 +27,7 @@ REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
 RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
 # Which capability analysis produced a capability_runs row; also the test_type of a
 # result_kind='capability' verdict.
-CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_modules", "model_support"})
 # spyre-test-framework's stages, each its own leg.
 SUITE_STAGE_VALUES = frozenset(
     {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}

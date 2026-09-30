@@ -35,13 +35,14 @@ CREATE TABLE IF NOT EXISTS capabilities
     capability_id UUID,
 
     component     LowCardinality(String),
-    -- Which analysis: model_ops | model_support -- the axis v1 put in the table name. Named
-    -- test_type, as on artifact_results, where their verdicts carry result_kind 'capability'.
-    -- Constrained by convention, not CHECK, so a new analysis can start writing unedited.
+    -- Which analysis: model_ops | model_modules | model_support -- the axis v1 put in the table
+    -- name. Named test_type, as on artifact_results, where their verdicts carry result_kind
+    -- 'capability'. No CHECK here: the writer refuses a type artifact_results.chk_test_type lacks.
     test_type     LowCardinality(String),
 
     -- The thing analysed (a model), and the capability asked of it (a torch op for model_ops, an
-    -- adapter for model_support). v1 spelled `subject` three ways for only 10 distinct triples.
+    -- nn.Module for model_modules, an adapter for model_support). v1 spelled `subject` three ways
+    -- for only 10 distinct triples.
     subject       String,
     name          String,
 

@@ -297,6 +297,21 @@ def test_an_incomplete_or_conflicting_declaration_is_skipped_and_counted(capsys)
     assert "1 capability declaration(s) with conflicting capability.name" in err
 
 
+def test_an_unregistered_capability_type_is_skipped_before_any_insert(capsys):
+    from spyre_clickhouse_ingest.schema import CAPABILITIES, CAPABILITY_RUNS
+
+    typo = _without(_declared("a"), "capability.test_type")
+    typo["properties"].append(("capability.test_type", "module_ops"))
+    c = FakeClient()
+    assert insert_test_results(c, "db", "torch-spyre", RUN, [typo], "a.xml") == 1
+    assert not [
+        i for i in c.inserts if i[0] in (CAPABILITIES.name, CAPABILITY_RUNS.name)
+    ]
+    err = capsys.readouterr().err
+    assert "unregistered capability.test_type 'module_ops'" in err
+    assert "model_modules, model_ops, model_support" in err
+
+
 def test_unknown_capability_keys_are_reported_and_dropped(capsys):
     from spyre_clickhouse_ingest.schema import CAPABILITY_RUNS
 

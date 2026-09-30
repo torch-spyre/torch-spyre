@@ -39,8 +39,8 @@ def capability_declaration(case: dict) -> tuple:
     The contract: `test_type`, `subject`, `name` (required) and `backend` are scalars;
     `sig.<k>` is hashed into capability_id; `tag` repeats; `prop.<k>` lands in the verdict's
     props. Any other key is reported in `unknown` and dropped. A case declaring no
-    `capability.*` property gives (None, ""); one missing a required key or giving a scalar
-    two values gives (None, <problem>).
+    `capability.*` property gives (None, ""); one missing a required key, giving a scalar
+    two values, or naming an unregistered test_type gives (None, <problem>).
     """
     decl = {"sig": {}, "tags": [], "props": {}, "unknown": [], "backend": ""}
     scalars: dict = {}
@@ -68,6 +68,13 @@ def capability_declaration(case: dict) -> tuple:
     missing = [k for k in CAPABILITY_REQUIRED if not scalars.get(k)]
     if missing:
         return None, "no " + "/".join(CAPABILITY_PREFIX + k for k in missing)
+    # Checked here, not at insert: there one bad case rejects the file's whole artifact_results batch.
+    if scalars["test_type"] not in schema.CAPABILITY_TYPE_VALUES:
+        return None, (
+            f"unregistered {CAPABILITY_PREFIX}test_type '{scalars['test_type']}' (registered: "
+            f"{', '.join(sorted(schema.CAPABILITY_TYPE_VALUES))}; a new one needs "
+            "schema.CAPABILITY_TYPE_VALUES and a migration of artifact_results.chk_test_type)"
+        )
     decl.update(scalars)
     return decl, ""
 

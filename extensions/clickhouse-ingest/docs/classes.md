@@ -128,11 +128,14 @@ of what identifies the subject.
 **Use cases.**
 - `TestResultWriter` derives `CapabilityId`s for any JUnit case that declares
   `capability.*` properties — torch-spyre's model-ops suites, `test_type="model_ops"`:
-  "does this build support op X".
+  "does this build support op X"; hf-adapters' module tests, `test_type="model_modules"`:
+  "does this build run the model's nn.Module X".
 - `capability_write.py` (hf-adapters) derives them for
   `test_type="model_support"` — "does this Hub checkpoint run on backend Y" —
-  the two share one table pair (`capabilities`/`capability_runs`) and are told
-  apart purely by `test_type`, a sibling vocabulary, not a subtype.
+  all share one table pair (`capabilities`/`capability_runs`) and are told
+  apart purely by `test_type`, a sibling vocabulary, not a subtype. The set is
+  closed (`schema.CAPABILITY_TYPE_VALUES`, mirrored by `artifact_results.chk_test_type`):
+  a case naming another type is skipped with a warning, before any insert.
 - `ingest_vllm_benchmarks.py` (spyre-inference) derives `BenchmarkId`s per
   vLLM benchmark name/tag/discriminator combination.
 
