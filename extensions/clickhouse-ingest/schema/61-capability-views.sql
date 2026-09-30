@@ -62,12 +62,11 @@ SELECT
     uniqExactIf(capability_id, status = 'passed' AND backend = 'spyre') AS distinct_spyre_enabled,
     uniqExactIf(capability_id, status = 'not_implemented')            AS distinct_not_implemented,
     uniqExactIf(capability_id, status = 'passed' AND backend = 'cpu') AS distinct_cpu_fallback,
-    -- Support rate over what was attempted on spyre: not_implemented is excluded from the
-    -- denominator (not a failure to fix), and guarded against a zero denominator.
-    -- undetermined is excluded too: the test broke before the op was tried.
-    if(countIf(backend = 'spyre' AND status != 'undetermined') = 0, 0,
+    -- Share of the model's verdicts that run on spyre (the Model Enablement page's progress):
+    -- not_implemented and CPU fallbacks count in the total; undetermined gave no verdict.
+    if(countIf(status != 'undetermined') = 0, 0,
        round(100.0 * countIf(status = 'passed' AND backend = 'spyre')
-             / countIf(backend = 'spyre' AND status != 'undetermined'), 2)) AS spyre_pass_rate
+             / countIf(status != 'undetermined'), 2))                AS spyre_pass_rate
 FROM v_capability_results
 GROUP BY run_id, component, test_type, subject;
 
