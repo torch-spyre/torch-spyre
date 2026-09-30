@@ -230,3 +230,113 @@ def test_an_unchanged_image_gets_a_verdict_but_no_artifact_row():
     assert _rows(c, ARTIFACTS) == []
     assert len(_rows(c, ARTIFACT_RESULTS)) == 1
     assert _rows(c, ARTIFACT_RESULTS)[0]["artifact_id"] == BASE
+
+
+# ── the batch a pipeline writer hands over (artifacts write) ─────────────────────────────
+
+NODE = {
+    "component": "spyre-backend",
+    "artifact_name": "spyre-backend-dev",
+    "id12": "5e67196b1a4c",
+    "arch": "amd64",
+    "kind": "image",
+    "ref": "registry.example/spyre-backend-dev:amd64-dev-5e67196b1a4c",
+}
+
+
+def _batch():
+    from spyre_clickhouse_ingest.artifacts import write_batch
+
+    c = FakeClient()
+    done = write_batch(
+        c,
+        "db",
+        {
+            "artifacts": [
+                {
+                    "artifact": NODE,
+                    "sources": [{"repo": "r", "git_ref": "main", "git_sha": "abc"}],
+                    "props": {"run_url": "u"},
+                }
+            ],
+            "tags": [
+                {
+                    "artifact": NODE,
+                    "tag": "latest",
+                    "tag_family": "main",
+                    "ref": "registry.example/spyre-backend-dev:amd64",
+                    "props": {"source": "jenkins"},
+                }
+            ],
+            "results": [
+                {
+                    "artifact": NODE,
+                    "run_id": RUN,
+                    "test_type": "perf",
+                    "state": "passed",
+                }
+            ],
+        },
+    )
+    return c, done
+
+
+def test_a_batch_writes_under_the_jenkins_artifact_id():
+    from spyre_clickhouse_ingest import ArtifactId
+
+    c, done = _batch()
+    assert done == {"artifacts": 1, "tags": 1, "results": 1}
+    aid = ArtifactId.derive(
+        "spyre-backend", "spyre-backend-dev", "5e67196b1a4c", "x86_64"
+    )
+    for t in (ARTIFACTS, ARTIFACT_RESULTS):
+        assert [r["artifact_id"] for r in _rows(c, t)] == [aid]
+    art = _rows(c, ARTIFACTS)[0]
+    assert (art["arch"], art["sources"], art["props"]["run_url"]) == (
+        "x86_64",
+        [("r", "main", "abc")],
+        "u",
+    )
+
+
+def test_a_tag_names_its_own_moving_ref_not_the_artifacts():
+    from spyre_clickhouse_ingest.schema import ArtifactTags
+
+    c, _ = _batch()
+    (tag,) = _rows(c, ArtifactTags)
+    assert tag["refs"] == [
+        (
+            "container-pull",
+            "pullspec",
+            "registry.example",
+            "registry.example/spyre-backend-dev:amd64",
+        )
+    ]
+    assert tag["props"] == {"id12": "5e67196b1a4c", "source": "jenkins"}
+
+
+def test_a_batch_result_takes_the_artifacts_arch_and_derives_its_kind():
+    c, _ = _batch()
+    (res,) = _rows(c, ARTIFACT_RESULTS)
+    assert (res["arch"], res["result_kind"]) == ("x86_64", "performance")
+
+
+def test_an_unknown_kind_is_recorded_as_a_download():
+    assert ArtifactWriter.ref_shape("file") == ArtifactWriter.REF_SHAPE["generic"]
+
+
+def test_a_misspelled_batch_key_is_refused_before_anything_is_written():
+    import pytest
+    from spyre_clickhouse_ingest.artifacts import write_batch
+
+    c = FakeClient()
+    batch = {
+        "tags": [
+            {"artifact": {**NODE, "artifactName": "x"}, "tag": "t", "tagFamily": "f"}
+        ],
+    }
+    with pytest.raises(
+        ValueError, match=r"tags\[0\]\.tagFamily.*tags\[0\]\.artifact\.artifactName"
+    ):
+        write_batch(c, "db", batch)
+    assert c.inserts == []

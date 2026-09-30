@@ -550,7 +550,7 @@ class ArtifactWriter:
                 ),
             }
             cls.artifact_table.insert(client, [row], db=db)
-        method, ref_kind = cls.REF_SHAPE[identity.kind]
+        method, ref_kind = cls.ref_shape(identity.kind)
         if identity.ref:
             # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
             ref_row: schema.ArtifactRefRow = {
@@ -564,20 +564,45 @@ class ArtifactWriter:
             }
             cls.ref_table.insert(client, [ref_row], db=db)
         for tag, family, tag_props in tags:
-            if not tag or cls.tag_recorded(client, db, tag, aid):
-                continue
-            tag_row: schema.ArtifactTagRow = {
-                "tag": tag,
-                "tag_family": family,
-                "artifact_id": aid,
-                "refs": [(method, ref_kind, cls._index_uri(identity.ref), identity.ref)]
-                if identity.ref
-                else [],
-                "published_refs": [],
-                "props": cls._props({"id12": identity.id12, **(tag_props or {})}),
-            }
-            cls.tag_table.insert(client, [tag_row], db=db)
+            cls.insert_tag(client, db, identity, tag, family, props=tag_props)
         return aid
+
+    @classmethod
+    def ref_shape(cls, kind: str) -> tuple:
+        """(method, ref_kind) for an artifact kind; an unknown kind is a plain download."""
+        return cls.REF_SHAPE.get(kind, cls.REF_SHAPE["generic"])
+
+    @classmethod
+    def insert_tag(
+        cls,
+        client,
+        db: str,
+        identity: ArtifactIdentity,
+        tag: str,
+        family: str,
+        *,
+        ref: str | None = None,
+        props=None,
+    ) -> bool:
+        """Point `tag` at `identity`, once. `ref` is the address the tag names, which may be a
+        moving one (`:amd64`) rather than the artifact's own; it defaults to the latter."""
+        aid = identity.artifact_id
+        if not (tag and aid):
+            return False
+        if cls.tag_recorded(client, db, tag, aid):
+            return True
+        ref = identity.ref if ref is None else ref
+        method, ref_kind = cls.ref_shape(identity.kind)
+        tag_row: schema.ArtifactTagRow = {
+            "tag": tag,
+            "tag_family": family,
+            "artifact_id": aid,
+            "refs": [(method, ref_kind, cls._index_uri(ref), ref)] if ref else [],
+            "published_refs": [],
+            "props": cls._props({"id12": identity.id12, **(props or {})}),
+        }
+        cls.tag_table.insert(client, [tag_row], db=db)
+        return True
 
     @classmethod
     def insert_result(
