@@ -53,7 +53,9 @@ M=1 (decode phase) correctly.
 import sympy
 import torch
 from sympy import Expr
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.utils import ceildiv
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -84,8 +86,13 @@ from .pass_utils import (
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
-from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from .views import compute_coordinates, matching_dim
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_elem_in_stick,
+)
 
 logger = get_inductor_logger("padding")
 
@@ -857,6 +864,50 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
+def _clone_input_for_padding(
+    op: ComputedBuffer, in_dep, in_buf, graph: GraphLowering, pass_name: str
+) -> ComputedBuffer | None:
+    """Give ``op`` a paddable copy of the graph input ``in_buf`` it reads.
+
+    A graph input has no producer output to pad, so insert an identity clone
+    ahead of ``op``, redirect ``op``'s read to it, and return the clone for the
+    caller to pad.  Returns ``None`` when the input has no device.  Callers decide
+    that padding is needed first, so no clone is stranded for an input they skip.
+    """
+    device = in_buf.get_device()
+    if device is None:
+        return None
+    in_layout = in_buf.get_layout()
+    patch_env(V.graph)
+    in_fx_node = find_fx_node(in_dep.name, V.graph)
+    if in_fx_node is None:
+        raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
+    clone_buf, new_ops = lower_identity_clone(
+        in_fx_node,
+        host_size=[concretize_expr(s) for s in in_layout.size],
+        host_stride=[concretize_expr(s) for s in in_layout.stride],
+        device=device,
+        dtype=in_layout.dtype,
+        orig_stl=in_layout.device_layout,
+        insert_before=next(iter(op.origins)),
+    )
+    _move_ops_before(graph.operations, new_ops, op)
+    redirect_computed_buffer_reads(
+        op,
+        {in_dep.name: clone_buf.get_name()},
+        graph.operations,
+        pass_name=pass_name,
+        reason="redirect consumer to padded input",
+    )
+    logger.debug(
+        "%s: inserted clone %s for input of %s",
+        pass_name,
+        clone_buf.get_name(),
+        op.get_name(),
+    )
+    return clone_buf
+
+
 def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     """Pad a restickify input's non-stick dim to cover codegen's stick-boundary
     read window.
@@ -913,40 +964,12 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     # Run AFTER the gate: cloning mutates the graph (insert + redirect), so
     # cloning for an input we then skip would strand a redundant clone.
     if not isinstance(in_buf, ComputedBuffer):
-        # A graph input has no producer output to pad: insert an identity clone
-        # ahead of the restickify, move it into place, redirect the read to it,
-        # then pad the clone.
-        device = in_buf.get_device()
-        if device is None:
+        clone_buf = _clone_input_for_padding(
+            op, in_dep, in_buf, graph, "insert_restickify_padding"
+        )
+        if clone_buf is None:
             return
-        patch_env(V.graph)
-        in_fx_node = find_fx_node(in_dep.name, V.graph)
-        if in_fx_node is None:
-            raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
-        clone_buf, new_ops = lower_identity_clone(
-            in_fx_node,
-            host_size=[concretize_expr(s) for s in in_layout.size],
-            host_stride=[concretize_expr(s) for s in in_layout.stride],
-            device=device,
-            dtype=in_layout.dtype,
-            orig_stl=in_layout.device_layout,
-            insert_before=next(iter(op.origins)),
-        )
-        _move_ops_before(graph.operations, new_ops, op)
-        redirect_computed_buffer_reads(
-            op,
-            {in_dep.name: clone_buf.get_name()},
-            graph.operations,
-            pass_name="insert_restickify_padding",
-            reason="redirect consumer to padded input",
-        )
         in_buf = clone_buf
-
-        logger.debug(
-            "insert_restickify_padding: inserted clone %s for input of %s",
-            clone_buf.get_name(),
-            op.get_name(),
-        )
 
     # --- Pad the input. ---
     if size1:
@@ -1014,3 +1037,223 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
+
+
+# --------------------------------------------------------------------------- #
+# insert_staggered_ea_padding                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _pad_num_sticks(
+    layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
+) -> FixedTiledLayout:
+    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks.
+
+    A dim holding several sticks is sized up in place.  A single stick has no dim
+    of its own to grow, as it may share a host step with the dim outside it, so an
+    outermost gap dim with ``stride_map`` -1 is prepended instead, as in
+    ``_pad_elided_dim``.  Codegen binds the stick index to that gap dim
+    (``_adjust_for_staggered_ea`` in spyre_kernel).
+    """
+    stl = layout.device_layout
+    if stl.device_size[num_sticks_dim] != 1:
+        return _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
+    return FixedTiledLayout(
+        layout.device,
+        layout.dtype,
+        [concretize_expr(s) for s in layout.size],
+        [concretize_expr(s) for s in layout.stride],
+        SpyreTensorLayout(
+            [new_num_sticks, *stl.device_size],
+            [-1, *stl.stride_map],
+            stl.device_dtype,
+            stl.element_arrangement,
+        ),
+    )
+
+
+def _num_sticks_dim(layout: FixedTiledLayout, dep: MemoryDep) -> int | None:
+    """The device dim of ``layout`` that steps the sticks ``dep`` accesses.
+
+    The outermost device dim whose coordinate carries the stick coordinate's
+    variable, as ``rescale_stl_for_dtype`` finds it. A stick dim no longer than
+    one stick never wraps into an outer dim, and every size-1 host dim has a zero
+    coordinate too, so the outermost zero-coordinate dim is taken instead, which
+    is where ``_pad_num_sticks`` prepends one. None when no device dim can hold
+    the count, or when the stick coordinate has a variable but no host dim
+    matches it.
+    """
+    device_coords = device_coordinates(layout.device_layout, dep, None)
+    if not device_coords:
+        return None
+    stick_coord = device_coords[-1]
+    stick_vars = stick_coord.free_symbols
+    host_coords = host_coordinates(layout, dep, None)
+    if stick_vars and matching_dim(host_coords, stick_coord) is None:
+        return None
+    outer_coords = device_coords[:-1]
+    for dim, coord in enumerate(outer_coords):
+        if coord.free_symbols & stick_vars:
+            return dim
+    for dim, coord in enumerate(outer_coords):
+        if coord == sympy.S.Zero:
+            return dim
+    return None
+
+
+def _pad_downcast_input(
+    op: ComputedBuffer,
+    out_layout: FixedTiledLayout,
+    in_dep,
+    in_buf,
+    in_layout: FixedTiledLayout,
+    graph: GraphLowering,
+) -> None:
+    """Grow a downcast's input to cover every input stick its output reads.
+
+    A downcast packs several input sticks into one output stick: two FP32 sticks
+    per FP16 stick, two FP16 sticks per FP8 stick.  The output is sized in whole
+    sticks, so an input ending inside a group is read past its allocation: 96 FP32
+    elements occupy 3 sticks, but their 2 FP16 sticks read 4.
+
+    A producer's output is padded in place; a graph input is cloned first
+    (``_clone_input_for_padding``).
+    """
+    in_stl = in_layout.device_layout
+    out_stl = out_layout.device_layout
+    out_dep = _write_dep(op)
+    in_num_sticks_dim = _num_sticks_dim(in_layout, in_dep)
+    out_num_sticks_dim = _num_sticks_dim(out_layout, out_dep)
+    if in_num_sticks_dim is None or out_num_sticks_dim is None:
+        return
+
+    # The output has more elements per stick, and its num-sticks count is already
+    # rounded up to whole sticks, so its capacity bounds what the input must hold.
+    in_eps = in_stl.device_size[-1]
+    out_eps = out_stl.device_size[-1]
+    out_num_sticks = out_stl.device_size[out_num_sticks_dim]
+    required_num_sticks = ceildiv(out_num_sticks * out_eps, in_eps)
+    current_num_sticks = in_stl.device_size[in_num_sticks_dim]
+    if current_num_sticks >= required_num_sticks:
+        return
+
+    if not isinstance(in_buf, ComputedBuffer):
+        clone_buf = _clone_input_for_padding(
+            op, in_dep, in_buf, graph, "insert_staggered_ea_padding"
+        )
+        if clone_buf is None:
+            return
+        in_buf = clone_buf
+
+    in_buf.layout = _pad_num_sticks(
+        in_buf.get_layout(), in_num_sticks_dim, required_num_sticks
+    )
+
+    logger.debug(
+        "insert_staggered_ea_padding: padded input %s device dim %d %d -> %d",
+        in_buf.get_name(),
+        in_num_sticks_dim,
+        current_num_sticks,
+        required_num_sticks,
+    )
+
+
+def _pad_upcast_output(
+    op: ComputedBuffer, layout: FixedTiledLayout, source_eps: int
+) -> None:
+    """Grow an upcast output to cover whole sticks of the input dtype.
+
+    An upcast writes one input stick across several output sticks: an FP16 stick
+    staggers across a pair of FP32 sticks, and an FP8 stick converts into two FP16
+    sticks.  The hardware writes the whole group, but layout propagation sizes the
+    output by the sticks its live elements occupy.  An op downstream that keeps the
+    ``DL16_TO_FP32`` arrangement writes whole pairs the same way.
+
+    Args:
+        op: The buffer to grow.
+        layout: ``op``'s layout.
+        source_eps: Elements per stick of the dtype upcast from.
+    """
+    stl = layout.device_layout
+
+    dep = _write_dep(op)
+    num_sticks_dim = _num_sticks_dim(layout, dep)
+    if num_sticks_dim is None:
+        return
+    out_eps = stl.device_size[-1]
+    if out_eps >= source_eps:
+        return
+    sticks_per_pair = ceildiv(source_eps, out_eps)
+
+    current_num_sticks = stl.device_size[num_sticks_dim]
+    required_num_sticks = ceildiv(current_num_sticks, sticks_per_pair) * sticks_per_pair
+    if current_num_sticks >= required_num_sticks:
+        return
+
+    op.layout = _pad_num_sticks(layout, num_sticks_dim, required_num_sticks)
+
+    logger.debug(
+        "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",
+        op.get_name(),
+        num_sticks_dim,
+        current_num_sticks,
+        required_num_sticks,
+    )
+
+
+def insert_staggered_ea_padding(graph: GraphLowering) -> None:
+    """Pad the side of a typecast with fewer elements per stick, and what it feeds.
+
+    A typecast maps one stick of the dtype with more elements per stick onto
+    several sticks of the other: an FP16 stick staggers across a pair of FP32
+    sticks, and an FP8 stick holds two FP16 sticks.  The hardware converts whole
+    sticks, but layout propagation sizes a buffer by the sticks its live elements
+    occupy, so the rest of the group is added here.
+
+    - An op with a ``DL16_TO_FP32`` output, the FP16 -> FP32 upcast or an op
+      downstream that keeps the arrangement, pads its output.
+    - Any other typecast, found by comparing the elements per stick of its input
+      and output, pads the side with fewer: a downcast its input, an upcast its
+      output.  Converting a staggered input back yields a ``STANDARD`` output, so
+      the arrangement alone would miss it.
+
+    Padding never touches the host size.  Growing a dim in place changes only
+    ``device_size``, and codegen's backGap path covers the gap; a prepended gap dim
+    instead has ``stride_map`` -1, and codegen binds the stick index to it.
+    """
+    fp16_eps = DataFormats.SEN169_FP16.elems_per_stick()
+    for op in list(graph.operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        out_layout = op.get_layout()
+        if not isinstance(out_layout, FixedTiledLayout):
+            continue
+        out_stl = out_layout.device_layout
+
+        # Ops with a DL16_TO_FP32 output, the FP16 -> FP32 upcast included.  Each
+        # FP32 stick pair holds one FP16 stick's elements.
+        if out_stl.element_arrangement == ElementArrangement.DL16_TO_FP32:
+            _pad_upcast_output(op, out_layout, fp16_eps)
+            continue
+
+        # Other typecasts: a single input whose elements per stick differ from the
+        # output's.
+        reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+        if len(reads) != 1:
+            continue
+        in_dep = reads[0]
+        in_buf = graph.get_buffer(in_dep.name)
+        if in_buf is None:
+            continue
+        in_layout = in_buf.get_layout()
+        if not isinstance(in_layout, FixedTiledLayout):
+            continue
+        in_eps = in_layout.device_layout.device_size[-1]
+        out_eps = out_stl.device_size[-1]
+
+        if in_eps < out_eps:
+            # Downcasts, from any arrangement: FP32 -> FP16, FP16 -> FP8.
+            _pad_downcast_input(op, out_layout, in_dep, in_buf, in_layout, graph)
+        elif in_eps > out_eps:
+            # Upcasts to STANDARD, missed above: FP8 -> FP16, FP32_TO_DL16 -> FP32.
+            _pad_upcast_output(op, out_layout, in_eps)

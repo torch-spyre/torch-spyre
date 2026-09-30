@@ -39,7 +39,11 @@ from . import timing_recorder
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import (
+    insert_bmm_padding,
+    insert_restickify_padding,
+    insert_staggered_ea_padding,
+)
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -567,6 +571,7 @@ class CustomPreSchedulingPasses:
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_restickify_padding,
+            insert_staggered_ea_padding,
             #
             dedup_and_promote_constants,
             #
