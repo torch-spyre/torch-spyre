@@ -114,7 +114,8 @@ class _Client:
 
     def query(self, sql, parameters=None):
         class R:
-            result_rows = [(0,)]
+            # The held-rows lookup selects audit_uuid; a fresh run holds none.
+            result_rows = [] if "audit_uuid" in sql else [(0,)]
 
         return R()
 

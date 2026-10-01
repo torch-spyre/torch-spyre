@@ -128,7 +128,7 @@ def test_copy_is_scoped_to_the_tiers_own_cases(ing):
     c = FakeCH()
     ing.copy_reused_cases(c, "db", "run-1", "torch-spyre", [("integration", "src-1")])
     sql, _ = c.commands[0]
-    assert "has(c.tags, concat('testtype__', {tier:String}))" in sql
+    assert "has(cr.tags, concat('testtype__', {tier:String}))" in sql
 
 
 def test_ran_in_is_preserved_not_overwritten(ing):
