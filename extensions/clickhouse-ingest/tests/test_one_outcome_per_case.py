@@ -133,3 +133,5 @@ def test_one_batch_keeps_differing_repeats_and_drops_exact_ones():
 def test_migration_009_is_rerunnable():
     sql = (SCHEMA_DIR / "migrations" / "009_one_outcome_per_case.sql").read_text()
     assert sql.startswith("-- RERUNNABLE")
+    # The writer compares durations to the ms, so the migration must too.
+    assert "round(duration_s, 3)" in sql

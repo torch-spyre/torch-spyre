@@ -1,7 +1,7 @@
 -- RERUNNABLE
 -- run_case_counters sums rows, so rows that restate another row of the same run are deleted.
 -- TestResultWriter applies the same rules at insert time. A row is redundant when it is:
---   * an exact copy (same file, attempt, status, duration and message);
+--   * an exact copy (same file, attempt, status, duration to the ms, and message);
 --   * an older attempt of a file that has a newer attempt of the case;
 --   * a reused copy, where the run executed the case itself;
 --   * a skip, where another file of the run executed the case.
@@ -32,7 +32,7 @@ FROM
             max(attempt) OVER (PARTITION BY component, run_id, test_case_id, source_file, copied) AS top_attempt,
             row_number() OVER (
                 PARTITION BY component, run_id, test_case_id, source_file, copied, attempt, status,
-                             duration_s, fail_message
+                             round(duration_s, 3), fail_message
                 ORDER BY audit_uuid DESC
             ) AS copy_rank
         FROM

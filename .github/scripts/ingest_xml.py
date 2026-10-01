@@ -1207,9 +1207,11 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             f"FROM {runs} AS cr "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
             "  AND has(cr.tags, concat('testtype__', {tier:String})) "
-            # A case this run already holds keeps its own outcome: one outcome per case.
+            # Only a case this run executed itself replaces the copy; a local skip does not.
             f"  AND cr.test_case_id NOT IN (SELECT test_case_id FROM {runs} "
-            "      WHERE run_id = {run_id:UUID} AND component = {component:String})",
+            "      WHERE run_id = {run_id:UUID} AND component = {component:String} "
+            "        AND status != 'skipped' "
+            "        AND props['ran_in'] IN ('', toString({run_id:UUID})))",
             parameters={
                 "run_id": run_id,
                 "src": src_run,
