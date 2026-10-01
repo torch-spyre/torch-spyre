@@ -27,6 +27,9 @@ test_suite_config:
             - test_find_device_overlaps
             - test_find_device_overlaps_invalid_events
             - test_kernel_time_overlap
+            - test_runtime_device_correlation_pairs
+            - test_runtime_device_correlation_pair_errors
+            - test_out_of_order_event_sequence
             - test_trace_analyzer_device_overlap
             - test_find_duplicate_kernel_start_timestamps
             - test_find_duplicate_kernel_start_timestamps_invalid_events
