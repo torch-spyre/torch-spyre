@@ -18,7 +18,7 @@ test_suite_config:
             # shape ops
             - TestOps::test_flatten.*
             # flip: non-stick dims reverse via index_select; the stick-dim
-            # cases are strict xfails inside the test itself
+            # cases are skipped inside the test: they fault the card
             - TestOps::test_flip.*
             - TestOps::test_permute.*
             - TestOps::test_unbind.*
