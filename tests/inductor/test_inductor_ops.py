@@ -2601,6 +2601,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Host-resident integer operand inside a Spyre graph: a position index
+        # built with torch.arange (CPU int64) and compared before being moved to
+        # the device, as in LFM2's causal conv. The compare runs on CPU, so the
+        # Spyre int -> float promotion must not be applied to it.
+        ("test_cmp_host_operand", "test_cmp_host_operand_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "param_sets": {
+                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
+            },
+        },
         # -----------------------------------------------------------------------
         # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
         # so above 2**24 the gaps between representable values exceed 1 and two
@@ -7328,6 +7345,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_mixed_dtype_cpu(self, op, x, y):
         # Operands with different dtypes: the lowering promotes both to one dtype.
         self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_cmp_host_operand_cpu(self, op, x):
+        # The compare's operands live on CPU even though the graph targets Spyre.
+        def fn(x):
+            positions = torch.arange(x.shape[-1])
+            mask = op(positions, 2)[None, None, :]
+            return x * mask.to(dtype=x.dtype, device=x.device)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_cmp_bigint_cpu(self, op, x, y):
         # Integers large enough that int→fp32 loses the distinction between them.
