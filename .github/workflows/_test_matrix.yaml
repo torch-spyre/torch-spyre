@@ -1488,6 +1488,7 @@ jobs:
         id: run_tests
         uses: ./.github/actions/run-test-suite
         with:
+          retried: pod
           suite_name: ${{ matrix.suite.name }}
           config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
@@ -1595,6 +1596,7 @@ jobs:
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         uses: ./.github/actions/run-test-suite
         with:
+          retried: pod
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}

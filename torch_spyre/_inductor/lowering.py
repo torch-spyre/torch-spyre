@@ -40,6 +40,7 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
+    DEVICE_NAME,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -2166,9 +2167,28 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     return pointwise_fn(convert(x), convert(y))
 
 
+def _is_host_cmp(x, y):
+    """True when no tensor operand of a comparison lives on the Spyre device.
+
+    enable_spyre_lowerings() overlays these lowerings on every node of the
+    graph, including host-side compares such as ``torch.arange(n) < k`` that a
+    model computes on CPU before moving the mask to the device. The int ->
+    float promotion exists only because Spyre has no integer compare; applied
+    to a CPU tensor it routes the cast through ``spyre::to_dtype_cpu``, which
+    has no CPU kernel.
+    """
+    devices = [v.get_device() for v in (x, y) if hasattr(v, "get_device")]
+    return not any(d is not None and d.type == DEVICE_NAME for d in devices)
+
+
 def _register_cmp_lowerings(aten_op, op_name: str):
     """Register .Tensor and .Scalar lowerings for one comparison op."""
     pw = _make_cmp_pointwise(op_name)
+    aten_packet = getattr(torch.ops.aten, aten_op)
+    # Inductor's own lowerings, captured before enable_spyre_lowerings() can
+    # overlay them, so host-side compares keep stock CPU semantics.
+    stock_tensor = lowering.lowerings[aten_packet.Tensor]
+    stock_scalar = lowering.lowerings[aten_packet.Scalar]
 
     # override_return_dtype=torch.bool must be passed here as well as to
     # make_pointwise. register_spyre_lowering forwards it to Inductor's
@@ -2179,22 +2199,26 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     # breaks codegen for the cpp/triton backends in the same process, in
     # compiles that never touch Spyre at all.
     @register_spyre_lowering(
-        getattr(torch.ops.aten, aten_op).Tensor,
+        aten_packet.Tensor,
         name=aten_op,
         type_promotion_kind=None,
         override_return_dtype=torch.bool,
         broadcast=True,
     )
     def _tensor(x, y):
+        if _is_host_cmp(x, y):
+            return stock_tensor(x, y)
         return _lower_cmp_impl(x, y, pw)
 
     @register_spyre_lowering(
-        getattr(torch.ops.aten, aten_op).Scalar,
+        aten_packet.Scalar,
         name=aten_op,
         type_promotion_kind=None,
         override_return_dtype=torch.bool,
     )
     def _scalar(x, y):
+        if _is_host_cmp(x, y):
+            return stock_scalar(x, y)
         return _lower_cmp_impl(x, y, pw)
 
     return _tensor, _scalar
