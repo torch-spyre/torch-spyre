@@ -110,6 +110,15 @@ inserted before their facts and MV targets are left to the MVs. A filter on a co
 source lacks (`artifact_results` has no `component`) drops that source, not the filter. A new
 base table needs a rule in `Sandbox.SEED`; `test_sandbox.py` fails until it has one.
 
+For self-serve use, `python -m spyre_clickhouse_ingest.sandbox_server` (extra `[server]`)
+wraps these operations in an HTTP MCP server that holds the dev admin login itself. A caller's
+bearer token names them -- a line of the shared per-user token file, or a token the server
+minted at `POST /register` for an OpenShift login (`oc whoami -t`) -- and every tool acts only
+on sandboxes whose database comment records that owner. Queries run as the sandbox's own login,
+whose password is derived from `SANDBOX_SECRET`; sandboxes expire after a TTL. `schema_diff` and
+`verify_schema` take any `<owner>/torch-spyre@<ref>`, so a pushed fork branch is proved the
+same way as below.
+
 Turning an experiment into a PR: edit the `CREATE` here to the shape `diff` shows, add the
 `migrations/NNN_*.sql` that gets a live table there, then prove both paths on dev:
 
