@@ -25,12 +25,17 @@ ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 
 ID_SEP = "|"
 
-_HEX = frozenset("0123456789abcdef")
+
+# Stdlib only: derive_artifact_id.py imports this module on the runner's bare python3.
+def _is_hex(s: str, n: int) -> bool:
+    return len(s) == n and all(c in "0123456789abcdef" for c in s)
 
 
-def _is_hex(value: str, length: int) -> bool:
-    # String ops, not `regex`: derive_artifact_id.py loads this module on the bare image python.
-    return len(value) == length and set(value) <= _HEX
+def _strip_dev_suffix(name: str) -> str:
+    for suffix in ("-devel", "-dev"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 # The component stamped on rows when the caller names none. A DEFAULT, not a constant: a
@@ -320,12 +325,7 @@ class ArtifactIdentity:
             raise ValueError(f"id12 must be 12 hex characters: {id12!r}")
         repo_name = repo.rsplit("/", 1)[-1].split(":", 1)[0]
         return cls(
-            component=component
-            or (
-                repo_name.removesuffix("-devel")
-                if repo_name.endswith("-devel")
-                else repo_name.removesuffix("-dev")
-            ),
+            component=component or _strip_dev_suffix(repo_name),
             artifact_name=name or repo_name,
             id12=id12 or digest[7:19],
             arch=DerivedId.arch(arch),

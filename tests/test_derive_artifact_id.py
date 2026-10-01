@@ -247,9 +247,10 @@ def test_the_package_init_is_never_run(derive_mod):
 
 
 def test_it_derives_with_no_third_party_modules_installed(tmp_path):
-    # The script runs on the bare image python, which has neither clickhouse_connect nor
-    # regex. A module that needs one makes it exit 0 having derived NOTHING -- silently,
-    # which is the exact failure mode this whole chain exists to remove.
+    # The regression this guards: importing the package __init__ pulled in clickhouse_connect,
+    # so on a runner without it the script exited 0 having derived NOTHING -- silently, which
+    # is the exact failure mode this whole chain exists to remove.
+    # `regex` too: the action runs on the runner's bare python3, which does not have it.
     base = tmp_path / "spyre_artifact_id.txt"
     base.write_text(BASE)
     blocker = (
