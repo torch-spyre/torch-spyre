@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from xml.etree import ElementTree
 
+import regex as re
+
 HELPER = Path(__file__).resolve().parent / "oot_framework" / "utils" / "mark_retried.py"
 _spec = importlib.util.spec_from_file_location("mark_retried", HELPER)
 assert _spec is not None and _spec.loader is not None
@@ -76,3 +78,11 @@ def test_an_unknown_kind_is_refused(tmp_path):
     )
     assert run.returncode != 0 and "usage" in run.stderr
     assert "result.retried" not in path.read_text()
+
+
+def test_every_signal_retry_in_run_test_marks_its_xml():
+    # The serial and the multi-card --parallel paths each re-run a signalled file with -n1.
+    script = (HELPER.parents[1] / "run_test.sh").read_text(encoding="utf-8")
+    retries = len(re.findall(r"_xdist_args=\(\"-n1\"", script))
+    assert retries >= 2
+    assert script.count('mark_retried.py" signal') == retries

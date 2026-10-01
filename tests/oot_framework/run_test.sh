@@ -2702,6 +2702,7 @@ _run_parallel_across_cards() {
                                 fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+                                    python3 "${_SCRIPT_DIR}/utils/mark_retried.py" signal "$_shard_xml" || true
                                 fi
                                 # Accumulate counts from xdist retry output.
                                 if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
