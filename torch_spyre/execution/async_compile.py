@@ -47,6 +47,7 @@ from .kernel_cache import (
     get_cached_kernel_dir,
     get_kernel_registry,
     load_symbol_kinds,
+    record_kernel_name,
     save_symbol_kinds,
     _move_to_failed_dir,
 )
@@ -419,8 +420,9 @@ class SpyreAsyncCompile(AsyncCompile):
         )
 
         if use_cache:
-            # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
-            # neither generate_bundle nor the backend compiler runs at all.
+            # Hash the specs in-memory before compiling.  On a cache hit
+            # neither generate_bundle nor the backend compiler runs at all
+            # (only the kernel_name.txt marker is touched).
             try:
                 cache_key = compute_specs_hash(
                     specs, kernel_name=kernel_name, pool_size=pool_size
@@ -439,6 +441,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 if cached_dir is not None:
                     logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
                     get_kernel_registry().record_hit(cache_key)
+                    record_kernel_name(cached_dir, kernel_name)
                     return SpyreSDSCKernelRunner(
                         kernel_name,
                         cached_dir,
@@ -451,7 +454,9 @@ class SpyreAsyncCompile(AsyncCompile):
 
                 # Allocate a temp dir INSIDE the cache root (same filesystem)
                 # so the rename in commit_compile_dir is atomic on POSIX.
-                compile_dir: str = allocate_compile_dir(cache_key)
+                compile_dir: str = allocate_compile_dir(
+                    cache_key, kernel_name=kernel_name
+                )
                 try:
                     symbol_kinds = _compile_to_dir(
                         kernel_name, compile_dir, specs, pool_size

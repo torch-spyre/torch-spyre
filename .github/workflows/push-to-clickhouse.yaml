@@ -19,7 +19,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
+        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
       component:
@@ -177,6 +177,8 @@ jobs:
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      # Empty on a manual re-ingest, which then keeps first-write-wins.
+      TRIGGERING_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || '' }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
@@ -273,7 +275,7 @@ jobs:
       # along are simply ignored.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # page, and a run with more jobs than that (e.g. the tests /
       # integration-tests matrices) silently lost every artifact past the
       # first page, with no error — rows just never showed up in ClickHouse.
       # `--paginate` applies `--jq` per page and concatenates the filtered
@@ -391,6 +393,7 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.

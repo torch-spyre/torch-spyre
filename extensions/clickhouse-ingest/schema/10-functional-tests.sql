@@ -2,14 +2,16 @@
 -- (and hf_/si_ mirrors). Rationale for every decision: docs/clickhouse_v2_functional_tests_schema.md
 --
 -- Bag-column convention, uniform with 20-artifacts.sql: `props` = Map, open-ended, never in a
--- key; `tags` = Array, a SET, and IN the identity hash (sort before hashing).
+-- key; `tags` = Array, a SET. test_cases.tags are the identity tags (hashed); run-context tags
+-- (identity.RUN_CONTEXT_TAG_NAMESPACES: arch, tier, cadence) live on test_case_runs.tags instead.
 
 CREATE TABLE IF NOT EXISTS test_cases
 (
     ts           DateTime DEFAULT now(),
 
-    -- uuid5 over (component, classname, name, sorted(tags)) -- derived, so one test reconciles
-    -- across runs; re-tagging mints a new id, so trend queries group on the plain triple, never test_case_id.
+    -- uuid5 over (component, classname, name, sorted(identity tags)) -- derived, so one test
+    -- reconciles across runs, arches and tiers; re-tagging mints a new id, so trend queries group
+    -- on the plain triple, never test_case_id.
     test_case_id UUID,
 
     component    LowCardinality(String),

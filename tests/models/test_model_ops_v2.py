@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
+import hashlib
+import json
 import logging
 import os
 import sys
+import warnings
 from typing import Any, Dict, List, Optional, Set
 
 import pytest
@@ -41,11 +44,16 @@ from oot_framework.oot_test_constants import ENV_TEST_CONFIG
 from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
 from oot_framework.oot_test_utilities import (
     print_test_tags_oot,
+    record_properties,
     _format_input_args_shapes,
+    _input_args_record,
     _RUNTIME_SHAPES,
+    _RUNTIME_TAGS,
 )
+from model_ops_capability import capability_properties
 from op_registry import OP_REGISTRY, OpAdapter
 import shared_config
+from torch_spyre.ops.fallbacks import FallbackWarning
 
 # Logger setup
 logger = logging.getLogger(__name__)
@@ -89,6 +97,14 @@ class ModelOpInfo(OpInfo):
 # ---------------------------------------------------------------------------
 
 
+def _signature_digest(op_name: str, ops_item: OpsNamedItem, salt: int = 0) -> str:
+    """8 decimal digits naming an op's inputs, so a test keeps its name when the YAML
+    around it changes. Decimal, as the `__<digits>` suffix is what the log parser strips."""
+    inputs = ops_item.sample_inputs_func.model_dump(mode="json", exclude_unset=True)
+    payload = json.dumps([op_name, inputs, salt], sort_keys=True, default=str)
+    return f"{int(hashlib.sha1(payload.encode()).hexdigest(), 16) % 10**8:08d}"
+
+
 def _build_model_ops_db() -> List[ModelOpInfo]:
     """One ModelOpInfo per edits.ops.include entry for TestSpyreModelOps::test_model_ops_db."""
     path = os.environ.get(ENV_TEST_CONFIG)
@@ -116,7 +132,6 @@ def _build_model_ops_db() -> List[ModelOpInfo]:
 
     db: List[ModelOpInfo] = []
     seen: Set[str] = set()
-    idx = 0
 
     for test_entry in matching_entries:
         for ops_item in test_entry.edits.ops.include:
@@ -129,12 +144,14 @@ def _build_model_ops_db() -> List[ModelOpInfo]:
                 )
                 continue
 
+            # A repeated signature is salted rather than dropped: its TestEntry may differ.
             safe_op = op_name.replace(".", "_")
-            unique_name = f"{safe_op}__{idx}"
-
-            assert unique_name not in seen, f"Duplicate model_ops_db key: {unique_name}"
+            salt = 0
+            unique_name = f"{safe_op}__{_signature_digest(op_name, ops_item)}"
+            while unique_name in seen:
+                salt += 1
+                unique_name = f"{safe_op}__{_signature_digest(op_name, ops_item, salt)}"
             seen.add(unique_name)
-            idx += 1
 
             # choose a representative dtype used as a part of test name
             args = ops_item.sample_inputs_func.args
@@ -392,6 +409,24 @@ class TestSpyreModelOps(TestCase):
         if not ops_item.sample_inputs_func.has_inputs():
             pytest.skip(f"No inputs specified for op {op_name!r}")
 
+        # Only a test that got past the filters and dedupe above carries a verdict.
+        capability = capability_properties(
+            op_name,
+            subject=next(
+                (
+                    t[len("model__") :]
+                    for t in _RUNTIME_TAGS.get(method_name, op.op_tags)
+                    if t.startswith("model__")
+                ),
+                "",
+            ),
+            variant=next(
+                (t for t in reversed(op.op_tags) if t.startswith("torch.")), ""
+            ),
+            args=_input_args_record(ops_item.sample_inputs_func.args),
+        )
+        record_properties(self, capability)
+
         # Config values — sourced entirely from TestEntry / OpsNamedItem
         seed: Optional[int] = op.seed
         description: Optional[str] = ops_item.description
@@ -514,10 +549,14 @@ class TestSpyreModelOps(TestCase):
             cpu_sample = adapter.pre(cpu_sample)
             test_sample = adapter.pre(test_sample)
 
-        # Run
+        # Run. FallbackWarning is recorded per test ("always"), since it is filtered "once"
+        # per process; every caught warning is re-issued so the summary is unchanged.
         fn = adapter.fn
+        caught: List[warnings.WarningMessage] = []
+        ran = False
         try:
-            with torch.no_grad():
+            with torch.no_grad(), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", FallbackWarning)
                 ref_out = fn(cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs)
                 test_out = _run_op(fn, test_sample, test_device, compile_backend)
                 if adapter.is_inplace:
@@ -542,7 +581,24 @@ class TestSpyreModelOps(TestCase):
                 case_name=method_name,
                 description=description,
             )
+            ran = True
         finally:
+            fallbacks = set()
+            for w in caught:
+                # v1 model-ops: delete once the dashboard reads v2 capabilities
+                warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+                m = re.match(r"(aten\.\S+) is falling back", str(w.message))
+                if m and issubclass(w.category, FallbackWarning):
+                    fallbacks.add(m.group(1))
+            # Only an op that ran says where it ran; one that failed is a verdict on Spyre.
+            if capability:
+                record_properties(
+                    self,
+                    {
+                        "capability.backend": "cpu" if ran and fallbacks else "spyre",
+                        "capability.prop.fallback_ops": " ".join(sorted(fallbacks)),
+                    },
+                )
             torch._dynamo.reset()
 
 

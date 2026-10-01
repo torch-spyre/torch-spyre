@@ -2311,6 +2311,54 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 [(0, 0), (1, 1)],
             )
 
+    def _carry_update(self):
+        """Make ``plain`` a loop carry updated by a new op ``update``."""
+        x = _isym("x")
+        storage_op = self.op_by_name["plain"]
+        update_op = self._op("update")
+        record = LoopCarryRecord(storage_name="plain", update_name="update")
+        storage_op._loop_carry_record = record
+        update_op._loop_carry_record = record
+        self.op_by_name["update"] = update_op
+        self.divisions["update"] = self.parent_divs
+        self.rw[update_op] = MagicMock(
+            writes=[MemoryDep("update", x, (x,), (8,))],
+            reads=[MemoryDep("plain", x, (x,), (8,))],
+        )
+        return update_op
+
+    def test_reading_a_loop_carry_update_is_an_edge_on_its_storage(self):
+        # The update writes through the carry's storage, so a later read of the
+        # update's name reads the storage's LX bytes: it needs the storage's
+        # ownership, although the update itself is never an LX buffer.
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        update_op = self._carry_update()
+        x = _isym("x")
+        self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))
+
+        with self._patches():
+            carry_edges = {
+                "update": allocator._loop_carry_update_edge(
+                    update_op, self.op_by_name, {}
+                )
+            }
+            edges = allocator._loop_carry_read_edges(self.consumer_op, carry_edges, {})
+            self.assertEqual(set(edges), {"plain"})
+            edge = edges["plain"]
+            self.assertIs(edge.consumer_op, self.consumer_op)
+            self.assertEqual(edge.read_dep.name, "plain")
+            self.assertEqual(
+                edge.match_pairs(
+                    [cd.splits for cd in self.parent_divs],
+                    [cd.splits for cd in self.consumer_divs],
+                ),
+                [(0, 0), (1, 1)],
+            )
+            # The update's own write is the carry edge, not a read edge.
+            self.assertEqual(
+                allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
+            )
+
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
         """Per-pair reimplementation of what ``match_pairs`` computes in

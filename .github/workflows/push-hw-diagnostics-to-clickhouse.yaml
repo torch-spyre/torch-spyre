@@ -71,6 +71,15 @@ jobs:
           echo "Resolved tier: ${TIER:-<none>, using ${TRIGGERING_WORKFLOW}}"
           echo "tier=${TIER:-${TRIGGERING_WORKFLOW}}" >> "${GITHUB_OUTPUT}"
 
+      # The orchestrator's uuid, as push-to-clickhouse.yaml recovers it: without it these rows
+      # hash their own run_id and never join the run's cases or its artifact verdict.
+      - name: Recover threaded run_id
+        id: threaded-run-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Recover this leg's artifact_id
         id: leg-artifact-id
         uses: ./.github/actions/recover-threaded-run-id
@@ -87,6 +96,7 @@ jobs:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          threaded-run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}

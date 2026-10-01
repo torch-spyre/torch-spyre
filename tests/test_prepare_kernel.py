@@ -387,18 +387,27 @@ class TestPrepareKernel:
             # gone), so nothing here depends on the program-region count.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Verify JobPlan was created
-            assert job_plan is not None
-            assert isinstance(job_plan, torch_spyre._C.JobPlan)
-
             # Verify it has 2 steps (HostCompute-with-H2D merged, Compute)
             # The adjacent DataTransfer H2D is collapsed into the HostCompute step
             # by translateComputeOnHostWithH2D
             assert job_plan.num_steps() == 2
-
-            # Verify the step types
-            assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "Compute"
+            assert [job_plan.get_step_type(i) for i in range(2)] == [
+                "HostCompute",
+                "Compute",
+            ]
+            # Roles are assigned by step type in the ctors, so the bare triple
+            # already carries the split roles -- the split is real.
+            assert [job_plan.get_step_stream_role(i) for i in range(2)] == [
+                "Prep",
+                "Dev",
+            ]
+            # pipeline_barrier stays True on EVERY step of the bare split:
+            # overlap comes only from the S_prep/S_dev split + flex's dynamic
+            # cross-stream events, never from relaxing a barrier.
+            assert [job_plan.get_step_pipeline_barrier(i) for i in range(2)] == [
+                True,
+                True,
+            ]
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
@@ -725,13 +734,7 @@ class TestPrepareKernel:
                 self._prepare_with_symbolic_args(spyrecode_dir, symbolic_args=True)
 
     def test_pipeline_barrier_dma_steps_default_true(self):
-        """H2D (merged into HostCompute) and D2H steps carry pipeline_barrier correctly.
-
-        Tthe correction H2D is owned by the HostCompute step; The plan no longer contains
-        a separate H2D step at index 1.  We instead verify that the merged HostCompute
-        step carries pipeline_barrier=False (overlap-eligible) and the Compute step at
-        index 1 carries True.
-        """
+        """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
@@ -742,8 +745,8 @@ class TestPrepareKernel:
             assert job_plan.num_steps() == 2
             assert job_plan.get_step_type(0) == "HostCompute"
             assert job_plan.get_step_type(1) == "Compute"
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute (merged) must be overlap-eligible: pipeline_barrier=False"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute (merged) must must carry pipeline_barrier=True by default"
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "Compute step must carry pipeline_barrier=True by default"
@@ -794,10 +797,11 @@ class TestPrepareKernel:
             assert job_plan.get_step_type(0) == "HostCompute"
             assert job_plan.get_step_type(1) == "Compute"
 
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute step must carry pipeline_barrier=False to preserve "
-                "host/device overlap (produce runs while prior device compute "
-                "is still in flight)"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute step must carry pipeline_barrier=True: it is a "
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "Compute step must carry pipeline_barrier=True: it is a "

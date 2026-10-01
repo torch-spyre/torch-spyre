@@ -55,7 +55,8 @@ Output formats
   paths         Space-separated list of absolute paths (Makefile / bash use).
   matrix-json   JSON object {"suite": [{name, config, runner}, ...]} for
                 GitHub Actions dynamic-matrix consumption.  "config" is the
-                path relative to --config-dir.
+                path relative to --config-dir.  A suite named in --flags-map
+                also carries "extra_test_flags".
 
 Runner overrides
 ----------------
@@ -64,6 +65,10 @@ Runner overrides
   a mapping of {config-relative-path: runner-label}.  Suites not listed in the
   map use the default runner (spyre_pf_x1).  This argument is optional and only
   relevant for matrix-json output.
+
+  --flags-map <yaml-file> likewise maps a config path, or a directory prefix
+  ending in "/", to the pytest flags that suite runs with instead of the
+  caller's extra_test_flags.
 
 Usage
 -----
@@ -128,14 +133,22 @@ def _load_labels(path: Path) -> list:
     return list(tsc.get("labels") or [])
 
 
-def _load_runner_map(runner_map_path: str) -> dict:
-    """Load {config-relative-path: runner-label} from a YAML file."""
-    path = Path(runner_map_path)
+def _load_path_map(map_path: str) -> dict:
+    """Load a {config-relative-path: value} YAML file (--runner-map, --flags-map)."""
+    path = Path(map_path)
     if not path.is_file():
-        sys.exit(f"ERROR: --runner-map file not found: {path}")
+        sys.exit(f"ERROR: map file not found: {path}")
     with path.open() as fh:
         data = yaml.safe_load(fh) or {}
     return {k: str(v) for k, v in data.items()}
+
+
+def _suite_flags(flags_map: dict, rel: str) -> str:
+    """The flags --flags-map gives this config: an exact path, else the longest prefix."""
+    if rel in flags_map:
+        return flags_map[rel]
+    prefixes = [k for k in flags_map if k.endswith("/") and rel.startswith(k)]
+    return flags_map[max(prefixes, key=len)] if prefixes else ""
 
 
 # The tier ladder. A config's labels also carry suite groups and one-off markers;
@@ -221,6 +234,16 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--flags-map",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional YAML file mapping config-relative paths (or 'dir/' prefixes) "
+            "to the pytest flags that suite runs with. Only used with --format "
+            "matrix-json."
+        ),
+    )
+    ap.add_argument(
         "--exclude-tiers",
         default="",
         help=(
@@ -255,7 +278,8 @@ def main() -> None:
 
     runner_map: dict = {}
     if args.runner_map:
-        runner_map = _load_runner_map(args.runner_map)
+        runner_map = _load_path_map(args.runner_map)
+    flags_map: dict = _load_path_map(args.flags_map) if args.flags_map else {}
 
     results = []
     skipped_covered = 0
@@ -276,6 +300,7 @@ def main() -> None:
                 "name": _display_name(cfg, config_dir),
                 "config": rel,
                 "runner": runner_map.get(rel, "spyre_pf_x1"),
+                "flags": _suite_flags(flags_map, rel),
                 "path": str(cfg),
             }
         )
@@ -297,7 +322,12 @@ def main() -> None:
         print(" ".join(r["path"] for r in results))
     else:
         matrix = [
-            {"name": r["name"], "config": r["config"], "runner": r["runner"]}
+            {
+                "name": r["name"],
+                "config": r["config"],
+                "runner": r["runner"],
+                **({"extra_test_flags": r["flags"]} if r["flags"] else {}),
+            }
             for r in results
         ]
         print(json.dumps({"suite": matrix}))

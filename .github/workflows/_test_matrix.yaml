@@ -103,6 +103,16 @@ on:
         required: false
         type: string
         default: regression
+      config_dir:
+        description: Run only this tests/configs/ subdir (e.g. model_ops_tests); empty = torch_spyre_tests, or the whole tree for trunk
+        required: false
+        type: string
+        default: ''
+      report_retention_days:
+        description: Days to keep the uploaded JUnit XML reports
+        required: false
+        type: number
+        default: 10
 
       # Spyre-Next integration path: test the PRE-BAKED dev image directly instead
       # of checking out + rebuilding torch-spyre on the runner. The ephemeral ARC
@@ -197,6 +207,8 @@ env:
   # — so run-test-suite's default relative '.venv' cannot resolve after it cd's
   # into the source dir. The prebaked path passes this absolute path instead.
   PREBAKED_VENV_PATH: /home/senuser/.venv
+  # tests/configs/ subdirs with their own caller (or job); the default trunk scan skips them.
+  DEDICATED_CONFIG_DIRS: distributed_tests model_ops_tests upstream_tests upstream_tests_beta
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -207,14 +219,7 @@ jobs:
   # the configs that match inputs.test_type.  The test job below consumes this
   # output via fromJSON so that only the requested subset of runners starts.
   #
-  # test_type=trunk is the exception: it scans the whole tests/configs/ tree
-  # (torch_spyre_tests, model_ops_tests, upstream_tests, upstream_tests_beta),
-  # matching the Makefile's TEST_TYPE=trunk semantics (see Makefile's TEST_TYPE
-  # docs) instead of just torch_spyre_tests. distributed_tests is excluded
-  # from that wider scan even though its configs carry the trunk label too --
-  # it is already covered by the dedicated test_multi_spyre job below (needs
-  # spyre_pf_x2 multi-card runners), so including it here would double-run
-  # those configs through this single-card matrix as well.
+  # trunk scans all of tests/configs/ minus DEDICATED_CONFIG_DIRS; config_dir scans just that subdir.
   # ---------------------------------------------------------------------------
   generate_matrix:
     name: Generate test matrix (${{ inputs.test_type || 'regression' }})
@@ -227,6 +232,8 @@ jobs:
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
       resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
+      # Dir that matrix.suite.config is relative to.
+      config_root: ${{ steps.filter.outputs.config_root }}
       # [{tier, covering_run}, ...] for the tiers this run SKIPS. The ingest copies those
       # runs' case rows in, so a delta run reports its whole tier rather than only the part
       # it executed. Empty ([] or "") whenever the delta is off or the lookup fails.
@@ -238,19 +245,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-          # trunk fetches the whole tests/configs/ tree (see the filter step
-          # below); every other tier stays scoped to torch_spyre_tests.
+          # trunk and config_dir scan the whole tests/configs/ tree; every other tier stays scoped to torch_spyre_tests.
           sparse-checkout: |
-            ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
+            ${{ ((inputs.test_type || 'regression') == 'trunk' || inputs.config_dir != '') && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
             .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
+            .github/suite_test_flags.yaml
           sparse-checkout-cone-mode: false
 
       - name: Filter configs by TEST_TYPE
         id: filter
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
+          CONFIG_DIR: ${{ inputs.config_dir }}
           ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
           DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           DELTA_ARCH: ${{ inputs.runner_label }}
@@ -287,6 +295,7 @@ jobs:
             exit 0
           fi
 
+          # v1 model-ops: delete once the dashboard reads v2 capabilities
           # capability is the same kind of exception as perf: the model-ops suites carry no
           # test_suite_config.labels either, so the config filter would return an empty matrix.
           # Unlike perf it IS a matrix -- one job per model config -- so the suite list is
@@ -337,36 +346,39 @@ jobs:
             echo "tier delta: skipping configs already covered by ${EXCLUDE_TIERS}"
           fi
 
-          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+          if [ "${RAW_TEST_TYPE}" = "trunk" ] || [ -n "${CONFIG_DIR}" ]; then
+            CONFIG_ROOT=tests/configs
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs \
               --test-type "${RAW_TEST_TYPE}" \
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
+              --flags-map .github/suite_test_flags.yaml \
               --format matrix-json)
           else
+            CONFIG_ROOT=tests/configs/torch_spyre_tests
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs/torch_spyre_tests \
               --test-type "${RAW_TEST_TYPE}" \
               "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
+              --flags-map .github/suite_test_flags.yaml \
               --format matrix-json)
           fi
 
-          # distributed_tests configs carry the trunk label too but are
-          # exclusively run by the test_multi_spyre job below (multi-card
-          # runners) -- strip them back out so the wider trunk scan above
-          # doesn't also schedule them through this single-card matrix.
-          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+          # Whole-tree scans keep only CONFIG_DIR when set, else drop DEDICATED_CONFIG_DIRS.
+          if [ "${CONFIG_ROOT}" = "tests/configs" ]; then
             matrix=$(echo "${matrix}" | python3 -c "
-          import json, sys
+          import json, os, sys
+          keep, drop = os.environ['CONFIG_DIR'].strip('/'), os.environ['DEDICATED_CONFIG_DIRS'].split()
           data = json.load(sys.stdin)
-          data['suite'] = [s for s in data['suite'] if not s['config'].startswith('distributed_tests/')]
+          data['suite'] = [s for s in data['suite'] if (s['config'].startswith(keep + '/') if keep else s['config'].split('/')[0] not in drop)]
           print(json.dumps(data))
           ")
           fi
 
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "config_root=${CONFIG_ROOT}" >> "$GITHUB_OUTPUT"
 
           # test_type is now the literal label vocabulary (smoke/unit/
           # integration/regression/trunk) with no alias-resolution layer, so
@@ -390,7 +402,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 7
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Job 0a: derive THIS LEG'S artifact identity
@@ -414,6 +426,12 @@ jobs:
     timeout-minutes: 10
     # Belt and braces with the action's degrade-to-empty: telemetry never reddens a run.
     continue-on-error: true
+    # For jobs that ingest inline (perf), which cannot read the uploaded artifact.
+    outputs:
+      record: >-
+        ${{ steps.derive.outputs.artifact_id != '' && format('{0}|{1}|{2}',
+        steps.derive.outputs.artifact_id, steps.derive.outputs.base_artifact_id,
+        steps.delta.outputs.installed) || '' }}
     steps:
       # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
       # At THIS ref, like every other job -- one definition of the id formula per commit.
@@ -661,23 +679,14 @@ jobs:
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          # generate_matrix's `filter.outputs.matrix` emits `config` relative to
-          # the --config-dir it scanned: trunk scans the full tests/configs/
-          # tree (see the sparse-checkout step above), so matrix.suite.config
-          # already carries its subdir (e.g. "model_ops_tests/foo.yaml");
-          # every other tier scans tests/configs/torch_spyre_tests/ only, so
-          # matrix.suite.config is bare (e.g. "foo.yaml") and needs that prefix
-          # re-added here. Hard-coding the torch_spyre_tests/ prefix regardless
-          # of tier double-prefixes trunk configs into nonexistent paths
-          # ("No YAML config file(s) found").
-          config: ${{ needs.generate_matrix.outputs.resolved_test_type == 'trunk' && format('tests/configs/{0}', matrix.suite.config) || format('tests/configs/torch_spyre_tests/{0}',
-            matrix.suite.config) }}
+          # matrix.suite.config is relative to the dir generate_matrix scanned.
+          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv (a sibling of the source, not inside it); normal: the
           # checkout (default 'torch-spyre') + its local '.venv'.
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ inputs.extra_test_flags }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
@@ -701,7 +710,7 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
-          retention-days: 10
+          retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
       # Records this leg's suite as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
@@ -750,7 +759,7 @@ jobs:
   # ---------------------------------------------------------------------------
   perf:
     name: Perf benchmark
-    needs: [generate_matrix, build_torch_spyre]
+    needs: [generate_matrix, build_torch_spyre, artifact_identity]
     if: >-
       !cancelled() &&
       github.event_name != 'pull_request' &&
@@ -897,6 +906,7 @@ jobs:
           trigger-type: perf
           # perf runs on x86 GitHub-hosted runners, so the rows are x86_64.
           platform: x86_64
+          artifact-id: ${{ needs.artifact_identity.outputs.record }}
           # Workspace sparse-checkout of this ref's .github — not the baked
           # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
           torch-spyre-dir: ${{ github.workspace }}
@@ -950,6 +960,7 @@ jobs:
           echo "ClickHouse ingest: ${INGEST}"
           echo "reason: ${REASON}"
 
+  # v1 model-ops: delete once the dashboard reads v2 capabilities
   # ---------------------------------------------------------------------------
   # Job 1c: model-ops capability suites  (test_type=capability only)
   #
@@ -1099,7 +1110,7 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn   # warn, not fail, if pytest itself crashed
-          retention-days: 10
+          retention-days: ${{ inputs.report_retention_days }}
 
       - name: Annotate job with suite metadata
         if: always()
@@ -1142,6 +1153,7 @@ jobs:
     # this job on the RPM path, where build_torch_spyre is intentionally skipped.
     if: >-
       !cancelled() &&
+      inputs.config_dir == '' &&
       (needs.generate_matrix.outputs.resolved_test_type == '' ||
        needs.generate_matrix.outputs.resolved_test_type == 'regression' ||
        needs.generate_matrix.outputs.resolved_test_type == 'trunk' ||
@@ -1279,7 +1291,7 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
-          retention-days: 10
+          retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
       # See the `test` job's identical step: lets collect_failed_suites rebuild a retry matrix without relying on this job's (continue-on-error-muddied) own conclusion.
@@ -1476,12 +1488,12 @@ jobs:
         id: run_tests
         uses: ./.github/actions/run-test-suite
         with:
+          retried: pod
           suite_name: ${{ matrix.suite.name }}
-          config: ${{ needs.generate_matrix.outputs.resolved_test_type == 'trunk' && format('tests/configs/{0}', matrix.suite.config) || format('tests/configs/torch_spyre_tests/{0}',
-            matrix.suite.config) }}
+          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
-          extra_test_flags: ${{ inputs.extra_test_flags }}
+          extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
@@ -1499,7 +1511,7 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
-          retention-days: 10
+          retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
   # ---------------------------------------------------------------------------
@@ -1584,6 +1596,7 @@ jobs:
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         uses: ./.github/actions/run-test-suite
         with:
+          retried: pod
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
@@ -1606,7 +1619,7 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
-          retention-days: 10
+          retention-days: ${{ inputs.report_retention_days }}
           overwrite: true
 
   # ---------------------------------------------------------------------------
