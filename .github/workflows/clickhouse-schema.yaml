@@ -8,6 +8,7 @@ on:
     paths:
       - extensions/clickhouse-ingest/schema/**
       - extensions/clickhouse-ingest/spyre_clickhouse_ingest/apply_schema.py
+      - extensions/clickhouse-ingest/spyre_clickhouse_ingest/sandbox.py
       - .github/workflows/clickhouse-schema.yaml
 
 concurrency:
