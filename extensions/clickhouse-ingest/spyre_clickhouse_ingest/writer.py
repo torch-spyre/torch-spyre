@@ -125,6 +125,11 @@ class TestResultWriter(RunWriter):
         "component = {component:String} AND run_id = {run_id:UUID}"
         " AND props['source_file'] = {sf:String}"
     )
+    # The counters sum rows, so a row that restates another row of the run is dropped: an exact
+    # copy, an older attempt of the same file, a reused copy of a case the run executed, or a
+    # skip where another file of the run executed the case. Differing outcomes otherwise stay:
+    # one test_case_id can be two tests (names differing only in case, hf-adapters' base and
+    # _adapter configs). Migration 009 applies the same rules to rows already written.
 
     @classmethod
     def already_ingested(
@@ -277,6 +282,9 @@ class TestResultWriter(RunWriter):
                 "measurements": measured,
             }
             run_rows.append(run_row)
+        run_rows, superseded = cls._one_per_case(
+            client, db, component, run_id, run_rows
+        )
         written = cls._flush(client, db, ident_rows, run_rows)
         # Checked before any batch is written, so a type's second batch is not refused.
         landed = {
@@ -299,6 +307,19 @@ class TestResultWriter(RunWriter):
                     disc_keys=disc_keys,
                     shard=source_file,
                 )
+        if superseded:
+            # After the insert, so a failed insert never loses the outcome it would replace.
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND audit_uuid IN {uuids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "uuids": superseded,
+                },
+            )
+            cls._rebuild_counters(client, db, run_id, component)
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
         for problem, n in sorted(problems.items()):
             cls._warn(n, f"capability declaration(s) with {problem}")
@@ -356,6 +377,82 @@ class TestResultWriter(RunWriter):
                 "props": {k: v for k, v in props.items() if v},
             }
         )
+
+    @staticmethod
+    def _restates(run_id: str, a: dict, b: dict) -> bool:
+        """Does row `a` make row `b` redundant in the run's counts?"""
+
+        def copied(r):
+            return r["ran_in"] not in ("", str(run_id))
+
+        def ran(r):
+            return not copied(r) and r["status"] != "skipped"
+
+        if ran(a) and copied(b):
+            return True
+        if a["source_file"] == b["source_file"] and copied(a) == copied(b):
+            if a["attempt"] != b["attempt"]:
+                return a["attempt"] > b["attempt"]
+            return all(a[k] == b[k] for k in ("status", "duration_s", "fail_message"))
+        return ran(a) and not ran(b) and not copied(b)
+
+    @classmethod
+    def _one_per_case(cls, client, db: str, component: str, run_id: str, rows: list):
+        """(rows to insert, audit_uuids they make redundant), per the rules above."""
+
+        def facts(r):
+            return {
+                "status": r["status"],
+                "duration_s": round(float(r["duration_s"]), 3),
+                "fail_message": r["fail_message"],
+                "ran_in": r["props"].get("ran_in", ""),
+                "attempt": int(r["props"].get("run_attempt") or 0),
+                "source_file": r["props"].get("source_file", ""),
+            }
+
+        batch: dict = {}
+        for r in rows:
+            same = batch.setdefault(r["test_case_id"], [])
+            if not any(cls._restates(run_id, facts(o), facts(r)) for o in same):
+                same.append(r)
+        ids = list(batch)
+        held: dict = {}
+        for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
+            for tcid, uuid, status, dur, msg, ran_in, attempt, sf in client.query(
+                "SELECT test_case_id, audit_uuid, status, duration_s, fail_message, "
+                "props['ran_in'], props['run_attempt'], props['source_file'] "
+                f"FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND test_case_id IN {ids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
+                },
+            ).result_rows:
+                held.setdefault(str(tcid), []).append(
+                    {
+                        "audit_uuid": str(uuid),
+                        "status": status,
+                        "duration_s": round(float(dur), 3),
+                        "fail_message": msg,
+                        "ran_in": ran_in,
+                        "attempt": int(attempt or 0),
+                        "source_file": sf,
+                    }
+                )
+        keep, superseded = [], set()
+        for tcid, new in batch.items():
+            rows_held = held.get(str(tcid), [])
+            for r in new:
+                f = facts(r)
+                if any(cls._restates(run_id, h, f) for h in rows_held):
+                    continue
+                keep.append(r)
+                superseded |= {
+                    h["audit_uuid"] for h in rows_held if cls._restates(run_id, f, h)
+                }
+        return keep, sorted(superseded)
 
     @staticmethod
     def _recorded(case: dict) -> tuple:

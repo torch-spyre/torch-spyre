@@ -916,3 +916,22 @@ def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
     c = _ArtifactClient()
     ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
     assert legs and c.inserts == []
+
+
+def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
+    # pytest-rerunfailures' shape: each failed attempt is a bare repeat of the testcase.
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest' tests='2'>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_once'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    props = {c["name"]: dict(c["properties"]) for c in cases}
+    assert props["test_flaky"] == {"result.reruns": "2"}
+    assert props["test_once"] == {}
+    assert run["total_tests"] == 2
