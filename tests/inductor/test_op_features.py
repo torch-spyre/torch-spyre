@@ -254,7 +254,7 @@ class SymbolicTiledFeatureTest(TestCase):
         """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and
         ``_loop_reread_bytes`` is reached unconditionally for an output-tiled
         matmul, so it used to lose the whole objective to a ValueError there --
-        but only once ``_tiled_rows`` already lets execution get that far. On
+        but only once a symbolic ``rpc`` no longer raises earlier. On
         the TRUE parent commit, the underfill-eff loop's
         ``o.tile_rows_per_core > 0`` comparison (``predict_ops``, a few lines
         before ``_loop_reread_bytes`` is called) raises the SAME TypeError as
@@ -338,11 +338,11 @@ class SymbolicTiledFeatureTest(TestCase):
         )
 
     def test_a_working_set_with_symbolic_cols_does_not_break_the_spill_gate(self):
-        """``_lx_spill_working_set`` multiplies ``rpc * _op_cols(o)``; ``_tiled_rows``
-        neutralizes a symbolic ``rpc`` but ``_op_cols`` -- an arg's own LOGICAL row
-        width, e.g. a dynamic-shape symbol, NOT a co-optimizer variable -- was not
-        similarly guarded. ``_lx_spill_bw_derate`` then compares the resulting
-        symbolic working set against its byte cap (``if ws <= _cap``), the same
+        """``_lx_spill_working_set`` multiplies ``rpc * _op_cols(o)``; a
+        symbolic ``rpc`` is a solver variable it keeps, but ``_op_cols`` -- an
+        arg's own LOGICAL row width, e.g. a dynamic-shape symbol, NOT a
+        co-optimizer variable -- was not guarded. ``_lx_spill_bw_derate`` then
+        compares the resulting symbolic working set against its byte cap (``if ws <= _cap``), the same
         "cannot determine truth value of Relational" failure as #4233 from an
         unrelated source. Built from scratch (independent of ``_symbolize`` and of
         the fixture's own residency) so ``rpc`` stays concrete and only ``cols`` is
@@ -357,7 +357,7 @@ class SymbolicTiledFeatureTest(TestCase):
             cores=1,
             dtype_bytes=2,
             tiles_output_dim=True,
-            tile_rows_per_core=16.0,  # concrete: not neutralized by `_tiled_rows`
+            tile_rows_per_core=16.0,  # concrete: only `cols` is symbolic
             args=[
                 ArgTraffic(
                     name="out0", role="output", is_lx=False, elems=1024, logical=[]
@@ -622,6 +622,89 @@ class SymbolicMatmulSplitCostTest(TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "unresolvable axes"):
             predict_ops([lost], self._params())
+
+
+class SymbolicTileCountCostTest(TestCase):
+    """A candidate coarse tiling whose tile COUNT is an undecided symbol.
+
+    ``extract_op_features(sym_tiling=...)`` hands ``predict_ops`` a
+    ``tiles_output_dim`` that is a CONDITION (``tile > 1``) rather than a bool,
+    since the solver may pick the candidate that leaves the axis untiled. Every
+    branch on the flag goes through ``cost_model._select``; binding the symbol
+    must then give exactly the cost of the matching concrete op -- untiled at
+    1, output-tiled at 4.
+    """
+
+    TILE = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+    ROWS = 1024.0
+
+    def _at(self, op: OpFeatures, count) -> OpFeatures:
+        if isinstance(count, sympy.Basic):
+            tiled = sympy.Gt(count, 1)
+            rpc = sympy.Piecewise((self.ROWS / count, tiled), (0.0, True))
+        else:
+            tiled = count > 1
+            rpc = self.ROWS / count if tiled else 0.0
+        return dataclasses.replace(
+            op, tiles_output_dim=tiled, loop_trip=count, tile_rows_per_core=rpc
+        )
+
+    def test_binding_the_tile_count_matches_the_concrete_cost(self):
+        checked = 0
+        for gname, bname, b in _entries():
+            for raw in b["features"][:2]:
+                if raw is None:
+                    continue
+                op = op_from_dict(raw)
+                if op.tiles_output_dim or op.loop_trip > 1:
+                    continue  # already committed-tiled: no candidate applies
+                expr = sympy.sympify(predict_ops([self._at(op, self.TILE)]))
+                for count in (1, 4):
+                    want = float(predict_ops([self._at(op, count)]))
+                    got = float(expr.subs(self.TILE, count))
+                    self.assertAlmostEqual(
+                        got,
+                        want,
+                        delta=1e-6 * max(1.0, abs(want)),
+                        msg=f"{gname}/{bname} at tile count {count}",
+                    )
+                checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_reduction_rows_ranks_symbolic_per_tile_inputs(self):
+        # A candidate tiling makes an undecided input's elems per-tile when
+        # LX-resident; the governing-rows argmax used to compare those sympy
+        # expressions and raise "cannot determine truth value of Relational".
+        from torch_spyre._inductor.cost_model import _reduction_rows
+
+        is_lx = sympy.Symbol("is_lx_buf1", integer=True, nonnegative=True)
+
+        def arg(name, dims, logical, is_lx=False):
+            elems = math.prod(dims)
+            if isinstance(is_lx, sympy.Basic):
+                elems = elems * (1 - is_lx) + elems / self.TILE * is_lx
+            return ArgTraffic(
+                name=name,
+                role="input",
+                is_lx=is_lx,
+                elems=elems,
+                dims=dims,
+                logical=logical,
+            )
+
+        op = OpFeatures(
+            name="sum",
+            is_reduction=True,
+            out_elems=64,
+            cores=1,
+            dtype_bytes=2,
+            args=[
+                arg("buf0", [16, 64], [16, 64], is_lx),
+                arg("buf1", [256, 64], [256, 64], is_lx),
+                arg("buf2", [1, 64], [1, 64]),
+            ],
+        )
+        self.assertEqual(_reduction_rows(op), 256)
 
 
 if __name__ == "__main__":

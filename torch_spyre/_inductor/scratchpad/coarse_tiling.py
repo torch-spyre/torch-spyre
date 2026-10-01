@@ -53,6 +53,56 @@ from .plan_solver import TileSpec
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
 
+def tile_axis_loop_var(
+    op: ComputedBuffer,
+    host_dim: int,
+    is_reduction: bool,
+    *,
+    out_coords: Sequence[sympy.Expr] | None = None,
+    red_vars: Sequence[sympy.Symbol] | None = None,
+) -> sympy.Symbol:
+    """The op's own loop variable for one tiled axis (a :class:`TileAxis`'s
+    ``host_dim``/``is_reduction``).
+
+    The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
+    the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
+    the inverse of :func:`reduction_loop_vars` -- ``host_dim`` positionally
+    indexes the op's ordered reduction loop variables. ``out_coords`` and
+    ``red_vars`` may be passed precomputed by a caller resolving several axes.
+    """
+    if is_reduction:
+        if not isinstance(op.data, Reduction):
+            raise Unsupported(
+                f"coarse tiling: reduction axis host_dim={host_dim} "
+                f"requested on non-Reduction op {op.get_name()}."
+            )
+        if red_vars is None:
+            red_vars = reduction_loop_vars(op)
+        if host_dim >= len(red_vars):
+            raise Unsupported(
+                f"coarse tiling: reduction host_dim={host_dim} is out "
+                f"of bounds for {len(red_vars)} reduction loop variables on "
+                f"{op.get_name()}."
+            )
+        return red_vars[host_dim]
+    if out_coords is None:
+        out_coords = op_out_coords(op)
+    if host_dim >= len(out_coords):
+        raise Unsupported(
+            f"coarse tiling: host_dim={host_dim} is out of bounds "
+            f"for {len(out_coords)} output coordinates on {op.get_name()}."
+        )
+    coord = out_coords[host_dim]
+    free_symbols = coord.free_symbols
+    if len(free_symbols) != 1:
+        raise Unsupported(
+            f"coarse tiling: host_dim={host_dim} output coordinate "
+            f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+            "symbols; expected exactly one loop var."
+        )
+    return next(iter(free_symbols))
+
+
 def tile_spec_to_dim_hints(
     op: ComputedBuffer,
     spec: TileSpec,
@@ -61,14 +111,10 @@ def tile_spec_to_dim_hints(
     """Lower a :class:`TileSpec` into per-op :class:`DimHint`s.
 
     Each :class:`TileAxis` becomes one ``DimHint`` carrying the axis's split
-    count and the op's *own* loop variable for that axis, paired with the group's
-    ``hint_id`` for that level. ``hint_ids`` has one entry per axis, outermost
-    first, matching the group's ``levels``.
-
-    The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
-    the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
-    the inverse of :func:`reduction_loop_vars` -- ``host_dim`` positionally
-    indexes the op's ordered reduction loop variables.
+    count and the op's *own* loop variable for that axis (see
+    :func:`tile_axis_loop_var`), paired with the group's ``hint_id`` for that
+    level. ``hint_ids`` has one entry per axis, outermost first, matching the
+    group's ``levels``.
     """
     if len(hint_ids) != len(spec.axes):
         raise ValueError(
@@ -79,36 +125,15 @@ def tile_spec_to_dim_hints(
     red_vars: list[sympy.Symbol] | None = None
     hints: list[DimHint] = []
     for axis, hint_id in zip(spec.axes, hint_ids):
-        if axis.is_reduction:
-            if not isinstance(op.data, Reduction):
-                raise Unsupported(
-                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
-                    f"requested on non-Reduction op {op.get_name()}."
-                )
-            if red_vars is None:
-                red_vars = reduction_loop_vars(op)
-            if axis.host_dim >= len(red_vars):
-                raise Unsupported(
-                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
-                    f"of bounds for {len(red_vars)} reduction loop variables on "
-                    f"{op.get_name()}."
-                )
-            loop_var = red_vars[axis.host_dim]
-        else:
-            if axis.host_dim >= len(out_coords):
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
-                    f"for {len(out_coords)} output coordinates on {op.get_name()}."
-                )
-            coord = out_coords[axis.host_dim]
-            free_symbols = coord.free_symbols
-            if len(free_symbols) != 1:
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
-                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
-                    "symbols; expected exactly one loop var."
-                )
-            loop_var = next(iter(free_symbols))
+        if axis.is_reduction and red_vars is None and isinstance(op.data, Reduction):
+            red_vars = reduction_loop_vars(op)
+        loop_var = tile_axis_loop_var(
+            op,
+            axis.host_dim,
+            axis.is_reduction,
+            out_coords=out_coords,
+            red_vars=red_vars,
+        )
         hints.append(
             DimHint(
                 dim_names=["_coarse_tile"],

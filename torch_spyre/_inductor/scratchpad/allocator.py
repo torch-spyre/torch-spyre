@@ -146,6 +146,29 @@ _COST_PARAMS = CostParams(
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
 )
+# The objective's variant, for every solver, with three tiling terms off.
+#
+# The coarse underfill and LX-spill derates: zero exponents drop the tile height
+# from both (``rpc**0 == 1``) and the 1.0 cap pins the underfill there, so each
+# derate is exactly 1. CP-SAT cannot lower their fractional powers of a symbolic
+# tile height at all (the whole cost objective would fall back to the
+# lexicographic one). The annealer can, but is misled by them: the underfill
+# derate divides a whole bundle's memory term by the efficiency of its smallest
+# tile, which over-prices a tile several times over on real decoder blocks.
+#
+# The loop-invariant re-read: ``read_bytes`` already charges a tiled matmul's
+# invariant operand once per iteration through its ``loop_factor``, and
+# ``_loop_reread_bytes`` charges the repeats again.
+_OBJECTIVE_COST_PARAMS = replace(
+    _COST_PARAMS,
+    coarse_underfill_exp=0.0,
+    coarse_underfill_col_exp=0.0,
+    coarse_underfill_cap=1.0,
+    lx_spill_exp=0.0,
+    mm_spill_ws_exp=0.0,
+    loop_reread_scale=0.0,
+)
+
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -2345,28 +2368,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # to an op the grouping will see -- a feature whose buffer is absent from
         # ``graph.operations`` would silently drop out of the objective.
         mem_usage = mem_usage_by_buf(graph)
-        op_features = {}
-        for output_name in mem_usage:
-            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
-                continue
-            if output_name not in bufmap:
-                continue
-            if output_name not in pricing_by_name:
-                continue
-            op_features[output_name] = self._extract_op_features(
-                graph,
-                output_name,
-                bufmap,
-                default_is_lx,
-                op=pricing_by_name[output_name],
-            )
+        feature_names = [
+            output_name
+            for output_name in mem_usage
+            if isinstance(graph.get_buffer(output_name), ComputedBuffer)
+            and output_name in bufmap
+            and output_name in pricing_by_name
+        ]
 
         from torch_spyre._inductor.cost_model import predict_bundles
 
         # Logged, not asserted: dropping a buffer from the objective changes what
         # the solver optimizes without failing anything, so it has to be visible,
         # but it is not worth killing a plan over. Empty today.
-        unscored = set(op_features) - {
+        unscored = set(feature_names) - {
             getattr(op, "name", None) for op in graph.operations
         }
         if unscored:
@@ -2383,7 +2398,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # TypeError is in the set because a cost-model branch over an undecided
         # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
         # rather than anything the model raises itself (issue #4233); every tiling
-        # surface that did so is now neutralised at `cost_model._tiled_rows`, so this
+        # surface that did so now skips a symbolic tile height in `cost_model`, so this
         # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
         # Losing the expression costs the objective, not correctness -- but it costs it
         # in BOTH engines now that #4164 has the annealer consume cost_expr: CP-SAT falls
@@ -2395,9 +2410,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
         bundle_terms: list = []
+        # Feature extraction runs inside the same fallback: a candidate tiling
+        # can raise Unsupported (an axis with no resolvable loop variable) or
+        # ValueError (candidates on an already coarse-tiled op), and either
+        # costs the objective, not the compile.
         try:
+            op_features = {
+                output_name: self._extract_op_features(
+                    graph,
+                    output_name,
+                    bufmap,
+                    default_is_lx,
+                    op=pricing_by_name[output_name],
+                )
+                for output_name in feature_names
+            }
             bundle_terms = predict_bundles(
-                pricing_ops, op_features, params=_COST_PARAMS
+                pricing_ops, op_features, params=_OBJECTIVE_COST_PARAMS
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2476,7 +2505,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             emit_json_line(
                 config.dump_cost_expr_file,
                 cost_expr_record(
-                    cost_expr, bundle_terms, result, _COST_PARAMS, context=context
+                    cost_expr,
+                    bundle_terms,
+                    result,
+                    _OBJECTIVE_COST_PARAMS,
+                    context=context,
                 ),
             )
         return result
@@ -2491,15 +2524,25 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         decision variables. The extractor reads each arg's symbolic residency
         from ``is_lx`` (built once by the caller over all of ``buffers``, not
         per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        Candidate coarse tilings enter the same way: each tiled axis's
+        symbolic count (``sym_tile_counts``) is keyed on the op's own loop
+        variable for that axis. With no tiled candidate there are none, and the
+        extractor reads the op's committed tiling (``loop_info``) as before.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.coarse_tiling import tile_axis_loop_var
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        sym_tiling: dict = {}
+        for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
+            var = tile_axis_loop_var(op, host_dim, is_reduction)
+            sym_tiling[var] = sym_tiling.get(var, 1) * symbol
+        return extract_op_features(op, ws, is_lx=is_lx, sym_tiling=sym_tiling or None)
 
     def _finalize_lx_relayout_allocation(
         self,

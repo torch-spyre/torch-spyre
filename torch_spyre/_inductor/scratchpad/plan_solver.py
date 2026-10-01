@@ -228,6 +228,13 @@ class TileSpec:
         """
         return math.prod(a.count for a in self.axes if not a.is_reduction)
 
+    def count_for(self, key: tuple[int, bool]) -> int:
+        """Total split factor this spec puts on the axis ``key``, a
+        ``(host_dim, is_reduction)`` pair; 1 for an axis it does not tile."""
+        return math.prod(
+            a.count for a in self.axes if (a.host_dim, a.is_reduction) == key
+        )
+
     @property
     def label(self) -> str:
         if not self.axes:
@@ -379,6 +386,30 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             for key in keys
         }
 
+    @property
+    def sym_tile_counts(self) -> dict[tuple[int, bool], sympy.Symbol]:
+        """Symbolic stand-in for a chosen ``tiling``, the coarse-tiling sibling
+        of :attr:`sym_core_divs`: one symbol per tiled axis (a
+        ``(host_dim, is_reduction)`` pair) seen across this buffer's candidate
+        divisions, bound to that candidate's count on the axis, 1 where it
+        leaves the axis untiled. Keyed on the axis rather than the nesting level, so the
+        symbols do not depend on how a candidate orders its levels -- the cost
+        of a nest (a product of per-level trip counts) does not either. Empty
+        while no candidate is tiled."""
+        keys = dict.fromkeys(
+            (axis.host_dim, axis.is_reduction)
+            for cd in self.core_divisions
+            for axis in cd.tiling.axes
+        )
+        return {
+            (dim, is_red): sympy.Symbol(
+                f"tile_{self.name}_{'r' if is_red else 'o'}{dim}",
+                integer=True,
+                positive=True,
+            )
+            for (dim, is_red) in keys
+        }
+
 
 def division_symbol(buffer_name: str) -> sympy.Symbol:
     """The objective symbol for ``buffer_name``'s chosen division index (see
@@ -432,8 +463,10 @@ def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
     for a placed buffer and 0 for a spilled one; a core-division buffer with a
     chosen division binds its ``division`` index and each per-axis split
-    symbol to that division's split (1 for an axis it does not split). The
-    same reading the annealer applies to a candidate plan."""
+    symbol to that division's split (1 for an axis it does not split), and
+    each tile-count symbol to that division's tile count (1 for an axis it
+    does not tile). The same reading the annealer applies to a candidate
+    plan."""
     bindings: dict = {}
     for buf in buffers:
         bindings[buf.sym_is_lx] = 1 if buf.address is not None else 0
@@ -445,6 +478,9 @@ def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
         splits = divisions[chosen].splits
         for key, sym in buf.sym_core_divs.items():
             bindings[sym] = splits.get(key, 1)
+        tiling = divisions[chosen].tiling
+        for key, sym in buf.sym_tile_counts.items():
+            bindings[sym] = tiling.count_for(key)
     return bindings
 
 

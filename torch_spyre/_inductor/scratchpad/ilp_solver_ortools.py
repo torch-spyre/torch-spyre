@@ -157,6 +157,9 @@ _CORE_LOG_SCALE = 32.0
 # the split has no candidate values (see _SympyExprToCpSat._inv_scale).
 # error <= ~4%
 _CORE_INV_SCALE = 1024
+# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
+# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
+_CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
 
@@ -361,6 +364,12 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 key: only.splits.get(key, 1) for key in b.sym_core_divs
             }
             self.cp_core_divs_raw = {key: [v] for key, v in self.cp_core_divs.items()}
+            self.cp_tile_counts = {
+                key: only.tiling.count_for(key) for key in b.sym_tile_counts
+            }
+            self.cp_tile_counts_raw = {
+                key: [v] for key, v in self.cp_tile_counts.items()
+            }
             true, false = m.new_constant(1), m.new_constant(0)
             self.division_is = lambda i: true if i == 0 else false
             return
@@ -381,6 +390,20 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
 
         self.cp_core_divs = cp_core_divs
         self.cp_core_divs_raw = cp_core_divs_raw
+
+        # The coarse-tiling counts, tied to the division index the same way:
+        # each candidate division carries its own tiling.
+        cp_tile_counts: dict = {}
+        cp_tile_counts_raw: dict = {}
+        for key, symbol in b.sym_tile_counts.items():
+            raw = [cd.tiling.count_for(key) for cd in b.core_divisions]
+            cp_var = m.new_int_var(min(raw), max(raw), symbol.name)
+            m.add_element(self.division, raw, cp_var)
+            cp_tile_counts[key] = cp_var
+            cp_tile_counts_raw[key] = raw
+
+        self.cp_tile_counts = cp_tile_counts
+        self.cp_tile_counts_raw = cp_tile_counts_raw
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
@@ -643,20 +666,32 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _is_split_sym(expr):
-        return expr.is_Symbol and expr.name.startswith("split_")
+        # A tile count is, like a core split, a positive integer tabulated over
+        # its buffer's candidate divisions, so its log and inverse lower the
+        # same way.
+        return expr.is_Symbol and expr.name.startswith(("split_", "tile_"))
 
     def _inv_scale(self, name: str) -> int:
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
         across the candidate divisions, so every ``scale // v`` is exact and the
         variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
-        are no values, or a value with many divisors if the LCM exceeds it."""
+        are no values, or a value with many divisors if the LCM exceeds the cap.
+
+        The cap is ``_CORE_INV_SCALE`` for values up to the core count and
+        doubles with each doubling past it, so a tile count, which can far
+        exceed any core split, keeps the resolution a split has rather than
+        flattening to ``scale // v == 0``."""
         _, raw = self._buffer_map.get(name, (None, ()))
         if not raw or min(raw) < 1:
             return _CORE_INV_SCALE
 
         ints = [int(r) for r in raw]
+        widen = max(
+            0, (max(ints) - 1).bit_length() - _CORE_INV_SCALE_MAX_VALUE.bit_length() + 1
+        )
+        cap = _CORE_INV_SCALE << widen
         lcm = math.lcm(*ints)
-        if lcm <= _CORE_INV_SCALE:
+        if lcm <= cap:
             return lcm
 
         # Otherwise: find the highest power of 2 in ints; among its multiples,
@@ -664,11 +699,9 @@ class _SympyExprToCpSat(Printer):
         # (We weight entries of ints by multiplicity.)
         cnt = Counter(ints)
         pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
-        assert pow2 < _CORE_INV_SCALE, (
-            f"expected _CORE_INV_SCALE={_CORE_INV_SCALE} to be greater than any "
-            f"power of 2 that might occur as a core division, but found {pow2}"
-        )
-        scaled_core_inv_scale = _CORE_INV_SCALE // pow2
+        # The cap is sized past every value, so this holds by construction.
+        assert pow2 < cap, f"expected cap={cap} past every value, found {pow2}"
+        scaled_core_inv_scale = cap // pow2
         counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
         for a, mult in cnt.items():
             step = a // math.gcd(a, pow2)
@@ -703,7 +736,8 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp == 0.25:
+            # Core splits only: a tile count can exceed 32.
+            if expr.exp == 0.25 and arg.name.startswith("split_"):
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
                 # pinned to return 1 at x=1, generated using tools/approximate-power.py.
                 # since we check that the base is a _split_ symbol, it is an integer in the
@@ -1341,6 +1375,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             symbol = sympy.Symbol("_product_" + "_".join(product))
             sym_map[symbol.name] = t.cores
             buffer_map[symbol.name] = (t, t.cores_used)
+
+            for key, symbol in t.buffer.sym_tile_counts.items():
+                sym_map[symbol.name] = t.cp_tile_counts[key]
+                buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
