@@ -74,7 +74,7 @@ from .pass_utils import (
     tile_ownership_view,
 )
 from .propagate_hints import get_op_hints
-from .scratchpad.plan_solver import CoreDivision, TileSpec
+from .scratchpad.plan_solver import CoreDivision, TileAxis, TileSpec
 from .work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
@@ -1346,15 +1346,21 @@ class OpSplitSpace:
 def _axis_by_host_dim(
     op: ComputedBuffer, axes: Sequence[sympy.Symbol]
 ) -> dict[int, sympy.Symbol]:
-    """Output host dim -> the iteration axis it cuts, for each dim whose
-    coordinate is a single axis. ``TileAxis.host_dim`` indexes
-    ``op_out_coords``, as the apply path resolves it."""
-    return {
-        host_dim: axis
-        for host_dim, coord in enumerate(op_out_coords(op))
-        if len(coord.free_symbols) == 1
-        and (axis := next(iter(coord.free_symbols))) in axes
-    }
+    """Output host dim -> the iteration axis it cuts, for each dim the
+    lowering's ``try_resolve_tile_axis_loop_vars`` resolves to one of
+    ``axes``. A level's ``count`` plays no part in that resolution."""
+    # Local import: ``scratchpad.coarse_tiling`` imports the allocator, which
+    # imports this module.
+    from .scratchpad.coarse_tiling import try_resolve_tile_axis_loop_vars
+
+    resolved: dict[int, sympy.Symbol] = {}
+    for host_dim in range(len(op_out_coords(op))):
+        loop_vars, _ = try_resolve_tile_axis_loop_vars(
+            op, TileSpec((TileAxis(host_dim, 1),))
+        )
+        if loop_vars is not None and loop_vars[0] in axes:
+            resolved[host_dim] = loop_vars[0]
+    return resolved
 
 
 def build_op_split_space(

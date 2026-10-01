@@ -55,6 +55,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
@@ -3227,12 +3228,15 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
 
     @contextmanager
     def _space(self, tiling, coords=None):
+        coords = [self.x, self.y] if coords is None else coords
         with (
             self.case.patches(),
+            patch.object(work_division_module, "op_out_coords", return_value=coords),
+            patch.object(coarse_tiling_module, "op_out_coords", return_value=coords),
             patch.object(
-                work_division_module,
-                "op_out_coords",
-                return_value=[self.x, self.y] if coords is None else coords,
+                coarse_tiling_module,
+                "iteration_space_from_op",
+                return_value=self.case.it_space,
             ),
         ):
             yield work_division_module.build_op_split_space(
@@ -3310,14 +3314,22 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
 
 
 class TestAxisByHostDim(unittest.TestCase):
-    """``TileAxis.host_dim`` indexes ``op_out_coords``, so that is where the
-    axis a level cuts is read off."""
+    """``TileAxis.host_dim`` indexes ``op_out_coords``, and the axis a level
+    cuts is read off it by the lowering's own resolver."""
 
     def setUp(self):
         self.d0, self.d1, self.d2 = _isym("d0"), _isym("d1"), _isym("d2")
 
     def _mapping(self, coords, axes):
-        with patch.object(work_division_module, "op_out_coords", return_value=coords):
+        with (
+            patch.object(work_division_module, "op_out_coords", return_value=coords),
+            patch.object(coarse_tiling_module, "op_out_coords", return_value=coords),
+            patch.object(
+                coarse_tiling_module,
+                "iteration_space_from_op",
+                return_value=dict.fromkeys(axes, 1),
+            ),
+        ):
             return work_division_module._axis_by_host_dim(MagicMock(), axes)
 
     def test_a_size_1_dim_shifts_the_frame(self):
