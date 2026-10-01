@@ -1756,11 +1756,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
                 "2d_size1_dim_0": ([0], cached_randn((1, 256))),
                 "2d_no_dims": ([], cached_randn((67, 256))),
-                # Stick-dim reversals: unsupported, but must fail loudly.
+                # Stick-dim reversals are unsupported and, rather than raising,
+                # fault the card, so they cannot run as xfails.
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
                 "1d_stick": ([0], cached_randn((256,))),
             },
-            "expect_fail": ["2d_dim_1_stick", "1d_stick"],
+            "device_fault": {
+                "2d_dim_1_stick": "RAS::RUNTIMESCHEDULER::ComputeHardwareError (0x7b1b) "
+                "leaves the card in StreamError",
+                "1d_stick": "RAS::RUNTIMESCHEDULER::ComputeHardwareError (0x7b1b) leaves "
+                "the card in StreamError",
+            },
         },
         ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
