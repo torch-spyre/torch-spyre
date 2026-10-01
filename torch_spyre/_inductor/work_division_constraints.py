@@ -450,19 +450,30 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     op_info = getattr(ctx.op.data, "op_info", None)
     if not isinstance(op_info, dict):
         return ConstraintResult()
+    # Convs record their geometry under conv_params, pools under pool_params; the
+    # same reasoning applies to both: a strided spatial split produces incorrect
+    # per-core addressing.
     conv_params = op_info.get("conv_params")
-    if not isinstance(conv_params, dict):
+    is_conv_op = isinstance(conv_params, dict)
+    window_params = conv_params if is_conv_op else op_info.get("pool_params")
+    if not isinstance(window_params, dict):
         return ConstraintResult()
 
-    stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
-    stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
+    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
+    # conv2d (#3284) and the pools record it as stride_h/stride_w. Accept either
+    # spelling so the strided-spatial-split block covers every windowed path.
+    stride_i = window_params.get("stride_i", window_params.get("stride_h", 1))
+    stride_j = window_params.get("stride_j", window_params.get("stride_w", 1))
     if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
         return ConstraintResult()
 
     write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
+    # Conv blocks both output spatial dims; a strided pool only needs the
+    # INNERMOST one blocked.
+    spatial = list(write.ranges)[-2:] if is_conv_op else list(write.ranges)[-1:]
     blocked = {
         sym
-        for sym in list(write.ranges)[-2:]
+        for sym in spatial
         if isinstance(sym, Symbol)
         and sym in ctx.it_space
         and concretize_expr(ctx.it_space[sym]) > 1
