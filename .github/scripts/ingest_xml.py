@@ -44,6 +44,7 @@ from spyre_clickhouse_ingest import (
     insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
+    capability_declaration,
     cases_already_ingested,
     drop_older_case_attempts,
     benchmarks_already_ingested,
@@ -1249,6 +1250,23 @@ def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
         acc["total"] += measured
 
 
+def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
+    """A leg per `capability.test_type` the cases declare, beside the run's functional one.
+
+    The verdicts themselves land in capability_runs; this is what ties them to the artifact.
+    """
+    for case in cases:
+        decl, _ = capability_declaration(case)
+        if not decl or case.get("status") == "skipped":
+            continue
+        acc = legs.setdefault(
+            (run_id, decl["test_type"]), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += 1
+        acc["failed"] += case.get("status") in ("failed", "error")
+        acc["duration_s"] += float(case.get("duration_s", 0) or 0)
+
+
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
     """Write the artifact and one artifact_results row per (run_id, tier) of this leg."""
     if not legs or not v2db or not (args.artifact_id or _opt(args, "artifact")):
@@ -1834,6 +1852,7 @@ def main():
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
                 print(

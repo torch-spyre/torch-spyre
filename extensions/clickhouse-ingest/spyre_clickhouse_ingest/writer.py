@@ -15,6 +15,7 @@
 """The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
 import math
+from collections import Counter
 import sys
 
 from . import schema
@@ -25,6 +26,57 @@ from .identity import (
     CaseId,
     DerivedId,
 )
+
+
+CAPABILITY_PREFIX = "capability."
+# A declaration without all three names no capability; it is skipped, never guessed.
+CAPABILITY_REQUIRED = ("test_type", "subject", "name")
+
+
+def capability_declaration(case: dict) -> tuple:
+    """(declaration, problem) from a case's `capability.*` JUnit properties.
+
+    The contract: `test_type`, `subject`, `name` (required) and `backend` are scalars;
+    `sig.<k>` is hashed into capability_id; `tag` repeats; `prop.<k>` lands in the verdict's
+    props. Any other key is reported in `unknown` and dropped. A case declaring no
+    `capability.*` property gives (None, ""); one missing a required key, giving a scalar
+    two values, or naming an unregistered test_type gives (None, <problem>).
+    """
+    decl = {"sig": {}, "tags": [], "props": {}, "unknown": [], "backend": ""}
+    scalars: dict = {}
+    seen = False
+    for pname, pvalue in case.get("properties", []) or []:
+        if not pname.startswith(CAPABILITY_PREFIX):
+            continue
+        seen = True
+        key, value = pname[len(CAPABILITY_PREFIX) :], str(pvalue).strip()
+        field, _, sub = key.partition(".")
+        if field in CAPABILITY_REQUIRED + ("backend",) and not sub:
+            if scalars.setdefault(field, value) != value:
+                return None, f"conflicting {CAPABILITY_PREFIX}{field}"
+        elif field == "sig" and sub:
+            decl["sig"][sub] = value
+        elif field == "prop" and sub:
+            decl["props"][sub] = value
+        elif key == "tag":
+            if value:
+                decl["tags"].append(value)
+        else:
+            decl["unknown"].append(f"unknown key {pname}")
+    if not seen:
+        return None, ""
+    missing = [k for k in CAPABILITY_REQUIRED if not scalars.get(k)]
+    if missing:
+        return None, "no " + "/".join(CAPABILITY_PREFIX + k for k in missing)
+    # Checked here, not at insert: there one bad case rejects the file's whole artifact_results batch.
+    if scalars["test_type"] not in schema.CAPABILITY_TYPE_VALUES:
+        return None, (
+            f"unregistered {CAPABILITY_PREFIX}test_type '{scalars['test_type']}' (registered: "
+            f"{', '.join(sorted(schema.CAPABILITY_TYPE_VALUES))}; a new one needs "
+            "schema.CAPABILITY_TYPE_VALUES and a migration of artifact_results.chk_test_type)"
+        )
+    decl.update(scalars)
+    return decl, ""
 
 
 class RunWriter:
@@ -118,7 +170,8 @@ class TestResultWriter(RunWriter):
         source_file: str,
         attempt: int,
     ) -> None:
-        """Delete this file's rows from attempts before `attempt`, so a re-run replaces them."""
+        """Delete this file's outcomes and capability verdicts from attempts before
+        `attempt`, so a re-run replaces them."""
         if not (attempt and source_file):
             return
         where = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
@@ -128,13 +181,20 @@ class TestResultWriter(RunWriter):
             "sf": source_file,
             "attempt": attempt,
         }
-        if not cls.fact_table.count_rows(client, db, where, params):
-            return
-        client.command(
-            f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
-            parameters=params,
-        )
-        cls._rebuild_counters(client, db, run_id, component)
+        if cls.fact_table.count_rows(client, db, where, params):
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
+                parameters=params,
+            )
+            cls._rebuild_counters(client, db, run_id, component)
+        # The file's capability verdicts are scoped by shard = source_file.
+        verdicts = where.replace("props['source_file']", "props['shard']")
+        capability_runs = CapabilityWriter.fact_table
+        if capability_runs.count_rows(client, db, verdicts, params):
+            client.command(
+                f"DELETE FROM {capability_runs.qualified(db)} WHERE {verdicts}",
+                parameters=params,
+            )
 
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
@@ -172,10 +232,13 @@ class TestResultWriter(RunWriter):
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
+        verdicts: dict[tuple, list] = {}
+        problems: Counter = Counter()
         skipped = ignored = 0
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
+            cls._capability(c, run_tags, attempt, verdicts, problems)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -215,20 +278,96 @@ class TestResultWriter(RunWriter):
             }
             run_rows.append(run_row)
         written = cls._flush(client, db, ident_rows, run_rows)
+        # Checked before any batch is written, so a type's second batch is not refused.
+        landed = {
+            t
+            for t in {k[0] for k in verdicts}
+            if CapabilityWriter.already_ingested(
+                client, db, run_id, component, t, shard=source_file
+            )
+        }
+        for (test_type, arch, disc_keys), results in verdicts.items():
+            if test_type not in landed:
+                CapabilityWriter.insert(
+                    client,
+                    db,
+                    component,
+                    run_id,
+                    test_type,
+                    results,
+                    arch=arch,
+                    disc_keys=disc_keys,
+                    shard=source_file,
+                )
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
-        cls._warn(ignored, "property value(s) ignored -- not tag, metric.* or result.*")
+        for problem, n in sorted(problems.items()):
+            cls._warn(n, f"capability declaration(s) with {problem}")
+        cls._warn(
+            ignored,
+            "property value(s) ignored -- not tag, metric.*, result.* or capability.*",
+        )
         return written
+
+    # A case's outcome as a capability verdict; a skipped case gave none.
+    _VERDICT = {
+        "passed": "passed",
+        "xpass": "passed",
+        "failed": "failed",
+        # pytest reports a test-body exception as <failure>; <error> is a broken setup/teardown.
+        "error": "undetermined",
+        "xfail": "not_implemented",
+    }
+
+    @classmethod
+    def _capability(
+        cls, case: dict, run_tags, attempt: int, verdicts: dict, problems: Counter
+    ) -> None:
+        """Add the case's `capability.*` verdict, if it declares a valid one, to `verdicts`.
+
+        Keyed by (test_type, arch, sig keys): one CapabilityWriter batch hashes one key set.
+        """
+        decl, problem = capability_declaration(case)
+        problems.update(decl["unknown"] if decl else [])
+        if problem:
+            problems[problem] += 1
+        status = cls._VERDICT.get(case.get("status", ""))
+        if not (decl and status):
+            return
+        props = {"test_name": case.get("name", ""), **decl["props"]}
+        if attempt:
+            props["run_attempt"] = str(attempt)
+        arch = next(
+            (
+                t.split("__", 1)[1]
+                for t in run_tags
+                if CaseId.namespace(t) == "platform"
+            ),
+            "",
+        )
+        key = (decl["test_type"], arch, tuple(sorted(decl["sig"])))
+        verdicts.setdefault(key, []).append(
+            {
+                "subject": decl["subject"],
+                "name": decl["name"],
+                "status": status,
+                "backend": decl["backend"],
+                "disc": decl["sig"],
+                "tags": decl["tags"],
+                "props": {k: v for k, v in props.items() if v},
+            }
+        )
 
     @staticmethod
     def _recorded(case: dict) -> tuple:
         """(measurements, result props, count ignored) from the case's JUnit properties.
 
         `metric.<name>` must be a finite number and lands in measurements under `<name>`;
-        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for.
+        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for,
+        `capability.*` by _capability.
         """
         measured, recorded, ignored = {}, {}, 0
         for pname, pvalue in case.get("properties", []) or []:
-            if pname == "tag" or "__" in pname:
+            if pname == "tag" or "__" in pname or pname.startswith("capability."):
                 continue
             if pname.startswith("metric.") and len(pname) > len("metric."):
                 try:

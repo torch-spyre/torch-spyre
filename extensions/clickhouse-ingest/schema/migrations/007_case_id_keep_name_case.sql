@@ -1,16 +1,19 @@
--- Re-key test_case_id to the identity-tags-only recipe, so one test has one id across arches and
--- test types. Every hash input is stored, so history is re-keyed, not abandoned. Applies what
--- CaseId.split_tags does to a fresh case: legacy bare tags get their namespace, run-context tags
--- move to the run row, result tags (refcoverage) move to its props as result.<ns>.
+-- RERUNNABLE
+-- Re-key test_case_id to the current recipe: identity tags only (as 006), and the test name
+-- hashed with its case, so sibling tests that differ only by case (test_T / test_t) get two ids.
+-- component and classname stay case-folded; an all-lowercase name keeps its id.
 --
--- The uuid5 below is CaseId.derive in SQL; it reproduced all 50,275 stored ids on prod when given
--- the full tag set. Pinned for review, matching test_identity_golden: component 'torch-spyre',
--- classname 'T', name 'test_x', tags [platform__x86_64, op__torch_mul]
--- -> 54bb0d72-7e92-55c4-bea8-675abd4dcc41.
+-- Supersedes 006 for reruns: 006 hashes the lowercased name, so rerunning it would undo this.
+-- The uuid5 below is CaseId.derive in SQL. Pinned for review, matching test_identity_golden:
+-- component 'Torch-Spyre', classname 'TestViewOps', name ' test_T_spyre ', no tags
+-- -> uuid5(ns, 'torch-spyre|testviewops|test_T_spyre|').
 -- The four arrays must equal RUN_CONTEXT_TAG_NAMESPACES, RESULT_TAG_NAMESPACES and
 -- LEGACY_TAG_ALIASES (keys, values) in identity.py; a test pins that.
 --
--- Not rerunnable: it hashes the lowercased name, so a rerun would undo 007. Rerun 007 instead.
+-- Runs store no name, so a pair that already shares an id moves under its stored name; only new
+-- ingests split it. Safe to repeat (`apply_schema --rerun`): rows written after the snapshot are
+-- left for the next pass, never deleted unmoved; case_id_rekey_runs survives a failed pass so its
+-- counters get recounted.
 
 DROP TABLE IF EXISTS case_id_rekey;
 
@@ -58,7 +61,7 @@ FROM
                 unhex('cb0af9bf28585eab9211f51190531bf3'),
                 lowerUTF8(trimBoth(component, ws)), '|',
                 lowerUTF8(trimBoth(classname, ws)), '|',
-                lowerUTF8(trimBoth(name, ws)), '|',
+                trimBoth(name, ws), '|',
                 arrayStringConcat(arraySort(arrayDistinct(
                     arrayMap(t -> lowerUTF8(trimBoth(t, ws)), id_tags))), ','))), 1, 16)) AS h
         FROM

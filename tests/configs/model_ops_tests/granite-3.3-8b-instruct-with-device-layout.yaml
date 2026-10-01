@@ -80,7 +80,7 @@ test_suite_config:
             - TestSpyreModelOps::test_model_ops_db
           mode: xfail
           tags:
-            - model__granite-3.3-8b-instruct
+            - model__granite-3.3-8b-instruct-with-device-layout
           edits:
             ops:
               include:
