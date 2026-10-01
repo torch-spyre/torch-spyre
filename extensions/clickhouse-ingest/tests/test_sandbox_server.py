@@ -42,12 +42,21 @@ def identity(tmp_path):
         ("Jane.Doe@ibm.com / profiling", "jane_doe"),
         ("IAM#jane.doe@in.ibm.com", "jane_doe"),
         ("42ops", "u42ops"),
-        ("a" * 40, "a" * 24),
+        ("a" * 24, "a" * 24),
         ("x__y", "x_y"),
     ],
 )
 def test_owner_is_normalized(label, owner):
     assert Identity.owner(label) == owner
+
+
+def test_long_owners_stay_distinct_and_valid():
+    a, b = Identity.owner("x" * 30 + "1"), Identity.owner("x" * 30 + "2")
+    assert (
+        a != b
+        and len(a) <= 24
+        and Identity.MINTED.match(Identity(SECRET, None).mint(a))
+    )
 
 
 def test_shared_file_and_minted_tokens_resolve(identity):

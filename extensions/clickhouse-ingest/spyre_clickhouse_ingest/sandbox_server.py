@@ -94,7 +94,11 @@ class Identity:
         name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
         if not name or not name[0].isalpha():
             name = "u" + name
-        return name[:24].rstrip("_")
+        if len(name) <= 24:
+            return name
+        # Cut names keep a hash of the whole, so two long names never share an owner.
+        digest = hashlib.sha256(name.encode()).hexdigest()[:6]
+        return f"{name[:17].rstrip('_')}_{digest}"
 
     def _sig(self, purpose: str, value: str, n: int = 16) -> str:
         mac = hmac.new(self.secret, f"{purpose}:{value}".encode(), hashlib.sha256)
@@ -650,6 +654,10 @@ def build_server(cfg: Config, ops: Sandboxes):
             )
         except Exception:
             return JSONResponse({"error": "OpenShift rejected that token"}, 401)
+        if user.startswith("system:"):
+            return JSONResponse(
+                {"error": "register with a person's login, not a service account"}, 403
+            )
         me = ops.identity.owner(user)
         return JSONResponse(
             {
