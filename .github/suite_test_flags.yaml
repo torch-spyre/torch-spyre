@@ -1,0 +1,8 @@
+# pytest flags a suite runs with instead of the caller's extra_test_flags.
+#
+# Keys are config paths relative to the scanned --config-dir, or a directory prefix ending
+# in "/". Read by filter_configs.py (--flags-map) when building the CI matrix.
+
+# Every model-ops test is xfail by config: an xfail IS the "not implemented" verdict these
+# suites record, so trunk's `-m "not xfail"` would deselect all of them.
+model_ops_tests/: -v

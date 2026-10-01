@@ -84,8 +84,9 @@ Full reference: [GitHub Actions](github-actions.md). Short version for a
 
 1. **Pick the composite action matching what you're ingesting** —
    `ingest-xml-to-clickhouse` for JUnit/benchmark results,
-   `ingest-hw-diagnostics-to-clickhouse` for hardware/RAS failures,
-   `ingest-model-ops-to-clickhouse` for capability logs, or write a small
+   `ingest-hw-diagnostics-to-clickhouse` for hardware/RAS failures (a pytest
+   capability verdict is a JUnit `capability.*` property, so it rides the XML path),
+   or write a small
    script following `capability_write.py`'s pattern (import
    `spyre_clickhouse_ingest` directly) if your data doesn't come from a GHA
    job log at all.
