@@ -1,8 +1,8 @@
 name: tests
 
-# One of torch-spyre's three "trunk" (push-to-main) workflows -- see
-# upstream_tests.yaml, upstream_tests_beta.yaml for the others. Its trunk scan
-# also runs the model-ops suites (tests/configs/model_ops_tests/). A push run passes test_type: trunk (below) so it's distinguishable
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
+# others. A push run passes test_type: trunk (below) so it's distinguishable
 # from a manually-dispatched regression run once tier-tagging reaches ClickHouse.
 on:
   push:
