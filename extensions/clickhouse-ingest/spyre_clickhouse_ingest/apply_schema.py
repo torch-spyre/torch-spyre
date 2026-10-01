@@ -374,7 +374,7 @@ def main() -> None:
     mode.add_argument(
         "--rerun",
         metavar="MIGRATION",
-        help="Run one -- RERUNNABLE migration again (e.g. 006_case_id_without_run_context.sql)",
+        help="Run one -- RERUNNABLE migration again (e.g. 007_case_id_keep_name_case.sql)",
     )
     args = parser.parse_args()
 
