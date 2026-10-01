@@ -55,40 +55,50 @@ class Sandbox:
         ("artifact_results", "ts"),
         ("hw_failure_diagnostics", "ingested_at"),
     )
-    # Insert order matters: oss_ci_benchmark_v3_mv joins benchmarks at insert time, so each
-    # dimension precedes its fact. MV targets and the ledger are filled by the schema itself.
+    # (table, predicate, key). Insert order matters: oss_ci_benchmark_v3_mv joins benchmarks at
+    # insert time, so each dimension precedes its fact. MV targets and the ledger are filled by
+    # the schema itself. A key the sandbox already holds is skipped, so a re-seed adds no
+    # duplicate rows and the MVs count each run once.
     SEED = (
         (
             "test_cases",
             "test_case_id GLOBAL IN (SELECT test_case_id FROM {src:test_case_runs} WHERE {runs})",
+            "test_case_id",
         ),
-        ("test_case_runs", "{runs}"),
+        ("test_case_runs", "{runs}", "run_id"),
         (
             "benchmarks",
             "benchmark_id GLOBAL IN (SELECT benchmark_id FROM {src:benchmark_runs} WHERE {runs})",
+            "benchmark_id",
         ),
-        ("benchmark_runs", "{runs}"),
+        ("benchmark_runs", "{runs}", "run_id"),
         (
             "capabilities",
             "capability_id GLOBAL IN (SELECT capability_id FROM {src:capability_runs} WHERE {runs})",
+            "capability_id",
         ),
-        ("capability_runs", "{runs}"),
+        ("capability_runs", "{runs}", "run_id"),
         (
             "artifacts",
-            "artifact_id GLOBAL IN (SELECT artifact_id FROM {src:artifact_results} WHERE {runs} "
-            "UNION ALL SELECT artifact_id FROM {src:hw_failure_diagnostics} WHERE {runs})",
+            (
+                "artifact_id GLOBAL IN (SELECT artifact_id FROM {src:artifact_results} WHERE {runs} "
+                "UNION ALL SELECT artifact_id FROM {src:hw_failure_diagnostics} WHERE {runs})"
+            ),
+            "artifact_id",
         ),
         (
             "artifact_refs",
             "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",
+            "artifact_id",
         ),
         (
             "artifact_tags",
             "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",
+            "artifact_id",
         ),
-        ("artifact_results", "{runs}"),
-        ("hw_failure_diagnostics", "{runs}"),
-        ("jenkins_agents", "ts >= now() - INTERVAL {days} DAY"),
+        ("artifact_results", "{runs}", "run_id"),
+        ("hw_failure_diagnostics", "{runs}", "run_id"),
+        ("jenkins_agents", "ts >= now() - INTERVAL {days} DAY", "(node, ts)"),
     )
 
     @classmethod
@@ -114,15 +124,16 @@ class Sandbox:
         )
 
     @classmethod
-    def render(cls, template: str, db: str, f: SeedFilter) -> str:
-        """A SEED predicate with its {src:t}, {runs}, {db} and {days} placeholders filled."""
+    def render(cls, table: str, template: str, key: str, db: str, f: SeedFilter) -> str:
+        """A SEED predicate with its placeholders filled, minus keys the sandbox already holds."""
         sql = re.sub(r"\{src:(\w+)\}", lambda m: cls.src(m.group(1)), template)
         runs = f"run_id GLOBAL IN (SELECT run_id FROM {db}.{cls.RUNS})"
-        return (
+        sql = (
             sql.replace("{runs}", runs)
             .replace("{db}", db)
             .replace("{days}", str(f.days))
         )
+        return f"({sql}) AND {key} GLOBAL NOT IN (SELECT {key.strip('()')} FROM {db}.{table})"
 
     @classmethod
     def run_selects(cls, f: SeedFilter, columns: dict) -> list:
@@ -183,7 +194,7 @@ class Sandbox:
                 f"INSERT INTO {db}.{cls.RUNS} SELECT toUUID(arrayJoin([{cls.quoted(f.run_ids)}]))"
             )
         out = []
-        for table, template in cls.SEED:
+        for table, template, key in cls.SEED:
             if table not in local:
                 continue
             mine = cls.columns(client, f"{db}.{table}")
@@ -191,7 +202,7 @@ class Sandbox:
             cols = ", ".join(f"`{c}`" for c in mine if c in theirs)
             client.command(
                 f"INSERT INTO {db}.{table} ({cols}) SELECT {cols} FROM {cls.src(table)} "
-                f"WHERE {cls.render(template, db, f)}"
+                f"WHERE {cls.render(table, template, key, db, f)}"
             )
             out.append((table, client.command(f"SELECT count() FROM {db}.{table}")))
         client.command(f"DROP TABLE {db}.{cls.RUNS}")
@@ -202,7 +213,7 @@ class Sandbox:
         """Full rights on its own database, read-only on dev v2, and read of prod via SOURCE."""
         db, user = cls.database(name), cls.user(name)
         client.command(
-            f"CREATE USER IF NOT EXISTS {user} IDENTIFIED WITH sha256_password BY %(pw)s "
+            f"CREATE USER OR REPLACE {user} IDENTIFIED WITH sha256_password BY %(pw)s "
             f"DEFAULT DATABASE {db}",
             parameters={"pw": password},
         )
@@ -212,12 +223,10 @@ class Sandbox:
         client.command(f"GRANT NAMED COLLECTION ON {cls.SOURCE} TO {user}")
 
     @classmethod
-    def extra_objects(cls, client, db: str, schema_dir: Path) -> list:
-        """(name, CREATE) for objects the sandbox has and schema/ does not declare."""
+    def extra_objects(cls, client, db: str, files: list) -> list:
+        """(name, CREATE) for objects the sandbox has and the selected schema files do not declare."""
         declared = {
-            o.name
-            for path, text in SchemaApplier.selected_files(schema_dir)
-            for o in SchemaApplier.objects(path, text)
+            o.name for path, text in files for o in SchemaApplier.objects(path, text)
         } | {SchemaApplier.LEDGER, cls.RUNS}
         out = []
         for n, ddl in sorted(SchemaApplier.live(client, db).items()):
@@ -250,7 +259,11 @@ def main() -> None:
     def seed_args(p):
         p.add_argument("--days", type=int, default=SeedFilter.days)
         p.add_argument(
-            "--runs-per-component", type=int, default=SeedFilter.runs_per_component
+            "--runs-per-component",
+            type=int,
+            default=SeedFilter.runs_per_component,
+            help="Per component where the source has one; artifact_results has none, so its "
+            "runs are capped in total",
         )
         p.add_argument("--component", action="append", default=[])
         p.add_argument("--arch", action="append", default=[])
@@ -293,7 +306,7 @@ def main() -> None:
         steps = SchemaApplier.plan(
             target, db, files, SchemaApplier.migration_files(args.schema_dir)
         )
-        extra = Sandbox.extra_objects(target, db, args.schema_dir)
+        extra = Sandbox.extra_objects(target, db, files)
         for action, name, detail in steps:
             label = {
                 "create": "removed",
@@ -315,16 +328,26 @@ def main() -> None:
             raise SystemExit(
                 "[error] SANDBOX_SOURCE_PASS (prod read-only password) is unset"
             )
+        # NOT OVERRIDABLE: otherwise a sandbox login could pass host= to remote() and receive
+        # the prod password. ALTER after CREATE so a rotated password replaces the stored one.
+        keys = (
+            "host = %(h)s NOT OVERRIDABLE, port = %(p)s NOT OVERRIDABLE, "
+            "user = %(u)s NOT OVERRIDABLE, password = %(pw)s NOT OVERRIDABLE, "
+            "database = %(d)s NOT OVERRIDABLE"
+        )
+        params = {
+            "h": args.source_host,
+            "p": int(args.source_port),
+            "u": args.source_user,
+            "pw": pw,
+            "d": args.source_database,
+        }
         client.command(
-            f"CREATE NAMED COLLECTION IF NOT EXISTS {Sandbox.SOURCE} AS host = %(h)s, "
-            "port = %(p)s, user = %(u)s, password = %(pw)s, database = %(d)s",
-            parameters={
-                "h": args.source_host,
-                "p": int(args.source_port),
-                "u": args.source_user,
-                "pw": pw,
-                "d": args.source_database,
-            },
+            f"CREATE NAMED COLLECTION IF NOT EXISTS {Sandbox.SOURCE} AS {keys}",
+            parameters=params,
+        )
+        client.command(
+            f"ALTER NAMED COLLECTION {Sandbox.SOURCE} SET {keys}", parameters=params
         )
         n = client.command(f"SELECT count() FROM {Sandbox.src('artifacts')}")
         print(f"[info] {Sandbox.SOURCE} reaches {args.source_host}: {n} artifacts")
@@ -374,6 +397,7 @@ def main() -> None:
                 target, db, files, SchemaApplier.migration_files(args.schema_dir)
             )
         except SchemaDrift as e:
+            client.command(f"DROP DATABASE IF EXISTS {db} SYNC")
             raise SystemExit(f"[error] {e}") from None
         print(f"[info] {len(steps)} object(s) from {args.schema_dir} applied to {db}")
         password = secrets.token_urlsafe(24)

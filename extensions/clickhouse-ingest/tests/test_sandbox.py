@@ -58,14 +58,15 @@ def test_values_are_quoted():
 
 
 def test_render_reads_prod_and_cuts_to_the_runs():
-    sql = Sandbox.render(dict(Sandbox.SEED)["test_cases"], "sandbox_x", SeedFilter())
+    table, template, key = Sandbox.SEED[0]
+    sql = Sandbox.render(table, template, key, "sandbox_x", SeedFilter())
     assert "remote(prod_v2, table='test_case_runs')" in sql
     assert "SELECT run_id FROM sandbox_x._seed_runs" in sql
     assert "{" not in sql
 
 
 def test_each_dimension_precedes_its_fact():
-    order = [t for t, _ in Sandbox.SEED]
+    order = [t for t, _, _ in Sandbox.SEED]
     for dim, fact in (
         ("test_cases", "test_case_runs"),
         ("benchmarks", "benchmark_runs"),
@@ -89,5 +90,13 @@ def test_seed_covers_every_base_table_in_schema():
         "oss_ci_benchmark_v3",
         "oss_ci_benchmark_metadata",
     }
-    unseeded = declared - {t for t, _ in Sandbox.SEED} - filled_by_mv
+    unseeded = declared - {t for t, _, _ in Sandbox.SEED} - filled_by_mv
     assert {t for t in unseeded if not t.startswith("otel_")} == set()
+
+
+@pytest.mark.parametrize("table, template, key", Sandbox.SEED)
+def test_a_reseed_skips_keys_the_sandbox_holds(table, template, key):
+    sql = Sandbox.render(table, template, key, "sandbox_x", SeedFilter())
+    assert sql.endswith(
+        f"AND {key} GLOBAL NOT IN (SELECT {key.strip('()')} FROM sandbox_x.{table})"
+    )
