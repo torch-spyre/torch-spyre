@@ -1,0 +1,38 @@
+name: model-ops-tests
+
+# One of torch-spyre's trunk (push-to-main) workflows: runs every trunk-labeled config in tests/configs/model_ops_tests/.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+      - docs/**
+      - extensions/clickhouse-ingest/docs/**
+      - README.md
+      - extensions/clickhouse-ingest/README.md
+      - CODEOWNERS
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  run-tests:
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux
+      config_dir: model_ops_tests
+      test_type: trunk
+      extra_test_flags: -v
+      checkout_pytorch: true
+    secrets:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
