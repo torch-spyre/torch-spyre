@@ -223,6 +223,40 @@ class Sandbox:
         client.command(f"GRANT NAMED COLLECTION ON {cls.SOURCE} TO {user}")
 
     @classmethod
+    def build(
+        cls, admin, connect, name: str, schema_dir: Path, comment: str = ""
+    ) -> list:
+        """Create sandbox_<name> and converge it on schema_dir; a drifted apply leaves nothing."""
+        db = cls.database(name)
+        admin.command(f"DROP DATABASE IF EXISTS {db} SYNC")
+        admin.command(f"CREATE DATABASE {db} COMMENT %(c)s", parameters={"c": comment})
+        target = connect(db)
+        server = SchemaApplier.version_tuple(target.command("SELECT version()"))
+        files = SchemaApplier.selected_files(schema_dir, server=server)
+        try:
+            return SchemaApplier.apply(
+                target, db, files, SchemaApplier.migration_files(schema_dir)
+            )
+        except SchemaDrift:
+            admin.command(f"DROP DATABASE IF EXISTS {db} SYNC")
+            raise
+
+    @classmethod
+    def drop(cls, admin, name: str) -> None:
+        admin.command(f"DROP DATABASE IF EXISTS {cls.database(name)} SYNC")
+        admin.command(f"DROP USER IF EXISTS {cls.user(name)}")
+
+    @classmethod
+    def diff(cls, target, db: str, schema_dir: Path) -> tuple:
+        """(applier plan steps, objects only the sandbox has) between db and schema_dir."""
+        server = SchemaApplier.version_tuple(target.command("SELECT version()"))
+        files = SchemaApplier.selected_files(schema_dir, server=server)
+        steps = SchemaApplier.plan(
+            target, db, files, SchemaApplier.migration_files(schema_dir)
+        )
+        return steps, cls.extra_objects(target, db, files)
+
+    @classmethod
     def extra_objects(cls, client, db: str, files: list) -> list:
         """(name, CREATE) for objects the sandbox has and the selected schema files do not declare."""
         declared = {
@@ -300,13 +334,9 @@ def main() -> None:
     # diff needs no rights outside the sandbox, so its own login can run it.
     if args.cmd == "diff":
         db = Sandbox.database(args.name)
-        target = ClickHouse.connect(database=db)
-        server = SchemaApplier.version_tuple(target.command("SELECT version()"))
-        files = SchemaApplier.selected_files(args.schema_dir, server=server)
-        steps = SchemaApplier.plan(
-            target, db, files, SchemaApplier.migration_files(args.schema_dir)
+        steps, extra = Sandbox.diff(
+            ClickHouse.connect(database=db), db, args.schema_dir
         )
-        extra = Sandbox.extra_objects(target, db, files)
         for action, name, detail in steps:
             label = {
                 "create": "removed",
@@ -377,8 +407,7 @@ def main() -> None:
     exists = bool(client.command(f"EXISTS DATABASE {db}"))
 
     if args.cmd == "drop":
-        client.command(f"DROP DATABASE IF EXISTS {db} SYNC")
-        client.command(f"DROP USER IF EXISTS {Sandbox.user(args.name)}")
+        Sandbox.drop(client, args.name)
         print(f"[info] dropped {db}")
         return
     if args.cmd == "seed" and not exists:
@@ -387,17 +416,14 @@ def main() -> None:
     if args.cmd == "create":
         if exists and not args.replace:
             raise SystemExit(f"[error] {db} exists -- pass --replace to rebuild it")
-        client.command(f"DROP DATABASE IF EXISTS {db} SYNC")
-        client.command(f"CREATE DATABASE {db}")
-        target = ClickHouse.connect(database=db)
-        server = SchemaApplier.version_tuple(target.command("SELECT version()"))
-        files = SchemaApplier.selected_files(args.schema_dir, server=server)
         try:
-            steps = SchemaApplier.apply(
-                target, db, files, SchemaApplier.migration_files(args.schema_dir)
+            steps = Sandbox.build(
+                client,
+                lambda d: ClickHouse.connect(database=d),
+                args.name,
+                args.schema_dir,
             )
         except SchemaDrift as e:
-            client.command(f"DROP DATABASE IF EXISTS {db} SYNC")
             raise SystemExit(f"[error] {e}") from None
         print(f"[info] {len(steps)} object(s) from {args.schema_dir} applied to {db}")
         password = secrets.token_urlsafe(24)
