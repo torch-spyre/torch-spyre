@@ -365,7 +365,9 @@ def _row_split(op, default: int, work_slices=None) -> int:
         return default
 
 
-def _contiguous_device_run(coords, dims, iteration_space, work_slices):
+def _contiguous_device_run(
+    coords, dims, iteration_space, work_slices, *, stick_planes=False
+):
     """Elements in a core's contiguous input run, or None if not provable.
 
     Flatten the *device* access, not the host index. Adjacent stick-plane and
@@ -373,6 +375,12 @@ def _contiguous_device_run(coords, dims, iteration_space, work_slices):
     the stick planes does not, and is deliberately left unmodelled. Walking the
     affine axes from stride one outward coalesces an axis only when every inner
     axis is unsplit and fully contiguous. Candidate splits may be symbolic.
+
+    ``stick_planes`` measures the burst a DMA issues over the source's own
+    layout instead (deeptools accumulates stick volume innermost-out over the
+    operand's dims): a stick plane walks as its own axis, and a dim the read
+    does not index is skipped. The transport term keeps the default, which
+    leaves a transpose within the stick planes unmodelled.
     """
     from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
@@ -381,13 +389,51 @@ def _contiguous_device_run(coords, dims, iteration_space, work_slices):
     index = index.replace(
         ModularIndexing, lambda a, b, c: sympy.Mod(sympy.floor(a / b), c)
     )
+    # A dim wider than a stick reaches the device as floor(d/s) and Mod(d, s).
+    # Name the two parts, d = s*q + r, so a stick plane that is not adjacent to
+    # its stick still walks as two affine axes; a core's share of d is whole
+    # sticks (deeptools rejects a partial-stick split), so the split lands on q.
+    space = dict(iteration_space)
+    slices = dict(work_slices)
+    for symbol, size in iteration_space.items() if stick_planes else ():
+        floors = {
+            f.args[0] * symbol**-1
+            for f in index.atoms(sympy.floor)
+            if f.args[0].free_symbols == {symbol}
+        }
+        if len(floors) != 1:
+            continue
+        (scale,) = floors
+        stick = 1 / scale
+        if not (stick.is_Integer and stick > 1 and sympy.sympify(size).is_Integer):
+            continue
+        stick, size = int(stick), int(size)
+        if size % stick or size == stick:
+            continue
+        q = sympy.Symbol(f"{symbol}_plane", integer=True, nonnegative=True)
+        r = sympy.Symbol(f"{symbol}_lane", integer=True, nonnegative=True)
+        index = index.replace(sympy.floor(symbol / stick), q).replace(
+            sympy.Mod(symbol, stick), r
+        )
+        if symbol in index.free_symbols:
+            index = index.subs(symbol, stick * q + r)
+        position = list(space)
+        at = position.index(symbol)
+        items = list(space.items())
+        space = dict(items[:at] + [(q, size // stick), (r, stick)] + items[at + 1 :])
+        slices[q] = slices.pop(symbol, 1)
     index = sympy.expand(
         index.replace(sympy.Mod, lambda a, b: a - b * sympy.floor(a / b))
     )
+    iteration_space, work_slices = space, slices
     axes = []
     remainder = index
     for symbol, size in iteration_space.items():
         stride = index.coeff(symbol)
+        # A dim this read does not walk (a broadcast or a reduction's other
+        # operand) cannot shorten its run.
+        if stick_planes and stride == 0 and symbol not in index.free_symbols:
+            continue
         if (
             not stride.is_Integer
             or stride <= 0
@@ -397,7 +443,10 @@ def _contiguous_device_run(coords, dims, iteration_space, work_slices):
             return None
         axes.append((int(stride), symbol, int(size)))
         remainder -= stride * symbol
-    if remainder.free_symbols or not remainder.is_Integer:
+    # What remains is the base offset. An enclosing loop's trip variable may
+    # survive in it (a for_each_tile body read pins only its own loop var); an
+    # offset moves the run, never shortens it. Only iteration symbols matter.
+    if remainder.free_symbols & set(iteration_space):
         return None
     axes.sort(key=lambda a: a[0])
     if not axes or axes[0][0] != 1:
@@ -456,6 +505,36 @@ def _transport_read_geometry(op, work_slices=None):
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         logger.debug("transport geometry unavailable", exc_info=True)
         return None, None
+
+
+def _read_run_bytes(op, read, work_slices=None):
+    """Bytes in one core's contiguous device run of ``read``, else None.
+
+    The burst a core's DMA can issue for this operand: the run ends at the
+    innermost split axis or a physical stride gap. Same geometry as
+    ``_transport_read_geometry``, for any single read of any op, so the burst
+    pricing reaches matmul operands and pointwise inputs too.
+    """
+    try:
+        from torch._inductor.virtualized import V
+
+        from .pass_utils import device_coordinates
+
+        rw = op.get_read_writes()
+        write = next(iter(rw.writes))
+        src = _real_layout(V.graph.get_buffer(read.name).get_layout()).device_layout
+        it_space = iteration_space_from_op(op)
+        coords = device_coordinates(src, read, None, op=op)
+        slices = _work_slices(op, write.index, read.index, it_space, work_slices)
+        run = _contiguous_device_run(
+            coords, src.device_size, it_space, slices, stick_planes=True
+        )
+        if run is None:
+            return None
+        return run * V.graph.get_buffer(read.name).get_dtype().itemsize
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        logger.debug("read run geometry unavailable", exc_info=True)
+        return None
 
 
 def _matmul_features(
@@ -1067,6 +1146,28 @@ def extract_op_features(
                 name,
                 mem == "lx",
             )
+        # Per-arg: this read's OWN index decides which levels it repeats at.
+        in_loop_factor = (
+            _loop_factor_for_index(index, _levels)
+            if (_levels and index is not None)
+            else in_factor
+        )
+        # Matmul consumers only: rung-G verified a pointwise broadcast operand
+        # loads once per kernel, the relayout sweep measured a bmm operand loading
+        # once per replicated core (cost_model.ArgTraffic).
+        replication = _replication(index, slices) if is_matmul else 1
+        # A replicated operand that a loop re-reads every iteration (an attention
+        # K/V block under a query split) behaves as one shared load: forced query
+        # splits of an SDPA scan replicating K/V 32 ways measured fastest, while the
+        # per-core replica price ranked them slowest.
+        if (
+            is_matmul
+            and not broadcast
+            and isinstance(in_loop_factor, int)
+            and in_loop_factor > 1
+            and not (isinstance(replication, int) and replication == 1)
+        ):
+            broadcast = True
         args.append(
             ArgTraffic(
                 name=name,
@@ -1076,17 +1177,10 @@ def extract_op_features(
                 broadcast=broadcast,
                 dims=list(dims),
                 logical=list(in_logical) if in_logical else [],
-                # Per-arg: this read's OWN index decides which levels it repeats at.
-                loop_factor=(
-                    _loop_factor_for_index(index, _levels)
-                    if (_levels and index is not None)
-                    else in_factor
-                ),
+                loop_factor=in_loop_factor,
                 is_boundary=(None if graph_inputs is None else name in graph_inputs),
-                # Matmul consumers only: rung-G verified a pointwise broadcast
-                # operand loads once per kernel, the relayout sweep measured a bmm
-                # operand loading once per replicated core (cost_model.ArgTraffic).
-                replication=_replication(index, slices) if is_matmul else 1,
+                replication=replication,
+                read_run_bytes=_read_run_bytes(op, dep, work_slices),
             )
         )
 
