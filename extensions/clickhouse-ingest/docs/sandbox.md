@@ -218,19 +218,19 @@ Calls that change a sandbox (`create_sandbox`, `seed_sandbox`,
 `drop_sandbox`, `extend_sandbox`, `verify_schema`) run one at a time per
 owner. A second call waits for the first to finish.
 
-| Tool | What it does | Notable arguments |
-|---|---|---|
-| `whoami` | Your owner name, sandboxes and the server's limits | — |
-| `create_sandbox` | Build from a schema ref and seed from prod | `days`, `runs_per_component`, `components`, `arches`, `tags`, `run_ids`, `schema_repo`, `schema_ref`, `ttl_days`, `replace`, `seed` |
-| `seed_sandbox` | Add another prod sample (additive, no duplicates) | same filters as `create_sandbox` |
-| `list_sandboxes` | Rows, size, schema source and expiry of each sandbox | — |
-| `run_query` | Run any statement as the sandbox's own login | `sql`, `max_rows` (default 200, capped at 1000) |
-| `schema_diff` | What your sandbox has that a schema ref does not | `schema_repo`, `schema_ref` |
-| `export_ddl` | Every `CREATE` in your sandbox, without the database name | — |
-| `verify_schema` | Prove a branch: a fresh apply, plus an upgrade from base with real rows | `schema_repo`, `schema_ref`, `base_repo`, `base_ref` |
-| `extend_sandbox` | Move expiry to `ttl_days` from now | `ttl_days` |
-| `drop_sandbox` | Drop the sandbox and its login | — |
-| `get_login` | Host, port, user and password for an outside client | — |
+| Tool | What it does | Notable arguments | Usage |
+|---|---|---|---|
+| `whoami` | Your owner name, sandboxes and the server's limits | — | `whoami()` |
+| `create_sandbox` | Build from a schema ref and seed from prod | `days`, `runs_per_component`, `components`, `arches`, `tags`, `run_ids`, `schema_repo`, `schema_ref`, `ttl_days`, `replace`, `seed` | `create_sandbox(days=7, runs_per_component=50, components=["hf-adapters"])` · `create_sandbox(name_suffix="exp1", schema_repo="jane-doe/torch-spyre", schema_ref="add-retries", seed=False)` |
+| `seed_sandbox` | Add another prod sample (additive, no duplicates) | same filters as `create_sandbox` | `seed_sandbox(arches=["s390x"], days=30)` · `seed_sandbox(run_ids=["<run uuid>"])` |
+| `list_sandboxes` | Rows, size, schema source and expiry of each sandbox | — | `list_sandboxes()` |
+| `run_query` | Run any statement as the sandbox's own login | `sql`, `max_rows` (default 200, capped at 1000) | `run_query("SELECT component, count() FROM test_case_runs GROUP BY component")` · `run_query("ALTER TABLE test_case_runs ADD COLUMN retries UInt8 DEFAULT 0")` · `run_query("SELECT count() FROM remote(prod_v2, table='artifacts')")` |
+| `schema_diff` | What your sandbox has that a schema ref does not | `schema_repo`, `schema_ref` | `schema_diff()` (vs `main`) · `schema_diff(schema_repo="jane-doe/torch-spyre", schema_ref="add-retries")` |
+| `export_ddl` | Every `CREATE` in your sandbox, without the database name | — | `export_ddl(name_suffix="exp1")` |
+| `verify_schema` | Prove a branch: a fresh apply, plus an upgrade from base with real rows | `schema_repo`, `schema_ref`, `base_repo`, `base_ref` | `verify_schema(schema_repo="jane-doe/torch-spyre", schema_ref="add-retries")` |
+| `extend_sandbox` | Move expiry to `ttl_days` from now | `ttl_days` | `extend_sandbox(ttl_days=30)` |
+| `drop_sandbox` | Drop the sandbox and its login | — | `drop_sandbox(name_suffix="exp1")` |
+| `get_login` | Host, port, user and password for an outside client | — | `get_login()` |
 
 ### `run_query` details
 
@@ -246,20 +246,63 @@ owner. A second call waits for the first to finish.
   default database.
 - ClickHouse errors come back verbatim, cut to 4000 characters.
 
-### `schema_diff` output
+### Using `schema_diff`
 
-Each entry has a `change` field:
+`schema_diff` compares your sandbox with the `schema/` directory at a GitHub
+ref and lists every difference. That list is what your PR has to contain.
 
-| `change` | Meaning | What the PR needs |
+```text
+schema_diff(name_suffix="", schema_repo="torch-spyre/torch-spyre", schema_ref="main")
+```
+
+It runs as your sandbox's own login and fetches the ref from GitHub. **Push
+your branch before you diff against it**, because local edits are not seen.
+
+**Against `main`: what have I changed?** After experimenting, run it with
+the defaults. Everything it lists is a change relative to prod's schema:
+
+```text
+run_query("ALTER TABLE test_case_runs ADD COLUMN retries UInt8 DEFAULT 0")
+run_query("CREATE VIEW v_retry_rate AS SELECT component, avg(retries) r FROM test_case_runs GROUP BY component")
+schema_diff()
+```
+
+```json
+{"against": "torch-spyre/torch-spyre@main",
+ "differences": [
+   {"change": "changed", "name": "test_case_runs", "detail": "<the column difference>"},
+   {"change": "added",   "name": "v_retry_rate",   "detail": "CREATE VIEW v_retry_rate AS ..."}
+ ]}
+```
+
+**Against your branch: does my PR cover it?** Write the changes into
+`schema/`, push to your fork, and diff against that branch:
+
+```text
+schema_diff(schema_repo="jane-doe/torch-spyre", schema_ref="add-retries")
+```
+
+Repeat until **only `migrate` entries are left**. At that point the branch's
+`CREATE` statements match your sandbox. The only remaining entry is your new
+migration, which has not run in the sandbox because you made the change by
+hand with `ALTER`.
+
+Each entry's `change` describes your sandbox relative to the ref:
+
+| `change` | Meaning | What to do in the branch |
 |---|---|---|
-| `added` | The object is in your sandbox but not in the ref | Its `CREATE` in `schema/` (see `detail`) |
-| `changed` | The table or MV differs from the ref's `CREATE` | A migration, plus the updated `CREATE` |
-| `view-changed` | The view differs | The updated `CREATE VIEW` |
-| `removed` | The ref declares it but your sandbox does not have it | Remove it from `schema/` or recreate it |
-| `migrate` | A migration in the ref has not run in your sandbox | Nothing, if this is the only kind left |
+| `added` | The object is in your sandbox but not in the ref | Add its `CREATE` (given in `detail`) to the right `schema/NN-*.sql` |
+| `changed` | The table or MV differs from the ref's `CREATE` | Update the `CREATE` **and** add `migrations/NNN_*.sql` with the `ALTER`. A live table only changes through a migration |
+| `view-changed` | The view differs | Update the `CREATE VIEW`. Views are dropped and recreated, so no migration is needed |
+| `removed` | The ref declares it but your sandbox does not have it | Either you dropped it on purpose, or the branch declares something you never created in the sandbox |
+| `migrate` | A migration in the ref has not run in your sandbox | Nothing, once it is the only kind left |
 
-When only `migrate` entries are left, your branch covers everything your
-sandbox has.
+An empty `differences` list means the sandbox and the ref match exactly.
+`schema_migrations` and `_seed_runs` are never reported.
+
+`schema_diff` shows that your branch *describes* the sandbox. Use
+`verify_schema` next to prove that the branch *applies* cleanly, both to an
+empty database and as an upgrade from `main` with real rows.
 
 ## Workflows
 
