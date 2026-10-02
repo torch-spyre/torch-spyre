@@ -14,15 +14,17 @@
 
 """Automated coarse tiling: explicit ``for_each_tile`` loops and tile discovery."""
 
+import contextlib
 import dataclasses
 import functools
 import pytest
 import os
+import random
 import sys
 import torch
 import unittest
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Optional
 
 from unittest.mock import patch
@@ -35,6 +37,8 @@ from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -46,6 +50,11 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
+
+
+# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
+# (with ``co_optimizing_lx_planning``, on by default).
+_TILING_SOLVERS = frozenset({"simulated_annealing"})
 
 
 def expected_unimplemented(fn):
@@ -281,15 +290,13 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
+        # Only the SA co-optimizer chooses tilings; elsewhere the flag is inert.
+        if auto_tiling and layout_solver not in _TILING_SOLVERS:
+            raise NotImplementedError(f"{layout_solver} does not choose tilings")
 
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -302,6 +309,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                auto_coarse_tiling=auto_tiling,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -548,7 +556,10 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["tiling_mode"] in ("auto", "explicit_auto"):
+        if (
+            params["tiling_mode"] in ("auto", "explicit_auto")
+            and params["solver_method"] not in _TILING_SOLVERS
+        ):
             decorators.append(expected_unimplemented)
         return decorators
 
@@ -557,3 +568,130 @@ class AutomatedCoarseTilingTests(
         self._CHECKS[params["tiling_mode"]](
             self, factory(self), params["solver_method"]
         )
+
+
+class _HeldDivisions(sa._GeneratedDivisions):
+    """A buffer's divisions restricted to one tiling, and optionally one split."""
+
+    spec = TileSpec()
+    pinned = False
+
+    def can_move(self) -> bool:
+        return not self.pinned and super().can_move()
+
+    def can_split(self) -> bool:
+        return not self.pinned and super().can_split()
+
+    def retiled(
+        self, config: sa.DivisionConfig, tiling: TileSpec
+    ) -> Optional[sa.DivisionConfig]:
+        return super().retiled(config, tiling) if tiling == self.spec else None
+
+    def _step_moves(self, config: sa.DivisionConfig) -> list[sa.DivisionConfig]:
+        if self.pinned:
+            return []
+        return [c for c in super()._step_moves(config) if c.tiling == self.spec]
+
+    def _draw_tiling(self, rng: random.Random) -> TileSpec:
+        return self.spec
+
+    def anchor(
+        self, config: sa.DivisionConfig, rng: random.Random
+    ) -> Optional[sa.DivisionConfig]:
+        c = None if self.pinned else super().anchor(config, rng)
+        return c if c is None or c.tiling == self.spec else None
+
+
+def _hold_tilings(
+    hold: Mapping[str, tuple[int, Optional[dict[str, int]]]], held: set[str]
+) -> contextlib.ExitStack:
+    """Hold each ``hold`` buffer's tiling (host dim x 2) and optional splits.
+
+    Every other buffer still anneals. The recolor flood assigns configs without
+    asking a source, so it is filtered too. ``held`` collects the buffers held.
+    """
+    build = sa.SaCoOptimizingSolver._build_sources
+    flood = sa.SaCoOptimizingSolver._flood_region
+
+    def build_sources(solver: sa.SaCoOptimizingSolver) -> None:
+        build(solver)
+        for i, (buf, src) in enumerate(zip(solver._bufs, solver._sources)):
+            if not isinstance(src, sa._GeneratedDivisions):
+                continue
+            source = _HeldDivisions(src.space, src.seed_config)
+            if buf.name in hold:
+                host_dim, pin = hold[buf.name]
+                source.spec = TileSpec((TileAxis(host_dim=host_dim, count=2),))
+                splits = {a: (pin or {}).get(str(a), 1) for a in src.space.axes}
+                assert src.space.admits(splits, source.spec), (buf.name, splits)
+                division = src.space.division(splits, source.spec)
+                source.seed_config = src.config_for(division)
+                source.pinned = pin is not None
+                held.add(buf.name)
+            solver._sources[i] = source
+
+    def flood_region(
+        solver: sa.SaCoOptimizingSolver, anchor: int, config: sa.DivisionConfig
+    ) -> dict[int, sa.DivisionConfig]:
+        return {
+            k: v
+            for k, v in flood(solver, anchor, config).items()
+            if v.tiling == solver._sources[k].spec
+        }
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(
+        patch.object(sa.SaCoOptimizingSolver, "_build_sources", build_sources)
+    )
+    stack.enter_context(
+        patch.object(sa.SaCoOptimizingSolver, "_flood_region", flood_region)
+    )
+    return stack
+
+
+class HeldSolverTilingTests(unittest.TestCase):
+    """States the SA co-optimizer can reach, held so the result is deterministic."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        torch.compiler.reset()
+        self.addCleanup(torch.compiler.reset)
+
+    def test_gqa_query_tiled_in_two_groups_and_split_on_kv_heads(self):
+        # buf0 (q transposed to [b, hq, s, d]) and buf1 (q viewed [b, hkv, g, s,
+        # d] times the scale) are tiled on s in two single-op groups, and buf1
+        # is split 8 ways on hkv. buf1 reads buf0's copy-out through a view
+        # traced at full scale; rescaling it again read heads 8*hkv + 2*g.
+        b, s, hq, hkv, d = 1, 64, 32, 8, 128
+
+        def attention(
+            qh: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor
+        ) -> torch.Tensor:
+            q, k, v = (t.transpose(1, 2) for t in (qh, kh, vh))
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, enable_gqa=True
+            )
+            return out.transpose(1, 2).reshape(b, s, hq * d)
+
+        args = [
+            torch.randn(b, s, heads, d, dtype=torch.float16) for heads in (hq, hkv, hkv)
+        ]
+        expected = attention(*(arg.float() for arg in args))
+        held: set[str] = set()
+        with (
+            t_inductor_config.patch(force_disable_caches=True),
+            ts_inductor_config.patch(
+                lx_planning=True,
+                auto_coarse_tiling=True,
+                layout_solver="simulated_annealing",
+                co_optimizing_lx_planning=True,
+            ),
+            _hold_tilings({"buf0": (2, None), "buf1": (3, {"d0": 8})}, held),
+        ):
+            compiled = torch.compile(attention, dynamic=False)
+            actual = compiled(*(arg.to(DEVICE_NAME) for arg in args))
+
+        self.assertEqual(held, {"buf0", "buf1"})
+        actual = actual.to("cpu").float()
+        rel_l2 = float((actual - expected).norm() / expected.norm())
+        self.assertLess(rel_l2, 0.01)  # fp16 lands at 0.003

@@ -226,6 +226,9 @@ class ReadCopyEntry:
         True only when every consumer reads the same source slice on every
         trip of the surrounding counted loop.  Such a copy is a preheader
         operation, not part of the loop body.
+    staged_pair:
+        ``(source, sizing op's buffer name)`` under which a planner placed this
+        copy, or None where no planner chose it (the pre-stickify hint route).
     """
 
     copy_name: str
@@ -238,6 +241,7 @@ class ReadCopyEntry:
         tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
     ] = ()
     loop_invariant: bool = False
+    staged_pair: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)

@@ -2278,7 +2278,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     eff = 1.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
@@ -2379,7 +2379,7 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     eff, eff_rows = 1.0, None
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -2589,7 +2589,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     lines = []
     for o in ops:
         r, w, lx = o.read_bytes(), o.write_bytes(), o.lx_bytes()
-        loop = f" loop_trip={o.loop_trip}" if o.loop_trip > 1 else ""
+        tiled = _is_sym(o.loop_trip) or o.loop_trip > 1
+        loop = f" loop_trip={o.loop_trip}" if tiled else ""
         pat = f" [{o.hbm_pattern}]" if getattr(o, "hbm_pattern", "") else ""
         lines.append(f"  {o.name:<12} read={r}B write={w}B lx={lx}B{loop}{pat}")
         for a in o.args:
@@ -2697,7 +2698,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
