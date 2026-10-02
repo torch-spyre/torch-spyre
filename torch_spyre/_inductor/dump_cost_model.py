@@ -207,7 +207,7 @@ def _input_traffic(name: str):
     return None, None, None, None
 
 
-def _loop_features(op):
+def _loop_features(op, tile_counts: Optional[Mapping[sympy.Symbol, sympy.Expr]] = None):
     """(loop_trip, tiles_reduction_dim, tiles_output_dim) from the coarse-tiling
     ``loop_info`` (loop_info.py / coarse_tile.py). ``loop_trip`` = product of
     loop_count (1 if not tiled). tiles_reduction_dim = loop_tiled_reduction_dims is
@@ -215,6 +215,16 @@ def _loop_features(op):
     (output / pointwise-dim tiling). NOTE the fill/combine ops carry the same loop_info
     but tile NEITHER (both lists empty), so their accumulators stay fixed (factor L); a
     genuinely tiled op's args advance (factor 1)."""
+    if tile_counts is not None:
+        # A tiling nothing has applied yet: the trip count is the solver's.
+        # `tiles_output_dim` stays false: it gates branches (a matmul's pt_eff,
+        # the standalone-reduction rate) that would move for every *tileable*
+        # op whether or not the search tiles it, so binding the counts to 1
+        # would no longer reproduce the untiled price. The rest of what it gates
+        # keys on `tile_rows_per_core`, symbolic here, which `_tiled_rows`
+        # withholds anyway. `tiles_reduction_dim` is false because v1 tiles
+        # output axes only.
+        return sympy.Mul(*tile_counts.values()), False, False
     li = getattr(op, "loop_info", None)
     if li is None:
         return 1, False, False
@@ -230,8 +240,14 @@ def _loop_features(op):
     )
 
 
-def _tiled_symbols_per_level(op):
+def _tiled_symbols_per_level(
+    op, tile_counts: Optional[Mapping[sympy.Symbol, sympy.Expr]] = None
+):
     """Per NESTING LEVEL, the set of loop symbols that level tiles.
+
+    ``tile_counts`` short-circuits the IR read: it already states one level per
+    iteration symbol, which is what the host-range mapping below exists to
+    recover.
 
     ``CoarseTileInfo`` stores the tiled dims as HOST-RANGE indices, one list per level
     (``loop_tiled_dims`` for output dims, ``loop_tiled_reduction_dims`` for reduction
@@ -249,6 +265,8 @@ def _tiled_symbols_per_level(op):
         loop_tiled_dims          = [[0], []]      # level 0 tiles output dim 0 -> i0
         loop_tiled_reduction_dims= [[],  [0]]     # level 1 tiles reduction dim 0 -> r0_0
     """
+    if tile_counts is not None:
+        return [(count, {axis}, 1) for axis, count in tile_counts.items()]
     li = getattr(op, "loop_info", None)
     if li is None:
         return []
@@ -862,6 +880,7 @@ def extract_op_features(
     work_slices=None,
     *,
     is_lx: Optional[Mapping[str, bool]] = None,
+    tile_counts: Optional[Mapping[sympy.Symbol, sympy.Expr]] = None,
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
@@ -877,13 +896,20 @@ def extract_op_features(
     graph boundary, resolved against the arg's own role, so a buffer that is both a
     graph input and a graph output (a returned view of an input; a mutated input that
     is returned) needs no special case.
+
+    ``tile_counts`` (iteration symbol -> tile count) is for a caller whose coarse
+    tiling is still undecided -- the co-optimizing allocator, which applies its
+    choices only after the solve. It replaces what ``op.loop_info`` would have
+    said, and the features that then carry an unknown are ``loop_trip`` and each
+    arg's ``loop_factor``. Everything else stays at its untiled value, so binding
+    every tile count to 1 reproduces the untiled features exactly.
     """
     is_lx = is_lx or {}
     boundary = _graph_boundary_names()
     graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
-    loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
+    loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op, tile_counts)
     # An arg ADVANCES (factor 1, walks the full tensor once across tiles) when this op
     # tiles a dim the arg traverses: an OUTPUT (pointwise) dim -> all args advance; a
     # REDUCTION dim -> only the reduced input advances. An arg is FIXED (factor L,
@@ -984,7 +1010,7 @@ def extract_op_features(
     #     mm_nested_m_k      4 / 1 / 2   -- old rule gave 1/1/1. The OUTPUT advances at
     #                                      level 0 (index has i0) and repeats at level 1
     #                                      (no r0_0) => 1*4; B does the opposite => 2*1.
-    _levels = _tiled_symbols_per_level(op)
+    _levels = _tiled_symbols_per_level(op, tile_counts)
     try:
         _rw = op.get_read_writes()
         _write_index = next(iter(_rw.writes)).index
@@ -992,6 +1018,8 @@ def extract_op_features(
         _write_index = None
     if _levels and _write_index is not None:
         out_factor = _loop_factor_for_index(_write_index, _levels)
+    elif tile_counts is not None:  # an output-axis level always advances the write
+        out_factor = 1
     else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
         out_factor = 1 if tiles_out_dim else loop_trip
     in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip

@@ -240,6 +240,21 @@ enable_reduction_tiling: bool = (
     os.environ.get("SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING", "1") == "1"
 )
 
+# Let the joint core-division + LX-placement search choose a coarse tiling per
+# op, and apply it (``scratchpad.coarse_tiling.CoarseTilingPass``) before the
+# divisions are committed. Only the SA co-optimizer can choose one -- a search
+# that indexes an enumerated menu has no tiling to index -- so this is read
+# alongside ``co_optimizing_lx_planning`` plus
+# ``layout_solver = "simulated_annealing"``.
+#
+# Off by default, for two reasons that are not about the machinery working.
+# Anything the apply refuses raises rather than falling back, so any gap
+# between what the search believes it may tile and what ``coarse_tile``
+# accepts is a compile failure. And the loop cost the search sees is only part
+# of what ``predict_ops`` charges a real tiling, so it is not yet a calibrated
+# brake on the tiling axis.
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
