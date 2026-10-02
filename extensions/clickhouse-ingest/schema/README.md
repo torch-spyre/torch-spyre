@@ -87,6 +87,8 @@ Mechanical constraints behind those rules:
 
 ## Sandboxes
 
+User guide, MCP tool reference and security model: [`docs/sandbox.md`](../docs/sandbox.md).
+
 `python -m spyre_clickhouse_ingest.sandbox` gives one person a database on the **dev** server to
 change schema and queries freely. A sandbox never reaches a live database: the only way a change
 lands in `spyre_v2` is a PR to this directory, applied by the Jenkins job above.

@@ -15,9 +15,13 @@
 """Pins the sandbox server's fences: who a token is, which sandboxes they may touch, and
 which schema sources it will fetch."""
 
+import contextlib
 import json
+import threading
 
 import pytest
+from clickhouse_connect.driver.exceptions import DatabaseError
+from spyre_clickhouse_ingest import sandbox_server
 from spyre_clickhouse_ingest.sandbox_server import (
     Config,
     Identity,
@@ -100,10 +104,15 @@ def test_schema_source_is_validated(repo, ref):
 
 
 class FakeAdmin:
-    """Answers the one system.databases query Sandboxes.meta makes."""
+    """Answers the one system.databases query Sandboxes.meta makes, and records commands."""
 
     def __init__(self, dbs):
         self.dbs = dbs
+        self.commands = []
+
+    def command(self, sql, parameters=None):
+        self.commands.append(sql)
+        return "25.3.1"
 
     def query(self, sql, parameters=None):
         class R:
@@ -166,3 +175,94 @@ def test_reads_and_statements_are_told_apart():
     assert Sandboxes.READS.match("DESCRIBE TABLE t")
     assert not Sandboxes.READS.match("ALTER TABLE t ADD COLUMN c UInt8")
     assert not Sandboxes.READS.match("INSERT INTO t SELECT 1")
+
+
+def test_revoked_owners_do_not_resolve(tmp_path):
+    f = tmp_path / "tokens.conf"
+    f.write_text("shared-tok=Jane.Doe@ibm.com\n")
+    revoked = tmp_path / "revoked.conf"
+    revoked.write_text("# comment\nbob\n")
+    identity = Identity(SECRET, f, revoked)
+    assert identity.resolve(identity.mint("bob")) is None
+    assert identity.resolve(identity.mint("ann")) == "ann"
+    revoked.write_text("jane.doe@ibm.com\n")
+    assert identity.resolve("shared-tok") is None
+
+
+def test_suffixed_names_cannot_collide_with_another_owner():
+    o = ops({})
+    assert o.name("ann", "x") == "ann__x"
+    assert o.name("ann", "x") != o.name(Identity.owner("ann_x"))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "(SELECT 1)",
+        "-- why\nSELECT 1",
+        "/* a\nb */ WITH x AS (SELECT 1) SELECT * FROM x",
+    ],
+)
+def test_reads_behind_comments_or_parens_are_reads(sql):
+    assert Sandboxes.READS.match(sql)
+
+
+def test_an_owners_mutations_are_serialized():
+    o = ops({"sandbox_ann": managed("ann")})
+    assert o.lock("ann") is o.lock("ann") and o.lock("ann") is not o.lock("bob")
+    done = threading.Event()
+    with o.lock("ann"):
+        threading.Thread(target=lambda: (o.drop("ann", ""), done.set())).start()
+        assert not done.wait(0.2)
+    assert done.wait(5)
+
+
+def test_login_resets_a_rotated_password():
+    calls = []
+
+    def connect(user, password, db):
+        calls.append(password)
+        if len(calls) == 1:
+            raise DatabaseError("Code: 516. DB::Exception: AUTHENTICATION_FAILED")
+        return "client"
+
+    o = ops({})
+    o.connect = connect
+    admin = FakeAdmin({})
+    assert o.login(admin, "ann") == "client"
+    assert len(calls) == 2 and "ALTER USER sandbox_ann_admin" in admin.commands[0]
+
+
+def test_login_does_not_mask_other_errors():
+    def connect(user, password, db):
+        raise DatabaseError("Code: 81. DB::Exception: Database does not exist")
+
+    o = ops({})
+    o.connect = connect
+    admin = FakeAdmin({})
+    with pytest.raises(DatabaseError):
+        o.login(admin, "ann")
+    assert admin.commands == []
+
+
+def test_verify_gates_the_upgrade_apply_on_the_server_version(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(
+        SchemaSource,
+        "fetch",
+        classmethod(lambda cls, r, f: contextlib.nullcontext(tmp_path)),
+    )
+    monkeypatch.setattr(sandbox_server.Sandbox, "build", lambda *a, **k: [])
+    monkeypatch.setattr(sandbox_server.Sandbox, "seed", lambda *a, **k: [])
+    monkeypatch.setattr(sandbox_server.Sandbox, "diff", lambda *a, **k: ([], []))
+    monkeypatch.setattr(
+        sandbox_server.SchemaApplier,
+        "selected_files",
+        lambda d, include=(), server=(): seen.append(server) or [],
+    )
+    monkeypatch.setattr(sandbox_server.SchemaApplier, "migration_files", lambda d: [])
+    monkeypatch.setattr(sandbox_server.SchemaApplier, "apply", lambda *a: [])
+    report = ops({}).verify(
+        "ann", "me/torch-spyre", "b", "torch-spyre/torch-spyre", "main"
+    )
+    assert report["ok"] and seen == [(25, 3)]

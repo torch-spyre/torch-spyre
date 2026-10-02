@@ -33,12 +33,14 @@ import os
 import ssl
 import tarfile
 import tempfile
+import threading
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import clickhouse_connect
 import regex as re
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 from .apply_schema import SchemaApplier
 from .sandbox import Sandbox, SeedFilter
@@ -56,6 +58,12 @@ class Config:
     tokens_file: Path = field(
         default_factory=lambda: Path(
             env("SANDBOX_TOKENS_FILE", "/etc/sandbox/tokens/tokens.conf")
+        )
+    )
+    # One owner per line; their tokens stop resolving without rotating SANDBOX_SECRET.
+    revoked_file: Path = field(
+        default_factory=lambda: Path(
+            env("SANDBOX_REVOKED_FILE", "/etc/sandbox/tokens/revoked.conf")
         )
     )
     public_url: str = field(
@@ -81,11 +89,14 @@ class Identity:
 
     MINTED = re.compile(r"^sbx_([a-z][a-z0-9_]{1,23})\.([A-Za-z0-9_-]{22})$")
 
-    def __init__(self, secret: bytes, tokens_file: Path):
+    def __init__(
+        self, secret: bytes, tokens_file: Path, revoked_file: Path | None = None
+    ):
         if len(secret) < 32:
             raise SystemExit("[error] SANDBOX_SECRET must be at least 32 bytes")
         self.secret = secret
         self.tokens_file = tokens_file
+        self.revoked_file = revoked_file
 
     @staticmethod
     def owner(label: str) -> str:
@@ -122,13 +133,26 @@ class Identity:
                     out[token.strip()] = label.strip()
         return out
 
+    def revoked(self) -> set:
+        """Owners refused regardless of token, re-read so a Secret update applies live."""
+        out = set()
+        if self.revoked_file:
+            with contextlib.suppress(FileNotFoundError):
+                for line in self.revoked_file.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        out.add(self.owner(line))
+        return out
+
     def resolve(self, token: str) -> str | None:
         m = self.MINTED.match(token)
         if m:
             ok = hmac.compare_digest(m.group(2), self._sig("token", m.group(1)))
-            return m.group(1) if ok else None
-        label = self.labels().get(token)
-        return self.owner(label) if label else None
+            owner = m.group(1) if ok else None
+        else:
+            label = self.labels().get(token)
+            owner = self.owner(label) if label else None
+        return owner if owner and owner not in self.revoked() else None
 
 
 class SchemaSource:
@@ -167,17 +191,31 @@ class Sandboxes:
 
     MANAGED = "sandbox-server"
     SUFFIX = re.compile(r"^[a-z0-9]{1,12}$")
-    READS = re.compile(r"^\s*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|EXISTS)\b", re.I)
+    # Leading whitespace, comments and parentheses do not hide a read.
+    READS = re.compile(
+        r"^(?:\s+|\(|--[^\n]*(?:\n|$)|/\*.*?\*/)*"
+        r"(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|EXISTS)\b",
+        re.I | re.S,
+    )
+    AUTH_FAILED = re.compile(r"\bCode: 516\b|AUTHENTICATION_FAILED")
 
     def __init__(self, cfg: Config, identity: Identity, admin_connect, connect):
         self.cfg, self.identity = cfg, identity
         self.admin_connect = admin_connect  # (database) -> admin client
         self.connect = connect  # (user, password, database) -> client
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def lock(self, owner: str) -> threading.Lock:
+        """Serializes one owner's mutating calls within this process (one replica)."""
+        with self._locks_guard:
+            return self._locks.setdefault(owner, threading.Lock())
 
     def name(self, owner: str, suffix: str = "") -> str:
         if suffix and not self.SUFFIX.match(suffix):
             raise ValueError("name_suffix must be 1-12 of [a-z0-9]")
-        return f"{owner}_{suffix}" if suffix else owner
+        # "__" never occurs in an owner, so owner "ann" + "x" cannot be owner "ann_x".
+        return f"{owner}__{suffix}" if suffix else owner
 
     def meta(self, admin) -> dict:
         """db -> comment metadata, for every sandbox this server manages."""
@@ -200,9 +238,20 @@ class Sandboxes:
             raise PermissionError(f"you have no sandbox named {Sandbox.database(name)}")
         return name
 
-    def login(self, name: str):
-        db = Sandbox.database(name)
-        return self.connect(Sandbox.user(name), self.identity.password(db), db)
+    def login(self, admin, name: str):
+        db, user = Sandbox.database(name), Sandbox.user(name)
+        password = self.identity.password(db)
+        try:
+            return self.connect(user, password, db)
+        except DatabaseError as e:
+            if not self.AUTH_FAILED.search(str(e)):
+                raise
+        # A rotated SANDBOX_SECRET derives a new password; re-set it rather than strand the login.
+        admin.command(
+            f"ALTER USER {user} IDENTIFIED WITH sha256_password BY %(pw)s",
+            parameters={"pw": password},
+        )
+        return self.connect(user, password, db)
 
     def seed_filter(self, f: dict) -> SeedFilter:
         return SeedFilter(
@@ -228,6 +277,14 @@ class Sandboxes:
         )
 
     def create(
+        self, owner, suffix, seed, filters, repo, ref, ttl_days, replace
+    ) -> dict:
+        with self.lock(owner):
+            return self._create(
+                owner, suffix, seed, filters, repo, ref, ttl_days, replace
+            )
+
+    def _create(
         self, owner, suffix, seed, filters, repo, ref, ttl_days, replace
     ) -> dict:
         admin = self.admin_connect("default")
@@ -263,6 +320,10 @@ class Sandboxes:
         }
 
     def seed(self, owner, suffix, filters) -> dict:
+        with self.lock(owner):
+            return self._seed(owner, suffix, filters)
+
+    def _seed(self, owner, suffix, filters) -> dict:
         admin = self.admin_connect("default")
         db = Sandbox.database(self.owned(admin, owner, suffix))
         return {
@@ -271,12 +332,20 @@ class Sandboxes:
         }
 
     def drop(self, owner, suffix) -> dict:
+        with self.lock(owner):
+            return self._drop(owner, suffix)
+
+    def _drop(self, owner, suffix) -> dict:
         admin = self.admin_connect("default")
         name = self.owned(admin, owner, suffix)
         Sandbox.drop(admin, name)
         return {"dropped": Sandbox.database(name)}
 
     def extend(self, owner, suffix, ttl_days) -> dict:
+        with self.lock(owner):
+            return self._extend(owner, suffix, ttl_days)
+
+    def _extend(self, owner, suffix, ttl_days) -> dict:
         admin = self.admin_connect("default")
         db = Sandbox.database(self.owned(admin, owner, suffix))
         m = self.meta(admin)[db]
@@ -331,14 +400,16 @@ class Sandboxes:
 
     def query(self, owner, suffix, sql, max_rows) -> dict:
         admin = self.admin_connect("default")
-        return self.rows(self.login(self.owned(admin, owner, suffix)), sql, max_rows)
+        return self.rows(
+            self.login(admin, self.owned(admin, owner, suffix)), sql, max_rows
+        )
 
     def diff(self, owner, suffix, repo, ref) -> dict:
         admin = self.admin_connect("default")
         name = self.owned(admin, owner, suffix)
         db = Sandbox.database(name)
         with SchemaSource.fetch(repo, ref) as schema_dir:
-            steps, extra = Sandbox.diff(self.login(name), db, schema_dir)
+            steps, extra = Sandbox.diff(self.login(admin, name), db, schema_dir)
         label = {"create": "removed", "drift": "changed", "recreate": "view-changed"}
         return {
             "against": f"{repo}@{ref}",
@@ -358,7 +429,7 @@ class Sandboxes:
         name = self.owned(admin, owner, suffix)
         db = Sandbox.database(name)
         rows = (
-            self.login(name)
+            self.login(admin, name)
             .query(
                 "SELECT name, create_table_query FROM system.tables WHERE database = %(db)s "
                 "ORDER BY name",
@@ -369,10 +440,14 @@ class Sandboxes:
         return {n: q.replace(f"{db}.", "") for n, q in rows if n != Sandbox.RUNS}
 
     def verify(self, owner, repo, ref, base_repo, base_ref) -> dict:
+        with self.lock(owner):
+            return self._verify(owner, repo, ref, base_repo, base_ref)
+
+    def _verify(self, owner, repo, ref, base_repo, base_ref) -> dict:
         """A fresh apply of repo@ref, and an upgrade onto base_ref with real rows, both clean."""
         admin = self.admin_connect("default")
         report = {"schema": f"{repo}@{ref}", "base": f"{base_repo}@{base_ref}"}
-        # "__" never occurs in an owner and SUFFIX has no "_", so no user sandbox shares these.
+        # A suffix has no "_", so no user sandbox (owner__suffix) shares these names.
         fresh, up = f"{owner}__verify_fresh", f"{owner}__verify_up"
         comment = self.comment(owner, 1, f"verify {repo}@{ref}")
         try:
@@ -388,7 +463,9 @@ class Sandboxes:
                     Sandbox.build(admin, self.admin_connect, up, base, comment)
                 Sandbox.seed(admin, Sandbox.database(up), SeedFilter(3, 5))
                 target = self.admin_connect(Sandbox.database(up))
-                files = SchemaApplier.selected_files(branch)
+                # Gate on the server version as build() does, or a skipped file applies here.
+                server = SchemaApplier.version_tuple(target.command("SELECT version()"))
+                files = SchemaApplier.selected_files(branch, server=server)
                 applied = SchemaApplier.apply(
                     target,
                     Sandbox.database(up),
@@ -419,7 +496,8 @@ class Sandboxes:
         for db, m in self.meta(admin).items():
             with contextlib.suppress(KeyError, ValueError):
                 if dt.datetime.fromisoformat(m["expires"]) < now:
-                    Sandbox.drop(admin, db.removeprefix(Sandbox.PREFIX))
+                    with self.lock(m["owner"]):
+                        Sandbox.drop(admin, db.removeprefix(Sandbox.PREFIX))
                     gone.append(db)
         return gone
 
@@ -440,7 +518,6 @@ def build_server(cfg: Config, ops: Sandboxes):
     from mcp.server.auth.middleware.auth_context import get_access_token
     from mcp.server.auth.provider import AccessToken
     from mcp.server.auth.settings import AuthSettings
-    from clickhouse_connect.driver.exceptions import DatabaseError
     from mcp.server.mcpserver import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
     from starlette.requests import Request
@@ -470,7 +547,7 @@ def build_server(cfg: Config, ops: Sandboxes):
         "clickhouse-sandbox",
         instructions=(
             "Personal spyre_v2 sandboxes on the dev ClickHouse server. Every tool acts only "
-            "on the caller's own sandboxes (sandbox_<you> or sandbox_<you>_<suffix>). Schema "
+            "on the caller's own sandboxes (sandbox_<you> or sandbox_<you>__<suffix>). Schema "
             "changes reach spyre_v2 only by a torch-spyre PR; use schema_diff and "
             "verify_schema to build and prove one."
         ),
@@ -526,7 +603,7 @@ def build_server(cfg: Config, ops: Sandboxes):
         replace: bool = False,
         seed: bool = True,
     ) -> dict:
-        """Create sandbox_<you>[_<suffix>] from the schema at github.com/<schema_repo>@<schema_ref>
+        """Create sandbox_<you>[__<suffix>] from the schema at github.com/<schema_repo>@<schema_ref>
         (push your branch to your fork to use it), seeded with prod runs from the last `days`
         days, `runs_per_component` most recent per component, optionally narrowed to
         components / arches / artifact tags, plus explicit run_ids. Takes ~2 minutes at the
@@ -630,6 +707,8 @@ def build_server(cfg: Config, ops: Sandboxes):
         me = owner()
         admin = await run(ops.admin_connect, "default")
         name = await run(ops.owned, admin, me, name_suffix)
+        # Proves the password, re-setting it after a SANDBOX_SECRET rotation.
+        await run(ops.login, admin, name)
         db = Sandbox.database(name)
         return {
             "host": cfg.public_ch_host,
@@ -659,6 +738,8 @@ def build_server(cfg: Config, ops: Sandboxes):
                 {"error": "register with a person's login, not a service account"}, 403
             )
         me = ops.identity.owner(user)
+        if me in ops.identity.revoked():
+            return JSONResponse({"error": f"{me} is revoked on this server"}, 403)
         return JSONResponse(
             {
                 "owner": me,
@@ -681,7 +762,7 @@ def main() -> None:
     from .client import ClickHouse, ClickHouseEnv
 
     cfg = Config()
-    identity = Identity(cfg.secret, cfg.tokens_file)
+    identity = Identity(cfg.secret, cfg.tokens_file, cfg.revoked_file)
 
     def connect(user, password, database):
         return clickhouse_connect.get_client(
