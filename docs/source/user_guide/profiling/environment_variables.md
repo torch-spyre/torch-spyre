@@ -106,6 +106,7 @@ did not move is omitted rather than recorded as zero.
 | `read_writes.requests` | Calls to the memoized `op_read_writes` helper: how many times the pass asked |
 | `read_writes.misses` | Of those, the ones the per-op memo could not serve |
 | `read_writes.extractions` | `ComputedBuffer.get_read_writes` invocations -- the sympy dependency extraction that actually costs something, including callers that bypass the memo |
+| `read_writes.extract_ns` | Nanoseconds spent inside those extractions, so a count can be sized rather than guessed (measured at ~143 us a call) |
 | `device_coordinates` | Device-space coordinate constructions |
 | `host_coordinates` | Host-space coordinate constructions |
 

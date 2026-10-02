@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import time
 from typing import Any, Iterator
 
 from torch._inductor.ir import ComputedBuffer
@@ -68,6 +69,11 @@ READ_WRITES_EXTRACTIONS = "read_writes.extractions"
 # the count is the work.
 DEVICE_COORDINATES = "device_coordinates"
 HOST_COORDINATES = "host_coordinates"
+# Nanoseconds spent inside ComputedBuffer.get_read_writes. The call count alone
+# cannot size the waste: extraction cost varies with body complexity, so a pass
+# doing 200 extractions per op is not necessarily dominated by them. Measured at
+# ~143 us a call, which made that distinction decidable.
+READ_WRITES_EXTRACT_NS = "read_writes.extract_ns"
 
 
 class PassCounters:
@@ -138,7 +144,11 @@ def counting(install: bool = True) -> Iterator[PassCounters]:
     @functools.wraps(original)
     def counted(self: ComputedBuffer, *args: Any, **kwargs: Any) -> Any:
         COUNTERS.bump(READ_WRITES_EXTRACTIONS)
-        return original(self, *args, **kwargs)
+        start = time.perf_counter_ns()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            COUNTERS.bump(READ_WRITES_EXTRACT_NS, time.perf_counter_ns() - start)
 
     ComputedBuffer.get_read_writes = counted  # type: ignore[method-assign]
     COUNTERS.reset()
@@ -175,6 +185,7 @@ __all__ = [
     "HOST_COORDINATES",
     "PassCounters",
     "READ_WRITES_EXTRACTIONS",
+    "READ_WRITES_EXTRACT_NS",
     "READ_WRITES_MISSES",
     "READ_WRITES_REQUESTS",
     "counted_region",
