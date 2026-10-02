@@ -36,7 +36,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 COMPILE_EVENT = "stage:compile_fx:spyre_compile"
-BACKEND_SUFFIX = ":backend_compile"
+#: Matched exactly, never by trailing segment. Upstream has a dynamo_timed phase of
+#: its own called backend_compile -- the call into Inductor, recorded as
+#: stage:torch:backend_compile -- which *encloses* the Spyre compile region, so a
+#: suffix match totals the whole Inductor compile as backend time and drives the
+#: frontend subtraction negative. Mirrors timing_recorder.BACKEND_COMPILE_EVENT.
+BACKEND_EVENT = "stage:SpyreAsyncCompile:backend_compile"
 GRAPH_PIPELINE = "pipeline:CustomPreSchedulingPasses"
 
 #: Metadata keys that describe the run rather than the point being measured.
@@ -80,7 +85,7 @@ class Record:
 
     def backend_ns(self) -> int:
         return sum(
-            e["inclusive_ns"] for e in self.events if e["name"].endswith(BACKEND_SUFFIX)
+            e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT
         )
 
     def graph_operations(self) -> int | None:
