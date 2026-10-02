@@ -612,7 +612,9 @@ def _pointwise_op(shape, name="buf0"):
     layout = _fixed_tiled_layout(shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
-    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    syms = sympy.symbols(
+        " ".join(f"d{i}" for i in range(len(shape))), integer=True, nonnegative=True
+    )
     if not isinstance(syms, tuple):
         syms = (syms,)
     index = sympy.Integer(0)
@@ -642,7 +644,9 @@ def _matmul_op(out_shape=(128, 256), k=64, name="mm"):
     layout = _fixed_tiled_layout(out_shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
-    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(out_shape))))
+    syms = sympy.symbols(
+        " ".join(f"d{i}" for i in range(len(out_shape))), integer=True, nonnegative=True
+    )
     if not isinstance(syms, tuple):
         syms = (syms,)
     index = sympy.Integer(0)

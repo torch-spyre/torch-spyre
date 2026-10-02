@@ -3224,6 +3224,10 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
             candidates=[],
             probes=[],
         )
+        # The write dep the enumerator resolves the stick dim through.
+        self.op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads=set(), writes={self.case.output_td.dep})
+        )
         self.tiling = TilingSpace(max_dims=2, output_counts={0: [2, 4]})
 
     @contextmanager

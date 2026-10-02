@@ -65,6 +65,9 @@ Two deliberate departures from the span-overflow path:
   tiling produces an undersized boundary ``full_buf`` and silently wrong results
   (the stick-dim upscale bug). So this enumerator drops the stick dim entirely
   rather than trusting the stick-alignment predicate the 448 path relies on.
+  It names the stick dim by coordinate identity only, and offers an op it
+  cannot name one for no output tiling: a size-based guess that missed would
+  leave the true stick dim offered and alignment-checked against the guess.
 * **It does not run on span pressure.** ``_candidate_host_dims`` only offers dims
   that relieve an overflowing span; enumerating from it would return the untiled
   option alone for an op under no pressure, and the solver would never tile it.
@@ -100,7 +103,6 @@ from .span_overflow_hint_analysis import (
     _layout_has_static_span_metadata,
     _post_tile_stick_alignment_error,
     _split_candidates_for_host_dim,
-    _within_stick_host_dim,
 )
 
 logger = get_inductor_logger("wsr.enumerate_tilings")
@@ -113,25 +115,12 @@ _MAX_TILE_OPTIONS = 64
 
 
 def _output_stick_host_dim(op: ComputedBuffer) -> int | None:
-    """The op's within-stick output host dim, or ``None`` when unresolved.
-
-    Tiling this dim is excluded (see the module docstring): fail closed. Prefer
-    the coordinate-identity resolver ``_stick_host_dim``; fall back to the
-    size-based ``_within_stick_host_dim``.
-    """
+    """The op's within-stick output host dim, or ``None`` when coordinate
+    identity cannot name it (see the module docstring)."""
     layout = op.get_layout()
     if getattr(layout, "device_layout", None) is None:
         return None
-    try:
-        dim = _stick_host_dim(op, layout.device_layout)
-    except (AttributeError, TypeError, ValueError, RuntimeError, KeyError, IndexError):
-        dim = None
-    if dim is None:
-        try:
-            dim = _within_stick_host_dim(layout)
-        except (AttributeError, TypeError, ValueError, IndexError):
-            dim = None
-    return dim
+    return _stick_host_dim(op, layout.device_layout)
 
 
 def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
@@ -462,8 +451,8 @@ def build_tiling_space(
     (:func:`_unit_tile_breaks_a_reader`).
     """
     output_counts: dict[int, list[int]] = {}
-    if _tileable(op) and _static_extents(op):
-        stick_dim = _output_stick_host_dim(op)
+    stick_dim = _output_stick_host_dim(op) if _tileable(op) else None
+    if stick_dim is not None and _static_extents(op):
         n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
         # Only a ComputedBuffer reader is re-indexed by the apply.
         retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
