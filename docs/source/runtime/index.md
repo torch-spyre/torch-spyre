@@ -335,6 +335,13 @@ to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0'
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
 
+### Compiled collectives and streams
+
+In compiled graphs, `wait_tensor` blocks the host until the collective
+finishes. `TORCH_SPYRE_DIST_ENFORCE_WAIT=0` skips that wait (experimental) and
+relies on the default stream, where `spyre_comms` runs every collective, to
+order it. The wait is never skipped on a non-default stream.
+
 ## More in This Section
 
 ```{toctree}

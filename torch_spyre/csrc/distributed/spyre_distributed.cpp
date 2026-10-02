@@ -65,6 +65,17 @@ void clear_retained_work_schedules() {
   retained_work_schedules_.clear();
 }
 
+// spyre-comms does not report failures through WorkSchedule::wait(), so check
+// the schedule state and the Flex stream error flag instead.
+static void check_collective_errors(spyre_comms::WorkSchedule& work) {
+  TORCH_CHECK(
+      work.getState() != spyre_comms::WorkScheduleState::State::DONE_ERROR,
+      "[SpyreCCL]: collective failed");
+  auto* runtime = spyre::GlobalRuntime::get();
+  TORCH_CHECK(runtime == nullptr || !runtime->hasStreamError(),
+              "[SpyreCCL]: device stream error during collective");
+}
+
 // Compile-time plan cache.
 enum class PlanKind { Broadcast, AllReduce, AllGather };
 
@@ -505,19 +516,22 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
   }
 
   // Lock released — concurrent wait_work and run ops can now proceed.
-  // No explicit work->wait() is needed here: Spyre Comms uses the default Flex
-  // stream, so Flex enforces ordering between the collective and any subsequent
-  // compute.  The result is visible to later operations on the stream without a
-  // host-side synchronization point.  See the comment in ensure_context() for
-  // the full rationale.
-  static const bool skip_wait = []() {
-    const char* env = std::getenv("TORCH_SPYRE_DIST_SKIP_WAIT");
+  // The wait is skipped only when opted in with TORCH_SPYRE_DIST_ENFORCE_WAIT=0
+  // and the current stream is the default Flex stream that Spyre Comms uses
+  // (see ensure_context()).  Other streams are not ordered with it.
+  static const bool enforce_wait = []() {
+    const char* env = std::getenv("TORCH_SPYRE_DIST_ENFORCE_WAIT");
     return !(env && std::string(env) == "0");
   }();
 
   if (pending.work) {
+    const c10::Device device = tensor.device();
+    const bool skip_wait =
+        !enforce_wait && spyre::getCurrentStream(device).id() ==
+                             spyre::getDefaultStream(device).id();
     if (!skip_wait) {
       pending.work->wait();
+      check_collective_errors(*pending.work);
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
     } else {
       // If we are skipping the wait, then we need to retain the object to
@@ -525,7 +539,13 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
       // completes. The WorkSchedule destructor will force the wait() to
       // complete. This will negate the performance improvements of avoiding
       // the wait().
+      check_collective_errors(*pending.work);
       std::lock_guard<std::mutex> lock(retained_work_mutex_);
+      // Release finished schedules so their buffers do not accumulate.
+      std::erase_if(retained_work_schedules_, [](const auto& w) {
+        return w->getState() ==
+               spyre_comms::WorkScheduleState::State::DONE_SUCCESS;
+      });
       retained_work_schedules_.push_back(std::move(pending.work));
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
     }
