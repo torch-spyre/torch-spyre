@@ -143,13 +143,35 @@ class Record:
                 )
         return totals
 
+    def self_by_prefix(self, prefix: str) -> dict[str, int]:
+        """Self time per region: inclusive minus direct children.
+
+        Recorded alongside the inclusive series because they answer different
+        questions and neither substitutes for the other. Inclusive is what the
+        frontend subtraction needs and what shows the nesting; it also sums to more
+        than the compile, so ranking regions by it puts every ancestor of the hot
+        pass at ~100% and says nothing. Self time is what ranks cost.
+        """
+        totals: dict[str, int] = {}
+        for event in self.events:
+            if event["name"].startswith(prefix):
+                totals[event["name"]] = totals.get(event["name"], 0) + int(
+                    event["self_ns"]
+                )
+        return totals
+
 
 #: Rows-file version; a consumer that does not know it should refuse the file.
 ROWS_SCHEMA = "frontend-timing-rows/1"
 
 
 def metric_key(event_name: str) -> str:
-    """``stage:Owner:what`` -> ``stage.Owner.what_ms``, safe as a warehouse Map key."""
+    """``stage:Owner:what`` -> ``stage.Owner.what_ms``, safe as a warehouse Map key.
+
+    Each region also gets a ``..._self_ms`` sibling. New metric names are additive, so
+    a reader written against an older rows file keeps working and simply does not see
+    them.
+    """
     return event_name.replace(":", ".") + "_ms"
 
 
@@ -263,6 +285,9 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
         ):
             if size is not None:
                 add(key, size)
+        for prefix in ("stage:", "pass:", "pipeline:"):
+            for name, ns in record.self_by_prefix(prefix).items():
+                add(metric_key(name)[:-3] + "_self_ms", ns / 1e6)
         for name, ns in record.by_prefix("stage:").items():
             # Already total_ms, so a sum over stage.* must not see it again.
             if name == COMPILE_EVENT:
