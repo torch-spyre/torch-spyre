@@ -168,6 +168,10 @@ def _child_env(
     env = dict(os.environ)
     env["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+    # One compile thread: above one, the per-kernel backend call runs in a pool worker
+    # that does not share this process's recorder, so its region is missing from the
+    # record and the frontend subtraction silently absorbs the backend.
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     env["TORCH_SPYRE_TIMING"] = "1"
     env["TORCH_SPYRE_TIMING_OUT"] = os.path.join(out_dir, record_name)
     if frontend_only:
