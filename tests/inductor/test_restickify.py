@@ -2784,3 +2784,93 @@ def test_nonstick_reorder_pointwise_into_matmul():
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
         f"nonstick_log={[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
     )
+
+
+# -------- Restickify of a staggered (FP32_TO_DL16) tensor ---------- #
+
+
+def _exact_ramp(*shape, mod=257):
+    """fp32 ramp of small integers, exact through fp32 -> fp16 on device."""
+    return (torch.arange(math.prod(shape)) % mod).reshape(shape).to(torch.float32)
+
+
+def _run_staggered(fn, *args):
+    """Run ``fn``; return (result, whether a FP32_TO_DL16 restickify was emitted)."""
+    import torch_spyre._inductor.codegen.superdsc as _superdsc
+
+    emitted = []
+    impl = _superdsc._restickifies_fp32_to_dl16
+
+    def record(*a, **kw):
+        used = impl(*a, **kw)
+        emitted.append(used)
+        return used
+
+    with patch.object(_superdsc, "_restickifies_fp32_to_dl16", record):
+        result = _compile_and_run(fn, args, DEVICE)
+    return result, any(emitted)
+
+
+@pytest.mark.parametrize(
+    "shape, dims",
+    [
+        ((64, 128), (0, 1)),
+        ((128, 256), (0, 1)),
+        ((192, 64), (0, 1)),
+        ((96, 128), (0, 1)),
+        ((2, 64, 128), (1, 2)),
+        ((128, 3, 64), (0, 2)),
+        ((2, 3, 64, 128), (2, 3)),
+    ],
+)
+def test_staggered_transpose_contiguous(shape, dims):
+    """A transpose of an on-device fp32 -> fp16 result comes back in order."""
+
+    def fn(x):
+        return x.to(torch.float16).transpose(*dims).contiguous()
+
+    x = _exact_ramp(*shape)
+    result, emitted = _run_staggered(fn, x)
+    assert emitted
+    assert torch.equal(result.cpu(), fn(x))
+
+
+def test_staggered_transpose_after_pointwise():
+    def fn(x):
+        return (x.to(torch.float16) * 0.5).transpose(0, 1).contiguous()
+
+    x = _exact_ramp(64, 128, mod=64)
+    result, emitted = _run_staggered(fn, x)
+    assert emitted
+    assert torch.equal(result.cpu(), fn(x))
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        pytest.param(lambda t: t * 2, id="mul"),
+        pytest.param(lambda t: t.sum(0), id="sum_rows"),
+        pytest.param(lambda t: t.sum(-1), id="sum_stick"),
+        pytest.param(lambda t: t @ t.transpose(0, 1)[:, :64], id="matmul"),
+    ],
+)
+def test_staggered_transpose_then_reader(consumer):
+    def fn(x):
+        return consumer(x.to(torch.float16).transpose(0, 1).contiguous())
+
+    x = _exact_ramp(64, 128, mod=5)
+    result, emitted = _run_staggered(fn, x)
+    assert emitted
+    torch.testing.assert_close(result.cpu(), fn(x), atol=0.5, rtol=0.01)
+
+
+def test_plain_transpose_keeps_standard_restickify():
+    """A STANDARD fp16 transpose keeps the plain ReStickifyOpHBM."""
+
+    def fn(x):
+        return x.transpose(0, 1).contiguous()
+
+    x = _exact_ramp(64, 128).to(torch.float16)
+    result, emitted = _run_staggered(fn, x)
+    assert not emitted
+    assert torch.equal(result.cpu(), fn(x))

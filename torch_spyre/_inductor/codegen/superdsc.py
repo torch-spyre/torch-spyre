@@ -41,6 +41,7 @@ from torch_spyre._inductor.constants import (
     POOL_DIM_LABELS,
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
+    RESTICKIFY_FP32_TO_DL16_OP,
     RESTICKIFY_OP,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
@@ -1645,6 +1646,11 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
+def _restickifies_fp32_to_dl16(op_spec: OpSpec) -> bool:
+    """True if a restickify's input sticks are in the FP32_TO_DL16 arrangement."""
+    return op_spec.args[0].element_arrangement == ElementArrangement.FP32_TO_DL16
+
+
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if _is_pool(op) or _is_conv(op):
         return op
@@ -2486,6 +2492,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             opfunc=(
                 "shuffle"
                 if is_relayout
+                else RESTICKIFY_FP32_TO_DL16_OP
+                if is_restickify and _restickifies_fp32_to_dl16(op_spec)
                 else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
             ),
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
