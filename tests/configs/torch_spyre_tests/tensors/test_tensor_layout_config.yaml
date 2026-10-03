@@ -9,3 +9,5 @@ test_suite_config:
       # The skipped test (test_to_spyre_layout_explicit_expanded_*) is excluded
       # via @unittest.skip and will not be collected.
       unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/tensor/test_d2h_slice_transfer.py
+      unlisted_test_mode: mandatory_success
