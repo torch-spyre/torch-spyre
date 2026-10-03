@@ -27,6 +27,8 @@ producer's output layout in place (if the producer is a ComputedBuffer and not a
 graph output) or inserts a spyre.restickify copy in the required layout.
 """
 
+from math import prod
+
 import sympy
 import torch
 
@@ -34,6 +36,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    FixedLayout,
     MutationLayoutSHOULDREMOVE,
     ReinterpretView,
     Scatter,
@@ -57,6 +60,7 @@ from .pass_utils import (
     _build_indirect_store_subs,
     _find_scatter_index_buf_names,
     build_operation_alignment_inputs,
+    compute_size1_restickify_target,
     concretize_expr,
     device_coordinates,
     indirect_info_from_op,
@@ -66,9 +70,11 @@ from .pass_utils import (
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
+from .work_division import MAX_SPAN_BYTES
 from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
+_STICK_BYTES = 128
 
 
 def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
@@ -199,6 +205,52 @@ def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bo
     return compliant
 
 
+def _retile_entry_per_stick(
+    value_stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Re-tile a tensor whose indexed coordinate is the stick.
+
+    Rotating cannot help: it lists the stick twice and grows the rank. Instead
+    the stick moves onto a size-1 dim, so each entry sits alone on a stick and
+    the indexed coordinate becomes an outer device dim. This is the layout a
+    host ``[N, 1]`` input already receives.
+    """
+    retiled_stl = compute_size1_restickify_target(value_stl, host_layout, dep, op)
+    if retiled_stl is None:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: no size-1 stick target for {value_stl}"
+        )
+    stride_idx = _indirect_stride_idx(
+        device_coordinates(retiled_stl, dep, sizes), access_subs
+    )
+    if stride_idx is None or stride_idx == 0:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: the indexed coordinate of {retiled_stl} "
+            f"is not an outer device dim"
+        )
+    if not _dim_order_is_compliant(retiled_stl, stride_idx):
+        # The entries may land in a spare size-1 dim; a reorder brings them out.
+        indirect_device_pos = len(retiled_stl.stride_map) - 1 - stride_idx
+        retiled_stl = _build_required_stl(retiled_stl, indirect_device_pos)
+
+    # A stick per entry, so a large table can outgrow the span limit.
+    retiled_bytes = prod(retiled_stl.device_size[:-1]) * _STICK_BYTES
+    if retiled_bytes > MAX_SPAN_BYTES:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: one entry per stick would take "
+            f"{retiled_bytes / (1024 * 1024):.2f} MB, over the "
+            f"{MAX_SPAN_BYTES / (1024 * 1024):.2f} MB per-core limit. "
+            f"Give the tensor a trailing dimension so its entries already sit "
+            f"on separate sticks."
+        )
+    return retiled_stl
+
+
 def _build_required_stl(
     value_stl: SpyreTensorLayout,
     indirect_device_pos: int,
@@ -208,6 +260,8 @@ def _build_required_stl(
     Takes the current device layout and rotates it so the indirect coordinate
     (at indirect_device_pos) moves to position 0, while keeping the stick
     (at position -1) at the end. Returns a new STL with the rotated layout.
+
+    When the indexed coordinate is the stick, use _retile_entry_per_stick.
     """
     device_size = list(value_stl.device_size)
     stride_map = list(value_stl.stride_map)
@@ -218,6 +272,8 @@ def _build_required_stl(
     if indirect_device_pos == 0:
         return value_stl
 
+    assert indirect_device_pos != stick_pos, "the indexed stick needs a re-tile"
+
     # Rotate: move indirect_device_pos to position 0, keep stick at end
     order = (
         [indirect_device_pos]
@@ -227,11 +283,24 @@ def _build_required_stl(
 
     new_device_size = [device_size[i] for i in order]
     new_stride_map = [stride_map[i] for i in order]
+    assert len(new_device_size) == n, (
+        f"rotation changed rank {n} -> {len(new_device_size)} (order={order})"
+    )
 
     return SpyreTensorLayout(
         device_size=new_device_size,
         stride_map=new_stride_map,
         device_dtype=value_stl.device_dtype,
+    )
+
+
+def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Whether ``b`` just reorders ``a``'s device dims.
+
+    Relabelling a producer moves no bytes, so it is only safe for a reorder.
+    """
+    return sorted(zip(a.device_size, a.stride_map)) == sorted(
+        zip(b.device_size, b.stride_map)
     )
 
 
@@ -563,6 +632,7 @@ def _insert_mutation_relayout_copy(
     output_stl = _output_real_layout(mutation_op).device_layout
 
     write_stride_idx: int | None = None
+    write_subs, write_sizes = access_subs, sizes
     if is_scatter_op:
         logger.debug(
             "enforce_indirect_layout: scatter op device_size=%s, stride_map=%s",
@@ -573,9 +643,9 @@ def _insert_mutation_relayout_copy(
         scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
             mutation_op, _output_real_layout(mutation_op), write_dep
         )
+        write_subs, write_sizes = scatter_access_subs, scatter_sizes
         write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, scatter_sizes),
-            scatter_access_subs,
+            device_coordinates(output_stl, write_dep, write_sizes), write_subs
         )
     else:
         write_stride_idx = _indirect_stride_idx(
@@ -585,8 +655,18 @@ def _insert_mutation_relayout_copy(
             f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
         )
     assert write_stride_idx is not None
-    output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    if write_stride_idx == 0:
+        required_stl = _retile_entry_per_stick(
+            output_stl,
+            _output_real_layout(mutation_op),
+            write_dep,
+            mutation_op,
+            write_subs,
+            write_sizes,
+        )
+    else:
+        output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
+        required_stl = _build_required_stl(output_stl, output_indirect_pos)
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -952,11 +1032,18 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
             if _dim_order_is_compliant(value_stl, stride_idx):
                 continue
 
-            # Rotate the device layout to put the indirect coordinate at position 0
-            indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-            required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            # Put the indexed coordinate where the gather can address it
+            if stride_idx == 0:
+                required_stl = _retile_entry_per_stick(
+                    value_stl, value_layout, value_dep, op, access_subs, sizes
+                )
+            else:
+                indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
+                required_stl = _build_required_stl(value_stl, indirect_device_pos)
 
-            if _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
+            if _is_permutation_of(
+                value_stl, required_stl
+            ) and _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
                 _rewrite_producer_layout(value_buf, required_stl)
             else:
                 required_layout = _fixed_tiled(value_layout, required_stl)

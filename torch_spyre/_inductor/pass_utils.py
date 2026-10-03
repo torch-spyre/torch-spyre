@@ -2262,7 +2262,9 @@ def restickify_stride_map(
     """Computes the new stride_map after a restickify is performed moving the stick from old_sd to new_sd."""
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
-    new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
+    new_stride_map[old_sd_outer_dim] = (
+        -1 if new_sd_host_stride < 0 else new_sd_host_stride * stick_size
+    )
     new_stride_map[new_sd_outer_dim] = old_sd_host_stride
     return new_stride_map
 
@@ -2275,20 +2277,32 @@ def compute_restickify_target_layout(
     idc: list,
 ) -> "SpyreTensorLayout | None":
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
+
+    A target_stick_expr of 0 moves the stick onto a dim of size 1, so each
+    stick holds one element. The size-1 dim need not exist on the host: it
+    behaves the same whether it is real or synthetic. Any other constant is
+    a stick offset, which cannot be targeted.
+
     Returns None if the restickify is infeasible.
     """
-    new_sd = matching_dim(ic, target_stick_expr)
-    if new_sd is None:
-        return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
+    size1_target = target_stick_expr == sympy.S.Zero
+    if size1_target:
+        # A size-1 dim has one element and maps to no host stride, as in
+        # dim_map_to_stride_map in spyre_tensor_impl.cpp.
+        new_sd_host_size, new_sd_host_stride = 1, -1
+    else:
+        new_sd = matching_dim(ic, target_stick_expr)
+        if new_sd is None:
+            return None
+        new_sd_host_size, new_sd_host_stride = host_size[new_sd], host_stride[new_sd]
     old_sd = matching_dim(ic, idc[-1])
     if old_sd is None:
         return None
     old_stick_expr = idc[-1]
     old_stride_map = list(stl.stride_map)
     old_var = next(iter(old_stick_expr.free_symbols))
-    new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_sd_outer_dim = next(
         (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
@@ -2296,16 +2310,30 @@ def compute_restickify_target_layout(
     )
     if old_sd_outer_dim is None:
         return None
-    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
-    if not candidates:
-        return None
-    new_sd_outer_dim = candidates[0]
+    if size1_target:
+        # Reuse a device dim whose coordinate is the literal 0 (a real size-1
+        # dim, or padding). Without one, the old stick's elements take over
+        # its own outer dim, one element per stick.
+        new_sd_outer_dim = next(
+            (
+                j
+                for j in range(len(idc) - 1)
+                if j != old_sd_outer_dim and idc[j] == sympy.S.Zero
+            ),
+            old_sd_outer_dim,
+        )
+    else:
+        new_var = next(iter(target_stick_expr.free_symbols))
+        candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
+        if not candidates:
+            return None
+        new_sd_outer_dim = candidates[0]
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
         host_size[old_sd],
         new_sd_outer_dim,
-        host_size[new_sd],
+        new_sd_host_size,
         stick_size,
     )
     stride_map = restickify_stride_map(
@@ -2313,7 +2341,7 @@ def compute_restickify_target_layout(
         old_sd_outer_dim,
         host_stride[old_sd],
         new_sd_outer_dim,
-        host_stride[new_sd],
+        new_sd_host_stride,
         stick_size,
     )
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
@@ -2577,6 +2605,25 @@ def compute_restickify_needed(
     return True, compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
     )
+
+
+def compute_size1_restickify_target(
+    in_stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    in_dep: MemoryDep,
+    op: "ComputedBuffer | None" = None,
+) -> "SpyreTensorLayout | None":
+    """Target STL that moves in_stl's stick onto a dim of size 1.
+
+    Used when the input's stick var must leave the stick (e.g. topk's
+    reduction var) and no other dim can take it.
+    """
+    _, _, ind_sizes = indirect_info_from_op(op)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
+    if idc is None:
+        return None
+    ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
+    return compute_restickify_target_layout(in_stl, in_host, sympy.S.Zero, ic, idc)
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
