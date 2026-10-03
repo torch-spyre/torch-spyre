@@ -239,10 +239,19 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
-    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
-    # not shifted (it is not a dimension index).
+    #
+    # The trailing -1 sparse-stick marker must NOT be counted among the body
+    # dims: it is not a dimension index and including it before the prepend
+    # would produce a list of length (input_rank + 1), breaking the
+    # `assert len(c_in_size) == len(projected_dim_order)` check in
+    # `_is_supported_layout` (triggered by 280-FP8Linear direct-load path).
+    has_marker = dim_order[-1] == -1
+    body = dim_order[:-1] if has_marker else dim_order
     leading = list(range(-rank_diff))
-    return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
+    result = leading + [(d - rank_diff) for d in body]
+    if has_marker:
+        result.append(-1)
+    return result
 
 
 def _pick_stick_dim(stick_expr, out_coords) -> int:
@@ -1735,7 +1744,17 @@ def _multi_arg_pointwise_layouts(
             )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+            # When the projected order carries the sparse-stick marker (-1 last)
+            # but c_in_size only covers the real dims, append a dummy entry so
+            # SpyreTensorLayout receives parallel size/stride/order lists.
+            # This happens whenever dim_order itself ends with -1 (rank_diff >= 0
+            # and rank_diff == -1 cases) OR when the projection re-introduces the
+            # marker for rank_diff < -1 inputs (where input_rank > output_rank+1).
+            if (
+                projected_dim_order
+                and projected_dim_order[-1] == -1
+                and len(c_in_size) < len(projected_dim_order)
+            ):
                 c_in_size.append(0)
                 c_in_stride.append(0)
             assert len(c_in_size) == len(projected_dim_order)

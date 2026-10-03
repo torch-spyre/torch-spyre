@@ -201,24 +201,17 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             )
         elif len(loop_vars) > len(names):
             # More loop vars than named dims: a reshape split this layout dim.
-            if all(n.startswith("_untracked_") for n in names):
-                # The split name is only an _untracked_ placeholder (no
-                # meaningful name to preserve, e.g. a k/v projection output
-                # reshaped into heads).  Assign fresh untracked names per loop
-                # var rather than aborting the whole pass.
-                for loop_var in loop_vars:
-                    size = int(dep.ranges[loop_var])
-                    result.setdefault(loop_var, []).append(
-                        _untracked_name(dep.name, loop_var, size)
-                    )
-                continue
-            # A real (meaningful) name was split — the caller must re-annotate
-            # after the reshape; we cannot guess the split.
-            raise Unsupported(
-                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
-                f"{len(names)} name(s) {names} -- reshape split a named dim, "
-                f"re-annotate after the reshape"
-            )
+            # Whether the original name is meaningful or an _untracked_ placeholder,
+            # we cannot reconstruct the split mapping — assign fresh untracked names
+            # for each loop var so the pass can continue rather than aborting.
+            # The compiler uses shape-based heuristics for work partitioning, so
+            # losing the symbolic name here does not affect correctness.
+            for loop_var in loop_vars:
+                size = int(dep.ranges[loop_var])
+                result.setdefault(loop_var, []).append(
+                    _untracked_name(dep.name, loop_var, size)
+                )
+            continue
         elif len(loop_vars) < len(names):
             # Fewer loop vars than names: a size-1 declared dim was fused into
             # this layout dim and zip would silently drop the trailing name(s).

@@ -397,6 +397,114 @@ class TestScaledMmPrequantizedClosedOver:
 
 
 # ---------------------------------------------------------------------------
+# register_buffer-backed FP8 weight (FP8Linear pattern)
+# ---------------------------------------------------------------------------
+
+
+class TestTransferModuleFp8Buffer:
+    """_transfer_module routes a register_buffer FP8 weight to QFP8WT KERNEL layout.
+
+    FP8Linear (from hf-adapters feat/fp8-direct-prequant-load) stores its
+    quantized weight via ``register_buffer("weight", ...)`` rather than as an
+    ``nn.Parameter``.  Because such a module is not ``nn.Linear``, the
+    old ``is_linear`` guard was False and the buffer fell through to
+    ``_dma_to_spyre_default``, which attempted ``float8_e4m3fn → bfloat16``
+    and crashed in DCI.
+
+    The fix removes the ``is_linear`` guard from the buffer branch and detects
+    the FP8 weight purely by
+    ``name == "weight" and buf.ndim == 2 and buf.dtype == float8_e4m3fn``.
+
+    This test class verifies:
+      1. The buffer-backed FP8 weight is moved to Spyre with dtype preserved
+         (not cast to bf16/fp16).
+      2. A non-FP8 buffer with the same name is *not* misrouted (dtype-guarded).
+      3. A non-weight FP8 buffer (different name) goes through the default path.
+    """
+
+    class _FP8LinearLike(nn.Module):
+        """Minimal stand-in for FP8Linear: weight stored as a buffer, not a Parameter."""
+
+        def __init__(self, out_features: int, in_features: int):
+            super().__init__()
+            # Weight is already in [in_features, out_features] == [K, N] orientation
+            # (transposed by FP8Linear.from_fp8_checkpoint before load_model_to_spyre).
+            w = torch.randn(in_features, out_features, dtype=torch.float16)
+            self.register_buffer(
+                "weight", w.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            )
+
+        def forward(self, x):  # pragma: no cover
+            return x
+
+    def test_fp8_buffer_weight_goes_to_kernel_layout(self):
+        """register_buffer FP8 weight is moved to Spyre with float8_e4m3fn preserved."""
+        from torch_spyre.model_utils import load_model_to_spyre
+
+        model = self._FP8LinearLike(out_features=128, in_features=256)
+        assert model.weight.dtype == torch.float8_e4m3fn, "pre-condition: fp8 buffer"
+        assert model.weight.device.type == "cpu", "pre-condition: weight on cpu"
+
+        load_model_to_spyre(model, use_fp8_weights=True)
+
+        assert model.weight.device.type == DEVICE_TYPE, (
+            f"Expected buffer weight on {DEVICE_TYPE}, got {model.weight.device}"
+        )
+        assert model.weight.dtype == torch.float8_e4m3fn, (
+            f"Expected fp8 dtype preserved, got {model.weight.dtype}"
+        )
+
+    def test_non_fp8_buffer_weight_uses_default_path(self):
+        """A float16 buffer named 'weight' is not misrouted by the FP8 guard."""
+        from torch_spyre.model_utils import load_model_to_spyre
+
+        class _Bf16BufferModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "weight", torch.randn(64, 128, dtype=torch.bfloat16)
+                )
+
+            def forward(self, x):  # pragma: no cover
+                return x
+
+        model = _Bf16BufferModule()
+        load_model_to_spyre(model, use_fp8_weights=True)
+
+        assert model.weight.device.type == DEVICE_TYPE
+        # dtype must be preserved — the default path does not cast bfloat16 buffers
+        assert model.weight.dtype == torch.bfloat16, (
+            f"Expected bfloat16 preserved, got {model.weight.dtype}"
+        )
+
+    def test_non_weight_fp8_buffer_uses_default_path(self):
+        """An FP8 buffer whose name is not 'weight' is not routed to the kernel path."""
+        from torch_spyre.model_utils import load_model_to_spyre
+
+        class _FP8ScaleBufferModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Simulate a per-channel scale stored as an FP8 buffer (not a weight)
+                w = torch.randn(64, 64, dtype=torch.float16)
+                self.register_buffer(
+                    "scale", w.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                )
+
+            def forward(self, x):  # pragma: no cover
+                return x
+
+        model = _FP8ScaleBufferModule()
+        load_model_to_spyre(model, use_fp8_weights=True)
+
+        assert model.scale.device.type == DEVICE_TYPE
+        # dtype must be preserved — the dtype-guard in the default-path branch
+        # keeps float8_e4m3fn as-is (buf_dtype = None) to avoid DCI crashes.
+        assert model.scale.dtype == torch.float8_e4m3fn, (
+            f"Expected fp8 dtype preserved on non-weight buffer, got {model.scale.dtype}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: quantscalepertokenfp8 + pre-quantized KERNEL weight
 # ---------------------------------------------------------------------------
 
