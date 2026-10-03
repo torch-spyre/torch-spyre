@@ -931,7 +931,12 @@ class _GatherScenarios:
                         lds["wordLength"], 4, "index int32 -> wordLength 4"
                     )
                 else:
-                    self.assertEqual(lds["wordLength"], 2, "value fp16 -> wordLength 2")
+                    # Non-index buffers are not all fp16; width follows format.
+                    fmt = lds["dataFormat_"]
+                    expected = 2 if ("FP16" in fmt or "BF16" in fmt) else 4
+                    self.assertEqual(
+                        lds["wordLength"], expected, f"{fmt} -> wordLength {expected}"
+                    )
 
             index_nodes += [
                 n

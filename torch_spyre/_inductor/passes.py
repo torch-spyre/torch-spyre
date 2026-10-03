@@ -74,6 +74,7 @@ from .insert_restickify import (
     validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .normalize_indices import normalize_negative_indices
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
@@ -263,7 +264,8 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        # The index wrap must land in a real buffer, so it runs before lowering.
+        super().__init__([normalize_negative_indices, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
