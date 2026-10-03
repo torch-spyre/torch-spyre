@@ -594,6 +594,44 @@ The same gate applies to `layout_solver` values of `"greedy"`, `"bestfit"`,
 or `"firstfit"` combined with `co_optimizing_lx_planning`, since none of
 those solvers is core-division-capable either.
 
+#### Solver-driven coarse tiling
+
+`config.auto_coarse_tiling` (env var `AUTO_COARSE_TILING=1`, off by
+default) lets the joint CP-SAT solve choose a coarse tiling for each op
+along with its core division. It has no effect with any other solver.
+
+- **Candidates.** An op is offered the output-axis tilings
+  `enumerate_tile_options` finds: never the stick dim, never a reduction
+  axis, and none that leave a per-core read over the read-distance limit.
+  Ops a `spyre_hint` or `for_each_tile` loop already tiles, every op inside
+  a `for_each_tile` region, restickifies and mutations are offered only the
+  untiled option. Each tiling gets its own division menu, enumerated on the
+  per-tile frame.
+- **Matching.** A producer/consumer pair of divisions is compatible when
+  the two agree on core ownership and on tile ownership of the buffer they
+  share, both taken on the untiled buffer: tile `t` must touch the same
+  slice on both sides. `TileSpec` equality is not the test. `host_dim` is
+  positional in each op's own output, so equal specs can tile different
+  dims of a shared buffer (a permuted or reducing consumer), and unequal
+  specs the same one. A buffer that some reader takes only in part gets no
+  compatible pairs.
+- **Loop groups.** Consecutive ops that run the same loop nest (the same
+  trip count at each level) share a loop group. The solve requires every
+  producer/consumer edge inside a group to be a compatible pair, and
+  `CoarseTilingPass` checks each such edge again before it applies the
+  tiling.
+- **Objective.** The cost expression is not used, since it has no term for
+  tile size or loop-group boundaries. The solve ranks plans
+  lexicographically: LX residency, then *cuts* (tiled ops whose value must
+  be copied out of their nest, for a consumer outside it or as a graph
+  output), then parallelism, division shape and, last, the fewest tiles.
+- **Materialize and re-plan.** When the solve picks any tiling,
+  `CoarseTilingPass` applies it and the allocation is solved again over the
+  tiled graph with no tilings offered; that second plan is the one
+  committed. A `SolveError` from the first solve falls back to greedy
+  placement over the untouched graph, and one from the second solve over
+  the tiled graph.
+
 ### Joint SA co-optimization
 
 Setting `layout_solver = "simulated_annealing"` together with

@@ -14,6 +14,7 @@
 
 """Automated coarse tiling: explicit ``for_each_tile`` loops and tile discovery."""
 
+import contextlib
 import dataclasses
 import functools
 import pytest
@@ -23,18 +24,33 @@ import torch
 import unittest
 
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Optional
 
-from unittest.mock import patch
+import sympy
+from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.virtualized import V
 
+from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    _spec_within_read_distance,
+    select_allocator,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -281,15 +297,21 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
-
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
+        # Auto tiling needs the joint CP-SAT co-opt path on (R8.1): the solver
+        # carries and applies the tiling candidates only under
+        # co_optimizing_lx_planning + layout_solver="cpsat". The two gates
+        # default off, so they are patched on only for the auto modes.
+        tiling_cfg = (
+            dict(
+                co_optimizing_lx_planning=True,
+                auto_coarse_tiling=True,
+            )
+            if auto_tiling
+            else {}
+        )
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -302,6 +324,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                **tiling_cfg,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -360,6 +383,8 @@ class AutomatedCoarseTilingTests(
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
+        if solver == "simulated_annealing":
+            raise NotImplementedError
         cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
@@ -535,20 +560,23 @@ class AutomatedCoarseTilingTests(
 
     @staticmethod
     def case_decorators(params):
-        """Mark the combos that cannot pass until the tile search is built.
+        """Per-combo decorators.
 
-        These entries are never edited again: each combo stops xfailing on its
-        own, the moment the last unbuilt piece on its path lands, because
-        ``expected_unimplemented`` keys on the exception rather than on a list
-        maintained by hand.  A combo turning green is the signal to delete its
-        row here.
+        The ``auto``/``explicit_auto`` combos were ``@expected_unimplemented``
+        while the solver-driven tile search was unbuilt, and briefly
+        ``@expected_lx_ownership_gap`` while _commit_divisions dropped the
+        division the solve had chosen for each ``coarse_tile_copy_*``. Both
+        markers retired themselves the moment those modes passed (each fails a
+        clean run), so only the ortools skip for the cpsat solver remains.
         """
         decorators = []
         if params["solver_method"] == "cpsat":
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["tiling_mode"] in ("auto", "explicit_auto"):
+        if params["solver_method"] in ("simulated_annealing") and params[
+            "tiling_mode"
+        ] in ("auto"):
             decorators.append(expected_unimplemented)
         return decorators
 
@@ -557,3 +585,455 @@ class AutomatedCoarseTilingTests(
         self._CHECKS[params["tiling_mode"]](
             self, factory(self), params["solver_method"]
         )
+
+
+# ---------------------------------------------------------------------------
+# Read-distance (span-limit) enforcement on the discovery path
+# ---------------------------------------------------------------------------
+# Device-free op builders, mirroring the span-overflow / enumerate-tilings
+# tests: a real FixedTiledLayout ComputedBuffer over a lightweight Pointwise
+# mock is all _tiling_candidates -> enumerate_tile_options -> the read-distance
+# filter needs.
+def _fixed_tiled_layout(shape, dtype=torch.float16):
+    size = list(shape)
+    stride = list(FlexibleLayout.contiguous_strides(size))
+    stride_ints = [int(s) for s in stride]
+    size_ints = [int(s) for s in size]
+    within_stick_dim = len(size_ints) - 1
+    dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
+    dim_order.append(within_stick_dim)
+    device_layout = SpyreTensorLayout(size_ints, stride_ints, dtype, dim_order)
+    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+
+
+def _pointwise_op(shape, name="buf0"):
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(shape)
+    layout = _fixed_tiled_layout(shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
+def _matmul_op(out_shape=(128, 256), k=64, name="mm"):
+    """A minimal matmul ``ComputedBuffer`` for ``_tiling_candidates`` unit tests.
+
+    Mirrors ``_pointwise_op`` but gives the op a ``Reduction`` ``data`` carrying
+    a matmul reduction type, so ``_is_matmul_op`` recognises it. Like the
+    pointwise mock it declares no reads, keeping the read-distance filter
+    permissive; the enumerator's own filters (output-axis ``is_clean``, stick-dim
+    exclusion) are what these tests exercise, so the reduction ranges only need
+    to exist, not to enumerate.
+    """
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(out_shape)
+    data.reduction_ranges = [k]
+    data.reduction_type = BATCH_MATMUL_OP
+    layout = _fixed_tiled_layout(out_shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(out_shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(out_shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
+# (1, 8195, 256, 64) fp16 = 268.7 MB, just over the 256 MiB read-distance limit;
+# splitting dim 1 (8195 = 5*11*149) by 5 -> 53.7 MB brings it back under.
+_OVERFLOW_SHAPE = (1, 8195, 256, 64)
+# dim 1 is prime with no divisor <= _MAX_AUTO_TILE_SPLIT_COUNT, so it cannot be
+# tiled; even the largest legal split of dim 2 leaves the span over the limit,
+# so no discovered tiling (untiled included) fits.
+_UNTILEABLE_OVERFLOW_SHAPE = (1, 1048583, 256, 64)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class DiscoveryReadDistanceTests(unittest.TestCase):
+    """The auto-tiling discovery path never offers the solve an over-span tiling.
+
+    Integration check for the real ``_tiling_candidates`` wiring (config gates ->
+    ``enumerate_tile_options`` -> the read-distance filter): under
+    ``auto_coarse_tiling`` an unpinned op whose untiled read overflows
+    ``MAX_SPAN_BYTES`` loses the untiled option -- it must be tiled to fit --
+    while a fitting op keeps it, and an op that cannot be tiled to fit raises
+    ``Unsupported``, matching the span-overflow planner's own gate. No device or
+    solve is needed: ``_tiling_candidates`` is a pure function of the op and
+    config.
+    """
+
+    _AUTO_CFG = dict(
+        co_optimizing_lx_planning=True,
+        auto_coarse_tiling=True,
+        layout_solver="cpsat",
+        sencores=4,
+    )
+
+    def _candidates(self, op, **overrides):
+        cfg = {**self._AUTO_CFG, **overrides}
+        with ts_inductor_config.patch(cfg):
+            alloc = select_allocator()
+            return alloc._tiling_candidates(op, cfg["sencores"])
+
+    def test_untiled_dropped_for_overspan_unhinted_op(self):
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op)
+
+        # The untiled read overflows, so untiled is not offered -- the solve is
+        # forced to tile -- but a fitting tiling remains.
+        self.assertNotIn(TileSpec(), options)
+        self.assertTrue(options)
+        # And every option the solve is offered actually fits the limit.
+        with ts_inductor_config.patch(self._AUTO_CFG):
+            for spec in options:
+                self.assertTrue(
+                    _spec_within_read_distance(op, spec, 4),
+                    f"discovery offered an over-span tiling {spec}",
+                )
+
+    def test_untiled_kept_for_fitting_unhinted_op(self):
+        op = _pointwise_op((1, 2, 16, 64))
+        options = self._candidates(op)
+
+        # Nothing overflows, so untiled stays on the menu.
+        self.assertIn(TileSpec(), options)
+
+    def test_raises_when_no_discovered_tiling_fits(self):
+        op = _pointwise_op(_UNTILEABLE_OVERFLOW_SHAPE)
+
+        with self.assertRaisesRegex(Unsupported, "read-distance limit"):
+            self._candidates(op)
+
+    def test_no_filtering_without_auto_coarse_tiling(self):
+        # Discovery off -> the op stays untiled and the read-distance filter never
+        # runs, even when the untiled read overflows: the drop is discovery's job.
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op, auto_coarse_tiling=False)
+
+        self.assertEqual(options, [TileSpec()])
+
+    def test_reshaping_reader_drops_the_unit_tile(self):
+        # d3:64 leaves a 1-extent tile, which CoarseTilingPass cannot retile
+        # for a reader that views the output through another rank.
+        op = _pointwise_op((2, 8, 5, 64, 128))
+        reader = MagicMock(spec=ComputedBuffer)
+        reader.data = SimpleNamespace(ranges=[2, 40, 64, 128])
+        unit_tile = TileSpec((TileAxis(host_dim=3, count=64),))
+
+        self.assertIn(unit_tile, self._candidates(op))
+        with patch.object(
+            CoOptimizingAllocator,
+            "_readers_by_name",
+            {op.get_name(): [reader]},
+            create=True,
+        ):
+            self.assertNotIn(unit_tile, self._candidates(op))
+
+    def test_matmul_offered_output_tiling(self):
+        # A matmul is no longer excluded by an op-kind guard: under discovery it
+        # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
+        # exactly like any other op.  This locks in the removal of the former
+        # `_is_matmul_op(op)` short-circuit in `_tiling_candidates`.
+        op = _matmul_op(out_shape=(128, 256))
+        options = self._candidates(op)
+
+        self.assertIn(TileSpec(), options)  # untiled still offered (read fits)
+        tiled = [t for t in options if not t.is_untiled]
+        self.assertTrue(
+            tiled,
+            "matmul was offered no tiling -- the removed matmul guard has "
+            f"silently returned (options were {options})",
+        )
+        for spec in tiled:
+            self.assertEqual(
+                [a.host_dim for a in spec.axes],
+                [0],
+                f"matmul offered a non-M-axis output tiling {spec}",
+            )
+
+    def test_matmul_never_offered_reduction_or_stick_tiling(self):
+        # Removing the guard does not open the numerically-fragile forms: the
+        # `is_clean` filter still drops every reduction (K) tiling, and the
+        # enumerator never emits the stick (innermost / N) dim.  So no offered
+        # spec tiles a reduction axis or the last host dim.
+        out_shape = (128, 256)
+        stick_dim = len(out_shape) - 1
+        op = _matmul_op(out_shape=out_shape)
+        options = self._candidates(op)
+
+        for spec in options:
+            self.assertFalse(
+                any(a.is_reduction for a in spec.axes),
+                f"matmul offered a reduction tiling {spec} (K-tiling is "
+                "~2 orders off CPU -- see _mlp_case)",
+            )
+            self.assertFalse(
+                any(a.host_dim == stick_dim for a in spec.axes),
+                f"matmul offered a stick-dim tiling {spec}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Loop nests follow tile ownership, not TileSpec equality
+# ---------------------------------------------------------------------------
+_D0_BY_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+_D1_BY_4 = TileSpec((TileAxis(host_dim=1, count=4),))
+
+
+def _reads_graph_inputs_only(op) -> bool:
+    graph_inputs = set(V.graph.graph_inputs)
+    return all(dep.name in graph_inputs for dep in op.get_read_writes().reads)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class TileOwnershipGroupingTests(unittest.TestCase):
+    """A consumer shares its producer's loop nest only where it reads it tile by
+    tile.
+
+    ``TileAxis.host_dim`` is positional in each op's own output, so a consumer
+    that reads its producer permuted, reduced or narrowed can carry an equal
+    ``TileSpec`` and still walk a different part of the producer's buffer.
+    Sharing a nest there reads, on tile ``t``, what the producer has not
+    written on tile ``t``. Each case compiles with automatic tiling on and is
+    checked against CPU.
+
+    ``consumer_menu`` replaces the discovered menus: the producer ``a = x + y``
+    (the one op that reads only graph inputs) is offered ``d0:4`` alone, and
+    every other op ``consumer_menu``. The ``_apply`` cases skip the solve's
+    choice instead, so they check ``CoarseTilingPass``'s own refusal.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0xAFFE)
+        torch.compiler.reset()
+        self.addCleanup(torch.compiler.reset)
+
+    def _compile(self, fn, args, consumer_menu=None):
+        """(cpu result, device result, tiling) for ``fn`` under auto tiling."""
+        cpu = fn(*args)
+        CollectTilingPasses.tiling = {}
+        with contextlib.ExitStack() as stack:
+            if consumer_menu is not None:
+
+                def offered(alloc, op, max_cores):
+                    if getattr(alloc, "_suppress_tiling", False):
+                        return [TileSpec()]
+                    if _reads_graph_inputs_only(op):
+                        return [_D0_BY_4]
+                    return consumer_menu
+
+                stack.enter_context(
+                    patch.object(CoOptimizingAllocator, "_tiling_candidates", offered)
+                )
+            stack.enter_context(torch.no_grad())
+            stack.enter_context(t_inductor_config.patch(force_disable_caches=True))
+            stack.enter_context(
+                ts_inductor_config.patch(
+                    co_optimizing_lx_planning=True,
+                    auto_coarse_tiling=True,
+                    layout_solver="cpsat",
+                    allow_all_ops_in_lx_planning=True,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses
+                )
+            )
+            compiled = torch.compile(fn, fullgraph=True)
+            device = compiled(*(arg.to(DEVICE_NAME) for arg in args)).to("cpu")
+        return cpu, device, CollectTilingPasses.tiling
+
+    def _assert_close(self, device, cpu):
+        torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+
+    @staticmethod
+    def _model_ops(nest):
+        """The nest's ops other than the copies coarse tiling adds to it."""
+        return sorted(name for name in nest if not name.startswith("coarse_tile_copy_"))
+
+    def test_permuted_consumer_of_a_solver_tiled_producer(self):
+        # Unforced: the solve alone once tiled both ops d0:2/d1:2 into one
+        # nest, and only the diagonal tiles came out right.
+        x = torch.randn(128, 128, 2048, dtype=torch.float16)
+        y = torch.randn(128, 128, 2048, dtype=torch.float16)
+        cpu, device, _ = self._compile(
+            lambda x, y: (x + y).permute(1, 0, 2) * 2 + 1, (x, y)
+        )
+        self._assert_close(device, cpu)
+
+    def _compile_with_both_tiled_d0(self, fn, args):
+        """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
+
+        Bypasses the solve's own pairing, so what is left to refuse an
+        out-of-step group is ``CoarseTilingPass`` itself.
+        """
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): _D0_BY_4
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+            return self._compile(fn, args)
+
+    def _assert_group_refused(self, fn):
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        with self.assertRaisesRegex(Exception, "cannot share a loop nest"):
+            self._compile_with_both_tiled_d0(fn, (x, y))
+
+    def test_apply_refuses_a_permuted_consumer_in_the_nest(self):
+        # The consumer's d0 is the producer's dim 1.
+        self._assert_group_refused(lambda x, y: (x + y).permute(1, 0, 2) * 2)
+
+    def test_apply_refuses_a_reducing_consumer_in_the_nest(self):
+        # sum(0) drops the producer's dim 0, so the consumer's d0 is dim 1.
+        self._assert_group_refused(lambda x, y: (x + y).sum(dim=0))
+
+    def test_apply_refuses_a_narrowing_consumer_in_the_nest(self):
+        # Same dim, half the rows: tile t reads 8 rows where the producer
+        # wrote 16.
+        self._assert_group_refused(lambda x, y: (x + y)[:32] * 2)
+
+    def test_apply_accepts_a_consumer_that_reads_in_step(self):
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile_with_both_tiled_d0(
+            lambda x, y: (x + y) * 2, (x, y)
+        )
+        self._assert_close(device, cpu)
+        nests = list(_nests(tiling).values())
+        self.assertEqual(len(nests), 1, _describe(tiling))
+        self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
+
+    def test_apply_grows_back_a_unit_tile_beside_a_unit_dim(self):
+        # d1:64 leaves the producer's tile (1, 1, 2048). Growing its copy-out's
+        # full buffer back from that tile's device layout cannot tell the two
+        # unit dims apart beside the unit dim 0, and would return
+        # [1, 32, 1, 64] for [64, 32, 1, 64]. The apply instead gives the full
+        # buffer the producer's own device layout, read before the tile is
+        # divided, so the untiled consumer reads a buffer of the size it
+        # expects. The enumerator does not offer this tiling; forcing it checks
+        # the apply itself.
+        x = torch.randn(1, 64, 2048, dtype=torch.float16)
+        y = torch.randn(1, 64, 2048, dtype=torch.float16)
+        unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): unit_tile
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
+            }
+
+        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+            cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self._assert_close(device, cpu)
+
+    def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
+        # d1:4 is the consumer tiling that walks the producer's dim 0, so the
+        # two share one four-trip nest although their specs differ.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile(
+            lambda x, y: (x + y).permute(1, 0, 2) * 2,
+            (x, y),
+            consumer_menu=[_D1_BY_4],
+        )
+        self._assert_close(device, cpu)
+        nests = list(_nests(tiling).values())
+        self.assertEqual(len(nests), 1, _describe(tiling))
+        self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
+        self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
+
+    def test_mutation_op_compiles(self):
+        # copy_forced writes through its target's layout, which has no device
+        # layout for the enumerator to stick-check a tile against.
+        a = torch.randn(128, 256, dtype=torch.float16) * 0.01
+        b = torch.randn(128, 256, dtype=torch.float16) * 0.01
+        d = torch.randn(128, 256, dtype=torch.float16) * 0.01
+
+        def fn(a, b, d):
+            return torch.ops.spyre.copy_forced(d, a + b)
+
+        cpu, device, _ = self._compile(fn, (a, b, d))
+        self._assert_close(device, cpu)
+
+
+class ReplanAfterTilingGateTests(unittest.TestCase):
+    """``_materialize_selection`` applies chosen tilings and solves again only
+    for an engine whose ``replans_after_tiling()`` is true; any other engine's
+    first placement stands, whatever tilings its allocation carries."""
+
+    _CHOICES = {"buf0": _D0_BY_4}
+
+    def _materialize(self, layout_solver, **patches):
+        with ts_inductor_config.patch(
+            co_optimizing_lx_planning=True, layout_solver=layout_solver
+        ):
+            alloc = select_allocator()
+            solver = alloc._build_solver([])
+            allocation = [MagicMock()]
+            graph = SimpleNamespace(operations=[])
+            with contextlib.ExitStack() as stack:
+                chosen = stack.enter_context(
+                    patch.object(
+                        CoOptimizingAllocator,
+                        "_chosen_tilings",
+                        return_value=self._CHOICES,
+                    )
+                )
+                apply = stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.scratchpad.coarse_tiling."
+                        "CoarseTilingPass"
+                    )
+                )
+                for name, value in patches.items():
+                    stack.enter_context(
+                        patch.object(CoOptimizingAllocator, name, return_value=value)
+                    )
+                result = alloc._materialize_selection(graph, solver, allocation)
+            return solver, allocation, result, chosen, apply
+
+    def test_annealer_placement_stands(self):
+        solver, allocation, result, chosen, apply = self._materialize(
+            "simulated_annealing"
+        )
+        self.assertFalse(solver.replans_after_tiling())
+        self.assertIs(result[0], solver)
+        self.assertIs(result[1], allocation)
+        chosen.assert_not_called()
+        apply.assert_not_called()
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+    def test_cpsat_applies_and_solves_again(self):
+        second_solver, second_allocation = MagicMock(), [MagicMock()]
+        _, _, result, _, apply = self._materialize(
+            "cpsat",
+            _prepare_buffers=[],
+            _build_solver=second_solver,
+            _solve=second_allocation,
+        )
+        apply.assert_called_once_with(self._CHOICES)
+        self.assertIs(result[0], second_solver)
+        self.assertIs(result[1], second_allocation)

@@ -25,7 +25,7 @@ The pass mints hint ids and a group-id offset from bases derived off the graph
 hint-driven group already stamped pre-stickification at pass 430. It reuses the
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
-ops that share a spec.
+ops that run the same loop nest.
 """
 
 from __future__ import annotations
@@ -35,12 +35,19 @@ from collections.abc import Mapping, Sequence
 
 import sympy
 
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import iteration_space_from_op, op_out_coords
+from ..pass_utils import (
+    _prepare_per_core_view,
+    iteration_space_from_op,
+    op_out_coords,
+    op_read_writes,
+    tile_ownership_view,
+)
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
@@ -50,6 +57,7 @@ from ..wsr.coarse_tile import (
 )
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
+from .utils import buffer_not_read_in_full
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -307,39 +315,107 @@ def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion
 def derive_tiling_groups(
     graph: GraphLowering,
     choices: Mapping[str, TileSpec],
-) -> list[tuple[list[Operation], TileSpec]]:
-    """Group consecutive ops that share the same non-empty :class:`TileSpec`.
+) -> list[tuple[list[Operation], tuple[int, ...]]]:
+    """Group consecutive ops that run the same non-empty loop nest.
 
-    Mirrors ``hints_to_coarse_tile_groups``' consecutive-run shape with the hint
-    key replaced by the chosen ``TileSpec``: a run breaks whenever an op is
-    untiled (absent from ``choices`` or mapped to the empty spec) or its spec
-    differs from the run's. Contiguity is a hard requirement, not an
-    optimization -- ``validate_coarse_tile_groups`` and ``_apply_plan`` both rely
-    on each group occupying one contiguous stretch of the operation list, so a
-    connected component that skipped an intervening untiled op would be rejected
-    at apply time.
+    Mirrors ``hints_to_coarse_tile_groups``' consecutive-run shape, keyed by
+    each op's nest (:attr:`TileSpec.level_counts`) instead of the hint: a run
+    breaks whenever an op is untiled (absent from ``choices`` or mapped to the
+    empty spec) or its nest differs from the run's. Contiguity is a hard
+    requirement, not an optimization -- ``validate_coarse_tile_groups`` and
+    ``_apply_plan`` both rely on each group occupying one contiguous stretch of
+    the operation list, so a connected component that skipped an intervening
+    untiled op would be rejected at apply time.
+
+    Ops in one run may tile different dims: ``host_dim`` is positional in each
+    op's own output, so equal specs can tile different dims of a buffer two
+    ops share, and different specs the same one. Whether a consumer reads its
+    in-group producer tile by tile is therefore checked per edge
+    (:func:`_misaligned_group_edge`), not here. Returns ``(ops, level counts)``
+    per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
-    groups: list[tuple[list[Operation], TileSpec]] = []
+    groups: list[tuple[list[Operation], tuple[int, ...]]] = []
     current_ops: list[Operation] = []
-    current_spec: TileSpec | None = None
+    current_nest: tuple[int, ...] = ()
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
-        if spec is not None and spec.is_untiled:
-            spec = None
-        if spec is not None and spec == current_spec:
+        nest = spec.level_counts if spec is not None else ()
+        if nest and nest == current_nest:
             current_ops.append(op)
         else:
             if current_ops:
-                assert current_spec is not None
-                groups.append((current_ops, current_spec))
-            current_ops = [op] if spec is not None else []
-            current_spec = spec
+                groups.append((current_ops, current_nest))
+            current_ops = [op] if nest else []
+            current_nest = nest
     if current_ops:
-        assert current_spec is not None
-        groups.append((current_ops, current_spec))
+        groups.append((current_ops, current_nest))
     return groups
+
+
+def _misaligned_group_edge(
+    graph: GraphLowering,
+    group_ops: Sequence[Operation],
+    choices: Mapping[str, TileSpec],
+) -> str | None:
+    """Why a consumer in ``group_ops`` cannot read an in-group producer tile by
+    tile, or ``None`` when every such edge lines up.
+
+    On tile ``t`` a consumer that shares its producer's loop nest can read only
+    what the producer wrote on tile ``t``. That holds exactly when both own the
+    buffer they share the same way on every tile (``tile_ownership_view``) and
+    the buffer is read in full, since a view compares partitions, not extents.
+    The joint solve only picks groups whose ``cd_parent_matches`` pairs pass
+    the same tests, so this is the check that makes any other choice fail
+    loudly rather than read the wrong tile.
+    """
+    written: dict[str, tuple[Operation, tuple[tuple[sympy.Symbol, int], ...]]] = {}
+    for op in group_ops:
+        spec = choices[op.get_operation_name()]
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+        if loop_vars is None:
+            return reason
+        tile_splits = tuple((v, axis.count) for v, axis in zip(loop_vars, spec.axes))
+        for read in op_read_writes(op).reads:
+            if read.name not in written:
+                continue
+            producer, producer_splits = written[read.name]
+            write = next(
+                (
+                    w
+                    for w in op_read_writes(producer).writes
+                    if w.name == read.name and isinstance(w, MemoryDep)
+                ),
+                None,
+            )
+            if (
+                write is None
+                or not isinstance(read, MemoryDep)
+                or buffer_not_read_in_full(graph, read.name)
+            ):
+                return (
+                    f"{op.get_name()} reads {read.name} through a dependency "
+                    "whose per-tile slice cannot be checked"
+                )
+            produced = tile_ownership_view(
+                _prepare_per_core_view(producer, write, read.name), producer_splits
+            )
+            consumed = tile_ownership_view(
+                _prepare_per_core_view(op, read, read.name), tile_splits
+            )
+            if (
+                produced is None
+                or consumed is None
+                or not produced.same_partition(consumed)
+            ):
+                return (
+                    f"{op.get_name()} ({spec.label}) does not read {read.name} "
+                    f"tile by tile as {producer.get_name()} "
+                    f"({choices[producer.get_operation_name()].label}) writes it"
+                )
+        written[op.get_name()] = (op, tile_splits)
+    return None
 
 
 def _derive_hint_id_base(graph: GraphLowering) -> int:
@@ -369,10 +445,11 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     """Apply a declared coarse tiling to a graph, inside the scratchpad pass.
 
     The tiling is an *input* (``choices``: operation name -> TileSpec),
-    not a search. Consecutive ops sharing a non-empty spec form one loop group;
-    the pass mints hint ids and a group-id offset from bases derived off the
-    graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
-    ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
+    not a search. Consecutive ops running the same non-empty loop nest form one
+    loop group, provided each in-group consumer reads its producer tile by tile
+    (else ``Unsupported``); the pass mints hint ids and a group-id offset from
+    bases derived off the graph, stamps each op's ``dim_hints`` from its own
+    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
     the op count is unchanged -- which is what keeps it inert while
     ``auto_coarse_tiling`` is off.
     """
@@ -382,6 +459,20 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
 
     def apply_pass(self, graph: GraphLowering) -> None:
         groups_specs = derive_tiling_groups(graph, self._choices)
+        # The group partition is the whole shape of the plan -- which ops share
+        # one loop nest, and therefore where the boundaries (and their full
+        # buffers and copy ops) fall. Nothing else reports it before the tiling
+        # is already applied.
+        for idx, (group_ops, nest) in enumerate(groups_specs):
+            logger.debug(
+                "tiling group %d: nest=%s ops=[%s]",
+                idx,
+                nest,
+                ", ".join(
+                    f"{op.get_name()}:{self._choices[op.get_operation_name()].label}"
+                    for op in group_ops
+                ),
+            )
         if not groups_specs:
             return
         # A for_each_tile region's tiling is the user's and already stamped;
@@ -393,7 +484,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             for region in prescribed_regions(graph.operations)
             for name in region.names
         }
-        for group_ops, spec in groups_specs:
+        for group_ops, _nest in groups_specs:
             clash = [
                 op.get_operation_name()
                 for op in group_ops
@@ -401,8 +492,13 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             ]
             if clash:
                 raise Unsupported(
-                    f"coarse tiling: {spec} would re-tile {', '.join(clash)}, "
+                    f"coarse tiling would re-tile {', '.join(clash)}, "
                     "which a for_each_tile loop already tiles."
+                )
+            reason = _misaligned_group_edge(graph, group_ops, self._choices)
+            if reason is not None:
+                raise Unsupported(
+                    f"coarse tiling: {reason}, so they cannot share a loop nest."
                 )
         # Both bases are derived off the graph *before* this pass stamps any of
         # its own hints/groups, so pre-existing (hint-driven) ids are avoided
@@ -410,15 +506,17 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         next_hint_id = _derive_hint_id_base(graph)
         group_idx_offset = _derive_group_idx_offset(graph)
         groups: list[tuple] = []
-        for group_ops, spec in groups_specs:
-            hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
-            next_hint_id += len(spec.axes)
+        for group_ops, nest in groups_specs:
+            hint_ids = list(range(next_hint_id, next_hint_id + len(nest)))
+            next_hint_id += len(nest)
             levels = [
-                (hint_id, sympy.Integer(axis.count))
-                for hint_id, axis in zip(hint_ids, spec.axes)
+                (hint_id, sympy.Integer(count))
+                for hint_id, count in zip(hint_ids, nest)
             ]
             for op in group_ops:
-                op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
+                op.dim_hints = tile_spec_to_dim_hints(
+                    op, self._choices[op.get_operation_name()], hint_ids
+                )
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
         # This pass runs inside scratchpad/LX planning -- after stickification
