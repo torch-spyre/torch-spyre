@@ -73,6 +73,9 @@ from torch_spyre._inductor.op_spec import (
 from torch_spyre._inductor.pass_utils import PerCoreView
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    FirstFitLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
@@ -773,8 +776,10 @@ def test_anchor_returns_unchanged_plans(plans, disabled):
 
 @pytest.mark.parametrize("mode", ["unsupported_solver", "off", "ktir"])
 def test_fixed_plan_handoff_keeps_feature_gates(mode):
-    factory = SimpleNamespace(supports_paired_buffers=mode != "unsupported_solver")
-    allocator = ScratchpadAllocator(factory, 256)
+    solver = (
+        FirstFitLayoutSolver if mode == "unsupported_solver" else GreedyLayoutSolver
+    )
+    allocator = ScratchpadAllocator(solver, 256)
     graph = _allocation_graph()
     with (
         config.patch(
@@ -1399,7 +1404,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         # LX relayout needs a paired-buffer-capable solver; only the greedy
-        # solver sets supports_paired_buffers. Pin it explicitly so this test
+        # solver supports paired buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
         "co_optimizing_lx_planning": False,

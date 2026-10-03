@@ -1537,8 +1537,8 @@ class NativeSolverDifferentialTests(TestCase):
         before = CoreDivisionBuffer(
             "before", 128, [0, 1], core_divisions=[CoreDivision()]
         )
-        result = ExhaustiveSearchSolver(
-            [unrelated, before], 160, FirstFitLayoutSolver, alignment=1
+        result = ExhaustiveSearchSolver.wrapping(FirstFitLayoutSolver)(
+            [unrelated, before], 160, alignment=1
         ).plan_layout_and_core_divisions()
 
         self.assertEqual(result[0].start_time, 2)

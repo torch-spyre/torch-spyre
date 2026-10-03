@@ -129,12 +129,14 @@ def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
 
     solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
     solver.buffers = []
-    solver.decides_lx_relayouts = False
     solver.plan_layout_and_core_divisions.return_value = [
         SimpleNamespace(lx_relayout_plans=[object()])
     ]
     allocator = allocator_module.CoOptimizingAllocator(
-        layout_planning=lambda _buffers, _size: solver,
+        # Never built: the test hands _solve the mock directly.
+        layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
+            allocator_module.GreedyLayoutSolver
+        ),
         size=0,
     )
     graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
@@ -1519,7 +1521,6 @@ class TestSelectAllocator(unittest.TestCase):
             CoOptimizingAllocator,
             ExhaustiveSearchSolver,
             ScratchpadAllocator,
-            _make_cpsat_solver,
             select_allocator,
         )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -1583,11 +1584,10 @@ class TestSelectAllocator(unittest.TestCase):
                     self.assertIs(solver._inner_factory, solver_cls)
 
         # cpsat + co-optimization routes to the joint allocator when ortools
-        # is present (the cpsat factory is core-division-capable and is used
-        # directly); without ortools it would need to degrade to an
-        # ExhaustiveSearchSolver wrapping the cpsat factory's own greedy
-        # fallback, which is likewise disallowed unless
-        # allow_exhaustive_search is set.
+        # is present (CpSatLayoutSolver is core-division-capable and is used
+        # directly); without ortools cpsat resolves to its greedy fallback,
+        # which would need an ExhaustiveSearchSolver wrapper -- likewise
+        # disallowed unless allow_exhaustive_search is set.
         with ts_inductor_config.patch(
             layout_solver="cpsat",
             co_optimizing_lx_planning=True,
@@ -1597,9 +1597,7 @@ class TestSelectAllocator(unittest.TestCase):
             if _HAS_ORTOOLS:
                 a = select_allocator()
                 self.assertIsInstance(a, CoOptimizingAllocator)
-                solver = a.layout_planning([], a.size)
-                self.assertIs(a.layout_planning, _make_cpsat_solver)
-                self.assertIsInstance(solver, CpSatLayoutSolver)
+                self.assertIs(a.layout_planning, CpSatLayoutSolver)
             else:
                 with self.assertRaises(ValueError):
                     select_allocator()
@@ -1614,21 +1612,24 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertIsInstance(a, CoOptimizingAllocator)
             solver = a.layout_planning([], a.size)
             if _HAS_ORTOOLS:
-                self.assertIs(a.layout_planning, _make_cpsat_solver)
+                self.assertIs(a.layout_planning, CpSatLayoutSolver)
                 self.assertIsInstance(solver, CpSatLayoutSolver)
             else:
                 self.assertIsInstance(solver, ExhaustiveSearchSolver)
-                self.assertIs(solver._inner_factory, _make_cpsat_solver)
+                self.assertIs(solver._inner_factory, GreedyLayoutSolver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
-        # driven by the cpsat factory (which falls back to greedy internally
-        # when ortools is absent) on the pre-determined core divisions.
+        # driven by CpSatLayoutSolver (GreedyLayoutSolver when ortools is
+        # absent) on the pre-determined core divisions.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIs(a.layout_planning, _make_cpsat_solver)
+            self.assertIs(
+                a.layout_planning,
+                CpSatLayoutSolver if _HAS_ORTOOLS else GreedyLayoutSolver,
+            )
 
         # simulated_annealing + co-optimization routes to the joint allocator
         # driven by the SA co-optimizer. This is a *different class* from the
@@ -1709,6 +1710,152 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertIn("allow_exhaustive_search", str(ctx.exception))
         finally:
             ilp_solver_ortools.cp_model = saved
+
+    def test_cpsat_without_ortools_is_greedy_with_its_capabilities(self):
+        """Without ortools, placement-only ``cpsat`` is resolved to the greedy
+        class at selection, so the allocator asks greedy about its capabilities
+        -- and so collects committed relayout plans, as
+        ``layout_solver="greedy"`` does."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+
+        saved = ilp_solver_ortools.cp_model
+        ilp_solver_ortools.cp_model = None
+        try:
+            with (
+                ts_inductor_config.patch(
+                    layout_solver="cpsat", co_optimizing_lx_planning=False
+                ),
+                self.assertLogs(allocator_module.logger, level="WARNING") as logs,
+            ):
+                a = allocator_module.select_allocator()
+        finally:
+            ilp_solver_ortools.cp_model = saved
+        self.assertIs(a.layout_planning, GreedyLayoutSolver)
+        self.assertTrue(a.layout_planning.supports_paired_buffers())
+        self.assertIn("falling back to the default greedy", "\n".join(logs.output))
+
+
+class TestSolverCapabilities(unittest.TestCase):
+    """The capability class methods every concrete solver answers, and the
+    definition-time checks ``MemoryPlanSolver.__init_subclass__`` makes."""
+
+    _NAMES = (
+        "chooses_core_divisions",
+        "supports_paired_buffers",
+        "decides_lx_relayouts",
+        "chooses_tilings",
+        "replans_after_tiling",
+        "linear_cost_only",
+    )
+
+    def _answers(self, cls) -> dict[str, bool]:
+        return {name: getattr(cls, name)() for name in self._NAMES}
+
+    def test_production_solvers(self):
+        from torch_spyre._inductor.scratchpad.exhaustive_search import (
+            ExhaustiveSearchSolver,
+        )
+        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+            BestFitLayoutSolver,
+            FirstFitLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+        from torch_spyre._inductor.scratchpad.simulated_annealing import (
+            SimulatedAnnealingLayoutSolver,
+        )
+
+        none = dict.fromkeys(self._NAMES, False)
+        joint = {**none, "chooses_core_divisions": True}
+        expected = {
+            GreedyLayoutSolver: {**none, "supports_paired_buffers": True},
+            FirstFitLayoutSolver: none,
+            BestFitLayoutSolver: none,
+            SimulatedAnnealingLayoutSolver: none,
+            SaCoOptimizingSolver: joint,
+            CpSatLayoutSolver: {
+                **joint,
+                "decides_lx_relayouts": True,
+                "linear_cost_only": True,
+            },
+            ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
+        }
+        for cls, answers in expected.items():
+            with self.subTest(solver=cls.__name__):
+                self.assertEqual(self._answers(cls), answers)
+
+    def test_exhaustive_search_is_one_class_per_inner_solver(self):
+        from torch_spyre._inductor.scratchpad.exhaustive_search import (
+            ExhaustiveSearchSolver,
+        )
+        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+            FirstFitLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+
+        greedy = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)
+        self.assertIs(ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver), greedy)
+        self.assertIsNot(ExhaustiveSearchSolver.wrapping(FirstFitLayoutSolver), greedy)
+        self.assertIs(greedy([], 1)._inner_factory, GreedyLayoutSolver)
+        self.assertEqual(greedy.__module__, ExhaustiveSearchSolver.__module__)
+        self.assertEqual(
+            greedy.__qualname__, "ExhaustiveSearchSolver[GreedyLayoutSolver]"
+        )
+        with self.assertRaisesRegex(TypeError, "wrapping"):
+            ExhaustiveSearchSolver([], 1)
+
+    def test_definition_time_checks(self):
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivisionLayoutSolver,
+            MemoryPlanSolver,
+        )
+
+        def placement(**answers):
+            return {
+                "plan_layout": lambda self, log_lx_usage=False: [],
+                **{
+                    name: classmethod(lambda cls, v=value: v)
+                    for name, value in answers.items()
+                },
+            }
+
+        all_false = dict.fromkeys(self._NAMES[1:], False)
+        # An abstract intermediate class answers nothing and is not checked.
+        type("StillAbstract", (MemoryPlanSolver,), {})
+        type("Placement", (MemoryPlanSolver,), placement(**all_false))
+
+        missing = placement(**all_false)
+        del missing["linear_cost_only"]
+        with self.assertRaisesRegex(TypeError, "must answer linear_cost_only"):
+            type("Missing", (MemoryPlanSolver,), missing)
+        with self.assertRaisesRegex(TypeError, "requires chooses_core_divisions"):
+            type(
+                "RelayoutsWithoutDivisions",
+                (MemoryPlanSolver,),
+                placement(**{**all_false, "decides_lx_relayouts": True}),
+            )
+
+        joint = placement(**all_false)
+        joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
+        with self.assertRaisesRegex(TypeError, "requires chooses_tilings"):
+            type(
+                "ReplansWithoutTilings",
+                (CoreDivisionLayoutSolver,),
+                {**joint, "replans_after_tiling": classmethod(lambda cls: True)},
+            )
+        with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
+            type(
+                "JointThatDenies",
+                (CoreDivisionLayoutSolver,),
+                {**joint, "chooses_core_divisions": classmethod(lambda cls: False)},
+            )
 
 
 class TestInplaceEdgeGate(unittest.TestCase):
@@ -2307,8 +2454,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         with self.pre_scheduling_iterating_pass(visit):
             # In-place reuse of boundary-clone buffers is a paired-buffer feature
-            # of the greedy build path (only the greedy solver sets
-            # supports_paired_buffers), which lives on the base placement
+            # of the greedy build path (only the greedy solver
+            # supports_paired_buffers()), which lives on the base placement
             # allocator. Pin greedy *and* co-optimization off so the slot-sharing
             # assertion holds regardless of the default layout_solver and the
             # default co-optimization flip.
