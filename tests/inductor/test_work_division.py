@@ -1302,6 +1302,41 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertGreater(unrestricted[batch], 1)
         self.assertEqual(restricted[batch], 1)
 
+    def test_m1_matmul_without_row_dims_is_priced(self):
+        """#4032: an M=1 matmul has no row dim left (only N and K), so the
+        planner returned the default split -- N alone, 25 of 32 cores."""
+        n, k = (_isym(name) for name in ("n", "k"))
+        op = _computed_buffer(
+            (25600,),
+            name="mm_out",
+            reduction_type="batchmatmul",
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("mm_out", (25600,), (n,))
+        input_tds = [
+            _tensor_dep("lhs", (4096,), (k,)),
+            _tensor_dep("rhs", (4096, 25600), (k, n)),
+        ]
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            {n: 25600, k: 4096}, input_tds + [output_td]
+        )
+
+        splits = _cost_model_matmul_planner(
+            op,
+            {n: 25, k: 1},
+            it_space_adjusted,
+            output_td,
+            stick_vars,
+            {},
+            32,
+            input_tds,
+            set(),
+            {},
+        )
+
+        self.assertEqual(math.prod(splits.values()), 32)
+        self.assertGreater(splits[k], 1)
+
     def test_fp8_cost_model_uses_correct_elems_per_stick(self):
         """#4466: N_e/K_e must come from the FP8 operand's stick (128
         elems/stick), not the FP16 output's (64) -- else they're halved."""

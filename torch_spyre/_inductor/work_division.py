@@ -1828,21 +1828,29 @@ def _cost_model_matmul_planner(
     ordered_output_coord_vars = [d for d in it_space_adjusted if d in output_coord_vars]
     n_dims = [d for d in ordered_output_coord_vars if d in stick_vars]
     row_dims = [d for d in ordered_output_coord_vars if d not in stick_vars]
-    if len(n_dims) != 1 or not row_dims:
+    if len(n_dims) != 1:
         return splits
     n_dim = n_dims[0]
 
-    m_candidates = _single_input_row_dims(row_dims, input_tds)
     rhs_loaded_once = False
-    if len(m_candidates) == 1:
-        m_dim = m_candidates[0]
-    elif len(m_candidates) > 1:
-        m_dim = _pick_innermost_output_dim(m_candidates, output_td.dep.index)
-        if m_dim is None:
-            return splits
-        rhs_loaded_once = True
+    m_dim: Symbol | None
+    if not row_dims:
+        # M=1 (#4032): the size-1 M dim is dropped from the iteration space,
+        # leaving only N and K. Price it as M=1 with nothing to split instead of
+        # deferring to the default distributor, which splits N alone and can
+        # leave cores idle (N=25600 -> 25 of 32 cores, K never split).
+        m_dim = None
     else:
-        return splits
+        m_candidates = _single_input_row_dims(row_dims, input_tds)
+        if len(m_candidates) == 1:
+            m_dim = m_candidates[0]
+        elif len(m_candidates) > 1:
+            m_dim = _pick_innermost_output_dim(m_candidates, output_td.dep.index)
+            if m_dim is None:
+                return splits
+            rhs_loaded_once = True
+        else:
+            return splits
     batch_dims = [d for d in row_dims if d != m_dim]
     # Folded projection matmuls have no batch dims left by this stage, but the
     # RHS is still an unbatched weight that is loaded once. Treat them like the
@@ -1871,7 +1879,7 @@ def _cost_model_matmul_planner(
         elems_per_stick = fp8_device_dtype.elems_per_stick()
     else:
         elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
-    M_e = concretize_expr(it_space_adjusted[m_dim])
+    M_e = 1 if m_dim is None else concretize_expr(it_space_adjusted[m_dim])
     n_sticks = concretize_expr(it_space_adjusted[n_dim])
     k_sticks = concretize_expr(it_space_adjusted[k_dim])
     N_e = n_sticks * elems_per_stick
@@ -1898,7 +1906,7 @@ def _cost_model_matmul_planner(
         if batch_dims
         else [()]
     )
-    m_divs = factors(m_dim, M_e)
+    m_divs = [1] if m_dim is None else factors(m_dim, M_e)
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
@@ -1942,7 +1950,8 @@ def _cost_model_matmul_planner(
     new_splits = dict(splits)
     for bd, bs in zip(batch_dims, b_combo):
         new_splits[bd] = bs
-    new_splits[m_dim] = m_s
+    if m_dim is not None:
+        new_splits[m_dim] = m_s
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
 
