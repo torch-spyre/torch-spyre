@@ -36,17 +36,28 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from unittest import TestCase
 
 import sympy
 
+from torch_spyre._inductor import config as ts_config
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
     _MIN_STEPS,
     _STEPS_PER_BUFFER,
+    DivisionConfig,
     SaCoOptimizingSolver,
+    _canonical_key,
+    _GeneratedDivisions,
+    _TableRelation,
+    _ViewRelation,
+    _one_axis_apart,
 )
+from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
@@ -56,8 +67,16 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    mock_op_split_space,
+    patch_row_major_out_coords,
+)
 
 
 def _seed_footprint(buffers):
@@ -123,7 +142,7 @@ def _all_cases_incl_synthetic():
 
 
 def _primed(buffers, capacity):
-    """A solver primed to the seed state (index-0 divisions, FirstFit ``pi``): the
+    """A solver primed to the seed state (seed configs, FirstFit ``pi``): the
     prefix of ``plan_layout_and_core_divisions`` up to the anneal, so a unit test
     can drive the move / snapshot machinery -- or read the seed score -- directly.
     """
@@ -131,7 +150,7 @@ def _primed(buffers, capacity):
     solver.spill_reasons = {}
     solver._rng = rnd.Random(0)
     solver._precompute_topology()
-    solver.chosen = [0] * len(buffers)
+    solver.chosen = solver._seed_configs()
     solver.packer = solver._build_seed_packer()
     solver._flippable_ops = solver._flippable()
     solver._best_score = solver._score()
@@ -509,11 +528,11 @@ def _div(partition):
     return CoreDivision(splits=({1: partition} if partition > 1 else {}))
 
 
-def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
-    """A minimal buffer with a 3-entry menu (index 0 trivial, 1 split-2, 2
-    split-4) and the given parent-compatibility pairs. ``size`` / ``uses`` are
-    overridable for the fixtures that need layout pressure (the flood tests do
-    not care)."""
+def _cdbuf(name, parents, matches, size=1024, uses=(0, 1), divisions=None):
+    """A minimal buffer with the given parent-compatibility pairs and menu, by
+    default a 3-entry one (index 0 trivial, 1 split-2, 2 split-4). ``size`` /
+    ``uses`` are overridable for the fixtures that need layout pressure (the
+    flood tests do not care)."""
     return CoreDivisionBuffer(
         name=name,
         size=size,
@@ -521,19 +540,23 @@ def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
         first_use_is_read=False,
         in_place_parents=[],
         residency_reason=None,
-        core_divisions=[_div(1), _div(2), _div(4)],
+        core_divisions=list(
+            [_div(1), _div(2), _div(4)] if divisions is None else divisions
+        ),
         parents=parents,
         cd_parent_matches=matches,
         boundary=BufferType.Intermediate,
     )
 
 
-def _flood(buffers, anchor_name, tiling):
-    """Run ``_flood_region`` on a hand-built graph; return name -> chosen index."""
+def _flood(buffers, anchor_name, index):
+    """Run ``_flood_region`` on a hand-built graph from the anchor's menu entry
+    ``index``; return name -> the flooded config's menu index."""
     solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
     solver._precompute_topology()
-    result = solver._flood_region(solver._name_to_idx[anchor_name], tiling)
-    return {buffers[i].name: d for i, d in result.items()}
+    anchor = solver._name_to_idx[anchor_name]
+    result = solver._flood_region(anchor, solver._sources[anchor].configs[index])
+    return {buffers[i].name: config.menu_index for i, config in result.items()}
 
 
 class FloodRegionTest(TestCase):
@@ -594,7 +617,7 @@ class RegionRecolorTest(TestCase):
     and applying one is a coordinated division change the packer keeps up with."""
 
     def test_corpus_holds_multi_op_regions(self):
-        # Floods every legal anchor/tiling on every graph rather than hoping the
+        # Floods every legal anchor/config on every graph rather than hoping the
         # search proposes one, so this is deterministic and independent of the
         # move weights. A corpus of singleton regions would make recolor pointless
         # and the bidirectional flood untested.
@@ -604,34 +627,35 @@ class RegionRecolorTest(TestCase):
             solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
             for anchor in solver._anchor_candidates:
                 anchored += 1
-                for tiling in solver._nontrivial_menu[anchor]:
-                    largest = max(largest, len(solver._flood_region(anchor, tiling)))
+                for config in solver._sources[anchor].splitting:
+                    largest = max(largest, len(solver._flood_region(anchor, config)))
         self.assertGreater(anchored, 0, "no graph offered a splittable anchor")
         self.assertGreater(largest, 1, "every region was a singleton")
 
     def test_recolor_recolors_the_whole_region_coherently(self):
-        # After a recolor, every op the flood reached carries the flooded index and
-        # the placement the packer holds for it reflects that division's footprint
-        # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
+        # After a recolor, every op the flood reached carries the flooded config
+        # and the placement the packer holds for it reflects that division's
+        # footprint
+        # -- i.e. the resize ripple in ``_apply_assignment`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
             solver = _primed(copy.deepcopy(buffers), cap)
             for anchor in solver._anchor_candidates:
-                tiling = solver._nontrivial_menu[anchor][0]
-                assignment = solver._flood_region(anchor, tiling)
-                solver._apply_recolor(assignment)
+                config = solver._sources[anchor].splitting[0]
+                assignment = solver._flood_region(anchor, config)
+                solver._apply_assignment(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
-                for op, div in assignment.items():
-                    self.assertEqual(solver.chosen[op], div, tag)
+                for op, flooded in assignment.items():
+                    self.assertEqual(solver.chosen[op], flooded, tag)
                     if addresses[op] is None:
                         continue  # spilled: the packer holds no extent to check
                     resized += 1
                     self.assertEqual(
                         solver.packer.top_or_inf(op) - addresses[op],
-                        solver._per_core_size(op, div),
+                        solver._per_core_size(op, flooded),
                         f"{tag}: packer footprint stale for op {op}",
                     )
         self.assertGreater(resized, 0, "no recolored op stayed resident")
@@ -664,7 +688,10 @@ def _live_state(solver):
     return (
         list(solver.packer.addresses),
         solver.packer.quality(),
-        list(solver.chosen),
+        # Key *and* menu position: configs compare by key alone, so a restore
+        # that put back a duplicate-key config at another menu position would
+        # otherwise pass -- and duplicated menu entries are real.
+        [(c.key, c.menu_index) for c in solver.chosen],
         solver._n_eligible,
     )
 
@@ -678,7 +705,7 @@ class SnapshotRestoreTest(TestCase):
     def _mutate(self, solver):
         """A division change (resize + eligibility ripple) plus a reinsertion --
         between them they move addresses, quality and ``chosen``."""
-        solver._atomic_flip(2, 2)
+        solver._atomic_flip(2, solver._sources[2].configs[2])
         solver.packer.rotate(0, 5)
 
     def test_adopt_round_trips_state(self):
@@ -805,8 +832,10 @@ class AllEligibleResidentTest(TestCase):
             for _ in range(50):
                 if solver._rng.random() < 0.5:
                     idx = solver._rng.choice(solver._flippable_ops)
-                    menu = len(solver._bufs[idx].core_divisions)
-                    solver._atomic_flip(idx, solver._rng.randrange(menu))
+                    configs = solver._sources[idx].configs
+                    solver._atomic_flip(
+                        idx, configs[solver._rng.randrange(len(configs))]
+                    )
                 else:
                     solver._recolor()
                 self.assertEqual(
@@ -824,7 +853,7 @@ class AllEligibleResidentTest(TestCase):
         self.assertFalse(solver._eligible(idx))
         before = solver._n_eligible
         snap = solver._snapshot()
-        solver._atomic_flip(idx, 1)
+        solver._atomic_flip(idx, solver._sources[idx].configs[1])
         self.assertTrue(solver._eligible(idx))
         self.assertFalse(solver._eligible(solver._name_to_idx["B6"]))
         self.assertEqual(solver._n_eligible, before + 1)
@@ -1094,7 +1123,7 @@ class ForeignParentTest(TestCase):
         # The owned edge survives; the unowned one leaves no trace behind.
         self.assertEqual(solver._parents_idx[1], {0})
         self.assertEqual(solver._children_idx[0], [1])
-        self.assertEqual(set(solver._edge_pairs), {(0, 1)})
+        self.assertEqual(set(solver._relations), {(0, 1)})
 
     def test_graph_with_only_unowned_parents_still_solves(self):
         bufs = [
@@ -1170,11 +1199,12 @@ class CostExprScoringTest(TestCase):
         solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
         cost_expr = buffers[0].sym_cores * 10
         solver.plan_layout_and_core_divisions(cost_expr)
+        configs = solver._sources[0].configs
         self.assertEqual(
-            solver._score_fn([0], frozenset()), utils.to_fixed_us(10 / 1000)
+            solver._score_fn([configs[0]], frozenset()), utils.to_fixed_us(10 / 1000)
         )
         self.assertEqual(
-            solver._score_fn([2], frozenset()), utils.to_fixed_us(40 / 1000)
+            solver._score_fn([configs[2]], frozenset()), utils.to_fixed_us(40 / 1000)
         )
 
     def test_residency_and_multiple_core_division_symbols_combine(self):
@@ -1204,12 +1234,13 @@ class CostExprScoringTest(TestCase):
             syms[0] * 10 + syms[1] * 100 + syms[2] * 1000 + 5000 * (1 - buf.sym_is_lx)
         )
         solver.plan_layout_and_core_divisions(cost_expr)
+        split_4x2 = [solver._sources[0].configs[2]]
         self.assertEqual(
-            solver._score_fn([2], frozenset()),
+            solver._score_fn(split_4x2, frozenset()),
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000 + 5000) / 1000),
         )
         self.assertEqual(
-            solver._score_fn([2], frozenset({"A"})),
+            solver._score_fn(split_4x2, frozenset({"A"})),
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
@@ -1222,3 +1253,793 @@ class CostExprScoringTest(TestCase):
         cost_expr = sympy.Symbol("mystery_shape_var")
         solver.plan_layout_and_core_divisions(cost_expr)
         self.assertIsNone(solver._score_fn)
+
+
+def _config(division, menu_index=0):
+    """A config for ``division``, built the way the engine builds one."""
+    return DivisionConfig(division, menu_index)
+
+
+class CanonicalKeyTest(TestCase):
+    """The key is a config's identity: hashable, order-free, and total over the
+    three things that make a division a different choice (output splits,
+    reduction splits, tiling). Everything downstream that dedups or memoizes a
+    *generated* config leans on that."""
+
+    def test_key_ignores_dict_order(self):
+        a = CoreDivision(splits={0: 2, 1: 4})
+        b = CoreDivision(splits={1: 4, 0: 2})
+        self.assertEqual(_canonical_key(a), _canonical_key(b))
+        self.assertEqual(_config(a), _config(b, menu_index=3))
+
+    def test_the_key_is_derived_not_supplied(self):
+        # The constructor takes no key, so a config's key cannot disagree with
+        # the config it identifies -- what dedup and memoization rest on.
+        division = CoreDivision(splits={0: 4, 1: 2}, reduction_syms=frozenset([1]))
+        self.assertEqual(DivisionConfig(division, 0).key, _canonical_key(division))
+
+    def test_each_way_a_division_can_differ_changes_the_key(self):
+        base = CoreDivision(splits={0: 2})
+        others = {
+            "output factor": CoreDivision(splits={0: 4}),
+            "output axis": CoreDivision(splits={1: 2}),
+            "extra output axis": CoreDivision(splits={0: 2, 1: 2}),
+            "reduction split": CoreDivision(
+                splits={0: 2, 1: 2}, reduction_syms=frozenset([1])
+            ),
+            "tiling": CoreDivision(
+                splits={0: 2}, tiling=TileSpec((TileAxis(host_dim=0, count=4),))
+            ),
+        }
+        for what, other in others.items():
+            self.assertNotEqual(_canonical_key(base), _canonical_key(other), what)
+            self.assertNotEqual(_config(base), _config(other), what)
+
+    def test_equality_is_the_key_not_the_menu_position(self):
+        # A generated config with no menu behind it must still compare equal to
+        # the menu entry making the same choice -- that is what lets a generator
+        # replace an enumerator without every consumer noticing.
+        division = CoreDivision(splits={0: 2})
+        self.assertEqual(_config(division, menu_index=0), _config(division, 7))
+        self.assertEqual(hash(_config(division, 0)), hash(_config(division, 7)))
+        self.assertNotEqual(_config(division), object())
+
+
+class ConfigStateTest(TestCase):
+    """``chosen[i]`` holds a config whose ``menu_index`` has to keep agreeing
+    with the menu the allocator will re-index."""
+
+    def test_state_holds_configs_that_carry_their_menu_entry(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
+            for i, (config, buf) in enumerate(zip(solver.chosen, solver._bufs)):
+                self.assertIs(
+                    config.division,
+                    buf.core_divisions[config.menu_index],
+                    f"{case}[{gi}] buffer {i}",
+                )
+
+    def test_seed_is_the_first_candidate(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
+            self.assertEqual(
+                [config.menu_index for config in solver.chosen],
+                [0] * len(buffers),
+                f"{case}[{gi}]",
+            )
+
+    def test_write_back_reports_the_position_of_the_config_it_ended_on(self):
+        # The allocator re-indexes ``core_divisions`` with ``chosen_division``
+        # (``allocator.py``), so the written index has to name the division the
+        # engine actually settled on -- not merely be in range.
+        for case, gi, buffers in _all_cases():
+            solver = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), max(1, _seed_footprint(buffers) // 2), 128
+            )
+            solved = solver.plan_layout_and_core_divisions()
+            for buf, config in zip(solved, solver.chosen):
+                self.assertIs(
+                    buf.core_divisions[buf.chosen_division],
+                    config.division,
+                    f"{case}[{gi}] {buf.name}",
+                )
+
+    def test_a_repeated_split_map_stays_a_menu_entry_of_its_own(self):
+        # A menu that carries one split map twice is a clone's: its entries are
+        # synthesized one per consumer, out of that consumer's own iteration
+        # symbols, and deduplicated by physical partition -- and Inductor's
+        # symbols are positional, so two consumers indexing the buffer
+        # differently can commit the same map. Both entries are choices.
+        buf = _cdbuf("A", [], {})
+        buf.core_divisions = [_div(1), _div(2), _div(2)]
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        solver._precompute_topology()
+        configs = solver._sources[0].configs
+        self.assertEqual([config.menu_index for config in configs], [0, 1, 2])
+        self.assertEqual(len({config.key for config in configs}), 3)
+        # The split map is still the identity of the position that owns it, so a
+        # generated config, which is keyed by one, meets the entry it names.
+        self.assertEqual(configs[1].key, _canonical_key(configs[1].division))
+        self.assertEqual(solver._menu_position(0, configs[2]), 2)
+
+
+def _axis_div(**factors):
+    """A division over the two named axes ``d0`` / ``d1``, factor 1 dropped."""
+    axes = {"d0": _AXIS_0, "d1": _AXIS_1}
+    return CoreDivision(splits={axes[name]: f for name, f in factors.items() if f > 1})
+
+
+_AXIS_0 = sympy.Symbol("d0", integer=True, positive=True)
+_AXIS_1 = sympy.Symbol("d1", integer=True, positive=True)
+# The cross product over two axes, as an enumeration would emit it.
+_TWO_AXIS_MENU = [
+    _axis_div(d0=first, d1=second) for first in (1, 2, 4) for second in (1, 2)
+]
+
+
+def _two_axis_space(legal=None, tiling=None):
+    return mock_op_split_space(
+        {_AXIS_0: [1, 2, 4], _AXIS_1: [1, 2]},
+        {_AXIS_0, _AXIS_1},
+        legal=legal,
+        tiling=tiling,
+    )
+
+
+def _tiling_space(output_counts=None):
+    """A tiling space over stated per-dim counts. Which counts are *legal* is
+    ``TilingSpace``'s business and is tested in ``test_enumerate_tilings.py``;
+    here they only have to be some counts."""
+    return TilingSpace(
+        max_dims=2,
+        output_counts={0: [2, 4]} if output_counts is None else output_counts,
+    )
+
+
+class DivisionSourceTest(TestCase):
+    """Where a buffer's candidate divisions come from, and what one move
+    reaches: the two sources have to answer alike, since which one a buffer
+    gets is the allocator's choice and not the search's."""
+
+    def test_both_sources_offer_the_same_one_axis_moves(self):
+        menu = _primed(
+            [_cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )._sources[0]
+        generated = _GeneratedDivisions(_two_axis_space(), menu.seed())
+        for config in menu.configs:
+            self.assertEqual(
+                {c.key for c in generated.neighbours(config)},
+                {c.key for c in menu.neighbours(config)},
+                config.division.label,
+            )
+        # Non-vacuity: a move alphabet reaching the whole menu from anywhere
+        # would not be a one-axis one.
+        self.assertLess(len(menu.neighbours(menu.seed())), len(_TWO_AXIS_MENU) - 1)
+
+    def test_one_axis_apart_counts_the_dropped_factor_of_one(self):
+        # ``{d0: 2}`` and ``{d0: 2, d1: 2}`` differ in one axis even though one
+        # map has an entry the other has not.
+        self.assertTrue(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=2, d1=2)))
+        self.assertTrue(_one_axis_apart(_axis_div(), _axis_div(d1=2)))
+        self.assertFalse(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=4, d1=2)))
+        self.assertFalse(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=2)))
+
+    def test_a_source_with_nothing_to_offer_is_filtered_out_statically(self):
+        pinned = _cdbuf("A", [], {}, divisions=[_axis_div()])
+        solver = _primed(
+            [pinned, _cdbuf("B", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )
+        self.assertEqual(solver._flippable(), [1])
+        self.assertEqual(solver._anchor_candidates, [1])
+        # And the generated side agrees: a single-factor domain cannot move.
+        frozen = _GeneratedDivisions(
+            mock_op_split_space({_AXIS_0: [1]}, {_AXIS_0}), solver._sources[0].seed()
+        )
+        self.assertFalse(frozen.can_move())
+        self.assertFalse(frozen.can_split())
+        self.assertTrue(
+            _GeneratedDivisions(
+                _two_axis_space(), solver._sources[1].seed()
+            ).can_split()
+        )
+
+    def test_a_recolor_anchor_splits_and_reaches_past_one_axis(self):
+        """Recolor is the long-range move: its anchor is drawn from the whole
+        space, not from the one-axis neighbours a flip takes."""
+        menu = _primed(
+            [_cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )._sources[0]
+        generated = _GeneratedDivisions(_two_axis_space(), menu.seed())
+        rng = rnd.Random(0)
+        for source in (menu, generated):
+            drawn = [source.anchor(source.seed(), rng) for _ in range(60)]
+            labels = {c.division.label for c in drawn if c is not None}
+            self.assertNotIn(_axis_div().label, labels, "an anchor never unsplits")
+            # Both scales are reachable from the unsplit seed: one axis-step,
+            # and a division two axis-steps away that no flip could reach.
+            self.assertIn(_axis_div(d0=2).label, labels)
+            self.assertIn(_axis_div(d0=4, d1=2).label, labels)
+        # A generated draw that comes out unsplit is a no-op step, not an
+        # unsplitting anchor.
+        self.assertTrue(
+            any(generated.anchor(generated.seed(), rng) is None for _ in range(60))
+        )
+        # An op with no splitting division to draw offers no anchor.
+        frozen = _primed([_cdbuf("A", [], {}, divisions=[_axis_div()])], 1 << 30)
+        self.assertIsNone(frozen._sources[0].anchor(frozen.chosen[0], rng))
+
+
+_TILE_2 = TileSpec((TileAxis(host_dim=0, count=2),))
+_TILE_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+
+
+def _menu_seed():
+    """The seed config a menu source hands over -- unsplit and untiled, which
+    is where every search starts."""
+    return (
+        _primed([_cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30)
+        ._sources[0]
+        .seed()
+    )
+
+
+class TilingInTheConfigTest(TestCase):
+    """A coarse tiling is part of the division the search moves on: it changes
+    the footprint the packer sees, it is a move of its own, and a search
+    handed no tiling space behaves exactly as one that never had the field."""
+
+    def test_a_tiling_shrinks_the_per_core_footprint(self):
+        """The whole payoff channel. Every tiling-sensitive term in the cost
+        model is a derate bounded by 1.0, so a tiling can only pay by bringing
+        this under the capacity gate and being repaid in freed traffic."""
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)  # size 1024
+        solver = _primed([buf], 1 << 30)
+        space = _two_axis_space(tiling=_tiling_space())
+        source = _GeneratedDivisions(space, solver._sources[0].seed())
+        untiled = source.config_for(space.division({_AXIS_0: 2}))
+        tiled = source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertEqual(solver._per_core_size(0, untiled), 512)
+        self.assertEqual(solver._per_core_size(0, tiled), 128)
+        # And the two are different *choices*, not one division seen twice.
+        self.assertNotEqual(untiled, tiled)
+
+    def test_the_flip_alphabet_gains_the_tile_levels(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        source = _GeneratedDivisions(space, _menu_seed())
+        seed = source.config_for(space.division({_AXIS_0: 2}))
+        moves = source.neighbours(seed)
+        self.assertEqual(
+            {config.tiling for config in moves}, {TileSpec(), _TILE_2, _TILE_4}
+        )
+
+    def test_no_tiling_space_offers_no_tiling_and_draws_no_randomness(self):
+        """The gate, from inside: handed no tiling space, the search has to
+        run the trajectory it ran before the field existed -- same moves, same
+        draws. That is what every engine but the SA co-optimizer sees."""
+        plain = _GeneratedDivisions(_two_axis_space(), _menu_seed())
+        seed = plain.config_for(_axis_div(d0=2))
+        left, right = rnd.Random(0), rnd.Random(0)
+        for _ in range(20):
+            plain.anchor(seed, left)
+            right.choice([1, 2, 4])  # one draw per axis, and nothing else
+            right.choice([1, 2])
+        self.assertEqual(left.random(), right.random())
+
+    def test_a_recolor_anchor_draws_a_tiling_and_can_leave_it_untiled(self):
+        """Long-range in the tiling dimension too, and undividing has to stay
+        reachable or a region can never be untiled again."""
+        space = _two_axis_space(tiling=_tiling_space())
+        source = _GeneratedDivisions(space, _menu_seed())
+        rng = rnd.Random(0)
+        seed = source.config_for(_axis_div(d0=2))
+        drawn = {
+            anchor.tiling
+            for _ in range(80)
+            if (anchor := source.anchor(seed, rng)) is not None
+        }
+        self.assertEqual(drawn, {TileSpec(), _TILE_2, _TILE_4})
+
+
+class GeneratedWriteBackTest(TestCase):
+    """A generated division carries no menu position, so the write-back is
+    where it is given one -- the allocator's contract, unchanged."""
+
+    def test_a_generated_choice_the_menu_carries_resolves_to_its_position(self):
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space()
+        solver = _primed([buf], 1 << 30)
+        source = solver._sources[0]
+        self.assertIsInstance(source, _GeneratedDivisions)
+        config = source.config_for(_axis_div(d0=4, d1=2))
+        self.assertIsNone(config.menu_index)
+        solver.chosen = [config]
+        solver._write_back()
+        self.assertEqual(len(buf.core_divisions), len(_TWO_AXIS_MENU))
+        self.assertEqual(
+            buf.core_divisions[buf.chosen_division].label,
+            _axis_div(d0=4, d1=2).label,
+        )
+
+    def test_a_tiled_division_is_appended_and_not_deduped_against_its_twin(self):
+        """Stage 3's common path, not a corner case: ``_canonical_key`` carries
+        the tiling and no enumerated entry carries one, so *every* tiled config
+        takes the append branch -- including one whose splits the menu already
+        has."""
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        twin = _axis_div(d0=4, d1=2)
+        self.assertIn(twin.label, [d.label for d in _TWO_AXIS_MENU])
+        tiled = CoreDivision(splits=dict(twin.splits), tiling=_TILE_4)
+        solver.chosen = [solver._sources[0].config_for(tiled)]
+        solver._write_back()
+        self.assertEqual(len(buf.core_divisions), len(_TWO_AXIS_MENU) + 1)
+        self.assertEqual(buf.chosen_division, len(_TWO_AXIS_MENU))
+        chosen = buf.core_divisions[buf.chosen_division]
+        self.assertEqual(chosen.tiling, _TILE_4)
+        self.assertEqual(chosen.output_splits, twin.output_splits)
+
+    def test_a_division_the_menu_does_not_carry_is_registered(self):
+        # What a truncated menu leaves.
+        buf = _cdbuf("A", [], {}, divisions=[_axis_div(), _axis_div(d0=2)])
+        buf.division_space = _two_axis_space()
+        solver = _primed([buf], 1 << 30)
+        config = solver._sources[0].config_for(_axis_div(d0=4, d1=2))
+        solver.chosen = [config]
+        solver._write_back()
+        self.assertEqual(buf.chosen_division, 2)
+        self.assertEqual(buf.core_divisions[2].label, _axis_div(d0=4, d1=2).label)
+
+
+class EdgeRelationTest(TestCase):
+    """The edge relation the residency gate and the recolor flood ask."""
+
+    @staticmethod
+    def _pair_graph(matches, spaces=False, edge=None):
+        parent = _cdbuf("P", [], {}, divisions=_TWO_AXIS_MENU)
+        child = _cdbuf("C", ["P"], {"P": matches}, divisions=_TWO_AXIS_MENU)
+        if spaces:
+            parent.division_space = _two_axis_space()
+            child.division_space = _two_axis_space()
+        if edge is not None:
+            child.residency_edges = {"P": edge}
+        return _primed([parent, child], 1 << 30)
+
+    def test_a_pair_does_not_spread_across_a_repeated_split_map(self):
+        # Two menu entries carrying one split map are two entries -- a clone's
+        # are synthesized per consumer, so a shared map is not a shared slicing.
+        # The projection is onto keys and keeps no position, so it has to keep
+        # the two apart: a pair naming the later entry must leave the earlier
+        # one incompatible, which is the physical check the pair stands for.
+        divisions = [_axis_div(), _axis_div(d0=2), _axis_div(d0=2)]
+        parent = _cdbuf("P", [], {}, divisions=divisions)
+        child = _cdbuf("C", ["P"], {"P": [(2, 2)]}, divisions=divisions)
+        solver = _primed([parent, child], 1 << 30)
+        relation = solver._relations[(0, 1)]
+        parent_configs = solver._sources[0].configs
+        self.assertEqual(len(parent_configs), 3, "the repeated entries merged")
+        checked, unchecked = parent_configs[2], parent_configs[1]
+        child_checked = solver._sources[1].configs[2]
+        self.assertNotEqual(checked, unchecked)
+        self.assertTrue(relation.compatible(checked, child_checked))
+        self.assertFalse(relation.compatible(unchecked, child_checked))
+        self.assertEqual(relation.child_for(checked), child_checked)
+        self.assertIsNone(relation.child_for(unchecked))
+
+    def test_the_table_serves_a_generated_config(self):
+        """The reason a graph where only some ops generate is not a mixture of
+        two answers: a generated division is one the enumeration would have
+        carried, so the table knows its key."""
+        solver = self._pair_graph([(1, 1)])
+        relation = solver._relations[(0, 1)]
+        generated = _GeneratedDivisions(
+            _two_axis_space(), solver._sources[0].seed()
+        ).config_for(_TWO_AXIS_MENU[1])
+        self.assertIsNone(generated.menu_index)
+        self.assertTrue(relation.compatible(generated, solver._sources[1].configs[1]))
+
+    def test_the_view_relation_is_taken_only_where_both_ends_generate(self):
+        edge = mock.MagicMock()
+        self.assertIsInstance(
+            self._pair_graph([], spaces=True, edge=edge)._relations[(0, 1)],
+            _ViewRelation,
+        )
+        for kwargs in ({"spaces": True}, {"edge": edge}, {}):
+            self.assertIsInstance(
+                self._pair_graph([], **kwargs)._relations[(0, 1)],
+                _TableRelation,
+            )
+
+    def test_the_view_relation_asks_the_edge_once_per_choice(self):
+        parent_source = _GeneratedDivisions(
+            _two_axis_space(), _config(_axis_div(), menu_index=0)
+        )
+        child_source = _GeneratedDivisions(
+            _two_axis_space(), _config(_axis_div(), menu_index=0)
+        )
+        edge = mock.MagicMock()
+        edge.consumer_division_for.return_value = _axis_div(d0=2)
+        edge.parent_division_for.return_value = None
+        edge.compatible.return_value = True
+        relation = _ViewRelation(edge, parent_source, child_source)
+        parent = parent_source.config_for(_axis_div(d0=2))
+        for _ in range(3):
+            child = relation.child_for(parent)
+            self.assertTrue(relation.compatible(parent, child))
+            self.assertIsNone(relation.parent_for(parent))
+        self.assertEqual(child.division.label, _axis_div(d0=2).label)
+        self.assertIsNone(child.menu_index)
+        self.assertEqual(edge.consumer_division_for.call_count, 1)
+        self.assertEqual(edge.parent_division_for.call_count, 1)
+        self.assertEqual(edge.compatible.call_count, 1)
+
+    def test_the_table_answers_a_tiled_config_as_it_answers_its_untiled_twin(self):
+        """A per-core view is a function of the splits alone, so a tiling
+        cannot change an edge's verdict -- and every table entry is untiled,
+        so the table has to be asked on the split half or it would silently
+        gate every tiled config out of LX."""
+        solver = self._pair_graph([(1, 1)])
+        relation = solver._relations[(0, 1)]
+        space = _two_axis_space(tiling=_tiling_space())
+        source = _GeneratedDivisions(space, solver._sources[0].seed())
+        # Menu position 1 on both sides -- the pair the table carries.
+        untiled = source.config_for(space.division({_AXIS_1: 2}))
+        tiled = source.config_for(space.division({_AXIS_1: 2}, _TILE_4))
+        child = solver._sources[1].configs[1]
+        self.assertTrue(relation.compatible(untiled, child))
+        self.assertTrue(relation.compatible(tiled, child))
+        # What it cannot do is carry the tiling: the far side is a menu entry.
+        self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
+
+    def test_the_view_relation_carries_the_tiling_across_the_edge(self):
+        """``child_for`` passes the edge's division through, tiling included."""
+        space = _two_axis_space(tiling=_tiling_space())
+        parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        edge = mock.MagicMock()
+        edge.consumer_division_for.side_effect = lambda division, _space: CoreDivision(
+            splits=dict(division.splits),
+            reduction_syms=division.reduction_syms,
+            tiling=division.tiling,
+        )
+        relation = _ViewRelation(edge, parent_source, child_source)
+        parent = parent_source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertEqual(relation.child_for(parent).tiling, _TILE_4)
+
+
+class MoveAlphabetTest(TestCase):
+    """A flip proposes one axis's factor, one step."""
+
+    def test_a_flip_lands_on_a_one_axis_neighbour(self):
+        solver = _primed(
+            [
+                _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU),
+                _cdbuf("B", [], {}, divisions=_TWO_AXIS_MENU),
+            ],
+            1 << 30,
+        )
+        seen = set()
+        for _ in range(40):
+            before = list(solver.chosen)
+            solver._execute_move("flip")
+            moved = [i for i in range(2) if solver.chosen[i].key != before[i].key]
+            self.assertLessEqual(len(moved), 1)
+            for i in moved:
+                self.assertTrue(
+                    _one_axis_apart(solver.chosen[i].division, before[i].division),
+                    f"{before[i].division.label} -> {solver.chosen[i].division.label}",
+                )
+                seen.add(solver.chosen[i].key)
+        self.assertGreater(len(seen), 1, "no flip changed a division")
+
+    def test_a_flip_with_no_neighbour_left_is_a_no_op(self):
+        # Legal only at the extremes, so the seed has no one-axis move at all:
+        # the move is skipped rather than made illegal or forced.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(
+            legal=lambda splits: splits[_AXIS_0] * splits[_AXIS_1] in (1, 8)
+        )
+        solver = _primed([buf], 1 << 30)
+        self.assertEqual(solver._flippable_ops, [0])
+        self.assertEqual(solver._sources[0].neighbours(solver.chosen[0]), [])
+        before = list(solver.chosen)
+        solver._execute_move("flip")
+        self.assertEqual(solver.chosen, before)
+
+
+class TestCoarseTilingIsGatedOnTheFlag(TestCase):
+    """Only the annealer may choose a coarse tiling, and only with
+    ``auto_coarse_tiling`` on."""
+
+    @staticmethod
+    def _allocator(layout_planning):
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=layout_planning, size=1
+        )
+
+    def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
+        """Only a search that generates divisions can carry a ``TileSpec``."""
+        for flag in (False, True):
+            with (
+                self.subTest(auto_coarse_tiling=flag),
+                mock.patch.object(ts_config, "auto_coarse_tiling", flag),
+            ):
+                self.assertEqual(
+                    self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings,
+                    flag,
+                )
+                self.assertFalse(
+                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                )
+
+
+def _run_buffer(name, position, space=None):
+    """A two-axis buffer that sits at a stated operation position, so it can be
+    part of a coarse-tiling run."""
+    buf = _cdbuf(name, [], {}, divisions=_TWO_AXIS_MENU)
+    buf.uses = [position, position + 1]
+    buf.op_position = position
+    buf.division_space = space
+    return buf
+
+
+def _run_solver(names, untiled=()):
+    """A primed solver over ``names`` at consecutive operation positions, each
+    with a tiling space unless named in ``untiled``. A ``None`` name leaves its
+    position to an operation with no buffer."""
+    bufs = [
+        _run_buffer(
+            name,
+            position,
+            _two_axis_space(tiling=None if name in untiled else _tiling_space()),
+        )
+        for position, name in enumerate(names)
+        if name is not None
+    ]
+    return _primed(bufs, 1 << 30)
+
+
+def _tiled(solver, idx, tiling=_TILE_4):
+    """Buffer ``idx``'s current splits under ``tiling``."""
+    return solver._sources[idx].retiled(solver.chosen[idx], tiling)
+
+
+class ContiguousTilingRunTest(TestCase):
+    """A tiling group is a contiguous run of the operation list, because that is
+    what ``derive_tiling_groups`` forms and what ``_validate_contiguous``
+    demands. Both structural moves write their tilings as contiguous stretches
+    of runs."""
+
+    def test_a_run_is_the_maximal_stretch_agreeing_on_the_tiling(self):
+        solver = _run_solver("ABC")
+        self.assertEqual(solver._run_bounds(0), (0, 2))  # all untiled: one run
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(1), (1, 1))
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+
+    def test_an_operation_with_no_buffer_breaks_a_run(self):
+        # Position 1 belongs to an operation the solver does not own -- nothing
+        # can carry a tiling to it, so it is untiled and the run stops there.
+        solver = _run_solver(["A", None, "C"])
+        solver.chosen[0] = _tiled(solver, 0)
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+
+    def test_the_trim_strips_a_tiling_the_anchors_run_does_not_reach(self):
+        solver = _run_solver("ABC")
+        # What a flood over the residency relation can produce: A and C tiled,
+        # B (between them) left alone: two groups at apply time.
+        assignment = {0: _tiled(solver, 0), 2: _tiled(solver, 2)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual(trimmed[0].tiling, _TILE_4)
+        self.assertTrue(trimmed[2].tiling.is_untiled)
+        # The splits are the flood's business and are left exactly as they were.
+        self.assertEqual(trimmed[2].splits, assignment[2].splits)
+
+    def test_a_buffer_with_no_operation_position_may_hold_no_tiling(self):
+        # An input clone, or any buffer built without operation order: it is in
+        # no run, so nothing can establish that a group containing it is
+        # contiguous, and declining is the safe direction.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        self.assertIsNone(solver._position_of[0])
+        assignment = {0: _tiled(solver, 0)}
+        self.assertTrue(
+            solver._trim_tilings_to_anchor_run(0, assignment)[0].tiling.is_untiled
+        )
+
+    def test_a_boundary_flip_respecs_one_whole_side_of_the_run(self):
+        solver = _run_solver("ABCD")
+        solver._retile_boundary(1, _tiled(solver, 1))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        # Whichever side was drawn, it is a contiguous stretch containing the
+        # drawn op and reaching one end of its run -- A..H or H..Z.
+        self.assertIn(tiled, ([0, 1], [1, 2, 3]))
+
+    def test_a_boundary_flip_truncates_at_an_op_that_refuses_the_tiling(self):
+        # C has no tiling space, so it can take no tiling at all. The walk stops
+        # there rather than skipping it (which would break contiguity) or
+        # abandoning the move (which would make long runs immovable).
+        solver = _run_solver("ABCD", untiled="C")
+        self.assertIsNone(_tiled(solver, 2))
+        with mock.patch.object(solver._rng, "random", return_value=0.0):  # forward
+            solver._retile_boundary(0, _tiled(solver, 0))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        self.assertEqual(tiled, [0, 1])
+
+    def test_a_search_with_no_tiling_space_never_takes_the_boundary_arm(self):
+        solver = _run_solver("ABCD", untiled="ABCD")
+        with mock.patch.object(solver, "_retile_boundary") as boundary:
+            for _ in range(200):
+                solver._execute_move("flip")
+        boundary.assert_not_called()
+
+
+def _attention_ops():
+    """``KT = K^T``, ``S = Q @ KT``, ``V``, ``O = S @ V`` as IR, in that order,
+    under the caller's graph handler: tiling host dim 0 of all four, ``S``
+    reduces over ``KT``'s tiled dim and ``O`` over ``V``'s."""
+    from torch._inductor.virtualized import ops
+
+    buf, load_input = ir_computed_buffer, ir_input_loader
+    load_q, load_k = load_input("q", [8, 16]), load_input("k", [8, 16])
+    load_kt, kt = buf("KT", [16, 8], lambda i: load_k([i[1], i[0]]))
+    load_s, s = buf(
+        "S",
+        [8, 8],
+        lambda i, r: ops.mul(load_q([i[0], r[0]]), load_kt([r[0], i[1]])),
+        reduction_ranges=[16],
+    )
+    load_v, v = buf("V", [8, 16], load_input("v_in", [8, 16]))
+    _, o = buf(
+        "O",
+        [8, 16],
+        lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+        reduction_ranges=[8],
+    )
+    return [kt, s, v, o]
+
+
+def _permuted_stretch_ops():
+    """``P``, ``C = P`` permuted, ``D = C + P`` permuted, as IR under the
+    caller's graph handler: tiling host dim 0, ``C`` misreads ``P`` and ``D``
+    reads ``C`` as written but misreads ``P``."""
+    from torch._inductor.virtualized import ops
+
+    buf = ir_computed_buffer
+    load_p, p = buf("P", [4, 8, 128], ir_input_loader("in0", [4, 8, 128]))
+    load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+    _, d = buf(
+        "D",
+        [8, 4, 128],
+        lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+    )
+    return [p, c, d]
+
+
+class ApplyGroupAgreementTest(TestCase):
+    """The SA's runs are the groups ``derive_tiling_groups`` forms, including
+    where a reader walks a run member's tiled host dim differently than that
+    member writes it -- the attention chain's ``S = Q @ K^T`` and ``O = S @ V``
+    both reduce over what the positional spec tiles upstream."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self.enterContext(
+            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None)))
+        )
+        self.enterContext(patch_row_major_out_coords())
+
+    def _solver(self, operations):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        op_by_name = {op.get_name(): op for op in operations}
+        bufs = []
+        for at, op in enumerate(operations):
+            buf = _run_buffer(
+                op.get_name(), at, _two_axis_space(tiling=_tiling_space())
+            )
+            buf.tile_aligned_parents = CoOptimizingAllocator._tile_aligned_parents(
+                op, op_by_name
+            )
+            buf.parents = sorted(buf.tile_aligned_parents)
+            bufs.append(buf)
+        solver = _primed(bufs, 1 << 30)
+        for idx in range(len(bufs)):
+            solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        return solver
+
+    def _assert_runs_are_the_applied_groups(self, operations, expected):
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            derive_tiling_groups,
+        )
+
+        solver = self._solver(operations)
+        groups = derive_tiling_groups(
+            SimpleNamespace(operations=operations),
+            {op.get_name(): _TILE_2 for op in operations},
+        )
+        position = {op.get_name(): at for at, op in enumerate(operations)}
+        applied = {
+            position[op.get_name()]: (
+                position[ops[0].get_name()],
+                position[ops[-1].get_name()],
+            )
+            for ops, _spec in groups
+            for op in ops
+        }
+        self.assertEqual(sorted(set(applied.values())), expected)
+        self.assertEqual(
+            {p: solver._run_bounds(p) for p in range(len(operations))}, applied
+        )
+
+    def test_the_runs_are_the_applied_groups(self):
+        self._assert_runs_are_the_applied_groups(
+            _attention_ops(), [(0, 0), (1, 2), (3, 3)]
+        )
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted.
+        self._assert_runs_are_the_applied_groups(
+            _permuted_stretch_ops(), [(0, 0), (1, 1), (2, 2)]
+        )
+
+    def test_the_trim_strips_a_tiling_carried_across_a_misaligned_read(self):
+        solver = self._solver(_attention_ops())
+        assignment = {i: solver.chosen[i] for i in range(4)}
+        trimmed = solver._trim_tilings_to_anchor_run(1, assignment)
+        self.assertEqual(
+            [trimmed[i].tiling.is_untiled for i in range(4)],
+            [True, False, False, True],
+        )
+
+    def test_a_boundary_flip_stops_at_a_misaligned_read(self):
+        tiled = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        for position, draw, expected in (
+            (1, 0.0, [False, True, True, False]),  # forward: O misreads V
+            (3, 0.9, [False, False, False, True]),  # back: likewise
+        ):
+            solver = self._solver(_attention_ops())
+            for idx in range(4):
+                solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}))
+            with mock.patch.object(solver._rng, "random", return_value=draw):
+                solver._retile_boundary(position, tiled)
+            self.assertEqual(
+                [not solver.chosen[i].tiling.is_untiled for i in range(4)], expected
+            )
+
+    def test_the_view_relation_carries_no_tiling_across_a_misaligned_read(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        edge = mock.MagicMock()
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        relation = _ViewRelation(
+            edge,
+            parent_source,
+            child_source,
+            lambda spec: spec.read_as_written(frozenset({1})),
+        )
+        tiled = parent_source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
+        self.assertTrue(relation.parent_for(tiled).tiling.is_untiled)
+        self.assertEqual(relation.child_for(tiled).division.output_splits, {_AXIS_0: 2})
+
+    def test_the_edge_relation_takes_the_readers_alignment(self):
+        parent = _run_buffer("P", 0, _two_axis_space(tiling=_tiling_space()))
+        child = _run_buffer("C", 1, _two_axis_space(tiling=_tiling_space()))
+        child.parents = ["P"]
+        child.residency_edges = {"P": mock.MagicMock()}
+        child.tile_aligned_parents = {"P": frozenset({1})}
+        relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
+        self.assertFalse(relation.carries(_TILE_2))
+        self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))

@@ -26,6 +26,10 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.work_division import (
+        OpSplitSpace,
+        ResidencyEdge,
+    )
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         ChosenRelayout,
         LXRelayoutPlan,
@@ -196,7 +200,8 @@ class TileSpec:
     because tile levels *nest*: swapping two levels is a different plan. Frozen
     and hashable so ``==`` is exactly the "same tiling shape" test the group
     derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    every :class:`CoreDivision` carries unless a solver chose otherwise -- only
+    the SA co-optimizer does.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -227,6 +232,16 @@ class TileSpec:
         :attr:`tile_count`.
         """
         return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    def read_as_written(self, aligned: Optional[frozenset[int]]) -> bool:
+        """Whether a reader walking a writer's output host dims ``aligned`` as
+        the writer does (``None``: an edge no spec aligns, see
+        :func:`~torch_spyre._inductor.scratchpad.coarse_tiling.tile_aligned_host_dims`)
+        reads each tile of this spec as written. Reduction axes are not in a
+        written buffer."""
+        return aligned is not None and all(
+            a.is_reduction or a.host_dim in aligned for a in self.axes
+        )
 
     @property
     def label(self) -> str:
@@ -315,6 +330,33 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
         default_factory=dict
     )
+    # The same relation per candidate rather than per pair: one edge per divided
+    # producer this buffer reads, keyed as ``cd_parent_matches`` is. A solver
+    # that generates divisions asks these instead of indexing the table, and
+    # constructs the division on the other end of an edge by inverting the view.
+    # Empty where the allocator has not built them (they need the live ops).
+    residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
+    # This buffer's producing op's legal divisions as a space to move in --
+    # ``core_divisions`` without materializing it. ``None`` where the allocator
+    # built none (see ``allocator._DivisionMap``).
+    division_space: Optional["OpSplitSpace"] = None
+    # Index of this buffer's producing operation in ``graph.operations``, which
+    # is what a coarse-tiling *run* is measured over: a group has to occupy one
+    # contiguous stretch of that list, and buffer order is not operation order
+    # (input clones are prepended, and an operation producing no solver buffer
+    # has no index at all). ``None`` where there is no producing operation -- an
+    # input clone -- or where the caller does not supply one, which is what a
+    # solver reads as "operation order is unknown here, so no tiling may span
+    # more than nothing".
+    op_position: Optional[int] = None
+    # Parent name -> the parent's output host dims this buffer's op reads as
+    # the parent writes them (``tile_aligned_host_dims``), for the parents the
+    # op reads that a tiling run could hold. A spec those dims do not cover
+    # breaks the run there (``derive_tiling_groups``). Filled only where the
+    # solver chooses tilings.
+    tile_aligned_parents: dict[str, Optional[frozenset[int]]] = field(
+        default_factory=dict
+    )
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
@@ -334,9 +376,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
         the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        are excluded (see :attr:`TileSpec.output_tile_count`); where no
+        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
+        ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(

@@ -2665,6 +2665,43 @@ def _fused_iteration_symbol_remap(
     )
 
 
+class IterationFrame(NamedTuple):
+    """An op's iteration symbols as captured before a range rewrite, for
+    :func:`iteration_symbol_remap` after it."""
+
+    # ``None`` where the symbols could not be matched to raw dims one to one.
+    logical: tuple[_LogicalIterationSymbol, ...] | None
+    symbols: tuple[sympy.Symbol, ...]
+
+
+def capture_iteration_frame(op: ComputedBuffer) -> IterationFrame:
+    try:
+        logical = _capture_logical_iteration_symbols(op)
+    except Unsupported:
+        logical = None
+    return IterationFrame(logical, tuple(iteration_space_from_op(op)))
+
+
+def iteration_symbol_remap(
+    op: ComputedBuffer, before: IterationFrame
+) -> dict[sympy.Symbol, sympy.Symbol]:
+    """Old-to-new symbols for ``op`` after a rewrite of its output ranges.
+
+    A dim a tile shrinks to extent 1 loses its symbol and renumbers every later
+    one; it has no entry here. Raises ``Unsupported`` where the correspondence
+    cannot be proven.
+    """
+    if before.logical is not None:
+        remap = _order_preserving_symbol_remap(
+            op, before.logical, _capture_logical_iteration_symbols(op)
+        )
+    else:
+        remap = _fused_iteration_symbol_remap(
+            op, before.symbols, max_trailing_removals=0
+        )
+    return dict(remap.pairs)
+
+
 def _apply_work_div_symbol_remap(
     op: ComputedBuffer, remap: _IterationSymbolRemap | None
 ) -> None:

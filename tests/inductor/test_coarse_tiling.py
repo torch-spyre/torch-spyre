@@ -100,6 +100,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
     derive_tiling_groups,
+    tile_aligned_host_dims,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
 )
@@ -126,6 +127,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_offset,
     compute_tile_index,
     compute_tile_stride,
+)
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    patch_row_major_out_coords,
 )
 
 _FP16 = DataFormats.SEN169_FP16
@@ -9846,6 +9852,7 @@ class TestDeriveTilingGroups(unittest.TestCase):
         choices = {"op1": spec, "op2": spec, "op4": spec}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+        self.assertEqual([s for _, s in groups], [spec, spec])
 
     def test_spec_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
@@ -9859,6 +9866,77 @@ class TestDeriveTilingGroups(unittest.TestCase):
         g = self._graph_of(["op0", "op1"])
         self.assertEqual(derive_tiling_groups(g, {}), [])
         self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
+    """A shared positional spec groups a reader only where it tiles the same
+    logical dim of what it reads: ``[A, S, D] -> [S, A, D]`` puts ``A`` at
+    host dim 0 of the writer and ``S`` at host dim 0 of the reader. Likewise
+    ``O = S @ V`` reduces over ``V``'s host dim 0, so it tiles ``S``'s row dim
+    but not ``V``'s."""
+
+    def setUp(self):
+        from torch._inductor.virtualized import ops
+
+        gm = fx.symbolic_trace(lambda: None)
+        self.enterContext(V.set_graph_handler(GraphLowering(gm)))
+        self.enterContext(patch_row_major_out_coords())
+        buf, load_input = ir_computed_buffer, ir_input_loader
+
+        load_p, p = buf("P", [4, 8, 128], load_input("in0", [4, 8, 128]))
+        load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+        self.graph = _graph([p, c])
+        self.p, self.c = p, c
+        _, d = buf(
+            "D",
+            [8, 4, 128],
+            lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+        )
+        self.stretch_graph = _graph([p, c, d])
+
+        load_v, v = buf("V", [8, 128], load_input("in_v", [8, 128]))
+        load_s, s = buf("S", [8, 8], load_input("in_s", [8, 8]))
+        _, o = buf(
+            "O",
+            [8, 128],
+            lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+            reduction_ranges=[8],
+        )
+        self.attn_graph = _graph([v, s, o])
+
+    def _names(self, spec, graph=None, tiled=("P", "C")):
+        groups = derive_tiling_groups(
+            graph or self.graph, {name: spec for name in tiled}
+        )
+        return [[o.get_operation_name() for o in ops] for ops, _ in groups]
+
+    def test_permuted_host_dim_breaks_the_run(self):
+        self.assertEqual(self._names(TileSpec((TileAxis(0, 2),))), [["P"], ["C"]])
+
+    def test_the_aligned_dims_are_those_walked_as_written(self):
+        self.assertEqual(tile_aligned_host_dims(self.c, self.p), frozenset({2}))
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted: whether a
+        # group starts at D depends on the specs since P, not on C's group.
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(
+            self._names(spec, self.stretch_graph, ("P", "C", "D")),
+            [["P"], ["C"], ["D"]],
+        )
+
+    def test_host_dim_the_permutation_keeps_stays_one_run(self):
+        self.assertEqual(self._names(TileSpec((TileAxis(2, 2),))), [["P", "C"]])
+
+    def test_reduction_over_a_tiled_dim_breaks_the_run(self):
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(
+            self._names(spec, self.attn_graph, ("V", "S", "O")), [["V", "S"], ["O"]]
+        )
+
+    def test_reduction_reader_of_its_own_row_dim_stays_one_run(self):
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(self._names(spec, self.attn_graph, ("S", "O")), [["S", "O"]])
 
 
 class TestDerivedBases(unittest.TestCase):
@@ -9965,6 +10043,21 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
+        g = _graph(ops)
+        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
+        self.assertEqual(hint_ids, [[0], [1]])
+        self.assertNotEqual(
+            tuple(ops[0].loop_info.loop_group_id),
+            tuple(ops[2].loop_info.loop_group_id),
+        )
+        # op1 was never in a group, so it is untiled and unhinted.
+        self.assertEqual(getattr(ops[1], "dim_hints", []), [])
+        self.assertEqual(ops[1].data.ranges[0], Integer(256))
 
     def test_pass_inputs_match_hint_path_structurally(self):
         # Two independent ops in one group: prove the group derivation and
