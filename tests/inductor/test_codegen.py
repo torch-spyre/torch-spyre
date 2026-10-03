@@ -568,6 +568,64 @@ class TestTiledAwayPhysicalAxis(InductorTestCase):
                 self.assertEqual(source.strides[mapping[head]], 2048)
                 self.assertEqual(destination.backGap, {})
 
+    def test_tiled_group_gap_inside_stick_block_axis(self):
+        """A group gap folded inside the stick block axis must not grow D."""
+        head, row, feature, group = sympy.symbols("head row feature tile_group")
+        iteration_space = {
+            head: (sympy.Integer(2), 1),
+            row: (sympy.Integer(256), 1),
+            feature: (sympy.Integer(64), 1),
+        }
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    # [D/64, Hkv, tiled-away G, S, D%64]
+                    device_size=[1, 2, 2, 256, 64],
+                    device_coordinates=[
+                        sympy.floor(feature / 64),
+                        head,
+                        sympy.S.Zero,
+                        row,
+                        sympy.Mod(feature, 64),
+                    ],
+                    allocation={"hbm": 0},
+                    device_tile_advance_expr=16384 * group,
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 256, 2, 64],
+                    device_coordinates=[
+                        sympy.floor(feature / 64),
+                        row,
+                        head,
+                        sympy.Mod(feature, 64),
+                    ],
+                    allocation={"lx": 0},
+                ),
+            ],
+            op_info={},
+            tiled_symbols=[[group]],
+            tiled_symbol_trip_counts={group: 2},
+        )
+
+        sdsc_spec, mapping = parse_op_spec(spec)
+        source, destination = sdsc_spec.args
+        # Only G's gap between rows; reading G's extent as a second stick of D
+        # would double the head stride past the end of the tensor.
+        self.assertEqual(source.backGap, {mapping[row]: 256})
+        self.assertEqual(source.strides[mapping[feature]], 65536)
+        self.assertEqual(source.strides[mapping[head]], 65536)
+        self.assertEqual(destination.backGap, {})
+
     def test_native_bmm_fake_broadcasts_gqa_axis(self):
         query = torch.empty((1, 8, 4, 256, 128), device="meta")
         key = torch.empty((1, 8, 1, 128, 256), device="meta")

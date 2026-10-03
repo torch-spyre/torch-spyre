@@ -765,6 +765,50 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    def test_gqa_group_loop_with_untiled_kv_heads(self):
+        """Several KV heads per group-loop body must each read their own query."""
+        generator = torch.Generator().manual_seed(0)
+        # Fused QKV projections. V comes from a second projection so that K and
+        # V do not share a storage.
+        query, key, value = (
+            torch.randn(1, 256, 8 * 64, dtype=torch.float16, generator=generator)
+            for _ in range(3)
+        )
+
+        def sdpa(qkv, qkv_k, qkv_v):
+            # Projection outputs: logical [B, H, S, D] over physical [B, S, H, D].
+            q = qkv[..., : 4 * 64].view(1, 256, 4, 64)
+            k = qkv_k[..., 4 * 64 : 6 * 64].view(1, 256, 2, 64)
+            v = qkv_v[..., 6 * 64 :].view(1, 256, 2, 64)
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+            return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+        def group_and_kv_loops(**kwargs):
+            return dataclasses.replace(
+                _select_sdpa_tiling(**kwargs),
+                strategy="work_divided_tiled",
+                num_batch_tiles=1,
+                num_head_tiles=1,
+                num_group_tiles=2,
+                num_q_tiles=1,
+                q_tile_size=256,
+                num_kv_blocks=2,
+                kv_block_size=128,
+                kv_blocks_per_loop_group=2,
+            )
+
+        expected = sdpa(query.float(), key.float(), value.float())
+        with mock.patch.object(
+            _decompositions,
+            "_select_sdpa_tiling",
+            side_effect=group_and_kv_loops,
+        ):
+            actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+                query.to("spyre"), key.to("spyre"), value.to("spyre")
+            )
+
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=0.01, rtol=0.01)
+
     def test_gqa_decode_with_interleaved_kv_cache(self):
         """A tiled-away group must preserve query strides across KV heads."""
         generator = torch.Generator().manual_seed(123)

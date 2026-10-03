@@ -1373,12 +1373,22 @@ def _create_sdsc_tensors(
             # Locate live roles by coordinate identity so that slot cannot
             # shift an outer role onto the wrong device extent.
             physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+            if (
+                dim is stick_dim
+                and physical_axis not in gap_factor_by_inner_axis
+                and not any(
+                    physical_axis is not None and axis > physical_axis
+                    for axis in gap_factor_by_inner_axis
+                )
+            ):
                 # Keep the positional handling for ordinary stick dimensions.
                 # When a tiled-away axis precedes the stick's block axis,
                 # however, include its gap just as for a non-stick dimension:
                 # [Hkv, G, D/64, D%64] with G tiled to one still has a G*D
                 # stride between heads, even if one core handles several heads.
+                # Likewise when a tiled-away role's gap folds into a live axis
+                # inside the block axis: in [D/64, Hkv, G, S, D%64] the
+                # positional lookup would read G's extent as the stick count.
                 physical_axis = None
 
             if has_indirect_access and (
