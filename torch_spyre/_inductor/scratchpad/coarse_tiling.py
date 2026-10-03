@@ -35,6 +35,7 @@ from collections.abc import Mapping, Sequence
 
 import sympy
 
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
@@ -304,6 +305,80 @@ def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion
     return regions
 
 
+def _host_dim_walk(
+    op: ComputedBuffer, dep: MemoryDep, host_dim: int
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """``(stride, extent)`` of ``dep`` along the loop var at output ``host_dim``
+    of ``op``, or ``None`` where that is not a single affine loop var."""
+    coords = op_out_coords(op)
+    if host_dim >= len(coords) or len(coords[host_dim].free_symbols) != 1:
+        return None
+    var = next(iter(coords[host_dim].free_symbols))
+    stride = sympy.diff(dep.index, var)
+    extent = dict(zip(dep.var_names, dep.size)).get(var)
+    if stride == 0 or stride.free_symbols or extent is None:
+        return None
+    return stride, extent
+
+
+def tile_aligned_host_dims(
+    op: ComputedBuffer, producer: ComputedBuffer
+) -> frozenset[int] | None:
+    """The output host dims of ``producer`` that ``op`` walks, in every read of
+    it, along the same buffer dim at the same extent as ``producer`` writes
+    them; ``None`` where no spec is read as written (a read or the write that
+    is not a :class:`MemoryDep`).
+
+    ``TileAxis.host_dim`` is positional, so a shared spec is not a shared
+    logical dim: across ``[A, S, D] -> [S, A, D]`` host dim 0 is ``A`` on one
+    side and ``S`` on the other, and the reader would index the writer's
+    per-tile scratch as though it held a tile of ``S``. Anything not provably
+    aligned counts as misaligned.
+    """
+    name = producer.get_name()
+    write = next(
+        (
+            w
+            for w in producer.get_read_writes().writes
+            if isinstance(w, MemoryDep) and w.name == name
+        ),
+        None,
+    )
+    if write is None:
+        return None
+    dims = set(range(len(op_out_coords(producer))))
+    for read in op.get_read_writes().reads:
+        if read.name != name:
+            continue
+        if not isinstance(read, MemoryDep):
+            return None
+        dims = {
+            d
+            for d in dims
+            if (walk := _host_dim_walk(producer, write, d)) is not None
+            and walk == _host_dim_walk(op, read, d)
+        }
+    return frozenset(dims)
+
+
+def _reads_tiles_as_written(
+    op: Operation,
+    by_buf: Mapping[str, ComputedBuffer],
+    spec: TileSpec,
+) -> bool:
+    """Whether ``op`` reads each op of ``by_buf`` it reads with every tiled
+    output axis of ``spec`` walked as that op writes it."""
+    if not isinstance(op, ComputedBuffer):
+        return True
+    for name in {read.name for read in op.get_read_writes().reads}:
+        producer = by_buf.get(name)
+        if producer is not None and not spec.read_as_written(
+            tile_aligned_host_dims(op, producer)
+        ):
+            return False
+    return True
+
+
 def derive_tiling_groups(
     graph: GraphLowering,
     choices: Mapping[str, TileSpec],
@@ -315,20 +390,51 @@ def derive_tiling_groups(
     untiled (absent from ``choices`` or mapped to the empty spec) or its spec
     differs from the run's. Contiguity is a hard requirement, not an
     optimization -- ``validate_coarse_tile_groups`` and ``_apply_plan`` both rely
-    on each group occupying one contiguous stretch of the operation list, so a
-    connected component that skipped an intervening untiled op would be rejected
-    at apply time.
+    on each group occupying one contiguous stretch of the operation list.
+
+    Two non-adjacent runs carrying the same spec are therefore **two groups**,
+    each minting its own hint ids and group id. They are not the same group and
+    not an error: ``TileSpec`` equality is structural, so unrelated regions
+    anywhere in the graph collide on a small alphabet (~6 counts per axis over
+    at most two dims), and refusing them would refuse ordinary graphs.
+
+    **Precondition on the caller, which this signature cannot check.** Ops meant
+    to tile together have to be contiguous in ``graph.operations``. A chooser
+    walking producer/consumer reachability is not walking contiguity: an op it
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. That is a mispricing rather than an illegal graph, and a
+    name->spec map carries no region identity to detect it with, so it belongs
+    to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
+    for the illegal case.
+
+    A run also breaks at an op that reads an op of its *stretch* -- the ops
+    since the spec last changed, not only its group -- along a different
+    logical dim than the spec tiles it by (:func:`tile_aligned_host_dims`):
+    one group would hand it the wrong slice, two make it a cross-group read of
+    the full buffer. Taking the stretch over-breaks only where that op is
+    already in an earlier group, and makes where a group starts depend on the
+    specs between an op and what it reads alone, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``).
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
     groups: list[tuple[list[Operation], TileSpec]] = []
     current_ops: list[Operation] = []
     current_spec: TileSpec | None = None
+    stretch_by_buf: dict[str, ComputedBuffer] = {}
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
         if spec is not None and spec.is_untiled:
             spec = None
-        if spec is not None and spec == current_spec:
+        if spec != current_spec:
+            stretch_by_buf = {}
+        if (
+            spec is not None
+            and spec == current_spec
+            and _reads_tiles_as_written(op, stretch_by_buf, spec)
+        ):
             current_ops.append(op)
         else:
             if current_ops:
@@ -336,6 +442,8 @@ def derive_tiling_groups(
                 groups.append((current_ops, current_spec))
             current_ops = [op] if spec is not None else []
             current_spec = spec
+        if spec is not None and isinstance(op, ComputedBuffer):
+            stretch_by_buf[op.get_name()] = op
     if current_ops:
         assert current_spec is not None
         groups.append((current_ops, current_spec))
@@ -373,8 +481,8 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
     ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    the op count is unchanged -- which is what keeps it inert until a solver
+    hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):

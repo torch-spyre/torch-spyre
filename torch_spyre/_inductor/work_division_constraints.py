@@ -544,6 +544,20 @@ _K_SPLIT_COMBINE_SUPPORTED = {
 _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
 
 
+# Set on an operation whose coarse tiling and core division were chosen by one
+# solver, together. It exempts the op from
+# :func:`coarse_tile_local_dim_split_domains`, whose pin guards against
+# *independent* per-op choosers -- see that function -- on the same ground as
+# the user ``work_div`` hint exemption there. Keyed on the op rather than a
+# config flag: the greedy passes run on the same graph and stay pinned, and an
+# op the hint pass tiled carries ``loop_info`` before the menu is enumerated, so
+# its candidates respect the pin. Written by whoever applies such a solve
+# (``CoOptimizingAllocator._apply_chosen_tilings``) and never cleared: nothing
+# after scratchpad planning re-derives a work division, so its lifetime is the
+# rest of the compile.
+JOINT_TILING_AND_DIVISION_ATTR = "_work_division_chosen_with_tiling"
+
+
 def _hinted_work_div_syms(ctx: WorkDivConstraintContext) -> set[Symbol]:
     """Symbols in ``ctx.it_space`` that carry an explicit user ``work_div`` hint.
 
@@ -683,6 +697,9 @@ def coarse_tile_local_dim_split_domains(
     loop_info = getattr(ctx.op, "loop_info", None)
     if loop_info is None:
         return ConstraintResult()
+
+    if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
+        return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
 
     if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
         return ConstraintResult()
