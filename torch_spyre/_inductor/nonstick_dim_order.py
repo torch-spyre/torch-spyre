@@ -29,6 +29,7 @@ from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from .constants import MATMUL_REDUCTION_OPS
 from .logging_utils import get_inductor_logger
 from .pass_utils import try_device_coordinates
+from .require_layout_pass import REQUIRE_LAYOUT_PIN_ATTR
 
 logger = get_inductor_logger("nonstick_dim_order")
 
@@ -165,6 +166,11 @@ def _forward_pass(targets: set[str]) -> None:
                 "nonstick_dim_order: skipping %s — not a ComputedBuffer (%s)",
                 name,
                 type(buf).__name__,
+            )
+            continue
+        if getattr(buf, REQUIRE_LAYOUT_PIN_ATTR, None) is not None:
+            logger.debug(
+                "nonstick_dim_order: preserving %s — explicit require_layout", name
             )
             continue
         # Use the buffer's write dep to compute device coordinates for each

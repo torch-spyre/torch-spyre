@@ -257,6 +257,9 @@ dimension ordering is not optimized. `reorder_nonstick_dims` is a pass that focu
 The current pass focuses only on improving `matmul` performance by swapping the largest non-stick device dimension into the slot
 between the two stick dimensions (`outer_stick+1`).  However this pass will be expanded in future work.
 
+Computed buffers constrained by `torch_spyre.require_layout` are excluded from
+this rewrite; the explicit physical layout takes precedence over its work-division heuristic.
+
 NOTE: this pass is currently executed after propagate_layouts and before `optimize_restickify`; however the code will soon align with the order written in this document.  `reorder_nonstick_dims` does not impact stick decisions or `optimize_restickify` in any way, so executing it between those passes is confusing and unnecessary.
 
 ---
