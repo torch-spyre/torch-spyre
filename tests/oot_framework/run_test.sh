@@ -1883,6 +1883,18 @@ _run_pytest_isolated() {
             fi
         else
             echo "[torch_oot_device_tests_run] Running serial test"
+            # torch-spyre is single-card-per-process. On multi-card hosts, pin
+            # serial runs to card 0 to prevent AOT backward tracing from
+            # touching device_index=1 (initializeStreamPoolImpl re-init failure.,
+            # --parallel already sets SPYRE_DEVICES perworker subshell; apply
+            # the same constraint to serial runs. 
+            if [[ -z "${SPYRE_DEVICES:-}" ]]; then
+                _N_CARDS_SERIAL=$(_detect_spyre_card_count)
+                if [[ "$_N_CARDS_SERIAL" -gt 1 ]]; then
+                    export SPYRE_DEVICES=0
+                    echo "[torch_oot_device_tests_run] Multi-card host (${_N_CARDS_SERIAL} cards): pinning serial run to SPYRE_DEVICES=0."
+                fi
+            fi
             # Regular pytest for non-distributed tests.
             #
             # Wall-clock cap. The harness stall-watcher only fires after N seconds
