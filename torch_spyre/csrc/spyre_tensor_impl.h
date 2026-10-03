@@ -21,8 +21,10 @@
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "spyre_storage_impl.h"
@@ -92,6 +94,11 @@ class SpyreTensorLayout {
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
+  /**
+   * Maps tile dimension vectors to tile sizes. Placeholder; not yet computed.
+   */
+  std::map<std::vector<int64_t>, int64_t> tile_size;
+
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
@@ -128,11 +135,13 @@ class SpyreTensorLayout {
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
       DataFormats device_dtype,
-      ElementArrangement element_arrangement = ElementArrangement::STANDARD)
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD,
+      std::map<std::vector<int64_t>, int64_t> tile_size = {})
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {
+        element_arrangement(element_arrangement),
+        tile_size(std::move(tile_size)) {
     validate_shape();
   }
 
@@ -195,7 +204,8 @@ class SpyreTensorLayout {
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement;
+           this->element_arrangement == other.element_arrangement &&
+           this->tile_size == other.tile_size;
   }
 };
 
@@ -265,6 +275,11 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
+    for (const auto& [dims, size] : layout.tile_size) {
+      for (int64_t d : dims)
+        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(size));
+    }
     return seed;
   }
 };
