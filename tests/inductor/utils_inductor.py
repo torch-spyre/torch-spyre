@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 import copy
 import functools
@@ -28,6 +29,11 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
 import unittest
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.work_division import OpSplitSpace
+    from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
 DEVICE = torch.device("spyre")
 
@@ -948,3 +954,38 @@ def assert_lx_only_relayout_payload(output_dirs):
     labeled_ds = lx_ops[0]["labeledDs_"]
     assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
     return lx_ops[0]["op"]["prodConsList"]
+
+
+def mock_op_split_space(
+    domains: dict,
+    output_axes: Iterable,
+    *,
+    op: Any = None,
+    legal: Callable[[dict], bool] | None = None,
+    tiling: "TilingSpace | None" = None,
+) -> "OpSplitSpace":
+    """An ``OpSplitSpace`` over stated domains, legal wherever ``legal`` says
+    (everywhere by default). The real legality rules are tested against the
+    enumeration in ``test_work_division.py``; a test of what *asks* a space
+    only needs some rule."""
+    from unittest.mock import MagicMock
+
+    from torch_spyre._inductor.work_division import OpSplitSpace
+
+    context = MagicMock()
+    context.axes = list(domains)
+    rule = legal or (lambda splits: True)
+    # The context takes the tiling's per-axis counts too; ``legal`` is a rule
+    # over the splits. How a tile count *narrows* a domain is the real
+    # context's business, so here the domain is tiling-independent.
+    context.is_legal.side_effect = lambda splits, tile_counts=None: rule(splits)
+    context.factor_domain.side_effect = lambda axis, tile_count=1: domains[axis]
+    return OpSplitSpace(
+        op=MagicMock() if op is None else op,
+        context=context,
+        output_axes=frozenset(output_axes),
+        factor_domains=domains,
+        tiling=tiling,
+        # Output host dim i is the i-th iteration axis, as it is for a real op.
+        axis_by_host_dim=dict(enumerate(domains)),
+    )
