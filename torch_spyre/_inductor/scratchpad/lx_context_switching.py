@@ -51,6 +51,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+from torch_spyre._inductor.pass_utils import origin_in_graph
 from torch_spyre.ops.fallbacks import fallback_ops
 
 logger = get_inductor_logger("lx_context_switching")
@@ -201,7 +202,19 @@ def _dump_buffers(
         assert isinstance(buf, ComputedBuffer), (
             f"unexpected at-risk buffer type {type(buf)} ({buf})"
         )
-        buf_fx = list(buf.origins)[0]  # only the clone's input arg -- not an
+        buf_fx = getattr(buf, "origin_node", None) or origin_in_graph(
+            buf.origins, editor.fx_graph
+        )
+        if buf_fx is None:
+            # Synthetic intermediate buffer (e.g. carry copy or scratchpad buffer)
+            # without an origin node in the current FX graph.
+            logger.debug(
+                "Skipping lx context dump for synthetic buffer %s with no FX origin in graph",
+                buf.get_name(),
+            )
+            continue
+
+        # only the clone's input arg -- not an
         # insertion point. target_fx_node (the FallbackKernel) is fixed for
         # the whole bracket, so every buffer's dump/restore pair anchors
         # there, however far buf_fx itself sits from the bracket.
@@ -268,6 +281,8 @@ def _restore_buffers(
     restored: list[ComputedBuffer] = []
 
     for buf in at_risk_bufs:
+        if buf.get_name() not in dumped:
+            continue
         dump_fx, dump_buf = dumped[buf.get_name()]
 
         editor.fx_graph.inserting_after(target_fx_node)
@@ -383,7 +398,11 @@ class LxContextSwitchingPass(ScratchpadOptimizationPass):
 
         editor = GraphEditor(graph)
         for target_op, at_risk_bufs in targets:
-            target_fx_node = list(target_op.origins)[0]
+            target_fx_node = getattr(target_op, "origin_node", None) or origin_in_graph(
+                target_op.origins, editor.fx_graph
+            )
+            if target_fx_node is None:
+                continue
             dumped = _dump_buffers(
                 graph, editor, target_op, target_fx_node, at_risk_bufs
             )

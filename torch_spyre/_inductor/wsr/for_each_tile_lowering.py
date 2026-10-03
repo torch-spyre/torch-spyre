@@ -3215,6 +3215,7 @@ def splice_while_loops(graph) -> None:
             carries = carry_bindings_for(
                 while_op,
                 _stacking_carry_indices(while_op, loop_var, result.trip_count),
+                passthrough_indices=frozenset({0}),
             )
             names_before_splice = {op.get_name() for op in graph.operations}
             group_ops = splice_while_loop(

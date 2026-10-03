@@ -121,6 +121,14 @@ class CarryBinding:
           layout to BE the folded shape, so the per-iteration write is an
           ordinary tile-advancing write into it. See
           ``fold_stacked_carry_layout``.
+    passthrough:
+        Whether this carry is a pass-through carry: the body returns the
+        placeholder unchanged (semantically a read-only leaf). The IR may
+        insert a stride-repair copy, so the FX graph is consulted to
+        determine the true semantic identity. Pass-through carries need no
+        fill/rewrite/drain machinery -- their read is simply aliased to the
+        real input. The trip counter (carried_inputs[0] in for_each_tile) is
+        the canonical example.
     """
 
     carry_index: int
@@ -128,11 +136,13 @@ class CarryBinding:
     body_output: Any
     scratch_name: str
     stacking: bool = False
+    passthrough: bool = False
 
 
 def carry_bindings_for(
     while_op: "ir.WhileLoop",
     stacking_indices: "frozenset[int] | None" = None,
+    passthrough_indices: "frozenset[int] | None" = None,
 ) -> list[CarryBinding]:
     """Build one CarryBinding per position in while_op.carried_inputs.
 
@@ -140,8 +150,14 @@ def carry_bindings_for(
     as stacking rather than accumulator carries (see ``CarryBinding``'s
     ``stacking`` docstring); omitting it treats every carry as an
     accumulator, the pre-existing behaviour.
+
+    ``passthrough_indices`` names the carry positions that are pass-through
+    carries (semantically read-only, body returns placeholder unchanged).
+    The trip counter (carried_inputs[0] in for_each_tile) is the canonical
+    example. These skip fill/rewrite/drain machinery entirely.
     """
     stacking_indices = stacking_indices or frozenset()
+    passthrough_indices = passthrough_indices or frozenset()
     carried_inputs = while_op.carried_inputs
     body_outputs = while_op.body_subgraph.graph.graph_outputs
     return [
@@ -151,6 +167,7 @@ def carry_bindings_for(
             body_output=body_outputs[i],
             scratch_name=f"while_carry_{id(while_op)}_{i}",
             stacking=i in stacking_indices,
+            passthrough=i in passthrough_indices,
         )
         for i, initial in enumerate(carried_inputs)
     ]
@@ -1216,6 +1233,17 @@ def splice_while_loop(
                     binding.carry_index,
                     real_name,
                 )
+            name_map[placeholder_name] = real_name
+            ref_map[placeholder_name] = real_input
+            continue
+
+        if binding.passthrough:
+            # Pass-through carry: body returns placeholder unchanged (semantically
+            # read-only). The IR may have a stride-repair copy making
+            # body_output_name != placeholder_name, but the FX graph confirms
+            # semantic identity. No fill/rewrite/drain needed -- just alias the
+            # read to the real input. The trip counter (carry_index=0) is the
+            # canonical example.
             name_map[placeholder_name] = real_name
             ref_map[placeholder_name] = real_input
             continue

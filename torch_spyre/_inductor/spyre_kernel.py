@@ -255,6 +255,10 @@ class SpyreOpFuncs:
         return PointwiseOp("mul", [x, y])
 
     @staticmethod
+    def logical_or(x, y):
+        return PointwiseOp("maximum", [x, y])
+
+    @staticmethod
     def lt(a, b):
         return PointwiseOp("lesserthan", [a, b])
 

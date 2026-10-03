@@ -1939,6 +1939,11 @@ def lower_where(condition, self, other):
     return result
 
 
+# Use type_promotion_kind=None because DEFAULT cannot assign the appropriate EA.
+# For example, with FP16→FP32 type promotion, DEFAULT performs the promotion
+# before layout propagation, resulting in an IR node with STANDARD EA.
+# In contrast, with None, the FP16 operand survives into the fused body,
+# allowing propagate_layouts to assign the correct DL16_TO_FP32 EA.
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
@@ -1953,18 +1958,27 @@ def lower_add(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    # SDSC selects addi32toi32 for native integer operands; default type
+    # promotion converts non-native operands to float before entry.
+    return lowering.add(x, y)
 
 
+# Use type_promotion_kind=None because DEFAULT cannot assign the appropriate EA.
+# For example, with FP16→FP32 type promotion, DEFAULT performs the promotion
+# before layout propagation, resulting in an IR node with STANDARD EA.
+# In contrast, with None, the FP16 operand survives into the fused body,
+# allowing propagate_layouts to assign the correct DL16_TO_FP32 EA.
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    # SDSC selects muli32toi32 for native integer operands; default type
+    # promotion converts non-native operands to float before entry.
+    return lowering.mul(x, y)
 
 
 @register_spyre_lowering(
@@ -2371,6 +2385,17 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.logical_or.default,
+    type_promotion_kind=None,
+    convert_input_to_bool=True,
+    override_return_dtype=torch.bool,
+    broadcast=True,
+)
+def lower_logical_or(x, y):
+    return lowering.logical_or(x, y)
 
 
 @register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)
