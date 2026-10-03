@@ -1050,6 +1050,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # A unary op on a view with reordered non-stick dims miscompiled in
+        # deeptools (issue #4869).
+        ("test_pointwise_unary_permuted_view", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "abs": lambda x: torch.abs(x.permute(1, 0, 2, 3)),
+                "neg": lambda x: torch.neg(x.permute(1, 0, 2, 3)),
+                "abs_add": lambda x: torch.abs(x.permute(1, 0, 2, 3)) + 1,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((4, 4, 64, 64),),
+                    ((8, 8, 64, 512),),
+                ]
+            ),
+        },
         ("test_add_alpha", "test_binary_op_cpu"): {
             "ops_dict": {
                 "add_alpha_2": lambda a, b: torch.add(a, b, alpha=2.0),
