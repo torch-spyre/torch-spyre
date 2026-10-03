@@ -15,6 +15,7 @@
 # Owner(s): ["module: spyre"]
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -36,6 +37,20 @@ from torch_spyre.model_utils import (
     patch_module_to_for_spyre,
 )
 
+try:
+    import transformers  # noqa: F401
+
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+
+try:
+    import safetensors  # noqa: F401
+
+    HAS_SAFETENSORS = True
+except ImportError:
+    HAS_SAFETENSORS = False
+
 # fp16 lands on device as DLFLOAT16 (SEN169_FP16, 9 mantissa bits), so a
 # round-trip is never bit-exact: 2**-10 half-ULP, and fp16 subnormals come
 # back halved (abs error <= 3.1e-5).
@@ -56,6 +71,12 @@ def _spyre_available() -> bool:
 
 #: Decorator: skip the test when no Spyre hardware is present.
 requires_spyre = unittest.skipUnless(_spyre_available(), "requires Spyre hardware")
+requires_transformers = unittest.skipUnless(
+    HAS_TRANSFORMERS, "transformers not installed"
+)
+requires_safetensors = unittest.skipUnless(
+    HAS_SAFETENSORS, "safetensors not installed"
+)
 
 
 @instantiate_parametrized_tests
@@ -85,6 +106,7 @@ class TestLoadModelToSpyre(TestCase):
         with self.assertRaises(AssertionError):
             _dma_to_spyre_dim_order_swapped(torch.randn(4, dtype=torch.float16))
 
+    @requires_spyre
     def test_dma_helpers_accept_an_explicit_device(self):
         """All DMA helpers target another device and restore current."""
         from torch_spyre._C import get_spyre_tensor_layout
@@ -133,6 +155,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(list(get_spyre_tensor_layout(scale).device_size), [3, 1, 64])
         self.assertEqual(torch.spyre.current_device(), previous)
 
+    @requires_spyre
     def test_low_level_layout_allocation_uses_explicit_device(self):
         """The layout allocator targets its device without changing the caller's."""
         from torch_spyre._C import SpyreTensorLayout, spyre_empty_with_layout
@@ -152,6 +175,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(tensor.device, device)
         self.assertEqual(torch.spyre.current_device(), previous)
 
+    @requires_spyre
     def test_dma_helpers_accept_an_integer_device(self):
         """Integer destinations are normalized before entering the C++ binding."""
         device_index = torch.spyre.current_device()
@@ -398,6 +422,195 @@ class TestLoadModelToSpyre(TestCase):
             self.assertEqual(layout.device_size[0], 2)  # 128/64
         finally:
             nn.Module.to = original
+
+
+# ── HF from_pretrained open-target monkey-patch ────────────────────
+# Companion to safetensors patch (#3962): stock HF still opens
+# checkpoints with device="cpu". These tests cover the resolver and the
+# wrapper that force safe_open(device="spyre") when device_map is a
+# uniform Spyre map. No hardware required except the last test.
+
+
+class TestHfSafeOpenMonkeypatch(TestCase):
+    """CPU tests for _resolve_checkpoint_open_target + the HF wrapper."""
+
+    def setUp(self):
+        # The wrapper tests rebind ``_original`` to a stub. Remember the real
+        # transformers loader so tearDown can put it back; otherwise the stub
+        # leaks into every later test in the process.
+        self._hf_original = None
+        if not HAS_TRANSFORMERS:
+            return
+        import transformers.modeling_utils as mu
+
+        existing = mu.PreTrainedModel._load_pretrained_model
+        self._hf_original = (
+            existing._original
+            if getattr(existing, "_spyre_hf_open_patched", False)
+            else existing
+        )
+
+    def tearDown(self):
+        if self._hf_original is None:
+            return
+        import transformers.modeling_utils as mu
+
+        from torch_spyre._monkey_patch import (
+            _patch_transformers_safe_open_for_spyre,
+        )
+
+        mu.PreTrainedModel._load_pretrained_model = staticmethod(self._hf_original)
+        _patch_transformers_safe_open_for_spyre()
+
+    def _run_wrapper_with_device_map(self, device_map):
+        """Install the wrapper over a stock-HF stub that always opens on CPU.
+
+        Returns the ``(device, backend)`` the stub's ``safe_open`` call was
+        actually rewritten to.
+        """
+        import safetensors as st
+        import transformers.modeling_utils as mu
+
+        from torch_spyre._monkey_patch import (
+            _patch_transformers_safe_open_for_spyre,
+        )
+
+        opened = {}
+
+        def fake_safe_open(
+            filename, framework="pt", device=None, backend="mmap", **kw
+        ):
+            opened["device"] = device
+            opened["backend"] = backend
+            return mock.MagicMock()
+
+        existing = mu.PreTrainedModel._load_pretrained_model
+        if getattr(existing, "_spyre_hf_open_patched", False):
+            mu.PreTrainedModel._load_pretrained_model = staticmethod(
+                existing._original
+            )
+
+        with mock.patch.object(st, "safe_open", fake_safe_open):
+            _patch_transformers_safe_open_for_spyre()
+            wrapped = mu.PreTrainedModel._load_pretrained_model
+            self.assertTrue(getattr(wrapped, "_spyre_hf_open_patched", False))
+
+            def stock_hf_opens_on_cpu(*args, **kwargs):
+                mu.safe_open(
+                    "ckpt.safetensors",
+                    framework="pt",
+                    device="cpu",
+                    backend="mmap",
+                )
+                return None
+
+            wrapped._original = stock_hf_opens_on_cpu
+            wrapped(None, None, [], SimpleNamespace(device_map=device_map))
+
+        return opened["device"], opened["backend"]
+
+    def _resolve(self, device_map):
+        from torch_spyre._monkey_patch import (
+            _ensure_safetensors_custom_device_stubs,
+            _resolve_checkpoint_open_target,
+        )
+
+        _ensure_safetensors_custom_device_stubs()
+        return _resolve_checkpoint_open_target(device_map)
+
+    def test_resolve_none_is_cpu(self):
+        self.assertEqual(self._resolve(None), ("mmap", "cpu"))
+
+    def test_resolve_cpu_map_is_cpu(self):
+        self.assertEqual(self._resolve({"": "cpu"}), ("mmap", "cpu"))
+
+    def test_resolve_mps(self):
+        self.assertEqual(
+            self._resolve({"": torch.device("mps")}), ("pread", "mps")
+        )
+
+    def test_resolve_mixed_map_falls_back(self):
+        from torch_spyre.constants import DEVICE_NAME
+
+        self.assertEqual(
+            self._resolve({"": DEVICE_NAME, "lm_head": "cpu"}),
+            ("mmap", "cpu"),
+        )
+
+    def test_resolve_spyre_when_stub_installed(self):
+        from torch_spyre.constants import DEVICE_NAME
+
+        self.assertEqual(
+            self._resolve({"": DEVICE_NAME}), ("mmap", DEVICE_NAME)
+        )
+
+    def test_resolve_unknown_device_without_hook_is_cpu(self):
+        self.assertEqual(self._resolve({"": "npu"}), ("mmap", "cpu"))
+
+    @requires_transformers
+    @requires_safetensors
+    def test_wrapper_forces_safe_open_device_to_spyre(self):
+        """Stock HF opens on CPU; the wrapper must rewrite that to Spyre."""
+        from torch_spyre.constants import DEVICE_NAME
+
+        device, backend = self._run_wrapper_with_device_map({"": DEVICE_NAME})
+        self.assertEqual(device, DEVICE_NAME)
+        self.assertEqual(backend, "mmap")
+
+    @requires_transformers
+    @requires_safetensors
+    def test_wrapper_cpu_device_map_stays_on_cpu(self):
+        """device_map='cpu' (hf-adapters today) must not be rewritten to Spyre."""
+        device, backend = self._run_wrapper_with_device_map({"": "cpu"})
+        self.assertEqual(device, "cpu")
+        self.assertEqual(backend, "mmap")
+
+    @requires_transformers
+    @requires_safetensors
+    def test_wrapper_restores_real_loader_between_tests(self):
+        """tearDown must put the genuine transformers loader back."""
+        import transformers.modeling_utils as mu
+
+        self._run_wrapper_with_device_map({"": "cpu"})
+        installed = mu.PreTrainedModel._load_pretrained_model
+        self.assertIsNot(installed._original, self._hf_original)
+        self.tearDown()
+        restored = mu.PreTrainedModel._load_pretrained_model
+        self.assertIs(restored._original, self._hf_original)
+
+    @requires_spyre
+    @requires_safetensors
+    def test_forced_spyre_open_lands_linear_layout(self):
+        """Resolver +  safe_open: a Linear .weight gets dim_order=[1,0]."""
+        import os
+        import tempfile
+
+        import safetensors.torch as st_torch
+        from torch_spyre._C import get_spyre_tensor_layout
+        from torch_spyre.constants import DEVICE_NAME
+        from torch_spyre._monkey_patch import (
+            _ensure_safetensors_custom_device_stubs,
+            _resolve_checkpoint_open_target,
+        )
+
+        _ensure_safetensors_custom_device_stubs()
+        backend, device = _resolve_checkpoint_open_target({"": DEVICE_NAME})
+        self.assertEqual((backend, device), ("mmap", DEVICE_NAME))
+
+        weight = torch.randn(128, 64, dtype=torch.float16)
+        tmp = tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False)
+        tmp.close()
+        try:
+            st_torch.save_file(
+                {"model.layers.0.self_attn.q_proj.weight": weight}, tmp.name
+            )
+            loaded = st_torch.load_file(tmp.name, device=device)
+            tensor = loaded["model.layers.0.self_attn.q_proj.weight"]
+            self.assertEqual(tensor.device.type, DEVICE_NAME)
+            layout = get_spyre_tensor_layout(tensor)
+            self.assertEqual(layout.device_size[0], 2)  # 128/64
+        finally:
+            os.unlink(tmp.name)
 
 
 if __name__ == "__main__":
