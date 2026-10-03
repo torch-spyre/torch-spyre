@@ -423,6 +423,24 @@ class TestSpyreTensorLayout(TestCase):
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
+    def test_to_spyre_layout_explicit_reordered_stick_split(self):
+        """Regression: a real dimension between split tile-count and stick
+        parts must not corrupt that dimension's DMA mapping. Reordered KV-cache
+        where token sits between head_dim's split parts. get_dim_map used to
+        unconditionally assume device_rank-3 was the stick's tile-count part.
+        """
+        sizes = [16, 128, 8, 128]
+        strides = [131072, 1024, 128, 1]
+        device_size = [8, 16, 128, 2, 64]
+        stride_map = [128, 131072, 1024, 64, 1]
+
+        x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        x_stl = SpyreTensorLayout(
+            device_size, stride_map, get_device_dtype(torch.float16)
+        )
+        x_dev = x.to(device_layout=x_stl)
+        self.assertEqual(x, x_dev.cpu())
+
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
