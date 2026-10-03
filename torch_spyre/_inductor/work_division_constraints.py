@@ -905,13 +905,13 @@ def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
 
 
 def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict TopK search-space and result dims to supported factors.
+    """Restrict TopK K-splits to factors within the per-core result limit.
 
-    TopK hardware requires at most ``TOPK_MAX_K_PER_CORE`` result rows per
-    core. Although larger divisors also meet that limit, the 4D ``k=32``
-    result-axis regression showed they produce incorrect output mapping. Keep
-    only the smallest sufficient K split until larger factors have codegen
-    support and regression coverage.
+    The reduction/search axes stay unsplit. Expose every divisor of the output
+    K axis that fits within ``SENCORES`` and leaves at most
+    ``TOPK_MAX_K_PER_CORE`` results per core. Larger factors have triggered an
+    incorrect result mapping for 4D ``k=32``; ``test_topk_4d_k32_dim2`` remains
+    a known failing case with those factors admitted.
     """
     if (
         not isinstance(ctx.op.data, Reduction)
@@ -935,7 +935,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
             f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
         )
-    allowed_splits[k_var] = frozenset({min(legal_k_splits)})
+    allowed_splits[k_var] = legal_k_splits
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
