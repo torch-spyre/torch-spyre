@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from sympy import Expr
 import torch
+from torch._inductor import dependencies
 from torch._inductor.utils import ir_dataclass
 from torch._inductor.ir import (
     FixedLayout,
@@ -539,6 +540,9 @@ class BroadcastAsyncFallback(ir.ExternKernel):
     def should_allocate(self) -> bool:
         return True
 
+    def has_side_effects(self) -> bool:
+        return True
+
     def get_mutation_names(self) -> Sequence[str]:
         return []
 
@@ -616,6 +620,9 @@ class AllGatherAsyncFallback(ir.ExternKernel):
     def should_allocate(self) -> bool:
         return False
 
+    def has_side_effects(self) -> bool:
+        return True
+
     def get_mutation_names(self) -> Sequence[str]:
         return []
 
@@ -687,6 +694,9 @@ class AllReduceAsyncFallback(ir.ExternKernel):
     def should_allocate(self):
         return False
 
+    def has_side_effects(self) -> bool:
+        return True
+
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
@@ -739,6 +749,19 @@ class WaitWorkFallback(ir.ExternKernel):
 
     def should_allocate(self) -> bool:
         return False
+
+    def has_side_effects(self) -> bool:
+        return True
+
+    def get_volatile_reads(self) -> OrderedSet[str]:
+        return OrderedSet([self.inputs[0].get_name()])
+
+    def get_read_writes(self) -> dependencies.ReadWrites:
+        reads = OrderedSet([dependencies.StarDep(name=self.inputs[0].get_name())])
+        writes = OrderedSet([dependencies.StarDep(name=self.get_name())])
+        return dependencies.ReadWrites(
+            reads=reads, writes=writes, index_exprs=OrderedSet()
+        )
 
     def get_mutation_names(self) -> Sequence[str]:
         return [self.inputs[0].get_name()]
