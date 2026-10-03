@@ -53,6 +53,28 @@ vision tower, for text-only inference on the same checkpoint. The canonical
 per-adapter list of verified checkpoints is in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints).
 
+## Weight loading and on-device layout
+
+Importing `torch_spyre` installs a wrapper around `safetensors.safe_open`
+(and the `get_tensor`/`get_tensors` accessors it returns). When a checkpoint
+is opened with `device="spyre"`, the wrapper assigns each weight a
+Spyre-aware on-device layout as it is read, rather than materializing a
+default-layout tensor on the host and restickifying it later. The layout is
+selected from the tensor's role, which the wrapper infers from its
+checkpoint key and shape:
+
+- Two-dimensional embedding weights receive a gather-optimal layout for
+  indirect access.
+- Two-dimensional Linear weights receive a matmul-optimal layout with
+  `dim_order=[1, 0]`.
+- Every other tensor receives the default Spyre layout.
+
+Weights load in `torch.float16` by default, which the host-to-device
+transfer requires. Pass an explicit `target_dtype` to override it. Because
+this path is on by default, a stock `transformers` or hf-adapters loader that
+opens a safetensors checkpoint with `device="spyre"` gets these layouts with
+no further configuration.
+
 ## Install
 
 hf-adapters uses [uv](https://docs.astral.sh/uv/) for dependency management.
