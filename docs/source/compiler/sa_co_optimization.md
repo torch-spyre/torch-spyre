@@ -29,8 +29,10 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 ## The search
 
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
-`PermutationBasedLayoutSolver` packer, and the division vector `W`, one menu index per buffer. The
-seed is every buffer at menu index 0 with `pi` from a FirstFit pass. One geometric cool runs
+`PermutationBasedLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
+buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
+identifying the choice it makes, and the `menu_index` it was enumerated at. The seed is every
+buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
 `clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
 
@@ -46,7 +48,7 @@ Three move types:
 * **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
   ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
 * **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
-  non-trivial (split) anchor tiling and recolor everything it reaches.
+  non-trivial (split) anchor config and recolor everything it reaches.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
@@ -69,7 +71,7 @@ expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles 
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
 symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
 from whether its owning buffer's name is in `resident`, a split symbol's value from
-`core_divisions[chosen[idx]]`. The compiled formula is evaluated fresh every step; unlike the
+`chosen[idx].splits`. The compiled formula is evaluated fresh every step; unlike the
 `BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
 tracking, and so nothing to invalidate on a rejected move.
 

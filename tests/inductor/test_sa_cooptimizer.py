@@ -45,7 +45,9 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
     _MIN_STEPS,
     _STEPS_PER_BUFFER,
+    DivisionConfig,
     SaCoOptimizingSolver,
+    _canonical_key,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
@@ -56,6 +58,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
 
@@ -123,7 +127,7 @@ def _all_cases_incl_synthetic():
 
 
 def _primed(buffers, capacity):
-    """A solver primed to the seed state (index-0 divisions, FirstFit ``pi``): the
+    """A solver primed to the seed state (seed configs, FirstFit ``pi``): the
     prefix of ``plan_layout_and_core_divisions`` up to the anneal, so a unit test
     can drive the move / snapshot machinery -- or read the seed score -- directly.
     """
@@ -131,7 +135,7 @@ def _primed(buffers, capacity):
     solver.spill_reasons = {}
     solver._rng = rnd.Random(0)
     solver._precompute_topology()
-    solver.chosen = [0] * len(buffers)
+    solver.chosen = solver._seed_configs()
     solver.packer = solver._build_seed_packer()
     solver._flippable_ops = solver._flippable()
     solver._best_score = solver._score()
@@ -528,12 +532,14 @@ def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
     )
 
 
-def _flood(buffers, anchor_name, tiling):
-    """Run ``_flood_region`` on a hand-built graph; return name -> chosen index."""
+def _flood(buffers, anchor_name, index):
+    """Run ``_flood_region`` on a hand-built graph from the anchor's menu entry
+    ``index``; return name -> the flooded config's menu index."""
     solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
     solver._precompute_topology()
-    result = solver._flood_region(solver._name_to_idx[anchor_name], tiling)
-    return {buffers[i].name: d for i, d in result.items()}
+    anchor = solver._name_to_idx[anchor_name]
+    result = solver._flood_region(anchor, solver._configs[anchor][index])
+    return {buffers[i].name: config.menu_index for i, config in result.items()}
 
 
 class FloodRegionTest(TestCase):
@@ -594,7 +600,7 @@ class RegionRecolorTest(TestCase):
     and applying one is a coordinated division change the packer keeps up with."""
 
     def test_corpus_holds_multi_op_regions(self):
-        # Floods every legal anchor/tiling on every graph rather than hoping the
+        # Floods every legal anchor/config on every graph rather than hoping the
         # search proposes one, so this is deterministic and independent of the
         # move weights. A corpus of singleton regions would make recolor pointless
         # and the bidirectional flood untested.
@@ -604,14 +610,15 @@ class RegionRecolorTest(TestCase):
             solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
             for anchor in solver._anchor_candidates:
                 anchored += 1
-                for tiling in solver._nontrivial_menu[anchor]:
-                    largest = max(largest, len(solver._flood_region(anchor, tiling)))
+                for config in solver._nontrivial_menu[anchor]:
+                    largest = max(largest, len(solver._flood_region(anchor, config)))
         self.assertGreater(anchored, 0, "no graph offered a splittable anchor")
         self.assertGreater(largest, 1, "every region was a singleton")
 
     def test_recolor_recolors_the_whole_region_coherently(self):
-        # After a recolor, every op the flood reached carries the flooded index and
-        # the placement the packer holds for it reflects that division's footprint
+        # After a recolor, every op the flood reached carries the flooded config
+        # and the placement the packer holds for it reflects that division's
+        # footprint
         # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
@@ -619,19 +626,19 @@ class RegionRecolorTest(TestCase):
             cap = max(1, _seed_footprint(buffers) // 2)
             solver = _primed(copy.deepcopy(buffers), cap)
             for anchor in solver._anchor_candidates:
-                tiling = solver._nontrivial_menu[anchor][0]
-                assignment = solver._flood_region(anchor, tiling)
+                config = solver._nontrivial_menu[anchor][0]
+                assignment = solver._flood_region(anchor, config)
                 solver._apply_recolor(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
-                for op, div in assignment.items():
-                    self.assertEqual(solver.chosen[op], div, tag)
+                for op, flooded in assignment.items():
+                    self.assertEqual(solver.chosen[op], flooded, tag)
                     if addresses[op] is None:
                         continue  # spilled: the packer holds no extent to check
                     resized += 1
                     self.assertEqual(
                         solver.packer.top_or_inf(op) - addresses[op],
-                        solver._per_core_size(op, div),
+                        solver._per_core_size(op, flooded),
                         f"{tag}: packer footprint stale for op {op}",
                     )
         self.assertGreater(resized, 0, "no recolored op stayed resident")
@@ -664,7 +671,10 @@ def _live_state(solver):
     return (
         list(solver.packer.addresses),
         solver.packer.quality(),
-        list(solver.chosen),
+        # Key *and* menu position: configs compare by key alone, so a restore
+        # that put back a duplicate-key config at another menu position would
+        # otherwise pass -- and duplicated menu entries are real.
+        [(c.key, c.menu_index) for c in solver.chosen],
         solver._n_eligible,
     )
 
@@ -678,7 +688,7 @@ class SnapshotRestoreTest(TestCase):
     def _mutate(self, solver):
         """A division change (resize + eligibility ripple) plus a reinsertion --
         between them they move addresses, quality and ``chosen``."""
-        solver._atomic_flip(2, 2)
+        solver._atomic_flip(2, solver._configs[2][2])
         solver.packer.rotate(0, 5)
 
     def test_adopt_round_trips_state(self):
@@ -805,8 +815,10 @@ class AllEligibleResidentTest(TestCase):
             for _ in range(50):
                 if solver._rng.random() < 0.5:
                     idx = solver._rng.choice(solver._flippable_ops)
-                    menu = len(solver._bufs[idx].core_divisions)
-                    solver._atomic_flip(idx, solver._rng.randrange(menu))
+                    configs = solver._configs[idx]
+                    solver._atomic_flip(
+                        idx, configs[solver._rng.randrange(len(configs))]
+                    )
                 else:
                     solver._recolor()
                 self.assertEqual(
@@ -824,7 +836,7 @@ class AllEligibleResidentTest(TestCase):
         self.assertFalse(solver._eligible(idx))
         before = solver._n_eligible
         snap = solver._snapshot()
-        solver._atomic_flip(idx, 1)
+        solver._atomic_flip(idx, solver._configs[idx][1])
         self.assertTrue(solver._eligible(idx))
         self.assertFalse(solver._eligible(solver._name_to_idx["B6"]))
         self.assertEqual(solver._n_eligible, before + 1)
@@ -1170,11 +1182,12 @@ class CostExprScoringTest(TestCase):
         solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
         cost_expr = buffers[0].sym_cores * 10
         solver.plan_layout_and_core_divisions(cost_expr)
+        configs = solver._configs[0]
         self.assertEqual(
-            solver._score_fn([0], frozenset()), utils.to_fixed_us(10 / 1000)
+            solver._score_fn([configs[0]], frozenset()), utils.to_fixed_us(10 / 1000)
         )
         self.assertEqual(
-            solver._score_fn([2], frozenset()), utils.to_fixed_us(40 / 1000)
+            solver._score_fn([configs[2]], frozenset()), utils.to_fixed_us(40 / 1000)
         )
 
     def test_residency_and_multiple_core_division_symbols_combine(self):
@@ -1204,12 +1217,13 @@ class CostExprScoringTest(TestCase):
             syms[0] * 10 + syms[1] * 100 + syms[2] * 1000 + 5000 * (1 - buf.sym_is_lx)
         )
         solver.plan_layout_and_core_divisions(cost_expr)
+        split_4x2 = [solver._configs[0][2]]
         self.assertEqual(
-            solver._score_fn([2], frozenset()),
+            solver._score_fn(split_4x2, frozenset()),
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000 + 5000) / 1000),
         )
         self.assertEqual(
-            solver._score_fn([2], frozenset({"A"})),
+            solver._score_fn(split_4x2, frozenset({"A"})),
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
@@ -1222,3 +1236,105 @@ class CostExprScoringTest(TestCase):
         cost_expr = sympy.Symbol("mystery_shape_var")
         solver.plan_layout_and_core_divisions(cost_expr)
         self.assertIsNone(solver._score_fn)
+
+
+def _config(division, menu_index=0):
+    """A config for ``division``, built the way the engine builds one."""
+    return DivisionConfig(division, menu_index)
+
+
+class CanonicalKeyTest(TestCase):
+    """The key is a config's identity: hashable, order-free, and total over the
+    three things that make a division a different choice (output splits,
+    reduction splits, tiling). Everything downstream that dedups or memoizes a
+    *generated* config leans on that."""
+
+    def test_key_ignores_dict_order(self):
+        a = CoreDivision(splits={0: 2, 1: 4})
+        b = CoreDivision(splits={1: 4, 0: 2})
+        self.assertEqual(_canonical_key(a), _canonical_key(b))
+        self.assertEqual(_config(a), _config(b, menu_index=3))
+
+    def test_the_key_is_derived_not_supplied(self):
+        # The constructor takes no key, so a config's key cannot disagree with
+        # the division it identifies -- what dedup and memoization rest on.
+        division = CoreDivision(splits={0: 4, 1: 2}, reduction_syms=frozenset([1]))
+        self.assertEqual(DivisionConfig(division, 0).key, _canonical_key(division))
+
+    def test_each_way_a_division_can_differ_changes_the_key(self):
+        base = CoreDivision(splits={0: 2})
+        others = {
+            "output factor": CoreDivision(splits={0: 4}),
+            "output axis": CoreDivision(splits={1: 2}),
+            "extra output axis": CoreDivision(splits={0: 2, 1: 2}),
+            "reduction split": CoreDivision(
+                splits={0: 2, 1: 2}, reduction_syms=frozenset([1])
+            ),
+            "tiling": CoreDivision(
+                splits={0: 2}, tiling=TileSpec((TileAxis(host_dim=0, count=4),))
+            ),
+        }
+        for what, other in others.items():
+            self.assertNotEqual(_canonical_key(base), _canonical_key(other), what)
+            self.assertNotEqual(_config(base), _config(other), what)
+
+    def test_equality_is_the_key_not_the_menu_position(self):
+        # A generated config with no menu behind it must still compare equal to
+        # the menu entry making the same choice -- that is what lets a generator
+        # replace an enumerator without every consumer noticing.
+        division = CoreDivision(splits={0: 2})
+        self.assertEqual(_config(division, menu_index=0), _config(division, 7))
+        self.assertEqual(hash(_config(division, 0)), hash(_config(division, 7)))
+        self.assertNotEqual(_config(division), object())
+
+
+class ConfigStateTest(TestCase):
+    """``chosen[i]`` holds a config whose ``menu_index`` has to keep agreeing
+    with the menu the allocator will re-index."""
+
+    def test_state_holds_configs_that_carry_their_menu_entry(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
+            for i, (config, buf) in enumerate(zip(solver.chosen, solver._bufs)):
+                self.assertIs(
+                    config.division,
+                    buf.core_divisions[config.menu_index],
+                    f"{case}[{gi}] buffer {i}",
+                )
+
+    def test_seed_is_the_first_candidate(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
+            self.assertEqual(
+                [config.menu_index for config in solver.chosen],
+                [0] * len(buffers),
+                f"{case}[{gi}]",
+            )
+
+    def test_write_back_reports_the_position_of_the_config_it_ended_on(self):
+        # The allocator re-indexes ``core_divisions`` with ``chosen_division``
+        # (``allocator.py``), so the written index has to name the division the
+        # engine actually settled on -- not merely be in range.
+        for case, gi, buffers in _all_cases():
+            solver = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), max(1, _seed_footprint(buffers) // 2), 128
+            )
+            solved = solver.plan_layout_and_core_divisions()
+            for buf, config in zip(solved, solver.chosen):
+                self.assertIs(
+                    buf.core_divisions[buf.chosen_division],
+                    config.division,
+                    f"{case}[{gi}] {buf.name}",
+                )
+
+    def test_a_menu_may_carry_the_same_choice_twice(self):
+        # Real menus do (see DivisionConfig); nothing here collapses them.
+        buf = _cdbuf("A", [], {})
+        buf.core_divisions = [_div(1), _div(2), _div(2)]
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        solver._precompute_topology()
+        configs = solver._configs[0]
+        self.assertEqual(len(configs), 3)
+        self.assertEqual(configs[1], configs[2])
+        self.assertNotEqual(configs[1].menu_index, configs[2].menu_index)
+        self.assertEqual(len(solver._nontrivial_menu[0]), 2)
