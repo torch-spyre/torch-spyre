@@ -2282,18 +2282,49 @@ def compute_restickify_target_layout(
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
-        return None
     old_stick_expr = idc[-1]
     old_stride_map = list(stl.stride_map)
-    old_var = next(iter(old_stick_expr.free_symbols))
-    new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
-    old_sd_outer_dim = next(
-        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
-    )
+    old_sd = matching_dim(ic, old_stick_expr)
+    # The access may read the stick's host dim at a stick-aligned offset: rows
+    # [64, 66) of a tensor whose stick spans rows give the host coordinate
+    # d0 + 64 for stick d0, and a single row k gives the constant k for stick
+    # 0. Either way the coordinates no longer match the stick expression, yet
+    # the restickify is the same as for an access from 0, so locate the stick's
+    # host dim, and the device dim holding its outer part, by stride, which the
+    # offset does not change (issue #4883).
+    located_by_stride = False
+    if old_sd is None and len(old_stick_expr.free_symbols) <= 1:
+        stick_host_dims = []
+        for d, (coord, stride) in enumerate(zip(ic, host_stride)):
+            offset = sympy.sympify(coord) - old_stick_expr
+            if (
+                stride == old_stride_map[-1]
+                and not offset.free_symbols
+                and offset % stick_size == 0
+            ):
+                stick_host_dims.append(d)
+        if len(stick_host_dims) == 1:
+            old_sd = stick_host_dims[0]
+            located_by_stride = True
+    if old_sd is None:
+        return None
+    new_var = next(iter(target_stick_expr.free_symbols))
+    # None when the stick coordinate is a constant (a single-index access);
+    # defined on both paths so later checks can read it either way.
+    old_var = next(iter(old_stick_expr.free_symbols), None)
+    if located_by_stride:
+        outer_dims = [
+            j
+            for j in range(len(idc) - 1)
+            if old_stride_map[j] == old_stride_map[-1] * stick_size
+        ]
+        old_sd_outer_dim = outer_dims[0] if len(outer_dims) == 1 else None
+    else:
+        old_sd_outer_dim = next(
+            (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
+            next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        )
     if old_sd_outer_dim is None:
         return None
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
