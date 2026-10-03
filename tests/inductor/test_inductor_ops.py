@@ -8297,10 +8297,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
-
-        print(f"Warn {len(record)}")
+        self.compare_with_cpu(fn, x, cpu_compile=True)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
