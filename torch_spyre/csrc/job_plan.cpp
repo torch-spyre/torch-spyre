@@ -156,9 +156,9 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   }
 
-  auto* params = flex::createHostComputeParams(
-      handle_.get(), correction_size_, &device_address_, input_buffer_,
-      std::move(args), pipeline_barrier_);
+  auto* params = flex::createHostComputeParams(handle_.get(), correction_size_,
+                                               input_buffer_, std::move(args),
+                                               pipeline_barrier_);
 
   struct Guard {
     flex::HostComputeParams* p;
@@ -167,7 +167,21 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  stream.launchHostCompute(params);
+  auto* hostBuffer = stream.launchHostCompute(params);
+
+  // Create DmaParams to transfer the host buffer.
+  auto* dmaParams =
+      flex::createDmaParams(hostBuffer->data(), hostBuffer->size(),
+                            /*to_device=*/true, &device_address_);
+
+  try {
+    stream.launchH2D(dmaParams);
+  }
+  catch (...) {
+    flex::destroyDmaParams(dmaParams);
+    throw;
+  }
+  flex::destroyDmaParams(dmaParams);
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
