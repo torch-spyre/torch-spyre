@@ -935,6 +935,52 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 5)
 
+    def test_fused_qkv_views_under_query_tiling(self):
+        """K and V split from one projection alias, and are invariant in the Lq map.
+
+        Mirrors an encoder's fused QKV path (bge-reranker-v2-m3, #4893), with the
+        Lq-map-around-Lk-scan nest forced at a small shape.
+        """
+        heads, head_dim, length = 2, 64, 256
+        hidden = heads * head_dim
+        generator = torch.Generator().manual_seed(0)
+        qkv = torch.randn(length, 3 * hidden, dtype=torch.float16, generator=generator)
+        mask = torch.zeros(1, 1, 1, length, dtype=torch.float16)
+
+        def sdpa(qkv, mask):
+            q, k, v = (
+                t.view(1, length, heads, head_dim).transpose(1, 2)
+                for t in qkv.split(hidden, dim=-1)
+            )
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=0.125)
+
+        def force_lq_map_around_lk_scan(**kwargs):
+            return dataclasses.replace(
+                _select_sdpa_tiling(**kwargs),
+                strategy="work_divided_tiled",
+                kv_block_size=128,
+                num_kv_blocks=2,
+                num_q_tiles=2,
+                q_tile_size=128,
+                num_batch_tiles=1,
+                num_head_tiles=1,
+                num_group_tiles=1,
+            )
+
+        expected = sdpa(qkv, mask)
+        with mock.patch.object(
+            _decompositions,
+            "_select_sdpa_tiling",
+            side_effect=force_lq_map_around_lk_scan,
+        ):
+            actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+                qkv.to("spyre"), mask.to("spyre")
+            )
+
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
