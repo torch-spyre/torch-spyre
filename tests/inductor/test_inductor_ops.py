@@ -432,14 +432,6 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
-TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.bfloat16, torch.float32]
-    for dst in [torch.float16, torch.float32]
-    if src != dst
-    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
-]
-
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
 TO_DTYPE_REDUCTION_PARAMS_SETS = {
@@ -5811,7 +5803,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6028,7 +6019,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -6036,7 +6026,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",

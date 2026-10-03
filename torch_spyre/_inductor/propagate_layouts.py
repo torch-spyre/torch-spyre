@@ -43,6 +43,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.utils import ceildiv
 from torch._inductor.virtualized import V
 
 from . import config
@@ -96,7 +97,6 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
-    rescale_stl_for_dtype,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -287,7 +287,13 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
+    out_coords,
+    output_dep,
+    c_size,
+    c_stride,
+    stick_dim,
+    dtype,
+    ea=ElementArrangement.STANDARD,
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -297,7 +303,7 @@ def _make_output_stl(
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order, ea)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
@@ -375,64 +381,264 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _convert_reads_whole_input(
+def _can_rescale_input_stl(
     in_layout: FixedLayout,
     output: FixedLayout,
     dep: MemoryDep,
     output_dep: MemoryDep,
+    stl: SpyreTensorLayout,
 ) -> bool:
-    """Whether a dtype conversion traverses its input exactly as it writes its output.
+    """Whether a conversion's output can take ``stl``, its input's layout, rescaled.
 
-    Only then may the conversion inherit the input buffer's
-    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
-    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
-    part of the fused QKV projection into a fresh, narrower per-head buffer --
-    the inherited row span belongs to the input buffer while the elements land
-    in a buffer with a different row stride. ``compute_coordinates`` then folds
-    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
-    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
-    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
-    representable but addresses the wrong sticks (``a == 1``, silently wrong
-    results). Mirrors the identical-access test the general convert path uses,
-    minus the element-width condition -- rescaling the stick depth is exactly
-    what this path is for.
+    ``rescale_stl_for_dtype`` keeps every device dim of ``stl``, so the conversion
+    must traverse its input exactly as it writes its output, and ``stl`` must lay
+    out only what it reads. Two reads fail that and take the sliced path:
+
+    - A slice of a wider buffer, e.g. Gemma's ``q_norm``/``k_norm`` upcast of part
+      of the fused QKV projection. The inherited row span belongs to the input
+      buffer while the elements land in a narrower one. ``compute_coordinates``
+      folds that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+      ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+      normalization grammar (``a != 1``, a codegen-time hard error) or addresses
+      the wrong sticks (``a == 1``, silently wrong results). The size, index and
+      host-coordinate checks catch it, mirroring the identical-access test of the
+      general convert path minus the element-width condition.
+    - A view keeping a wider buffer's layout, which can pass all of those: eager
+      decode passes q as ``qkv[:, :256].view(1, 2, 128)``, whose device dim steps
+      both heads and sticks, at ``2*head + floor(elem/64)``. A device coordinate
+      over more than one host var catches it.
+
+    A layout with no device dim to count the stick's sticks takes the sliced path
+    too, since the rescale has no dim to resize: a ``[16, 4096]`` hidden state
+    with its 16 tokens on the stick reads at ``[d1, d0]``. Such a dim's coordinate
+    carries the stick var, or is zero for a stick dim no longer than one stick.
     """
+    device_coords = device_coordinates(stl, dep, None)
+    stick_vars = device_coords[-1].free_symbols if device_coords else set()
     return (
         list(in_layout.size) == list(output.size)
         and dep.index == output_dep.index
         and host_coordinates(in_layout, dep, None)
         == host_coordinates(output, output_dep, None)
+        and all(len(c.free_symbols) <= 1 for c in device_coords)
+        and (
+            not stick_vars
+            or any(
+                c.free_symbols & stick_vars or c == sympy.S.Zero
+                for c in device_coords[:-1]
+            )
+        )
     )
 
 
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
-    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
+def rescale_stl_for_dtype(
+    stl: SpyreTensorLayout,
+    out_dtype: torch.dtype,
+    ea: ElementArrangement,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+) -> SpyreTensorLayout:
+    """Rescale a device layout across a conversion that changes the elements per stick.
 
-    Propagates the input device layout, preserving any padding, and rescales
-    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
-    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
-    odd number of 64-element sticks ends in one partially filled 128-element
-    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
-    conversion that consumes it rebuilds a dense layout from the host size,
-    treating the partial stick exactly like any other unaligned stick dim --
-    so it must never floor to a size-0 dim (issue #3604).
+    Keeps every device dim of ``stl`` and resizes only the stick (the last device
+    dim) and the num-sticks dim, both found from ``dep``'s coordinates. ``dep``
+    must read the input exactly as the conversion writes its output; a slice of a
+    wider buffer would keep that buffer's ``stride_map``.
+
+    The num-sticks dim's size and ``stride_map`` entry come from the input layout,
+    except in two cases the input does not record: a split into more sticks counts
+    from the host dim size, and a merge into a single stick takes the host dim
+    size as its entry. For example, with a contiguous stick dim::
+
+        conversion    host dim size  in sticks, entry    out sticks, entry
+        fp32 -> fp16  20             1, 20               1, 20  (kept)
+        fp32 -> fp16  50             2, 32               1, 50  (host dim size)
+        fp32 -> fp16  96             3, 32               2, 64
+        fp16 -> fp32  40             1, 40               2, 32
+        fp16 -> fp32  65             2, 64               3, 32  (not 4)
+
+    The layout holds only the sticks the live elements reach; the rest of the
+    stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
+    growing it here would follow the value into every consumer of this STL.
+
+    Every device dim must read at most one host dim, as ``_can_rescale_input_stl``
+    ensures; a num-sticks dim folding other host dims is not bounded by its host
+    dim size.
+
+    Args:
+        stl: Input device layout to rescale.
+        out_dtype: Torch dtype of the conversion output.
+        ea: ElementArrangement to stamp on the returned layout.
+        host_layout: Host layout of the tensor ``stl`` describes.
+        dep: The conversion's access to that tensor.
     """
-    in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
+    out_device_size = [*stl.device_size[:-1], out_eps]
     out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ElementArrangement.QFP8CH,
+    device_coords = device_coordinates(stl, dep, None)
+    stick_coord = device_coords[-1] if device_coords else sympy.S.Zero
+    stick_vars = stick_coord.free_symbols
+    if not stick_vars:
+        # A stick holding one element (a size-1 or sparse stick dim) needs no more
+        # sticks at any number of elements per stick.
+        return SpyreTensorLayout(
+            out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+        )
+
+    stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
+    outer_coords = device_coords[:-1]
+    assert all(len(c.free_symbols) <= 1 for c in outer_coords), (stl, dep)
+    num_sticks_dim = next(
+        (d for d, c in enumerate(outer_coords) if c.free_symbols & stick_vars), None
     )
+    if num_sticks_dim is None:
+        # A stick dim no longer than one stick never wraps into an outer dim, so
+        # the outermost zero coordinate holds its count: ``[1, 64]`` reads at
+        # ``[0, 0, d0]``.
+        num_sticks_dim = next(
+            (d for d, c in enumerate(outer_coords) if c == sympy.S.Zero), None
+        )
+    if stick_host_dim is None or num_sticks_dim is None:
+        # ``_can_rescale_input_stl`` sends a read with no dim to count its sticks
+        # down the sliced path.
+        # TODO: a stick coordinate whose variable matches no host dim has not been
+        # seen; resizing the stick alone could drop elements.
+        raise Unsupported(
+            f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
+            f"for {dep}"
+        )
+
+    in_sticks = stl.device_size[num_sticks_dim]
+    in_eps = stl.device_size[-1]
+    elem_step = stl.stride_map[-1]
+    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
+
+    if out_eps < in_eps:
+        # Splitting sticks, where the last input stick may be part-filled:
+        # 65 fp16 elements in 2 sticks -> 3 fp32 sticks, not 4.
+        out_sticks = ceildiv(host_dim_size, out_eps)
+    else:
+        # Whole input sticks merge (or keep their width): 3 fp32 sticks -> 2 fp16.
+        out_sticks = ceildiv(in_sticks * in_eps, out_eps)
+
+    if out_sticks > 1:
+        # The dim steps one output stick: 40 fp16 elements -> 2 fp32, entry 32.
+        stride_map_entry = out_eps * elem_step
+    elif in_sticks == 1:
+        # A single stick's entry never enters an address, so it is kept:
+        # 20 fp16 elements in 1 stick -> 1 fp32 stick, entry 20.
+        stride_map_entry = stl.stride_map[num_sticks_dim]
+    else:
+        # Sticks merged into one, whose entry is the host dim size, as
+        # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
+        stride_map_entry = host_dim_size * elem_step
+
+    out_device_size[num_sticks_dim] = out_sticks
+    out_stride_map[num_sticks_dim] = stride_map_entry
+    return SpyreTensorLayout(
+        out_device_size, out_stride_map, get_device_dtype(out_dtype), ea
+    )
+
+
+def _typecast_layouts(
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    dep: MemoryDep,
+    in_layout: FixedLayout,
+    stl: SpyreTensorLayout,
+) -> list[SpyreTensorLayout]:
+    """Output STLs of a typecast that changes the elements per stick.
+
+    One candidate per source layout of the input: the input as it stands and,
+    where it can be restickified, the input restickified onto each other dim.
+    These let a consumer ask for another stick dim, and are the only route for an
+    input whose stick starts at a slice offset. The optimizer inserts the
+    restickify on the input edge.
+
+    A read that can take the source's layout (``_can_rescale_input_stl``)
+    rescales it (``rescale_stl_for_dtype``), keeping all its device dims. A slice
+    of a wider buffer cannot, since the source's ``stride_map`` steps through the
+    wider buffer: it builds the layout from the output's host size with the
+    source's stick dim instead, which may reorder the non-stick device dims. The
+    conversion works on whole sticks, so a slice skips a source whose stick it
+    starts mid-stick.
+
+    Either layout holds only the sticks the live elements reach;
+    ``insert_staggered_ea_padding`` adds the rest.
+    """
+    in_device_coords = device_coordinates(stl, dep, None)
+    in_stick_expr = in_device_coords[-1]
+    input_ea = stl.element_arrangement
+    ea_src_dtype = in_layout.dtype
+    if ea_src_dtype == torch.bool:
+        # The EA map is keyed by logical dtypes; a bool takes its backing format's.
+        ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
+    if output.dtype == torch.float8_e4m3fn:
+        out_ea = ElementArrangement.QFP8CH
+    else:
+        out_ea = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_coords = host_coordinates(output, output_dep, None)
+
+    sources = [stl]
+    # ReStickifyOpHBM supports only fp16 in the STANDARD arrangement, so the output
+    # of a conversion from fp16 cannot be restickified. Add candidates from the
+    # input's alternate layouts, so the optimizer restickifies the input just
+    # before the conversion instead.
+    if (
+        stl.device_dtype == DataFormats.SEN169_FP16
+        and input_ea == ElementArrangement.STANDARD
+    ):
+        in_coords = host_coordinates(in_layout, dep, None)
+        for target_stick_expr in in_coords:
+            target_vars = target_stick_expr.free_symbols
+            # Restickifying onto the input's own stick dim changes nothing.
+            if not target_vars or target_vars & in_stick_expr.free_symbols:
+                continue
+            target_stl = compute_restickify_target_layout(
+                stl, in_layout, target_stick_expr, in_coords, in_device_coords
+            )
+            if target_stl is not None:
+                sources.append(target_stl)
+
+    layouts: list[SpyreTensorLayout] = []
+    for source_stl in sources:
+        candidate: SpyreTensorLayout | None
+        if _can_rescale_input_stl(in_layout, output, dep, output_dep, source_stl):
+            # Keeps every device dim of the source; only the elements per stick
+            # and the num-sticks count change.
+            # TODO: support slices in rescale_stl_for_dtype, so a sliced read
+            # keeps the source's device dims too. Alternatively drop this
+            # branch: the host-size layout below is correct for whole reads
+            # as well, only it may permute the non-stick device dims.
+            candidate = rescale_stl_for_dtype(
+                source_stl, output.dtype, out_ea, in_layout, dep
+            )
+        else:
+            # The source's stride_map steps through the wider buffer, so only
+            # its stick dim carries over; the non-stick device dims are rebuilt
+            # from the output's host size and may come out permuted.
+            source_stick_expr = device_coordinates(source_stl, dep, None)[-1]
+            if not is_stick_expr_offset_free(
+                source_stick_expr, source_stl.elems_per_stick()
+            ):
+                continue
+            stick_dim = _pick_stick_dim(source_stick_expr, out_coords)
+            if source_stick_expr.free_symbols and stick_dim < 0:
+                continue
+            candidate = _make_output_stl(
+                out_coords,
+                output_dep,
+                c_size,
+                c_stride,
+                stick_dim,
+                output.dtype,
+                out_ea,
+            )
+        if candidate is not None and candidate not in layouts:
+            layouts.append(candidate)
+    return layouts
 
 
 def _qfp8wt_stl(
@@ -567,122 +773,11 @@ def _single_arg_op_layout(
             prims.convert_element_type.default
             | aten.copy.default
             | torch.ops.spyre.to_dtype_d2d.default
+            | spyreop.qfp8ch.default
         ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
             output.dtype
         ):
-            # Type conversion may require padding when input has padding due to stick
-            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-            # which becomes 64 FP32 elements when converted. We need to reflect this
-            # in the output host size so the constructor creates the correct device layout.
-            try:
-                in_stick_expr = device_coordinates(stl, dep, None)[-1]
-            except Unsupported:
-                # Staggered-EA candidate whose physical stick depth differs from
-                # elems_per_stick — not a valid input for this conversion path.
-                return []
-            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
-                return []
-
-            input_ea = stl.element_arrangement
-
-            # For bool inputs, ea_map must resolve from the physical backing
-            # dtype (e.g. IEEE_FP32 for a fp32-backed bool) rather than the
-            # logical torch.bool, which is not in the EA map. Use the
-            # bool-equivalent dtype of the STL's device_dtype as the source.
-            ea_src_dtype = in_layout.dtype
-            if ea_src_dtype == torch.bool:
-                resolved_dtype = bool_equivalent_dtype(stl.device_dtype)
-                if resolved_dtype is not None:
-                    ea_src_dtype = resolved_dtype
-                else:
-                    logger.warning(
-                        "bool input has unrecognised device_dtype %s; "
-                        "falling back to torch.bool for EA map lookup",
-                        stl.device_dtype,
-                    )
-
-            fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
-
-            # Two strategies, chosen by whether a staggered EA is involved:
-            #
-            # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that
-            #    traverse the whole input. The staggered element ordering only
-            #    exists on the physical device layout, so propagate the input's
-            #    device_size/stride_map and rescale just the stick depth via
-            #    rescale_stl_for_dtype; reconstructing from the logical host size
-            #    would lose the stick choice a downstream reduction needs.
-            #    Inheriting is only sound for an identical access -- see
-            #    _convert_reads_whole_input; a sliced read falls through to (2),
-            #    which still stamps the staggered EA.
-            #
-            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
-            #    device layout can be degenerate — qfp8ch rescales a size-1
-            #    num-sticks dim to 0 (1*64//128), leaving a size-0 dim — and
-            #    rescale_stl_for_dtype would faithfully propagate that garbage,
-            #    changing the layout rank and downstream graph partitioning.
-            #    Rebuild a clean dense layout from the output host size instead,
-            #    as the general (non-EA) convert path does.
-            staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-            if staggered and _convert_reads_whole_input(
-                in_layout, output, dep, output_dep
-            ):
-                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
-
-                # A conversion that creates a staggered EA must also expose
-                # outputs reachable by restickifying its STANDARD input first.
-                # Otherwise the conversion permanently inherits the input's
-                # stick and a downstream reduction-broadcast join has no way to
-                # request the normalized dimension as the stick. Gemma 4 hits
-                # this when an embedding output enters RMSNorm with its sequence
-                # dimension on the stick.
-                if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
-                    in_coords = host_coordinates(in_layout, dep, None)
-                    source_device_coords = device_coordinates(stl, dep, None)
-                    for target_stick_expr in in_coords:
-                        if not target_stick_expr.free_symbols:
-                            continue
-                        target_stl = compute_restickify_target_layout(
-                            stl,
-                            in_layout,
-                            target_stick_expr,
-                            in_coords,
-                            source_device_coords,
-                        )
-                        if target_stl is None:
-                            continue
-                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                        if candidate not in layouts:
-                            layouts.append(candidate)
-
-                # Under the current EA map, an already-staggered input is the
-                # reverse staggered-to-STANDARD restoration. It needs no
-                # expansion: preserve the stick selected before the upcast.
-
-                return layouts
-
-            # Dense reconstruction from the output host size. When the input
-            # stick dim is unaligned, force a full input-stick depth so stick
-            # padding is reflected in the device layout (see #1756 example above).
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-                c_size = [concretize_expr(s) for s in output.size[:-1]] + [
-                    in_elems_per_stick
-                ]
-                c_stride = [concretize_expr(s) for s in output.stride[:-1]] + [1]
-            return [
-                SpyreTensorLayout(
-                    c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
-                )
-            ]
-
-        case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
-            # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL. Not
-            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
-            # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            return _typecast_layouts(output, output_dep, dep, in_layout, stl)
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
