@@ -297,6 +297,97 @@ for rereading inputs when large output tiles are split across many cores. That f
 has not been recalibrated together with shared-input delivery; their combined accuracy is
 not established for all shapes. Pointwise broadcast inputs retain their existing one-load rule.
 
+### Two matmul models: the planner's and the report's
+
+The scratchpad allocator and the report price a matmul with different models, so a
+fix to one is not a fix to the other.
+
+| caller | setting | matmul compute |
+|---|---|---|
+| scratchpad allocator (the CP-SAT objective that chooses plans) | `use_bundled_cost_model=False` | rebuilds batch, M, N and K from the features and calls `work_division._matmul_execution_cost` without its HBM term |
+| report (`cost_model_pass`, `SPYRE_DUMP_COST`) | default, `use_bundled_cost_model=True` | `matmul_macs / cores / (mac_peak * pt_eff)` |
+
+Both must count the same work over a loop. The rebuilt axes describe **one pass over the
+output buffer**: batch × M × N is `out_elems`, and K is the slice of the reduction one
+trip sees. `matmul_macs` is the work of the whole loop: the extractor multiplies one
+pass by the write's own loop factor. The allocator's estimate is therefore charged once
+per pass, `passes = matmul_macs / (out_elems * K)`, and never multiplied by the trip
+count directly. Two loops of 128 experts, each expert a `[64, 128]` output with K = 64:
+
+- a body that re-writes one `[64, 128]` buffer every trip makes 128 passes;
+- a body that writes its own slice of a stacked `[128, 64, 128]` buffer makes one pass,
+  because the batch already counts the 128 experts.
+
+Both cost 128 experts of work on both models. A reduction-tiled loop makes one pass per
+K slice; a loop that tiles an output dimension walks its output once and makes one pass.
+
+### Delivering the operand a loop walks
+
+A `for_each_tile` loop that reads one expert bank (or one KV page) per trip streams that
+operand from main memory one slice per trip. When too few cores stream it, delivery is
+slower than the shared peak. The allocator adds that excess time for an input of a
+looped matmul only when all three hold:
+
+1. a `for_each_tile` variable advances the read's address, by the lowering's own
+   per-read verdict: its stamp, else a nonzero coefficient on the variable. This is the
+   same verdict that sets the read's loop factor;
+2. the loop walks the read once (loop factor 1);
+3. some division in the allocator's legal menu splits a dimension the read indexes.
+
+The excess is `bytes / (cores * rate) - bytes / peak`, and never below zero. Three reads
+look similar but are not eligible: a read whose index contains the variable but does not
+advance with it (the tests use the synthetic index `4096 * FloorDiv(u0, 2)`; no lowered
+kernel is known to produce such a read); a read walked only by a coarse-tiled dimension
+of the op; a read re-entered every trip.
+
+The report leaves this estimate out. It extracts features without the legal menu, so
+condition 3 never holds there, and its totals need not rank eligible looped-matmul plans
+the way the allocator does.
+
+### DMA requests of a loop matmul's operand reads
+
+A core reads its slice of an operand as contiguous runs, and each run is one DMA request.
+A request has a fixed cost, so a slice cut into many tiny runs is slow even when its bytes
+are few. The transport term already prices this with a calibrated request law. The same
+law prices each HBM input of a matmul inside a loop (`loop_trip > 1`):
+
+- requests per trip = the read's own footprint per trip / one core's contiguous run (a
+  run ends at the innermost split of the axes the read indexes), floored at one maximum
+  burst and capped at one 128-byte word;
+- each request costs the calibrated ns of the largest calibrated core count at or below
+  the op's (22 cores take the 16-core rate, 11 take the 8-core rate);
+- the excess over `bytes / peak`, times the trips, times `(1 - is_lx)`.
+
+Toy example: one expert of the MoE gate bank is `[2816, 704]` in a layout that keeps each
+row's 11 sticks together. Split the columns 11 ways (on 22 cores) and every core gets one
+128-byte stick of every row: 2816 × 11 = 30,976 requests per trip. At 7.5 ns that is
+232 µs, against 26.4 µs to move the bytes, so 206 µs per trip, 26.35 ms over 128 experts.
+Split K 4 ways instead and each core reads whole rows, one long run: no excess.
+
+The loop-delivery estimate above prices the same bytes for a different reason (too few
+cores streaming them). Delivery takes as long as the slower of the two, so a read is
+charged `max(delivery, requests)`, never their sum, and this term adds only the part the
+estimate does not already charge. Both sides aggregate reads the same way: a graph input
+read by several ops of one kernel is one load, charged once at the slowest of its reads;
+any other read is charged on its own. With two reads of one graph input at (delivery,
+requests) = (10, 10) and (1, 20), the load is delivered in 20: the estimate charges 10
+and this term adds 10, not 19.
+
+Where it does not apply:
+
+- a single-pass matmul (no loop) keeps its previous price, which keeps this term disjoint
+  from any single-pass delivery estimate;
+- a read whose geometry is not proven (another device dtype, a gather or indirect index,
+  or a stick split that some candidate of the menu cannot keep whole) keeps its previous
+  price for every candidate;
+- copies and other one-input ops keep the transport term exactly as before; a matmul
+  never enters it, so the allocator's direct-read decisions are unchanged.
+
+The report has no menu, so the delivery estimate is absent there and the report charges
+the whole request excess. Two things are assumptions, not measurements: the rate at core
+counts the calibration never visited, and that the two bottlenecks combine by `max`
+rather than adding.
+
 `spyre_fuse_nodes` fuses everything it can — contiguous Spyre nodes accumulate in order, and
 only a node that is not on the device starts a new bundle. No size limit, no cost heuristic,
 no reordering. The pass applies that same rule, with two differences:
