@@ -1036,6 +1036,18 @@ def _select_sdpa_tiling(
             # the map boundary. Requiring more means DWSRS did not right-size
             # the working set.
             if plan.estimated_spill_buffers <= 1
+            # Each tiled axis (batch, head, group, Q, KV) becomes a scan loop,
+            # and torch.compile re-enters itself for every nested scan body at
+            # trace time.  Python's default recursion limit is hit at three or
+            # more simultaneously active scan loops.  Reject plans that would
+            # produce that depth.
+            and (
+                int(plan.num_batch_tiles > 1)
+                + int(plan.num_head_tiles > 1)
+                + int(plan.num_group_tiles > 1)
+                + int(plan.num_q_tiles > 1)
+                + int(plan.kv.num_blocks > 1)
+            ) < 3
         ]
         for plan in plans:
             logger.debug(
@@ -1918,6 +1930,22 @@ def spyre__sdpa_overrideable(
             attn_bias,
         )
         if mask is not None
+    )
+
+    # K and V are normalised conditionally to contiguous layout before the cost model runs.
+    # A non-dense any inner axis stride (e.g. key/value sliced from a KV cache, or V
+    # produced by v.transpose(1, 2)) would inflate head_tile_staging_bytes and
+    # increasing scan nesting depth. Only copy when the H-axis is actually non-dense
+    # to avoid redundant work.
+    key = (
+        key.contiguous()
+        if not _axis_slice_is_dense(tuple(key.shape), tuple(key.stride()), 1)
+        else key
+    )
+    value = (
+        value.contiguous()
+        if not _axis_slice_is_dense(tuple(value.shape), tuple(value.stride()), 1)
+        else value
     )
 
     # Tiling an interleaved H axis requires map inputs/outputs to be staged in
