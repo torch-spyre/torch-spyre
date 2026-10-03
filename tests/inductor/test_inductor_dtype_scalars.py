@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 import torch
 import torch._dynamo as dynamo
-
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
 
 
@@ -278,6 +277,24 @@ class TestDatatypeScalarOperations:
 
         x = cached_randn((128, 64), dtype=torch.float64)
         _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
+
+    # Regression test for https://github.com/torch-spyre/torch-spyre/issues/4487
+    def test_float64_conversion_raises_clean_error(self, execution_mode):
+        """Unsupported float64 conversion must raise rather than terminate Python.
+
+        Compiled mode reproduces issue #4487; eager mode checks consistent behavior.
+        """
+
+        def fn(x):
+            return x.to(torch.float64)
+
+        x = cached_randn((8,), dtype=torch.float32)
+
+        with pytest.raises(
+            (RuntimeError, torch._inductor.exc.InductorError),
+            match="Spyre backend does not support dtype Double",
+        ):
+            _run_spyre(execution_mode, fn, x)
 
     @pytest.mark.parametrize(
         "dtype,scalar_value,atol,rtol",
