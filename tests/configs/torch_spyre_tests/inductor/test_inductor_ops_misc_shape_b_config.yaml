@@ -39,6 +39,7 @@ test_suite_config:
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
             - TestOps::test_reduction_with_to_dtype.*
+            - TestOps::test_dtype_conversion_padding_unpadded_size_int32_to_fp32_rsqrt
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported_xfail
