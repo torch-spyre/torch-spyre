@@ -554,6 +554,15 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
   void write(std::ostream& os) const override;
 
+  /**
+   * @brief Resolve a symbolic_args payload to a vector of HostComputeArgs.
+   *
+   * NOTE: kDimension is not yet implemented; only kAddress is supported.
+   */
+  static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
+      const std::vector<at::Tensor>& tensors,
+      const std::vector<SymbolicArg>& symbolic_args);
+
  private:
   size_t correction_size_;  ///< byte count of the correction blob
   flex::CompositeAddress device_address_;  ///< device destination for H2D

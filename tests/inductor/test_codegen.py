@@ -28,6 +28,9 @@ from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
+    SymbolicArg,
+    SymbolicArgKind,
+    _resolve_symbolic_args,
 )
 from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.compute_ops import (
@@ -275,6 +278,61 @@ class TestSpyreConfig(InductorTestCase):
             args_str = line[line.index("(") + 1 : line.rindex(")")]
             args = [a.strip() for a in args_str.split(",")]
             self.assertEqual(len(args), len(set(args)), f"Duplicate args: {line}")
+
+    def test_symbolic_address_call_emits_canonical_symbolic_args_payload(self):
+        """The runner builds one SymbolicArg(kAddress) per backend symbol in
+        canonical inputSym_ order using generate_bundle()'s returned symbol_kinds.
+
+        Verifies the resolved address vector is correct and that a reversed payload
+        yields a different vector -- proving the ordering contract is load-bearing.
+        """
+
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+        b = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+
+        with config.patch({"bundle_symbolic_args": True}):
+            comp_fn = torch.compile(fn)
+            out, source_codes = run_and_get_code(comp_fn, a, b)
+
+        # Ground-truth: resolve each tensor by its known run() position.
+        # tensor_id == arg_index == position in the deduped call_args list.
+        tensors = [a, b, out]
+        addr_0 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
+        )[0]
+        addr_1 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1)]
+        )[0]
+        addr_2 = _resolve_symbolic_args(
+            tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2)]
+        )[0]
+
+        payload_canonical = [
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
+        ]
+        resolved = _resolve_symbolic_args(tensors, payload_canonical)
+        self.assertEqual(resolved, [addr_0, addr_1, addr_2])
+
+        # Forward-vs-reversed differential: wrong slot order must produce a
+        # different address vector, proving the ordering contract is exercised.
+        payload_reversed = [
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=2),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=1),
+            SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0),
+        ]
+        resolved_rev = _resolve_symbolic_args(tensors, payload_reversed)
+        self.assertNotEqual(
+            resolved,
+            resolved_rev,
+            "canonical and reversed payloads resolved identically -- "
+            "all tensors share an address so ordering is not exercised",
+        )
+        self.assertEqual(resolved_rev, [addr_2, addr_1, addr_0])
 
 
 class TestResolveSdscSize(InductorTestCase):
