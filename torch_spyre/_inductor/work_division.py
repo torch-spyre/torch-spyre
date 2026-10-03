@@ -2004,10 +2004,11 @@ def _iter_computed_buffers(operations: list[Operation]):
                 continue
             yield op
         elif isinstance(op, FallbackKernel):
-            # FallbackKernel produces 0..N trailing MultiOutputs
-            # (see torch_spyre/_inductor/propagate_layouts.py).
-            # Work division is not supported on either; the MultiOutputs
-            # are skipped in their own branch below.
+            # FallbackKernel either carries a single output itself or
+            # produces trailing MultiOutputs (see
+            # torch_spyre/_inductor/propagate_layouts.py). Work division is
+            # not supported on either; the MultiOutputs are skipped in their
+            # own branch below.
             pass
         elif isinstance(op, MultiOutput):
             pass
