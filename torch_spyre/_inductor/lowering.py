@@ -1286,6 +1286,11 @@ def _validate_reoffset_supported(layout, offset) -> None:
     ``offset % elems_per_stick == 0`` yet still miscompiles, and detecting it
     would require the base-storage layout that is unavailable here. It stays a
     documented known limitation (``test_column_slice_inner_offset``).
+
+    The eager dispatcher applies the same rule up front
+    (``_d2d_offset_is_stick_aligned`` in ``torch_spyre/ops/eager.py``) to
+    route an unaligned source view through the host instead of reaching this
+    rejection; keep the two in step.
     """
     try:
         off = int(offset)

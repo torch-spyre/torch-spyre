@@ -13,7 +13,12 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
+from torch_spyre._C import (
+    fill_tensor,
+    copy_tensor,
+    get_elem_in_stick,
+    SpyreTensorLayout,
+)
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -140,9 +145,12 @@ def _materialize_offset_view(x):
     silently read the wrong data.
 
     ``clone()`` dispatches ``aten::clone`` -> ``aten::copy_`` ->
-    ``spyre::copy_from_d2d``, i.e. that same offset-honoring path, producing a
-    correct offset-0 buffer. This is a no-op for the overwhelmingly common
-    offset-0 case (fresh buffers, and slices that already forced a copy).
+    ``spyre__copy_from``, which re-injects the offset through
+    ``spyre::copy_from_d2d`` when the kernel can express it (a whole number of
+    sticks) and otherwise stages the view through the host (see
+    ``_d2d_offset_is_stick_aligned``), producing a correct offset-0 buffer
+    either way. This is a no-op for the overwhelmingly common offset-0 case
+    (fresh buffers, and slices that already forced a copy).
 
     ``List[Tensor]`` args (e.g. ``aten.cat``/``aten.stack``) are recursed into
     element-wise so an offset view nested in a list is materialized too;
@@ -155,6 +163,19 @@ def _materialize_offset_view(x):
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
     return x
+
+
+def _d2d_offset_is_stick_aligned(offset: int, dtype: torch.dtype) -> bool:
+    """Whether a d2d copy kernel can honor ``offset`` on a tensor of ``dtype``.
+
+    The compiled ``spyre::copy_from_d2d`` re-injects a view's ``storage_offset``
+    into the kernel coordinate, which the backend can only bake as a whole
+    number of sticks; ``_validate_reoffset_supported`` in
+    ``torch_spyre/_inductor/lowering.py`` rejects anything else. This is the
+    same rule, evaluated up front so eager can choose a path that works instead
+    of compiling one that will be rejected (issue #4329).
+    """
+    return offset % get_elem_in_stick(dtype) == 0
 
 
 class RetileWarning(UserWarning):
@@ -194,6 +215,14 @@ def _run_compiled_fallback(op, *args, **kwargs):
 
 def _in_compiled_fallback():
     return bool(getattr(_compiled_fallback_state, "depth", 0))
+
+
+class HostStagedCopyWarning(UserWarning):
+    """Warning issued when an eager device-to-device copy had to be staged
+    through the host because its source view starts inside a stick."""
+
+
+warnings.simplefilter("once", HostStagedCopyWarning)
 
 
 def _normalize_result_layout(x):
@@ -774,6 +803,37 @@ def spyre__copy_from(self, dst, non_blocking=False):
         if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
+        elif not _d2d_offset_is_stick_aligned(self.storage_offset(), self.dtype):
+            # The d2d kernel cannot read from an offset inside a stick (e.g.
+            # ``x[1]`` of a 1-D tensor, issue #4329), but the D2H DMA honors
+            # any source offset. Stage the view through the host: straight
+            # into ``dst`` when it is a plain contiguous buffer at its storage
+            # base (the H2D DMA writes host order and ignores strides and
+            # offset, so anything else would land silently wrong), otherwise
+            # via a fresh offset-0 device copy so the kernel path below handles
+            # ``dst``'s own offset and strides exactly as for an aligned source.
+            #
+            # Warned like RetileWarning: the copy is correct but costs two DMAs
+            # instead of a kernel, and a deployment should be able to tell when
+            # a hot path is paying for it. The "once" filter keys on the message
+            # text, so the text names only the dtype (one warning per stick
+            # width), not the offset (one per distinct slice would flood a loop
+            # over, e.g., embedding-bag offsets).
+            warnings.warn(
+                f"staging d2d copies of {self.dtype} views through the host: a "
+                f"storage_offset that is not a multiple of elems_per_stick="
+                f"{get_elem_in_stick(self.dtype)} cannot be expressed by the d2d "
+                "kernel; slice on a stick boundary to keep the copy on device",
+                category=HostStagedCopyWarning,
+                stacklevel=2,
+            )
+            cpu_tmp = self.to("cpu")
+            if dst.storage_offset() == 0 and dst.is_contiguous():
+                copy_tensor(cpu_tmp, dst, non_blocking)
+            else:
+                torch.ops.spyre.copy_from_d2d(
+                    cpu_tmp.to(self.device), dst, 0, dst.storage_offset()
+                )
         else:
             # Pass storage_offsets explicitly: a graph input's storage_offset
             # is dropped by Inductor, so the lowering must re-introduce it

@@ -446,6 +446,16 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
 
+    def test_compute_coordinates_accepts_bare_int_index(self):
+        # A rank-0 access (``x[i]`` of a 1-D tensor) has no index variables, so
+        # a caller building ``offset + sum(stride * var)`` over an empty range
+        # hands over a plain Python int. It must be treated as the constant
+        # index it is, not fail on the sympy API (issue #4330). int64 lands on
+        # the device as int32: 40 elements -> 2 sticks of 32.
+        self.assertEqual(compute_coordinates([2, 32], [32, 1], {}, 32), [1, 0])
+        self.assertEqual(compute_coordinates([2, 32], [32, 1], {}, 33), [1, 1])
+        self.assertEqual(compute_coordinates([2, 32], [32, 1], {}, 0), [0, 0])
+
     def test_offset_across_padded_row_stays_stick_offset_free(self):
         # Regression: a non-stick offset on a padded row (row width not a
         # multiple of elem_in_stick) must not leak a residual onto the stick
