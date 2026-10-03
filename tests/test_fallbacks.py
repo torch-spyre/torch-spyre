@@ -139,6 +139,34 @@ class TestFallbacks(TestCase):
             self._assert_close(op, output_spyre.cpu(), output_cpu)
             self.assertEqual(id(buffer_spyre), id(output_spyre))
 
+    # histc: CPU fallback that computes in float32 (CPU histc has no float16 or
+    # int32 kernel) and returns counts in the input dtype.
+    _histc_cases = [
+        (torch.rand(64, dtype=torch.float16) * 3, dict(bins=4, min=0.0, max=3.0)),
+        # issue #3982 (gpt-oss): float32, 2-D input
+        (torch.rand(1, 5, dtype=torch.float32), dict(bins=10, min=0.0, max=1.0)),
+        # transformers MoE routing: histc(expert_ids.int(), bins=E, min=0, max=E-1)
+        (
+            torch.randint(0, 128, (192,), dtype=torch.int32),
+            dict(bins=128, min=0, max=127),
+        ),
+    ]
+
+    def test_histc(self):
+        for x, kwargs in self._histc_cases:
+            output_cpu = torch.histc(x.to(torch.float32), **kwargs).to(x.dtype)
+            output_spyre = torch.histc(x.to("spyre"), **kwargs)
+            self.assertEqual(output_spyre.dtype, x.dtype)
+            assert_close(output_spyre.cpu(), output_cpu, rtol=0, atol=0)
+
+    def test_histc_out(self):
+        for x, kwargs in self._histc_cases:
+            output_cpu = torch.histc(x.to(torch.float32), **kwargs).to(x.dtype)
+            buffer_spyre = torch.empty_like(output_cpu, device="spyre")
+            output_spyre = torch.histc(x.to("spyre"), **kwargs, out=buffer_spyre)
+            assert_close(output_spyre.cpu(), output_cpu, rtol=0, atol=0)
+            self.assertEqual(id(buffer_spyre), id(output_spyre))
+
 
 if __name__ == "__main__":
     run_tests()

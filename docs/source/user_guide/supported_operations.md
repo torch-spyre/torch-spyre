@@ -130,6 +130,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.histc` | Y | Y | CPU fallback | Runs on CPU in float32, counts cast back to the input dtype |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
