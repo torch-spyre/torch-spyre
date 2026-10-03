@@ -29,7 +29,7 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 ## The search
 
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
-`PermutationBasedLayoutSolver` packer, and the division vector `W`, one menu index per buffer. The
+`NativePermutationLayoutSolver` packer, and the division vector `W`, one menu index per buffer. The
 seed is every buffer at menu index 0 with `pi` from a FirstFit pass. One geometric cool runs
 `clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.

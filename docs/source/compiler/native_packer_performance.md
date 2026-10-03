@@ -1,27 +1,24 @@
 # Native packer performance
 
-**Measured 2026-08-12.** These numbers describe the C++
-`NativePermutationLayoutSolver` as it stood when it became the default packer for
-the simulated-annealing layout solver. They are a snapshot, not a contract: re-run
-the harness rather than trusting them after the packer, the annealing driver, or
-the cost model changes.
+**Historical record.** This is the measurement that made the C++
+`NativePermutationLayoutSolver` the default packer for the simulated-annealing
+layout solver, taken 2026-08-12. The Python packer it was compared against, and
+the harness that produced these tables, were both removed in #4173, so the
+comparison can no longer be re-run — the page is kept for the reasoning and the
+shape of the result, not as a benchmark to repeat.
 
-Harness:
-[`docs/source/user_guide/examples/scratchpad/profile_native_packer.py`](../user_guide/examples/index.md).
-Every invocation below prints the tables it produced and can emit the raw
-per-instance timings with `--json`.
+## What was being compared
 
-## What is being compared
+At the time the permutation packer had two interchangeable implementations — the
+then-canonical Python `PermutationBasedLayoutSolver` and the C++ accelerator —
+selected by `config.native_layout_packer` / `TORCH_SPYRE_NATIVE_PACKER`. They were
+behaviourally identical, asserted bit-for-bit by the differential and
+SA-equivalence suites. See
+[Simulated annealing layout planner](simulated_annealing_layout.md) for the packer
+as it stands now.
 
-The permutation packer that the annealing search drives has two interchangeable
-implementations — the canonical Python `PermutationBasedLayoutSolver` and the C++
-accelerator — selected by `config.native_layout_packer` /
-`TORCH_SPYRE_NATIVE_PACKER`. They are behaviourally identical, asserted
-bit-for-bit by the differential and SA-equivalence suites. See
-[Simulated annealing layout planner](simulated_annealing_layout.md).
-
-That identity is what makes the comparison clean: layout quality is not a random
-variable across the two arms, so **time is the only thing under test**.
+That identity is what made the comparison clean: layout quality was not a random
+variable across the two arms, so **time was the only thing under test**.
 
 ## Method
 
@@ -119,11 +116,13 @@ asymptotic improvement. Per-step cost under `foot2`:
 
 Past n≈128 the native per-step cost grows faster than the Python one, which
 follows from the design. The native packer recomputes placement from scratch in
-permutation order after every operation; the Python packer is genuinely
-incremental, splicing contact profiles. The port buys a very large constant factor
-by deleting per-operation interpreter and pybind overhead, at the cost of the
-incremental algorithm, so its advantage narrows as the recompute grows. Earlier
-profiling put the crossover with a truly incremental C++ packer near n≈640.
+permutation order after every operation — quadratic in the worst case; the Python
+packer was genuinely incremental, splicing contact profiles. The port buys a very
+large constant factor by deleting per-operation interpreter and pybind overhead,
+at the cost of the incremental algorithm, so its advantage narrows as the
+recompute grows. Earlier profiling put the crossover with a truly incremental C++
+packer near n≈640 — which, together with the incremental version being roughly
+2.5× the code in C++, is why only the naive algorithm was ported.
 
 Two things bound how much that matters. Captured real graphs run n≈5–80, which is
 the 12–16× region under representative capacity. And the large-n cells are a

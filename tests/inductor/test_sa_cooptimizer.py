@@ -47,9 +47,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _STEPS_PER_BUFFER,
     SaCoOptimizingSolver,
 )
-from torch_spyre._inductor.scratchpad.permutation_layout import (
-    make_permutation_packer,
-)
+from torch_spyre._C import NativePermutationLayoutSolver
 
 from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -993,12 +991,12 @@ class ReorderSweepTest(TestCase):
                 # And the incrementally-maintained placement must match a
                 # from-scratch rebuild on the permutation it ended up with.
                 sizes = [s._per_core_size(i, s.chosen[i]) for i in range(len(s._bufs))]
-                fresh = make_permutation_packer(
+                fresh = NativePermutationLayoutSolver(
                     s._lifetime_buffers(sizes),
                     list(s.packer.permutation),
                     s.limit,
                     s.alignment,
-                    eligible=[s._eligible(i) for i in range(len(s._bufs))],
+                    [s._eligible(i) for i in range(len(s._bufs))],
                 )
                 self.assertEqual(list(fresh.addresses), list(s.packer.addresses), tag)
                 self.assertEqual(fresh.quality(), s.packer.quality(), tag)
