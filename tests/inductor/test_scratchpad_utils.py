@@ -39,12 +39,13 @@ from unittest import TestCase, mock
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ExternKernel, FallbackKernel
+from torch._inductor.ir import ExternKernel, FallbackKernel, MutationLayoutSHOULDREMOVE
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     get_ncores_for_buffers,
+    ops_in_offset_mutation_component,
 )
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
@@ -169,6 +170,81 @@ class ExternalOperandTest(TestCase):
                     self.assertIn("FallbackKernel/ExternKernel", reasons[_BUF])
                     self.assertEqual(views, {})
                     project.assert_not_called()
+
+
+def _pin_dep(name, offset=0):
+    """A (4, 64) access of ``name``, starting ``offset`` elements in."""
+    return MemoryDep(name, 64 * d0 + d1 + offset, (d0, d1), (4, 64))
+
+
+def _pin_op(name, reads=(), target=None, write_offset=0):
+    """An op writing ``name`` (or, through a MutationLayout, ``target``)."""
+    layout = None
+    if target is not None:
+        layout = mock.MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        layout.target = mock.MagicMock()
+        layout.target.get_name.return_value = target
+    rw = SimpleNamespace(
+        reads=[_pin_dep(r) for r in reads], writes=[_pin_dep(name, write_offset)]
+    )
+    return SimpleNamespace(name=name, layout=layout, rw=rw)
+
+
+def _pinned(ops):
+    graph = SimpleNamespace(operations=ops)
+    with mock.patch(
+        "torch_spyre._inductor.scratchpad.utils.op_read_writes",
+        side_effect=lambda op: op.rw,
+    ):
+        return ops_in_offset_mutation_component(graph)
+
+
+class OffsetMutationPinTest(TestCase):
+    """Which ops ``ops_in_offset_mutation_component`` pins around an offset write."""
+
+    def test_no_offset_write_pins_nothing(self):
+        ops = [_pin_op("a", reads=["arg0"]), _pin_op("b", reads=["a"])]
+        self.assertEqual(_pinned(ops), set())
+
+    def test_pad_before_ffn_does_not_pin_upstream_attention(self):
+        # attention -> o_proj -> norm -> pad (fill + two mutations, one at an
+        # offset) -> gate_up -> silu -> down -> residual: the shape of issue #4990.
+        ops = [
+            _pin_op("attn", reads=["q", "k_pages", "v_pages"]),
+            _pin_op("o_proj", reads=["attn", "w_o"]),
+            _pin_op("norm", reads=["o_proj"]),
+            _pin_op("pad_fill"),
+            _pin_op("pad_rows", reads=["norm"], target="pad_fill"),
+            _pin_op("pad_zeros", target="pad_fill", write_offset=256),
+            _pin_op("gate_up", reads=["pad_fill", "w_gu"]),
+            _pin_op("silu", reads=["gate_up"]),
+            _pin_op("down", reads=["silu", "w_d"]),
+            _pin_op("residual", reads=["o_proj", "down"]),
+        ]
+        self.assertEqual(
+            _pinned(ops),
+            {"pad_fill", "pad_rows", "pad_zeros", "gate_up", "silu"},
+        )
+
+    def test_copy_back_into_graph_input_pins_its_readers(self):
+        # z = x.copy_(y)._base; (z + 1) + amax(z), with z a mutated graph input:
+        # the offset write lands in a clone that is then copied back into arg0.
+        ops = [
+            _pin_op("y_slice", reads=["arg1"]),
+            _pin_op("y_restick", reads=["y_slice"]),
+            _pin_op("clone", reads=["arg0"]),
+            _pin_op(
+                "slice_write", reads=["y_restick"], target="clone", write_offset=32
+            ),
+            _pin_op("copy_back", reads=["clone"], target="arg0"),
+            _pin_op("add_one", reads=["arg0", "one"]),
+            _pin_op("amax", reads=["arg0"]),
+            _pin_op("add", reads=["add_one", "amax"]),
+        ]
+        self.assertEqual(
+            _pinned(ops),
+            {"clone", "slice_write", "copy_back", "add_one", "amax", "add"},
+        )
 
 
 if __name__ == "__main__":

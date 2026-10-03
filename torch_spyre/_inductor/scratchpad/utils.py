@@ -458,66 +458,86 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 def ops_in_offset_mutation_component(
     graph: GraphLowering,
 ) -> set[str]:
-    """Names of ops data-connected to a sliced in-place mutation that writes at
-    a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
+    """Names of ops around a sliced in-place mutation that writes at a constant
+    non-zero offset (e.g. ``x[:, 32:96] = ...``).
 
-    Such a mutation and everything fused with it land in one SDSC. The offset
-    write's codegen assumes the target buffer keeps the slicing the eager path
-    chose; if the co-optimizing allocator re-slices any op in that fused kernel
-    (a different core division), the deeptools scheduler can no longer place the
-    offset write and aborts the compile (``DtException: "There must be at least
-    one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``). This is the root
-    cause of the ``slice_stick_mutation_*`` co-optimizing-allocator failures --
-    the division change, *not* LX residency (the abort reproduces with pinning
-    fully disabled).
+    The offset write's codegen assumes the target buffer keeps the slicing the
+    eager path chose. If the co-optimizing allocator re-slices the ops around it
+    (a different core division), the deeptools scheduler can no longer place
+    the offset write and aborts the compile (``DtException: "There must be at
+    least one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``), or the
+    compiled result is wrong. This is the root cause of the
+    ``slice_stick_mutation_*`` co-optimizing-allocator failures -- the division
+    change, *not* LX residency (the abort reproduces with pinning fully
+    disabled).
 
-    The caller pins every op in this set to its upstream (fixed) division, so
-    the offset-write SDSC keeps the schedulable slicing the greedy /
-    placement-only path uses. Fusion boundaries are unknown at planning time, so
-    the SDSC is over-approximated by the undirected data-dependency component
-    containing the offset write: producer chain (the value written), the
-    mutation target it aliases, and the consumers of that target. Over-approxi-
-    mation only forgoes a division optimization (correct, never a new failure --
-    a fixed division is exactly what greedy uses).
+    The caller pins every op in this set to its upstream (fixed) division, the
+    slicing the greedy / placement-only path uses. The set is the ops that touch
+    the mutated storage, plus their direct consumers:
+
+    * the storage's aliases: the offset write, its target, every other
+      ``MutationLayout`` write into an alias, and copy-back chains (a mutation
+      that reads an alias, such as the write back into a mutated graph input,
+      makes its own target an alias too);
+    * every op that reads an alias;
+    * every op that reads one of those readers' outputs.
+
+    Producers of the written value are deliberately not followed, and neither is
+    anything further away. An earlier version pinned the whole undirected
+    data-dependency component of the write, which in a transformer block is
+    every op: one ``constant_pad_nd`` in front of an FFN matmul pinned the
+    attention that precedes it (issue #4990).
 
     Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
-    offsets (coarse tiling) are not offset writes, so no component is seeded and
+    offsets (coarse tiling) are not offset writes, so nothing is seeded and
     coarse tiling is not constrained.
     """
-    # Undirected adjacency over buffer names (op.name == its output buffer,
-    # Inductor convention). Edges: producer<->operand (read deps) and a
-    # MutationLayout op <-> its aliased target buffer.
-    adj: dict[str, set[str]] = {}
+    seeds = [op.name for op in graph.operations if _writes_at_constant_offset(op)]
+    if not seeds:
+        return set()
 
-    def link(a: str, b: str) -> None:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    seeds: list[str] = []
+    # Undirected MutationLayout op <-> target links (op.name == its output
+    # buffer, Inductor convention); these name one storage.
+    mutation_targets: dict[str, str] = {}
+    alias_links: dict[str, set[str]] = {}
     for op in graph.operations:
-        for dep in op_read_writes(op).reads:
-            name = getattr(dep, "name", None)
-            if name:
-                link(op.name, name)
         layout = getattr(op, "layout", None)
-        if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            try:
-                link(op.name, layout.target.get_name())
-            except (AttributeError, TypeError):
-                pass
-        if _writes_at_constant_offset(op):
-            seeds.append(op.name)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        try:
+            target = layout.target.get_name()
+        except (AttributeError, TypeError):
+            continue
+        mutation_targets[op.name] = target
+        alias_links.setdefault(op.name, set()).add(target)
+        alias_links.setdefault(target, set()).add(op.name)
 
-    op_names = {op.name for op in graph.operations}
-    component: set[str] = set()
+    reads_by_op = {
+        op.name: {
+            name
+            for dep in op_read_writes(op).reads
+            if (name := getattr(dep, "name", None))
+        }
+        for op in graph.operations
+    }
+
+    aliases: set[str] = set()
     stack = list(seeds)
     while stack:
-        node = stack.pop()
-        if node in component:
-            continue
-        component.add(node)
-        stack.extend(adj.get(node, ()))
-    return component & op_names
+        while stack:
+            node = stack.pop()
+            if node not in aliases:
+                aliases.add(node)
+                stack.extend(alias_links.get(node, ()))
+        # A copy-back reads an alias and writes a new target; it and the
+        # storage it writes join the alias set.
+        for writer, target in mutation_targets.items():
+            if writer not in aliases and reads_by_op[writer] & aliases:
+                stack.extend((writer, target))
+
+    readers = {name for name, reads in reads_by_op.items() if reads & aliases}
+    consumers = {name for name, reads in reads_by_op.items() if reads & readers}
+    return (aliases | readers | consumers) & reads_by_op.keys()
 
 
 def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
