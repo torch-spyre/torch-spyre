@@ -1,0 +1,101 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Default values for spyre-dashboard Helm chart.
+#  Override on the command line:  helm install ... --set key=value
+#  or with a values file:         helm install ... -f my-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Use:  helm install spyre-dashboard . -n <your-namespace>
+
+image:
+  nginx: nginx:alpine
+  git: alpine/git:latest
+  pullPolicy: Always
+
+git:
+  repo: git@github.com:anubhavjana/torch-spyre-anu-forked.git
+  branch: torch_spyre_dashboard
+  # Path inside the cloned repo where dashboard.html lives
+  dashboardPath: tests/dashboard
+
+ssh:
+  # Name of the Secret containing the SSH private key.
+  # Create with:
+  #   kubectl create secret generic spyre-dashboard-ssh-key \
+  #     --from-file=id_rsa=$HOME/.ssh/id_ed25519 -n <namespace>
+  secretName: spyre-dashboard-ssh-key
+
+security:
+  # context for fmaas cluster
+  # runAsUser: 1000
+  # runAsGroup: 1000
+  # fsGroup: 1000
+  # context for torch-cicd cluster
+  runAsUser: 1000840000
+  runAsGroup: 0
+  fsGroup: 1000840000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+service:
+  port: 80
+  targetPort: 8080
+
+route:
+  enabled: true
+  # Leave host empty to let OpenShift auto-generate:
+  #   <release-name>-<namespace>.apps.<cluster-domain>
+  host: ''
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+deployer: anubhavjana
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ClickHouse integration
+#  The patch-dashboard initContainer injects these as <meta> tags into
+#  dashboard.html so spyre-clickhouse.js can connect without hardcoding.
+#
+#  Before deploying, create the reader secret:
+#    kubectl create secret generic spyre-clickhouse-token \
+#      --from-literal=token=<your-clickhouse-password> \
+#      -n <namespace>
+# ──────────────────────────────────────────────────────────────────────────────
+clickhouse:
+  # ClickHouse Cloud HTTPS URL — direct connection from the browser.
+  # This is the public HTTPS endpoint, no nginx proxy needed for ClickHouse Cloud.
+  url: https://spyre-dashboard-clickhouse-clickhouse.apps.torch-cicd.spyre.res.ibm.com
+
+  # ClickHouse database name
+  db: spyre
+
+  # ClickHouse user for SELECT queries from the dashboard
+  user: default
+
+  # Name of the K8s Secret and key holding the password.
+  tokenSecret: spyre-clickhouse-token
+  tokenSecretKey: token
+
+  # Password-based auth fallback (used when tokenSecret is "")
+  passwordSecret: ''
+  passwordSecretKey: password
+
+  # Optional: pre-filter run list to a single workflow. Empty = all workflows.
+  defaultWorkflow: ''
+
+  # Number of recent runs shown in the "Fetch from ClickHouse" panel.
+  defaultLimit: 30
+
+  # When true, the newest run loads automatically when the dashboard opens.
+  autoload: false
+
+  # Internal service fields — not used for ClickHouse Cloud direct access
+  # but kept for future in-cluster ClickHouse deployments.
+  internalServiceHost: spyre-dashboard-clickhouse-clickhouse.apps.torch-cicd.spyre.res.ibm.com
+  internalServicePort: 443

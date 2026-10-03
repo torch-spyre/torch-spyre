@@ -1,0 +1,4133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Torch Spyre · Test Health Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+/* Dark Mode v2.1 - Fixed spacing */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f8fafc;--bg2:#ffffff;--bg3:#f1f5f9;--bg4:#e2e8f0;
+  --border:rgba(15,23,42,0.10);--border2:rgba(15,23,42,0.16);
+  --text:#0f172a;--text2:#475569;--text3:#64748b;
+  --accent:#2563eb;--accent2:#1d4ed8;
+  --pass:#16a34a;--fail:#dc2626;--xfail:#d97706;--skip:#6b7280;--xpass:#6366f1;
+  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;
+  --radius:8px;--radius-lg:12px;
+}
+[data-theme="dark"]{
+  --bg:#0f172a;--bg2:#1e293b;--bg3:#273548;--bg4:#334155;
+  --border:rgba(255,255,255,0.10);--border2:rgba(255,255,255,0.16);
+  --text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;
+  --accent:#3b82f6;--accent2:#2563eb;
+  --pass:#22c55e;--fail:#ef4444;--xfail:#f59e0b;--skip:#9ca3af;--xpass:#818cf8;
+}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.6;min-height:100vh;margin:0;padding:0}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg2)}
+::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+.main{width:100%;margin:0;padding:0;box-sizing:border-box;display:flex;min-height:100vh}
+.panel{display:none}.panel.active{display:block}
+.sidebar{position:sticky;top:0;background:#f8fafc;box-shadow:2px 0 8px rgba(0,0,0,0.06);padding:0;height:100vh;display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;transition:all .3s ease;width:280px;flex-shrink:0}
+[data-theme="dark"] .sidebar{background:#1e293b;box-shadow:2px 0 12px rgba(0,0,0,0.4)}
+.main.sidebar-collapsed .sidebar{width:70px}
+.sidebar-header{height:58px;padding:0 24px;box-shadow:0 1px 0 rgba(0,0,0,0.06);display:flex;align-items:center;gap:12px;transition:all .3s ease}
+[data-theme="dark"] .sidebar-header{box-shadow:0 1px 0 rgba(255,255,255,0.1)}
+.main.sidebar-collapsed .sidebar-header{padding:0 12px;justify-content:center}
+.sidebar-logo{width:32px;height:32px;background:linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;box-shadow:0 2px 8px rgba(37,99,235,0.3)}
+.sidebar-logo-text{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--text);letter-spacing:.05em;white-space:nowrap;transition:opacity .2s}
+[data-theme="dark"] .sidebar-logo-text{color:#fff}
+.main.sidebar-collapsed .sidebar-logo-text{opacity:0;width:0;overflow:hidden}
+.sidebar-toggle{width:28px;height:28px;background:linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);border:2px solid var(--border2);border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .3s;box-shadow:0 2px 8px rgba(37,99,235,0.2);margin:16px 24px 20px auto}
+[data-theme="dark"] .sidebar-toggle{border:2px solid rgba(255,255,255,0.2);box-shadow:0 2px 8px rgba(0,0,0,0.3)}
+.main.sidebar-collapsed .sidebar-toggle{margin:16px auto 20px}
+.sidebar-toggle:hover{background:linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);transform:scale(1.1);box-shadow:0 4px 12px rgba(37,99,235,0.4)}
+.sidebar-toggle svg{width:12px;height:12px;color:#fff;transition:transform .3s ease}
+.main.sidebar-collapsed .sidebar-toggle svg{transform:rotate(180deg)}
+.sidebar-title{font-family:var(--mono);font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:16px;padding:0 24px;white-space:nowrap;transition:opacity .2s;margin-top:24px}
+[data-theme="dark"] .sidebar-title{color:rgba(255,255,255,0.5)}
+.main.sidebar-collapsed .sidebar-title{opacity:0;pointer-events:none}
+.main-content-wrapper{flex:1;display:flex;flex-direction:column;min-width:0}
+.topbar{position:sticky;top:0;z-index:100;background:var(--bg);backdrop-filter:blur(12px);box-shadow:0 1px 3px rgba(0,0,0,0.06);padding:0 24px;height:58px;display:flex;align-items:center;gap:16px}
+[data-theme="dark"] .topbar{background:#1e293b !important;backdrop-filter:none !important;box-shadow:0 1px 6px rgba(0,0,0,0.3)}
+.topbar-tabs{display:flex;gap:6px;margin-left:auto}
+.tab-btn{font-family:var(--sans);font-size:12px;padding:7px 12px;border-radius:var(--radius);border:1px solid transparent;background:transparent;color:var(--text2);cursor:pointer;transition:all .15s}
+.tab-btn:hover{background:var(--bg3);color:var(--text);border-color:var(--border)}
+.tab-btn.active{background:var(--bg2);color:var(--accent);border-color:var(--border2)}
+.app-shell{flex:1;display:flex;flex-direction:column}
+.nav-list{display:flex;flex-direction:column;gap:4px;padding:0 12px;flex:1}
+.nav-item{padding:12px 16px;border:none;border-radius:var(--radius);background:transparent;color:var(--text2);font-size:13px;text-align:left;cursor:pointer;transition:all .2s;border-left:3px solid transparent;margin:0 12px;white-space:nowrap;overflow:visible;position:relative;display:flex;align-items:center;gap:8px}
+[data-theme="dark"] .nav-item{color:rgba(255,255,255,0.7)}
+.main.sidebar-collapsed .nav-item{padding:0;margin:6px auto;justify-content:center;text-align:center;font-size:20px;border-left:none;width:48px;height:48px;border-radius:50%;display:flex;align-items:center}
+.main.sidebar-collapsed .nav-item .nav-text{display:none}
+.main.sidebar-collapsed .nav-item::after{content:attr(data-tooltip);position:fixed;left:82px;background:var(--bg2);color:var(--text);padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;opacity:0;pointer-events:none;transition:all .2s;z-index:10000;box-shadow:0 8px 24px rgba(0,0,0,0.2);border:1px solid var(--border2);font-family:var(--sans);font-weight:400}
+[data-theme="dark"] .main.sidebar-collapsed .nav-item::after{background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);color:#fff;box-shadow:0 8px 24px rgba(0,0,0,0.4);border:1px solid rgba(59,130,246,0.3)}
+.main.sidebar-collapsed .nav-item:hover::after{opacity:1;left:78px}
+.nav-item:hover{background:var(--bg3);color:var(--text)}
+[data-theme="dark"] .nav-item:hover{background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.95)}
+.main.sidebar-collapsed .nav-item:hover{transform:scale(1.05)}
+[data-theme="dark"] .main.sidebar-collapsed .nav-item:hover{background:rgba(255,255,255,0.12)}
+.nav-item.active{background:rgba(37,99,235,0.15);color:#60a5fa;border-left-color:#2563eb;font-weight:500}
+.main.sidebar-collapsed .nav-item.active{background:rgba(37,99,235,0.25);border-left:none;box-shadow:0 0 0 2px rgba(59,130,246,0.4)}
+.nav-help{margin-top:auto;padding:16px 24px;box-shadow:0 -1px 0 rgba(0,0,0,0.06);font-size:11px;color:var(--text3);line-height:1.5;transition:opacity .2s}
+[data-theme="dark"] .nav-help{box-shadow:0 -1px 0 rgba(255,255,255,0.1);color:rgba(255,255,255,0.4)}
+.main.sidebar-collapsed .nav-help{opacity:0;pointer-events:none;padding:16px 8px}
+.content-area{padding:24px;background:var(--bg)}
+.content-area{display:flex;flex-direction:column;gap:18px}
+.panel-content{display:flex;flex-direction:column;gap:18px}
+.hero-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:18px}
+[data-theme="dark"] .hero-row{box-shadow:0 1px 3px rgba(0,0,0,0.3)}
+.hero-kicker{font-family:var(--mono);font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.08em}
+.hero-title{font-family:var(--mono);font-size:16px;color:var(--text);font-weight:500}
+.hero-sub{font-size:12px;color:var(--text3);margin-top:3px}
+.split-grid{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;align-items:start}
+.surface{background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:16px}
+[data-theme="dark"] .surface{box-shadow:0 1px 3px rgba(0,0,0,0.3)}
+.control-stack{display:flex;flex-direction:column;gap:16px}
+.chart-card{background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:16px}
+[data-theme="dark"] .chart-card{box-shadow:0 1px 3px rgba(0,0,0,0.3)}
+.chart-mini{height:220px}
+.run-list-compact{display:flex;flex-direction:column;gap:8px;max-height:280px;overflow:auto}
+@media(max-width:980px){
+  .main{flex-direction:column}
+  .sidebar{position:static;width:100%!important;height:auto;border-right:none;border-bottom:1px solid rgba(255,255,255,0.1)}
+  .sidebar-header{padding:16px 20px}
+  .sidebar-toggle{display:none}
+  .main.sidebar-collapsed .sidebar{width:100%!important}
+  .main.sidebar-collapsed .nav-item{padding:12px 16px;margin:0 12px;width:auto;height:auto;border-radius:var(--radius);font-size:13px;justify-content:flex-start}
+  .main.sidebar-collapsed .nav-item .nav-text{display:inline}
+  .main.sidebar-collapsed .sidebar-logo-text{opacity:1;width:auto}
+  .main.sidebar-collapsed .sidebar-header{padding:16px 20px}
+  .split-grid{grid-template-columns:1fr}
+}
+/* upload */
+.upload-section{min-height:calc(100vh - 100px);display:flex;align-items:center;justify-content:center}
+.upload-box{width:100%;max-width:640px}
+.upload-title{font-family:var(--mono);font-size:22px;font-weight:500;color:var(--text);margin-bottom:6px}
+.upload-sub{color:var(--text2);font-size:13px;margin-bottom:28px}
+.drop-zone{border:1.5px dashed var(--border2);border-radius:var(--radius-lg);padding:40px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg2)}
+.drop-zone:hover,.drop-zone.over{border-color:var(--accent);background:rgba(79,142,247,.05)}
+.drop-zone input{display:none}
+.drop-icon{width:40px;height:40px;margin:0 auto 12px;opacity:.4}
+.drop-label{font-size:14px;color:var(--text2)}
+.drop-hint{font-size:11px;font-family:var(--mono);color:var(--text3);margin-top:6px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--radius);border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-family:var(--sans);font-size:12px;cursor:pointer;transition:all .15s}
+.btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.btn-primary{background:var(--accent2);border-color:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent);color:#fff}
+.btn-sm{padding:5px 10px;font-size:11px}
+.btn-danger{border-color:rgba(240,82,82,.4);color:var(--fail)}
+.theme-toggle{width:32px;height:32px;border-radius:50%;border:1px solid var(--border2);background:var(--bg2);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .2s;margin-left:8px}
+.theme-toggle:hover{background:var(--bg3);border-color:var(--accent);transform:scale(1.05)}
+.theme-toggle svg{width:16px;height:16px;color:var(--text2);transition:all .2s}
+.theme-toggle:hover svg{color:var(--accent)}
+.btn-danger:hover{background:rgba(240,82,82,.1)}
+.or-divider{text-align:center;color:var(--text3);font-size:12px;margin:16px 0}
+.run-list{display:flex;flex-direction:column;gap:8px;margin-top:20px}
+.run-item{display:flex;align-items:center;gap:10px;background:var(--bg3);box-shadow:0 1px 2px rgba(0,0,0,0.06);border-radius:var(--radius);padding:10px 14px}
+[data-theme="dark"] .run-item{box-shadow:0 1px 2px rgba(0,0,0,0.25)}
+.run-item-name{font-family:var(--mono);font-size:12px;color:var(--text);flex:1}
+.run-item-meta{font-size:11px;color:var(--text3)}
+.run-badge{font-size:10px;font-family:var(--mono);padding:2px 7px;border-radius:10px}
+.rb-pass{background:rgba(52,201,138,.15);color:var(--pass)}
+.rb-fail{background:rgba(240,82,82,.15);color:var(--fail)}
+/* metrics */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:24px}
+.metric{background:linear-gradient(to bottom, rgba(255, 255, 255, 1) 0%, rgba(59, 130, 246, 0.08) 100%);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:16px;position:relative;border:1px solid var(--border);transition:all .25s ease}
+.metric:hover{box-shadow:0 4px 12px rgba(0,0,0,0.15);border-color:var(--accent);transform:scale(1.02) translateY(-2px)}
+[data-theme="dark"] .metric{box-shadow:0 1px 3px rgba(0,0,0,0.3);background:linear-gradient(to bottom, rgba(30, 41, 59, 1) 0%, rgba(59, 130, 246, 0.15) 100%)}
+[data-theme="dark"] .metric:hover{box-shadow:0 4px 12px rgba(0,0,0,0.6)}
+.metric-label{font-size:11px;font-family:var(--mono);color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between}
+.metric-value{font-size:26px;font-weight:300;line-height:1}
+.metric-sub{font-size:11px;color:var(--text3);margin-top:4px}
+.metric-download{width:20px;height:20px;padding:3px;border-radius:4px;background:transparent;border:none;color:var(--text3);cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center}
+.metric-download:hover{background:var(--bg3);color:var(--accent)}
+.metric-download svg{width:14px;height:14px}
+/* group-by tabs */
+.groupby-row{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.groupby-label{font-size:11px;font-family:var(--mono);color:var(--text3);text-transform:uppercase;letter-spacing:.08em;white-space:nowrap}
+.gb-btn{font-size:11px;font-family:var(--mono);padding:4px 10px;border-radius:var(--radius);border:1px solid var(--border2);background:transparent;color:var(--text2);cursor:pointer;transition:all .15s}
+.gb-btn:hover{border-color:var(--accent);color:var(--accent)}
+.gb-btn.active{background:rgba(79,142,247,.15);border-color:var(--accent);color:var(--accent)}
+/* section */
+.section-hd{display:flex;align-items:center;justify-content:space-between;margin:28px 0 14px}
+.section-title{font-family:var(--mono);font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em}
+.section-actions{display:flex;gap:6px}
+/* bars */
+.bar-track{display:flex;height:8px;border-radius:4px;overflow:hidden;gap:1px;background:var(--bg4)}
+.bar-seg{height:100%;transition:flex .5s}
+.bs-pass{background:var(--pass)}.bs-fail{background:var(--fail)}
+.bs-xfail{background:var(--xfail)}.bs-skip{background:var(--skip)}.bs-xpass{background:var(--xpass)}
+/* filter pills */
+.tag-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.tag-pill{font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:20px;border:1px solid var(--border2);background:transparent;color:var(--text2);cursor:pointer;transition:all .15s}
+.tag-pill:hover{border-color:var(--accent);color:var(--accent)}
+.tag-pill.active{background:rgba(79,142,247,.15);border-color:var(--accent);color:var(--accent)}
+/* search */
+.search-wrap{position:relative;margin-bottom:14px}
+.search-wrap svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none}
+.search-input{width:100%;padding:8px 12px 8px 34px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:var(--sans);font-size:13px;outline:none;transition:border-color .15s}
+.search-input:focus{border-color:var(--accent)}
+.search-input::placeholder{color:var(--text3)}
+/* cards */
+.model-cards{display:grid;gap:10px}
+.model-card{background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:14px 16px;cursor:pointer;transition:all .15s}
+[data-theme="dark"] .model-card{box-shadow:0 1px 3px rgba(0,0,0,0.3)}
+.model-card:hover{box-shadow:0 2px 6px rgba(0,0,0,0.12);transform:translateY(-1px)}
+[data-theme="dark"] .model-card:hover{box-shadow:0 2px 6px rgba(0,0,0,0.4)}
+.model-card.selected{border-color:var(--accent)}
+.mc-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.mc-name{font-family:var(--mono);font-size:13px;font-weight:500;color:var(--text)}
+.mc-pct{font-family:var(--mono);font-size:12px;color:var(--text2)}
+.mc-stats{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}
+.mc-stat{font-size:11px;color:var(--text3);display:flex;align-items:center;gap:4px}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.d-pass{background:var(--pass)}.d-fail{background:var(--fail)}
+.d-xfail{background:var(--xfail)}.d-skip{background:var(--skip)}.d-xpass{background:var(--xpass)}
+/* legend */
+.legend{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:18px}
+.leg-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text2)}
+.leg-dot{width:9px;height:9px;border-radius:2px}
+.test-table{width:100%;border-collapse:collapse}
+.test-table th{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);background:var(--bg3)}
+.test-table td{padding:7px 12px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text2)}
+.test-table td:first-child{font-family:var(--mono);color:var(--text);max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.test-table tr:last-child td{border-bottom:none}
+.test-table tr:hover td{background:var(--bg3)}
+.status-badge{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px}
+.sb-passed{background:rgba(52,201,138,.15);color:var(--pass)}
+.sb-failed{background:rgba(240,82,82,.15);color:var(--fail)}
+.sb-xfail{background:rgba(245,158,11,.15);color:var(--xfail)}
+.sb-skipped{background:rgba(107,114,128,.15);color:var(--skip)}
+.sb-xpass{background:rgba(129,140,248,.15);color:var(--xpass)}
+.sb-error{background:rgba(220,38,38,.12);color:#b91c1c}
+.sb-pass{background:rgba(22,163,74,.12);color:#15803d}
+.sb-fail{background:rgba(220,38,38,.12);color:#b91c1c}
+.sb-skip{background:rgba(107,114,128,.12);color:#4b5563}
+.table-wrap{max-height:420px;overflow-y:auto;overflow-x:visible}
+.note-row{padding:8px 12px;font-size:11px;color:var(--text3);font-family:var(--mono)}
+.action-menu-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text);cursor:pointer;padding:6px 10px;font-size:16px;font-weight:bold;line-height:1;border-radius:4px;transition:all .2s}
+.action-menu-btn:hover{background:var(--bg4);color:var(--text);border-color:var(--border2)}
+.action-dropdown{position:fixed;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius);box-shadow:0 12px 32px rgba(0,0,0,0.25);min-width:150px;z-index:2147483647;display:none}
+.action-dropdown[style*="display: block"]{display:block}
+[data-theme="dark"] .action-dropdown{box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.action-dropdown-item{display:block;width:100%;padding:10px 14px;text-align:left;background:transparent;border:none;color:var(--text2);font-size:13px;cursor:pointer;transition:all .15s;border-bottom:1px solid var(--border)}
+.action-dropdown-item:first-child{border-radius:var(--radius) var(--radius) 0 0}
+.action-dropdown-item:last-child{border-bottom:none;border-radius:0 0 var(--radius) var(--radius)}
+.action-dropdown-item:hover{background:var(--bg3);color:var(--text)}
+.action-dropdown-item.danger{color:var(--fail)}
+.action-dropdown-item.danger:hover{background:rgba(220,38,38,.1);color:var(--fail)}
+/* failure detail */
+.failure-msg{font-family:var(--mono);font-size:10px;color:var(--fail);background:rgba(240,82,82,.07);border-radius:4px;padding:4px 8px;margin-top:2px;white-space:pre-wrap;word-break:break-all;max-height:120px;overflow-y:auto}
+/* trend */
+.trend-empty{text-align:center;padding:60px 20px;color:var(--text3);font-size:13px}
+.trend-empty code{font-family:var(--mono);font-size:12px;background:var(--bg3);padding:2px 6px;border-radius:4px}
+.run-timeline{display:flex;flex-direction:column;gap:16px}
+.run-block{background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,0.08);border-radius:var(--radius-lg);padding:14px 16px}
+[data-theme="dark"] .run-block{box-shadow:0 1px 3px rgba(0,0,0,0.3)}
+.run-block-hd{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.run-num{font-family:var(--mono);font-size:11px;color:var(--text3)}
+.run-filename{font-family:var(--mono);font-size:12px;color:var(--text)}
+.run-time-label{font-size:11px;color:var(--text3);margin-left:auto}
+.chart-container{position:relative;width:100%}
+/* overall bar */
+.overall-bar-wrap{margin-bottom:24px}
+.overall-bar-label{font-size:11px;font-family:var(--mono);color:var(--text3);margin-bottom:5px}
+.overall-bar{display:flex;height:14px;border-radius:7px;overflow:hidden;gap:1px}
+/* toast - top right corner with icon, title, and message */
+.toast{position:fixed;top:24px;right:24px;background:var(--bg3);box-shadow:0 4px 12px rgba(0,0,0,0.15);border-radius:var(--radius);padding:14px 16px;font-size:13px;color:var(--text);z-index:9999;transform:translateX(400px);opacity:0;transition:all .3s;display:flex;align-items:center;gap:12px;min-width:300px;max-width:400px;border:1px solid var(--border2);border-left:4px solid var(--accent)}
+[data-theme="dark"] .toast{box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.toast.show{transform:translateX(0);opacity:1}
+.toast.success{border-left-color:var(--pass)}
+.toast.error{border-left-color:var(--fail)}
+.toast-icon{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
+.toast.success .toast-icon{background:var(--pass);color:white}
+.toast.error .toast-icon{background:var(--fail);color:white}
+.toast-content{flex:1;display:flex;flex-direction:column;gap:4px}
+.toast-title{font-weight:600;font-size:13px;color:var(--text);display:flex;align-items:center;justify-content:space-between}
+.toast-message{font-size:12px;color:var(--text2);line-height:1.4}
+.toast-close{width:18px;height:18px;border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:14px;line-height:1;transition:all .2s;flex-shrink:0}
+.toast-close:hover{background:var(--bg2);color:var(--text)}
+/* info icon and tooltip */
+.info-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:var(--bg4);color:var(--text3);font-size:10px;font-weight:600;cursor:pointer;margin-left:6px;transition:all .2s;position:relative;border:1px solid var(--border2);z-index:1;text-transform:none}
+[data-theme="dark"] .info-icon{background:rgba(255,255,255,0.1);border-color:rgba(255,255,255,0.2)}
+.info-icon:hover{background:var(--accent);color:#fff;border-color:var(--accent);transform:scale(1.1);z-index:10001}
+.info-icon::before{content:'i';font-style:normal;font-family:var(--sans)}
+.info-tooltip{position:absolute;top:50%;left:calc(100% + 12px);transform:translateY(-50%);background:var(--bg2);color:var(--text2);padding:10px 12px;border-radius:var(--radius);font-size:11px;line-height:1.5;white-space:normal;width:240px;opacity:0;pointer-events:none;transition:all .2s;z-index:10002;box-shadow:0 8px 24px rgba(0,0,0,0.2);border:1px solid var(--border2);font-family:var(--sans);font-weight:400}
+[data-theme="dark"] .info-tooltip{background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);box-shadow:0 8px 24px rgba(0,0,0,0.4);border:1px solid rgba(59,130,246,0.3)}
+.info-tooltip::after{content:'';position:absolute;top:50%;right:100%;transform:translateY(-50%);border:6px solid transparent;border-right-color:var(--bg2);z-index:10003}
+[data-theme="dark"] .info-tooltip::after{border-right-color:#1e293b}
+.info-icon:hover .info-tooltip{opacity:1;left:calc(100% + 16px)}
+/* developer link and tooltip */
+.dev-link{position:relative;display:inline-block;color:var(--accent);cursor:pointer;text-decoration:none;transition:all .2s}
+.dev-link:hover{color:var(--accent2);text-decoration:underline}
+.dev-tooltip{position:absolute;top:50%;left:calc(100% + 12px);transform:translateY(-50%);background:var(--bg2);color:var(--text2);padding:10px 14px;border-radius:var(--radius);font-size:11px;line-height:1.6;white-space:nowrap;opacity:0;pointer-events:none;transition:all .2s;z-index:10002;box-shadow:0 8px 24px rgba(0,0,0,0.2);border:1px solid var(--border2);font-family:var(--sans);font-weight:400}
+[data-theme="dark"] .dev-tooltip{background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);box-shadow:0 8px 24px rgba(0,0,0,0.4);border:1px solid rgba(59,130,246,0.3)}
+.dev-tooltip::after{content:'';position:absolute;top:50%;right:100%;transform:translateY(-50%);border:6px solid transparent;border-right-color:var(--bg2);z-index:10003}
+[data-theme="dark"] .dev-tooltip::after{border-right-color:#1e293b}
+.dev-link:hover .dev-tooltip{opacity:1;left:calc(100% + 16px)}
+.empty{text-align:center;padding:40px;color:var(--text3);font-size:13px}
+.export-row{display:flex;gap:8px;flex-wrap:wrap}
+.badge-new{font-size:9px;font-family:var(--mono);background:var(--accent2);color:#fff;padding:1px 5px;border-radius:8px;margin-left:4px;vertical-align:middle}
+.fade-in{animation:fadeIn .3s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+/* loading animations */
+.loading-text{display:inline-flex;align-items:center;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.loading-dots::after{content:'';animation:dots 1.5s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}100%{content:''}}
+
+/* Full-screen loader overlay - theme-aware and lighter */
+.loader-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.15);backdrop-filter:blur(2px);display:none;align-items:center;justify-content:center;z-index:99999;flex-direction:column;gap:16px}
+[data-theme="dark"] .loader-overlay{background:rgba(0,0,0,0.3)}
+.loader-overlay.show{display:flex}
+.loader-spinner{width:48px;height:48px;border:4px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loader-text{color:var(--text);font-size:14px;font-weight:500}
+/* sub-tabs */
+.sub-tabs{display:flex;gap:4px;margin-bottom:18px;border-bottom:2px solid var(--border);padding-bottom:0}
+.sub-tab-btn{font-family:var(--sans);font-size:13px;padding:10px 16px;border:none;background:transparent;color:var(--text2);cursor:pointer;transition:all .15s;border-bottom:2px solid transparent;margin-bottom:-2px;position:relative}
+.sub-tab-btn:hover{color:var(--text);background:var(--bg3)}
+.sub-tab-btn.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
+.sub-panel{display:none}.sub-panel.active{display:block}
+@media(max-width:640px){.main{padding:14px}.topbar{padding:0 14px}.metrics{grid-template-columns:repeat(2,1fr)}}
+
+/* failure expand row */
+.failure-row td{padding:0 12px 8px 12px!important;border-bottom:none}
+.failure-row-inner{background:rgba(220,38,38,.06);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:10px;color:#b91c1c;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;border-left:2px solid var(--fail)}
+
+/* action menu styles */
+.action-menu-container{position:relative;display:inline-block}
+.action-menu-btn{background:transparent;border:none;border-radius:var(--radius);padding:4px 8px;font-size:11px;color:var(--text2);cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:4px}
+.action-menu-btn:hover{background:var(--bg3);color:var(--accent)}
+.action-menu-dropdown{position:fixed;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius);box-shadow:0 4px 12px rgba(0,0,0,.15);min-width:160px;z-index:9999;display:none}
+.action-menu-dropdown.show{display:block}
+.action-menu-item{display:block;width:100%;text-align:left;padding:8px 12px;font-size:12px;background:transparent;border:none;color:var(--text);cursor:pointer;transition:all .15s;font-family:var(--sans);position:relative}
+.action-menu-item:hover{background:var(--bg3);color:var(--accent)}
+.action-menu-item:first-child{border-radius:var(--radius) var(--radius) 0 0}
+.action-menu-item:last-child{border-radius:0 0 var(--radius) var(--radius)}
+
+/* Multi-select dropdown styles */
+.multiselect-dropdown{position:relative;display:inline-block;min-width:200px;z-index:100}
+.multiselect-dropdown.disabled{opacity:0.5;pointer-events:none;}
+.multiselect-button{padding:6px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:8px;transition:border-color .2s}
+.multiselect-button:hover{border-color:var(--text3)}
+[data-theme="dark"] .multiselect-button{background:var(--bg);border-color:rgba(255,255,255,0.08)}
+[data-theme="dark"] .multiselect-button:hover{border-color:rgba(255,255,255,0.15)}
+.multiselect-button-text{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.multiselect-arrow{font-size:10px;color:var(--text3)}
+.multiselect-clear-btn{background:transparent;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:0 4px;display:flex;align-items:center;justify-content:center;transition:color .2s}
+.multiselect-clear-btn:hover{color:var(--fail)}
+.multiselect-menu{position:fixed;background:var(--bg2);border:1px solid var(--border2);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.15);min-width:200px;max-height:250px;overflow-y:auto;z-index:10001;display:none}
+[data-theme="dark"] .multiselect-menu{background:var(--bg2);border-color:rgba(255,255,255,0.08);box-shadow:0 4px 12px rgba(0,0,0,0.5)}
+.multiselect-menu.show{display:block}
+.multiselect-option{padding:8px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:8px;transition:background-color .2s}
+.multiselect-option:hover{background-color:var(--bg3)}
+.multiselect-option input[type="checkbox"]{cursor:pointer}
+.spacing-bottom{ margin-bottom: 18px;}
+</style>
+</head>
+<body>
+
+<!-- Full-screen loader overlay -->
+<div class="loader-overlay" id="loader-overlay">
+  <div class="loader-spinner"></div>
+  <div class="loader-text" id="loader-text">Loading...</div>
+</div>
+
+<div class="main">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">
+        <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="32" height="32" rx="4" fill="url(#ibm-gradient)"/>
+          <path d="M8 10h16M8 14h16M8 18h16M8 22h16" stroke="white" stroke-width="1.5" stroke-linecap="square"/>
+          <path d="M12 10v12M16 10v12M20 10v12" stroke="white" stroke-width="1.5" stroke-linecap="square"/>
+          <defs>
+            <linearGradient id="ibm-gradient" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#0f62fe"/>
+              <stop offset="1" stop-color="#0043ce"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div class="sidebar-logo-text">Spyre View</div>
+    </div>
+    <div class="sidebar-title">Test Coverage</div>
+    <div class="nav-list">
+      <button class="nav-item active" id="nav-overview" onclick="switchTab('overview')" data-tooltip="Test Overview">
+        <span class="nav-icon">🔍</span>
+        <span class="nav-text">Test Overview</span>
+      </button>
+      <button class="nav-item" id="nav-details" onclick="switchTab('details')" data-tooltip="Test Details">
+        <span class="nav-icon">📋</span>
+        <span class="nav-text">Test Details</span>
+      </button>
+      <!-- COMMENTED OUT: Run History Tab -->
+      <!-- <button class="nav-item" id="nav-history" onclick="switchTab('trend')" data-tooltip="Run History">
+        <span class="nav-icon">📈</span>
+        <span class="nav-text">Run History</span>
+      </button> -->
+      <button class="nav-item" id="nav-reports" onclick="switchTab('reports')" data-tooltip="All Commits">
+        <span class="nav-icon">📊</span>
+        <span class="nav-text">All Commits</span>
+      </button>
+      <!-- Hidden: Add Reports section not needed for ClickHouse-only mode -->
+      <!-- <button class="nav-item" id="nav-upload" onclick="switchTab('upload')" data-tooltip="Add Reports">
+        <span class="nav-icon">➕</span>
+        <span class="nav-text">Add Reports</span>
+      </button> -->
+    </div>
+    
+    <div class="nav-help">
+      <div style="margin-bottom:12px">Navigate between different views: overview, detailed analysis, and lists.</div>
+      <div style="font-size:10px;color:var(--text3);border-top:1px solid var(--border);padding-top:12px;margin-top:12px">
+        <div style="font-weight:600;margin-bottom:6px;color:var(--text2)">Developers</div>
+        <div style="margin-bottom:4px">
+          <a href="mailto:thanmaiboddoju@ibm.com" class="dev-link">
+            Thanmai Boddoju
+            <span class="dev-tooltip">
+              <div style="font-weight:600;margin-bottom:4px">Thanmai Boddoju</div>
+              <div style="color:var(--text3);font-size:10px">Thanmaiboddoju@ibm.com</div>
+              <div style="color:var(--text3);font-size:10px">IBM Z</div>
+            </span>
+          </a>
+        </div>
+        <div>
+          <a href="mailto:anubhavjana@ibm.com" class="dev-link">
+            Anubhav Jana
+            <span class="dev-tooltip">
+              <div style="font-weight:600;margin-bottom:4px">Anubhav Jana</div>
+              <div style="color:var(--text3);font-size:10px">Anubhav.Jana97@ibm.com</div>
+              <div style="color:var(--text3);font-size:10px">IBM Research</div>
+            </span>
+          </a>
+        </div>
+      </div>
+    </div>
+    <div class="sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"></polyline>
+      </svg>
+    </div>
+  </aside>
+
+    <div class="main-content-wrapper">
+      <div class="topbar">
+        <div id="topbar-run-info" style="display:none;margin-right:auto">
+          <span style="font-size:12px;color:var(--text2);font-weight:600" id="topbar-run-name">—</span>
+        </div>
+        <div class="topbar-tabs">
+        </div>
+        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" id="theme-toggle">
+          <svg id="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="display:none">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+          </svg>
+          <svg id="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+          </svg>
+        </button>
+      </div>
+
+      <div class="app-shell">
+        <div class="content-area">
+
+      <!-- UPLOAD -->
+      <div class="panel" id="panel-upload">
+        <div class="hero-row">
+          <div>
+            <div class="hero-kicker">ingest reports</div>
+            <div class="hero-title">model coverage dashboard</div>
+            <div class="hero-sub">Upload one or more pytest JUnit XML reports to analyse op/model coverage and compare runs over time.</div>
+          </div>
+          <div class="export-row">
+            <button class="btn btn-primary" onclick="loadSample()">Load sample data</button>
+          </div>
+        </div>
+        <div class="surface" style="margin-top:18px">
+          <div class="drop-zone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+            <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <div class="drop-label">Drop report.xml files here, or click to browse</div>
+            <div class="drop-hint">pytest --junit-xml=report.xml -v &nbsp;·&nbsp; multiple files supported for trend</div>
+            <input type="file" id="fileInput" accept=".xml,text/xml" multiple>
+          </div>
+          <div class="or-divider">— or —</div>
+          <div style="text-align:center"><button class="btn" onclick="switchTab('overview')">Open dashboard</button></div>
+          <div id="run-list-preview" style="display:none">
+            <div class="section-hd" style="margin-top:24px">
+              <span class="section-title">loaded runs</span>
+              <button class="btn btn-sm btn-danger" onclick="clearAll()">Clear all</button>
+            </div>
+            <div class="run-list" id="run-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- REPORTS TABLE -->
+      <div class="panel" id="panel-reports">
+        <!-- <div class="hero-row spacing-bottom">
+          <div>
+            <div class="hero-kicker">all reports</div>
+            <div class="hero-title">Commits Summary</div>
+            <div class="hero-sub">View commits from ClickHouse</div>
+          </div>
+        </div> -->
+
+        <!-- ClickHouse Commits Table -->
+        <div id="commits-section" style="margin-bottom:24px">
+          <div class="surface">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:12px">
+              <div style="display:flex;align-items:center;gap:4px">
+                <div style="font-family:var(--mono);font-size:13px;font-weight:500;color:var(--text)">
+                  Test Results by Commit
+                </div>
+                <span class="info-icon">
+                  <span class="info-tooltip">Test execution results for each commit from ClickHouse. Click "View Details" to see full test breakdown.</span>
+                </span>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <label style="font-size:11px;font-family:var(--mono);color:var(--text3)">FILTER:</label>
+                <div class="multiselect-dropdown" id="commit-type-filter-container">
+                  <div class="multiselect-button" onclick="toggleCommitTypeFilter(event)">
+                    <span class="multiselect-button-text" id="commit-filter-text">PR Merge</span>
+                    <span class="multiselect-arrow">▼</span>
+                  </div>
+                  <div class="multiselect-menu" id="commit-type-filter-menu">
+                    <label class="multiselect-option">
+                      <input type="radio" name="commit-type" value="push" checked onchange="updateCommitTypeFilter()"> PR Merge
+                    </label>
+                    <label class="multiselect-option">
+                      <input type="radio" name="commit-type" value="merge-queue" onchange="updateCommitTypeFilter()"> PR merge queue
+                    </label>
+                    <label class="multiselect-option">
+                      <input type="radio" name="commit-type" value="commit" onchange="updateCommitTypeFilter()"> PR Commit
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="table-wrap" style="max-height:600px">
+              <table class="test-table">
+                <thead>
+                  <tr>
+                    <th style="width:40px">#</th>
+                    <th>Commit SHA</th>
+                    <th>PR</th>
+                    <th>Branch</th>
+                    <th>Workflows</th>
+                    <th style="text-align:center">Total Tests</th>
+                    <th style="text-align:center">
+                      <div style="display:inline-flex;align-items:center;gap:4px">
+                        Passed
+                        <span class="info-icon">
+                          <span class="info-tooltip">Includes passed tests + xpass (unexpected passes)</span>
+                        </span>
+                      </div>
+                    </th>
+                    <th style="text-align:center">
+                      <div style="display:inline-flex;align-items:center;gap:4px">
+                        Failed
+                        <span class="info-icon">
+                          <span class="info-tooltip">Includes failed tests + xfail (expected failures)</span>
+                        </span>
+                      </div>
+                    </th>
+                    <th style="text-align:center">Pass%</th>
+                    <th style="text-align:center">Latest Run</th>
+                    <th style="text-align:center;width:120px">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="commits-table-body">
+                  <tr><td colspan="9" style="text-align:center;padding:20px;color:var(--text3)">
+                    <span class="loading-text">Loading commits from ClickHouse<span class="loading-dots"></span></span>
+                  </td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-top:1px solid var(--border)">
+              <div style="font-size:12px;color:var(--text3)" id="commits-pagination-info">Showing 0 commits</div>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-sm" id="commits-prev-btn" onclick="loadPreviousCommits()" disabled>← Previous</button>
+                <button class="btn btn-sm" id="commits-next-btn" onclick="loadNextCommits()" disabled>Next →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hidden: Uploaded reports section not needed for ClickHouse-only mode -->
+        <!-- <div id="reports-empty" class="empty" style="display:none">
+          No reports uploaded yet. <a href="#" onclick="switchTab('upload');return false;" style="color:var(--accent)">Upload a report →</a>
+        </div>
+
+        <div id="reports-content" style="display:none">
+          <div class="surface">
+            <div style="font-family:var(--mono);font-size:13px;font-weight:500;color:var(--text);margin-bottom:14px">
+              Uploaded Reports
+            </div>
+            <div class="table-wrap" style="max-height:none">
+              <table class="test-table">
+                <thead>
+                  <tr>
+                    <th style="width:50px">#</th>
+                    <th>Report Name</th>
+                    <th style="text-align:center">Total Tests</th>
+                    <th style="text-align:center">Passed</th>
+                    <th style="text-align:center">Failed</th>
+                    <th style="text-align:center">Xfail</th>
+                    <th style="text-align:center">Xpass</th>
+                    <th style="text-align:center">Skipped</th>
+                    <th style="text-align:center">Error</th>
+                    <th style="text-align:center">Pass Rate</th>
+                    <th style="text-align:center">Uploaded</th>
+                    <th style="text-align:center;width:180px">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="reports-table-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div> -->
+      </div><!-- end panel-reports -->
+
+      <!-- COMMON HEADER: Hidden - controls moved to topbar -->
+      <div id="common-run-header" style="display:none"></div>
+
+      <!-- OVERVIEW -->
+      <div class="panel active" id="panel-overview">
+        <div id="overview-empty" class="empty" style="display:none">
+          <div style="text-align:center;padding:40px">
+            <div style="font-size:18px;color:var(--text2);margin-bottom:12px">⚠️ No Data Available</div>
+            <div style="font-size:14px;color:var(--text3);margin-bottom:16px">No test data has been loaded yet, or there was an error loading data from the database.</div>
+            <div style="font-size:13px;color:var(--text3)">Try selecting a commit from the <a href="#" onclick="switchTab('reports');return false;" style="color:var(--accent);text-decoration:underline">Commits tab</a></div>
+          </div>
+        </div>
+        <div id="overview-content">
+          
+          <!-- Generic Filters -->
+          <div class="surface" style="margin-bottom:18px;padding:12px 16px">
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:4px">
+                <label style="font-size:11px;font-family:var(--mono);color:var(--text3);font-weight:600">TEST FILTERS:</label>
+                <span class="info-icon">
+                  <span class="info-tooltip">Filter tests by dtype, operation, model, or module. Select multiple values to narrow results.</span>
+                </span>
+              </div>
+              
+              <!-- Dtype Filter -->
+              <div class="multiselect-dropdown" id="filter-dtype-container">
+                <div class="multiselect-button" onclick="toggleFilter('dtype', event)">
+                  <span class="multiselect-button-text" id="filter-dtype-text">Dtype: All</span>
+                  <span class="multiselect-arrow" id="filter-dtype-arrow">▼</span>
+                  <button class="multiselect-clear-btn" id="filter-dtype-clear" onclick="clearFilter('dtype'); event.stopPropagation();" style="display:none;" title="Clear filter">✕</button>
+                </div>
+                <div class="multiselect-menu" id="filter-dtype-menu">
+                  <div style="padding:8px;border-bottom:1px solid var(--border)">
+                    <input type="text" id="filter-dtype-search" placeholder="Search dtypes..."
+                      style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg2);color:var(--text)"
+                      oninput="filterOptions('dtype')" onclick="event.stopPropagation()">
+                  </div>
+                  <div id="filter-dtype-options">
+                    <!-- Will be populated dynamically -->
+                  </div>
+                </div>
+              </div>
+              
+              <!-- Op Filter -->
+              <div class="multiselect-dropdown" id="filter-op-container">
+                <div class="multiselect-button" onclick="toggleFilter('op', event)">
+                  <span class="multiselect-button-text" id="filter-op-text">Op: All</span>
+                  <span class="multiselect-arrow" id="filter-op-arrow">▼</span>
+                  <button class="multiselect-clear-btn" id="filter-op-clear" onclick="clearFilter('op'); event.stopPropagation();" style="display:none;" title="Clear filter">✕</button>
+                </div>
+                <div class="multiselect-menu" id="filter-op-menu">
+                  <div style="padding:8px;border-bottom:1px solid var(--border)">
+                    <input type="text" id="filter-op-search" placeholder="Search ops..."
+                      style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg2);color:var(--text)"
+                      oninput="filterOptions('op')" onclick="event.stopPropagation()">
+                  </div>
+                  <div id="filter-op-options">
+                    <!-- Will be populated dynamically -->
+                  </div>
+                </div>
+              </div>
+              
+              <!-- Model Filter -->
+              <div class="multiselect-dropdown" id="filter-model-container">
+                <div class="multiselect-button" onclick="toggleFilter('model', event)">
+                  <span class="multiselect-button-text" id="filter-model-text">Model: All</span>
+                  <span class="multiselect-arrow" id="filter-model-arrow">▼</span>
+                  <button class="multiselect-clear-btn" id="filter-model-clear" onclick="clearFilter('model'); event.stopPropagation();" style="display:none;" title="Clear filter">✕</button>
+                </div>
+                <div class="multiselect-menu" id="filter-model-menu">
+                  <div style="padding:8px;border-bottom:1px solid var(--border)">
+                    <input type="text" id="filter-model-search" placeholder="Search models..."
+                      style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg2);color:var(--text)"
+                      oninput="filterOptions('model')" onclick="event.stopPropagation()">
+                  </div>
+                  <div id="filter-model-options">
+                    <!-- Will be populated dynamically -->
+                  </div>
+                </div>
+              </div>
+
+              <!-- Module Filter -->
+              <div class="multiselect-dropdown" id="filter-module-container">
+                <div class="multiselect-button" onclick="toggleFilter('module', event)">
+                  <span class="multiselect-button-text" id="filter-module-text">Module: All</span>
+                  <span class="multiselect-arrow" id="filter-module-arrow">▼</span>
+                  <button class="multiselect-clear-btn" id="filter-module-clear" onclick="clearFilter('module'); event.stopPropagation();" style="display:none;" title="Clear filter">✕</button>
+                </div>
+                <div class="multiselect-menu" id="filter-module-menu">
+                  <div style="padding:8px;border-bottom:1px solid var(--border)">
+                    <input type="text" id="filter-module-search" placeholder="Search modules..."
+                      style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg2);color:var(--text)"
+                      oninput="filterOptions('module')" onclick="event.stopPropagation()">
+                  </div>
+                  <div id="filter-module-options">
+                    <!-- Will be populated dynamically -->
+                  </div>
+                </div>
+              </div>
+              
+              <div style="margin-left:auto;font-size:12px;color:var(--text3)" id="filter-status">
+                All results
+              </div>
+            </div>
+          </div>
+
+          <div class="metrics" id="metrics"></div>
+
+          <!-- Show only Summary in Overview -->
+          <div id="sub-panel-summary">
+            <!-- Row 1: Status Distribution and Coverage Results -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px;margin-bottom:18px">
+              <!-- Status Distribution Chart -->
+              <div class="chart-card">
+                <div class="section-hd" style="margin:0 0 14px">
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <span class="section-title">Test Status Distribution</span>
+                    <span class="info-icon">
+                      <span class="info-tooltip">Breakdown of test results: passed, failed, xfail (expected failures), xpass (unexpected passes), and skipped tests.</span>
+                    </span>
+                  </div>
+                </div>
+                <div class="chart-container" style="height:320px;padding:16px">
+                  <canvas id="summary-pie-chart"></canvas>
+                </div>
+              </div>
+
+              <div class="chart-card" style="display:flex;flex-direction:column">
+                <!-- Operation Coverage Section -->
+                <div style="flex:1;display:flex;flex-direction:column">
+                  <div style="font-size:11px;font-family:var(--mono);color:var(--text2);margin-bottom:10px;display:flex;align-items:center;gap:4px">
+                    <span style="text-transform:uppercase;letter-spacing:.08em;">Operation Coverage</span>
+                    <span class="info-icon">
+                      <span class="info-tooltip">Test coverage for PyTorch operations. Shows number of tests and pass rate per operation.</span>
+                    </span>
+                  </div>
+                  <div id="model-op-coverage" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;flex:1"></div>
+                </div>
+                
+                <!-- Module Coverage Section -->
+                <div style="flex:1;margin-top:16px;padding-top:16px;border-top:1px solid var(--border);display:flex;flex-direction:column">
+                  <div style="font-size:11px;font-family:var(--mono);color:var(--text2);margin-bottom:10px;display:flex;align-items:center;gap:4px">
+                    <span style="text-transform:uppercase;letter-spacing:.08em;">Module Coverage</span>
+                    <span class="info-icon">
+                      <span class="info-tooltip">Test coverage by test module. Displays total tests and pass rate for each module.</span>
+                    </span>
+                  </div>
+                  <div id="model-module-coverage" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;flex:1"></div>
+                </div>
+              </div>
+              <!-- Model Test Results -->
+              <!-- <div class="chart-card">
+                <div class="section-hd" style="margin:0 0 14px">
+                  <span class="section-title">model test results</span>
+                  <select id="model-selector" class="btn btn-sm" onchange="updateModelPieChart()" style="min-width:200px;max-width:280px">
+                    <option value="">Select a model...</option>
+                  </select>
+                </div>
+                <div id="model-chart-container" style="display:none">
+                  <div style="display:flex;gap:16px;align-items:center;min-height:300px">
+                    <div style="flex:0 0 auto;width:280px;height:280px;display:flex;align-items:center;justify-content:center">
+                      <canvas id="model-pie-chart"></canvas>
+                    </div>
+                    <div id="model-stats" style="flex:1;display:flex;flex-direction:column;gap:8px;padding:12px"></div>
+                  </div>
+                </div>
+                <div id="model-chart-empty" style="height:300px;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:13px">
+                  Select a model to view results
+                </div>
+              </div> -->
+            </div>
+
+            <!-- Row 2: Pass Rate by Model with Coverage -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px;margin-bottom:18px">
+              
+              
+
+              <!-- Pass Rate by Model with Coverage -->
+              <div class="chart-card">
+                <div class="section-hd" style="margin:0 0 14px">
+                  <span class="section-title">pass rate by model</span>
+                </div>
+                <div id="model-bars-list"></div>
+                
+                
+              </div>
+            </div>
+          </div>
+        </div><!-- end overview-content -->
+      </div><!-- end panel-overview -->
+
+      <!-- PANEL: TEST DETAILS -->
+      <div class="panel" id="panel-details">
+        <div class="overview-content">
+          <div class="surface" style="margin-bottom:16px">
+              <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                <div style="display:flex;gap:6px;align-items:center">
+                  <span style="font-size:11px;font-family:var(--mono);color:var(--text3);text-transform:uppercase">Status:</span>
+                  <div class="multiselect-dropdown" id="details-status-filter">
+                    <div class="multiselect-button" onclick="toggleMultiselect('details-status-filter')">
+                      <span class="multiselect-button-text" id="details-status-text">All Selected</span>
+                      <span class="multiselect-arrow">▼</span>
+                    </div>
+                    <div class="multiselect-menu">
+                      <label class="multiselect-option">
+                        <input type="checkbox" checked onchange="updateDetailsStatusFilter()" data-status="passed"> Passed
+                      </label>
+                      <label class="multiselect-option">
+                        <input type="checkbox" checked onchange="updateDetailsStatusFilter()" data-status="failed"> Failed
+                      </label>
+                      <label class="multiselect-option">
+                        <input type="checkbox" checked onchange="updateDetailsStatusFilter()" data-status="xfail"> Xfail
+                      </label>
+                      <label class="multiselect-option">
+                        <input type="checkbox" checked onchange="updateDetailsStatusFilter()" data-status="skipped"> Skipped
+                      </label>
+                      <label class="multiselect-option">
+                        <input type="checkbox" checked onchange="updateDetailsStatusFilter()" data-status="xpass"> Xpass
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <span style="font-size:11px;font-family:var(--mono);color:var(--text3);text-transform:uppercase">FILTERS:</span>
+                  <div class="multiselect-dropdown" id="details-property-filter">
+                    <div class="multiselect-button" onclick="toggleMultiselect('details-property-filter')">
+                      <span class="multiselect-button-text" id="details-property-text">All Selected</span>
+                      <span class="multiselect-arrow">▼</span>
+                    </div>
+                    <div class="multiselect-menu" id="details-property-menu">
+                      <!-- Dynamically populated -->
+                    </div>
+                  </div>
+                </div>
+                <div class="search-wrap" style="flex:1;margin:0">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                  <input class="search-input" id="details-search" placeholder="Search test names…" oninput="filterTestDetails()">
+                </div>
+              </div>
+            </div>
+            <div class="surface">
+              <div class="table-wrap" style="max-height:600px">
+                <table class="test-table">
+                  <thead><tr>
+                    <th>Test Name</th>
+                    <th>Status</th>
+                    <th>Dtype</th>
+                    <th>Op</th>
+                    <th>Module</th>
+                    <th onclick="toggleDetailsSortByTime()" style="cursor:pointer;user-select:none" title="Click to sort by time">
+                      Time (s) <span id="details-time-sort-indicator" style="font-size:14px;margin-left:4px;color:var(--text3)">⇅</span>
+                    </th>
+                  </tr></thead>
+                  <tbody id="details-table-body"></tbody>
+                </table>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-top:1px solid var(--border)">
+                <div class="note-row" id="details-note" style="margin:0"></div>
+                <div id="details-pagination" style="display:flex;gap:6px;align-items:center"></div>
+              </div>
+          </div>
+        </div>
+      </div><!-- end panel-details -->
+
+      <!-- COMMENTED OUT: TREND / RUN HISTORY PANEL -->
+      <!-- <div class="panel" id="panel-trend">
+        <div id="trend-empty" class="trend-empty">
+          No historical data yet.<br><br>
+          Upload multiple XML files to see pass-rate trends over time.
+        </div>
+        <div id="trend-content" class="panel-content" style="display:none">
+          <div class="hero-row spacing-bottom">
+            <div>
+              <div class="hero-kicker">historical quality</div>
+              <div class="hero-title">suite pass rate over time</div>
+              <div class="hero-sub">Track effective pass rate and compare prior runs in an Allure-style history view.</div>
+            </div>
+            <div class="section-actions">
+              <button class="btn btn-sm" onclick="exportTrendCSV()">↓ export trend CSV</button>
+            </div>
+          </div>
+          <div class="chart-card spacing-bottom">
+            <div class="chart-container" style="height:280px">
+              <canvas id="trend-chart" role="img" aria-label="Line chart showing pass/xpass/fail rate trend across runs"></canvas>
+            </div>
+          </div>
+          <div class="chart-card">
+            <div class="section-hd" style="margin:0 0 14px"><span class="section-title">run history</span></div>
+            <div class="run-timeline" id="run-timeline"></div>
+          </div>
+        </div>
+      </div> -->
+
+        </div><!-- end content-area -->
+      </div><!-- end app-shell -->
+    </div><!-- end main-content-wrapper -->
+</div><!-- end main -->
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── theme toggle ────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const html = document.documentElement;
+  const currentTheme = html.getAttribute('data-theme');
+  const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', newTheme);
+  localStorage.setItem('theme', newTheme);
+  updateThemeIcon(newTheme);
+  
+  // Refresh current view to update all colors
+  if (runs.length > 0) {
+    const activePanel = document.querySelector('.panel.active');
+    if (activePanel) {
+      const panelId = activePanel.id;
+      if (panelId === 'panel-overview') {
+        renderOverview();
+      } else if (panelId === 'panel-details') {
+        renderTestDetails();
+      } 
+      // else if (panelId === 'panel-trend') {
+      //    renderTrend(); // COMMENTED OUT
+      // }
+    }
+  }
+}
+
+function updateThemeIcon(theme) {
+  const sunIcon = document.getElementById('theme-icon-sun');
+  const moonIcon = document.getElementById('theme-icon-moon');
+  if (theme === 'dark') {
+    sunIcon.style.display = 'block';
+    moonIcon.style.display = 'none';
+  } else {
+    sunIcon.style.display = 'none';
+    moonIcon.style.display = 'block';
+  }
+}
+
+function initTheme() {
+  const savedTheme = localStorage.getItem('theme');
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const theme = savedTheme || (prefersDark ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', theme);
+  updateThemeIcon(theme);
+}
+
+// Initialize theme on page load
+initTheme();
+
+// Helper function to get chart colors based on theme
+function getChartColors() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  return {
+    text: isDark ? '#f1f5f9' : '#0f172a',
+    text2: isDark ? '#cbd5e1' : '#475569',
+    text3: isDark ? '#94a3b8' : '#64748b',
+    border: isDark ? '#334155' : '#ffffff',
+    border2: isDark ? '#475569' : '#e2e8f0',
+    bg: isDark ? '#0f172a' : '#ffffff',
+    bg2: isDark ? '#1e293b' : '#f8fafc',
+    bg3: isDark ? '#334155' : '#f1f5f9',
+    gridColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(148,163,184,0.18)'
+  };
+}
+
+// ─── state ───────────────────────────────────────────────────────────────────
+let runs = [];
+let groupBy = 'model';   // model | test | op | dtype | class
+let activeFilter = 'all';
+let selectedGroup = null;
+let modelPieChart = null;
+let selectedModelName = '';
+let availableModels = [];
+let trendChart = null;
+
+// ─── XML PARSING (fixed for pytest JUnit format) ──────────────────────────────
+/*
+  pytest JUnit XML status rules:
+  - <testcase> with NO child element              → passed
+  - <testcase><failure .../>                      → failed
+  - <testcase><error .../>                        → error
+  - <testcase><skipped type="pytest.xfail" .../>  → xfail  (expected failure, ran and failed as expected)
+  - <testcase><skipped type="pytest.skip" .../>   → skipped (hard skip, never ran)
+  - xpass: pytest marks an unexpected pass as a bare <testcase> BUT the test was decorated with xfail.
+    In JUnit XML, xpass appears as a bare <testcase> (no children) — indistinguishable from passed
+    unless the message attribute says something. However many pytest versions emit xpass with a
+    <failure type="pytest.xfail"> child OR as bare. We check the failure message too.
+
+  Spyre specific: xfail tests produce <skipped type="pytest.xfail"> with empty message.
+  xpass tests produce bare <testcase> (no children) — same as passed.
+  We can detect xpass by checking if the suite-level xpassed count minus passed count makes sense,
+  but per-test we have to rely on the type attribute.
+
+  Actually in newer pytest: xpass with --strict-markers produces <failure type="pytest.xfail">
+  and without strict produces bare <testcase>. We'll check both.
+*/
+// function parseXML(text) {
+//   const doc = new DOMParser().parseFromString(text, 'text/xml');
+//   const tests = [];
+
+//   // Read suite-level counters.
+//   // Non-strict xpass appears as bare <testcase> (no children), same as truly-passed.
+//   // Formula: xpass_bare = bareCount + max(0, suiteFailures - trueFailRaw - strictXpassRaw)
+//   //   where strictXpassRaw = <failure type="pytest.xfail"> elements (strict mode)
+//   //   and   nonStrictInFailures = 0 for non-strict mode (your case)
+//   //   so    xpassToPromote = bareCount (all bare = xpass)
+//   const suiteEl      = doc.querySelector('testsuite');
+//   const suiteTests   = suiteEl ? parseInt(suiteEl.getAttribute('tests')    || '0', 10) : 0;
+//   const suiteSkipped = suiteEl ? parseInt(suiteEl.getAttribute('skipped')  || '0', 10) : 0;
+//   const suiteFailures= suiteEl ? parseInt(suiteEl.getAttribute('failures') || '0', 10) : 0;
+//   const suiteErrors  = suiteEl ? parseInt(suiteEl.getAttribute('errors')   || '0', 10) : 0;
+
+//   // First pass: classify every testcase
+//   const rawTests = [];
+//   doc.querySelectorAll('testcase').forEach(tc => {
+//     const name    = tc.getAttribute('name') || '';
+//     const cls     = tc.getAttribute('classname') || '';
+//     const timeVal = parseFloat(tc.getAttribute('time') || '0');
+//     const file    = tc.getAttribute('file') || cls.replace(/\./g, '/') + '.py';
+
+//     const failEl  = tc.querySelector('failure');
+//     const errorEl = tc.querySelector('error');
+//     const skipEl  = tc.querySelector('skipped');
+
+//     let status  = 'passed';
+//     let failMsg = '';
+//     let isBare  = false;
+
+//     // Extract properties from <properties><property name="..." value="..."/></properties>
+//     // Store in format: dtype__float32, op__add, model__granite, etc.
+//     // A test can have multiple properties of different types
+//     const properties = [];
+//     const propsEl = tc.querySelector('properties');
+//     if (propsEl) {
+//       propsEl.querySelectorAll('property').forEach(prop => {
+//         const propName = prop.getAttribute('name');
+//         const propValue = prop.getAttribute('value');
+        
+//         if (!propName || !propValue) return;
+        
+//         // Categorize properties by type - a test can have multiple properties
+//         // dtype properties: dtype, data_type, etc.
+//         if (propName.toLowerCase().includes('dtype') || propName.toLowerCase() === 'data_type') {
+//           properties.push(`dtype__${propValue}`);
+//         }
+//         // op properties: op, operation, op_name, etc.
+//         else if (propName.toLowerCase().includes('op') && !propName.toLowerCase().includes('prop')) {
+//           properties.push(`op__${propValue}`);
+//         }
+//         // model properties: model, tag, model_name, etc.
+//         else if (propName.toLowerCase().includes('model') || propName === 'tag') {
+//           properties.push(`model__${propValue}`);
+//         }
+//         // module properties: module .
+//         else if (propName.toLowerCase().includes('module') || propName === 'tag') {
+//           properties.push(`model__${propValue}`);
+//         }
+//         // For boolean properties (True/1), infer category from name
+//         else if (propValue.toLowerCase() === 'true' || propValue === '1') {
+//           // Common model names as boolean flags
+//           if (propName.match(/^(granite|llama|mistral|gpt|ministral)/i)) {
+//             properties.push(`model__${propName}`);
+//           }
+//           // Common op names as boolean flags
+//           else if (propName.match(/^(add|mul|matmul|conv|linear|softmax|relu|gelu)/i)) {
+//             properties.push(`op__${propName}`);
+//           }
+//           // Otherwise store as-is for backward compatibility
+//           else {
+//             properties.push(propName);
+//           }
+//         }
+//         // Store other properties with their values
+//         else {
+//           properties.push(`${propName}__${propValue}`);
+//         }
+//       });
+//     }
+
+//     if (errorEl) {
+//       status  = 'error';
+//       failMsg = (errorEl.getAttribute('message') || '') + '\n' + (errorEl.textContent || '');
+//     } else if (failEl) {
+//       const ftype = (failEl.getAttribute('type') || '').toLowerCase();
+//       if (ftype === 'pytest.xfail' || ftype.includes('xfail')) {
+//         status = 'xpass'; // strict-mode xpass recorded as <failure type="pytest.xfail">
+//       } else {
+//         status = 'failed';
+//       }
+//       failMsg = (failEl.getAttribute('message') || '') + '\n' + (failEl.textContent || '');
+//     } else if (skipEl) {
+//       const stype = (skipEl.getAttribute('type') || '').toLowerCase();
+//       const smsg  = skipEl.getAttribute('message') || skipEl.textContent || '';
+//       status  = (stype === 'pytest.xfail' || stype.includes('xfail')) ? 'xfail' : 'skipped';
+//       failMsg = smsg;
+//     } else {
+//       isBare = true; // bare testcase — passed OR non-strict xpass
+//     }
+
+//     rawTests.push({ name, cls, timeVal, file, status, failMsg, isBare, properties });
+//   });
+
+//   // Second pass: promote bare 'passed' → 'xpass'
+//   //
+//   // Key insight: pytest suite attributes record:
+//   //   skipped  = xfail_count + hard_skip_count   (both use <skipped> child)
+//   //   failures = true_fail_count + strict_xpass_count  (strict xpass uses <failure type="pytest.xfail">)
+//   //   errors   = error_count
+//   //   tests    = total
+//   //
+//   // Therefore: passed_count + xpass_count = tests - skipped - failures - errors
+//   //   (because both passed and non-strict-xpass are bare testcases)
+//   //
+//   // From our first pass we know:
+//   //   bare_count  = rawTests.filter(isBare).length  = passed + non_strict_xpass
+//   //   strict_xpass = rawTests.filter(status==='xpass').length  (already detected via <failure type=xfail>)
+//   //   true_fail    = rawTests.filter(status==='failed').length
+//   //   error_count  = rawTests.filter(status==='error').length
+//   //   xml_skipped  = rawTests.filter(status==='xfail'||'skipped').length
+//   //
+//   // From suite attrs: expected_bare = suiteTests - suiteSkipped - suiteFailures - suiteErrors
+//   // This gives passed + non_strict_xpass.
+//   //
+//   // Now: suiteFailures = true_fail + strict_xpass + (non_strict_xpass counted as failures in some pytest versions)
+//   // In pytest non-strict xfail mode (your case): non_strict xpass is NOT counted in failures attr.
+//   // So: suiteFailures = true_fail + strict_xpass
+//   //     expected_bare = suiteTests - suiteSkipped - (true_fail + strict_xpass) - suiteErrors
+//   //                   = suiteTests - suiteSkipped - suiteFailures - suiteErrors
+//   //
+//   // And bare_count (from XML) should equal expected_bare. If it does, then ALL bare are either
+//   // passed or xpass. To split: non_strict_xpass = bare_count - true_pass.
+//   // But we don't know true_pass from the XML alone — it's not an attribute.
+//   //
+//   // However: pytest summary says "X passed, Y xpassed". The suite XML attrs don't expose this split.
+//   // BUT: if we trust that in Spyre's test framework, xpass is the ONLY thing that produces bare testcases
+//   // (i.e., there are no genuinely passing tests in this run), then bare_count = xpass_count.
+//   //
+//   // More generally: we can compute non_strict_xpass by comparing what suiteFailures says vs what
+//   // the raw failure/error/xfail child elements account for:
+//   //
+//   //   accounted_failures = true_fail_raw + strict_xpass_raw + xml_skip_count
+//   //   accounted_failures should equal suiteSkipped + suiteFailures + suiteErrors
+//   //
+//   //   If suiteFailures > (true_fail_raw + strict_xpass_raw):
+//   //     → some xpass are counted as failures in the suite attr (strict mode or old pytest)
+//   //     → non_strict_xpass_as_failures = suiteFailures - true_fail_raw - strict_xpass_raw
+//   //
+//   // For non-strict (your case): suiteFailures = true_fail_raw = 1. strict_xpass_raw = 0. 
+//   //   non_strict_xpass_as_failures = 1 - 1 - 0 = 0. ← previous (wrong) approach stopped here.
+//   //
+//   // The remaining xpass (non-strict) = bare_count - true_pass_count.
+//   // Since we can't get true_pass from XML, use:
+//   //   true_pass = suiteTests - suiteSkipped - suiteFailures - suiteErrors - bare_count
+//   //             = expected_bare - bare_count ... this would be 0 if they match, which they do.
+//   //
+//   // So that gives true_pass = 0, meaning ALL bare = xpass. That is the correct answer here!
+//   // The formula: true_pass = max(0, (suiteTests - suiteSkipped - suiteFailures - suiteErrors) - bare_count)
+//   //              xpass_bare = bare_count - true_pass
+
+//   const bareCount        = rawTests.filter(r => r.isBare).length;
+//   const trueFailRaw      = rawTests.filter(r => r.status === 'failed' || r.status === 'error').length;
+//   const strictXpassRaw   = rawTests.filter(r => r.status === 'xpass').length;
+//   const expectedBare     = suiteTests - suiteSkipped - suiteFailures - suiteErrors;
+//   // true_pass = expectedBare - bareCount would be negative if xpass counted in failures.
+//   // true_pass = max(0, expectedBare - bareCount) won't work since expectedBare == bareCount always.
+//   // 
+//   // Instead: non_strict_xpass counted as failures in suite = max(0, suiteFailures - trueFailRaw - strictXpassRaw)
+//   // Then total xpass = strictXpassRaw + non_strict_xpass_in_failures + bare_xpass
+//   // bare_xpass = bareCount - true_pass
+//   // true_pass = suiteTests - suiteSkipped - (suiteFailures + non_strict_xpass_counted_as_failures_extra) - suiteErrors - bareCount
+//   // 
+//   // Simplest correct formula that works for BOTH strict and non-strict:
+//   //   total_accounted_as_pass_or_xpass = suiteTests - suiteSkipped - suiteFailures - suiteErrors
+//   //   non_strict_in_failures = max(0, suiteFailures - trueFailRaw - strictXpassRaw)
+//   //   total_xpass = strictXpassRaw + non_strict_in_failures + (bareCount - true_pass)
+//   //   true_pass = total_accounted_as_pass_or_xpass - non_strict_in_failures - (bareCount - true_pass)... circular
+//   //
+//   // FINAL SIMPLEST that works: promote ALL bare to xpass, then subtract suite-reported pass count.
+//   // suite doesn't report pass count. So:
+//   //   xpass_bare_count = bareCount - max(0, suiteTests - suiteSkipped - suiteFailures - suiteErrors - bareCount)
+//   // When expectedBare == bareCount (normal case): xpass_bare = bareCount - 0 = bareCount. ✓
+//   // When there are truly passed tests: expectedBare > bareCount would be impossible (expectedBare = bareCount by def).
+//   // Actually expectedBare is derived from attrs and bareCount from XML children—they should match.
+//   // If they differ, the difference IS the non_strict_xpass counted in failures.
+
+//   const nonStrictInFailures = Math.max(0, suiteFailures - trueFailRaw - strictXpassRaw);
+//   // Only promote non-strict xpass that are counted in suite.failures
+//   // Keep all other bare testcases as 'passed' (normal passing tests)
+//   let xpassToPromote = nonStrictInFailures;
+//   for (const r of rawTests) {
+//     if (xpassToPromote <= 0) break;
+//     if (r.isBare) { r.status = 'xpass'; xpassToPromote--; }
+//   }
+//   // Remaining bare tests stay as 'passed'
+
+//   // Third pass: extract metadata and push to tests[]
+//   const dtypeNames = ['float16','float32','float64','bfloat16','int8','int16','int32','int64','uint8','bool','complex64','complex128','complex32'];
+//   const testMethods = ['test_contig_vs_transposed','test_scalar_support','test_add','test_forward','test_compare_cpu'];
+
+//   // Track if report has op__ or module__ tags
+//   let hasOpTags = false;
+//   let hasModuleTags = false;
+
+//   rawTests.forEach(({ name, cls, timeVal, file, status, failMsg, properties }) => {
+//     // Extract [model_tag] brackets
+//     const tags = [];
+//     const re = /\[([^\[\]]+)\]/g;
+//     let m;
+//     while ((m = re.exec(name)) !== null) {
+//       m[1].split('][').forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
+//     }
+
+//     // Extract dtype and op from structured properties first
+//     let opName = '(no op)', dtype = '', shortName = name;
+//     if (properties && properties.length > 0) {
+//       const dtypeTag = properties.find(prop => prop.startsWith('dtype__'));
+//       if (dtypeTag) {
+//         dtype = dtypeTag.substring(7); // Remove 'dtype__' prefix for display
+//       }
+//     }
+//     if (shortName.endsWith('_spyre'))      shortName = shortName.slice(0, -6);
+//     if (shortName.endsWith('_privateuse1')) shortName = shortName.slice(0, -12);
+
+//     let testMethod = '';
+//     for (const tm of testMethods) {
+//       if (shortName === tm || shortName.startsWith(tm + '_')) {
+//         testMethod = tm;
+//         break;
+//       }
+//     }
+//     if (!testMethod) {
+//       const parts = shortName.split('_');
+//       testMethod = parts.slice(0,3).join('_');
+//     }
+
+//     // Extract op ONLY from op__ tag in properties
+//     if (properties && properties.length > 0) {
+//       const opTag = properties.find(prop => prop.startsWith('op__'));
+//       if (opTag) {
+//         opName = opTag.substring(4); // Remove 'op__' prefix for display
+//         hasOpTags = true;
+//       }
+//       // Check for module tags
+//       if (!hasModuleTags && properties.some(prop => prop.startsWith('module__'))) {
+//         hasModuleTags = true;
+//       }
+//     }
+
+//     const clsParts = cls.split('.');
+//     const clsShort = clsParts[clsParts.length-1] || cls;
+
+//     tests.push({ name, cls, clsShort, timeVal, file, status, failMsg: failMsg.trim(), tags, testMethod, opName, dtype, properties: properties || [] });
+//   });
+  
+//   // Store metadata about available tags as non-enumerable properties
+//   Object.defineProperty(tests, 'hasOpTags', { value: hasOpTags, enumerable: false });
+//   Object.defineProperty(tests, 'hasModuleTags', { value: hasModuleTags, enumerable: false });
+  
+//   return tests;
+// }
+
+function buildGroupMap(tests, by) {
+  const map = {};
+  tests.forEach(t => {
+    let keys = [];
+    if (by === 'model') {
+      // Filter both properties and tags to only include those starting with "model__"
+      if (t.properties && t.properties.length) {
+        keys = t.properties.filter(prop => prop.startsWith('model__'));
+      } else if (t.tags && t.tags.length) {
+        keys = t.tags.filter(tag => /^model__.+/.test(tag));
+      }
+      // If no model tags found, mark as untagged
+      if (!keys || keys.length === 0) {
+        keys = ['(No Model)'];
+      }
+    } else if (by === 'module') {
+      // Filter both properties and tags to only include those starting with "module__"
+      if (t.properties && t.properties.length) {
+        keys = t.properties.filter(prop => prop.startsWith('module__'));
+      } else if (t.tags && t.tags.length) {
+        keys = t.tags.filter(tag => /^module__.+/.test(tag));
+      }
+      // If no module tags found, mark as untagged
+      if (!keys || keys.length === 0) {
+        keys = ['(No Module)'];
+      }
+    } else if (by === 'op') {
+      keys = [t.opName || '(No Op)'];
+    } else if (by === 'dtype') {
+      keys = [t.dtype || '(No Dtype)'];
+    }
+    keys.forEach(k => {
+      if (!map[k]) map[k] = [];
+      map[k].push(t);
+    });
+  });
+  return map;
+}
+
+// ─── ingest ──────────────────────────────────────────────────────────────────
+// Commented out - not needed for ClickHouse-based dashboard
+// function ingestFiles(files) {
+//   const arr = Array.from(files);
+//   if (!arr.length) return;
+//   let loaded = 0;
+//   arr.forEach(f => {
+//     const reader = new FileReader();
+//     reader.onload = e => {
+//       try {
+//         const tests = parseXML(e.target.result);
+//         const run = {
+//           filename: f.name,
+//           timestamp: f.lastModified || Date.now(),
+//           tests,
+//           modelMap: buildGroupMap(tests, groupBy),
+//         };
+//         runs.push(run);
+//         runs.sort((a, b) => a.timestamp - b.timestamp);
+//         toast('✓ Loaded: ' + f.name + ' (' + tests.length + ' tests)');
+//       } catch (err) {
+//         toast('✗ Error parsing ' + f.name + ': ' + err.message, true);
+//       } finally {
+//         loaded++;
+//         if (loaded === arr.length && runs.length) {
+//           // Select first file (index 0) by default
+//           selectRun(0);
+//           toast(`✓ Successfully loaded ${arr.length} file(s). Total runs: ${runs.length}.`);
+//           // Automatically switch to reports tab after loading files
+//           switchTab('reports');
+//         }
+//       }
+//     };
+//     reader.readAsText(f);
+//   });
+// }
+
+function rebuildGroupMaps() {
+  runs.forEach(r => { r.modelMap = buildGroupMap(r.tests, groupBy); });
+}
+
+function updateRunList() {
+  const wrap = document.getElementById('run-list-preview');
+  const list = document.getElementById('run-list');
+  if (!runs.length) {
+    wrap.style.display = 'none';
+    selectedRunIndex = -1;
+    return;
+  }
+  if (selectedRunIndex < 0 || selectedRunIndex >= runs.length) selectedRunIndex = runs.length - 1;
+  wrap.style.display = 'block';
+  const renderItem = (r, i) => {
+    const stats = getRunStats(r);
+    const total = stats.total;
+    const pct = total ? Math.round((stats.passed) / total * 100) : 0;
+    const activeCls = i === selectedRunIndex ? ' style="border-color:var(--accent);background:rgba(37,99,235,.06)"' : '';
+    return `<div class="run-item"${activeCls} onclick="selectRun(${i})" style="cursor:pointer">
+      <div class="run-item-name">#${i+1} ${esc(r.filename)}</div>
+      <div class="run-item-meta">${total} tests</div>
+      <span class="run-badge rb-pass">${pct}% pass</span>
+      ${stats.xpass ? `<span class="run-badge" style="background:rgba(129,140,248,.15);color:var(--xpass)">${stats.xpass} xpass</span>` : ''}
+      ${stats.failed ? `<span class="run-badge rb-fail">${stats.failed} fail</span>` : ''}
+      <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeRun(${i})">✕</button>
+    </div>`;
+  };
+  list.innerHTML = runs.map((r, i) => renderItem(r, i)).join('');
+}
+
+function countStatuses(tests) {
+  const c = {passed:0,failed:0,xfail:0,xpass:0,skipped:0,error:0};
+  tests.forEach(t => c[t.status] = (c[t.status]||0)+1);
+  return c;
+}
+
+function getRunStats(run) {
+  // If it's an aggregated commit, use the aggregated data
+  if (run._isAggregated && run.aggregatedData) {
+    return {
+      passed: run.aggregatedData.passed + run.aggregatedData.xpass,
+      failed: run.aggregatedData.failed,
+      xfail: run.aggregatedData.xfail,
+      xpass: run.aggregatedData.xpass,
+      skipped: run.aggregatedData.skipped,
+      error: 0,
+      total: run.aggregatedData.total_tests
+    };
+  }
+  // Otherwise count from tests array
+  const cnt = countStatuses(run.tests);
+  return {
+    passed: cnt.passed,
+    failed: cnt.failed,
+    xfail: cnt.xfail,
+    xpass: cnt.xpass,
+    skipped: cnt.skipped,
+    error: cnt.error || 0,
+    total: run.tests.length
+  };
+}
+
+function selectRun(i) {
+  selectedRunIndex = i;
+  selectedGroup = null;
+  updateRunList();
+  
+  // Refresh all pages with the new run data
+  renderOverview();
+  renderTestDetails();
+  // renderTrend(); // COMMENTED OUT
+  renderReports();
+}
+function removeRun(i) {
+  runs.splice(i,1);
+  if (selectedRunIndex >= runs.length) selectedRunIndex = runs.length - 1;
+  updateRunList();
+  renderOverview();
+  // renderTrend(); // COMMENTED OUT
+  renderReports();
+}
+function clearAll() {
+  runs=[];
+  selectedRunIndex = -1;
+  updateRunList();
+  selectedGroup=null;
+  renderOverview();
+  // renderTrend(); // COMMENTED OUT
+  renderReports();
+}
+
+// ─── render reports table ─────────────────────────────────────────────────────
+function renderReports() {
+  const emptyDiv = document.getElementById('reports-empty');
+  const contentDiv = document.getElementById('reports-content');
+  const tbody = document.getElementById('reports-table-body');
+  
+  // If tbody doesn't exist, we're not on the reports tab - skip rendering
+  if (!tbody) return;
+  
+  if (!runs.length) {
+    if (emptyDiv) emptyDiv.style.display = 'block';
+    if (contentDiv) contentDiv.style.display = 'none';
+    return;
+  }
+  
+  if (emptyDiv) emptyDiv.style.display = 'none';
+  if (contentDiv) contentDiv.style.display = 'block';
+  
+  const rows = runs.map((run, idx) => {
+    const stats = getRunStats(run);
+    const total = stats.total;
+    const passRate = total ? Math.round((stats.passed / total) * 100) : 0;
+    const uploadDate = new Date(run.timestamp).toLocaleString();
+    
+    return `
+      <tr>
+        <td style="text-align:center;font-weight:600;color:var(--text)">${idx + 1}</td>
+        <td style="font-family:var(--mono);color:var(--text);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(run.filename)}">${esc(run.filename)}</td>
+        <td style="text-align:center;font-weight:600">${total}</td>
+        <td style="text-align:center"><span class="status-badge sb-pass">${stats.passed - stats.xpass}</span></td>
+        <td style="text-align:center"><span class="status-badge sb-fail">${stats.failed}</span></td>
+        <td style="text-align:center"><span class="status-badge sb-xfail">${stats.xfail}</span></td>
+        <td style="text-align:center"><span class="status-badge sb-xpass">${stats.xpass}</span></td>
+        <td style="text-align:center"><span class="status-badge sb-skip">${stats.skipped}</span></td>
+        <td style="text-align:center"><span class="status-badge sb-error">${stats.error}</span></td>
+        <td style="text-align:center">
+          <span style="font-weight:600;color:${passRate >= 90 ? 'var(--pass)' : passRate >= 70 ? 'var(--xfail)' : 'var(--fail)'}">${passRate}%</span>
+        </td>
+        <td style="text-align:center;font-size:11px;color:var(--text3)">${uploadDate}</td>
+        <td style="text-align:center">
+          <button class="action-menu-btn" onclick="toggleReportActionMenu(${idx}, event)" title="Actions">⋮</button>
+          <div class="action-dropdown" id="action-menu-${idx}" style="display:none">
+            <button class="action-dropdown-item" onclick="selectRun(${idx});switchTab('overview');closeAllMenus()">view details</button>
+            <button class="action-dropdown-item" onclick="exportRunCSV(${idx});closeAllMenus()">Export CSV</button>
+            <button class="action-dropdown-item danger" onclick="removeRun(${idx});renderReports();closeAllMenus()">Delete Report</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+  
+  tbody.innerHTML = rows;
+}
+
+// ─── reports action menu helpers ──────────────────────────────────────────────
+function toggleReportActionMenu(idx, event) {
+  if (event) event.stopPropagation();
+  const menu = document.getElementById('action-menu-' + idx);
+  
+  if (!menu) {
+    console.error('Menu not found for index:', idx);
+    return;
+  }
+  
+  const isCurrentlyVisible = menu.style.display === 'block';
+  
+  closeAllMenus();
+  
+  if (!isCurrentlyVisible) {
+    const button = event?.currentTarget || event?.target;
+    if (button) {
+      const rect = button.getBoundingClientRect();
+      menu.style.display = 'block';
+      menu.style.top = (rect.bottom + 6) + 'px';
+      menu.style.left = Math.max(8, rect.right - 160) + 'px';
+    } else {
+      menu.style.display = 'block';
+    }
+  }
+}
+
+function closeAllMenus() {
+  document.querySelectorAll('.action-dropdown').forEach(m => {
+    m.style.display = 'none';
+  });
+}
+
+function exportRunCSV(idx) {
+  if (idx < 0 || idx >= runs.length) return;
+  selectedRunIndex = idx;
+  exportCSV();
+}
+
+// Close menus when clicking outside
+document.addEventListener('click', () => closeAllMenus());
+
+// ─── tab navigation ───────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('panel-' + tab).classList.add('active');
+  const labels = {overview:'Summary',details:'Details',trend:'History',reports:'Reports',upload:'Upload'};
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    if (b.textContent.trim().startsWith(labels[tab]?.charAt(0) || '?')) b.classList.add('active');
+  });
+  
+  // Clear search input when switching away from details tab
+  if (tab !== 'details') {
+    const searchInput = document.getElementById('details-search');
+    if (searchInput) {
+      searchInput.value = '';
+    }
+  }
+  
+  // Show/hide topbar run info based on tab
+  const topbarRunInfo = document.getElementById('topbar-run-info');
+  if (tab === 'upload' || tab === 'reports') {
+    if (topbarRunInfo) topbarRunInfo.style.display = 'none';
+  } else {
+    if (topbarRunInfo && runs.length > 0) topbarRunInfo.style.display = 'block';
+  }
+  
+  if (tab === 'overview') {
+    document.getElementById('nav-overview')?.classList.add('active');
+    renderOverview();
+  }
+  if (tab === 'details') {
+    document.getElementById('nav-details')?.classList.add('active');
+    renderTestDetails();
+  }
+  // if (tab === 'trend') {
+  //   document.getElementById('nav-history')?.classList.add('active');
+  //    renderTrend(); // COMMENTED OUT
+  // }
+  if (tab === 'reports') {
+    document.getElementById('nav-reports')?.classList.add('active');
+    renderReports();
+    // Auto-load commits when reports tab is opened
+    
+    if (!window.__commitsLoaded) {
+      
+      window.__commitsLoaded = true;
+      initCommitsTable();
+    } else {
+      console.log('[switchTab] Commits already loaded, skipping initialization');
+    }
+  }
+  if (tab === 'upload') {
+    document.getElementById('nav-upload')?.classList.add('active');
+  }
+}
+
+// ─── sidebar toggle ───────────────────────────────────────────────────────────
+function toggleSidebar() {
+  const main = document.querySelector('.main');
+  main.classList.toggle('sidebar-collapsed');
+  
+  // Save state to localStorage
+  const isCollapsed = main.classList.contains('sidebar-collapsed');
+  localStorage.setItem('sidebarCollapsed', isCollapsed);
+}
+
+// Restore sidebar state on page load
+document.addEventListener('DOMContentLoaded', () => {
+  const isCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
+  if (isCollapsed) {
+    document.querySelector('.main')?.classList.add('sidebar-collapsed');
+  }
+  
+  // Render overview initially to show "No data" message if no data is loaded
+  renderOverview();
+  
+  // Show loader immediately
+  showLoader('Loading latest commit...');
+  
+  // Auto-load latest commit on page load (regardless of active panel)
+  // Use setTimeout to ensure spyre-api-client.js has loaded
+  setTimeout(() => {
+    if (!window.__commitsLoaded) {
+      window.__commitsLoaded = true;
+      initCommitsTable();
+    }
+  }, 100);
+});
+
+let selectedRunIndex = -1;
+let currentSubTab = 'summary';
+let summaryPieChart = null;
+let detailsCurrentPage = 1;
+let detailsItemsPerPage = 10;
+
+// ─── render functions for each panel ─────────────────────────────────────────
+function renderTestDetails() {
+  if (selectedRunIndex < 0) return;
+  
+  // Update filename display
+  const run = currentRun();
+  const filenameEl = document.getElementById('details-filename');
+  if (filenameEl && run) {
+    filenameEl.textContent = run.filename || '—';
+  }
+  
+  filterTestDetails();
+}
+
+
+function setGroupBy(by) {
+  groupBy = by;
+  activeFilter = 'all';
+  selectedGroup = null;
+  document.querySelectorAll('.gb-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  rebuildGroupMaps();
+  renderOverview();
+}
+
+// ─── overview ─────────────────────────────────────────────────────────────────
+function currentRun() {
+  if (selectedRunIndex >= 0 && selectedRunIndex < runs.length) {
+    return runs[selectedRunIndex];
+  }
+  return runs[runs.length - 1] || null;
+}
+
+function renderOverview() {
+  const run = currentRun();
+  if (!run) {
+    document.getElementById('overview-empty').style.display = 'block';
+    document.getElementById('overview-content').style.display = 'none';
+    return;
+  }
+  
+  // Check if run has no tests
+  if (!run.tests || run.tests.length === 0) {
+    document.getElementById('overview-empty').style.display = 'block';
+    document.getElementById('overview-empty').innerHTML = '<div style="text-align:center;padding:40px"><div style="font-size:18px;color:var(--text2);margin-bottom:12px">⚠️ No Test Data Available</div><div style="font-size:14px;color:var(--text3)">The selected run contains no test results. This may be due to a data loading error.</div></div>';
+    document.getElementById('overview-content').style.display = 'none';
+    return;
+  }
+  
+  document.getElementById('overview-empty').style.display = 'none';
+  document.getElementById('overview-content').style.display = 'block';
+
+  // Populate run selector dropdown
+  const selector = document.getElementById('run-selector');
+  const selectorHTML = runs.map((r, i) => {
+    const stats = getRunStats(r);
+    const p = stats.total ? Math.round(stats.passed / stats.total * 100) : 0;
+    return `<option value="${i}" ${i===selectedRunIndex?'selected':''}>#${i+1} ${esc(r.filename)} (${p}% pass)</option>`;
+  }).join('');
+  
+  if (selector && runs.length > 0) {
+    selector.innerHTML = selectorHTML;
+  }
+  
+  // Update topbar run info
+  const topbarRunInfo = document.getElementById('topbar-run-info');
+  const topbarRunName = document.getElementById('topbar-run-name');
+  if (topbarRunInfo && topbarRunName && runs.length > 0) {
+    topbarRunInfo.style.display = 'block';
+    topbarRunName.textContent = run.filename;
+  }
+  
+  // Populate all filters
+  populateAllFilters();
+  
+  // Get filtered tests for stats calculation
+  const filteredTests = getFilteredTests();
+  const isFiltered = filteredTests.length < run.tests.length;
+  
+  let stats, total, totalTime;
+  if (isFiltered) {
+    // Calculate stats from filtered tests
+    const cnt = countStatuses(filteredTests);
+    stats = {
+      passed: cnt.passed + cnt.xpass,
+      failed: cnt.failed,
+      xfail: cnt.xfail,
+      xpass: cnt.xpass,
+      skipped: cnt.skipped,
+      error: cnt.error || 0,
+      total: filteredTests.length
+    };
+    total = filteredTests.length;
+    totalTime = run._isAggregated ? 0 : filteredTests.reduce((s,t) => s+t.timeVal, 0);
+  } else {
+    // Use original stats
+    stats = getRunStats(run);
+    total = stats.total;
+    totalTime = run._isAggregated ? 0 : run.tests.reduce((s,t) => s+t.timeVal, 0);
+  }
+  
+  const pct = v => total ? Math.round(v/total*100) : 0;
+  const effectivePct = pct(stats.passed);
+  
+  const groupsInfo = run._isAggregated
+    ? (run.aggregatedData.workflows.length + ' workflows' + (isFiltered ? ' (filtered)' : ''))
+    : (Object.keys(run.modelMap).length + ' groups (' + groupBy + ')');
+
+  document.getElementById('metrics').innerHTML = [
+    {label:'total tests',    val:total,                  sub: groupsInfo, color:'var(--text)', status:'all'},
+    {label:'effective pass', val:effectivePct + '%',     sub:(stats.passed ) + ' pass + ' + stats.xpass + ' xpass', color:'var(--accent)', status:'effective_pass'},
+    {label:'passed',         val:stats.passed - stats.xpass, sub:pct(stats.passed - stats.xpass)+'%',   color:'var(--pass)', status:'passed'},
+    {label:'failed',         val:stats.failed,           sub:pct(stats.failed)+'%',   color:'var(--fail)', status:'failed'},
+    {label:'xfail',          val:stats.xfail,            sub:pct(stats.xfail)+'%',    color:'var(--xfail)', status:'xfail'},
+    {label:'xpass',          val:stats.xpass,            sub:pct(stats.xpass)+'%',    color:'var(--xpass)', status:'xpass'},
+    {label:'skipped',        val:stats.skipped,          sub:pct(stats.skipped)+'%',  color:'var(--skip)', status:'skipped'},
+  ].map(m => `<div class="metric">
+    <div class="metric-label">
+      <span>${m.label}</span>
+      <div style="display:flex;gap:4px">
+        <button class="metric-download" onclick="viewMetricDetails('${m.status}')" title="View ${m.label} test cases">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </button>
+        <button class="metric-download" onclick="downloadMetricData('${m.status}')" title="Download ${m.label} test cases">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="metric-value" style="color:${m.color}">${m.val}</div>
+    <div class="metric-sub">${m.sub}</div>
+  </div>`).join('');
+
+  // Populate model selector and render summary content for overview panel
+  populateModelSelector();
+  renderSummary();
+}
+
+// ─── summary tab ──────────────────────────────────────────────────────────────
+function renderSummary() {
+  const run = currentRun();
+  if (!run) return;
+  
+  // Get filtered tests for stats calculation
+  const filteredTests = getFilteredTests();
+  const isFiltered = filteredTests.length < run.tests.length;
+  
+  let stats, total;
+  if (isFiltered) {
+    // Calculate stats from filtered tests
+    const cnt = countStatuses(filteredTests);
+    stats = {
+      passed: cnt.passed + cnt.xpass,
+      failed: cnt.failed,
+      xfail: cnt.xfail,
+      xpass: cnt.xpass,
+      skipped: cnt.skipped,
+      error: cnt.error || 0,
+      total: filteredTests.length
+    };
+    total = filteredTests.length;
+  } else {
+    // Use original stats
+    stats = getRunStats(run);
+    total = stats.total;
+  }
+  
+  // Check if there's no data
+  if (total === 0) {
+    const ctx = document.getElementById('summary-pie-chart');
+    if (summaryPieChart) {
+      summaryPieChart.destroy();
+      summaryPieChart = null;
+    }
+    if (ctx) {
+      // Hide canvas and show empty message
+      ctx.style.display = 'none';
+      const container = ctx.parentElement;
+      if (container) {
+        let emptyMsg = container.querySelector('.chart-empty-message');
+        if (!emptyMsg) {
+          emptyMsg = document.createElement('div');
+          emptyMsg.className = 'chart-empty-message';
+          emptyMsg.style.cssText = 'display:flex;align-items:center;justify-content:center;height:250px;color:var(--text3);font-size:14px';
+          container.appendChild(emptyMsg);
+        }
+        emptyMsg.textContent = 'No test data available';
+        emptyMsg.style.display = 'flex';
+      }
+    }
+    return;
+  }
+  
+  // Render pie chart
+  const ctx = document.getElementById('summary-pie-chart');
+  if (ctx) {
+    // Show canvas and hide empty message
+    ctx.style.display = 'block';
+    const container = ctx.parentElement;
+    if (container) {
+      const emptyMsg = container.querySelector('.chart-empty-message');
+      if (emptyMsg) {
+        emptyMsg.style.display = 'none';
+      }
+    }
+    if (summaryPieChart) {
+      summaryPieChart.destroy();
+      summaryPieChart = null;
+    }
+    const colors = getChartColors();
+    // Add shadow effect to canvas
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const canvasCtx = ctx.getContext('2d');
+    // Clear the canvas completely before redrawing
+    canvasCtx.clearRect(0, 0, ctx.width, ctx.height);
+    canvasCtx.shadowColor = isDark ? 'rgba(0, 0, 0, 0.5)' : 'rgba(0, 0, 0, 0.15)';
+    canvasCtx.shadowBlur = 20;
+    canvasCtx.shadowOffsetX = 0;
+    canvasCtx.shadowOffsetY = 4;
+    
+    summaryPieChart = new Chart(canvasCtx, {
+      type: 'doughnut',
+      data: {
+        labels: ['Passed', 'Failed', 'Xfail', 'Xpass', 'Skipped'],
+        datasets: [{
+          data: [stats.passed - stats.xpass, stats.failed, stats.xfail, stats.xpass, stats.skipped],
+          backgroundColor: ['#16a34a', '#dc2626', '#d97706', '#6366f1', '#6b7280'],
+          hoverBackgroundColor: isDark ? ['#22c55e', '#ef4444', '#f59e0b', '#818cf8', '#9ca3af'] : ['#15803d', '#b91c1c', '#c2410c', '#4f46e5', '#52525b'],
+          borderWidth: 4,
+          borderColor: isDark ? '#1e293b' : '#ffffff',
+          hoverBorderWidth: 8,
+          hoverBorderColor: isDark ? '#475569' : '#cbd5e1',
+          hoverOffset: 20,
+          spacing: 0
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '65%',
+        layout: {
+          padding: {
+            left: 10,
+            right: 10,
+            top: 10,
+            bottom: 10
+          }
+        },
+        animation: {
+          animateRotate: true,
+          animateScale: true,
+          duration: 1000,
+          easing: 'easeInOutQuart'
+        },
+        plugins: {
+          legend: {
+            display: true,
+            position: 'right',
+            align: 'center',
+            onClick: (e, legendItem, legend) => {
+              const index = legendItem.index;
+              const chart = legend.chart;
+              const meta = chart.getDatasetMeta(0);
+              
+              // Toggle visibility
+              meta.data[index].hidden = !meta.data[index].hidden;
+              chart.update();
+            },
+            labels: {
+              font: {
+                family: 'IBM Plex Sans',
+                size: 13,
+                weight: '600',
+                lineHeight: 1.8
+              },
+              padding: 14,
+              usePointStyle: true,
+              pointStyle: 'rectRounded',
+              boxWidth: 12,
+              boxHeight: 12,
+              color: colors.text,
+              textAlign: 'left',
+              generateLabels: (chart) => {
+                const data = chart.data;
+                const currentColors = getChartColors();
+                return data.labels.map((label, i) => {
+                  const value = data.datasets[0].data[i];
+                  const pct = Math.round(value / total * 100);
+                  const meta = chart.getDatasetMeta(0);
+                  const hidden = meta.data[i].hidden;
+                  
+                  return {
+                    text: `${label}  ${pct}%`,
+                    fillStyle: hidden ? currentColors.text3 : data.datasets[0].backgroundColor[i],
+                    fontColor: currentColors.text,
+                    strokeStyle: data.datasets[0].backgroundColor[i],
+                    lineWidth: 2,
+                    hidden: hidden,
+                    index: i,
+                    textDecoration: hidden ? 'line-through' : ''
+                  };
+                });
+              }
+            }
+          },
+          tooltip: {
+            enabled: true,
+            backgroundColor: colors.bg3,
+            titleColor: colors.text,
+            bodyColor: colors.text2,
+            borderColor: colors.border2,
+            borderWidth: 1,
+            padding: 12,
+            displayColors: true,
+            boxWidth: 10,
+            boxHeight: 10,
+            usePointStyle: true,
+            callbacks: {
+              label: (ctx) => {
+                const pct = Math.round(ctx.parsed / total * 100);
+                return ` ${ctx.label}: ${ctx.parsed} tests (${pct}%)`;
+              }
+            }
+          }
+        },
+        interaction: {
+          mode: 'nearest',
+          intersect: true
+        }
+      }
+    });
+  }
+  
+  
+  // Render model bars (use filtered tests)
+  const modelMap = buildGroupMap(filteredTests, 'model');
+  const models = Object.keys(modelMap).sort().slice(0, 8);
+  document.getElementById('model-bars-list').innerHTML = models.map(key => {
+    const tests = modelMap[key];
+    const c = countStatuses(tests);
+    const pct = tests.length ? Math.round((c.passed + c.xpass) / tests.length * 100) : 0;
+    return `<div style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">
+        <span style="color:var(--text);font-family:var(--mono)">${esc(displayGroupName(key))}</span>
+        <span style="color:var(--text2)">${pct}%</span>
+      </div>
+      <div class="bar-track" style="height:6px">
+        <div class="bar-seg bs-pass" style="flex:${c.passed}"></div>
+        <div class="bar-seg bs-xpass" style="flex:${c.xpass}"></div>
+        <div class="bar-seg bs-xfail" style="flex:${c.xfail}"></div>
+        <div class="bar-seg bs-skip" style="flex:${c.skipped}"></div>
+        <div class="bar-seg bs-fail" style="flex:${c.failed}"></div>
+      </div>
+    </div>`;
+  }).join('');
+  
+  // Calculate overall operation and module coverage across all tests
+  renderOverallCoverage(run.tests);
+}
+
+function renderOverallCoverage(tests) {
+  // Check if there are no tests
+  if (!tests || tests.length === 0) {
+    document.getElementById('model-op-coverage').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3);font-size:14px">No test data available</div>';
+    document.getElementById('model-module-coverage').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3);font-size:14px">No test data available</div>';
+    return;
+  }
+  
+  // Calculate operation coverage
+  const opMap = {};
+  tests.forEach(t => {
+    const op = t.opName || '(no op)';
+    if (!opMap[op]) opMap[op] = {total: 0, passed: 0, failed: 0};
+    opMap[op].total++;
+    if (t.status === 'passed' || t.status === 'xpass') opMap[op].passed++;
+    if (t.status === 'failed' || t.status === 'error') opMap[op].failed++;
+  });
+  
+  const totalOps = Object.keys(opMap).length;
+  
+  // Check if no operations found
+  if (totalOps === 0) {
+    document.getElementById('model-op-coverage').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3);font-size:14px">No operation data available</div>';
+  } else {
+    // Fully passing: 100% pass rate (all tests passed, no failures, no skips, no xfail)
+    const fullyPassingOps = Object.values(opMap).filter(o => o.passed === o.total && o.total > 0).length;
+    // Partially failing: NOT fully passing (includes ops with failures, xfails, skips, etc.)
+    const partiallyFailingOps = Object.values(opMap).filter(o => o.passed < o.total && o.total > 0).length;
+    
+    document.getElementById('model-op-coverage').innerHTML = [
+    {label: 'Total Ops', val: totalOps, color: 'var(--text)', filter: null},
+    {label: 'Fully Passing', val: fullyPassingOps, pct: totalOps > 0 ? Math.round((fullyPassingOps / totalOps) * 100) : 0, color: 'var(--pass)', filter: 'op_passing'},
+    {label: 'Partially Passing', val: partiallyFailingOps, pct: totalOps > 0 ? Math.round((partiallyFailingOps / totalOps) * 100) : 0, color: 'var(--fail)', filter: 'op_failing'}
+  ].map(m =>
+    `<div style="padding:8px 10px;background:var(--bg3);border-radius:var(--radius);border-left:3px solid ${m.color};position:relative">
+      <div style="font-size:10px;color:var(--text3);margin-bottom:3px;display:flex;justify-content:space-between;align-items:center">
+        <span>${m.label}</span>
+        ${m.filter ? `<button class="metric-download" onclick="viewCoverageDetails('${m.filter}')" title="View ${m.label}" style="width:16px;height:16px;padding:2px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+        </button>` : ''}
+      </div>
+      <div style="font-size:16px;font-weight:600;color:${m.color}">${m.val}${m.pct !== undefined ? ` <span style="font-size:10px;font-weight:400;color:var(--text3)">(${m.pct}%)</span>` : ''}</div>
+    </div>`
+  ).join('');
+  }
+  
+  // Calculate module coverage
+  const moduleMap = {};
+  tests.forEach(t => {
+    const module = t.clsShort || '(unknown)';
+    if (!moduleMap[module]) moduleMap[module] = {total: 0, passed: 0, failed: 0};
+    moduleMap[module].total++;
+    if (t.status === 'passed' || t.status === 'xpass') moduleMap[module].passed++;
+    if (t.status === 'failed' || t.status === 'error') moduleMap[module].failed++;
+  });
+  
+  const totalModules = Object.keys(moduleMap).length;
+  
+  // Check if no modules found
+  if (totalModules === 0) {
+    document.getElementById('model-module-coverage').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3);font-size:14px">No module data available</div>';
+  } else {
+    const fullyPassingModules = Object.values(moduleMap).filter(m => m.passed === m.total && m.total > 0).length;
+    const partiallyFailingModules = Object.values(moduleMap).filter(m => m.passed < m.total && m.total > 0).length;
+    
+    document.getElementById('model-module-coverage').innerHTML = [
+      {label: 'Total Modules', val: totalModules, color: 'var(--text)', filter: null},
+      {label: 'Fully Passing', val: fullyPassingModules, pct: totalModules > 0 ? Math.round((fullyPassingModules / totalModules) * 100) : 0, color: 'var(--pass)', filter: 'module_passing'},
+      {label: 'Partially Passing', val: partiallyFailingModules, pct: totalModules > 0 ? Math.round((partiallyFailingModules / totalModules) * 100) : 0, color: 'var(--fail)', filter: 'module_failing'}
+    ].map(m =>
+      `<div style="padding:8px 10px;background:var(--bg3);border-radius:var(--radius);border-left:3px solid ${m.color};position:relative">
+        <div style="font-size:10px;color:var(--text3);margin-bottom:3px;display:flex;justify-content:space-between;align-items:center">
+          <span>${m.label}</span>
+          ${m.filter ? `<button class="metric-download" onclick="viewCoverageDetails('${m.filter}')" title="View ${m.label}" style="width:16px;height:16px;padding:2px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </button>` : ''}
+        </div>
+        <div style="font-size:16px;font-weight:600;color:${m.color}">${m.val}${m.pct !== undefined ? ` <span style="font-size:10px;font-weight:400;color:var(--text3)">(${m.pct}%)</span>` : ''}</div>
+      </div>`
+    ).join('');
+  }
+}
+
+// ─── model pie chart ──────────────────────────────────────────────────────────
+function populateModelSelector() {
+  const run = currentRun();
+  const selector = document.getElementById('model-selector');
+  const emptyDiv = document.getElementById('model-chart-empty');
+  
+  if (!run || !selector) return;
+  
+  // Get filtered tests first
+  const filteredTests = getFilteredTests();
+  
+  // Extract unique models from test properties (looking for "tag" properties)
+  // Only include tags that start with "model__"
+  availableModels = [];
+  const modelSet = new Set();
+  
+  filteredTests.forEach(t => {
+    if (t.properties && t.properties.length > 0) {
+      t.properties.forEach(prop => {
+        // Properties are stored as property names from XML <property name="tag" value="model_name"/>
+        // The property name itself is the tag (e.g., "paddedtensor", "bf16operation", etc.)
+        // But we want the actual model tags which are stored as property names
+        // Only include tags that start with "model__"
+        if (prop && prop.startsWith('model__') && !modelSet.has(prop)) {
+          modelSet.add(prop);
+          availableModels.push(prop);
+        }
+      });
+    }
+  });
+  
+  // Sort models alphabetically
+  availableModels.sort();
+  
+  // Populate dropdown and handle empty state
+  if (availableModels.length === 0) {
+    selector.innerHTML = '<option value="">No models available</option>';
+    selector.disabled = true;
+    selectedModelName = '';
+    document.getElementById('model-chart-container').style.display = 'none';
+    emptyDiv.style.display = 'flex';
+    emptyDiv.innerHTML = '<div style="text-align:center"><div style="font-size:14px;color:var(--text2);margin-bottom:8px">No Model Data Available</div><div style="font-size:12px;color:var(--text3)">This report does not contain model tags in test properties</div></div>';
+  } else {
+    // Populate dropdown with models
+    selector.innerHTML = availableModels.map(model =>
+      `<option value="${escAttr(model)}">${esc(displayGroupName(model))}</option>`
+    ).join('');
+    selector.disabled = false;
+    
+    // Automatically select the first model
+    selectedModelName = availableModels[0];
+    selector.value = selectedModelName;
+    
+    // Render the chart for the first model
+    updateModelPieChart();
+  }
+}
+
+function updateModelPieChart() {
+  const selector = document.getElementById('model-selector');
+  selectedModelName = selector ? selector.value : '';
+  
+  if (!selectedModelName) {
+    document.getElementById('model-chart-container').style.display = 'none';
+    document.getElementById('model-chart-empty').style.display = 'block';
+    if (modelPieChart) {
+      modelPieChart.destroy();
+      modelPieChart = null;
+    }
+    return;
+  }
+  
+  const run = currentRun();
+  if (!run) return;
+  
+  // Get filtered tests first, then filter by model
+  const filteredTests = getFilteredTests();
+  const modelTests = filteredTests.filter(t =>
+    t.properties && t.properties.includes(selectedModelName)
+  );
+  
+  if (modelTests.length === 0) {
+    document.getElementById('model-chart-container').style.display = 'none';
+    document.getElementById('model-chart-empty').innerHTML = 
+      '<div style="text-align:center;padding:40px;color:var(--text3)">No tests found for this model</div>';
+    document.getElementById('model-chart-empty').style.display = 'block';
+    return;
+  }
+  
+  // Show chart container
+  document.getElementById('model-chart-container').style.display = 'block';
+  document.getElementById('model-chart-empty').style.display = 'none';
+  
+  // Count statuses for this model
+  const cnt = countStatuses(modelTests);
+  const total = modelTests.length;
+  const pct = v => total ? Math.round(v/total*100) : 0;
+  
+  // Render pie chart
+  const ctx = document.getElementById('model-pie-chart');
+  if (ctx) {
+    if (modelPieChart) modelPieChart.destroy();
+    const colors = getChartColors();
+    
+    modelPieChart = new Chart(ctx.getContext('2d'), {
+      type: 'doughnut',
+      data: {
+        labels: ['Passed', 'Failed', 'Xfail', 'Xpass', 'Skipped'],
+        datasets: [{
+          data: [cnt.passed, cnt.failed, cnt.xfail, cnt.xpass, cnt.skipped],
+          backgroundColor: ['#16a34a', '#dc2626', '#d97706', '#6366f1', '#6b7280'],
+          borderWidth: 2,
+          borderColor: colors.border
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: {
+          legend: {
+            display: true,
+            position: 'right',
+            align: 'center',
+            labels: {
+              font: { family: 'IBM Plex Sans', size: 11 },
+              padding: 8,
+              usePointStyle: true,
+              pointStyle: 'circle',
+              boxWidth: 8,
+              boxHeight: 8,
+              color: colors.text2
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const percentage = Math.round(ctx.parsed / total * 100);
+                return `${ctx.label}: ${ctx.parsed} (${percentage}%)`;
+              }
+            }
+          },
+          title: {
+            display: true,
+            text: displayGroupName(selectedModelName),
+            font: { family: 'IBM Plex Mono', size: 14, weight: '500' },
+            padding: { bottom: 16 },
+            color: colors.text
+          }
+        }
+      }
+    });
+  }
+  
+  // Render stats - vertical list on the right side of pie chart
+  const effectivePct = pct(cnt.passed + cnt.xpass);
+  document.getElementById('model-stats').innerHTML = [
+    {label:'Total Tests', val:total, color:'var(--text)'},
+    {label:'Pass Rate', val:effectivePct+'%', color:'var(--accent)'},
+    {label:'Passed', val:cnt.passed, pct:pct(cnt.passed), color:'var(--pass)'},
+    {label:'Failed', val:cnt.failed, pct:pct(cnt.failed), color:'var(--fail)'},
+    {label:'Xfail', val:cnt.xfail, pct:pct(cnt.xfail), color:'var(--xfail)'},
+    {label:'Xpass', val:cnt.xpass, pct:pct(cnt.xpass), color:'var(--xpass)'},
+    {label:'Skipped', val:cnt.skipped, pct:pct(cnt.skipped), color:'var(--skip)'}
+  ].map(m =>
+    `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg3);border-radius:var(--radius);border-left:3px solid ${m.color}">
+      <span style="font-size:11px;font-family:var(--sans);color:var(--text2)">${m.label}</span>
+      <span style="font-size:14px;font-weight:600;color:${m.color}">${m.val}${m.pct !== undefined ? ` <span style="font-size:11px;font-weight:400;color:var(--text3)">(${m.pct}%)</span>` : ''}</span>
+    </div>`
+  ).join('');
+  
+  // Calculate and render operation coverage
+  renderModelOperationCoverage(modelTests);
+  
+  // Calculate and render module coverage
+  renderModelModuleCoverage(modelTests);
+}
+
+function renderModelOperationCoverage(modelTests) {
+  const opMap = {};
+  modelTests.forEach(t => {
+    const op = t.opName || '(no op)';
+    if (!opMap[op]) opMap[op] = {total: 0, passed: 0, failed: 0};
+    opMap[op].total++;
+    if (t.status === 'passed' || t.status === 'xpass') opMap[op].passed++;
+    if (t.status === 'failed' || t.status === 'error') opMap[op].failed++;
+  });
+  
+  const totalOps = Object.keys(opMap).length;
+  const fullyPassingOps = Object.values(opMap).filter(o => o.failed === 0 && o.total > 0).length;
+  const partiallyFailingOps = Object.values(opMap).filter(o => o.failed > 0).length;
+  const opCoveragePct = totalOps > 0 ? Math.round((fullyPassingOps / totalOps) * 100) : 0;
+  
+  document.getElementById('model-op-coverage').innerHTML = [
+    {label: 'Total Operations', val: totalOps, color: 'var(--text)'},
+    {label: 'Fully Passing', val: fullyPassingOps, pct: opCoveragePct, color: 'var(--pass)'},
+    {label: 'Partially Failing', val: partiallyFailingOps, pct: totalOps > 0 ? Math.round((partiallyFailingOps / totalOps) * 100) : 0, color: 'var(--fail)'}
+  ].map(m =>
+    `<div style="padding:10px 12px;background:var(--bg3);border-radius:var(--radius);border-left:3px solid ${m.color}">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:4px">${m.label}</div>
+      <div style="font-size:18px;font-weight:600;color:${m.color}">${m.val}${m.pct !== undefined ? ` <span style="font-size:12px;font-weight:400;color:var(--text3)">(${m.pct}%)</span>` : ''}</div>
+    </div>`
+  ).join('');
+}
+
+function renderModelModuleCoverage(modelTests) {
+  const moduleMap = {};
+  modelTests.forEach(t => {
+    const module = t.clsShort || '(unknown)';
+    if (!moduleMap[module]) moduleMap[module] = {total: 0, passed: 0, failed: 0};
+    moduleMap[module].total++;
+    if (t.status === 'passed' || t.status === 'xpass') moduleMap[module].passed++;
+    if (t.status === 'failed' || t.status === 'error') moduleMap[module].failed++;
+  });
+  
+  const totalModules = Object.keys(moduleMap).length;
+  const fullyPassingModules = Object.values(moduleMap).filter(m => m.failed === 0 && m.total > 0).length;
+  const partiallyFailingModules = Object.values(moduleMap).filter(m => m.failed > 0).length;
+  const moduleCoveragePct = totalModules > 0 ? Math.round((fullyPassingModules / totalModules) * 100) : 0;
+  
+  document.getElementById('model-module-coverage').innerHTML = [
+    {label: 'Total Modules', val: totalModules, color: 'var(--text)'},
+    {label: 'Fully Passing', val: fullyPassingModules, pct: moduleCoveragePct, color: 'var(--pass)'},
+    {label: 'Partially Failing', val: partiallyFailingModules, pct: totalModules > 0 ? Math.round((partiallyFailingModules / totalModules) * 100) : 0, color: 'var(--fail)'}
+  ].map(m =>
+    `<div style="padding:10px 12px;background:var(--bg3);border-radius:var(--radius);border-left:3px solid ${m.color}">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:4px">${m.label}</div>
+      <div style="font-size:18px;font-weight:600;color:${m.color}">${m.val}${m.pct !== undefined ? ` <span style="font-size:12px;font-weight:400;color:var(--text3)">(${m.pct}%)</span>` : ''}</div>
+    </div>`
+  ).join('');
+}
+
+// ─── test details tab ─────────────────────────────────────────────────────────
+function renderTestDetails() {
+  const run = currentRun();
+  if (!run) return;
+  
+  // Populate property filter
+  populatePropertyFilter('details-property-filter', 'details-property-menu', 'details-property-text', 'updateDetailsPropertyFilter');
+  
+  // Apply pending filters if they exist (from Overview page View buttons)
+  if (window.pendingDetailsFilters) {
+    const { status, properties } = window.pendingDetailsFilters;
+    
+    // Apply status filter
+    if (status && status.length > 0) {
+      const statusDropdown = document.getElementById('details-status-filter');
+      if (statusDropdown) {
+        statusDropdown.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+          const cbStatus = cb.getAttribute('data-status');
+          cb.checked = status.includes(cbStatus);
+        });
+        updateMultiselectText('details-status-filter', 'details-status-text');
+      }
+    }
+    
+    // Apply property filters
+    if (properties && Object.keys(properties).length > 0) {
+      // Wait for property filter to be populated, then apply filters
+      setTimeout(() => {
+        const propertyDropdown = document.getElementById('details-property-filter');
+        if (propertyDropdown) {
+          // Get all property checkboxes
+          const checkboxes = propertyDropdown.querySelectorAll('input[type="checkbox"]');
+          
+          // Get all filter types that have properties in the dropdown
+          const filterTypesInDropdown = new Set();
+          checkboxes.forEach(cb => {
+            const propValue = cb.getAttribute('data-property');
+            ['dtype', 'op', 'model', 'module'].forEach(filterType => {
+              if (propValue.startsWith(filterType + '__')) {
+                filterTypesInDropdown.add(filterType);
+              }
+            });
+          });
+          
+          // For each checkbox, determine if it should be checked
+          checkboxes.forEach(cb => {
+            const propValue = cb.getAttribute('data-property');
+            let shouldCheck = false;
+            
+            // Check each filter type (dtype, op, model, module)
+            ['dtype', 'op', 'model', 'module'].forEach(filterType => {
+              const prefix = filterType + '__';
+              if (propValue.startsWith(prefix)) {
+                // If this filter type was used in Overview, check only selected values
+                if (properties[filterType]) {
+                  const value = propValue.replace(prefix, '');
+                  shouldCheck = properties[filterType].includes(value);
+                } else {
+                  // If this filter type was NOT used in Overview, check all (show all)
+                  shouldCheck = true;
+                }
+              }
+            });
+            
+            cb.checked = shouldCheck;
+          });
+          
+          updateMultiselectText('details-property-filter', 'details-property-text');
+        }
+        
+        // Clear pending filters after applying
+        window.pendingDetailsFilters = null;
+        
+        // Trigger filter update
+        filterTestDetails();
+      }, 50);
+    } else {
+      // No property filters, just clear pending and filter
+      window.pendingDetailsFilters = null;
+      detailsCurrentPage = 1;
+      filterTestDetails();
+    }
+  } else {
+    // No pending filters, normal render
+    detailsCurrentPage = 1;
+    filterTestDetails();
+  }
+}
+
+// ─── multi-select dropdown functions ──────────────────────────────────────────
+function toggleMultiselect(dropdownId) {
+  const dropdown = document.getElementById(dropdownId);
+  if (!dropdown) return;
+  
+  const menu = dropdown.querySelector('.multiselect-menu');
+  const button = dropdown.querySelector('.multiselect-button');
+  const isOpen = menu.classList.contains('show');
+  
+  // Close all other dropdowns
+  document.querySelectorAll('.multiselect-menu.show').forEach(m => {
+    if (m !== menu) m.classList.remove('show');
+  });
+  
+  // Toggle this dropdown
+  if (!isOpen) {
+    // Position the menu relative to the button
+    const rect = button.getBoundingClientRect();
+    menu.style.top = (rect.bottom + 4) + 'px';
+    menu.style.left = rect.left + 'px';
+    menu.style.minWidth = rect.width + 'px';
+    menu.classList.add('show');
+    
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener('click', function closeDropdown(e) {
+        if (!dropdown.contains(e.target)) {
+          menu.classList.remove('show');
+          document.removeEventListener('click', closeDropdown);
+        }
+      });
+    }, 0);
+  } else {
+    menu.classList.remove('show');
+  }
+}
+
+function updateMultiselectText(dropdownId, textId) {
+  const dropdown = document.getElementById(dropdownId);
+  const textEl = document.getElementById(textId);
+  if (!dropdown || !textEl) return;
+  
+  const checkboxes = dropdown.querySelectorAll('input[type="checkbox"]');
+  const checked = Array.from(checkboxes).filter(cb => cb.checked);
+  
+  if (checked.length === 0) {
+    textEl.textContent = 'None Selected';
+  } else if (checked.length === checkboxes.length) {
+    textEl.textContent = 'All Selected';
+  } else {
+    const labels = checked.map(cb => cb.parentElement.textContent.trim()).join(', ');
+    textEl.textContent = labels.length > 30 ? `${checked.length} selected` : labels;
+  }
+}
+
+function getSelectedStatuses(dropdownId) {
+  const dropdown = document.getElementById(dropdownId);
+  if (!dropdown) return { passed: true, failed: true, xfail: true, skipped: true, xpass: true };
+  
+  const result = {};
+  dropdown.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    const status = cb.getAttribute('data-status');
+    result[status] = cb.checked;
+  });
+  return result;
+}
+
+function updateDetailsStatusFilter() {
+  updateMultiselectText('details-status-filter', 'details-status-text');
+  filterTestDetails();
+}
+
+
+// ─── property filter functions ────────────────────────────────────────────────
+function getAllProperties(tests) {
+  const propsSet = new Set();
+  tests.forEach(t => {
+    if (t.properties && Array.isArray(t.properties)) {
+      t.properties.forEach(prop => propsSet.add(prop));
+    }
+  });
+  return Array.from(propsSet).sort();
+}
+
+function populatePropertyFilter(dropdownId, menuId, textId, updateFn) {
+  const run = currentRun();
+  if (!run) {
+    console.log('populatePropertyFilter: No run available');
+    return;
+  }
+  
+  
+  const allProps = getAllProperties(run.tests);
+  
+  const menu = document.getElementById(menuId);
+  if (!menu) {
+    console.log('populatePropertyFilter: Menu element not found:', menuId);
+    return;
+  }
+  
+  const textEl = document.getElementById(textId);
+  
+  if (allProps.length === 0) {
+    menu.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--text3)">No properties found in this report</div>';
+    if (textEl) textEl.textContent = 'No properties';
+    console.log('populatePropertyFilter: No properties found');
+    return;
+  }
+  
+  menu.innerHTML = allProps.map(prop =>
+    `<label class="multiselect-option">
+      <input type="checkbox" checked onchange="${updateFn}()" data-property="${esc(prop)}"> ${esc(prop)}
+    </label>`
+  ).join('');
+  
+  if (textEl) textEl.textContent = 'All Selected';
+}
+
+function getSelectedProperties(dropdownId) {
+  const dropdown = document.getElementById(dropdownId);
+  if (!dropdown) return null; // null means no filter (show all)
+  
+  const checkboxes = dropdown.querySelectorAll('input[type="checkbox"]');
+  if (checkboxes.length === 0) return null; // no properties available
+  
+  const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+  if (allChecked) return null; // all selected = no filter
+  
+  const selected = [];
+  checkboxes.forEach(cb => {
+    if (cb.checked) {
+      selected.push(cb.getAttribute('data-property'));
+    }
+  });
+  
+  // If no properties selected, treat as "show all" (return null) instead of "show none" (return [])
+  return selected.length > 0 ? selected : null;
+}
+
+function testMatchesProperties(test, selectedProps) {
+  if (!selectedProps || selectedProps === null) return true; // no filter
+  if (selectedProps.length === 0) return true; // none selected = show all (changed from false)
+  
+  // Group selected properties by type (dtype, op, model, module)
+  const propsByType = {};
+  const allPropsByType = {}; // Track all available properties by type
+  
+  selectedProps.forEach(prop => {
+    const parts = prop.split('__');
+    if (parts.length === 2) {
+      const [type, value] = parts;
+      if (!propsByType[type]) {
+        propsByType[type] = [];
+      }
+      propsByType[type].push(value);
+      
+      if (!allPropsByType[type]) {
+        allPropsByType[type] = new Set();
+      }
+      allPropsByType[type].add(value);
+    }
+  });
+  
+  // Get all available properties for each type from the property filter
+  const propertyDropdown = document.getElementById('details-property-filter');
+  const allAvailableByType = {};
+  if (propertyDropdown) {
+    propertyDropdown.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      const propValue = cb.getAttribute('data-property');
+      const parts = propValue.split('__');
+      if (parts.length === 2) {
+        const [type, value] = parts;
+        if (!allAvailableByType[type]) {
+          allAvailableByType[type] = new Set();
+        }
+        allAvailableByType[type].add(value);
+      }
+    });
+  }
+  
+  // Test must match ALL filter types that are actually filtered (AND logic across types)
+  // But only needs to match ONE value within each type (OR logic within type)
+  // If all values of a type are selected, that type is not filtered
+  return Object.keys(propsByType).every(filterType => {
+    const selectedValues = propsByType[filterType];
+    const availableValues = allAvailableByType[filterType];
+    
+    // If all available values are selected, this filter type is not active - skip it
+    if (availableValues && selectedValues.length === availableValues.size) {
+      return true;
+    }
+    
+    const prefix = filterType + '__';
+    const noFilterKey = 'No_' + filterType;
+    
+    // Check if user selected "No_filtertype" option
+    const hasNoFilterSelected = selectedValues.includes(noFilterKey);
+    
+    // Check if test has any properties of this filter type
+    const testHasFilterType = test.properties && Array.isArray(test.properties) &&
+      test.properties.some(prop => prop.startsWith(prefix));
+    
+    // If "No_filtertype" is selected
+    if (hasNoFilterSelected) {
+      // If ONLY "No_filtertype" is selected, show tests without this property
+      if (selectedValues.length === 1) {
+        return !testHasFilterType;
+      }
+      // If "No_filtertype" AND other values are selected, show tests that either:
+      // 1. Don't have this property type, OR
+      // 2. Have one of the selected values
+      else {
+        if (!testHasFilterType) {
+          return true; // Test has no property of this type
+        }
+        // Test has the property, check if it matches selected values
+        return test.properties.some(prop => {
+          if (prop.startsWith(prefix)) {
+            const value = prop.replace(prefix, '');
+            return selectedValues.includes(value);
+          }
+          return false;
+        });
+      }
+    }
+    
+    // Normal filtering: test must have the property type and match selected values
+    if (!test.properties || !Array.isArray(test.properties)) {
+      return false;
+    }
+    
+    return test.properties.some(prop => {
+      if (prop.startsWith(prefix)) {
+        const value = prop.replace(prefix, '');
+        return selectedValues.includes(value);
+      }
+      return false;
+    });
+  });
+}
+
+function updateDetailsPropertyFilter() {
+  updateMultiselectText('details-property-filter', 'details-property-text');
+  filterTestDetails();
+}
+
+function toggleDetailsSortByTime() {
+  // Toggle between: null (default status sort) -> 'asc' -> 'desc' -> null
+  if (!window.detailsSortByTime) {
+    window.detailsSortByTime = 'asc';
+  } else if (window.detailsSortByTime === 'asc') {
+    window.detailsSortByTime = 'desc';
+  } else {
+    window.detailsSortByTime = null;
+  }
+  
+  // Update indicator - always show double arrow, but change color/style
+  const indicator = document.getElementById('details-time-sort-indicator');
+  if (indicator) {
+    if (window.detailsSortByTime === 'asc') {
+      indicator.innerHTML = '<span style="color:var(--text3);font-size: 14px;">↑</span>';
+    } else if (window.detailsSortByTime === 'desc') {
+      indicator.innerHTML = '<span style="color:var(--text3);font-size: 14px;">↓</span>';
+    } else {
+      indicator.innerHTML = '<span style="color:var(--text3);font-size: 14px;">⇅</span>';
+    }
+  }
+  
+  // Re-filter to apply new sort
+  filterTestDetails();
+}
+
+function filterTestDetails() {
+  const run = currentRun();
+  if (!run) return;
+  
+  const statuses = getSelectedStatuses('details-status-filter');
+  const selectedProps = getSelectedProperties('details-property-filter');
+  const searchTerm = (document.getElementById('details-search')?.value || '').toLowerCase();
+  
+  let filtered = run.tests.filter(t => {
+    // Property filter (top-level)
+    if (!testMatchesProperties(t, selectedProps)) return false;
+    
+    // Status filter
+    if (!statuses.passed && t.status === 'passed') return false;
+    if (!statuses.failed && (t.status === 'failed' || t.status === 'error')) return false;
+    if (!statuses.xfail && t.status === 'xfail') return false;
+    if (!statuses.skipped && t.status === 'skipped') return false;
+    if (!statuses.xpass && t.status === 'xpass') return false;
+    
+    // Search filter
+    if (searchTerm && !t.name.toLowerCase().includes(searchTerm)) return false;
+    return true;
+  });
+  
+  // Sort based on current sort settings
+  if (window.detailsSortByTime) {
+    // Sort by time
+    filtered.sort((a, b) => {
+      const diff = a.timeVal - b.timeVal;
+      return window.detailsSortByTime === 'asc' ? diff : -diff;
+    });
+  } else {
+    // Default sort: failures first
+    filtered.sort((a, b) => {
+      const order = {failed:0, error:1, xfail:2, xpass:3, passed:4, skipped:5};
+      return (order[a.status] ?? 9) - (order[b.status] ?? 9);
+    });
+  }
+  
+  // Pagination
+  const totalPages = Math.ceil(filtered.length / detailsItemsPerPage);
+  if (detailsCurrentPage > totalPages) detailsCurrentPage = Math.max(1, totalPages);
+  
+  const startIdx = (detailsCurrentPage - 1) * detailsItemsPerPage;
+  const endIdx = startIdx + detailsItemsPerPage;
+  const showing = filtered.slice(startIdx, endIdx);
+
+  
+  document.getElementById('details-table-body').innerHTML = showing.map((t, i) => {
+    const hasFailMsg = (t.status === 'failed' || t.status === 'error') && t.failMsg;
+    const rowId = 'detail-frow-' + (startIdx + i);
+    return `<tr onclick="${hasFailMsg ? `toggleFailure('${rowId}',event)` : ''}" style="${hasFailMsg ? 'cursor:pointer' : ''}">
+      <td title="${esc(t.name)}">${esc(t.name)}${hasFailMsg ? ' <span style="font-size:9px;color:var(--fail);opacity:.7">▶ error</span>' : ''}</td>
+      <td><span class="status-badge sb-${t.status}">${t.status}</span></td>
+      <td style="color:var(--text3)">${esc(t.dtype)}</td>
+      <td style="color:var(--text3)">${esc(t.opName)}</td>
+      <td style="color:var(--text3)">${esc(t.module || t.clsShort || '')}</td>
+      <td style="color:var(--text3)">${t.timeVal.toFixed(2)}</td>
+    </tr>${hasFailMsg ? `<tr class="failure-row" id="${rowId}" style="display:none"><td colspan="6"><div class="failure-row-inner">${esc(t.failMsg)}</div></td></tr>` : ''}`;
+  }).join('');
+  
+  // Update note
+  document.getElementById('details-note').textContent = filtered.length
+    ? `Showing ${startIdx + 1}-${Math.min(endIdx, filtered.length)} of ${filtered.length} test${filtered.length !== 1 ? 's' : ''}`
+    : 'No tests match the current filters';
+  
+  // Render pagination
+  renderDetailsPagination(totalPages, filtered.length);
+}
+
+function renderDetailsPagination(totalPages, totalItems) {
+  const paginationEl = document.getElementById('details-pagination');
+  if (!paginationEl) return;
+  
+  if (totalPages <= 1) {
+    paginationEl.innerHTML = '';
+    return;
+  }
+  
+  let html = '';
+  
+  // Previous button
+  html += `<button class="btn btn-sm" ${detailsCurrentPage === 1 ? 'disabled' : ''} onclick="goToDetailsPage(${detailsCurrentPage - 1})" style="${detailsCurrentPage === 1 ? 'opacity:0.5;cursor:not-allowed' : ''}">← Prev</button>`;
+  
+  // Page input
+  html += `<span style="padding:0 8px;display:inline-flex;align-items:center;gap:6px;font-size:12px">
+    <span>Page</span>
+    <input type="number" min="1" max="${totalPages}" value="${detailsCurrentPage}"
+           onchange="goToDetailsPage(parseInt(this.value))"
+           style="width:60px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;text-align:center;font-size:12px;background:var(--bg2);color:var(--text)">
+    <span>of ${totalPages}</span>
+  </span>`;
+  
+  // Next button
+  html += `<button class="btn btn-sm" ${detailsCurrentPage === totalPages ? 'disabled' : ''} onclick="goToDetailsPage(${detailsCurrentPage + 1})" style="${detailsCurrentPage === totalPages ? 'opacity:0.5;cursor:not-allowed' : ''}">Next →</button>`;
+  
+  // Items per page selector
+  html += `<select class="btn btn-sm" onchange="changeDetailsItemsPerPage(parseInt(this.value))" style="margin-left:8px">
+    <option value="10" ${detailsItemsPerPage === 10 ? 'selected' : ''}>10 per page</option>
+    <option value="25" ${detailsItemsPerPage === 25 ? 'selected' : ''}>25 per page</option>
+    <option value="50" ${detailsItemsPerPage === 50 ? 'selected' : ''}>50 per page</option>
+    <option value="100" ${detailsItemsPerPage === 100 ? 'selected' : ''}>100 per page</option>
+  </select>`;
+  
+  paginationEl.innerHTML = html;
+}
+
+function goToDetailsPage(page) {
+  detailsCurrentPage = page;
+  filterTestDetails();
+}
+
+function changeDetailsItemsPerPage(items) {
+  detailsItemsPerPage = items;
+  detailsCurrentPage = 1;
+  filterTestDetails();
+}
+
+let expandedFailures = new Set();
+
+function toggleFailure(id, e) {
+  e.stopPropagation();
+  const row = document.getElementById(id);
+  if (!row) return;
+  if (expandedFailures.has(id)) { row.style.display='none'; expandedFailures.delete(id); }
+  else { row.style.display='table-row'; expandedFailures.add(id); }
+}
+
+// ─── action menu ──────────────────────────────────────────────────────────────
+let currentOpenMenu = null;
+
+function toggleActionMenu(menuId, event) {
+  const menu = document.getElementById(menuId);
+  if (!menu) return;
+  
+  // Close any other open menu
+  if (currentOpenMenu && currentOpenMenu !== menuId) {
+    const prevMenu = document.getElementById(currentOpenMenu);
+    if (prevMenu) prevMenu.classList.remove('show');
+  }
+  
+  // Toggle current menu
+  const isShowing = menu.classList.contains('show');
+  menu.classList.toggle('show');
+  currentOpenMenu = menu.classList.contains('show') ? menuId : null;
+  
+  // Position the menu using fixed positioning
+  if (menu.classList.contains('show')) {
+    const button = event ? event.target : document.querySelector(`[onclick*="${menuId}"]`);
+    if (button) {
+      const rect = button.getBoundingClientRect();
+      menu.style.top = (rect.bottom + 4) + 'px';
+      menu.style.left = (rect.right - 160) + 'px';
+    }
+  }
+}
+
+// Close menu when clicking outside
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('.action-menu-container')) {
+    if (currentOpenMenu) {
+      const menu = document.getElementById(currentOpenMenu);
+      if (menu) menu.classList.remove('show');
+      currentOpenMenu = null;
+    }
+  }
+});
+
+
+// ─── COMMENTED OUT: trend / run history ───────────────────────────────────────
+/* function renderTrend() {
+  if (!runs.length) {
+    document.getElementById('trend-empty').style.display='block';
+    document.getElementById('trend-content').style.display='none';
+    return;
+  }
+  document.getElementById('trend-empty').style.display='none';
+  document.getElementById('trend-content').style.display='block';
+
+  const labels = runs.map((r,i) => r.filename.replace(/\.xml$/i,'') || `Run ${i+1}`);
+  const passRates  = runs.map(r => { const c=countStatuses(r.tests); return r.tests.length ? Math.round((c.passed+c.xpass)/r.tests.length*100):0; });
+  const failRates  = runs.map(r => { const c=countStatuses(r.tests); return r.tests.length ? Math.round(c.failed/r.tests.length*100):0; });
+  const xfailRates = runs.map(r => { const c=countStatuses(r.tests); return r.tests.length ? Math.round(c.xfail/r.tests.length*100):0; });
+
+  if (trendChart) trendChart.destroy();
+  const colors = getChartColors();
+  trendChart = new Chart(document.getElementById('trend-chart'), {
+    type:'line',
+    data:{labels,datasets:[
+      {label:'Pass+Xpass %',data:passRates, borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.08)',tension:.3,pointRadius:4,pointBackgroundColor:'#16a34a'},
+      {label:'Fail %',      data:failRates, borderColor:'#dc2626',backgroundColor:'rgba(220,38,38,.06)',tension:.3,pointRadius:4,pointBackgroundColor:'#dc2626',borderDash:[4,3]},
+      {label:'Xfail %',     data:xfailRates,borderColor:'#d97706',backgroundColor:'rgba(217,119,6,.06)',tension:.3,pointRadius:4,pointBackgroundColor:'#d97706',borderDash:[2,3]},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:true,labels:{color:colors.text2}}},
+      scales:{
+        x:{ticks:{color:colors.text3,font:{family:'IBM Plex Mono',size:10}},grid:{color:colors.gridColor}},
+        y:{min:0,max:100,ticks:{color:colors.text3,font:{family:'IBM Plex Mono',size:10},callback:v=>v+'%'},grid:{color:colors.gridColor}},
+      }
+    }
+  });
+
+  const tl = document.getElementById('run-timeline');
+  tl.innerHTML = runs.map((r,i) => {
+    const cnt = countStatuses(r.tests);
+    const total = r.tests.length;
+    const pct = v => total ? Math.round(v/total*100) : 0;
+    const d = new Date(r.timestamp);
+    const timeStr = isNaN(d) ? '' : d.toLocaleString();
+    const effectivePct = pct(cnt.passed+cnt.xpass);
+    return `<div class="run-block">
+      <div class="run-block-hd">
+        <span class="run-num">#${i+1}</span>
+        <span class="run-filename">${esc(r.filename)}</span>
+        <span class="run-time-label">${timeStr}</span>
+        <span class="run-badge rb-pass">${effectivePct}% pass</span>
+        ${cnt.xpass ? `<span class="run-badge" style="background:rgba(129,140,248,.15);color:var(--xpass)">${cnt.xpass} xpass</span>` : ''}
+        ${cnt.failed ? `<span class="run-badge rb-fail">${cnt.failed} fail</span>` : ''}
+      </div>
+      <div class="bar-track">
+        <div class="bar-seg bs-pass" style="flex:${cnt.passed}"></div>
+        <div class="bar-seg bs-xpass" style="flex:${cnt.xpass}"></div>
+        <div class="bar-seg bs-xfail" style="flex:${cnt.xfail}"></div>
+        <div class="bar-seg bs-skip" style="flex:${cnt.skipped}"></div>
+        <div class="bar-seg bs-fail" style="flex:${cnt.failed}"></div>
+      </div>
+      <div class="mc-stats" style="margin-top:6px">
+        ${cnt.passed  ? `<span class="mc-stat"><span class="dot d-pass"></span>${cnt.passed} passed</span>`  : ''}
+        ${cnt.xpass   ? `<span class="mc-stat"><span class="dot d-xpass"></span>${cnt.xpass} xpass</span>`   : ''}
+        ${cnt.failed  ? `<span class="mc-stat"><span class="dot d-fail"></span>${cnt.failed} failed</span>`  : ''}
+        ${cnt.xfail   ? `<span class="mc-stat"><span class="dot d-xfail"></span>${cnt.xfail} xfail</span>`  : ''}
+        ${cnt.skipped ? `<span class="mc-stat"><span class="dot d-skip"></span>${cnt.skipped} skipped</span>`: ''}
+        <span class="mc-stat" style="margin-left:auto;color:var(--text3)">${total} total</span>
+      </div>
+    </div>`;
+  }).join('');
+} */
+
+// ─── exports ──────────────────────────────────────────────────────────────────
+function exportCSV() {
+  const run = currentRun();
+  if (!run) return;
+  const rows = [['test_name','classname','op','dtype','test_method','status','fail_message','time_s','tags']];
+  run.tests.forEach(t => rows.push([q(t.name),q(t.cls),q(t.opName),q(t.dtype),q(t.testMethod),t.status,q(t.failMsg),t.timeVal.toFixed(3),q(t.tags.join(';'))]));
+  downloadCSV(rows, run.filename.replace('.xml','')+'_tests.csv');
+  toast('Exported CSV');
+}
+
+/* function exportTrendCSV() {
+  const header = ['run','filename','total','passed','xpass','failed','xfail','skipped','pass_pct'];
+  const rows = [header];
+  runs.forEach((r,i) => {
+    const cnt = countStatuses(r.tests);
+    const total = r.tests.length;
+    const pct = total ? Math.round((cnt.passed+cnt.xpass)/total*100) : 0;
+    rows.push([i+1,r.filename,total,cnt.passed,cnt.xpass,cnt.failed,cnt.xfail,cnt.skipped,pct]);
+  });
+  downloadCSV(rows,'spyre_trend.csv');
+  toast('Exported trend CSV');
+} */
+
+function downloadCSV(rows, filename) {
+  const csv = rows.map(r=>r.join(',')).join('\n');
+  const blob = new Blob([csv],{type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+// ─── View metric details in test details tab ──────────────────────────────────
+function viewMetricDetails(status) {
+  const run = currentRun();
+  if (!run) {
+    toast('No run selected');
+    return;
+  }
+  
+  // Store current property filters from Overview page
+  const overviewPropertyFilters = {};
+  ['dtype', 'op', 'model', 'module'].forEach(filterType => {
+    if (propertyFilters[filterType].selected.length > 0 &&
+        propertyFilters[filterType].selected.length < propertyFilters[filterType].available.length) {
+      overviewPropertyFilters[filterType] = [...propertyFilters[filterType].selected];
+    }
+  });
+  
+  // Map status parameter to checkbox values
+  const statusMap = {
+    'all': ['passed', 'failed', 'xfail', 'xpass', 'skipped', 'error'],
+    'total': ['passed', 'failed', 'xfail', 'xpass', 'skipped', 'error'],
+    'effective_pass': ['passed', 'xpass'],
+    'passed': ['passed'],
+    'failed': ['failed', 'error'],
+    'xfail': ['xfail'],
+    'xpass': ['xpass'],
+    'skipped': ['skipped']
+  };
+  
+  const statusesToShow = statusMap[status] || [];
+  
+  // Store filters to apply after tab switch
+  window.pendingDetailsFilters = {
+    status: statusesToShow,
+    properties: overviewPropertyFilters
+  };
+  
+  // Switch to details tab
+  switchTab('details');
+  
+  // Scroll to top
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  
+  // toast(`Viewing ${status} tests`);
+}
+
+// ─── View coverage details (operations/modules) ────────────────────────────────
+function viewCoverageDetails(filterType) {
+  const run = currentRun();
+  if (!run) {
+    toast('No run selected');
+    return;
+  }
+  
+  // Store current property filters from Overview page
+  const overviewPropertyFilters = {};
+  ['dtype', 'op', 'model', 'module'].forEach(type => {
+    if (propertyFilters[type].selected.length > 0 &&
+        propertyFilters[type].selected.length < propertyFilters[type].available.length) {
+      overviewPropertyFilters[type] = [...propertyFilters[type].selected];
+    }
+  });
+  
+  // Parse filterType to determine what to filter
+  // filterType can be: 'op_passing', 'op_failing', 'module_passing', 'module_failing'
+  const [category, status] = filterType.split('_');
+  
+  // Calculate which ops/modules match the filter
+  if (category === 'op') {
+    // Calculate operation coverage
+    const opMap = {};
+    run.tests.forEach(t => {
+      const op = t.opName || '(no op)';
+      if (!opMap[op]) opMap[op] = {total: 0, passed: 0, failed: 0};
+      opMap[op].total++;
+      if (t.status === 'passed' || t.status === 'xpass') opMap[op].passed++;
+      if (t.status === 'failed' || t.status === 'error') opMap[op].failed++;
+    });
+    
+    // Filter ops based on status
+    const matchingOps = Object.entries(opMap)
+      .filter(([op, stats]) => {
+        if (status === 'passing') {
+          // Fully passing: 100% pass rate
+          return stats.passed === stats.total && stats.total > 0;
+        } else if (status === 'failing') {
+          // Partially failing: NOT fully passing (includes failures, xfails, skips, etc.)
+          return stats.passed < stats.total && stats.total > 0;
+        }
+        return false;
+      })
+      .map(([op]) => op);
+    
+    // Add op filter to properties
+    if (matchingOps.length > 0) {
+      overviewPropertyFilters['op'] = matchingOps;
+    }
+  } else if (category === 'module') {
+    // Calculate module coverage
+    const moduleMap = {};
+    run.tests.forEach(t => {
+      const module = t.clsShort || '(unknown)';
+      if (!moduleMap[module]) moduleMap[module] = {total: 0, passed: 0, failed: 0};
+      moduleMap[module].total++;
+      if (t.status === 'passed' || t.status === 'xpass') moduleMap[module].passed++;
+      if (t.status === 'failed' || t.status === 'error') moduleMap[module].failed++;
+    });
+    
+    // Filter modules based on status
+    const matchingModules = Object.entries(moduleMap)
+      .filter(([module, stats]) => {
+        if (status === 'passing') {
+          // Fully passing: 100% pass rate
+          return stats.passed === stats.total && stats.total > 0;
+        } else if (status === 'failing') {
+          // Partially failing: NOT fully passing (includes failures, xfails, skips, etc.)
+          return stats.passed < stats.total && stats.total > 0;
+        }
+        return false;
+      })
+      .map(([module]) => module);
+    
+    // Add module filter to properties
+    if (matchingModules.length > 0) {
+      overviewPropertyFilters['module'] = matchingModules;
+    }
+  }
+  
+  // Store filters to apply after tab switch (show all statuses for coverage view)
+  window.pendingDetailsFilters = {
+    status: ['passed', 'failed', 'xfail', 'xpass', 'skipped', 'error'],
+    properties: overviewPropertyFilters
+  };
+  
+  // Switch to details tab
+  switchTab('details');
+  
+  // Scroll to top
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  
+  const filterLabel = filterType.replace('_', ' ');
+  // toast(`Viewing ${filterLabel} tests`);
+}
+
+// ─── Clear all filters helper ─────────────────────────────────────────────────
+function setFilters() {
+  // Clear all active filters
+  // activeFilters.dtype = [];
+  // activeFilters.op = [];
+  // activeFilters.model = [];
+  // activeFilters.module = [];
+  
+  // // Update filter UI
+  // updateFilterUI();
+}
+
+// ─── Download metric-specific data ────────────────────────────────────────────
+function downloadMetricData(status) {
+  const run = currentRun();
+  if (!run) {
+    toast('No run selected');
+    return;
+  }
+  
+  // Get filtered tests
+  const filteredTests = getFilteredTests();
+  
+  // Filter tests by status
+  let tests = [];
+  switch(status) {
+    case 'all':
+      tests = filteredTests;
+      break;
+    case 'effective_pass':
+      tests = filteredTests.filter(t => t.status === 'passed' || t.status === 'xpass');
+      break;
+    case 'passed':
+      tests = filteredTests.filter(t => t.status === 'passed');
+      break;
+    case 'failed':
+      tests = filteredTests.filter(t => t.status === 'failed' || t.status === 'error');
+      break;
+    case 'xfail':
+      tests = filteredTests.filter(t => t.status === 'xfail');
+      break;
+    case 'xpass':
+      tests = filteredTests.filter(t => t.status === 'xpass');
+      break;
+    case 'skipped':
+      tests = filteredTests.filter(t => t.status === 'skipped');
+      break;
+    default:
+      tests = filteredTests;
+  }
+  
+  if (tests.length === 0) {
+    toast(`No tests found for status: ${status}`);
+    return;
+  }
+  
+  // Prepare CSV data with metadata
+  const rows = [];
+  
+  // Add metadata header
+  rows.push(['# Metadata']);
+  rows.push(['Run ID', run._runId || 'N/A']);
+  rows.push(['Commit SHA', run._commitSha || run.aggregatedData?.commit_sha || 'N/A']);
+  rows.push(['Filename', run.filename]);
+  rows.push(['Status Filter', status]);
+  rows.push(['Total Tests in Filter', tests.length]);
+  rows.push(['Timestamp', new Date(run.timestamp).toISOString()]);
+  
+  // Add workflow info if available
+  if (run._isAggregated && run.aggregatedData) {
+    rows.push(['Workflows', run.aggregatedData.workflows?.join('; ') || 'N/A']);
+    rows.push(['GHA Run IDs', run.aggregatedData.gha_run_ids?.join('; ') || 'N/A']);
+    rows.push(['PR Number', run.aggregatedData.pr_number || 'N/A']);
+    
+    // Add branch information
+    if (run.aggregatedData.branches) {
+      rows.push(['All Branches', run.aggregatedData.branches.join('; ')]);
+    }
+    if (run.aggregatedData.branch_types) {
+      const bt = run.aggregatedData.branch_types;
+      if (bt.push && bt.push.length > 0) {
+        rows.push(['Push Branches', bt.push.join('; ')]);
+      }
+      if (bt['merge-queue'] && bt['merge-queue'].length > 0) {
+        rows.push(['Merge Queue Branches', bt['merge-queue'].join('; ')]);
+      }
+      if (bt.commit && bt.commit.length > 0) {
+        rows.push(['Commit Branches', bt.commit.join('; ')]);
+      }
+    }
+    if (run.aggregatedData.branch_filters_applied) {
+      rows.push(['Branch Filters Applied', run.aggregatedData.branch_filters_applied.join('; ')]);
+    }
+  } else if (run.aggregatedData) {
+    // For single runs loaded via __chLoadRun
+    rows.push(['Branch', run.aggregatedData.branch || 'N/A']);
+    rows.push(['Workflow', run.aggregatedData.workflow || 'N/A']);
+    rows.push(['GHA Run ID', run.aggregatedData.gha_run_id || 'N/A']);
+  }
+  
+  rows.push([]); // Empty row separator
+  
+  // Add test data header
+  rows.push(['test_name', 'classname', 'op_name', 'dtype', 'status', 'duration_s', 'fail_message', 'tags', 'properties']);
+  
+  // Add test data
+  tests.forEach(t => {
+    rows.push([
+      q(t.name),
+      q(t.cls),
+      q(t.opName),
+      q(t.dtype),
+      t.status,
+      t.timeVal.toFixed(3),
+      q(t.failMsg || ''),
+      q(t.tags?.join('; ') || ''),
+      q(t.properties?.join('; ') || '')
+    ]);
+  });
+  
+  // Generate filename
+  const statusLabel = status.replace(/_/g, '-');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  const baseFilename = run.filename.replace(/\.(xml|json)$/i, '').replace(/[^a-z0-9_-]/gi, '_');
+  const filename = `${baseFilename}_${statusLabel}_${timestamp}.csv`;
+  
+  downloadCSV(rows, filename);
+  toast(`✓ Downloaded ${tests.length} ${status} test cases`);
+}
+
+function q(s) { return '"' + String(s||'').replace(/"/g,'""') + '"'; }
+
+// function exportPDF() {
+//   const run = currentRun();
+//   if (!run) return;
+//   const cnt = countStatuses(run.tests);
+//   const total = run.tests.length;
+//   const pct = v => total ? Math.round(v/total*100) : 0;
+//   const effectivePct = pct(cnt.passed + cnt.xpass);
+
+//   const modelRows = Object.entries(run.modelMap).sort().map(([key, tests]) => {
+//     const c = countStatuses(tests);
+//     const ep = tests.length ? Math.round((c.passed+c.xpass)/tests.length*100) : 0;
+//     return `<tr><td>${key}</td><td>${tests.length}</td><td style="color:#166534">${c.passed}</td><td style="color:#3730a3">${c.xpass}</td><td style="color:#991b1b">${c.failed}</td><td style="color:#92400e">${c.xfail}</td><td style="color:#374151">${c.skipped}</td><td><b>${ep}%</b></td></tr>`;
+//   }).join('');
+
+//   const failures = run.tests.filter(t=>t.status==='failed'||t.status==='error');
+//   const failRows = failures.slice(0,50).map(t =>
+//     `<tr><td style="font-family:monospace;font-size:11px">${t.name}</td><td style="color:#991b1b">${t.status}</td><td style="font-size:10px;color:#6b7280;max-width:400px;overflow:hidden;text-overflow:ellipsis">${t.failMsg.split('\n')[0]}</td></tr>`
+//   ).join('');
+
+//   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+// <title>Spyre Coverage — ${run.filename}</title>
+// <style>body{font-family:'IBM Plex Sans',sans-serif;color:#111;padding:32px;max-width:960px;margin:0 auto}
+// h1{font-size:20px;margin-bottom:4px}h2{font-size:14px;font-weight:500;margin:28px 0 10px;text-transform:uppercase;letter-spacing:.08em;color:#6b7280}
+// .sub{color:#6b7280;font-size:13px;margin-bottom:24px}
+// .metrics{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:28px}
+// .m{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:14px 18px;min-width:100px}
+// .ml{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em}.mv{font-size:22px;font-weight:300}
+// table{width:100%;border-collapse:collapse;font-size:13px}
+// th{background:#f3f4f6;text-align:left;padding:8px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280}
+// td{padding:7px 10px;border-bottom:1px solid #f3f4f6}
+// .note{font-size:11px;color:#9ca3af;margin-top:4px}
+// .footer{margin-top:32px;font-size:11px;color:#9ca3af;border-top:1px solid #f3f4f6;padding-top:12px}
+// </style></head><body>
+// <h1>Torch Spyre · Test Health Dashboard</h1>
+// <div class="sub">${run.filename} · Generated ${new Date().toLocaleString()} · Grouped by: ${groupBy}</div>
+// <div class="metrics">
+//   <div class="m"><div class="ml">Total</div><div class="mv">${total}</div></div>
+//   <div class="m"><div class="ml">Passed</div><div class="mv" style="color:#166534">${cnt.passed}</div></div>
+//   <div class="m"><div class="ml">Xpass</div><div class="mv" style="color:#3730a3">${cnt.xpass}</div></div>
+//   <div class="m"><div class="ml">Failed</div><div class="mv" style="color:#991b1b">${cnt.failed}</div></div>
+//   <div class="m"><div class="ml">Xfail</div><div class="mv" style="color:#92400e">${cnt.xfail}</div></div>
+//   <div class="m"><div class="ml">Skipped</div><div class="mv" style="color:#374151">${cnt.skipped}</div></div>
+//   <div class="m"><div class="ml">Pass rate</div><div class="mv">${effectivePct}%</div></div>
+// </div>
+// <h2>Coverage by ${groupBy}</h2>
+// <table><thead><tr><th>Group</th><th>Tests</th><th>Passed</th><th>Xpass</th><th>Failed</th><th>Xfail</th><th>Skipped</th><th>Pass %</th></tr></thead>
+// <tbody>${modelRows}</tbody></table>
+// ${failures.length ? `<h2>Failures (${Math.min(failures.length,50)} of ${failures.length})</h2>
+// <table><thead><tr><th>Test</th><th>Status</th><th>Error</th></tr></thead><tbody>${failRows}</tbody></table>` : ''}
+// <div class="footer">Spyre Coverage Dashboard · IBM Research</div>
+// </body></html>`;
+//   const win = window.open('','_blank');
+//   win.document.write(html);
+//   win.document.close();
+//   setTimeout(()=>{win.focus();win.print();},400);
+//   toast('PDF report opened — use Print → Save as PDF');
+// }
+
+// ─── sample data ──────────────────────────────────────────────────────────────
+// Represents a realistic Spyre run: mostly xfail, some passed, one failure
+function makeSampleTests() {
+  const ops = ['add','mul','sub','gcd','eq','ne','ge','gt','le','lt','floor_divide','fmod','remainder','pow','maximum','minimum'];
+  const dtypes = ['float16','float32','int64','bool','complex64'];
+  const methods = ['test_scalar_support','test_contig_vs_transposed'];
+  const cls = 'TestBinaryUfuncsPRIVATEUSE1';
+  const tests = [];
+  methods.forEach(method => {
+    ops.forEach(op => {
+      dtypes.forEach(dtype => {
+        const r = Math.random();
+        let status;
+        // simulate: add/mul pass for float16/float32, others xfail, one failure
+        if ((op==='add'||op==='mul'||op==='sub') && (dtype==='float16'||dtype==='float32')) {
+          status = r < 0.9 ? 'passed' : 'xpass';
+        } else if (op==='gcd') {
+          status = r < 0.05 ? 'failed' : 'xfail';
+        } else if (dtype==='complex64') {
+          status = 'skipped';
+        } else {
+          status = r < 0.05 ? 'xpass' : 'xfail';
+        }
+        const failMsg = status==='failed' ? 'RuntimeError: Error: In-device copy not implemented.\n\nTraceback (most recent call last):\n  File "test_binary_ufuncs.py", line 42, in test_scalar_support\n    res = op(a, b)' : '';
+        tests.push({
+          name:`${method}_${op}_spyre_${dtype}`,
+          cls:`test.test_binary_ufuncs.${cls}`, clsShort:cls,
+          timeVal: Math.random()*0.5+0.01, file:'test/test_binary_ufuncs.py',
+          status, failMsg, tags:[],
+          testMethod:method, opName:op, dtype,
+        });
+      });
+    });
+  });
+  return tests;
+}
+
+// Commented out - not needed for ClickHouse-based dashboard
+// function loadSample() {
+//   // Embedded sample XML data with model tags
+//   const sampleXML = `<?xml version="1.0" encoding="utf-8"?>
+// <testsuites name="pytest tests">
+//     <testsuite name="pytest" errors="0" failures="1" skipped="45" tests="60" time="8.5" timestamp="2026-04-25T14:20:45.381718+00:00" hostname="sample-host">
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_as_strided_gradients_spyre" time="0.079">
+//             <properties>
+//                 <property name="granite" value="True"/>
+//                 <property name="llama" value="True"/>
+//             </properties>
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_contiguous_self_spyre" time="0.003">
+//             <properties>
+//                 <property name="granite" value="True"/>
+//             </properties>
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_unbind_spyre" time="0.004">
+//             <properties>
+//                 <property name="llama" value="True"/>
+//                 <property name="mistral" value="True"/>
+//             </properties>
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_conj_self_spyre_bfloat16" time="0.002" />
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_conj_self_spyre_float16" time="0.002">
+//             <properties>
+//                 <property name="granite" value="True"/>
+//             </properties>
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_conj_self_spyre_float32" time="0.002">
+//             <properties>
+//                 <property name="mistral" value="True"/>
+//             </properties>
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_T_view_spyre" time="6.042">
+//             <skipped type="pytest.xfail" message="" />
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_advanced_indexing_assignment_spyre" time="0.117">
+//             <properties>
+//                 <property name="llama" value="True"/>
+//             </properties>
+//             <skipped type="pytest.xfail" message="" />
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_reshape_view_spyre" time="0.011">
+//             <properties>
+//                 <property name="granite" value="True"/>
+//                 <property name="mistral" value="True"/>
+//             </properties>
+//             <skipped type="pytest.xfail" message="" />
+//         </testcase>
+//         <testcase classname="test.test_view_ops.TestViewOpsPRIVATEUSE1" name="test_failed_example_spyre" time="0.050">
+//             <properties>
+//                 <property name="granite" value="True"/>
+//             </properties>
+//             <failure message="AssertionError">Test failed with error</failure>
+//         </testcase>
+//     </testsuite>
+// </testsuites>`;
+//
+//   runs = [];
+//   try {
+//     const tests = parseXML(sampleXML);
+//     const run = {
+//       filename: 'sample_data_with_models.xml',
+//       timestamp: Date.now(),
+//       tests,
+//       modelMap: buildGroupMap(tests, groupBy),
+//     };
+//     runs.push(run);
+//     selectedRunIndex = 0;
+//     updateRunList();
+//     toast('✓ Sample data loaded (' + tests.length + ' tests with model tags)');
+//     setTimeout(() => switchTab('overview'), 300);
+//   } catch (err) {
+//     toast('✗ Error parsing sample data: ' + err.message, true);
+//   }
+// }
+
+// ─── drag & drop ──────────────────────────────────────────────────────────────
+// Commented out - not needed for ClickHouse-based dashboard
+// const dz = document.getElementById('dropzone');
+// dz.addEventListener('dragover', e=>{e.preventDefault();dz.classList.add('over')});
+// dz.addEventListener('dragleave', ()=>dz.classList.remove('over'));
+// dz.addEventListener('drop', e=>{e.preventDefault();dz.classList.remove('over');ingestFiles(e.dataTransfer.files)});
+// document.getElementById('fileInput').addEventListener('change', e=>{ingestFiles(e.target.files);e.target.value=''});
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+// ─── helper function to display group name without prefix ────────────────────
+function displayGroupName(name) {
+  if (name.startsWith('model__')) return name.substring(7);
+  if (name.startsWith('module__')) return name.substring(8);
+  return name;
+}
+function escAttr(s){ return String(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+function toast(msg, isErr){
+  const el = document.getElementById('toast');
+  
+  // Determine status and icon
+  const title = isErr ? 'Error' : 'Success';
+  const statusClass = isErr ? 'error' : 'success';
+  const icon = isErr ? '✕' : '✓';
+  
+  // Format with icon on left, title with close button inline, message on bottom
+  el.innerHTML = `
+    <div class="toast-icon">${icon}</div>
+    <div class="toast-content">
+      <div class="toast-title">
+        ${title}
+        <div class="toast-close" onclick="closeToast()" title="Close">✕</div>
+      </div>
+      <div class="toast-message">${esc(msg)}</div>
+    </div>
+  `;
+  
+  // Remove previous status classes and add new one
+  el.classList.remove('error', 'success');
+  el.classList.add(statusClass);
+  el.classList.add('show');
+  
+  // Clear any existing timeout
+  if (window.toastTimeout) clearTimeout(window.toastTimeout);
+  
+  // Auto-hide after 3 seconds
+  window.toastTimeout = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+function closeToast() {
+  const el = document.getElementById('toast');
+  el.classList.remove('show');
+  if (window.toastTimeout) clearTimeout(window.toastTimeout);
+}
+
+// ─── ClickHouse Commits Pagination ────────────────────────────────────────────
+let commitsData = [];
+let commitsOffset = 0;
+let commitsPageSize = 10;
+let hasMoreCommits = true;
+let selectedCommitTypes = ['push']; // Only main branch by default
+
+// ─── Generic Property Filtering ───────────────────────────────────────────────
+let propertyFilters = {
+  dtype: { selected: [], available: [] },
+  op: { selected: [], available: [] },
+  model: { selected: [], available: [] },
+  module: { selected: [], available: []},
+  status: { selected: [], available: ['passed', 'failed', 'xfail', 'xpass', 'skipped', 'error'] }
+};
+
+function extractPropertiesFromTests(tests, propertyType) {
+  const properties = new Set();
+  const prefix = propertyType + '__';
+  const noFilterKey = 'No_' + propertyType;
+  
+  tests.forEach(test => {
+    if (test.properties && Array.isArray(test.properties)) {
+      test.properties.forEach(prop => {
+        if (prop.startsWith(prefix)) {
+          properties.add(prop.replace(prefix, ''));
+        }
+      });
+    }
+  });
+  
+  // Sort all properties alphabetically, then prepend No_filtertype at the top
+  const sortedProperties = Array.from(properties).sort();
+  return [noFilterKey, ...sortedProperties];
+}
+
+function populateFilter(filterType) {
+  const run = currentRun();
+  const container = document.getElementById(`filter-${filterType}-container`);
+  
+  if (!run || !run.tests || run.tests.length === 0) {
+    propertyFilters[filterType].available = [];
+    if (container) container.classList.add('disabled');
+    return;
+  }
+  
+  propertyFilters[filterType].available = extractPropertiesFromTests(run.tests, filterType);
+  const optionsList = document.getElementById(`filter-${filterType}-options`);
+  if (!optionsList) return;
+  
+  // Check if there are any actual property values (excluding "No_filtertype")
+  const hasActualValues = propertyFilters[filterType].available.length > 1;
+  
+  if (!hasActualValues) {
+    // Disable the filter when only "No_filtertype" exists (no actual values)
+    optionsList.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text3)">No ${filterType} properties found</div>`;
+    if (container) container.classList.add('disabled');
+    return;
+  }
+  
+  // Enable the filter
+  if (container) container.classList.remove('disabled');
+  
+  renderFilterOptions(filterType, propertyFilters[filterType].available);
+}
+
+function renderFilterOptions(filterType, options) {
+  
+  const optionsList = document.getElementById(`filter-${filterType}-options`);
+  if (!optionsList) return;
+  
+  const selected = propertyFilters[filterType].selected;
+  optionsList.innerHTML = options.map(option => `
+    <label class="multiselect-option" data-value="${option}">
+      <input type="checkbox" value="${option}" ${selected.includes(option) ? 'checked' : ''} onchange="updateFilter('${filterType}')"> ${option}
+    </label>
+  `).join('');
+}
+
+function filterOptions(filterType) {
+  const searchInput = document.getElementById(`filter-${filterType}-search`);
+  if (!searchInput) return;
+  
+  const searchTerm = searchInput.value.toLowerCase();
+  const available = propertyFilters[filterType].available;
+  
+  if (!searchTerm) {
+    renderFilterOptions(filterType, available);
+    return;
+  }
+  
+  const filtered = available.filter(option =>
+    option.toLowerCase().includes(searchTerm)
+  );
+  
+  renderFilterOptions(filterType, filtered);
+}
+
+function toggleFilter(filterType, event) {
+  event.stopPropagation();
+  const menu = document.getElementById(`filter-${filterType}-menu`);
+  if (menu) {
+    menu.classList.toggle('show');
+  }
+}
+
+function updateFilter(filterType) {
+  const checkboxes = document.querySelectorAll(`#filter-${filterType}-menu input[type="checkbox"]`);
+  propertyFilters[filterType].selected = Array.from(checkboxes)
+    .filter(cb => cb.checked)
+    .map(cb => cb.value);
+  
+  // Update button text and clear button visibility
+  const buttonText = document.getElementById(`filter-${filterType}-text`);
+  const clearBtn = document.getElementById(`filter-${filterType}-clear`);
+  const arrow = document.getElementById(`filter-${filterType}-arrow`);
+  const selected = propertyFilters[filterType].selected;
+  const available = propertyFilters[filterType].available;
+  
+  // Show/hide clear button based on filter state
+  const hasActiveFilter = selected.length > 0 && selected.length < available.length;
+  if (clearBtn && arrow) {
+    if (hasActiveFilter) {
+      clearBtn.style.display = 'flex';
+      arrow.style.display = 'none';
+    } else {
+      clearBtn.style.display = 'none';
+      arrow.style.display = 'block';
+    }
+  }
+  
+  if (buttonText) {
+    const label = filterType.charAt(0).toUpperCase() + filterType.slice(1);
+    if (selected.length === 0 || selected.length === available.length) {
+      buttonText.textContent = `${label}: All`;
+    } else if (selected.length === 1) {
+      buttonText.textContent = `${label}: ${selected[0]}`;
+    } else {
+      buttonText.textContent = `${label}: ${selected.length} selected`;
+    }
+  }
+  
+  // Update status
+  updateFilterStatus();
+  
+  // Re-render overview with filtered data
+  renderOverview();
+}
+
+function clearFilter(filterType) {
+  propertyFilters[filterType].selected = [];
+  const checkboxes = document.querySelectorAll(`#filter-${filterType}-menu input[type="checkbox"]`);
+  checkboxes.forEach(cb => cb.checked = false);
+  updateFilter(filterType);
+}
+
+function getFilteredTests() {
+  const run = currentRun();
+  if (!run || !run.tests) return [];
+  
+  // Check if any filters are active
+  const hasActiveFilters = Object.keys(propertyFilters).some(filterType => {
+    const filter = propertyFilters[filterType];
+    return filter.selected.length > 0 && filter.selected.length < filter.available.length;
+  });
+  
+  if (!hasActiveFilters) {
+    return run.tests;
+  }
+  
+  // Filter tests by all active filters
+  return run.tests.filter(test => {
+    // Test must match ALL active filters (AND logic)
+    return Object.keys(propertyFilters).every(filterType => {
+      const filter = propertyFilters[filterType];
+      
+      // If no filter selected or all selected, skip this filter
+      if (filter.selected.length === 0 || filter.selected.length === filter.available.length) {
+        return true;
+      }
+      
+      // Special handling for status filter (not a property, but test.status field)
+      if (filterType === 'status') {
+        return filter.selected.includes(test.status);
+      }
+      
+      const prefix = filterType + '__';
+      const noFilterKey = 'No_' + filterType;
+      
+      // Check if user selected "No_filtertype" option
+      const hasNoFilterSelected = filter.selected.includes(noFilterKey);
+      
+      // Check if test has any properties of this filter type
+      const testHasFilterType = test.properties && Array.isArray(test.properties) &&
+        test.properties.some(prop => prop.startsWith(prefix));
+      
+      // If "No_filtertype" is selected
+      if (hasNoFilterSelected) {
+        // If ONLY "No_filtertype" is selected, show tests without this property
+        if (filter.selected.length === 1) {
+          return !testHasFilterType;
+        }
+        // If "No_filtertype" AND other values are selected, show tests that either:
+        // 1. Don't have this property type, OR
+        // 2. Have one of the selected values
+        else {
+          if (!testHasFilterType) {
+            return true; // Test has no property of this type
+          }
+          // Test has the property, check if it matches selected values
+          return test.properties.some(prop => {
+            if (prop.startsWith(prefix)) {
+              const value = prop.replace(prefix, '');
+              return filter.selected.includes(value);
+            }
+            return false;
+          });
+        }
+      }
+      
+      // Normal filtering: test must have the property type and match selected values
+      if (!test.properties || !Array.isArray(test.properties)) {
+        return false;
+      }
+      
+      return test.properties.some(prop => {
+        if (prop.startsWith(prefix)) {
+          const value = prop.replace(prefix, '');
+          return filter.selected.includes(value);
+        }
+        return false;
+      });
+    });
+  });
+}
+
+function updateFilterStatus() {
+  const status = document.getElementById('filter-status');
+  if (!status) return;
+  
+  const run = currentRun();
+  if (!run) return;
+  
+  const hasActiveFilters = Object.keys(propertyFilters).some(filterType => {
+    const filter = propertyFilters[filterType];
+    return filter.selected.length > 0 && filter.selected.length < filter.available.length;
+  });
+  
+  if (!hasActiveFilters) {
+    status.textContent = `All results (${run.tests.length} tests)`;
+  } else {
+    const filtered = getFilteredTests();
+    const totalTests = run.tests.length;
+    status.textContent = `Filtered results (${filtered.length} of ${totalTests} tests)`;
+  }
+}
+
+// Populate all filters when run is loaded
+function populateAllFilters() {
+  populateFilter('dtype');
+  populateFilter('op');
+  populateFilter('model');
+  populateFilter('module');
+}
+
+// Close filter menus when clicking outside
+document.addEventListener('click', function(event) {
+  ['dtype', 'op', 'model', 'module'].forEach(filterType => {
+    const menu = document.getElementById(`filter-${filterType}-menu`);
+    const container = document.getElementById(`filter-${filterType}-container`);
+    if (menu && container && !container.contains(event.target)) {
+      menu.classList.remove('show');
+    }
+  });
+});
+
+// Auto-load commits when reports tab is opened
+function initCommitsTable() {
+  if (typeof window.__chFetchCommits === 'function') {
+    loadInitialCommits();
+  } else {
+    console.error('[initCommitsTable] __chFetchCommits function not found!');
+  }
+}
+
+async function loadInitialCommits() {
+  commitsOffset = 0;
+  commitsData = [];
+  
+  try {
+    const commits = await loadCommitsPage();
+    
+    // Auto-load the latest commit (first in the list) to overview page
+    if (commits && commits.length > 0) {
+      const latestCommit = commits[0];
+      const sha = latestCommit.commit_sha;
+      const branch = latestCommit.branch || '';
+      const workflows = latestCommit.workflows || [];
+      const workflow = workflows.length > 0 ? workflows[0] : '';
+      
+      // Load all runs for the latest commit with custom loader message
+      await loadAllRunsForCommit(sha, branch, workflow, selectedCommitTypes, true);
+    } else {
+      // No commits available, hide loader
+      hideLoader();
+      toast('No commits available', true);
+    }
+  } catch (err) {
+    console.error('[commits] Error during initial load:', err);
+    hideLoader();
+    toast(`Error loading initial data: ${err.message}`, true);
+  }
+}
+
+async function loadNextCommits() {
+  if (!hasMoreCommits) return;
+  commitsOffset += commitsPageSize;
+  try {
+    await loadCommitsPage();
+  } catch (err) {
+    // Error already handled and displayed by loadCommitsPage
+    // Just reset offset on error
+    commitsOffset = Math.max(0, commitsOffset - commitsPageSize);
+  }
+}
+
+async function loadPreviousCommits() {
+  if (commitsOffset === 0) return;
+  const previousOffset = commitsOffset;
+  commitsOffset = Math.max(0, commitsOffset - commitsPageSize);
+  try {
+    await loadCommitsPage();
+  } catch (err) {
+    // Error already handled and displayed by loadCommitsPage
+    // Just restore offset on error
+    commitsOffset = previousOffset;
+  }
+}
+
+function toggleCommitTypeFilter(event) {
+  event.stopPropagation();
+  const menu = document.getElementById('commit-type-filter-menu');
+  if (menu) {
+    menu.classList.toggle('show');
+  }
+}
+
+function updateCommitTypeFilter() {
+  const selectedRadio = document.querySelector('#commit-type-filter-menu input[type="radio"]:checked');
+  selectedCommitTypes = selectedRadio ? [selectedRadio.value] : ['push'];
+  
+  // Update button text
+  const buttonText = document.getElementById('commit-filter-text');
+  if (buttonText) {
+    const labels = {
+      'push': 'PR Merge',
+      'merge-queue': 'PR Merge Queue',
+      'commit': 'PR Commit'
+    };
+    buttonText.textContent = labels[selectedCommitTypes[0]] || 'PR Merge';
+  }
+  
+  // Reset to first page when filter changes
+  commitsOffset = 0;
+  loadCommitsPage();
+}
+
+// No client-side filtering needed - filtering is done in ClickHouse query
+
+// Close multiselect when clicking outside
+document.addEventListener('click', function(event) {
+  const menu = document.getElementById('commit-type-filter-menu');
+  const container = document.getElementById('commit-type-filter-container');
+  if (menu && container && !container.contains(event.target)) {
+    menu.classList.remove('show');
+  }
+});
+
+// Toggle workflows display between limited and full view
+function toggleWorkflows(workflowId) {
+  const limited = document.getElementById(`${workflowId}-limited`);
+  const all = document.getElementById(`${workflowId}-all`);
+  const more = document.getElementById(`${workflowId}-more`);
+  const less = document.getElementById(`${workflowId}-less`);
+  
+  if (limited && all && more && less) {
+    const isExpanded = all.style.display !== 'none';
+    
+    if (isExpanded) {
+      // Collapse: show limited view
+      limited.style.display = 'block';
+      all.style.display = 'none';
+      more.style.display = 'inline';
+      less.style.display = 'none';
+    } else {
+      // Expand: show all workflows
+      limited.style.display = 'none';
+      all.style.display = 'block';
+      more.style.display = 'none';
+      less.style.display = 'inline';
+    }
+  }
+}
+
+async function loadCommitsPage() {
+  const tbody = document.getElementById('commits-table-body');
+  const status = document.getElementById('commits-status');
+  const prevBtn = document.getElementById('commits-prev-btn');
+  const nextBtn = document.getElementById('commits-next-btn');
+  const paginationInfo = document.getElementById('commits-pagination-info');
+  
+  if (!tbody) {
+    console.error('[commits] Table body element not found');
+    return;
+  }
+  
+  if (typeof window.__chFetchCommits !== 'function') {
+    console.warn('[commits] ClickHouse integration not available - window.__chFetchCommits is not a function');
+    if (status) status.innerHTML = '<span style="color:var(--fail)">⚠️ ClickHouse integration not available</span>';
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--text3)">ClickHouse integration not configured. Please check spyre-clickhouse.js is loaded and configured.</td></tr>';
+    return;
+  }
+  
+  // Disable buttons while loading
+  if (prevBtn) prevBtn.disabled = true;
+  if (nextBtn) nextBtn.disabled = true;
+  if (status) status.innerHTML = '<span class="loading-text">Loading commits<span class="loading-dots"></span></span>';
+  tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--text3)"><span class="loading-text">Loading<span class="loading-dots"></span></span></td></tr>';
+  
+  // Helper function to extract PR number based on branch pattern
+  function extractPRNumber(branch, commitPRNumber) {
+    if (branch === 'main') {
+      // For main branch, use pr_number directly from commit
+      return commitPRNumber || '';
+    } else if (branch && branch.startsWith('gh-readonly-queue/')) {
+      // For gh-readonly-queue branches, extract PR number from pattern
+      // Pattern: gh-readonly-queue/main/pr-2507-5838b3b0bfc2a3a633bdd973e5a3e561042c5aee
+      const match = branch.match(/\/pr-(\d+)-/);
+      return match ? match[1] : (commitPRNumber || '');
+    } else {
+      // For other branches, use pr_number from commit
+      return commitPRNumber || '';
+    }
+  }
+  
+  try {
+    // Pass selected filters to ClickHouse query for server-side filtering
+    const response = await window.__chFetchCommits(commitsOffset, commitsPageSize, selectedCommitTypes);
+    // Extract commits data and total count from response
+    const commits = response.data || response; // Support both {data: [], total: N} and legacy array format
+    const totalCommitCount = response.total || 0;
+    
+    if (!commits || commits.length === 0) {
+      hasMoreCommits = false;
+      tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--text3)">No commits found</td></tr>';
+      if (status) status.textContent = selectedCommitTypes.length === 0 ? 'No filter selected' : 'No commits available';
+      if (paginationInfo) paginationInfo.textContent = 'No commits';
+      // Enable/disable pagination buttons for empty state
+      if (prevBtn) {
+        prevBtn.disabled = commitsOffset === 0;
+        prevBtn.style.opacity = commitsOffset === 0 ? '0.5' : '1';
+        prevBtn.style.cursor = commitsOffset === 0 ? 'not-allowed' : 'pointer';
+      }
+      if (nextBtn) {
+        nextBtn.disabled = true;
+        nextBtn.style.opacity = '0.5';
+        nextBtn.style.cursor = 'not-allowed';
+      }
+      return [];
+    }
+    
+    // Check if there are more commits using total count if available, otherwise use page size heuristic
+    if (totalCommitCount > 0) {
+      hasMoreCommits = (commitsOffset + commits.length) < totalCommitCount;
+    } else {
+      hasMoreCommits = commits.length === commitsPageSize;
+    }
+    
+    // Render commits table
+    tbody.innerHTML = commits.map((commit, idx) => {
+      const num = commitsOffset + idx + 1;
+      const sha = commit.commit_sha || 'N/A';
+      const shortSha = sha.substring(0, 8);
+      const branch = commit.branch || 'N/A';
+      const workflows = commit.workflows || [];
+      const workflowCount = commit.total_workflows || workflows.length;
+      const prNumber = extractPRNumber(branch, commit.pr_number);
+      const totalTests = commit.total || 0;
+      const passed = commit.passed || 0;
+      const failed = commit.failed || 0;
+      const xpass = commit.xpass || 0;
+      const xfailed = commit.xfail || 0;
+      const xpassed = commit.xpassed || 0;
+      const xtotal = commit.xtotal || 0;
+      const passRate = totalTests > 0 ? Math.round(((passed + xpass) / totalTests) * 100) : 0;
+      const triggeredAt = commit.triggered_at ? new Date(commit.triggered_at).toLocaleString() : 'N/A';
+      const passColor = passRate >= 90 ? 'var(--pass)' : passRate >= 60 ? 'var(--xfail)' : 'var(--fail)';
+      
+      // Format workflows list with expand/collapse functionality - 2 per line
+      const workflowId = `workflows-${idx}`;
+      
+      // Helper to format workflows in rows of 2
+      const formatWorkflowsInRows = (workflowList) => {
+        let html = '<div style="display:flex;flex-direction:column;gap:4px">';
+        for (let i = 0; i < workflowList.length; i += 2) {
+          html += '<div style="display:flex;gap:4px;flex-wrap:wrap">';
+          html += `<span style="background:var(--bg3);padding:2px 6px;border-radius:4px;font-size:10px">${esc(workflowList[i])}</span>`;
+          if (i + 1 < workflowList.length) {
+            html += `<span style="background:var(--bg3);padding:2px 6px;border-radius:4px;font-size:10px">${esc(workflowList[i + 1])}</span>`;
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+        return html;
+      };
+      
+      const limitedWorkflowsHTML = formatWorkflowsInRows(workflows.slice(0, 2));
+      const allWorkflowsHTML = formatWorkflowsInRows(workflows);
+      
+      const workflowsDisplay = workflows.length > 0
+        ? `<div id="${workflowId}-limited">${limitedWorkflowsHTML}</div>
+           <div id="${workflowId}-all" style="display:none">${allWorkflowsHTML}</div>`
+        : '<span style="color:var(--text3)">N/A</span>';
+      
+      // Put +X more and total count on same line
+      const workflowInfo = workflows.length > 2
+        ? `<div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+             <span id="${workflowId}-more" style="font-size:10px;color:var(--accent);cursor:pointer;text-decoration:underline" onclick="toggleWorkflows('${workflowId}')">+${workflows.length - 2} more</span>
+             <span id="${workflowId}-less" style="display:none;font-size:10px;color:var(--accent);cursor:pointer;text-decoration:underline" onclick="toggleWorkflows('${workflowId}')">show less</span>
+             <span style="font-size:10px;color:var(--text3)">(${workflowCount} workflow${workflowCount !== 1 ? 's' : ''})</span>
+           </div>`
+        : `<div style="font-size:10px;color:var(--text3);margin-top:4px">(${workflowCount} workflow${workflowCount !== 1 ? 's' : ''})</div>`;
+      
+      return `
+        <tr>
+          <td style="text-align:center;color:var(--text3)">${num}</td>
+          <td style="font-family:var(--mono);font-size:11px" title="${esc(sha)}">
+            <a href="https://github.com/torch-spyre/torch-spyre/commit/${esc(sha)}" target="_blank" style="text-decoration:none">
+              <code style="background:var(--bg3);padding:2px 6px;border-radius:4px;color:var(--accent);cursor:pointer">${esc(shortSha)}</code>
+            </a>
+            </td>
+            <td style="font-family:var(--mono);font-size:11px" title="${prNumber}">
+            ${prNumber ?
+              `<a href="https://github.com/torch-spyre/torch-spyre/pull/${prNumber}" target="_blank" style="text-decoration:none">
+                <code style="background:var(--bg3);padding:2px 6px;border-radius:4px;color:var(--accent);cursor:pointer">#${prNumber}</code>
+              </a>`
+              : '-'}
+          </td>
+          <td style="font-size:11px">${esc(branch)}</td>
+          <td style="font-size:11px">
+            ${workflowsDisplay}
+            ${workflowInfo}
+          </td>
+          <td style="text-align:center;font-weight:600">${totalTests}</td>
+          <td style="text-align:center">
+            <span class="status-badge sb-pass">${passed + xpass}</span>
+          </td>
+          <td style="text-align:center">
+            <span class="status-badge sb-fail">${failed + xfailed}</span>
+          </td>
+          <td style="text-align:center;font-weight:600;color:${passColor}">${passRate}%</td>
+          <td style="text-align:center;font-size:11px;color:var(--text3)">${triggeredAt}</td>
+          <td style="text-align:center">
+            <button class="action-menu-btn" onclick="toggleReportActionMenu(${idx}, event)" title="Actions">⋮</button>
+            <div class="action-dropdown" id="action-menu-${idx}" style="display:none">
+              <button class="action-dropdown-item" onclick="loadAllRunsForCommit('${escAttr(sha)}', '${escAttr(branch)}', '', selectedCommitTypes, false, 'overview');closeAllMenus()">View Overview</button>
+              <button class="action-dropdown-item" onclick="loadAllRunsForCommit('${escAttr(sha)}', '${escAttr(branch)}', '', selectedCommitTypes, false, 'details');closeAllMenus()">View Details</button>
+              <button class="action-dropdown-item" onclick="exportRunCSV(${idx});closeAllMenus()">Export CSV</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+    
+    // Update status and pagination
+    const startNum = commitsOffset + 1;
+    const endNum = commitsOffset + commits.length;
+    if (status) status.textContent = `Showing commits ${startNum}-${endNum}`;
+    if (paginationInfo) paginationInfo.textContent = `Showing ${startNum}-${endNum} of ${totalCommitCount} commits`;
+    
+    // Enable/disable pagination buttons
+    const shouldDisablePrev = commitsOffset === 0;
+    const shouldDisableNext = !hasMoreCommits;
+    
+    console.log('[commits] Pagination state:', {
+      commitsOffset,
+      commitsLength: commits.length,
+      totalCommitCount,
+      hasMoreCommits,
+      shouldDisablePrev,
+      shouldDisableNext
+    });
+    
+    if (prevBtn) {
+      prevBtn.disabled = shouldDisablePrev;
+      prevBtn.style.opacity = shouldDisablePrev ? '0.5' : '1';
+      prevBtn.style.cursor = shouldDisablePrev ? 'not-allowed' : 'pointer';
+    }
+    if (nextBtn) {
+      nextBtn.disabled = shouldDisableNext;
+      nextBtn.style.opacity = shouldDisableNext ? '0.5' : '1';
+      nextBtn.style.cursor = shouldDisableNext ? 'not-allowed' : 'pointer';
+    }
+    
+    // Return commits data for use by loadInitialCommits
+    return commits;
+    
+  } catch (err) {
+    console.error('[commits] Error loading commits:', err);
+    // tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:20px;color:var(--fail)">⚠️ Error loading commits: ${esc(err.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:20px;">No Data Found</td></tr>`;
+
+    if (status) status.innerHTML = `<span style="color:var(--fail)">⚠️ Error: ${esc(err.message)}</span>`;
+    
+    // Re-enable buttons on error with proper state
+    const shouldDisablePrev = commitsOffset === 0;
+    const shouldDisableNext = !hasMoreCommits;
+    
+    if (prevBtn) {
+      prevBtn.disabled = shouldDisablePrev;
+      prevBtn.style.opacity = shouldDisablePrev ? '0.5' : '1';
+      prevBtn.style.cursor = shouldDisablePrev ? 'not-allowed' : 'pointer';
+    }
+    if (nextBtn) {
+      nextBtn.disabled = shouldDisableNext;
+      nextBtn.style.opacity = shouldDisableNext ? '0.5' : '1';
+      nextBtn.style.cursor = shouldDisableNext ? 'not-allowed' : 'pointer';
+    }
+    
+    // Re-throw error so loadInitialCommits can handle it properly
+    throw err;
+  }
+}
+
+// Helper functions for loader overlay
+function showLoader(message = 'Loading...') {
+  const overlay = document.getElementById('loader-overlay');
+  const text = document.getElementById('loader-text');
+  if (overlay) overlay.classList.add('show');
+  if (text) text.textContent = message;
+}
+
+function hideLoader() {
+  const overlay = document.getElementById('loader-overlay');
+  if (overlay) overlay.classList.remove('show');
+}
+
+async function loadAllRunsForCommit(commitSha, branch, workflow, branchFilters, isInitialLoad = false, targetTab = null) {
+  if (typeof window.__chLoadAllRunsForCommit !== 'function') {
+    toast('ClickHouse integration not available', true);
+    return;
+  }
+  
+  const shortSha = commitSha.substring(0, 8);
+  // Show different message for initial load vs manual load
+  const loaderMessage = isInitialLoad ? 'Loading latest commit...' : `Loading commit ${shortSha}...`;
+  showLoader(loaderMessage);
+  
+  try {
+    const loadedCount = await window.__chLoadAllRunsForCommit(commitSha, branch, workflow, branchFilters);
+    hideLoader();
+    toast(`Loaded ${loadedCount} run${loadedCount !== 1 ? 's' : ''} for commit ${shortSha}`);
+    
+    // Switch to specified tab or default to overview (but not during initial load)
+    if (!isInitialLoad && targetTab) {
+      setTimeout(() => {
+        switchTab(targetTab);
+        // Scroll to top of page
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }, 300);
+    } else if (!isInitialLoad) {
+      // Default behavior: switch to overview if not already there
+      const overviewPanel = document.getElementById('panel-overview');
+      const isOverviewActive = overviewPanel && overviewPanel.classList.contains('active');
+      
+      if (!isOverviewActive) {
+        setTimeout(() => {
+          switchTab('overview');
+          // Scroll to top of page
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }, 300);
+      }
+    }
+  } catch (err) {
+    hideLoader();
+    console.error('[commits] Error loading runs for commit:', err);
+    toast(`Error loading runs: ${err.message}`, true);
+  }
+}
+</script>
+</body>
+</html>
