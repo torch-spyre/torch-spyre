@@ -160,6 +160,31 @@ def _get_red_var(
     return loop_var, None
 
 
+def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
+    """Why ``op`` takes no coarse tiling for carrying a symbolic extent, or
+    ``None``.
+
+    Not a lowering limit but an applier one. The applier reads every output
+    range, reduction range and layout size of a tiled op as an ``int``
+    (``_raw_to_squeezed_pos``, ``_divide_ranges``), whichever axis the tiling
+    falls on. So an op with a symbolic extent anywhere -- a dim a recompile for
+    a second shape left symbolic -- cannot be tiled even on its static dims.
+    """
+    for what, extents in (
+        ("output range", getattr(op.data, "ranges", None)),
+        ("reduction range", getattr(op.data, "reduction_ranges", None)),
+        ("layout size", getattr(getattr(op, "layout", None), "size", None)),
+    ):
+        for extent in extents or ():
+            if not (isinstance(extent, int) or getattr(extent, "is_Integer", False)):
+                return (
+                    f"coarse tiling: {op.get_name()} has symbolic {what} "
+                    f"{extent}; the applier reads every extent of a tiled op "
+                    "as an integer, so the op cannot be tiled."
+                )
+    return None
+
+
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, spec: TileSpec
 ) -> tuple[list[sympy.Symbol] | None, str | None]:
@@ -176,7 +201,14 @@ def try_resolve_tile_axis_loop_vars(
     ``is_reduction``: ``op_out_coords(op)`` for an output axis
     (:func:`_get_out_var`), the squeezed reduction loop variables for a
     reduction axis (:func:`_get_red_var`).
+
+    A non-empty ``spec`` on an op with a symbolic extent is rejected whatever
+    its axes (:func:`_symbolic_extent_reason`).
     """
+    if spec.axes:
+        reason = _symbolic_extent_reason(op)
+        if reason is not None:
+            return None, reason
     out_coords = op_out_coords(op)
     iter_space = iteration_space_from_op(op)
     loop_vars: list[sympy.Symbol] = []

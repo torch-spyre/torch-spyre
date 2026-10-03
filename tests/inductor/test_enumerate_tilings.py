@@ -27,8 +27,12 @@ from unittest.mock import MagicMock, patch
 import sympy
 import torch
 
+from torch import fx
+from torch._dynamo.source import ConstantSource
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -113,6 +117,24 @@ def _reduction_op(out_shape, reduction_ranges, name="buf0", reduction_type="sum"
         return_value=SimpleNamespace(reads={read}, writes={write})
     )
     return op
+
+
+def _reader(ranges):
+    """A ComputedBuffer reading the tiled op's output, over ``ranges``."""
+    reader = MagicMock(spec=ComputedBuffer)
+    reader.data = SimpleNamespace(ranges=list(ranges))
+    return reader
+
+
+def _counts(options, host_dim):
+    """The single-level counts ``options`` offers for output ``host_dim``."""
+    return [
+        spec.axes[0].count
+        for spec in options
+        if spec.depth == 1
+        and not spec.axes[0].is_reduction
+        and spec.axes[0].host_dim == host_dim
+    ]
 
 
 def _exact_divisor_splits(n, max_split=_MAX_AUTO_TILE_SPLIT_COUNT):
@@ -243,6 +265,119 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertLessEqual(len(red_axes), 1, spec.label)
                     # Never an output axis and a reduction axis together.
                     self.assertFalse(red_axes and out_axes, spec.label)
+
+
+class TestApplyRefusals(unittest.TestCase):
+    """Counts the coarse-tile apply would refuse are not offered."""
+
+    def test_a_folded_device_dim_admits_no_count(self):
+        # The attention output [1, 64, hq, 128] lays heads and head_dim's outer
+        # stick out as one device dim, which ``_resize_device_layout`` cannot
+        # resize for any tile.
+        op = _pointwise_op((1, 64, 40, 128))
+        self.assertNotEqual(enumerate_tile_options(op), [TileSpec()])  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertEqual(enumerate_tile_options(op), [TileSpec()])
+
+    def test_a_unit_tile_is_offered(self):
+        # A dim tiled all the way down is offered, also when the tile then has
+        # a second unit host dim: [1, 1, 2048] of [1, 64, 2048].
+        for shape in ((8, 64, 128), (1, 64, 2048)):
+            with self.subTest(shape=shape):
+                self.assertIn(
+                    64, _counts(enumerate_tile_options(_pointwise_op(shape)), 1)
+                )
+
+    def test_a_one_stick_tile_is_offered_for_a_reduction_too(self):
+        # Halving a two-stick dim leaves a one-stick tile, whose tile-count
+        # device dim is then one of two with extent 1. Nothing is grown back
+        # from that tile -- the full buffer and the accumulator take the layout
+        # planning recorded -- so the split is as legal for a Reduction as for
+        # a Pointwise.
+        from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+            _split_candidates_for_host_dim,
+        )
+
+        shape = (1, 6, 128)
+        for kind, op in (
+            ("reduction", _reduction_op(shape, (8,))),
+            ("pointwise", _pointwise_op(shape)),
+        ):
+            with self.subTest(kind=kind):
+                self.assertIn(2, _split_candidates_for_host_dim(op, 2))
+
+    _SHAPE = (2, 8, 5, 64, 128)
+
+    def test_a_reshaping_reader_drops_only_the_unit_tile(self):
+        untouched = enumerate_tile_options(_pointwise_op(self._SHAPE))
+        self.assertIn(64, _counts(untouched, 3))  # non-vacuity
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 8, 5, 64, 64))]
+        )
+        for dim in (0, 1, 2, 3):
+            self.assertEqual(
+                _counts(options, dim),
+                [c for c in _counts(untouched, dim) if c != self._SHAPE[dim]],
+            )
+
+    def test_a_rank_changing_reader_drops_the_unit_tile(self):
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 40, 64, 128))]
+        )
+        self.assertNotIn(64, _counts(options, 3))
+        self.assertIn(32, _counts(options, 3))
+
+    def test_a_same_shape_or_non_computed_reader_keeps_the_unit_tile(self):
+        extern = SimpleNamespace(data=SimpleNamespace(ranges=[2, 40, 64, 128]))
+        for readers in ([], [_reader(self._SHAPE)], [extern]):
+            options = enumerate_tile_options(
+                _pointwise_op(self._SHAPE), readers=readers
+            )
+            self.assertIn(64, _counts(options, 3))
+            self.assertEqual(_counts(options, 2), [5])
+
+    def test_a_symbolic_dim_is_offered_no_tiling(self):
+        # A recompile for a second shape leaves the changed dim symbolic in the
+        # host layout while the device layout is built from its actual value.
+        # The applier reads every extent of a tiled op as an int, so the op is
+        # offered no tiling, not even on its static dims. The split helper the
+        # span-overflow planner shares still reads the symbol's value and
+        # returns the static dim's counts instead of raising.
+        from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+            _split_candidates_for_host_dim,
+        )
+
+        shape = (4, 8, 256)
+        static = enumerate_tile_options(_pointwise_op(shape))
+        self.assertEqual(_counts(static, 1), [2, 4, 8])  # non-vacuity
+        static_splits = _split_candidates_for_host_dim(_pointwise_op(shape), 1)
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+            s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+            op = _pointwise_op(shape)
+            op.data.ranges = [s0, *shape[1:]]
+            op.layout.size = [s0, *shape[1:]]
+            options = enumerate_tile_options(op)
+            splits = _split_candidates_for_host_dim(op, 1)
+        self.assertEqual(options, [TileSpec()])
+        self.assertEqual(splits, static_splits)
+
+    def test_a_symbolic_output_dim_withholds_reduction_options(self):
+        # Reduction axes are resolved one dim at a time, past the resolver's
+        # own symbolic-extent check, so the enumerator has to refuse the op
+        # itself: the reduction dim is static, the output dim beside it is not.
+        with patch.object(config, "enable_reduction_tiling", True):
+            static = enumerate_tile_options(_reduction_op((4, 256), (8,)))
+            self.assertTrue(any(s.axes[0].is_reduction for s in static if s.axes))
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+                op = _reduction_op((4, 256), (8,))
+                op.data.ranges = [s0, 256]
+                op.layout.size = [s0, 256]
+                options = enumerate_tile_options(op)
+        self.assertEqual(options, [TileSpec()])
 
 
 if __name__ == "__main__":
