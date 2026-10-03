@@ -27,6 +27,7 @@ Tests all 4 conversion cases:
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
 
@@ -303,6 +304,25 @@ def test_stagger_to_standard_ea(x, fp16):
     spyre_result = compiled_fn(x.to("spyre"), fp16)
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
+    """Keep conflicting physical row segments local to one core (#4703)."""
+    torch._dynamo.reset()
+    # Distinct, exactly representable rows make a row permutation unambiguous.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
+    x = x.expand(2, 4, 64).contiguous()
+    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
+        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
+        result = compiled_fn(x.to(DEVICE_NAME), fp16)
+    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
+    assert_ea(result, ElementArrangement.STANDARD)
 
 
 _SLICED_RMSNORM_SHAPES = {
