@@ -63,39 +63,10 @@ from .pass_utils import (
     iteration_space_from_op,
     iteration_space_with_splits,
     loop_var_ranges_from_dim_hints,
-    padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
-from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
-
-
-def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
-    """Grow a gather output's index-entry dim to the index stick multiple.
-
-    Multi-core work division splits the index-entry dim in whole index sticks.
-    When the entry count is a partial last stick (e.g. 40 over a 32-int32 index
-    stick), the per-core base is stick-aligned for the index tensor but
-    element-aligned for the shorter output, so the two disagree and the split
-    miscompiles. ``padded_entry_output_stl`` returns the output layout grown so
-    that dim spans whole sticks (or None when there is nothing to pad); applying
-    it aligns the output base and gives the later cores an in-bounds place to
-    write. The logical size is unchanged: the D2H copy extracts the logical view
-    from the (larger) physical allocation.
-
-    No-op on a single core, on an already stick-aligned count, or on an in-place
-    (mutation) destination this pass cannot safely resize.
-    """
-    if config.sencores <= 1:
-        return False
-    if isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
-        return False
-    padded_stl = padded_entry_output_stl(op)
-    if padded_stl is None:
-        return False
-    op.layout = _fixed_tiled(_real_layout(op), padded_stl)
-    return True
 
 
 def _scatter_access_subs_and_sizes(
@@ -361,9 +332,13 @@ def _scatter_alignment_inputs(
         if not isinstance(layout, FixedTiledLayout):
             return None
         accesses.append(
-            AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
+            AlignmentAccess(
+                overrides.get(dep.name, layout.device_layout), dep.index, dep.name
+            )
         )
-    accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    accesses.append(
+        AlignmentAccess(output_layout.device_layout, write_dep.index, write_dep.name)
+    )
     space = iteration_space_from_op(op)
     return build_operation_alignment_inputs(
         space,
@@ -899,10 +874,6 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
         if not requirement:
             continue
         dep_names, access_subs, sizes = requirement
-
-        # Pad the output's index-entry dim up to a stick multiple so a
-        # partial-last-stick gather can split stick-aligned across cores.
-        _pad_output_for_stick_aligned_split(original_op)
 
         op = original_op
         if is_scatter:
