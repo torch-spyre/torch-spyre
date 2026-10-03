@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+import itertools
 import math
 import unittest
-from contextlib import ExitStack
+from contextlib import contextmanager, ExitStack
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
@@ -50,8 +52,10 @@ from torch_spyre._inductor.constants import (
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
+from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -94,6 +98,7 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
+from utils_inductor import mock_op_split_space
 
 
 def _isym(name):
@@ -2216,6 +2221,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
+        # ``op_read_writes`` is called from both modules -- the allocator reads
+        # the consumer's, the edge its producer's -- so each name is patched
+        # wherever it is bound.
         stack = ExitStack()
         for target, kwargs in [
             ("_view_for_div", {"side_effect": self._view_for_div}),
@@ -2233,24 +2241,16 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 {"side_effect": lambda op: op.get_name() == "matmul"},
             ),
         ]:
-            stack.enter_context(
-                patch(
-                    f"torch_spyre._inductor.scratchpad.allocator.{target}",
-                    **kwargs,
-                )
-            )
+            for module in (allocator_module, work_division_module):
+                if hasattr(module, target):
+                    stack.enter_context(patch.object(module, target, **kwargs))
         return stack
 
     def _table(self, allocator):
-        return allocator._cd_parent_matches(
-            self.consumer_op,
-            self.consumer_divs,
-            self.parent_names,
-            self.divisions,
-            self.op_by_name,
-            {},
-            self.residency,
+        edges = allocator._parent_residency_edges(
+            self.consumer_op, self.parent_names, self.op_by_name, {}, self.residency
         )
+        return allocator._cd_parent_matches(edges, self.consumer_divs, self.divisions)
 
     def test_match_table_is_the_expected_pairs(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
@@ -2376,7 +2376,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
-                edge = allocator_module.build_residency_edge(
+                edge = work_division_module.build_residency_edge(
                     parent,
                     self.op_by_name[parent],
                     self.consumer_op,
@@ -2416,7 +2416,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 ("spilled", "residency"),
             ]:
                 self.assertIsNone(
-                    allocator_module.build_residency_edge(
+                    work_division_module.build_residency_edge(
                         parent,
                         self.op_by_name[parent],
                         self.consumer_op,
@@ -2450,10 +2450,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
     def test_no_consumer_op_matches_nothing(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
-            self.assertEqual(
-                allocator._cd_parent_matches(None, [], [], {}, {}, {}, self.residency),
-                {},
-            )
+            edges = allocator._parent_residency_edges(None, [], {}, {}, self.residency)
+            self.assertEqual(allocator._cd_parent_matches(edges, [], {}), {})
 
 
 class TestCloneDivisionMatching(unittest.TestCase):
@@ -2555,7 +2553,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             patch.object(allocator, "_enumerate_core_divisions") as enumerate_divs,
         ):
-            divisions = allocator._division_map(graph)
+            divisions = allocator._division_map(graph).divisions
 
         self.assertEqual(divisions[op.name], [fixed])
         enumerate_divs.assert_not_called()
@@ -2624,6 +2622,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
+            # ``_core_division`` reads the write dep from ``work_division``.
+            patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -2633,7 +2633,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 side_effect=lambda _op, splits: splits == safe,
             ) as is_legal,
         ):
-            divisions = allocator._division_map(graph)[op.name]
+            division_map = allocator._division_map(graph)
+            divisions = division_map.divisions[op.name]
 
         self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
@@ -2687,8 +2688,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 return_value=True,
             ),
         ):
+            # Not an enumeration, so a solver may not generate divisions for
+            # this op: the committed one is all it is allowed.
             self.assertEqual(
-                allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
+                allocator._enumerate_core_divisions(op, max_cores=32),
+                ([fixed], False),
             )
 
     def test_over_budget_candidate_menu_is_rejected(self):
@@ -2730,6 +2734,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
+            # ``_core_division`` reads the write dep from ``work_division``.
+            patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -2809,3 +2815,292 @@ class TestIndirectAccessSplitDomains(unittest.TestCase):
         with patch(self._PATCH_TARGET, return_value=set()):
             result = indirect_access_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})
+
+
+def _division_key(division):
+    """A division as comparable literals -- symbols are unorderable."""
+    return (
+        tuple(sorted(_by_name(division.output_splits).items())),
+        tuple(sorted(_by_name(division.reduction_splits).items())),
+    )
+
+
+@contextmanager
+def _space_for(case):
+    """The generated split space for one candidate case, under its patches."""
+    with case.patches():
+        yield work_division_module.build_op_split_space(case.op, case.max_cores)
+
+
+class TestOpSplitSpace(unittest.TestCase):
+    """The generation seam: a space that admits exactly what the enumeration
+    carries, and a move alphabet over it."""
+
+    def test_space_admits_exactly_the_enumerated_candidates(self):
+        """Generation changes when a candidate is materialized, not which
+        candidates exist -- so the space and the menu have to agree, over the
+        corpus that exercises every rule a candidate is judged by."""
+        narrowed = []
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                with _space_for(case) as space:
+                    admitted = [
+                        splits
+                        for combo in itertools.product(
+                            *(space.factor_domains[axis] for axis in space.axes)
+                        )
+                        if space.admits(splits := dict(zip(space.axes, combo)))
+                    ]
+                    whole_product = math.prod(
+                        len(space.factor_domains[axis]) for axis in space.axes
+                    )
+                self.assertEqual(
+                    [_by_name(s) for s in admitted],
+                    [_by_name(c) for c in case.candidates],
+                )
+                narrowed.append(len(admitted) < whole_product)
+        # At least one case must be narrowed by the whole-split rules rather
+        # than by the per-axis domains alone.
+        self.assertTrue(any(narrowed))
+
+    def test_space_division_agrees_with_the_classifier(self):
+        """:meth:`OpSplitSpace.division` derives the output/reduction roles once
+        instead of per candidate; it owes the same answer as the classifier the
+        menu is built with."""
+        reductions = 0
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                with _space_for(case) as space:
+                    for splits in case.candidates:
+                        expected = work_division_module._core_division(case.op, splits)
+                        actual = space.division(splits)
+                        self.assertEqual(_division_key(actual), _division_key(expected))
+                        reductions += bool(expected.reduction_splits)
+        self.assertGreater(reductions, 0, "no case splits a reduction axis")
+
+    def test_neighbours_are_the_one_axis_moves_inside_the_space(self):
+        local = []
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                with _space_for(case) as space:
+                    for splits in case.candidates:
+                        expected = {
+                            _division_key(space.division(other))
+                            for other in case.candidates
+                            if sum(other[axis] != splits[axis] for axis in space.axes)
+                            == 1
+                        }
+                        actual = {
+                            _division_key(division)
+                            for division in space.neighbours(space.division(splits))
+                        }
+                        self.assertEqual(actual, expected, _by_name(splits))
+                        local.append(len(expected) < len(case.candidates) - 1)
+        # A move alphabet that reached every candidate from every candidate
+        # would not be a local one, and the test would say nothing.
+        self.assertTrue(any(local))
+
+    def test_no_space_where_the_menu_would_carry_one_candidate(self):
+        """The ops generation has nothing to offer are exactly the ops
+        ``_enumerate_core_divisions`` leaves at their committed division."""
+        not_a_buffer = MagicMock()
+        other_data = MagicMock(spec=ComputedBuffer)
+        other_data.data = MagicMock()
+        for op in (not_a_buffer, other_data):
+            self.assertIsNone(work_division_module.build_op_split_space(op, 32))
+        case = next(c for c in _candidate_cases() if c.name == "two_dims")
+        with patch.object(
+            work_division_module,
+            "work_division_context_for_op",
+            side_effect=Unsupported("no iteration space"),
+        ):
+            self.assertIsNone(
+                work_division_module.build_op_split_space(case.op, case.max_cores)
+            )
+
+
+class TestResidencyEdgeInversion(unittest.TestCase):
+    """Propagating a division across an edge by *constructing* the other end's
+    division instead of scanning its menu for a compatible entry."""
+
+    def setUp(self):
+        self.x, self.y, self.k = _isym("x"), _isym("y"), _isym("k")
+        self.r, self.c = _isym("r"), _isym("c")
+        shape = (8, 128)  # 128 fp16 elements = 2 sticks, so both dims can split
+        self.producer = _computed_buffer(shape, name="p")
+        self.consumer = _computed_buffer(shape, name="cons")
+        layout = _fixed_tiled_layout(shape)
+        self.write_dep = MemoryDep("p", 128 * self.x + self.y, (self.x, self.y), shape)
+        self.read_dep = MemoryDep("p", 128 * self.r + self.c, (self.r, self.c), shape)
+        consumer_write = MemoryDep(
+            "cons", 128 * self.r + self.c, (self.r, self.c), shape
+        )
+        # The producer carries a reduction axis its buffer does not see; the
+        # consumer names its two axes differently. Both are what makes the
+        # inverse a real inverse rather than a rename.
+        self.iter_spaces = {
+            "p": {self.x: 8, self.y: 128, self.k: 4},
+            "cons": {self.r: 8, self.c: 128},
+        }
+        self.read_writes = {
+            "p": MagicMock(writes=[self.write_dep], reads=[]),
+            "cons": MagicMock(writes=[consumer_write], reads=[self.read_dep]),
+        }
+        self.graph = SimpleNamespace(
+            _repeat_info={}, get_buffer=lambda name: SimpleNamespace(layout=layout)
+        )
+        self.parent_space = mock_op_split_space(
+            {self.x: [1, 2, 4, 8], self.y: [1, 2], self.k: [1, 2, 4]},
+            {self.x, self.y},
+            op=self.producer,
+        )
+        self.consumer_space = mock_op_split_space(
+            {self.r: [1, 2, 4, 8], self.c: [1, 2]},
+            {self.r, self.c},
+            op=self.consumer,
+        )
+
+    def _edge(self):
+        return work_division_module.ResidencyEdge(
+            buf_name="p",
+            parent_op=self.producer,
+            consumer_op=self.consumer,
+            write_dep=self.write_dep,
+            read_dep=self.read_dep,
+            prep_cache={},
+        )
+
+    def _geometry(self):
+        stack = ExitStack()
+        stack.enter_context(pass_utils_module.V.set_graph_handler(self.graph))
+        stack.enter_context(
+            patch.object(
+                pass_utils_module,
+                "iteration_space_from_op",
+                side_effect=lambda op: self.iter_spaces[op.get_name()],
+            )
+        )
+        for module in (pass_utils_module, work_division_module):
+            stack.enter_context(
+                patch.object(
+                    module,
+                    "op_read_writes",
+                    side_effect=lambda op: self.read_writes[op.get_name()],
+                )
+            )
+        return stack
+
+    def test_inverse_builds_the_other_end_of_the_edge(self):
+        cases = [
+            (CoreDivision({self.x: 4}), {"r": 4}),
+            (CoreDivision({self.x: 4, self.y: 2}), {"r": 4, "c": 2}),
+            (CoreDivision(), {}),
+        ]
+        with self._geometry():
+            edge = self._edge()
+            for parent_division, expected in cases:
+                consumer_division = edge.consumer_division_for(
+                    parent_division, self.consumer_space
+                )
+                self.assertIsNotNone(consumer_division, parent_division.label)
+                self.assertEqual(_by_name(consumer_division.output_splits), expected)
+                self.assertTrue(
+                    edge.compatible(parent_division.splits, consumer_division.splits)
+                )
+                # And back: the mirror recovers the division it came from.
+                self.assertEqual(
+                    _division_key(
+                        edge.parent_division_for(consumer_division, self.parent_space)
+                    ),
+                    _division_key(parent_division),
+                )
+
+    def test_a_partial_reduction_producer_hosts_nothing(self):
+        """The write side's policy filters, which the geometry is blind to: a
+        reduction-split producer leaves partial sums, so there is no division
+        the consumer could read from LX."""
+        with self._geometry():
+            self.assertIsNone(
+                self._edge().consumer_division_for(
+                    CoreDivision(
+                        splits={self.x: 4, self.k: 2},
+                        reduction_syms=frozenset({self.k}),
+                    ),
+                    self.consumer_space,
+                )
+            )
+
+    def test_compatibility_compares_partitions_not_records(self):
+        """A view is a record of a slicing, and two records can describe one
+        slicing -- so the edge asks ``same_partition``, not ``==``. Here the
+        consumer's view is restated with its dims in the other order, which
+        ``==`` calls a mismatch and the buffer's geometry does not."""
+        parent_division = CoreDivision({self.x: 4, self.y: 2})
+        consumer_division = CoreDivision({self.r: 4, self.c: 2})
+        with self._geometry():
+            edge = self._edge()
+            view = edge.consumer_view(consumer_division.splits)
+            self.assertEqual(len(view.work_slice_dims), 2)
+            restated = dataclasses.replace(
+                view,
+                work_slice_dims=view.work_slice_dims[::-1],
+                core_to_slot=view.core_to_slot[::-1],
+            )
+            self.assertNotEqual(restated, view)
+            with patch.object(
+                work_division_module.ResidencyEdge,
+                "consumer_view",
+                return_value=restated,
+            ):
+                self.assertTrue(
+                    edge.compatible(parent_division.splits, consumer_division.splits)
+                )
+                self.assertEqual(
+                    edge.match_pairs(
+                        [parent_division.splits], [consumer_division.splits]
+                    ),
+                    [(0, 0)],
+                )
+
+    def test_the_write_side_policy_rides_along_inside_the_inversion(self):
+        """The producer's filters are geometry-blind, so they go in ``accept``
+        rather than on the answer: a partial-reduction solution then backtracks
+        to the next geometric one (``invert_per_core_view`` pins that a
+        rejected candidate backtracks) instead of losing the edge outright --
+        which ``_ViewRelation`` would memoize for the whole solve."""
+        captured: list = []
+        real = work_division_module.invert_per_core_view
+
+        def spy(prep, target, domains, **kwargs):
+            captured.append(kwargs["accept"])
+            return real(prep, target, domains, **kwargs)
+
+        with (
+            self._geometry(),
+            patch.object(work_division_module, "invert_per_core_view", spy),
+        ):
+            edge = self._edge()
+            edge.parent_division_for(CoreDivision({self.r: 4}), self.parent_space)
+            up = captured.pop()
+            edge.consumer_division_for(CoreDivision({self.x: 4}), self.consumer_space)
+            down = captured.pop()
+            self.assertTrue(up({self.x: 4, self.y: 1, self.k: 1}))
+            self.assertFalse(up({self.x: 4, self.y: 1, self.k: 2}))
+            # The consumer's side has no policy of its own: an unrepresentable
+            # read cannot reproduce the target anyway.
+            self.assertTrue(down({self.r: 4, self.c: 2}))
+
+    def test_an_illegal_candidate_loses_the_edge_rather_than_being_taken(self):
+        """``admits`` rides along inside the inversion, so the only division
+        that reproduces the geometry being illegal means no edge -- not an
+        illegal division."""
+        space = self.consumer_space
+        space.context.is_legal.side_effect = lambda splits: splits[self.r] != 4
+        with self._geometry():
+            edge = self._edge()
+            self.assertIsNone(
+                edge.consumer_division_for(CoreDivision({self.x: 4}), space)
+            )
+            self.assertIsNotNone(
+                edge.consumer_division_for(CoreDivision({self.x: 2}), space)
+            )

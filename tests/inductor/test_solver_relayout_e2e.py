@@ -42,8 +42,8 @@ from torch_spyre._inductor.scratchpad import allocator as alloc_mod
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
 
 
-def _no_matches(self, consumer_op, consumer_divs, parent_names, *args, **kwargs):
-    return {parent: [] for parent in parent_names}
+def _no_matches(self, edges, *args, **kwargs):
+    return {parent: [] for parent in edges}
 
 
 class _Observed:
