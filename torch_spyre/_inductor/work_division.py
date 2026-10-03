@@ -1535,6 +1535,62 @@ _SHARED_DOWN_N_SPLIT_PENALTY_US = 10.0
 _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
+# Weight delivery for small-M decode projections (a shared 2D weight streamed once,
+# 2 <= M <= 32 rows). Fitted to the 2026-09-30 split sweep, 361 splits of the four
+# granite-3.3-8b projections at M = 8/16/32 (tests/inductor/decode_matmul_sweep.py):
+#   BW(cores, m, k) = min(_DECODE_CAP_GBPS[m, k], (cores / m) * _DECODE_SLICE_GBPS[m])
+# ``m`` cores splitting M share one slice of the weight; the cores / m = n * k
+# distinct slices stream in parallel, each at the rate its sharing degree reaches.
+# Unshared (m = 1) that is ~5.4 GB/s per reading core, so 16 cores get ~86 GB/s;
+# shared by 4 a slice reaches ~33 GB/s. The cap is the bus once the slices saturate
+# it, lower where many cores (m * k) read the same weight columns. Held out one
+# projection at a time, the fit ranks every held-out split within 4.2% of the best.
+# M = 1 keeps the partitioned-read model it was measured with (#4880). m = 16 / 32
+# caps are never binding in the sweep and are neutral.
+_DECODE_MAX_ROWS = 32
+_DECODE_SLICE_GBPS = {1: 5.4, 2: 18.4, 4: 33.0, 8: 42.9, 16: 40.1, 32: 41.6}
+_DECODE_CAP_GBPS = {
+    (1, 1): 142.0, (1, 2): 142.0, (1, 4): 140.0, (1, 8): 140.0,
+    (2, 1): 144.0, (2, 2): 146.0, (2, 4): 143.0, (2, 8): 136.0,
+    (4, 1): 152.0, (4, 2): 147.0, (4, 4): 140.0, (4, 8): 128.0,
+    (8, 1): 135.0, (8, 2): 120.0, (8, 4): 103.0,
+}  # fmt: skip
+_DECODE_NEUTRAL_CAP_GBPS = 140.0
+
+
+def _decode_table_key(split: int) -> int:
+    """The measured table row for a split: the largest power of two not above it."""
+    return 1 << max(0, int(split).bit_length() - 1)
+
+
+def _in_decode_delivery_scope(
+    B, M, shared_weight, operand_bytes: float = _DTYPE_BYTES
+) -> bool:
+    """Whether ``_decode_weight_delivery_us`` was measured for this matmul: a shared
+    fp16 weight (the sweep had no other operand width) reused over 2..32 rows."""
+    return (
+        shared_weight
+        and operand_bytes == _DTYPE_BYTES
+        and not isinstance(M, sympy.Basic)
+        and 1 < M <= _DECODE_MAX_ROWS
+        and B == 1
+    )
+
+
+def _decode_weight_delivery_gbps(cores: int, m: int, k: int) -> float:
+    """Effective bandwidth of a decode weight stream; see ``_DECODE_SLICE_GBPS``."""
+    mk = min(_decode_table_key(m), max(_DECODE_SLICE_GBPS))
+    kk = _decode_table_key(k)
+    cap = _DECODE_CAP_GBPS.get((mk, min(kk, 8)), _DECODE_NEUTRAL_CAP_GBPS)
+    return min(cap, cores / m * _DECODE_SLICE_GBPS[mk])
+
+
+def _decode_weight_delivery_us(
+    weight_bytes: float, cores: int, m: int, k: int
+) -> float:
+    """Microseconds to stream a decode projection's shared weight under a split."""
+    return weight_bytes / (_decode_weight_delivery_gbps(cores, m, k) * 1000)
+
 
 def _matmul_multicast_penalty(consumers):
     """Existing bandwidth derate for cores sharing one operand load.
@@ -1555,6 +1611,38 @@ def _matmul_multicast_penalty(consumers):
             (1.0, True),
         )
     return max(1.0, (consumers / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+
+
+def _matmul_hbm_us(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    shared_weight: bool,
+    operand_bytes: float = _DTYPE_BYTES,
+    output_bytes: float = _DTYPE_BYTES,
+) -> float:
+    """HBM term of ``_matmul_execution_cost``.
+
+    A small-M decode projection streams its shared weight at the measured
+    ``_decode_weight_delivery_us`` rate; its activation and output move at the
+    peak. Otherwise every input operand is broadcast to the cohort of cores
+    splitting the orthogonal dim, and past _COHORT_LIMIT the broadcasts contend
+    for the shared link, so effective bandwidth falls off with cohort size.
+    """
+    (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    if _in_decode_delivery_scope(B, M, shared_weight, operand_bytes):
+        io_bytes = M * K * operand_bytes + M * N * output_bytes
+        return io_bytes / (_HBM_BW_GBS * 1000) + _decode_weight_delivery_us(
+            K * N * operand_bytes, b * m * n * k, m, k
+        )
+    weight_batches = 1 if shared_weight else B
+    bytes_total = (
+        B * M * K + weight_batches * K * N
+    ) * operand_bytes + B * M * N * output_bytes
+    fanout_split = max(m, n) if shared_weight else n
+    cohort_penalty = _matmul_multicast_penalty(fanout_split)
+    return bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
 
 
 def _matmul_execution_cost(
@@ -1614,19 +1702,13 @@ def _matmul_execution_cost(
     compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
     compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
 
-    # HBM: every input operand is broadcast to the cohort of cores splitting the
-    # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
-    # link, so effective bandwidth falls off linearly with cohort size.
-    if include_hbm:
-        weight_batches = 1 if shared_weight else B
-        bytes_total = (
-            B * M * K + weight_batches * K * N
-        ) * operand_bytes + B * M * N * output_bytes
-        fanout_split = max(m, n) if shared_weight else n
-        cohort_penalty = _matmul_multicast_penalty(fanout_split)
-        hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
-    else:
-        hbm_us = 0.0
+    hbm_us = (
+        _matmul_hbm_us(
+            b_axis, m_axis, n_axis, k_axis, shared_weight, operand_bytes, output_bytes
+        )
+        if include_hbm
+        else 0.0
+    )
 
     # PSUM: a K-split spreads the reduction over k cores, costing (k-1)
     # partial-sum hops. Charge each core's output tile rather than the whole
@@ -1682,8 +1764,13 @@ def _matmul_split_cost(
         min(max_cores // 2, max(1, M // (_TARGET_M_TIE_PASSES * _PT_ROWS))),
     )
     m_lane_underuse_us = max(0.0, log2(target_m / m)) * _M_LANE_UNDERUSE_PENALTY_US
+    # In decode scope the measured weight delivery already charges short per-core M
+    # tiles (a slice shared by many cores streams slower); this proxy would count it
+    # twice and, on the 2026-09-30 sweep, push o_proj / qkv 5-7% off their best split.
     m_tile_underfill_us = (
-        max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
+        0.0
+        if _in_decode_delivery_scope(b_axis[0], M, shared_weight, operand_bytes)
+        else max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
         * _M_TILE_UNDERFILL_PENALTY_US
     )
 

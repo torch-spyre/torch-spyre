@@ -64,11 +64,16 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
+from decode_matmul_sweep import SHAPES as DECODE_SHAPES, SWEEP as DECODE_SWEEP
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
+    _decode_weight_delivery_us,
     _default_split,
     _HBM_BW_GBS,
+    _in_decode_delivery_scope,
+    _matmul_hbm_us,
+    _matmul_multicast_penalty,
     _matmul_split_cost,
     adjust_it_space_for_sticks,
     enumerate_work_division_candidates,
@@ -1419,11 +1424,14 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertEqual(captured["output_bytes"], 2.0)
 
         # Layer 2: old no-kwargs callers (e.g. cost_model.py) keep the flat default.
+        # M = 64 stays outside the small-M decode scope, where an fp16 weight's
+        # HBM time is the measured delivery (_decode_weight_delivery_us) instead.
         B, M, K, N = 1, 8, 4096, 12800
         sm, sn, sk = 4, 8, 1  # fanout_split=max(sm,sn)=8 keeps cohort_penalty == 1.0
+        M_FLAT = 64
         legacy_cost_with_hbm = _matmul_split_cost(
             (B, 1),
-            (M, sm),
+            (M_FLAT, sm),
             (N, sn),
             (K, sk),
             32,
@@ -1431,7 +1439,7 @@ class TestCostModelConstraints(unittest.TestCase):
         )
         legacy_cost_without_hbm = _matmul_split_cost(
             (B, 1),
-            (M, sm),
+            (M_FLAT, sm),
             (N, sn),
             (K, sk),
             32,
@@ -1441,7 +1449,7 @@ class TestCostModelConstraints(unittest.TestCase):
         legacy_bytes_total = (
             (legacy_cost_with_hbm - legacy_cost_without_hbm) * _HBM_BW_GBS * 1000
         )
-        self.assertAlmostEqual(legacy_bytes_total, 105_127_936, delta=1.0)
+        self.assertAlmostEqual(legacy_bytes_total, 107_020_288, delta=1.0)
 
         # Layer 3: the real (unmocked) function, given correct fp8 byte widths,
         # must itself compute the correct bytes_total.
@@ -2809,3 +2817,97 @@ class TestIndirectAccessSplitDomains(unittest.TestCase):
         with patch(self._PATCH_TARGET, return_value=set()):
             result = indirect_access_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})
+
+
+class TestDecodeWeightDelivery(unittest.TestCase):
+    """Weight delivery for small-M decode matmuls, against the measured sweep.
+
+    A decode projection streams its shared weight; how fast depends on how the
+    split shares it. ``m`` cores splitting M read the same slice, the ``n * k``
+    distinct slices stream in parallel, and a K split contends on the columns it
+    shares. The flat 8-core cohort threshold priced M8 x N4 like M4 x N8 on
+    gate_up (1626 vs 1357 us measured), and 16-core unshared splits at full bus
+    (2470 vs ~1430 us). ``decode_matmul_sweep`` is the measured record.
+    """
+
+    @staticmethod
+    def _weight_bytes(shape):
+        K, N = DECODE_SHAPES[shape]
+        return K * N * 2
+
+    @staticmethod
+    def _split_cost(shape, M, m, n, k):
+        K, N = DECODE_SHAPES[shape]
+        return _matmul_split_cost(
+            (1, 1), (M, m), (N, n), (K, k), 32, shared_weight=True
+        )
+
+    def test_delivery_tracks_the_sweep(self):
+        errors = sorted(
+            abs(
+                _decode_weight_delivery_us(self._weight_bytes(s), m * n * k, m, k) / us
+                - 1
+            )
+            for (s, _M), rows in DECODE_SWEEP.items()
+            for m, n, k, us in rows
+        )
+        self.assertLess(errors[len(errors) // 2], 0.05)  # median
+        self.assertLess(errors[int(0.9 * len(errors))], 0.20)  # p90
+
+    def test_sharing_by_eight_is_slower_than_by_four_on_gate_up(self):
+        w = self._weight_bytes("gate_up")
+        self.assertAlmostEqual(
+            _decode_weight_delivery_us(w, 32, 4, 1), 1357, delta=0.05 * 1357
+        )
+        self.assertAlmostEqual(
+            _decode_weight_delivery_us(w, 32, 8, 1), 1626, delta=0.10 * 1626
+        )
+        self.assertLess(
+            self._split_cost("gate_up", 8, 4, 8, 1),
+            self._split_cost("gate_up", 8, 8, 4, 1),
+        )
+
+    def test_unshared_splits_are_limited_by_their_reading_cores(self):
+        w = self._weight_bytes("gate_up")
+        on_16 = _decode_weight_delivery_us(w, 16, 1, 1)
+        self.assertAlmostEqual(on_16, 2470, delta=0.08 * 2470)
+        self.assertLess(_decode_weight_delivery_us(w, 32, 1, 1), 0.65 * on_16)
+
+    def test_outside_the_measured_scope_the_estimate_is_unchanged(self):
+        K, N = DECODE_SHAPES["gate_up"]
+        m, n, k = 1, 8, 4
+        for M, shared_weight, B in [
+            (1, True, 1),
+            (64, True, 1),
+            (8, False, 1),
+            (8, True, 4),
+        ]:
+            with self.subTest(M=M, shared_weight=shared_weight, B=B):
+                self.assertFalse(_in_decode_delivery_scope(B, M, shared_weight))
+                # The shipped cohort formula, restated: bytes at the peak times
+                # the penalty.
+                weights = 1 if shared_weight else B
+                legacy = (
+                    ((B * M * K + weights * K * N) * 2 + B * M * N * 2)
+                    / (_HBM_BW_GBS * 1000)
+                    * _matmul_multicast_penalty(max(m, n) if shared_weight else n)
+                )
+                self.assertAlmostEqual(
+                    _matmul_hbm_us((B, 1), (M, m), (N, n), (K, k), shared_weight),
+                    legacy,
+                )
+
+    def test_the_planner_picks_a_split_within_five_percent_of_the_best(self):
+        for (shape, M), rows in sorted(DECODE_SWEEP.items()):
+            with self.subTest(shape=shape, M=M):
+                best = min(us for *_, us in rows)
+                costs = {
+                    (m, n, k): self._split_cost(shape, M, m, n, k)
+                    for m, n, k, _ in rows
+                }
+                lowest = min(costs.values())
+                # The planner may return any split it cannot tell from its optimum.
+                tied = [
+                    us for m, n, k, us in rows if costs[(m, n, k)] <= lowest * 1.005
+                ]
+                self.assertLessEqual(max(tied), best * 1.05)

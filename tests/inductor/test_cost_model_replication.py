@@ -35,14 +35,17 @@ import torch
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import config, cost_model, spyre_hint
+from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor import cost_model_pass as cmp
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     CostParams,
     OpFeatures,
+    _decode_weight_delivery_excess,
     _fused_hbm_bytes,
     _partitioned_operand_read_excess,
     _replicated_operand_reads,
+    _shared_operand_read_excess,
     explain,
     predict_ops,
 )
@@ -576,3 +579,187 @@ def test_extractor_stamps_the_matmul_operand_the_core_split_replicates(monkeypat
     for f in captured.values():
         if not f.is_matmul:
             assert all(a.replication == 1 for a in f.args), f.name
+
+
+# ------------------------------------------------ small-M decode weight delivery
+#
+# The co-optimizer's price for a small-M decode projection's shared weight must
+# follow ``work_division._decode_weight_delivery_us`` at every candidate, concretely
+# and as lowered to CP-SAT, so the joint solver ranks gate_up M4 x N8 ahead of
+# M8 x N4 (1357 vs 1626 us measured) instead of pricing them alike.
+
+GU_K, GU_N = 4096, 25600  # gate_up
+GU_W_ELEMS = GU_K * GU_N
+GU_W_BYTES = 2 * GU_W_ELEMS
+
+
+def _gate_up(M, m, n, k, *, weight_lx=False):
+    cores = m * n * k
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        out_elems=M * GU_N,
+        cores=cores,
+        dtype_bytes=2,
+        reduction_cores=k,
+        args=[
+            ArgTraffic("buf0", "input", False, M * GU_K, replication=n),
+            ArgTraffic(
+                "arg1_1", "input", weight_lx, GU_W_ELEMS, broadcast=m > 1,
+                is_boundary=True, replication=m,
+            ),
+            ArgTraffic("buf1", "output", False, M * GU_N),
+        ],
+        is_matmul=True,
+        matmul_macs=M * GU_K * GU_N,
+        matmul_a_bytes=2 * M * GU_K,
+        matmul_b_bytes=GU_W_BYTES,
+        matmul_rows_per_core=M / m,
+        matmul_cols_per_core=GU_N / n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+    )  # fmt: skip
+
+
+def _decode_expected(m, k, cores, p=_COST_PARAMS):
+    bw = wd._decode_weight_delivery_gbps(cores, m, k)
+    return max(0.0, GU_W_BYTES / bw - GU_W_BYTES / p.bw_peak_gbps)
+
+
+@pytest.mark.parametrize("m, n, k", [(4, 8, 1), (8, 4, 1), (1, 16, 1), (8, 2, 2)])
+def test_the_excess_is_the_measured_delivery_over_the_peak(m, n, k):
+    got = _decode_weight_delivery_excess([_gate_up(8, m, n, k)], _COST_PARAMS)
+    assert got == pytest.approx(_decode_expected(m, k, m * n * k))
+
+
+def test_the_joint_price_ranks_sharing_by_four_ahead_of_eight():
+    p = _COST_PARAMS
+    by_4 = predict_ops([_gate_up(8, 4, 8, 1)], p)
+    by_8 = predict_ops([_gate_up(8, 8, 4, 1)], p)
+    unshared_16 = predict_ops([_gate_up(8, 1, 16, 1)], p)
+    assert by_4 < by_8 < unshared_16
+    assert by_8 - by_4 > 100_000  # ~270 us measured
+
+
+def test_a_resident_weight_pays_no_delivery():
+    assert _decode_weight_delivery_excess([_gate_up(8, 8, 4, 1, weight_lx=True)], _COST_PARAMS) == 0  # fmt: skip
+
+
+@pytest.mark.parametrize("M", [1, 64])
+def test_outside_the_measured_rows_the_cohort_excess_still_prices(M):
+    op = _gate_up(M, 16, 2, 1)  # shared by 16: past the cohort limit
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    expected = (
+        GU_W_BYTES * (wd._matmul_multicast_penalty(16) - 1) / _COST_PARAMS.bw_peak_gbps
+    )
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == pytest.approx(expected)
+
+
+def test_in_scope_the_cohort_excess_steps_aside():
+    op = _gate_up(8, 16, 2, 1)  # replication 16: the old cohort penalty would fire
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == 0
+
+
+DECODE_MENU = [
+    (4, 8, 1),
+    (8, 4, 1),
+    (2, 16, 1),
+    (1, 16, 1),
+    (8, 2, 2),
+    (2, 4, 4),
+    (1, 8, 4),
+]
+DECODE_DIVISION = sympy.Symbol("division_buf1", integer=True, nonnegative=True)
+
+
+def _decode_symbolic(M, *, weight_lx=False):
+    """The op as the co-optimizer extracts it: symbolic splits plus the table of
+    (m, k, cores) at each candidate division."""
+    m, n, k = sympy.symbols("split_m split_n split_k", integer=True, positive=True)
+    op = _gate_up(M, 1, 1, 1, weight_lx=weight_lx)
+    return dataclasses.replace(
+        op,
+        cores=m * n * k,
+        reduction_cores=k,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        args=[
+            dataclasses.replace(op.args[0], replication=n),
+            dataclasses.replace(op.args[1], broadcast=True, replication=m),
+            op.args[2],
+        ],
+        division_menu=(
+            DECODE_DIVISION,
+            tuple((m_, k_, m_ * n_ * k_) for m_, n_, k_ in DECODE_MENU),
+        ),
+    )
+
+
+def test_the_symbolic_price_equals_the_concrete_price_at_every_candidate():
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    at = sympy.lambdify([DECODE_DIVISION], expr, modules="math")
+    for i, (m, n, k) in enumerate(DECODE_MENU):
+        assert at(i) == pytest.approx(_decode_expected(m, k, m * n * k), abs=1.0), (
+            m,
+            n,
+            k,
+        )
+
+
+def test_a_resident_symbolic_weight_pays_nothing():
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    at = sympy.lambdify([DECODE_DIVISION, is_lx], expr, modules="math")
+    assert at(1, 1) == 0
+    assert at(1, 0) == pytest.approx(_decode_expected(8, 1, 32), abs=1.0)
+
+
+def test_without_a_candidate_table_the_symbolic_split_stays_unpriced():
+    op = dataclasses.replace(_decode_symbolic(8), division_menu=None)
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+
+
+def test_cp_sat_keeps_the_price_at_every_candidate():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    for i, (m, n, k) in enumerate(DECODE_MENU):
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, len(DECODE_MENU) - 1, "div")
+        model.add(division == i)
+        wrapper = types.SimpleNamespace(
+            division=division, buffer=types.SimpleNamespace(core_divisions=DECODE_MENU)
+        )
+        sym_map = {f"_division_of_{DECODE_DIVISION.name}": wrapper}
+        buffer_map = {}
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        solver = cp_model.CpSolver()
+        assert solver.Solve(model) == cp_model.OPTIMAL
+        assert solver.ObjectiveValue() == pytest.approx(
+            _decode_expected(m, k, m * n * k), rel=2e-3, abs=2.0
+        ), (m, n, k)
+
+
+def test_the_allocator_tabulates_each_candidates_splits_in_order():
+    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+    m, n = sympy.symbols("split_m split_n", integer=True, positive=True)
+    buffer = types.SimpleNamespace(
+        sym_division=DECODE_DIVISION,
+        sym_core_divs={"d0": m, "d1": n},
+        core_divisions=[
+            types.SimpleNamespace(splits={"d0": 4, "d1": 8}),
+            types.SimpleNamespace(splits={"d0": 8, "d1": 4}),
+            types.SimpleNamespace(splits={"d1": 16}),
+        ],
+    )
+    # A bare split symbol, a constant and a product: xreplace on a bare symbol
+    # hands back the substituted value itself, which must still read as an int.
+    features = types.SimpleNamespace(matmul_m_split=m, reduction_cores=1, cores=m * n)
+    assert CoOptimizingAllocator._matmul_division_menu(features, buffer) == (
+        DECODE_DIVISION,
+        ((4, 1, 32), (8, 1, 32), (1, 1, 16)),
+    )

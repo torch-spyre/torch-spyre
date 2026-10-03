@@ -1015,6 +1015,39 @@ class _SympyExprToCpSat(Printer):
         self._model.add(charge == 0).only_enforce_if(lit.Not())
         return charge
 
+    def _print_DecodeDeliveryCharge(self, expr):
+        """``DecodeDeliveryCharge(is_lx, division_X, price_0, ...)`` (a decode
+        weight's delivery excess, ``cost_model._decode_weight_delivery_excess``)
+        -> one ``element`` lookup of X's division into the price table and a
+        charge equal to it while the weight is NOT resident: the
+        ``_print_RelayoutCharge`` lowering with the residency gate inverted.
+        A matmul that is not a division-choosing buffer of this solve prices 0."""
+        is_lx, division, *prices = expr.args
+        table = [int(p) for p in prices]
+        if division.is_Integer:
+            i = int(division)
+            price = table[i] if 0 <= i < len(table) else 0
+            return price if is_lx.is_Number else price * (1 - self._print(is_lx))
+        wrapper = self._sym_map.get(f"_division_of_{division.name}")
+        if wrapper is None or getattr(wrapper, "division", None) is None:
+            return 0
+        menu = getattr(getattr(wrapper, "buffer", None), "core_divisions", table)
+        table = (table + [0] * len(menu))[: len(menu)]
+        top = max(table, default=0)
+        if top <= 0:
+            return 0
+        name = f"{division.name}_{self._count}"
+        self._count += 1
+        price = self._model.new_int_var(0, top, f"decode_price_{name}")
+        self._model.add_element(wrapper.division, table, price)
+        if is_lx.is_Number:
+            return price if int(is_lx) == 0 else 0
+        resident = self._print(is_lx)
+        charge = self._model.new_int_var(0, top, f"decode_charge_{name}")
+        self._model.add(charge == price).only_enforce_if(resident.Not())
+        self._model.add(charge == 0).only_enforce_if(resident)
+        return charge
+
     def _print_Pow(self, expr):
         if expr.exp == 2:
             base = self._print(expr.base)
