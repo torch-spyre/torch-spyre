@@ -307,10 +307,19 @@ def eager_fallback(op, *args, **kwargs):
 
 
 def _ensure_synthetic_origin(result, target, args: tuple) -> None:
-    """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
-    layout passes (which key off ``op.data.origins[].target``) recognize it even
-    when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    """Stamp a synthetic ``target`` FX origin on ``result``.
+
+    When a lowering (e.g. clone, to_dtype) is called directly from another
+    lowering rather than dispatched from an FX node, the result inherits the
+    caller's origin. Layout passes that key off ``op.data.origins[].target``
+    then misidentify the buffer and skip the wrong layout rules. This injects a
+    synthetic ``"call_function"`` node with the correct ``target`` so those
+    passes see the right op identity. No-op if a ``target`` origin already
+    exists.
+
+    Also registers the node in ``V.graph.env`` so that split_multi_ops can
+    resolve the buffer by name when it appears as a load-input inside a
+    downstream fused buffer.
     """
 
     def _realized_buffer(node):
@@ -330,9 +339,24 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # Realize so the origin lands on a stable ComputedBuffer, not a Pointwise.
     result.realize()
     buf = _realized_buffer(result)
+    # Add to the existing origins rather than replacing them: a layout pass reads
+    # the op identity from this set, and a conversion called from another
+    # lowering sits on a buffer whose real origins describe the consumer that
+    # chose its layout. Dropping them leaves that pass nothing to classify.
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
-    object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
-    buf.origins = OrderedSet([fx_node])
+    merged = OrderedSet([*(getattr(buf.data, "origins", None) or ()), fx_node])
+    object.__setattr__(buf.data, "origins", merged)
+    buf.origins = OrderedSet([*(buf.origins or ()), fx_node])
+
+    # FakeTensor propagation has already run, so the synthetic node has no
+    # meta["val"]. Fill it with a meta-device tensor so downstream passes
+    # (e.g. split_multi_ops._make_intermediate_bufs) can read shape and dtype.
+    fx_node.meta["val"] = torch.empty(
+        result.get_size(), dtype=result.get_dtype(), device="meta"
+    )
+
+    # Register so split_multi_ops can resolve this buffer by name.
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1838,13 +1862,23 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
+    # Convert args, skipping constants. Each conversion is realized as its own
+    # buffer: fused into fn's body, two conversions of one buffer at different
+    # offsets (e.g. two select() rows) would be rebuilt by split_multi_ops as an
+    # op over the whole buffer, losing the offsets.
     converted_args = []
     for x in args:
         if isinstance(x, (int, float)):
             converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            continue
+        converted = to_dtype(x, torch.float32)
+        args_: tuple = ()
+        if isinstance(x, ir.IRNode) and (n := x.get_origin_node()) is not None:
+            args_ = (n,)
+        _ensure_synthetic_origin(
+            converted, torch.ops.prims.convert_element_type.default, args_
+        )
+        converted_args.append(converted)
 
     output = fn(*converted_args)
 

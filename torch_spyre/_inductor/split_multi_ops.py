@@ -458,6 +458,7 @@ def _lower_fx_node(node, gl, ops, idx):
         The created buffer
     """
     tb = gl.run_node(node)
+    gl.env[node] = tb
     buf = tb.data.data
     gl.operations.remove(buf)
     ops.insert(idx, buf)
