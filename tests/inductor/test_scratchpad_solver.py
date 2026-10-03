@@ -20,6 +20,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -1400,6 +1401,66 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             ).plan_layout_and_core_divisions(cost_expr)
         }
         self.assertIsNotNone(result["mm_out"].chosen_division)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "stall stop needs ortools")
+class TestStallStop(TestCase):
+    """``_StallStop``: stop a solve once the incumbent stops improving."""
+
+    def _stop(self, stall_s=10.0):
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _StallStop
+
+        now = [0.0]
+        solver = types.SimpleNamespace(stopped=0)
+        solver.stop_search = lambda: setattr(solver, "stopped", solver.stopped + 1)
+        stop = _StallStop(solver, stall_s, clock=lambda: now[0], poll_s=0.001)
+        return stop, solver, now
+
+    def test_no_solution_never_stops(self):
+        stop, _solver, now = self._stop()
+        now[0] = 1000.0
+        self.assertFalse(stop.should_stop())
+
+    def test_improvement_resets_the_clock(self):
+        stop, _solver, now = self._stop(stall_s=10.0)
+        stop.note(100.0)
+        now[0] = 9.0
+        self.assertFalse(stop.should_stop())
+        stop.note(90.0)  # better: clock restarts at t=9
+        now[0] = 18.0
+        self.assertFalse(stop.should_stop())
+        stop.note(90.0)  # equal: not an improvement, clock keeps running
+        now[0] = 19.0
+        self.assertTrue(stop.should_stop())
+
+    def test_watchdog_calls_stop_search_once(self):
+        stop, solver, now = self._stop(stall_s=10.0)
+        stop.note(100.0)
+        now[0] = 50.0
+        with stop.watch():
+            for _ in range(200):
+                if stop.fired:
+                    break
+                time.sleep(0.001)
+        self.assertTrue(stop.fired)
+        self.assertEqual(solver.stopped, 1)
+
+    def test_easy_solve_finishes_optimal_under_the_watchdog(self):
+        # The wiring must not disturb a solve that proves before any stall.
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _StallStop
+
+        model = cp_model.CpModel()
+        x = model.new_int_var(0, 10, "x")
+        y = model.new_int_var(0, 10, "y")
+        model.add(x + y >= 7)
+        model.minimize(3 * x + 2 * y)
+        solver = cp_model.CpSolver()
+        stop = _StallStop(solver, 5.0)
+        with stop.watch():
+            status = solver.solve(model, stop)
+        self.assertEqual(solver.status_name(status), "OPTIMAL")
+        self.assertFalse(stop.fired)
+        self.assertGreaterEqual(stop.solutions, 1)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat printer tests need ortools")

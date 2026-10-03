@@ -306,6 +306,16 @@ cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
 )
 
+# Stop a CP-SAT objective solve once this many seconds pass without the
+# incumbent plan improving, and take the incumbent (status FEASIBLE). CP-SAT
+# has no way to search without also trying to prove optimality, and on the
+# co-optimizing models the plan is typically final within seconds while the
+# proof can run out any budget (measured on Gemma 4 block graphs: the plan
+# found at 300 s was identical to the one proven optimal, and the 76-buffer
+# spyre_attn prefill graph last improved at 25 s of a 60 s solve). The time
+# limit above still applies as the hard cap. 0 disables the stall stop.
+cpsat_stall_seconds: float = float(os.environ.get("CPSAT_STALL_SECONDS", "0"))
+
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
