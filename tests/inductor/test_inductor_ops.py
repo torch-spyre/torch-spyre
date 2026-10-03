@@ -3721,8 +3721,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["eval_mode"],
         },
-        # TODO: TorchInductor compilation failure in the Spyre lowering pass —
-        # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
+        # TODO: group_norm fails layout propagation with a stick incompatibility
+        # (issue #3287).
         ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
             "param_sets": {
                 "8_groups": (
@@ -6512,6 +6512,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # int64 prod over the stick dim decomposes to select+mul, and a
+            # stick-dim select reads one element per stick, a layout only a
+            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -6617,6 +6626,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "param_sets": {
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
+        # int64 arithmetic over rows of one tensor. The rows hold distinct values,
+        # so combining a row with the wrong one gives a wrong answer.
+        ("test_multiops_split", "test_int64_select_rows_cpu"): {
+            "ops_dict": {
+                "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
+                "mul_3_rows": lambda x: x.select(0, 0)
+                * x.select(0, 1)
+                * x.select(0, 2),
+                "add_3_rows": lambda x: x.select(0, 0)
+                + x.select(0, 1)
+                + x.select(0, 2),
+            },
+            "param_sets": {
+                "3x32": (
+                    torch.tensor([[2] * 32, [3] * 32, [5] * 32], dtype=torch.int64),
+                ),
             },
         },
         # A view that splits the stick dim into (heads, D) and then slices or
@@ -8508,6 +8535,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
+
+    def test_int64_select_rows_cpu(self, op, x):
+        # Small integers convert to fp32 exactly, so any difference is a wrong row.
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
 
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.

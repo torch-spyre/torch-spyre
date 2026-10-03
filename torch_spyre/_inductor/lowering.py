@@ -310,7 +310,9 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
     layout passes (which key off ``op.data.origins[].target``) recognize it even
     when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    if a ``target`` origin already exists. The node is registered in the graph
+    env, so split_multi_ops can resolve the buffer by name when a fused body
+    downstream loads it.
     """
 
     def _realized_buffer(node):
@@ -333,6 +335,11 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # Passes that read the node expect what an FX-lowered node carries: an
+    # example value and an env entry.
+    fx_node.meta["val"] = ir.ir_node_to_tensor(result)
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1811,6 +1818,9 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
 
+    # Do not realize the result or stamp an origin on it here. split_multi_ops
+    # materializes a fused conversion over its source buffer; realizing it here
+    # would size the conversion of an expanded view at the broadcast extent.
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
     )
@@ -1838,15 +1848,25 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
-    converted_args = []
-    for x in args:
+    def convert(x):
         if isinstance(x, (int, float)):
-            converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            return x
+        converted = to_dtype(x, torch.float32)
 
-    output = fn(*converted_args)
+        # split_multi_ops currently does not support views in a fused
+        # intermediate: it rebuilds the op over the base buffers, so two
+        # conversions of one buffer at different offsets (e.g. two select()
+        # rows) would read the same elements. Work around it by giving each
+        # conversion a buffer of its own.
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        return converted
+
+    output = fn(*[convert(x) for x in args])
 
     if convert_output:
         return to_dtype(output, torch.int64)
