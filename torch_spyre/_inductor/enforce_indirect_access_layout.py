@@ -64,6 +64,7 @@ from .pass_utils import (
     iteration_space_with_splits,
     loop_var_ranges_from_dim_hints,
     padded_entry_output_stl,
+    per_trip_index,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
 from . import config
@@ -361,9 +362,16 @@ def _scatter_alignment_inputs(
         if not isinstance(layout, FixedTiledLayout):
             return None
         accesses.append(
-            AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
+            AlignmentAccess(
+                overrides.get(dep.name, layout.device_layout),
+                per_trip_index(op, dep.index),
+            )
         )
-    accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    accesses.append(
+        AlignmentAccess(
+            output_layout.device_layout, per_trip_index(op, write_dep.index)
+        )
+    )
     space = iteration_space_from_op(op)
     return build_operation_alignment_inputs(
         space,

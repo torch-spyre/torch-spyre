@@ -46,6 +46,44 @@ def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
     return name, code_dir, kernel_provenance, symbol_kinds
 
 
+@pytest.mark.parametrize("unroll", [None, "0", "1"])
+def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll):
+    code_dir = tmp_path / "spyreCodeDir"
+    code_dir.mkdir()
+    (code_dir / "spyrecode.json").write_text("{}")
+    env = {} if unroll is None else {"DXP_LOOP_UNROLL": unroll}
+    with (
+        patch.object(async_compile_mod, "_check_backend_compiler_on_path"),
+        patch.object(async_compile_mod.subprocess, "run") as run,
+    ):
+        assert async_compile_mod._run_backend_compiler(
+            "kernel", str(tmp_path), env
+        ) == str(tmp_path)
+    args = run.call_args.args[0]
+    flags = [arg for arg in args if arg.startswith("--enable-loop-unroll=")]
+    assert flags == ([] if unroll is None else [f"--enable-loop-unroll={unroll}"])
+    assert run.call_args.kwargs["env"] == env
+
+
+def test_loop_unroll_control_changes_kernel_cache_key():
+    from torch_spyre.execution import kernel_cache
+
+    with (
+        patch.object(
+            kernel_cache, "_get_backend_compiler_version", return_value="test"
+        ),
+        patch.object(kernel_cache, "_get_torch_spyre_version", return_value="test"),
+        patch.dict(os.environ, {"DXP_LOOP_UNROLL": "0"}),
+    ):
+        preserved = kernel_cache.compute_specs_hash([])
+        os.environ["DXP_LOOP_UNROLL"] = "1"
+        unrolled = kernel_cache.compute_specs_hash([])
+        del os.environ["DXP_LOOP_UNROLL"]
+        default = kernel_cache.compute_specs_hash([])
+    assert preserved != unrolled
+    assert unrolled == default
+
+
 def test_single_worker_compiles_inline_without_starting_pool():
     compiler = async_compile_mod.SpyreAsyncCompile()
 

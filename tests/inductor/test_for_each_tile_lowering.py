@@ -2022,6 +2022,32 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_host_counter_stays_integer_under_spyre_comparison_lowering(self):
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _extract_trip_count
+
+        with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+            counter = torch.empty((), dtype=torch.int64, device="cpu")
+            gm = make_fx(lambda i: (i < 16,))(counter)
+            graph = GraphLowering(
+                gm, example_inputs=[counter], shape_env=fake_mode.shape_env
+            )
+            with (
+                V.set_graph_handler(graph),
+                V.set_fake_mode(fake_mode),
+                enable_spyre_lowerings(),
+            ):
+                graph.run(counter)
+                self.assertEqual(_extract_trip_count(graph), 16)
+                self.assertEqual(len(graph.operations), 1)
+                self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
@@ -2197,6 +2223,108 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
             graph.run(*placeholders)
         return graph
+
+    def test_scatter_indexer_preserves_marker_advance_and_read_redirection(self):
+        from for_each_tile_fixtures import scatter_carry_fn
+        from torch._inductor import config, ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.pass_utils import (
+            _scatter_index_buf_names_ordered,
+            redirect_computed_buffer_reads,
+        )
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        args = (
+            torch.randn(4, 32, 64),
+            torch.arange(128).reshape(4, 32),
+            torch.full((192, 64), 3.0),
+        )
+        with (
+            mock.patch("torch.accelerator.is_available", return_value=False),
+            config.patch("force_disable_caches", True),
+        ):
+            graph = self._run_graph(scatter_carry_fn, args)
+
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        proof = try_prove_for_each_tile(while_op)
+        self.assertTrue(proof.accepted)
+        loop_var = _body_loop_var(while_op)
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group = splice_while_loop(
+                graph, while_op, carries, trip_count=proof.trip_count
+            )
+            scatter = next(
+                op
+                for op in group
+                if isinstance(op, ir.ComputedBuffer) and isinstance(op.data, ir.Scatter)
+            )
+            destination = scatter.layout.get_buffer()
+            self.assertEqual(destination.get_name(), graph.graph_outputs[0].get_name())
+            self.assertNotIn(destination, group)
+            self.assertFalse(
+                any(
+                    isinstance(op, ir.ComputedBuffer)
+                    and not isinstance(op.data, ir.Scatter)
+                    and list(op.data.ranges) == [192, 64]
+                    for op in group
+                ),
+                "the output carry must not copy all rows on every trip",
+            )
+            for dep in scatter.get_read_writes().reads:
+                if isinstance(dep, MemoryDep):
+                    self.assertNotIsInstance(
+                        graph.get_buffer(dep.name).get_layout(),
+                        ir.MutationLayoutSHOULDREMOVE,
+                    )
+            (marker_name,) = _scatter_index_buf_names_ordered(scatter)
+            marker = graph.name_to_buffer[marker_name]
+            self.assertEqual(marker.tile_marker_dim, 0)
+            (upstream,) = [
+                dep
+                for dep in marker.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(upstream.index.coeff(loop_var), 32)
+
+            _consume_tile_dim_markers(group, graph.operations)
+            scatter = graph.name_to_buffer[scatter.get_name()]
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [upstream.name])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == upstream.name
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(marker_name, {op.get_name() for op in group})
+
+            # Read renames must also reach the separate destination indexer.
+            renamed = "renamed_scatter_indices"
+            graph.name_to_buffer[renamed] = graph.get_buffer(upstream.name)
+            scatter = redirect_computed_buffer_reads(
+                scatter, {upstream.name: renamed}, graph.operations, pass_name="test"
+            )
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [renamed])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == renamed
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(
+                upstream.name, {d.name for d in scatter.get_read_writes().reads}
+            )
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
         """Marker resolution for split_m_fn's StarDep-shaped matmul consumer.

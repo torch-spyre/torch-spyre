@@ -183,6 +183,9 @@ def _run_backend_compiler(
     # than given a bundle-path spelling of its own.
     if _spyre_config.ktir_device_mlir:
         cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    # dbo-opt needs an explicit flag for the former dxp_standalone control.
+    if "DXP_LOOP_UNROLL" in env:
+        cmd.append(f"--enable-loop-unroll={env['DXP_LOOP_UNROLL']}")
     cmd += [
         f"--export-dir={compile_dir}",
         "-kEmitSpyreCode",

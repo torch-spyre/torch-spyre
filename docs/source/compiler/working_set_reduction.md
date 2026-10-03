@@ -89,7 +89,8 @@ def for_each_tile(
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of each returned output leaf. Tiles may be a tensor or a pytree of
+            tensors. ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -117,6 +118,14 @@ that a purely elementwise tiling doesn't need: `init` threads a **carry**
 each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Output leaves may have different ranks; `out_dim` is normalized separately for
+each leaf. A functional `index_copy` into a carried output preserves its caller's
+initializer. The compiler removes a full carry clone only when its addresses,
+shape, strides and offset are unchanged.
+
+Set `DXP_LOOP_UNROLL=0` to keep counted loops in the backend compiler. The setting
+is part of the kernel cache key, so changing it cannot reuse an unrolled artifact.
 
 ## Example: tiling `y = a + b; z = y * c`
 

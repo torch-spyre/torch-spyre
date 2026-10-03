@@ -973,6 +973,11 @@ def _rewire_accumulator_output(
     """
     from torch._inductor import ir
 
+    from torch_spyre._inductor.pass_utils import (
+        _identity_load,
+        redirect_computed_buffer_reads,
+    )
+
     while_out_name = None
     for child in graph.operations:
         if not isinstance(child, ir.MultiOutput):
@@ -1002,6 +1007,37 @@ def _rewire_accumulator_output(
         )
         return body_ops
 
+    partial_update = False
+    updates = [
+        op
+        for op in body_ops
+        if isinstance(op, ir.ComputedBuffer)
+        and isinstance(op.layout, ir.MutationLayoutSHOULDREMOVE)
+        and op.layout.get_buffer().get_name() == body_output_name
+    ]
+    if len(updates) == 1 and isinstance(updates[0].data, ir.Scatter):
+        # A private carry needs no full clone before an index_copy scatter
+        # when the clone preserves every address, size, stride and offset.
+        identity = _identity_load(producer)
+        body_graph = while_op.body_subgraph.graph
+        placeholder_name = list(body_graph.graph_inputs)[binding.carry_index]
+        placeholder_layout = body_graph.graph_inputs[placeholder_name].get_layout()
+        clone_layout = producer.get_layout()
+        update_layout = updates[0].layout.real_layout()
+        if (
+            identity is not None
+            and identity[0] == placeholder_name
+            and list(producer.data.ranges) == list(placeholder_layout.size)
+            and clone_layout.size == placeholder_layout.size == update_layout.size
+            and clone_layout.stride == placeholder_layout.stride == update_layout.stride
+            and clone_layout.offset == placeholder_layout.offset == update_layout.offset
+            and clone_layout.dtype == placeholder_layout.dtype
+            and identity[1] == placeholder_layout.make_indexer()(identity[2])
+        ):
+            body_ops = [op for op in body_ops if op is not producer]
+            producer = updates[0]
+            partial_update = True
+
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
@@ -1015,12 +1051,31 @@ def _rewire_accumulator_output(
     # same recursive view/box unwrapping used when resolving mutation storage.
     storage = mutation_layout.get_buffer()
     storage_name = storage.get_name()
-    record = LoopCarryRecord(
-        storage_name=storage_name,
-        update_name=producer.get_name(),
-    )
-    storage._loop_carry_record = record
-    producer._loop_carry_record = record
+    if not partial_update:
+        record = LoopCarryRecord(
+            storage_name=storage_name,
+            update_name=producer.get_name(),
+        )
+        storage._loop_carry_record = record
+        producer._loop_carry_record = record
+
+    # In-body readers must use carry storage: the former producer is now a
+    # mutation operation without an independent allocation.
+    body_ops = [
+        redirect_computed_buffer_reads(
+            op,
+            {body_output_name: storage_name},
+            body_ops,
+            pass_name="splice_while_loops",
+            reason="redirect in-body reads of an updated carry to its storage",
+        )
+        if isinstance(op, ir.ComputedBuffer)
+        and (op is not producer or partial_update)
+        and any(d.name == body_output_name for d in op.get_read_writes().reads)
+        else op
+        for op in body_ops
+    ]
+    _substitute_direct_input_refs(body_ops, {body_output_name: target})
 
     if while_out_name is not None:
         _repoint_refs_to_buffer(graph, while_out_name, target)

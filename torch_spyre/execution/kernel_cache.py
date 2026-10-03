@@ -383,6 +383,7 @@ def compute_specs_hash(
     content_parts.append(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
+    content_parts.append(f"loop_unroll:{os.getenv('DXP_LOOP_UNROLL', '1')}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(

@@ -33,10 +33,11 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
     StorageBox,
     TensorBox,
 )
-from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
@@ -749,74 +750,49 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     return True
 
 
-def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
-    """Return names of the index tensors used in a Scatter op's output_indexer.
+class _IdentityLoadRecorder(DefaultHandler):
+    def __init__(self) -> None:
+        self.value = object()
+        self.loads: list[tuple[str, Any]] = []
 
-    For Scatter ops the indirect index is encoded in the output_indexer
-    closure. Extract the index buffer names directly from the 'indices'
-    closure variable, preserving the order of `indices` (position within that
-    list is the scattered dimension). Returns [] if op isn't a Scatter, or if
-    the closure doesn't expose an 'indices' variable in the expected shape
-    (e.g. because Inductor renamed it), in which case a warning is logged
-    since downstream passes will silently miss the scatter index tensors.
-    """
-    from torch._inductor.ir import Scatter
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if name != "load" or self.loads:
+            raise ValueError("not a single-load identity")
+        self.loads.append((args[0], args[1]))
+        return self.value
+
+
+def _identity_load(
+    op: Operation,
+) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]] | None:
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
+        return None
+    indices = tuple(
+        sympy.Symbol(f"_fet_identity_i{i}", integer=True)
+        for i in range(len(op.data.ranges))
+    )
+    recorder = _IdentityLoadRecorder()
+    try:
+        with V.set_ops_handler(recorder):
+            result = op.data.inner_fn(indices)
+    except Exception:  # noqa: BLE001
+        return None
+    if (
+        getattr(result, "value", result) is not recorder.value
+        or len(recorder.loads) != 1
+    ):
+        return None
+    name, index = recorder.loads[0]
+    return name, sympy.sympify(index), indices
+
+
+def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
+    from torch._inductor.dependencies import extract_read_writes
 
     if not isinstance(op.data, Scatter):
         return []
-
-    fn = op.data.output_indexer
-    if fn.__closure__ is None:
-        return []
-
-    freevars = fn.__code__.co_freevars
-    try:
-        cells = {
-            name: cell.cell_contents for name, cell in zip(freevars, fn.__closure__)
-        }
-    except ValueError:
-        return []
-
-    indices = None
-    if "indices" in cells:
-        indices = cells["indices"]
-    elif "index_loader" in cells:
-        # Fallback: PyTorch Inductor may use index_loader instead of direct indices.
-        # Try to extract the indices from index_loader's closure.
-        index_loader = cells["index_loader"]
-        if hasattr(index_loader, "__closure__") and index_loader.__closure__:
-            loader_freevars = index_loader.__code__.co_freevars
-            try:
-                loader_cells = {
-                    name: cell.cell_contents
-                    for name, cell in zip(loader_freevars, index_loader.__closure__)
-                }
-                if "indices" in loader_cells:
-                    indices = loader_cells["indices"]
-            except (ValueError, AttributeError):
-                pass
-
-    if indices is None:
-        logger.warning(
-            "Scatter.output_indexer closure has no 'indices' variable or "
-            "'index_loader' — Inductor structure may have changed. "
-            "Scatter index tensors will not be excluded from stick compatibility "
-            "checks. (freevars: %s)",
-            list(freevars),
-        )
-        return []
-
-    names = []
-    for idx_tensor in indices:
-        if idx_tensor is None:
-            continue
-        # Unwrap TensorBox -> StorageBox -> Buffer to get the name
-        node = idx_tensor
-        while hasattr(node, "data"):
-            node = node.data
-        if hasattr(node, "name") and node.name is not None:
-            names.append(node.name)
-    return names
+    rw = extract_read_writes(op.data.output_indexer, op.data.ranges, normalize=False)
+    return [dep.name for dep in rw.reads if isinstance(dep, MemoryDep)]
 
 
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
@@ -1863,8 +1839,19 @@ def iter_var_id(stick_expr) -> int:
     return int(name[i + 1 :])
 
 
+def _scatter_iteration_space(rw: ReadWrites) -> dict[sympy.Symbol, sympy.Expr]:
+    # With loop merging disabled, the longest dependency range retains the
+    # value/index axes hidden by an indirect store.
+    return max(
+        (dep.ranges for dep in rw.reads_and_writes() if isinstance(dep, MemoryDep)),
+        key=len,
+    ).copy()
+
+
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
-    if isinstance(n.node.data, Pointwise):
+    if isinstance(n.node.data, Scatter):
+        return _scatter_iteration_space(n.read_writes)
+    elif isinstance(n.node.data, Pointwise):
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
@@ -1890,7 +1877,9 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     """Pre-scheduler version of iteration_space: uses op.get_read_writes() instead
     of SchedulerNode.read_writes."""
     rw = op_read_writes(op)
-    if isinstance(op.data, Pointwise):
+    if isinstance(op.data, Scatter):
+        return _scatter_iteration_space(rw)
+    elif isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
@@ -2300,6 +2289,12 @@ def compute_restickify_target_layout(
     if not candidates:
         return None
     new_sd_outer_dim = candidates[0]
+    # Swapping one device axis cannot preserve another host dimension folded
+    # into it (for example page * block_size + token in a paged cache).
+    if idc[old_sd_outer_dim].free_symbols - {old_var} or idc[
+        new_sd_outer_dim
+    ].free_symbols - {new_var}:
+        return None
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,
@@ -2801,6 +2796,14 @@ def redirect_computed_buffer_reads(
             return _orig_inner(*args)
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
+    if isinstance(op.data, Scatter):
+        orig_indexer = op.data.output_indexer
+
+        def new_output_indexer(*args, _map=name_map, _orig_indexer=orig_indexer):
+            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+                return _orig_indexer(*args)
+
+        object.__setattr__(op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(op.data)
 
     # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
