@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Copyright 2025-2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# One front door for the SDSC tooling.
+#
+#   sdsc capture [-d DIR] -- <command...>   run a compile with artifacts + both cost
+#                                           dumps collected under DIR (default
+#                                           ~/sdsc_runs/<timestamp>)
+#   sdsc tui [DIR] [tui options]            browse DIR (default: newest ~/sdsc_runs/*
+#                                           or /tmp/torchinductor_*)
+#   sdsc report [DIR] [report options]      the report on stdout (box table;
+#                                           --format github for collapsible
+#                                           Markdown, --out FILE to save it)
+#   sdsc diff DIR_A DIR_B [options]         what changed between two captured
+#                                           runs: totals, then only the ops
+#                                           whose plan differs
+#   sdsc shot [DIR] [FILE.svg]              headless TUI screenshot
+#
+# The dumps are found by name next to the artifacts (cost_dump.log,
+# cost_expr.jsonl, probe.json), so tui/report/diff need no --cost/--cost-expr/
+# --probe flags.
+set -euo pipefail
+# Resolve symlinks: this script is meant to be linked onto PATH, and its
+# companions (batch_summarize_sdsc.py, sdsc_tui.py) live next to the REAL file.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    LINK="$(readlink "$SELF")"
+    case "$LINK" in
+        /*) SELF="$LINK" ;;
+        *) SELF="$(dirname "$SELF")/$LINK" ;;
+    esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+# Pick an interpreter that actually has the deps (tabulate, and textual for the
+# TUI). The system python3 usually has neither, so a bare `sdsc tui` from a fresh
+# shell would die on an import -- override with SDSC_PYTHON to force one.
+pick_python() {
+    if [ -n "${SDSC_PYTHON:-}" ]; then echo "$SDSC_PYTHON"; return; fi
+    local root
+    root="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || true)"
+    for cand in ${root:+"$root/.venv/bin/python3"} python3; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import tabulate" >/dev/null 2>&1; then
+            echo "$cand"; return
+        fi
+    done
+    echo python3
+}
+PY="$(pick_python)"
+
+newest_dir() {
+    ls -dt ~/sdsc_runs/*/ /tmp/torchinductor_*/ 2>/dev/null | head -1
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  capture)
+    dir=""
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        case "$1" in
+          -d|--dir) dir="$2"; shift 2 ;;
+          *) echo "unknown option $1" >&2; exit 2 ;;
+        esac
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || { echo "usage: sdsc capture [-d DIR] -- <command...>" >&2; exit 2; }
+    dir="${dir:-$HOME/sdsc_runs/$(date +%Y%m%d_%H%M%S)}"
+    mkdir -p "$dir"
+    echo "sdsc: artifacts + dumps -> $dir" >&2
+    TORCHINDUCTOR_CACHE_DIR="$dir" \
+    SPYRE_DUMP_COST=1 SPYRE_DUMP_COST_FILE="$dir/cost_dump.log" \
+    SPYRE_DUMP_COST_EXPR_FILE="$dir/cost_expr.jsonl" \
+    "$@"
+    echo "sdsc: done. next: sdsc tui $dir   |   sdsc report $dir" >&2
+    ;;
+  tui)
+    dir="${1:-}"; [[ -n "$dir" && "$dir" != -* ]] && shift || dir="$(newest_dir)"
+    exec "$PY" "$HERE/sdsc_tui.py" "$dir" "$@"
+    ;;
+  report)
+    dir="${1:-}"; [[ -n "$dir" && "$dir" != -* ]] && shift || dir="$(newest_dir)"
+    # Markdown for a PR comment is one collapsed block per op, not one flat
+    # table: --format github implies --collapsible here.
+    extra=(); prev=""
+    for a in "$@"; do
+        [[ "$a" == "--format=github" || ( "$prev" == "--format" && "$a" == "github" ) ]] && extra=(--collapsible)
+        prev="$a"
+    done
+    exec "$PY" "$HERE/batch_summarize_sdsc.py" "$dir" "$@" "${extra[@]}"
+    ;;
+  diff)
+    [[ $# -ge 2 ]] || { echo "usage: sdsc diff DIR_A DIR_B [options]" >&2; exit 2; }
+    a="$1"; b="$2"; shift 2
+    exec "$PY" "$HERE/batch_summarize_sdsc.py" "$a" --diff "$b" "$@"
+    ;;
+  shot)
+    dir="${1:-}"; [[ -n "$dir" && "$dir" != -* ]] && shift || dir="$(newest_dir)"
+    out="${1:-$dir/summary.svg}"
+    "$PY" "$HERE/sdsc_tui.py" "$dir" --screenshot "$out"
+    ;;
+  *)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
