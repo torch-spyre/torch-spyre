@@ -2169,6 +2169,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (2, 3, 4, 44), dtype=torch.int64),
                     32,
                 ),
+                # 0-dim: regression guard for rank-0 integer compare promotion.
+                # INT_TO_FLOAT promotes int64 to fp32 before the compare, so the
+                # scalar must be < 2^24 to be represented exactly in fp32.
+                "0dim_scalar": (
+                    torch.randint(0, 1000, (), dtype=torch.int64),
+                    1361920,
+                ),
             },
         },
         # -----------------------------------------------------------------------
@@ -2299,6 +2306,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 4-D
                 "4d_2x3x4x64_scalar500": (
                     torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 0-dim: regression guard for rank-0 integer compare promotion.
+                # INT_TO_FLOAT promotes int32 to fp32 before the compare, so the
+                # scalar must be < 2^24 to be represented exactly in fp32; 500 < 2^24.
+                "0dim_scalar500": (
+                    torch.randint(0, 1000, (), dtype=torch.int32),
                     500,
                 ),
             },

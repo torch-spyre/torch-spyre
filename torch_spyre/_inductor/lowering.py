@@ -2144,9 +2144,15 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     # expects exactly one ``load(iter) < constant(int N)`` op in the cond
     # graph.  The int -> float cast below would insert a second op and coerce
     # N to float, breaking both checks and causing silently wrong loop counts.
+    #
+    # The guard is restricted to subgraph lowerings (V.graph.parent is not
+    # None), which is the only context where the cond graph is compiled.
+    # Top-level 0-dim integer compares (e.g. model-level torch.eq(i64[], N))
+    # must fall through to the INT_TO_FLOAT promotion below.
     dtypes = {t.get_dtype() for t in tensors}
     if (
-        len(dtypes) == 1
+        getattr(V.graph, "parent", None) is not None
+        and len(dtypes) == 1
         and not next(iter(dtypes)).is_floating_point
         and all(len(t.get_size()) == 0 for t in tensors)
         and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
