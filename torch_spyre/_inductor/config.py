@@ -306,6 +306,55 @@ cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
 )
 
+
+def _positive_int_env(name: str) -> int | None:
+    """``name`` as a positive integer, or None when it is unset or not one."""
+    value = os.environ.get(name, "").strip()
+    return int(value) if value.isdigit() and int(value) > 0 else None
+
+
+# CPUs this process may use; sizes CP-SAT's parallel search worker pool (a
+# deterministic-algorithms run still uses one worker). None detects the count,
+# see ``get_cpu_count``. SPYRE_NUM_CPUS backs the default, the variable
+# spyre-inference's ``threading_config`` reads for the same budget. A value
+# that is not a positive integer (unset, ``0``, ``-2``, ``abc``) means None.
+num_cpus: int | None = _positive_int_env("SPYRE_NUM_CPUS")
+
+
+def get_cpu_count() -> int:
+    """CPUs this process may actually use, after spyre-inference's
+    ``threading_config.get_cpu_count``. Resolution order: ``num_cpus`` when it
+    is a positive integer, the cgroup v2 CPU quota, psutil's physical core
+    count, ``os.cpu_count()``.
+
+    ``os.cpu_count()`` reports every CPU on the host, even when a container's
+    cgroup quota lets the process use only some of them. Sizing CP-SAT's worker
+    pool to the host then oversubscribes the CPUs actually available: the search
+    thrashes instead of progressing, and the other work in the container is
+    starved."""
+    # ``install_config_module`` below moves ``num_cpus`` onto a wrapper object,
+    # so it is an attribute of this module and not a global of this function.
+    cfg = sys.modules[__name__]
+    if cfg.num_cpus is not None and cfg.num_cpus > 0:
+        return cfg.num_cpus
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            return int(physical)
+    except ImportError:
+        pass
+    return os.cpu_count() or 1
+
+
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
@@ -332,5 +381,16 @@ _cpsat_warn_on_cost_expr: bool = True
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+
+# Settings left out of the Inductor FX graph cache key. This module is the Spyre
+# backend's ``device_custom_config``, so ``save_config_portable`` puts every
+# other setting's value in the key. A setting belongs here when it describes the
+# machine rather than the graph, as Inductor's own ``compile_threads`` does: a
+# cached compile is reused whatever its value is.
+_cache_config_ignore_prefix: list[str] = [
+    # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
+    # otherwise split the cache by machine for identical graphs.
+    "num_cpus",
+]
 
 install_config_module(sys.modules[__name__])

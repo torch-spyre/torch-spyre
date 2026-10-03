@@ -840,9 +840,12 @@ Environment Variables
      - Cache compiled Spyre kernels on disk and reuse them across
        invocations (default ``0``; set ``1`` to enable)
    * - ``SPYRE_NUM_CPUS``
-     - Override the CPU count CP-SAT uses to size its search worker pool.
-       When unset the count is derived from the cgroup v2 quota, then
-       ``psutil``, then ``os.cpu_count()``
+     - CPUs CP-SAT uses to size its search worker pool (config
+       ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When
+       unset, or not a positive integer, ``num_cpus`` is ``None`` and the
+       count is derived from the cgroup v2 quota, then ``psutil``, then
+       ``os.cpu_count()``. Not part of the compile cache key, so a cached
+       compile is reused whatever the value
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
