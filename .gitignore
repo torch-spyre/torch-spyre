@@ -246,6 +246,8 @@ build_ios
 distribute/*
 *.testbin
 *.bin
+# Precompiled spyre-cli example kernels ship their device binary.
+!extensions/spyre-cli/examples/**/*.bin
 cmake_build
 .cmake_build
 gen
