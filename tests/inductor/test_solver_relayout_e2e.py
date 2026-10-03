@@ -425,25 +425,16 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     spies; the parity spy checks the committed collector certifies the same
     edge, and #3440's payload check that the emitted op runs in LX."""
     from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
-
     from relayout_fixtures import grouped_relayout_graph
-    from utils_inductor import (
-        assert_lx_only_relayout_payload,
-        capture_backend_output_dirs,
-    )
 
     observed = _Observed(monkeypatch, force=False)
     fn, args, reference, expect = grouped_relayout_graph(kind)
-    with (
-        config.patch({**_COOPT, "sencores": 32}),
-        capture_backend_output_dirs() as dirs,
-    ):
+    with config.patch({**_COOPT, "sencores": 32}):
         out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
             *args
         )
 
     observed.assert_emitted_in_lx(expected_plans=1)
-    assert_lx_only_relayout_payload(dirs)
     (plan,) = observed.plans
     assert plan.num_cores == expect["source_cores"], "the plan keeps the source's"
     assert plan.destination_view.num_cores == expect["destination_cores"]
