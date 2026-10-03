@@ -1,5 +1,9 @@
 test_suite_config:
   labels: [trunk]
+  # Qwen weights are not available for download on ppc64le; excluded there so
+  # filter_configs.py (make tests TEST_TYPE=trunk, and the model-ops-tests CI
+  # workflow) drops this suite on that architecture only.
+  exclude_platforms: [ppc64le]
   global:
     supported_dtypes:
       - name: float16
