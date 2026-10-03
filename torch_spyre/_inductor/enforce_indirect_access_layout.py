@@ -20,12 +20,19 @@ ops (gather/scatter) impose an additional requirement on non-stick dimension
 ordering: the indexed dimension must be outermost in the value tensor's device
 layout, based on their coordinate access patterns.
 
+A rank-1 table is the one case where the indexed dimension is the stick. No
+reordering can move it outermost, so the layout is re-tiled to one entry per
+stick, leaving the stick mapped to no host element.
+
 This pass runs after insert_restickify, once every op has a committed
 FixedTiledLayout. For indirect-access ops, it checks whether the value tensor's
-current dim_order matches this requirement; if not, either rewrites the
-producer's output layout in place (if the producer is a ComputedBuffer and not a
-graph output) or inserts a spyre.restickify copy in the required layout.
+current dim_order matches this requirement; if not, it either rewrites the
+producer's output layout in place -- only when that layout is a reorder, since
+rewriting moves no bytes, and the producer is a ComputedBuffer and not a graph
+output -- or inserts a spyre.restickify copy in the required layout.
 """
+
+from math import prod
 
 import sympy
 import torch
@@ -66,9 +73,11 @@ from .pass_utils import (
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
+from .work_division import MAX_SPAN_BYTES
 from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
+_STICK_BYTES = 128
 
 
 def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
@@ -199,15 +208,99 @@ def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bo
     return compliant
 
 
+def _tiles_one_host_dim(sizes: list[int], strides: list[int]) -> bool:
+    """Whether these device dims are contiguous tiles of one host dim."""
+    tiles = sorted(zip(strides, sizes))
+    expected = tiles[0][0]
+    for stride, size in tiles:
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _build_entry_per_stick_stl(
+    value_stl: SpyreTensorLayout,
+    host_size: list,
+) -> SpyreTensorLayout:
+    """Re-tile a value tensor so each entry sits alone on a stick.
+
+    Leaves the stick mapped to no host element -- the sparse arrangement a host
+    ``[N, 1]`` input's layout also has -- while preserving the input's rank.
+    """
+    device_size = list(value_stl.device_size)
+    stride_map = list(value_stl.stride_map)
+
+    # Only a table with a single real dim can collapse to one entry per stick.
+    # Sizes can be symbolic; the span check below needs a concrete count.
+    extents = [s for s in (concretize_expr(x) for x in host_size) if s != 1]
+    if len(extents) > 1:
+        raise Unsupported(
+            f"cannot re-tile value tensor: host shape {list(host_size)} "
+            f"has more than one non-unit dimension"
+        )
+    # Device dims round up to whole sticks, so take the count from the host.
+    entries = extents[0] if extents else 1
+
+    mapped = [i for i, stride in enumerate(stride_map) if stride >= 0]
+    # A size-1 dim is never stepped, so its stride says nothing about the
+    # tiling: a table shorter than a stick holds the host extent there (device
+    # [1, 64] stride_map [63, 1]). The rest must tile the host dim contiguously
+    # -- a strided view leaves a gap and cannot collapse to one entry per stick.
+    tiled = [i for i in mapped if device_size[i] != 1]
+    if not tiled or not _tiles_one_host_dim(
+        [device_size[i] for i in tiled], [stride_map[i] for i in tiled]
+    ):
+        raise Unsupported(
+            f"cannot re-tile value tensor: device dims "
+            f"{[(device_size[i], stride_map[i]) for i in tiled]} do not "
+            f"tile a single host dimension"
+        )
+    # The dims that walk the host dim fold into the entry count; the stick
+    # already steps one element, so it carries the new entry stride. Dims that
+    # map to no host element (broadcasts) keep their place.
+    new_device_size = [entries]
+    new_stride_map = [stride_map[-1]]
+    for i in range(len(device_size) - 1):
+        if i not in mapped:
+            new_device_size.append(device_size[i])
+            new_stride_map.append(stride_map[i])
+    new_device_size.append(device_size[-1])
+    new_stride_map.append(-1)
+
+    # A stick per entry, so a large table can outgrow the span limit.
+    retiled_bytes = prod(new_device_size[:-1]) * _STICK_BYTES
+    if retiled_bytes > MAX_SPAN_BYTES:
+        raise Unsupported(
+            f"cannot re-tile value tensor: one entry per stick would take "
+            f"{retiled_bytes / (1024 * 1024):.2f} MB for {entries} entries, "
+            f"over the {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB per-core limit. "
+            f"Give the tensor a trailing dimension so its entries already sit "
+            f"on separate sticks."
+        )
+
+    return SpyreTensorLayout(
+        device_size=new_device_size,
+        stride_map=new_stride_map,
+        device_dtype=value_stl.device_dtype,
+    )
+
+
 def _build_required_stl(
     value_stl: SpyreTensorLayout,
     indirect_device_pos: int,
+    host_size: list | None = None,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0.
+    """Build a new STL with the indirect coordinate at device position 0.
 
-    Takes the current device layout and rotates it so the indirect coordinate
-    (at indirect_device_pos) moves to position 0, while keeping the stick
-    (at position -1) at the end. Returns a new STL with the rotated layout.
+    Usually rotates the current device layout so the indirect coordinate (at
+    indirect_device_pos) moves to position 0, keeping the stick (at position -1)
+    at the end.
+
+    When the indexed coordinate *is* the stick, rotation would list the stick
+    twice, so the layout is re-tiled to one entry per stick instead.
+    ``host_size`` is the value tensor's host shape, required for that case
+    because the device dims round up to whole sticks and cannot give the count.
     """
     device_size = list(value_stl.device_size)
     stride_map = list(value_stl.stride_map)
@@ -218,6 +311,11 @@ def _build_required_stl(
     if indirect_device_pos == 0:
         return value_stl
 
+    if indirect_device_pos == stick_pos:
+        # Rotating would list the stick twice and grow the rank.
+        assert host_size is not None, "re-tiling needs the host size"
+        return _build_entry_per_stick_stl(value_stl, host_size)
+
     # Rotate: move indirect_device_pos to position 0, keep stick at end
     order = (
         [indirect_device_pos]
@@ -227,11 +325,24 @@ def _build_required_stl(
 
     new_device_size = [device_size[i] for i in order]
     new_stride_map = [stride_map[i] for i in order]
+    assert len(new_device_size) == n, (
+        f"rotation changed rank {n} -> {len(new_device_size)} (order={order})"
+    )
 
     return SpyreTensorLayout(
         device_size=new_device_size,
         stride_map=new_stride_map,
         device_dtype=value_stl.device_dtype,
+    )
+
+
+def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Whether ``b`` just reorders ``a``'s device dims.
+
+    Relabelling a producer moves no bytes, so it is only safe for a reorder.
+    """
+    return sorted(zip(a.device_size, a.stride_map)) == sorted(
+        zip(b.device_size, b.stride_map)
     )
 
 
@@ -586,7 +697,9 @@ def _insert_mutation_relayout_copy(
         )
     assert write_stride_idx is not None
     output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    required_stl = _build_required_stl(
+        output_stl, output_indirect_pos, _output_real_layout(mutation_op).size
+    )
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -952,11 +1065,15 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
             if _dim_order_is_compliant(value_stl, stride_idx):
                 continue
 
-            # Rotate the device layout to put the indirect coordinate at position 0
+            # Put the indexed coordinate where the gather can address it
             indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-            required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            required_stl = _build_required_stl(
+                value_stl, indirect_device_pos, value_layout.size
+            )
 
-            if _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
+            if _is_permutation_of(
+                value_stl, required_stl
+            ) and _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
                 _rewrite_producer_layout(value_buf, required_stl)
             else:
                 required_layout = _fixed_tiled(value_layout, required_stl)
