@@ -19,8 +19,13 @@ import platform
 import sys
 import pytest
 import unittest
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
+from torch import fx
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
+from torch._inductor.virtualized import V
 
 
 from utils_inductor import (
@@ -40,6 +45,11 @@ from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.split_multi_ops import (
+    _index_syms,
+    _validate_split_supported,
+)
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -786,6 +796,31 @@ def _build_fp32_proxy_cpu_refs(
         else:
             kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
     return kwargs
+
+
+def _check_split_of_trace(sizes, trace):
+    """Run split_multi_ops' guard on a hand-built trace over one output dim of 32."""
+    with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+        for name, size in sizes.items():
+            V.graph.name_to_buffer[name] = InputBuffer(
+                name=name,
+                layout=FixedLayout(
+                    torch.device("cpu"), torch.float32, size, [32, 1][-len(size) :]
+                ),
+            )
+        pointwise = Pointwise.create(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=lambda index: None,
+            ranges=[32],
+        ).data.data
+        op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
+        intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
+        _validate_split_supported(op, trace, intermediate_ops)
+
+
+def _split_load(vid, name, index):
+    return ("load", vid, (), {"_name": name, "_index": index})
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -8539,6 +8574,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_int64_select_rows_cpu(self, op, x):
         # Small integers convert to fp32 exactly, so any difference is a wrong row.
         self.compare_with_cpu(op, x, atol=0, rtol=0)
+
+    def test_multiops_split_refuses_two_rows_of_one_buffer(self):
+        """An intermediate over two select() rows of one buffer is refused.
+
+        The split rebuilds it as an op over whole buffers, which would pair each
+        element with itself.
+        """
+        (i0,) = _index_syms(1)
+        trace = [
+            _split_load(0, "arg", i0),
+            _split_load(1, "arg", i0 + 32),
+            ("mul", 2, (0, 1), {}),
+            ("to_dtype", 3, (2,), {}),
+        ]
+        with self.assertRaises(Unsupported):
+            _check_split_of_trace({"arg": [3, 32]}, trace)
+
+    def test_multiops_split_allows_one_view_load(self):
+        """A single tensor operand is reloaded at its own index on replay."""
+        (i0,) = _index_syms(1)
+        trace = [
+            _split_load(0, "arg", i0 + 32),
+            ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
+            ("add", 2, (0, 1), {}),
+            ("to_dtype", 3, (2,), {}),
+        ]
+        _check_split_of_trace({"arg": [3, 32]}, trace)
+
+    def test_multiops_split_allows_whole_buffers(self):
+        """Two buffers read at their own positions combine correctly."""
+        (i0,) = _index_syms(1)
+        trace = [
+            _split_load(0, "a", i0),
+            _split_load(1, "b", i0),
+            ("mul", 2, (0, 1), {}),
+            ("to_dtype", 3, (2,), {}),
+        ]
+        _check_split_of_trace({"a": [32], "b": [32]}, trace)
 
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.
