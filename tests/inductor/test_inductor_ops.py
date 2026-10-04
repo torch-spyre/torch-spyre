@@ -798,31 +798,6 @@ def _build_fp32_proxy_cpu_refs(
     return kwargs
 
 
-def _check_split_of_trace(sizes, trace):
-    """Run split_multi_ops' guard on a hand-built trace over one output dim of 32."""
-    with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
-        for name, size in sizes.items():
-            V.graph.name_to_buffer[name] = InputBuffer(
-                name=name,
-                layout=FixedLayout(
-                    torch.device("cpu"), torch.float32, size, [32, 1][-len(size) :]
-                ),
-            )
-        pointwise = Pointwise.create(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            inner_fn=lambda index: None,
-            ranges=[32],
-        ).data.data
-        op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
-        intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
-        _validate_split_supported(op, trace, intermediate_ops)
-
-
-def _split_load(vid, name, index):
-    return ("load", vid, (), {"_name": name, "_index": index})
-
-
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -6665,7 +6640,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # int64 arithmetic over rows of one tensor. The rows hold distinct values,
         # so combining a row with the wrong one gives a wrong answer.
-        ("test_multiops_split", "test_int64_select_rows_cpu"): {
+        ("test_split_multi_ops_view_loads", "test_split_multi_ops_view_loads_cpu"): {
             "ops_dict": {
                 "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
                 "mul_3_rows": lambda x: x.select(0, 0)
@@ -8571,47 +8546,83 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    def test_int64_select_rows_cpu(self, op, x):
+    def test_split_multi_ops_view_loads_cpu(self, op, x):
         # Small integers convert to fp32 exactly, so any difference is a wrong row.
         self.compare_with_cpu(op, x, atol=0, rtol=0)
 
-    def test_multiops_split_refuses_two_rows_of_one_buffer(self):
-        """An intermediate over two select() rows of one buffer is refused.
+    def test_split_multi_ops_view_loads_guard(self):
+        """split_multi_ops refuses an intermediate only if it combines view loads."""
 
-        The split rebuilds it as an op over whole buffers, which would pair each
-        element with itself.
-        """
-        (i0,) = _index_syms(1)
-        trace = [
-            _split_load(0, "arg", i0),
-            _split_load(1, "arg", i0 + 32),
-            ("mul", 2, (0, 1), {}),
-            ("to_dtype", 3, (2,), {}),
-        ]
-        with self.assertRaises(Unsupported):
-            _check_split_of_trace({"arg": [3, 32]}, trace)
+        def load(vid, name, index):
+            return ("load", vid, (), {"_name": name, "_index": index})
 
-    def test_multiops_split_allows_one_view_load(self):
-        """A single tensor operand is reloaded at its own index on replay."""
-        (i0,) = _index_syms(1)
-        trace = [
-            _split_load(0, "arg", i0 + 32),
-            ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
-            ("add", 2, (0, 1), {}),
-            ("to_dtype", 3, (2,), {}),
-        ]
-        _check_split_of_trace({"arg": [3, 32]}, trace)
+        def validate(sizes, trace):
+            """Run the guard on a hand-built trace over one output dim of 32."""
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                for name, size in sizes.items():
+                    V.graph.name_to_buffer[name] = InputBuffer(
+                        name=name,
+                        layout=FixedLayout(
+                            torch.device("cpu"),
+                            torch.float32,
+                            size,
+                            [32, 1][-len(size) :],
+                        ),
+                    )
+                pointwise = Pointwise.create(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    inner_fn=lambda index: None,
+                    ranges=[32],
+                ).data.data
+                op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
+                intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
+                _validate_split_supported(op, trace, intermediate_ops)
 
-    def test_multiops_split_allows_whole_buffers(self):
-        """Two buffers read at their own positions combine correctly."""
         (i0,) = _index_syms(1)
-        trace = [
-            _split_load(0, "a", i0),
-            _split_load(1, "b", i0),
-            ("mul", 2, (0, 1), {}),
-            ("to_dtype", 3, (2,), {}),
-        ]
-        _check_split_of_trace({"a": [32], "b": [32]}, trace)
+        cases = {
+            # The split rebuilds the op over whole buffers, which would pair each
+            # element with itself.
+            "two_rows_of_one_buffer": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0),
+                    load(1, "arg", i0 + 32),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                True,
+            ),
+            # A single tensor operand is reloaded at its own index on replay.
+            "one_view_load": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0 + 32),
+                    ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
+                    ("add", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+            # Two buffers read at their own positions combine correctly.
+            "whole_buffers": (
+                {"a": [32], "b": [32]},
+                [
+                    load(0, "a", i0),
+                    load(1, "b", i0),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+        }
+        for case, (sizes, trace, refused) in cases.items():
+            with self.subTest(case):
+                if refused:
+                    with self.assertRaises(Unsupported):
+                        validate(sizes, trace)
+                else:
+                    validate(sizes, trace)
 
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.
