@@ -60,11 +60,6 @@ ATOL = 0.05
 
 aten = torch.ops.aten
 
-# The compile-time failure the backend raises for an unsupported rounding mode.
-# Narrower than ``Exception`` so the rounding-mode xfails cannot mask an
-# unrelated break; see :func:`test_div_rounding_mode`.
-_DIV_MODE_ERROR = torch._inductor.exc.InductorError
-
 # (in-place packet, overload, scalar operand) for each registered arithmetic op.
 INPLACE_SCALAR = [
     (aten.mul_, "Scalar", 3.0),
@@ -294,21 +289,25 @@ def test_inplace_tensor_operand(packet):
     [
         None,
         # 'floor'/'trunc' fail in the *functional* div kernel, independently of
-        # any in-place wrapper: torch.div(x, 3.0, rounding_mode='floor') raises
-        # InductorError("No FX node for buf1") for a scalar operand and
-        # "Cannot resolve target for 'div_rn'/'truediv'" for a tensor one. The
-        # in-place kernel inherits that gap; it does not introduce it.
+        # any in-place wrapper. 'floor' raises InductorError("Cannot resolve
+        # target for 'div_rn'"), and so does a tensor-operand 'trunc' ('truediv');
+        # a scalar-operand 'trunc' compiles but has no trunc kernel, so it raises
+        # a RuntimeError when the kernel runs. The in-place kernel inherits that
+        # gap; it does not introduce it.
         #
-        # ``raises`` is the specific compile failure, not bare ``Exception``:
-        # these xfails must not double as a blanket licence for this path to
-        # break some other way. A wrong *value* or a failure in the derivation
-        # or ``copy_`` wrapper raises something else and still fails the suite,
+        # ``raises`` names the expected failure, not bare ``Exception``: these
+        # xfails must not double as a blanket licence for this path to break
+        # some other way. A wrong *value* or a failure in the derivation or
+        # ``copy_`` wrapper raises something else and still fails the suite,
         # while ``strict=True`` catches the day the kernel starts working.
         pytest.param(
-            "floor", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
+            "floor",
+            marks=pytest.mark.xfail(
+                raises=torch._inductor.exc.InductorError, strict=True
+            ),
         ),
         pytest.param(
-            "trunc", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
+            "trunc", marks=pytest.mark.xfail(raises=RuntimeError, strict=True)
         ),
     ],
     ids=lambda m: str(m),
@@ -322,7 +321,7 @@ def test_div_rounding_mode(rounding_mode, scalar_operand):
     These take a kwarg-only ``rounding_mode``; the kernel forwards ``**kwargs``
     to the functional op, and nothing else in this module exercises that path.
     The ``rounding_mode=None`` case is the one the backend supports today; the
-    rounding modes are strict-xfail on the specific compile error so this starts
+    rounding modes are strict-xfail on their expected error so this starts
     passing (and tells us) once the functional kernel gains support, while any
     *other* failure on this path still fails the suite.
     """
