@@ -15,6 +15,13 @@ dependencies = [
     "regex",
 ]
 
+[project.optional-dependencies]
+# Only the self-serve sandbox server (sandbox_server.py) needs these; the ingests never import it.
+server = [
+    "mcp>=2.2,<3",
+    "uvicorn>=0.30",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

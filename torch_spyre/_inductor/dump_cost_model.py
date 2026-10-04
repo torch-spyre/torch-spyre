@@ -46,6 +46,7 @@ from .pass_utils import (
     _build_indirect_store_subs,
     apply_splits_from_index_coeff,
     iteration_space_from_op,
+    loop_var_ranges_from_dim_hints,
 )
 
 logger = get_logger("cost_model")
@@ -302,7 +303,95 @@ def _tiled_symbols_per_level(op):
     return levels
 
 
-def _loop_factor_for_index(index, levels) -> int:
+def _dep_index(dep):
+    """A dependency's index, or None for one without (``StarDep`` raises, ``WeakDep``
+    has no attribute)."""
+    try:
+        return dep.index
+    except (AttributeError, NotImplementedError):
+        return None
+
+
+def _level_loop_vars(op, levels) -> list:
+    """The ``for_each_tile`` loop variable of each level of ``levels``, or ``None``.
+
+    The ``for_each_tile`` lowering stamps one ``CoarseTileInfo`` level per nesting
+    level, outermost first, and appends one ``DimHint(loop_var, loop_var_range=trip)``
+    per level in the same order, so the i-th hint carrying a ``loop_var_range`` (read
+    through ``loop_var_ranges_from_dim_hints``) is the loop variable of level i.  Each
+    variable is paired to its level by position and its range is checked against the
+    level's trip count; pairing by trip count alone would give two nested loops of
+    equal trip count each other's variable.  When the hint count and the level count
+    differ (the loop info also comes from another source) nothing is paired, which
+    keeps the previous price; a debug line records it.
+    """
+    loop_vars = list(loop_var_ranges_from_dim_hints(op).items())
+    if len(loop_vars) != len(levels):
+        if loop_vars:
+            logger.debug(
+                "%s: %d for_each_tile loop variables for %d loop levels; "
+                "loop-variable reads keep the tiled-dim price",
+                getattr(op, "get_name", lambda: "?")(),
+                len(loop_vars),
+                len(levels),
+            )
+        return [None] * len(levels)
+    return [
+        var if _int(var_range, -1) == trip else None
+        for (trip, _syms, _declared), (var, var_range) in zip(levels, loop_vars)
+    ]
+
+
+def _stamped_advances(tiled, squeezed, n_levels: int) -> list[bool] | None:
+    """Per-level "this dependency's address advances" verdict stamped by the lowering.
+
+    ``tiled`` is one dependency's ``CoarseTileInfo.tiled_dims_per_read`` entry (or
+    ``output_tiled_dims``) and ``squeezed`` the parallel
+    ``squeezed_advance_per_read`` entry (or ``squeezed_advance_output``).  The
+    ``for_each_tile`` lowering decides advancement per dependency
+    (``_stamp_direct_loop_info``: a nonzero coefficient on the loop variable), and
+    ``insert_restickify`` rewrites the verdict when it moves an advance onto a copy;
+    code generation reads only these stamps.  A level advances when either list names
+    something at that level; an empty level is the explicit "pinned" verdict.
+    ``None`` when the stamp is missing or does not cover every level.
+    """
+    if tiled is None or len(tiled) != n_levels:
+        return None
+    if squeezed and len(squeezed) != n_levels:
+        return None
+    return [
+        bool(tiled[lv]) or bool(squeezed and squeezed[lv]) for lv in range(n_levels)
+    ]
+
+
+def _loop_var_advances(index, loop_vars, stamped=None) -> list[bool]:
+    """Per level: does a dependency at ``index`` advance with that level's loop?
+
+    A complete stamped verdict decides for every level, with or without a paired
+    ``for_each_tile`` loop variable (``_stamped_advances``); the tiled dims of every
+    level are handled by ``_loop_factor_for_index`` itself.  Without a stamp, only a
+    level with a paired loop variable can say yes, by the lowering's own rule: the
+    address advances iff the index has a nonzero coefficient on the loop variable.  A
+    loop variable that is merely a free symbol of the index does not advance the
+    address; the tested example is the synthetic index ``4096*FloorDiv(u0, 2)``
+    (coefficient 0).  No lowered kernel is known to produce such a read; following the
+    lowering's rule keeps the price consistent with what the lowering stamps.
+    """
+    advances = []
+    for lv, var in enumerate(loop_vars):
+        if stamped is not None:
+            advances.append(stamped[lv])
+        elif var is None:
+            advances.append(False)
+        else:
+            try:
+                advances.append(sympy.sympify(index).coeff(var) != 0)
+            except Exception:  # noqa: BLE001 - best-effort feature extraction
+                advances.append(False)
+    return advances
+
+
+def _loop_factor_for_index(index, levels, advances=None) -> int:
     """How many times traffic at ``index`` is transferred over the whole loop nest.
 
     An operand is re-transferred at a level whose tiled symbols do NOT appear in its
@@ -316,6 +405,11 @@ def _loop_factor_for_index(index, levels) -> int:
     level 0 (its index has ``i0``) and repeats at level 1 (no ``r0_0``), giving 1*4 = 4,
     while its B operand does the opposite, giving 2*1 = 2. IR-verified factors for that
     op at t=4 are out=4, A=1, B=2 -- the extractor previously emitted 1/1/1.
+
+    ``advances`` (optional, one bool per level, from ``_loop_var_advances``) marks the
+    levels at which the arg's address advances with a ``for_each_tile`` loop variable
+    rather than a tiled dim of this op -- one expert's slice of an expert bank, one KV
+    page -- so the arg is walked there too.
     """
     if not levels:
         return 1
@@ -324,7 +418,9 @@ def _loop_factor_for_index(index, levels) -> int:
     except Exception:  # noqa: BLE001
         return 1
     factor = 1
-    for trip, syms, _declared in levels:
+    for lv, (trip, syms, _declared) in enumerate(levels):
+        if advances is not None and advances[lv]:
+            continue
         # An arg REPEATS at a level whenever that level's tiled symbols are absent from
         # its index -- for EITHER reason:
         # * the level tiles nothing this op has (`coarse_tile_fill` / `_combine`, whose
@@ -462,8 +558,7 @@ def _matmul_features(
     op,
     out_elems: int,
     dtype_bytes: int,
-    loop_trip: int = 1,
-    tiles_red_dim: bool = False,
+    out_factor: int = 1,
     work_slices=None,
 ):
     """(macs, rows_per_core, cols_per_core, a_bytes, b_bytes, k_split, m_split, n_split).
@@ -476,9 +571,27 @@ def _matmul_features(
     loop tiles only an OUTPUT dim the output buffer is full-extent and the raw product is
     already the total. The consumer (cost_model.predict_ops) multiplies nothing by
     ``loop_trip``, so the reduction-tiled ops were under-counting compute by up to 16x.
-    ``tiles_reduction_dim`` is exactly the discriminator -- it predicts the convention on
-    all six coarse ops measured (row_tiling total; k_tiling / nested / bmm_k / bmm_nested
-    / bmm_3d2d per-tile) -- so the factor is applied here, once, at the source. ``rows_per_core`` = M/m (drives pt_eff + A re-read),
+
+    The scale is ``out_factor``: how many times the op's output buffer is produced over
+    the whole loop nest, the write's own loop factor from ``extract_op_features``.  The
+    raw product ``out_elems * K`` is one pass over the output buffer, so the work of the
+    whole nest is that product times the number of passes:
+
+    * output-tiled loop: the buffer is full-extent and walked once -> 1;
+    * reduction-tiled loop: the write has no reduction variable, so the same output
+      tile is produced every trip with ``K / trips`` each time -> ``trips``;
+    * per-trip body op of a ``for_each_tile`` loop (one expert's MLP, one attention
+      step over a KV page), re-writing the same buffer each trip -> ``trips``;
+    * per-trip body op writing its own slice of a stacked buffer (``out[u0, m, n]``
+      into ``[E, T, N]``): the buffer already holds every trip -> 1.  This is the
+      write-index form the factor handles; whether a lowered body ``batchmatmul``
+      reaches that write is not established (its test is synthetic);
+    * nested loops: the product over levels (``mm_nested_m_k`` -> 4).
+
+    The factor is per level, so a nest that tiles at one level and not another is
+    priced at each level by what that level does.
+
+    ``rows_per_core`` = M/m (drives pt_eff + A re-read),
     ``cols_per_core`` = N/n (drives B re-read). ``a_bytes`` = |A| = M*K, ``b_bytes`` =
     |B| = K*N (device dtype). ``k_split``/``m_split``/``n_split`` = the K/M/N core splits.
     M/N/K + splits are recovered from the iteration space: reduction (K) vars have coeff 0
@@ -491,8 +604,8 @@ def _matmul_features(
     """
     data = getattr(op, "data", None)
     k_size = _prod_ints(getattr(data, "reduction_ranges", None) or [])
-    # Scale a reduction-tiled slice back up to the whole-loop total (see docstring).
-    macs = out_elems * k_size * (loop_trip if tiles_red_dim else 1)
+    # One pass over the output buffer, times the passes over the whole loop nest.
+    macs = out_elems * k_size * out_factor
     rows_per_core = cols_per_core = 0.0
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
@@ -914,6 +1027,32 @@ def extract_op_features(
         _mem_of_layout(op.get_layout()) == "lx",
     )
 
+    # Per-level loop structure, shared by the output's loop factor (which also scales a
+    # matmul's work) and every read's (see the PER-ARG comment below).
+    _levels = _tiled_symbols_per_level(op)
+    _loop_vars = _level_loop_vars(op, _levels) if _levels else []
+    _li = getattr(op, "loop_info", None)
+    try:
+        _rw = op.get_read_writes()
+        _write_index = next(iter(_rw.writes)).index
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        _write_index = None
+    if _levels and _write_index is not None:
+        _write_advances = _loop_var_advances(
+            _write_index,
+            _loop_vars,
+            _stamped_advances(
+                getattr(_li, "output_tiled_dims", None),
+                getattr(_li, "squeezed_advance_output", None),
+                len(_levels),
+            ),
+        )
+        out_factor = _loop_factor_for_index(_write_index, _levels, _write_advances)
+    else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
+        out_factor = 1 if tiles_out_dim else loop_trip
+    _stamped_reads = getattr(_li, "tiled_dims_per_read", None) or []
+    _squeezed_reads = getattr(_li, "squeezed_advance_per_read", None) or []
+
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
     # so the existing combine term becomes the PSUM ring). Non-matmul ops keep is_matmul
@@ -932,9 +1071,7 @@ def extract_op_features(
             k_split,
             matmul_m_split,
             matmul_n_split,
-        ) = _matmul_features(
-            op, out_elems, dtype_bytes, loop_trip, is_tiled_red, work_slices
-        )
+        ) = _matmul_features(op, out_elems, dtype_bytes, out_factor, work_slices)
         reduction_cores = k_split
 
     # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
@@ -984,16 +1121,8 @@ def extract_op_features(
     #     mm_nested_m_k      4 / 1 / 2   -- old rule gave 1/1/1. The OUTPUT advances at
     #                                      level 0 (index has i0) and repeats at level 1
     #                                      (no r0_0) => 1*4; B does the opposite => 2*1.
-    _levels = _tiled_symbols_per_level(op)
-    try:
-        _rw = op.get_read_writes()
-        _write_index = next(iter(_rw.writes)).index
-    except Exception:  # noqa: BLE001 - best-effort feature extraction
-        _write_index = None
-    if _levels and _write_index is not None:
-        out_factor = _loop_factor_for_index(_write_index, _levels)
-    else:  # no loop_info (or unreadable index) -> the pre-existing behaviour
-        out_factor = 1 if tiles_out_dim else loop_trip
+    # ``_levels``, ``_loop_vars`` and ``out_factor`` are computed above, before the
+    # matmul work, which is scaled by the same ``out_factor``.
     in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip
 
     # Traffic of an indirect mutation's store (see _indirect_write_elems). Symbolic
@@ -1036,9 +1165,18 @@ def extract_op_features(
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
+    # The lowering stamps one verdict per MemoryDep read, in read order; StarDep and
+    # WeakDep have no index and no entry.
+    n_indexed_reads = sum(_dep_index(dep) is not None for dep in reads)
+    stamps_cover_reads = len(_stamped_reads) == n_indexed_reads and (
+        not _squeezed_reads or len(_squeezed_reads) == n_indexed_reads
+    )
+    indexed_pos = -1
     for dep in reads:
         name = getattr(dep, "name", "?")
-        index = getattr(dep, "index", None)
+        index = _dep_index(dep)
+        if index is not None:
+            indexed_pos += 1
         # Broadcast heuristic: the read index references fewer loop variables than
         # the output rank -> it is loaded ONCE and reused across the broadcast dim, so
         # it is counted at its own (small) device size, not the output size. This
@@ -1078,7 +1216,23 @@ def extract_op_features(
                 logical=list(in_logical) if in_logical else [],
                 # Per-arg: this read's OWN index decides which levels it repeats at.
                 loop_factor=(
-                    _loop_factor_for_index(index, _levels)
+                    _loop_factor_for_index(
+                        index,
+                        _levels,
+                        _loop_var_advances(
+                            index,
+                            _loop_vars,
+                            _stamped_advances(
+                                _stamped_reads[indexed_pos],
+                                _squeezed_reads[indexed_pos]
+                                if _squeezed_reads
+                                else None,
+                                len(_levels),
+                            )
+                            if stamps_cover_reads
+                            else None,
+                        ),
+                    )
                     if (_levels and index is not None)
                     else in_factor
                 ),

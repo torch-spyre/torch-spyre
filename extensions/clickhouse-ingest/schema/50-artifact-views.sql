@@ -163,6 +163,8 @@ SELECT
     e.failed       AS failed,
     e.errors       AS errors,
     e.skipped      AS skipped,
+    e.xfail        AS xfail,
+    e.xpass        AS xpass,
     e.duration_s   AS duration_s,
     e.pass_rate    AS pass_rate,
     e.suite_ran    AS suite_ran,
@@ -221,7 +223,11 @@ SELECT
     sum(e.failed)           AS failed,
     sum(e.errors)           AS errors,
     sum(e.skipped)          AS skipped,
-    if(sum(e.total_tests) > 0, sum(e.passed) / sum(e.total_tests), NULL) AS pass_rate,
+    sum(e.xfail)            AS xfail,
+    sum(e.xpass)            AS xpass,
+    -- Same denominator as v_artifact_results_enriched: xfail/xpass excluded.
+    if(sum(e.total_tests) - sum(e.xfail) - sum(e.xpass) > 0,
+       sum(e.passed) / (sum(e.total_tests) - sum(e.xfail) - sum(e.xpass)), NULL) AS pass_rate,
     avg(e.duration_s)       AS mean_duration_s
 FROM
 (

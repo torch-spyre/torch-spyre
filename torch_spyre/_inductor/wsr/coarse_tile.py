@@ -2400,11 +2400,21 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
 def _loop_var_to_reduction_ranges_pos(
     op: ComputedBuffer, sym: sympy.Symbol
 ) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
-    try:
-        return reduction_loop_vars(op).index(sym)
-    except ValueError:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+
+    ``reduction_loop_vars`` is *squeezed*: Inductor mints no loop variable for a
+    size-1 dim (``SqueezeView.squeezer``, whose ``!= 1`` test this mirrors), so
+    the k-th reduction loop variable belongs to the k-th reduction dim whose
+    extent is not 1. None also when the loop variables do not pair one-to-one
+    with those dims, since no position is then trustworthy.
+    """
+    red_vars = reduction_loop_vars(op)
+    if sym not in red_vars:
         return None
+    not_one = [i for i, r in enumerate(op.data.reduction_ranges) if r != 1]
+    if len(not_one) < len(red_vars):
+        return None
+    return not_one[red_vars.index(sym)]
 
 
 def _loop_var_hinted_ranges(op: ComputedBuffer) -> dict[int, Expr]:

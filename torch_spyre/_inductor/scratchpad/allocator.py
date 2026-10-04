@@ -3022,6 +3022,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 cd_parent_matches[storage_name] = update_matches
                 cd_parent_relayouts.pop(storage_name, None)
 
+            # A read of a carry update reads the storage's bytes, so it must
+            # agree with the storage's ownership too; otherwise a resident
+            # carry reaches a reader that slices it differently, and kernel
+            # preparation demotes it (#4990). A relayout copy taken before the
+            # update would be stale, so this edge also has match pairs only.
+            for storage_name, read_edge in self._loop_carry_read_edges(
+                op, carry_update_edges, prep_cache
+            ).items():
+                read_matches = read_edge.match_pairs(
+                    [cd.splits for cd in divisions[storage_name]],
+                    [cd.splits for cd in buf_divisions],
+                )
+                if storage_name in parent_proj:
+                    known = set(cd_parent_matches.get(storage_name, []))
+                    read_matches = [p for p in read_matches if p in known]
+                else:
+                    parent_proj.append(storage_name)
+                cd_parent_matches[storage_name] = read_matches
+                cd_parent_relayouts.pop(storage_name, None)
+
             for input_name in parent_proj:
                 if input_name in input_clone_matches:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
@@ -3136,6 +3156,40 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             read_dep=update_write.rename({record.update_name: record.storage_name}),
             prep_cache=prep_cache,
         )
+
+    @staticmethod
+    def _loop_carry_read_edges(
+        consumer_op: Optional[Operation],
+        carry_update_edges: dict[str, ResidencyEdge],
+        prep_cache: dict,
+    ) -> dict[str, ResidencyEdge]:
+        """Storage-ownership edges for ``consumer_op``'s reads of carry updates.
+
+        A carry update writes through the carry's storage, so a later read of the
+        update's name reads the storage's bytes. The update itself is never an LX
+        buffer, so its ordinary producer -> consumer edge is excluded, and without
+        this edge nothing ties a resident storage's ownership to that reader. Each
+        returned edge, keyed by storage name, compares the storage's write with the
+        reader's access renamed onto the storage, as
+        :meth:`_loop_carry_update_edge` does for the update's own write.
+        """
+        if consumer_op is None:
+            return {}
+        edges: dict[str, ResidencyEdge] = {}
+        for dep in op_read_writes(consumer_op).reads:
+            carry_edge = carry_update_edges.get(dep.name)
+            if carry_edge is None or not isinstance(dep, MemoryDep):
+                continue
+            storage_name = carry_edge.buf_name
+            edges[storage_name] = ResidencyEdge(
+                buf_name=storage_name,
+                parent_op=carry_edge.parent_op,
+                consumer_op=consumer_op,
+                write_dep=carry_edge.write_dep,
+                read_dep=dep.rename({dep.name: storage_name}),
+                prep_cache=prep_cache,
+            )
+        return edges
 
     @staticmethod
     def _relayout_copy_buffers(
