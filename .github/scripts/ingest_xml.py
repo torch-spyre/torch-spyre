@@ -44,6 +44,7 @@ from spyre_clickhouse_ingest import (
     insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
+    capability_declaration,
     cases_already_ingested,
     drop_older_case_attempts,
     benchmarks_already_ingested,
@@ -920,14 +921,20 @@ def parse_test_xml(xml_path: Path):
     except ValueError:
         triggered_at = datetime.now(UTC)
 
-    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins.
-    by_key = {}
+    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
+    # and the earlier attempts are kept only as its result.reruns count.
+    by_key: dict = {}
+    seen: Counter = Counter()
     for tc in suite.findall(".//testcase"):
-        by_key[(tc.get("classname", ""), tc.get("name", ""))] = tc
+        key = (tc.get("classname", ""), tc.get("name", ""))
+        by_key[key] = tc
+        seen[key] += 1
     raw_cases = []
-    for tc in by_key.values():
+    for key, tc in by_key.items():
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
+        if seen[key] > 1:
+            properties = [*properties, ("result.reruns", str(seen[key] - 1))]
         op_name, dtype, platform = extract_op_dtype_platform(
             tc.get("name", ""), properties
         )
@@ -1199,7 +1206,12 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             "       cr.tags, cr.measurements "
             f"FROM {runs} AS cr "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
-            "  AND has(cr.tags, concat('testtype__', {tier:String}))",
+            "  AND has(cr.tags, concat('testtype__', {tier:String})) "
+            # Only a case this run executed itself replaces the copy; a local skip does not.
+            f"  AND cr.test_case_id NOT IN (SELECT test_case_id FROM {runs} "
+            "      WHERE run_id = {run_id:UUID} AND component = {component:String} "
+            "        AND status != 'skipped' "
+            "        AND props['ran_in'] IN ('', toString({run_id:UUID})))",
             parameters={
                 "run_id": run_id,
                 "src": src_run,
@@ -1247,6 +1259,23 @@ def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
             (run_id, "perf"), {"failed": 0, "total": 0, "duration_s": 0.0}
         )
         acc["total"] += measured
+
+
+def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
+    """A leg per `capability.test_type` the cases declare, beside the run's functional one.
+
+    The verdicts themselves land in capability_runs; this is what ties them to the artifact.
+    """
+    for case in cases:
+        decl, _ = capability_declaration(case)
+        if not decl or case.get("status") == "skipped":
+            continue
+        acc = legs.setdefault(
+            (run_id, decl["test_type"]), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += 1
+        acc["failed"] += case.get("status") in ("failed", "error")
+        acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
@@ -1834,6 +1863,7 @@ def main():
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
                 print(

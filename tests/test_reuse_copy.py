@@ -128,7 +128,17 @@ def test_copy_is_scoped_to_the_tiers_own_cases(ing):
     c = FakeCH()
     ing.copy_reused_cases(c, "db", "run-1", "torch-spyre", [("integration", "src-1")])
     sql, _ = c.commands[0]
-    assert "has(c.tags, concat('testtype__', {tier:String}))" in sql
+    assert "has(cr.tags, concat('testtype__', {tier:String}))" in sql
+
+
+def test_only_a_case_the_run_executed_blocks_the_copy(ing):
+    """A local skip keeps the copy beside it, as the writer and migration 009 do."""
+    c = FakeCH()
+    ing.copy_reused_cases(c, "db", "run-1", "torch-spyre", [("integration", "src-1")])
+    sql, _ = c.commands[0]
+    held = sql.split("NOT IN")[1]
+    assert "status != 'skipped'" in held
+    assert "props['ran_in'] IN ('', toString({run_id:UUID}))" in held
 
 
 def test_ran_in_is_preserved_not_overwritten(ing):

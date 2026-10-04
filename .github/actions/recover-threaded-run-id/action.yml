@@ -26,7 +26,7 @@ description: |
       - run: printf '%s' "$ {{ inputs.run_id }}" > run-id.txt
       - uses: actions/upload-artifact@<pinned>
         if: $ {{ inputs.run_id != '' }}
-        with: { name: run-id, path: run-id.txt, retention-days: 7 }
+        with: { name: run-id, path: run-id.txt, retention-days: 14 }
 
 inputs:
   triggering-run-id:

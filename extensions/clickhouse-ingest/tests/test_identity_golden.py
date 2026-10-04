@@ -115,6 +115,14 @@ def test_test_case_id_golden_with_run_context():
     ) == str(uuid.uuid5(ID_NAMESPACE, "torch-spyre|t|test_x|op__torch_mul"))
 
 
+def test_test_case_id_keeps_the_name_case():
+    # Pinned beside the migrations/007 SQL too (its header).
+    assert case_id_for("Torch-Spyre", "TestViewOps", " test_T_spyre ", []) == str(
+        uuid.uuid5(ID_NAMESPACE, "torch-spyre|testviewops|test_T_spyre|")
+    )
+    assert case_id_for("c", "T", "test_T", []) != case_id_for("c", "T", "test_t", [])
+
+
 def test_tags_split_into_identity_run_context_and_results():
     props = [
         ("tag", "platform__x86_64"),
@@ -141,10 +149,12 @@ def _sql_array(sql, alias):
 def test_rekey_migration_matches_the_tag_rules():
     # The SQL copy of the rule re-keys history; a mismatch leaves migrated ids that no writer
     # will ever produce again.
-    sql = (
-        SCHEMA_DIR / "migrations" / "006_case_id_without_run_context.sql"
-    ).read_text()
+    sql = (SCHEMA_DIR / "migrations" / "007_case_id_keep_name_case.sql").read_text()
     assert SchemaApplier.RERUNNABLE.search(sql)
+    assert "lowerUTF8(trimBoth(name, ws))" not in sql
+    assert not SchemaApplier.RERUNNABLE.search(
+        (SCHEMA_DIR / "migrations" / "006_case_id_without_run_context.sql").read_text()
+    )
     assert set(_sql_array(sql, "ctx")) == set(RUN_CONTEXT_TAG_NAMESPACES)
     assert set(_sql_array(sql, "res")) == set(RESULT_TAG_NAMESPACES)
     assert (

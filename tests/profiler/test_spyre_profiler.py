@@ -1401,3 +1401,38 @@ def test_duplicate_kernel_start_timestamps(tmp_path):
             f"{len(duplicate_groups)} duplicate kernel start timestamp group(s) "
             f"detected:\n" + "\n".join(duplicate_details)
         )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_runtime_events_emitted_on_multiple_thread_rows():
+    """Runtime activities are attributed to the flex thread that emitted them,
+    so they span more than one thread row instead of collapsing onto one."""
+    cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        device_tensor = cpu_src.to("spyre")
+        _ = device_tensor + device_tensor
+        _ = device_tensor.cpu()
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace.get("traceEvents", [])
+    runtime_tids = {
+        e["tid"]
+        for e in events
+        if e.get("cat") == "privateuse1_runtime" and e.get("ph") == "X"
+    }
+
+    assert runtime_tids, (
+        "Expected at least one runtime event in the AIUPTI-backed trace"
+    )
+    assert len(runtime_tids) > 1, (
+        f"Runtime events all landed on tid(s) {sorted(runtime_tids)}; "
+        "expected more than one thread row"
+    )

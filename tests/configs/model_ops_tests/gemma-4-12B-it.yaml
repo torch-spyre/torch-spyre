@@ -1639,21 +1639,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -2628,21 +2628,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 24, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 24, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -4108,21 +4108,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 1024, 256]
                           stride: [4194304, 262144, 256, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0
@@ -4998,21 +4998,21 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 2048, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 16, 2048, 512]
                           stride: [1048576, 0, 512, 1]
                           storage_offset: 0
                           dtype: torch.bfloat16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                     kwargs:
                       dropout_p: 0.0
                       scale: 1.0

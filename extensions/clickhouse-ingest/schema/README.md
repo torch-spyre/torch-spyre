@@ -85,6 +85,54 @@ Mechanical constraints behind those rules:
 - The server rejects `CREATE OR REPLACE VIEW` (`renameat2() is not supported`), and dropping a
   base table silently drops its views.
 
+## Sandboxes
+
+User guide, MCP tool reference and security model: [`docs/sandbox.md`](../docs/sandbox.md).
+
+`python -m spyre_clickhouse_ingest.sandbox` gives one person a database on the **dev** server to
+change schema and queries freely. A sandbox never reaches a live database: the only way a change
+lands in `spyre_v2` is a PR to this directory, applied by the Jenkins job above.
+
+| command | what it does |
+|---|---|
+| `bootstrap` | Once per dev server: stores prod's read-only `spyre_user` login (`SANDBOX_SOURCE_PASS`) as the `prod_v2` named collection |
+| `create --name <n>` | `sandbox_<n>` from `--schema-dir` (default: this directory), seeded from prod, plus a `sandbox_<n>_admin` login it prints once |
+| `seed --name <n>` | Appends another sample; copies only the columns both sides have, so an edited table still seeds |
+| `diff --name <n>` | What the sandbox has that `--schema-dir` does not -- the content a PR must carry; exit 1 if any |
+| `drop --name <n>`, `list` | Remove one; list all |
+
+`create`, `seed`, `drop` and `bootstrap` connect as the dev admin (`CLICKHOUSE_*`); `diff` runs
+as the sandbox login. That login holds `ALL` on its own database, `SELECT` on dev `spyre_v2`,
+and read of prod through `remote(prod_v2, table='<t>')` -- nothing else.
+
+The sample is connected, not random: runs are picked first (`--days`, `--runs-per-component`,
+`--component`, `--arch`, `--tag`, `--run-id`), then each table is cut to those runs and the
+dimension rows they reference, so every join a view makes finds its rows. Dimensions are
+inserted before their facts and MV targets are left to the MVs. A filter on a column a run
+source lacks (`artifact_results` has no `component`) drops that source, not the filter. A new
+base table needs a rule in `Sandbox.SEED`; `test_sandbox.py` fails until it has one.
+
+For self-serve use, `python -m spyre_clickhouse_ingest.sandbox_server` (extra `[server]`)
+wraps these operations in an HTTP MCP server that holds the dev admin login itself. A caller's
+bearer token names them -- a line of the shared per-user token file, or a token the server
+minted at `POST /register` for an OpenShift login (`oc whoami -t`) -- and every tool acts only
+on sandboxes whose database comment records that owner. Queries run as the sandbox's own login,
+whose password is derived from `SANDBOX_SECRET`; sandboxes expire after a TTL. `schema_diff` and
+`verify_schema` take any `<owner>/torch-spyre@<ref>`, so a pushed fork branch is proved the
+same way as below.
+
+Turning an experiment into a PR: edit the `CREATE` here to the shape `diff` shows, add the
+`migrations/NNN_*.sql` that gets a live table there, then prove both paths on dev:
+
+```bash
+sandbox diff --name <n> --schema-dir <branch>/schema       # only `migrate` lines left
+sandbox create --name <n>_fresh --schema-dir <branch>/schema --no-seed
+apply_schema --database sandbox_<n>_fresh --schema-dir <branch>/schema --check   # 0 pending
+sandbox create --name <n>_up --days 3 --runs-per-component 5       # main's schema, real rows
+apply_schema --database sandbox_<n>_up --schema-dir <branch>/schema   # migrations run on data
+apply_schema --database sandbox_<n>_up --schema-dir <branch>/schema --check      # 0 pending
+```
+
 Several comments in these files cite row counts and percentages measured when the statement was
 written. They are evidence for a design decision, not live figures; re-measure before relying on
 one.

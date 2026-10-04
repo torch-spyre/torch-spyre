@@ -15,6 +15,7 @@
 """The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
 import math
+from collections import Counter
 import sys
 
 from . import schema
@@ -25,6 +26,57 @@ from .identity import (
     CaseId,
     DerivedId,
 )
+
+
+CAPABILITY_PREFIX = "capability."
+# A declaration without all three names no capability; it is skipped, never guessed.
+CAPABILITY_REQUIRED = ("test_type", "subject", "name")
+
+
+def capability_declaration(case: dict) -> tuple:
+    """(declaration, problem) from a case's `capability.*` JUnit properties.
+
+    The contract: `test_type`, `subject`, `name` (required) and `backend` are scalars;
+    `sig.<k>` is hashed into capability_id; `tag` repeats; `prop.<k>` lands in the verdict's
+    props. Any other key is reported in `unknown` and dropped. A case declaring no
+    `capability.*` property gives (None, ""); one missing a required key, giving a scalar
+    two values, or naming an unregistered test_type gives (None, <problem>).
+    """
+    decl = {"sig": {}, "tags": [], "props": {}, "unknown": [], "backend": ""}
+    scalars: dict = {}
+    seen = False
+    for pname, pvalue in case.get("properties", []) or []:
+        if not pname.startswith(CAPABILITY_PREFIX):
+            continue
+        seen = True
+        key, value = pname[len(CAPABILITY_PREFIX) :], str(pvalue).strip()
+        field, _, sub = key.partition(".")
+        if field in CAPABILITY_REQUIRED + ("backend",) and not sub:
+            if scalars.setdefault(field, value) != value:
+                return None, f"conflicting {CAPABILITY_PREFIX}{field}"
+        elif field == "sig" and sub:
+            decl["sig"][sub] = value
+        elif field == "prop" and sub:
+            decl["props"][sub] = value
+        elif key == "tag":
+            if value:
+                decl["tags"].append(value)
+        else:
+            decl["unknown"].append(f"unknown key {pname}")
+    if not seen:
+        return None, ""
+    missing = [k for k in CAPABILITY_REQUIRED if not scalars.get(k)]
+    if missing:
+        return None, "no " + "/".join(CAPABILITY_PREFIX + k for k in missing)
+    # Checked here, not at insert: there one bad case rejects the file's whole artifact_results batch.
+    if scalars["test_type"] not in schema.CAPABILITY_TYPE_VALUES:
+        return None, (
+            f"unregistered {CAPABILITY_PREFIX}test_type '{scalars['test_type']}' (registered: "
+            f"{', '.join(sorted(schema.CAPABILITY_TYPE_VALUES))}; a new one needs "
+            "schema.CAPABILITY_TYPE_VALUES and a migration of artifact_results.chk_test_type)"
+        )
+    decl.update(scalars)
+    return decl, ""
 
 
 class RunWriter:
@@ -73,6 +125,11 @@ class TestResultWriter(RunWriter):
         "component = {component:String} AND run_id = {run_id:UUID}"
         " AND props['source_file'] = {sf:String}"
     )
+    # The counters sum rows, so a row that restates another row of the run is dropped: an exact
+    # copy, an older attempt of the same file, a reused copy of a case the run executed, or a
+    # skip where another file of the run executed the case. Differing outcomes otherwise stay:
+    # one test_case_id can be two tests (names differing only in case, hf-adapters' base and
+    # _adapter configs). Migration 009 applies the same rules to rows already written.
 
     @classmethod
     def already_ingested(
@@ -118,7 +175,8 @@ class TestResultWriter(RunWriter):
         source_file: str,
         attempt: int,
     ) -> None:
-        """Delete this file's rows from attempts before `attempt`, so a re-run replaces them."""
+        """Delete this file's outcomes and capability verdicts from attempts before
+        `attempt`, so a re-run replaces them."""
         if not (attempt and source_file):
             return
         where = f"{cls._FILE} AND {cls._ATTEMPT} < {{attempt:UInt32}}"
@@ -128,13 +186,20 @@ class TestResultWriter(RunWriter):
             "sf": source_file,
             "attempt": attempt,
         }
-        if not cls.fact_table.count_rows(client, db, where, params):
-            return
-        client.command(
-            f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
-            parameters=params,
-        )
-        cls._rebuild_counters(client, db, run_id, component)
+        if cls.fact_table.count_rows(client, db, where, params):
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} WHERE {where}",
+                parameters=params,
+            )
+            cls._rebuild_counters(client, db, run_id, component)
+        # The file's capability verdicts are scoped by shard = source_file.
+        verdicts = where.replace("props['source_file']", "props['shard']")
+        capability_runs = CapabilityWriter.fact_table
+        if capability_runs.count_rows(client, db, verdicts, params):
+            client.command(
+                f"DELETE FROM {capability_runs.qualified(db)} WHERE {verdicts}",
+                parameters=params,
+            )
 
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
@@ -172,10 +237,13 @@ class TestResultWriter(RunWriter):
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
+        verdicts: dict[tuple, list] = {}
+        problems: Counter = Counter()
         skipped = ignored = 0
         for c in cases:
             tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
             measured, recorded, unrouted = cls._recorded(c)
+            cls._capability(c, run_tags, attempt, verdicts, problems)
             ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
@@ -214,21 +282,189 @@ class TestResultWriter(RunWriter):
                 "measurements": measured,
             }
             run_rows.append(run_row)
+        run_rows, superseded = cls._one_per_case(
+            client, db, component, run_id, run_rows
+        )
         written = cls._flush(client, db, ident_rows, run_rows)
+        # Checked before any batch is written, so a type's second batch is not refused.
+        landed = {
+            t
+            for t in {k[0] for k in verdicts}
+            if CapabilityWriter.already_ingested(
+                client, db, run_id, component, t, shard=source_file
+            )
+        }
+        for (test_type, arch, disc_keys), results in verdicts.items():
+            if test_type not in landed:
+                CapabilityWriter.insert(
+                    client,
+                    db,
+                    component,
+                    run_id,
+                    test_type,
+                    results,
+                    arch=arch,
+                    disc_keys=disc_keys,
+                    shard=source_file,
+                )
+        if superseded:
+            # After the insert, so a failed insert never loses the outcome it would replace.
+            client.command(
+                f"DELETE FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND audit_uuid IN {uuids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "uuids": superseded,
+                },
+            )
+            cls._rebuild_counters(client, db, run_id, component)
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
-        cls._warn(ignored, "property value(s) ignored -- not tag, metric.* or result.*")
+        for problem, n in sorted(problems.items()):
+            cls._warn(n, f"capability declaration(s) with {problem}")
+        cls._warn(
+            ignored,
+            "property value(s) ignored -- not tag, metric.*, result.* or capability.*",
+        )
         return written
+
+    # A case's outcome as a capability verdict; a skipped case gave none.
+    _VERDICT = {
+        "passed": "passed",
+        "xpass": "passed",
+        "failed": "failed",
+        # pytest reports a test-body exception as <failure>; <error> is a broken setup/teardown.
+        "error": "undetermined",
+        "xfail": "not_implemented",
+    }
+
+    @classmethod
+    def _capability(
+        cls, case: dict, run_tags, attempt: int, verdicts: dict, problems: Counter
+    ) -> None:
+        """Add the case's `capability.*` verdict, if it declares a valid one, to `verdicts`.
+
+        Keyed by (test_type, arch, sig keys): one CapabilityWriter batch hashes one key set.
+        """
+        decl, problem = capability_declaration(case)
+        problems.update(decl["unknown"] if decl else [])
+        if problem:
+            problems[problem] += 1
+        status = cls._VERDICT.get(case.get("status", ""))
+        if not (decl and status):
+            return
+        props = {"test_name": case.get("name", ""), **decl["props"]}
+        if attempt:
+            props["run_attempt"] = str(attempt)
+        arch = next(
+            (
+                t.split("__", 1)[1]
+                for t in run_tags
+                if CaseId.namespace(t) == "platform"
+            ),
+            "",
+        )
+        key = (decl["test_type"], arch, tuple(sorted(decl["sig"])))
+        verdicts.setdefault(key, []).append(
+            {
+                "subject": decl["subject"],
+                "name": decl["name"],
+                "status": status,
+                "backend": decl["backend"],
+                "disc": decl["sig"],
+                "tags": decl["tags"],
+                "props": {k: v for k, v in props.items() if v},
+            }
+        )
+
+    @staticmethod
+    def _restates(run_id: str, a: dict, b: dict) -> bool:
+        """Does row `a` make row `b` redundant in the run's counts?"""
+
+        def copied(r):
+            return r["ran_in"] not in ("", str(run_id))
+
+        def ran(r):
+            return not copied(r) and r["status"] != "skipped"
+
+        if ran(a) and copied(b):
+            return True
+        if a["source_file"] == b["source_file"] and copied(a) == copied(b):
+            if a["attempt"] != b["attempt"]:
+                return a["attempt"] > b["attempt"]
+            return all(a[k] == b[k] for k in ("status", "duration_s", "fail_message"))
+        return ran(a) and not ran(b) and not copied(b)
+
+    @classmethod
+    def _one_per_case(cls, client, db: str, component: str, run_id: str, rows: list):
+        """(rows to insert, audit_uuids they make redundant), per the rules above."""
+
+        def facts(r):
+            return {
+                "status": r["status"],
+                "duration_s": round(float(r["duration_s"]), 3),
+                "fail_message": r["fail_message"],
+                "ran_in": r["props"].get("ran_in", ""),
+                "attempt": int(r["props"].get("run_attempt") or 0),
+                "source_file": r["props"].get("source_file", ""),
+            }
+
+        batch: dict = {}
+        for r in rows:
+            same = batch.setdefault(r["test_case_id"], [])
+            if not any(cls._restates(run_id, facts(o), facts(r)) for o in same):
+                same.append(r)
+        ids = list(batch)
+        held: dict = {}
+        for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
+            for tcid, uuid, status, dur, msg, ran_in, attempt, sf in client.query(
+                "SELECT test_case_id, audit_uuid, status, duration_s, fail_message, "
+                "props['ran_in'], props['run_attempt'], props['source_file'] "
+                f"FROM {cls.fact_table.qualified(db)} "
+                "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+                "AND test_case_id IN {ids:Array(UUID)}",
+                parameters={
+                    "component": component,
+                    "run_id": run_id,
+                    "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
+                },
+            ).result_rows:
+                held.setdefault(str(tcid), []).append(
+                    {
+                        "audit_uuid": str(uuid),
+                        "status": status,
+                        "duration_s": round(float(dur), 3),
+                        "fail_message": msg,
+                        "ran_in": ran_in,
+                        "attempt": int(attempt or 0),
+                        "source_file": sf,
+                    }
+                )
+        keep, superseded = [], set()
+        for tcid, new in batch.items():
+            rows_held = held.get(str(tcid), [])
+            for r in new:
+                f = facts(r)
+                if any(cls._restates(run_id, h, f) for h in rows_held):
+                    continue
+                keep.append(r)
+                superseded |= {
+                    h["audit_uuid"] for h in rows_held if cls._restates(run_id, f, h)
+                }
+        return keep, sorted(superseded)
 
     @staticmethod
     def _recorded(case: dict) -> tuple:
         """(measurements, result props, count ignored) from the case's JUnit properties.
 
         `metric.<name>` must be a finite number and lands in measurements under `<name>`;
-        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for.
+        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for,
+        `capability.*` by _capability.
         """
         measured, recorded, ignored = {}, {}, 0
         for pname, pvalue in case.get("properties", []) or []:
-            if pname == "tag" or "__" in pname:
+            if pname == "tag" or "__" in pname or pname.startswith("capability."):
                 continue
             if pname.startswith("metric.") and len(pname) > len("metric."):
                 try:
@@ -583,7 +819,7 @@ class ArtifactWriter:
                 ),
             }
             cls.artifact_table.insert(client, [row], db=db)
-        method, ref_kind = cls.REF_SHAPE[identity.kind]
+        method, ref_kind = cls.ref_shape(identity.kind)
         if identity.ref:
             # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
             ref_row: schema.ArtifactRefRow = {
@@ -597,20 +833,45 @@ class ArtifactWriter:
             }
             cls.ref_table.insert(client, [ref_row], db=db)
         for tag, family, tag_props in tags:
-            if not tag or cls.tag_recorded(client, db, tag, aid):
-                continue
-            tag_row: schema.ArtifactTagRow = {
-                "tag": tag,
-                "tag_family": family,
-                "artifact_id": aid,
-                "refs": [(method, ref_kind, cls._index_uri(identity.ref), identity.ref)]
-                if identity.ref
-                else [],
-                "published_refs": [],
-                "props": cls._props({"id12": identity.id12, **(tag_props or {})}),
-            }
-            cls.tag_table.insert(client, [tag_row], db=db)
+            cls.insert_tag(client, db, identity, tag, family, props=tag_props)
         return aid
+
+    @classmethod
+    def ref_shape(cls, kind: str) -> tuple:
+        """(method, ref_kind) for an artifact kind; an unknown kind is a plain download."""
+        return cls.REF_SHAPE.get(kind, cls.REF_SHAPE["generic"])
+
+    @classmethod
+    def insert_tag(
+        cls,
+        client,
+        db: str,
+        identity: ArtifactIdentity,
+        tag: str,
+        family: str,
+        *,
+        ref: str | None = None,
+        props=None,
+    ) -> bool:
+        """Point `tag` at `identity`, once. `ref` is the address the tag names, which may be a
+        moving one (`:amd64`) rather than the artifact's own; it defaults to the latter."""
+        aid = identity.artifact_id
+        if not (tag and aid):
+            return False
+        if cls.tag_recorded(client, db, tag, aid):
+            return True
+        ref = identity.ref if ref is None else ref
+        method, ref_kind = cls.ref_shape(identity.kind)
+        tag_row: schema.ArtifactTagRow = {
+            "tag": tag,
+            "tag_family": family,
+            "artifact_id": aid,
+            "refs": [(method, ref_kind, cls._index_uri(ref), ref)] if ref else [],
+            "published_refs": [],
+            "props": cls._props({"id12": identity.id12, **(props or {})}),
+        }
+        cls.tag_table.insert(client, [tag_row], db=db)
+        return True
 
     @classmethod
     def insert_result(

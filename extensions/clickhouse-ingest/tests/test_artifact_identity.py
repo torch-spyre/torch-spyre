@@ -168,6 +168,78 @@ def test_insert_writes_artifact_ref_and_tag_once():
     assert not _rows(again, ARTIFACTS) and not _rows(again, ARTIFACT_TAGS)
 
 
+def test_a_release_names_itself_in_its_own_family():
+    from spyre_clickhouse_ingest.artifacts import register_release
+
+    manifest = {
+        "name": "ci-cd-tech-preview-v1",
+        "date": "2026-09-22",
+        "images": [{"ref": IMAGE, "arch": "s390x"}],
+    }
+    tagged = {}
+    for family in (None, "ci-cd-tech-preview"):
+        c = FakeClient()
+        register_release(c, "db", {**manifest, "family": family})
+        tagged[family] = sorted(
+            (t["tag"], t["tag_family"]) for t in _rows(c, ARTIFACT_TAGS)
+        )
+    assert tagged[None] == [
+        ("ci-cd-tech-preview-v1", "release"),
+        ("release", "release"),
+        ("release-2026-09-22", "release"),
+    ]
+    assert tagged["ci-cd-tech-preview"] == [
+        ("ci-cd-tech-preview-v1", "ci-cd-tech-preview"),
+        ("release", "release"),
+        ("release-2026-09-22", "release"),
+    ]
+
+
+def test_a_release_tags_its_manifest_list_like_its_per_arch_images():
+    from spyre_clickhouse_ingest.artifacts import register_release
+
+    list_digest = "sha256:" + "11" * 32
+    lst = IMAGE.replace(DIGEST, list_digest)
+    c = FakeClient()
+    register_release(
+        c,
+        "db",
+        {
+            "name": "ci-cd-tech-preview-v2",
+            "date": "2026-10-01",
+            "images": [
+                {"ref": IMAGE, "arch": "s390x"},
+                {"ref": lst, "arch": "multi", "manifests": {"s390x": DIGEST}},
+            ],
+        },
+    )
+    leaf, multi = (
+        ArtifactIdentity.from_image(IMAGE, "s390x"),
+        ArtifactIdentity.from_image(lst, "multi"),
+    )
+    arts = {a["artifact_id"]: a for a in _rows(c, ARTIFACTS)}
+    assert (
+        arts[multi.artifact_id]["arch"],
+        arts[multi.artifact_id]["identity_deps"],
+    ) == (
+        "multi",
+        [f"s390x={DIGEST}"],
+    )
+    assert arts[leaf.artifact_id]["identity_deps"] == []
+    tags = {}
+    for t in _rows(c, ARTIFACT_TAGS):
+        tags.setdefault(t["artifact_id"], set()).add(t["tag"])
+    assert (
+        tags[leaf.artifact_id]
+        == tags[multi.artifact_id]
+        == {
+            "ci-cd-tech-preview-v2",
+            "release-2026-10-01",
+            "release",
+        }
+    )
+
+
 def test_result_kind_follows_the_test_type():
     from spyre_clickhouse_ingest import insert_artifact_result
     from spyre_clickhouse_ingest.schema import ARTIFACT_RESULTS

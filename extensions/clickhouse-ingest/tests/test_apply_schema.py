@@ -260,6 +260,35 @@ def test_repo_schema_parses_as_create_only():
         assert SchemaApplier.objects(path, text)
 
 
+def test_the_writer_checks_the_values_the_ddl_and_last_migration_allow():
+    from spyre_clickhouse_ingest.schema import (
+        CAPABILITY_STATUS_VALUES,
+        RESULT_KIND_VALUES,
+        TEST_TYPE_VALUES,
+    )
+
+    def check(text, name, table=None):
+        prefix = rf"ALTER TABLE {table} ADD CONSTRAINT " if table else ""
+        found = re.findall(rf"{prefix}{name}\s+CHECK\s+\w+\s+IN\s*\(([^)]*)\)", text)
+        return set(re.findall(r"'([^']+)'", found[-1])) if found else None
+
+    d = SchemaApplier.schema_dir()
+    migs = [p.read_text() for p in SchemaApplier.migration_files(d)]
+    for ddl, table, name, values in (
+        ("20-artifacts.sql", "artifact_results", "chk_test_type", TEST_TYPE_VALUES),
+        ("20-artifacts.sql", "artifact_results", "chk_result_kind", RESULT_KIND_VALUES),
+        (
+            "46-capabilities.sql",
+            "capability_runs",
+            "chk_status",
+            CAPABILITY_STATUS_VALUES,
+        ),
+    ):
+        # A live database carries the last migration's CHECK, a fresh one the DDL's.
+        last = next(v for v in (check(m, name, table) for m in reversed(migs)) if v)
+        assert check((d / ddl).read_text(), name) == last == set(values), name
+
+
 def test_rerun_repeats_only_a_rerunnable_migration(tmp_path):
     d = _schema(
         tmp_path,

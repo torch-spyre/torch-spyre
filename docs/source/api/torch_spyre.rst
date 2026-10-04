@@ -407,7 +407,7 @@ transpose. For ``nn.Embedding`` layers, tables get a gather-optimal
 "indirect access" layout (vocab dim outermost) because they are read as a
 gather rather than a matmul.
 
-.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
+.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None, use_fp8_weights=False)
 
    Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
    weights use a dimension-swapped layout (``dim_order=[1, 0]``);
@@ -416,11 +416,22 @@ gather rather than a matmul.
    use the default layout. Idempotent: parameters already on Spyre are
    skipped.
 
+   When *use_fp8_weights* is ``True``, ``nn.Linear`` weights that are already
+   ``torch.float8_e4m3fn`` are loaded directly into KERNEL layout with 2D stick
+   ``[2, 64]`` and ``ElementArrangement.QFP8WT``, bypassing any runtime
+   quantization step. Non-FP8 parameters are transferred with their normal
+   optimal layouts regardless of this flag.
+
    :param model: The model to transfer.
    :type model: torch.nn.Module
-   :param dtype: Target dtype on Spyre (default: the parameter's existing
-       dtype).
+   :param dtype: Target dtype for non-FP8 weight conversion (default: the
+       parameter's existing dtype). Ignored for FP8 weights when
+       *use_fp8_weights* is ``True``.
    :type dtype: torch.dtype or None
+   :param use_fp8_weights: If ``True``, ``torch.float8_e4m3fn`` Linear weights
+       are loaded with KERNEL layout and ``QFP8WT`` arrangement. Use this for
+       pre-quantized FP8 model checkpoints.
+   :type use_fp8_weights: bool
    :returns: The model with all parameters on Spyre.
    :rtype: torch.nn.Module
 
@@ -432,6 +443,33 @@ gather rather than a matmul.
 
       model = MyModel()
       load_model_to_spyre(model)
+      compiled = torch.compile(model)
+
+.. function:: torch_spyre.model_utils.load_fp8_model_to_spyre(model)
+
+   Convenience wrapper around :func:`load_model_to_spyre` for models whose
+   ``nn.Linear`` weights are already quantized to ``torch.float8_e4m3fn``.
+   Each FP8 weight is DMA'd directly into KERNEL layout with 2D stick ``[2, 64]``
+   and ``ElementArrangement.QFP8WT``, so ``_scaled_mm`` can consume it without
+   any runtime quantization overhead.
+
+   Non-FP8 parameters (biases, layer norms, embeddings) are transferred with
+   their normal optimal layouts.
+
+   :param model: The pre-quantized FP8 model to transfer.
+   :type model: torch.nn.Module
+   :returns: The model with all parameters on Spyre.
+   :rtype: torch.nn.Module
+
+   Example:
+
+   .. code-block:: python
+
+      from transformers import AutoModelForCausalLM
+      from torch_spyre.model_utils import load_fp8_model_to_spyre
+
+      model = AutoModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-8b-instruct-fp8")
+      model = load_fp8_model_to_spyre(model)
       compiled = torch.compile(model)
 
 .. function:: torch_spyre.model_utils.patch_module_to_for_spyre()

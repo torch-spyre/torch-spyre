@@ -69,6 +69,8 @@ from .junit import (
     source_and_external_run_id,
 )
 from .writer import (
+    CAPABILITY_PREFIX,
+    CAPABILITY_REQUIRED,
     ArtifactWriter,
     BenchmarkWriter,
     CapabilityWriter,
@@ -77,6 +79,7 @@ from .writer import (
     artifact_result_already_recorded,
     benchmarks_already_ingested,
     capabilities_already_ingested,
+    capability_declaration,
     cases_already_ingested,
     drop_older_case_attempts,
     insert_artifact,
@@ -88,6 +91,8 @@ from .writer import (
 )
 
 __all__ = [
+    "CAPABILITY_PREFIX",
+    "CAPABILITY_REQUIRED",
     "COMPONENT_DEFAULT",
     "HW_COLUMN_NAMES",
     "ID_NAMESPACE",
@@ -124,6 +129,7 @@ __all__ = [
     "build_row",
     "canonical_arch",
     "capabilities_already_ingested",
+    "capability_declaration",
     "capability_id_for",
     "case_id_for",
     "cases_already_ingested",

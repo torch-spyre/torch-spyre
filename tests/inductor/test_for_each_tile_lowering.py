@@ -633,6 +633,75 @@ def _find_while_loop_ir_op(fn, args):
     return while_ops[0]
 
 
+def _find_while_loop_ir_op_with_spyre_cmp_lowerings(fn, args):
+    """Like _find_while_loop_ir_op, but patches only the Spyre comparison
+    lowerings into lowering.lowerings for the duration of graph.run().
+
+    Only cmp overloads (eq/ne/lt/le/gt/ge) are injected -- NOT the full
+    enable_spyre_lowerings() CM -- because that CM also activates Spyre's
+    batchmatmul lowering, which the CPU GraphLowering codegen cannot handle.
+    The body subgraph contains a matmul and would fail with
+    ``unknown reduction_type=batchmatmul`` if any matmul lowering were live.
+    """
+    import contextlib
+    from torch._inductor.graph import GraphLowering
+    from torch._inductor import ir
+    import torch._inductor.lowering as ind_lowering
+    from torch_spyre._inductor.lowering import spyre_lowerings
+
+    _out, gm = capture_post_grad_while_loop(fn, args)
+
+    fake_mode = None
+    for node in gm.graph.nodes:
+        val = node.meta.get("val") if hasattr(node, "meta") else None
+        candidate = getattr(val, "fake_mode", None)
+        if candidate is not None:
+            fake_mode = candidate
+            break
+    assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
+
+    # Identify the cmp overloads registered in spyre_lowerings.
+    _CMP_OPS = {
+        torch.ops.aten.eq,
+        torch.ops.aten.ne,
+        torch.ops.aten.lt,
+        torch.ops.aten.le,
+        torch.ops.aten.gt,
+        torch.ops.aten.ge,
+    }
+    cmp_patch = {}
+    for overload, fn_impl in spyre_lowerings.items():
+        try:
+            packet = overload.overloadpacket
+        except AttributeError:
+            continue
+        if packet in _CMP_OPS:
+            cmp_patch[overload] = fn_impl
+
+    @contextlib.contextmanager
+    def _patch_cmp():
+        saved = {}
+        for ov, fn_impl in cmp_patch.items():
+            saved[ov] = ind_lowering.lowerings.get(ov)
+            ind_lowering.lowerings[ov] = fn_impl
+        try:
+            yield
+        finally:
+            for ov, prev in saved.items():
+                if prev is None:
+                    ind_lowering.lowerings.pop(ov, None)
+                else:
+                    ind_lowering.lowerings[ov] = prev
+
+    graph = GraphLowering(gm, example_inputs=list(args), shape_env=fake_mode.shape_env)
+    with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
+        with _patch_cmp():
+            graph.run(*args)
+    while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+    assert len(while_ops) == 1, f"expected exactly one WhileLoop, got {len(while_ops)}"
+    return while_ops[0]
+
+
 class TestCarryRealInputOwnership(unittest.TestCase):
     """The in-place-guard predicate on real IR buffers (no device)."""
 
@@ -1980,6 +2049,32 @@ class TestTryProveForEachTile(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertTrue(result.reason)
+
+    def test_map_mode_trip_count_survives_spyre_cmp_lowerings(self):
+        # Regression: the int-compare lowering (_lower_cmp_impl) must not
+        # insert a to_dtype cast for 0-dim integer predicates compared against
+        # an int.  If it does, the cond graph grows a second op (n_ops == 2)
+        # and the bound becomes float(N) instead of int(N), both of which make
+        # _extract_trip_count return None, causing silently wrong loop counts.
+        while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
+            split_m_fn, matmul_inputs()[0]
+        )
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertIsNotNone(result.trip_count)
+
+    def test_carry_mode_trip_count_survives_spyre_cmp_lowerings(self):
+        # Same regression check for the carry / split-K variant.
+        while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
+            split_k_fn, matmul_inputs()[0]
+        )
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertIsNotNone(result.trip_count)
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
