@@ -19,16 +19,24 @@ import json
 import uuid
 from dataclasses import dataclass
 
-import regex as re
-
 from .junit import RunCoordinates
 
 ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 
 ID_SEP = "|"
 
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_HEX12 = re.compile(r"[0-9a-f]{12}")
+
+# Stdlib only: derive_artifact_id.py imports this module on the runner's bare python3.
+def _is_hex(s: str, n: int) -> bool:
+    return len(s) == n and all(c in "0123456789abcdef" for c in s)
+
+
+def _strip_dev_suffix(name: str) -> str:
+    for suffix in ("-devel", "-dev"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
 
 # The component stamped on rows when the caller names none. A DEFAULT, not a constant: a
 # test cell may run another component's suite, and component is a hash input.
@@ -167,10 +175,11 @@ class CaseId(DerivedId):
         """The test's uuid, or '' with no component/name; classname may be blank."""
         if not cls.complete(component, name):
             return ""
+        # name keeps its case: sibling tests can differ only by case (upstream test_T / test_t).
         return cls.hash(
             cls.norm(component),
             cls.norm(classname),
-            cls.norm(name),
+            str(name).strip(),
             cls.tag_part(tags),
         )
 
@@ -308,15 +317,15 @@ class ArtifactIdentity:
         inputs into id12 and uses its config name) is matched by passing those three fields.
         """
         repo, _, digest = (ref or "").strip().partition("@")
-        if not _SHA256.fullmatch(
-            digest.removeprefix("sha256:")
-        ) or not digest.startswith("sha256:"):
+        if not _is_hex(digest.removeprefix("sha256:"), 64) or not digest.startswith(
+            "sha256:"
+        ):
             raise ValueError(f"image ref needs an @sha256:<64 hex> digest: {ref!r}")
-        if id12 and not _HEX12.fullmatch(id12):
+        if id12 and not _is_hex(id12, 12):
             raise ValueError(f"id12 must be 12 hex characters: {id12!r}")
         repo_name = repo.rsplit("/", 1)[-1].split(":", 1)[0]
         return cls(
-            component=component or re.sub(r"-(devel|dev)$", "", repo_name),
+            component=component or _strip_dev_suffix(repo_name),
             artifact_name=name or repo_name,
             id12=id12 or digest[7:19],
             arch=DerivedId.arch(arch),
@@ -331,7 +340,7 @@ class ArtifactIdentity:
     ) -> "ArtifactIdentity":
         """A downloadable file or folder; id12 is its content sha256, never its address."""
         digest = DerivedId.norm(sha256).removeprefix("sha256:")
-        if not url or not _SHA256.fullmatch(digest):
+        if not url or not _is_hex(digest, 64):
             raise ValueError(
                 f"generic artifact needs <url>#<64-hex sha256>: {url!r}#{sha256!r}"
             )

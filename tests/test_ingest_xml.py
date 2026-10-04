@@ -885,3 +885,53 @@ def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_pa
     assert by_name["test_a"]["duration_s"] == 3.0
     assert run["total_tests"] == 3
     assert run["failed"] == 0
+
+
+def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
+    def case(status, name="aten.mm"):
+        props = [
+            ("capability.test_type", "model_ops"),
+            ("capability.subject", "m"),
+            ("capability.name", name),
+        ]
+        return {"status": status, "duration_s": 1.5, "properties": props}
+
+    legs: dict = {}
+    plain = {"status": "passed", "properties": [("tag", "op__mm")]}
+    cases = [case("xfail"), case("failed"), case("skipped"), case("passed", ""), plain]
+    ingest._capability_legs(legs, "r1", cases)
+    assert legs == {("r1", "model_ops"): {"failed": 1, "total": 2, "duration_s": 3.0}}
+    assert [t for _, t, _ in ingest._admitted_legs(legs)] == ["model_ops"]
+
+
+def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
+    # The verdicts themselves are written by insert_test_results; only the leg needs the id.
+    legs: dict = {}
+    props = [
+        ("capability.test_type", "model_ops"),
+        ("capability.subject", "m"),
+        ("capability.name", "aten.mm"),
+    ]
+    ingest._capability_legs(legs, _RUN_ID, [{"status": "passed", "properties": props}])
+    c = _ArtifactClient()
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert legs and c.inserts == []
+
+
+def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
+    # pytest-rerunfailures' shape: each failed attempt is a bare repeat of the testcase.
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest' tests='2'>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_once'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    props = {c["name"]: dict(c["properties"]) for c in cases}
+    assert props["test_flaky"] == {"result.reruns": "2"}
+    assert props["test_once"] == {}
+    assert run["total_tests"] == 2

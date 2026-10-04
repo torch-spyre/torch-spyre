@@ -1,4 +1,3 @@
--- RERUNNABLE
 -- Re-key test_case_id to the identity-tags-only recipe, so one test has one id across arches and
 -- test types. Every hash input is stored, so history is re-keyed, not abandoned. Applies what
 -- CaseId.split_tags does to a fresh case: legacy bare tags get their namespace, run-context tags
@@ -11,9 +10,7 @@
 -- The four arrays must equal RUN_CONTEXT_TAG_NAMESPACES, RESULT_TAG_NAMESPACES and
 -- LEGACY_TAG_ALIASES (keys, values) in identity.py; a test pins that.
 --
--- Safe to repeat (`apply_schema --rerun`): writers that still carry the old recipe keep minting
--- old ids, so a later pass re-keys those. Rows written after the snapshot are left for that pass,
--- never deleted unmoved; case_id_rekey_runs survives a failed pass so its counters get recounted.
+-- Not rerunnable: it hashes the lowercased name, so a rerun would undo 007. Rerun 007 instead.
 
 DROP TABLE IF EXISTS case_id_rekey;
 
