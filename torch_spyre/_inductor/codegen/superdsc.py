@@ -2070,23 +2070,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # A type conversion that changes the elements per stick (DL16TOFP32,
-    # FP32TODL16) requires at least one outer spatial dim beyond the stick;
-    # inject a virtual mb=1 row when the op's tensor has only the stick dim.
-    changes_stick_width = (
-        len({arg.device_dtype.elems_per_stick() for arg in op_spec.args}) > 1
+    # A unary conversion that changes the elements per stick (DL16TOFP32,
+    # FP32TODL16, qfp8ch) requires at least one outer spatial dim beyond the
+    # stick; inject a virtual mb=1 row when the op's tensor has only the stick dim.
+    changes_stick_width = len(op_spec.args) == 2 and (
+        op_spec.args[0].device_dtype.elems_per_stick()
+        != op_spec.args[1].device_dtype.elems_per_stick()
     )
     mb_sym: Symbol | None = None
     if (
-        (
-            (DtypeOpTable.is_dtype_op(op_spec.op) and changes_stick_width)
-            or op_spec.op == "qfp8ch"
-            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
-        )
-        and op_spec.op != IDENTITY_OP
+        changes_stick_width
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)
     ):
+        assert op_spec.op != IDENTITY_OP and (
+            DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch"
+        ), f"{op_spec.op} changes the elements per stick but is not a conversion"
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
