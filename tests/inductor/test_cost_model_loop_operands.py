@@ -261,9 +261,10 @@ def test_tie_break_prefers_m_splits_that_keep_64_rows_per_core(monkeypatch):
 
 
 def test_tie_break_keeps_the_optimal_cost(monkeypatch, tmp_path):
-    """The re-solve may only choose among plans at the solved cost. Holding
-    the cost as a constraint let linearized Max/product terms go slack and the
-    true cost rise; keeping it in the objective must reproduce the optimum."""
+    """The tie-break may only choose among plans at the optimal cost. Holding
+    the cost as a constraint of a second solve let linearized Max/product terms
+    go slack and the true cost rise; weighting it in the one objective must
+    reproduce the optimum."""
     import json
 
     select = decompositions._select_sdpa_tiling

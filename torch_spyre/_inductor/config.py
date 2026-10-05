@@ -305,11 +305,11 @@ allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") =
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
 )
-# After the priced co-optimizing solve, re-solve at the found cost to choose,
-# among equally priced matmul divisions, the one with the largest useful M
-# split (at least 64 rows per core), then the lowest candidate index. Without
-# it, CP-SAT's parallel workers return a different optimum from run to run.
-# Set CPSAT_DIVISION_TIE_BREAK=0 to disable.
+# Break ties in the priced co-optimizing solve: among equally priced matmul
+# divisions, take the one with the largest useful M split (at least 64 rows
+# per core), then the lowest candidate index. Without it, CP-SAT's parallel
+# workers return a different optimum from run to run. Set
+# CPSAT_DIVISION_TIE_BREAK=0 to disable.
 cpsat_division_tie_break: bool = os.environ.get("CPSAT_DIVISION_TIE_BREAK", "1") == "1"
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch

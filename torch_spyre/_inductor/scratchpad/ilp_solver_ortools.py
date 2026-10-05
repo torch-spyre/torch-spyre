@@ -1345,19 +1345,21 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
-                # if the cost is non-constant, we minimize it
+                # if the cost is non-constant, we minimize it, breaking ties
+                # between equally priced divisions in the same solve
                 # if the cost is constant, we use any solution
-                model.minimize(cp_cost)
+                objective = (
+                    self._tie_break_objective(model, tensors, cp_cost)
+                    if config.cpsat_division_tie_break
+                    else None
+                )
+                model.minimize(cp_cost if objective is None else objective)
             status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
                 )
-            if config.cpsat_division_tie_break and not isinstance(
-                cp_cost, (int, float)
-            ):
-                self._break_division_ties(model, solver, tensors, cp_cost)
             return status
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
@@ -1375,22 +1377,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             }
             return None
 
-    def _break_division_ties(
-        self,
+    @staticmethod
+    def _tie_break_objective(
         model: "cp_model.CpModel",
-        solver: "cp_model.CpSolver",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         cp_cost,
-    ) -> None:
-        """Among equally priced optima, take the most preferred divisions.
+    ):
+        """``weight * cost - preference + candidate index``, or None.
 
-        Re-solve one lexicographic objective, ``weight * cost - preference +
-        candidate index``, with ``weight`` larger than any preference gain, so
-        no increase in cost can pay for a preference and equal-cost optima
-        resolve the same way on every compile. The cost stays in the objective
-        rather than becoming a constraint: the linearization keeps Max/Min and
-        product terms tight only while they are minimized. The first solution
-        seeds the hint; if the re-solve returns nothing, it is restored.
+        Equally priced divisions otherwise come back in whatever order CP-SAT's
+        parallel workers find them, so one graph compiled twice could run up
+        to 16% apart. ``weight`` exceeds any preference-plus-index gain, so no
+        increase in cost can pay for a preference: the minimum is the cost
+        optimum, and among equally priced optima the most preferred divisions,
+        then the lowest candidate indices. The cost stays in the objective
+        rather than becoming a constraint of a second solve, because the
+        linearization keeps its Max/Min and product terms tight only while they
+        are minimized; one solve also costs about half the solver time. None
+        when no division carries a preference.
         """
         scored = [
             t
@@ -1400,8 +1404,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             and len(set(t.buffer.division_preference)) > 1
         ]
         if not scored:
-            return
-        first = list(solver.ResponseProto().solution)
+            return None
         index_span = sum(len(t.buffer.core_divisions) for t in scored)
         index_weight = index_span + 1
         preference_span = sum(
@@ -1415,27 +1418,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             var = model.new_int_var(min(prefs), max(prefs), f"pref_{t.buffer.name}")
             model.add_element(t.division, prefs, var)
             preference.append(var)
-        model.minimize(
+        return (
             cost_weight * cp_cost
             - index_weight * sum(preference)
             + sum(t.division for t in scored)
         )
-        model.clear_hints()
-        for i, value in enumerate(first):
-            model.proto.solution_hint.vars.append(i)
-            model.proto.solution_hint.values.append(value)
-        status = self._solve_and_record(solver, model, objective=True)
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return
-        model.clear_objective()
-        for i, value in enumerate(first):
-            model.proto.variables[i].ClearField("domain")
-            model.proto.variables[i].domain.extend([value, value])
-        if self._solve_and_record(solver, model, objective=True) not in (
-            cp_model.OPTIMAL,
-            cp_model.FEASIBLE,
-        ):
-            raise SolveError("CP-SAT lost the first plan while breaking ties")
 
     def _solve_and_record(
         self,
