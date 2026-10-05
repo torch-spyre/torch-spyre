@@ -23,6 +23,7 @@ was charged at the peak rate, although keeping it resident halved the time.
 
 import dataclasses
 
+import pytest
 import sympy
 import torch
 import torch.nn.functional as F
@@ -234,37 +235,89 @@ def test_stick_plane_geometry_measures_the_source_burst():
     assert dcm._contiguous_device_run(coords, dims, space, {}) is None
 
 
-# ------------------------------------------------------- CP-SAT tie-break
+# ---------------------------------------------------- batched matmul splits
 
 
-def test_tie_break_prefers_m_splits_that_keep_64_rows_per_core(monkeypatch):
-    from torch_spyre._inductor.scratchpad import allocator
-    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+def _bmm(monkeypatch, batch, batch_split, m_extent, m_split, loop_trip=8):
+    from torch_spyre._inductor import cost_model as cm
 
-    m, n = sympy.symbols("m n", integer=True, nonnegative=True)
-    monkeypatch.setattr(allocator, "_is_matmul_op", lambda op: True)
-    for rows, splits, expected in (
-        # 1024 rows: M splits count up to 16, n splits never do.
-        (1024, ({}, {m: 4}, {m: 16}, {m: 32}, {n: 32}), [0, 2, 4, 4, 0]),
-        # 128 rows: past 2 ways a core would hold fewer than 64 rows.
-        (128, ({}, {m: 2}, {m: 8}, {m: 32}), [0, 1, 1, 1]),
-    ):
-        monkeypatch.setattr(
-            allocator,
-            "_matmul_axis_parse",
-            lambda op, rows=rows: {"M": (m, rows, 1), "N": (n, 512, 1)},
-        )
-        divisions = [CoreDivision(splits=dict(s)) for s in splits]
-        assert allocator._division_tie_break_scores(object(), divisions) == expected
-    monkeypatch.setattr(allocator, "_is_matmul_op", lambda op: False)
-    assert allocator._division_tie_break_scores(object(), divisions) == []
+    op = OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        out_elems=ELEMS,
+        cores=32,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        loop_trip=loop_trip,
+    )
+    monkeypatch.setattr(
+        cm,
+        "_matmul_axes_for_split_cost",
+        lambda o: (
+            (batch, batch_split),
+            (m_extent, m_split),
+            (512, 1),
+            (128, 1),
+            True,
+        ),
+    )
+    return cm, op
 
 
-def test_tie_break_keeps_the_optimal_cost(monkeypatch, tmp_path):
-    """The tie-break may only choose among plans at the optimal cost. Holding
-    the cost as a constraint of a second solve let linearized Max/product terms
-    go slack and the true cost rise; weighting it in the one objective must
-    reproduce the optimum."""
+def test_batch_split_charges_the_m_split_it_gives_up(monkeypatch):
+    p = CostParams()
+    rate = p.mm_batch_split_ns_per_step
+    # 1024 rows allow an 8-way M split at 128 rows per core; batch 4 x M 2
+    # forgoes two steps of M.
+    cm, op = _bmm(monkeypatch, 16, 4, 1024, 2)
+    assert cm._matmul_batch_split_ns([op], p) == rate * 8 * 2
+    # All 8 useful M ways taken: the batch split gives nothing up.
+    cm, op = _bmm(monkeypatch, 16, 4, 1024, 8)
+    assert cm._matmul_batch_split_ns([op], p) == 0
+    # No batch split, nothing to charge however little M is split.
+    cm, op = _bmm(monkeypatch, 16, 1, 1024, 1)
+    assert cm._matmul_batch_split_ns([op], p) == 0
+
+
+def test_short_m_caps_the_charge_at_the_row_bound(monkeypatch):
+    p = CostParams()
+    # 256 rows: only a 2-way M split keeps 128 rows, so an 8-way batch split
+    # forgoes one step, not three.
+    cm, op = _bmm(monkeypatch, 16, 8, 256, 1)
+    assert cm._matmul_batch_split_ns([op], p) == p.mm_batch_split_ns_per_step * 8
+    # Lq 128: no M split is worth taking, so a head split costs nothing.
+    cm, op = _bmm(monkeypatch, 16, 8, 128, 1)
+    assert cm._matmul_batch_split_ns([op], p) == 0
+
+
+def test_unbatched_or_disabled_batch_split_costs_nothing(monkeypatch):
+    cm, op = _bmm(monkeypatch, 1, 1, 1024, 1)
+    assert cm._matmul_batch_split_ns([op], CostParams()) == 0
+    cm, op = _bmm(monkeypatch, 16, 8, 1024, 1)
+    off = dataclasses.replace(CostParams(), mm_batch_split_ns_per_step=0.0)
+    assert cm._matmul_batch_split_ns([op], off) == 0
+
+
+def test_batch_split_cost_follows_symbolic_splits(monkeypatch):
+    s0, s1, sm = sympy.symbols(
+        "split_bmm_d0 split_bmm_d1 split_bmm_d2", integer=True, positive=True
+    )
+    cm, op = _bmm(monkeypatch, 16, s0 * s1, 1024, sm)
+    expr = cm._matmul_batch_split_ns([op], CostParams())
+    rate = CostParams().mm_batch_split_ns_per_step
+
+    def at(b0, b1, m):
+        return float(expr.subs({s0: b0, s1: b1, sm: m}))
+
+    assert at(1, 1, 32) == pytest.approx(0, abs=1e-6)
+    assert at(4, 2, 2) == pytest.approx(rate * 8 * 2)
+    assert at(2, 1, 8) == pytest.approx(0, abs=1e-6)
+
+
+def test_co_optimizer_prices_batch_splits_of_an_sdpa_scan(monkeypatch, tmp_path):
+    """The co-optimizing solve lowers the log2 batch-split term and still
+    produces a correct four-block scan."""
     import json
 
     select = decompositions._select_sdpa_tiling
@@ -287,20 +340,15 @@ def test_tie_break_keeps_the_optimal_cost(monkeypatch, tmp_path):
     monkeypatch.setattr(decompositions, "_select_sdpa_tiling", four_blocks)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 256, 64, dtype=torch.float16) for _ in range(3))
-    objectives = {}
-    for tie_break in (False, True):
-        dump = tmp_path / f"cost_{tie_break}.jsonl"
-        torch._inductor.codecache.FxGraphCache.clear()
-        torch._dynamo.reset()
-        with config.patch(
-            {"cpsat_division_tie_break": tie_break, "dump_cost_expr_file": str(dump)}
-        ):
-            out = torch.compile(F.scaled_dot_product_attention, dynamic=False)(
-                q.to("spyre"), k.to("spyre"), v.to("spyre")
-            )
-        ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
-        assert torch.allclose(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
-        records = [json.loads(line) for line in dump.read_text().splitlines()]
-        assert records, "the co-optimizer did not solve a priced plan"
-        objectives[tie_break] = [round(r["objective_ns"]) for r in records]
-    assert objectives[True] == objectives[False]
+    dump = tmp_path / "cost.jsonl"
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
+    with config.patch({"dump_cost_expr_file": str(dump)}):
+        out = torch.compile(F.scaled_dot_product_attention, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre")
+        )
+    ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+    assert torch.allclose(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
+    records = [json.loads(line) for line in dump.read_text().splitlines()]
+    assert records and all(r["solve"]["status"] == "OPTIMAL" for r in records)
+    assert any("log" in b["expr"] for r in records for b in r["bundles"])

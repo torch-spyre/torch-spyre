@@ -1822,37 +1822,6 @@ def build_residency_edge(
     )
 
 
-# Rows per core below which an M split stops filling the matmul pipeline:
-# deeptools sizes the streamed M tile at the largest divisor up to 64.
-_TIE_BREAK_MIN_M_ROWS = 64
-
-
-def _division_tie_break_scores(
-    op: Optional[Operation], divisions: list[CoreDivision]
-) -> list[int]:
-    """Preference among a matmul's equally priced divisions: log2 of its M split.
-
-    The objective prices a matmul's division mostly by its core count, so
-    divisions of one count tie, and CP-SAT's parallel workers return different
-    ones from run to run. On Granite GQA scans the solves that split query rows
-    more and KV heads less ran 10-13% faster at the same cost (Lq 1024: Lq8 x
-    Hkv4 2.00 ms vs Lq4 x Hkv8 2.24 ms). The M split counts only while each
-    core keeps ``_TIE_BREAK_MIN_M_ROWS`` rows: below that a split only shrinks
-    the streamed tile. Non-matmul ops get no preference.
-    """
-    if op is None or not _is_matmul_op(op):
-        return []
-    try:
-        m_sym, m_extent, _ = _matmul_axis_parse(op)["M"]
-    except (ValueError, StopIteration, KeyError):
-        return []
-    useful = max(1, int(m_extent) // _TIE_BREAK_MIN_M_ROWS)
-    return [
-        min(max(int(division.splits.get(m_sym, 1)), 1), useful).bit_length() - 1
-        for division in divisions
-    ]
-
-
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -3124,7 +3093,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     first_use_is_read=False,
                     in_place_parents=parents,
                     core_divisions=buf_divisions,
-                    division_preference=_division_tie_break_scores(op, buf_divisions),
                     parents=parent_proj,
                     cd_parent_matches=cd_parent_matches,
                     cd_parent_relayouts=cd_parent_relayouts,

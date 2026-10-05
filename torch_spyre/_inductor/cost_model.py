@@ -932,6 +932,22 @@ class CostParams:
     # those that kept it resident, against the ~0.5 ms the peak rate charged.
     # The excess over the peak rate is added after compute overlap; 0 disables it.
     loop_reread_gbps: float = 25.0
+    # Extra time, per invocation, for each log2 step of M split a batched matmul
+    # gives up by splitting its batch dims instead, at the same core count (the
+    # batch-split preference of work_division._matmul_split_cost, made a
+    # latency). Only M splits that keep mm_batch_split_min_m_rows rows per core
+    # count. Fitted to device kernel time over 71 compiles of 6 Granite GQA SDPA
+    # chunks, whose equally priced divisions differed only in how the scan
+    # matmuls split KV heads/groups vs query rows: 4.0 us per step
+    # (leave-one-graph-out 2.3-4.5 us); 0 disables it.
+    mm_batch_split_ns_per_step: float = 4000.0
+    # Rows per core an M split must leave for its step to count. Empirical, not
+    # a hardware constant: deeptools streams M in tiles of up to 64 rows, but
+    # on device a 2-way M split of Lq 128 chunks (64 rows per core) still lost
+    # to a head split (+12%); with 128 no Granite GQA chunk ran more than 3.3%
+    # slower than without the term. Without any bound the term pushed Lq 128
+    # chunks onto 4-row tiles (+11-27%).
+    mm_batch_split_min_m_rows: int = 128
     # Ops that stream a FULL input plus a small BROADCAST operand (loaded once) -- copy
     # (x+const), bcast, bcastcol, mulbcast -- run FASTER than a plain 1R:1W op (~118 vs
     # ~105 GB/s; mechanism open). NOT `write` (both operands broadcast, no full input).
@@ -1943,7 +1959,53 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 f"k_axis={k_axis}, cores_used={cores_used})"
             )
         total_us += us
-    return total_us * 1000.0  # us -> ns
+    return total_us * 1000.0 + _matmul_batch_split_ns(ops, p)  # us -> ns
+
+
+def _matmul_batch_split_ns(ops: list, p: CostParams):
+    """Time a batched matmul pays for splitting batch dims instead of M rows.
+
+    At a fixed core count, a division that splits a true BMM's batch dims (SDPA
+    KV heads and GQA groups) instead of its M rows ran slower on device, by
+    ``mm_batch_split_ns_per_step`` per log2 step, per invocation (``loop_trip``).
+    The charged steps are the M split forgone,
+    ``min(log2(batch split), max(0, log2(M_max / M split)))`` with ``M_max`` the
+    split that leaves ``mm_batch_split_min_m_rows`` rows per core. Without this
+    term the co-optimizer priced those divisions equally and CP-SAT returned
+    either from run to run. A matmul without batch dims pays nothing.
+    """
+    rate = p.mm_batch_split_ns_per_step
+    if rate <= 0:
+        return 0.0
+    total = 0.0
+    for o in ops:
+        if not getattr(o, "is_matmul", False):
+            continue
+        axes = _matmul_axes_for_split_cost(o)
+        if axes is None:
+            continue
+        (batch, batch_split), (m_extent, m_split), *_ = axes
+        batch = sympy.sympify(batch)
+        if not batch.is_Integer or batch <= 1:
+            continue
+        m_max = max(1, int(m_extent) // max(1, p.mm_batch_split_min_m_rows))
+        if m_max <= 1:
+            continue
+        trip = max(1, int(getattr(o, "loop_trip", 1) or 1))
+
+        def log2(value):
+            if isinstance(value, sympy.Basic) and value.free_symbols:
+                return sympy.log(value) / math.log(2)
+            return math.log2(max(1, int(value)))
+
+        b_steps, m_steps = log2(batch_split), log2(m_split)
+        forgone = math.log2(m_max) - m_steps
+        if isinstance(b_steps, sympy.Basic) or isinstance(forgone, sympy.Basic):
+            steps = sympy.Min(b_steps, sympy.Max(0, forgone))
+        else:
+            steps = min(b_steps, max(0.0, forgone))
+        total += rate * trip * steps
+    return total
 
 
 def _matmul_ns_bundled(ops: list, p: CostParams) -> float:

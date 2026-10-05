@@ -1345,15 +1345,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
-                # if the cost is non-constant, we minimize it, breaking ties
-                # between equally priced divisions in the same solve
+                # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
-                objective = (
-                    self._tie_break_objective(model, tensors, cp_cost)
-                    if config.cpsat_division_tie_break
-                    else None
-                )
-                model.minimize(cp_cost if objective is None else objective)
+                model.minimize(cp_cost)
             status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
@@ -1376,53 +1370,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "objective_used": False,
             }
             return None
-
-    @staticmethod
-    def _tie_break_objective(
-        model: "cp_model.CpModel",
-        tensors: dict[str, _LifetimeBufferWithCpVars],
-        cp_cost,
-    ):
-        """``weight * cost - preference + candidate index``, or None.
-
-        Equally priced divisions otherwise come back in whatever order CP-SAT's
-        parallel workers find them, so one graph compiled twice could run up
-        to 16% apart. ``weight`` exceeds any preference-plus-index gain, so no
-        increase in cost can pay for a preference: the minimum is the cost
-        optimum, and among equally priced optima the most preferred divisions,
-        then the lowest candidate indices. The cost stays in the objective
-        rather than becoming a constraint of a second solve, because the
-        linearization keeps its Max/Min and product terms tight only while they
-        are minimized; one solve also costs about half the solver time. None
-        when no division carries a preference.
-        """
-        scored = [
-            t
-            for t in tensors.values()
-            if isinstance(t, _CoreDivisionBufferWithCpVars)
-            and len(t.buffer.division_preference) == len(t.buffer.core_divisions) > 1
-            and len(set(t.buffer.division_preference)) > 1
-        ]
-        if not scored:
-            return None
-        index_span = sum(len(t.buffer.core_divisions) for t in scored)
-        index_weight = index_span + 1
-        preference_span = sum(
-            max(t.buffer.division_preference) - min(t.buffer.division_preference)
-            for t in scored
-        )
-        cost_weight = index_weight * (preference_span + 1) + index_span
-        preference = []
-        for t in scored:
-            prefs = list(t.buffer.division_preference)
-            var = model.new_int_var(min(prefs), max(prefs), f"pref_{t.buffer.name}")
-            model.add_element(t.division, prefs, var)
-            preference.append(var)
-        return (
-            cost_weight * cp_cost
-            - index_weight * sum(preference)
-            + sum(t.division for t in scored)
-        )
 
     def _solve_and_record(
         self,
