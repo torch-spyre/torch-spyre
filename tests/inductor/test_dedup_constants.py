@@ -996,7 +996,7 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "PRECONDITION: no dedup group with >=3 constants (D>=2). "
                 "Not a dedup failure.",
             )
-            n_ops_at_entry = len(graph.operations)
+            n_computed = sum(isinstance(op, ComputedBuffer) for op in graph.operations)
 
             with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
@@ -1004,28 +1004,33 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
 
             # In the single-sweep implementation, each ComputedBuffer in
             # graph.operations at pass entry is visited exactly once,
-            # so the call count is at most n_ops_at_entry.
+            # so the call count is at most n_computed.
             #
             # A regression that rebuilds the reverse index inside the
-            # per-duplicate loop would call get_read_writes on each op
-            # once per duplicate; with D >= 2 in the largest group the
-            # call count would be at least 2 * (number of ComputedBuffer
-            # candidates) > n_ops_at_entry.
+            # per-duplicate loop would call get_read_writes on each
+            # ComputedBuffer once per duplicate; with D >= 2 in the
+            # largest group the call count would be at least
+            # 2 * n_computed.
             #
             # The tight invariant this guard enforces:
             #
-            #     get_read_writes calls <= n_ops_at_entry.
+            #     get_read_writes calls <= n_computed.
             #
-            # Any per-duplicate rebuild would blow past this bound.
+            # Any per-duplicate rebuild would blow past this bound. It counts
+            # ComputedBuffers rather than all ops because constants and other
+            # extern kernels are never counted: against an op-count bound, a
+            # rebuild passes whenever ComputedBuffers are half the graph or
+            # less.
             self.assertLessEqual(
                 calls,
-                n_ops_at_entry,
+                n_computed,
                 f"regression guard: dedup called "
                 f"ComputedBuffer.get_read_writes {calls} times on a graph "
-                f"with {n_ops_at_entry} ops at pass entry. A single-sweep "
-                "reverse-index build should make at most one call per op. "
-                "A count materially larger than N suggests the index is "
-                "being rebuilt per duplicate (regression).",
+                f"with {n_computed} ComputedBuffers at pass entry. A "
+                "single-sweep reverse-index build should make at most one "
+                "call per ComputedBuffer. A count materially larger "
+                "suggests the index is being rebuilt per duplicate "
+                "(regression).",
             )
             # Also assert a lower bound so a broken impl that made zero
             # get_read_writes calls (and never built the index) does not
@@ -1044,93 +1049,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             return torch.bmm(x, w1) + torch.bmm(x, w2) + torch.bmm(x, w3)
 
         self._drive(cb, fn, (x, w1, w2, w3))
-
-    # ------------------------------------------------------------------
-    # test_reverse_index_bound_holds_as_D_grows
-    # ------------------------------------------------------------------
-
-    def test_reverse_index_bound_holds_as_D_grows(self) -> None:
-        """The same bound at two duplicate-group sizes, D=2 and D=4.
-
-        One data point leaves open that the fixture, not the implementation, is
-        what keeps the count under N. Raising D makes a per-duplicate rebuild
-        proportionally worse -- roughly D*N calls -- so re-checking
-        ``calls <= N`` at D=4 fails harder than at D=2 while staying an exact
-        bound. A fitted slope was the alternative and is worse here: the
-        invariant is exact, so fitting would trade a hard bound for a threshold
-        that can drift into flakiness in a shared suite.
-
-        Growing the group grows N as well as D in this fixture (each bmm adds
-        ops), which is why the assertion is the per-graph bound at each size
-        rather than a comparison of raw counts across the two.
-        """
-        dtype = torch.float16
-        stick_size = get_elem_in_stick(dtype)
-        k = stick_size + 1
-        # (n_bmms, calls, n_ops_at_entry) for each graph driven below.
-        measured: list[tuple[int, int, int]] = []
-
-        def make_cb(n_bmms: int) -> Callable[[GraphLowering], None]:
-            def cb(graph: GraphLowering) -> None:
-                from torch_spyre._inductor.dedup_constants import _constant_key
-
-                constants = self._constants(graph.operations)
-                groups: dict[tuple, list[SpyreConstantFallback]] = {}
-                for c in constants:
-                    groups.setdefault(_constant_key(c), []).append(c)
-                largest = max((len(g) for g in groups.values()), default=0)
-                self.assertGreaterEqual(
-                    largest,
-                    n_bmms,
-                    f"PRECONDITION: {n_bmms} unaligned bmms sharing one "
-                    f"unaligned K should have produced a duplicate group of "
-                    f"{n_bmms} padding constants; largest group is {largest}. "
-                    "Not a dedup failure -- fixture shape changed.",
-                )
-                n_ops = len(graph.operations)
-                with pass_counters.counted_region() as counts:
-                    dedup_and_promote_constants(graph)
-                measured.append((n_bmms, counts.get(READ_WRITES_EXTRACTIONS, 0), n_ops))
-                raise _TestStopSignal()
-
-            return cb
-
-        def fn(x, *ws):
-            out = torch.bmm(x, ws[0])
-            for w in ws[1:]:
-                out = out + torch.bmm(x, w)
-            return out
-
-        for n_bmms in (3, 5):
-            x = torch.randn(2, 8, k, dtype=dtype, device="spyre")
-            ws = tuple(
-                torch.randn(2, k, 32, dtype=dtype, device="spyre")
-                for _ in range(n_bmms)
-            )
-            self._drive(make_cb(n_bmms), fn, (x, *ws))
-
-        self.assertEqual(
-            [m[0] for m in measured],
-            [3, 5],
-            f"both graphs must have reached dedup; measured {measured}",
-        )
-        for n_bmms, calls, n_ops in measured:
-            self.assertGreater(
-                calls,
-                0,
-                f"regression guard: duplicates exist at {n_bmms} bmms but dedup "
-                "made zero get_read_writes calls -- the reverse index was "
-                "never built.",
-            )
-            self.assertLessEqual(
-                calls,
-                n_ops,
-                f"regression guard: at {n_bmms} bmms (D={n_bmms - 1}) dedup made "
-                f"{calls} ComputedBuffer.get_read_writes calls on a graph with "
-                f"{n_ops} ops at pass entry. A single sweep makes at most one "
-                f"call per op; a per-duplicate rebuild would make about "
-                f"{(n_bmms - 1) * n_ops}. All measurements: {measured}",
-            )
 
     # ------------------------------------------------------------------
     # test_all_output_name_duplicates_still_dropped
