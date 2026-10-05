@@ -106,13 +106,21 @@ did not move is omitted rather than recorded as zero.
 | `read_writes.requests` | Calls to the memoized `op_read_writes` helper: how many times the pass asked |
 | `read_writes.misses` | Of those, the ones the per-op memo could not serve |
 | `read_writes.extractions` | `ComputedBuffer.get_read_writes` invocations -- the sympy dependency extraction that actually costs something, including callers that bypass the memo |
-| `read_writes.extract_ns` | Nanoseconds spent inside those extractions, so a count can be sized rather than guessed (measured at ~143 us a call) |
+| `read_writes.extract_ns` | Nanoseconds spent inside those extractions, so a count can be sized rather than guessed |
 | `device_coordinates` | Device-space coordinate constructions |
 | `host_coordinates` | Host-space coordinate constructions |
 
-Requests far above extractions is a rescan the memo is absorbing; misses far
-below extractions is a pass going around the memo. Pipeline events carry the
-inclusive total, the same way `inclusive_ns` does.
+Both read-writes counters cover `ComputedBuffer.get_read_writes` only. The
+scheduler extracts directly in `SchedulerNode._compute_attrs`, and so do several
+`ir.py` classes (`Loops`, `BaseView`, `TemplateBuffer`), so `extractions` is a
+lower bound on dependency extraction and `extract_ns` a lower bound on its cost.
+
+Read these against a baseline record of the same workload rather than in the
+absolute. Most extractions come from callers that reach past the memo by design,
+so misses sitting far below extractions is the normal state and not a finding; a
+*change* in that relationship for one workload is. Requests far above extractions
+is a rescan the memo is absorbing. Pipeline events carry the inclusive total, the
+same way `inclusive_ns` does.
 
 ## FFDC (First Failure Data Capture)
 

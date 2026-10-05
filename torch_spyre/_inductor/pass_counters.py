@@ -40,7 +40,10 @@ and restores it on exit.
 
 Counts are per-process and unsynchronized: the passes this is aimed at run on
 the compiling thread, but a concurrently compiling worker would land in the
-same totals.
+same totals. One consequence to know: if the region that installed the counters
+exits while another thread's pipeline is still running, the reset leaves that
+pipeline's :meth:`PassCounters.since` deltas negative. A reader should treat a
+negative delta as "another compile owned the region", not as a measurement.
 
 New counter names need no ``RECORDER_VERSION`` bump; they are event ``meta``,
 which readers already treat as open.

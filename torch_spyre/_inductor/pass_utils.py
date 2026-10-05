@@ -1491,6 +1491,11 @@ def device_coordinates(
         the stick expression.
     """
     if COUNTERS.enabled:
+        # Defined as constructions, not asks: a reader treats the count as the
+        # work because nothing memoizes this today. #4245 adds a shared memo, and
+        # whichever of the two lands second must bump this only on the miss path
+        # and count asks under a separate ``device_coordinates.requests`` -- a
+        # single counter spanning both stops measuring either.
         COUNTERS.bump(DEVICE_COORDINATES)
     index = per_trip_index(op, dep.index) if op is not None else dep.index
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)

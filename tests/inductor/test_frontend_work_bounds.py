@@ -15,35 +15,46 @@
 
 """Per-operation analysis work on a real compile, bounded.
 
-A timing threshold cannot guard the frontend: sample-to-sample spread on the
-2026-10-02 sweep was 3.68% median and 12.9% at p90 for per-pass times, so any
-bound tight enough to catch a regression also flakes. The work counters have a
-median spread of **0.00%** across the same samples -- 84.8% of counter series
-were byte-identical over three cold runs -- so a bound on them is a real guard.
+A timing threshold cannot guard the frontend: per-pass times spread 3.68% median
+and 12.9% at p90 across a 50-point sweep, so a bound tight enough to catch a
+regression also flakes. The same sweep's work counters spread 0.00% median and
+0.03% at p90 -- stable to within a fraction of a percent -- so a bound on them
+holds without pinning the implementation.
 
-The numbers below are calibrated from that sweep: 50 points, 4,443 graph
-operations, with the whole pre-scheduling pipeline counted.
+Two regressions are worth guarding, and they move different counters:
 
-======================================  ==========  ==================
-counter                                 per op      what a breach means
-======================================  ==========  ==================
-``read_writes.misses``                  1.32        the memo stopped working
-``read_writes.requests``                705.9       (absorbed by the memo)
-``device_coordinates``                  39.1        a new unmemoized rescan
-======================================  ==========  ==================
+* **The memo stops absorbing repeats.** ``read_writes.misses`` rises toward the
+  number of asks. Caught by the misses bound.
+* **A caller bypasses the memo**, calling ``op.get_read_writes()`` instead of
+  ``op_read_writes(op)``. Requests fall by that caller's share, misses barely
+  move (the memo still fills once from whoever asks first), and
+  ``read_writes.extractions`` rises. Only the extractions bound sees this.
 
-The misses figure is the load-bearing one. A perfectly cold cache is 1.0 per
-operation, so 1.32 says the memo is serving essentially every repeat ask. The
-705.9 requests behind those 1.32 misses are what makes the bound meaningful: a
-change that routes a pass around ``op_read_writes`` converts requests into
-misses and extractions, and only this ratio notices.
+An earlier revision bounded ``requests / misses`` instead, which catches neither:
+defeating the memo fails the misses bound first, and a single bypass cannot move
+a 534x ratio below any useful threshold.
 
-Bounds carry roughly 2-3x headroom over the measured value, because the point is
-to catch a pass newly re-deriving per-duplicate or per-consumer -- which moves a
-count by an order of magnitude -- and not to pin the current implementation.
+Bounds are calibrated on the two graphs below rather than on the sweep, because
+the sweep measures the pre-scheduling pipeline over model shapes while these
+tests count a whole ``torch.compile`` of a small graph. Measured per operation
+(``_calibrate``, torch 2.13 on a Spyre pod):
+
+=================  ====  ========  ============  ==================  ========
+workload            ops    misses   extractions  device coordinates  requests
+=================  ====  ========  ============  ==================  ========
+matmul_chain          4      1.50        102.00               31.00    203.25
+elementwise_chain    32      1.03        107.03               26.81    214.31
+=================  ====  ========  ============  ==================  ========
+
+The sweep's figures over 4,443 operations counted at pre-scheduling-pipeline
+entry -- 1.32 misses, 90.7 extractions, 39.1 device coordinates, 705.9 requests
+per operation -- agree on everything except requests, which are far lower here
+because a four-operation graph gives later passes little to re-ask about.
+
+``matmul_chain``'s 1.50 misses per operation is a small-N artifact: six misses
+over four operations. The bound holds anyway, and the second workload at 32
+operations is the one that pins it.
 """
-
-from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import (
@@ -62,137 +73,26 @@ from torch_spyre._inductor.pass_counters import (
 )
 
 
-#: Measured 1.32; a pass re-deriving per duplicate would push this past 1 per
-#: duplicate and well beyond the bound.
+WORKLOADS = ("matmul_chain", "elementwise_chain")
+
+#: Measured 1.03-1.50 here, 1.32 on the sweep, against a cold-cache floor of 1.0.
 MAX_MISSES_PER_OP = 4.0
-#: Measured 39.1. Unmemoized by design, so the count is the work.
-MAX_DEVICE_COORDS_PER_OP = 120.0
-#: Measured 534x (705.9 requests against 1.32 misses). Guards the memo itself.
-MIN_REQUESTS_PER_MISS = 20.0
-
-
-class TestFrontendWorkBounds(TestCase):
-    """Bounds on the analysis work one compile does per graph operation."""
-
-    def _counted_compile(self, fn, args) -> tuple[dict[str, int], int]:
-        """Compile and return (counter deltas, operations at scheduling).
-
-        The operation count comes from a pipeline subclass swapped in over the
-        module attribute, which is how the rest of these tests reach the
-        pre-scheduling pipeline: ``patches.enable_spyre_context`` imports the
-        name inside the function, so the module attribute is what it resolves.
-        """
-        from torch_spyre._inductor import passes
-
-        seen: list[int] = []
-
-        class _Capturing(passes.CustomPreSchedulingPasses):  # type: ignore[name-defined]
-            def __call__(self, graph) -> None:
-                seen.append(len(graph.operations))
-                super().__call__(graph)
-
-        # A cache hit skips the pipeline entirely, so every counter reads zero
-        # and a bound on them passes vacuously. Forcing a cold compile is what
-        # makes this a guard rather than a no-op; the PRECONDITION below is the
-        # backstop if it ever stops working.
-        torch._dynamo.reset()
-        with (
-            patch.object(passes, "CustomPreSchedulingPasses", _Capturing),
-            torch._inductor.config.patch({"force_disable_caches": True}),
-        ):
-            # counted_region fills the dict on exit, so read it after the block.
-            with pass_counters.counted_region() as counts:
-                torch.compile(fn, fullgraph=True)(*args)
-        deltas = dict(counts)
-
-        self.assertTrue(
-            seen,
-            "PRECONDITION: the pre-scheduling pipeline never ran, so nothing "
-            "was counted. Not a work regression -- the harness missed the hook.",
-        )
-        return deltas, max(seen)
-
-    @parametrize("shape", ["matmul_chain", "elementwise_chain"])
-    def test_memo_serves_every_repeat_ask(self, shape: str) -> None:
-        """Misses stay near one per operation however often a pass asks.
-
-        The failure this catches: a pass calling ``op.get_read_writes()``
-        directly instead of ``op_read_writes``, or mutating dependencies without
-        ``invalidate_op_read_writes`` and re-deriving to compensate. Either turns
-        cheap requests into expensive extractions.
-        """
-        deltas, ops = self._counted_compile(*_workload(shape))
-        misses = deltas.get(READ_WRITES_MISSES, 0)
-        requests = deltas.get(READ_WRITES_REQUESTS, 0)
-
-        self.assertGreater(
-            requests,
-            0,
-            "PRECONDITION: no pass asked for a read/write set on this graph, so "
-            "the memo was never exercised. Not a work regression.",
-        )
-        self.assertLessEqual(
-            misses / ops,
-            MAX_MISSES_PER_OP,
-            f"the read-writes memo is no longer absorbing repeats: {misses} "
-            f"misses over {ops} operations ({misses / ops:.2f} per op) against a "
-            f"bound of {MAX_MISSES_PER_OP}. A cold cache is 1.0 per op and the "
-            "sweep measured 1.32, so a figure far above that means a pass is "
-            "re-deriving rather than reusing.",
-        )
-        self.assertGreaterEqual(
-            requests / max(misses, 1),
-            MIN_REQUESTS_PER_MISS,
-            f"only {requests / max(misses, 1):.1f} requests per miss, against "
-            f"{MIN_REQUESTS_PER_MISS} expected. The sweep measured 534. A low "
-            "ratio means callers are going around op_read_writes, so the memo "
-            "has nothing to serve.",
-        )
-
-    def test_coordinate_construction_is_bounded(self) -> None:
-        """Device coordinates are unmemoized, so their count is their cost."""
-        deltas, ops = self._counted_compile(*_workload("matmul_chain"))
-        coords = deltas.get(DEVICE_COORDINATES, 0)
-        self.assertGreater(
-            coords,
-            0,
-            "PRECONDITION: no device coordinates were constructed, so this graph "
-            "does not exercise layout analysis. Not a work regression.",
-        )
-        self.assertLessEqual(
-            coords / ops,
-            MAX_DEVICE_COORDS_PER_OP,
-            f"coordinate construction grew to {coords / ops:.1f} per operation "
-            f"against a bound of {MAX_DEVICE_COORDS_PER_OP} (sweep: 39.1). "
-            "Nothing memoizes these, so the count is the work.",
-        )
-
-    def test_extractions_do_not_outnumber_requests(self) -> None:
-        """Every extraction should be a miss the memo could not serve.
-
-        Extractions far above misses mean callers reaching past the helper to
-        upstream's uncached ``ComputedBuffer.get_read_writes``, which costs
-        ~143 us a call. They are counted separately for exactly this reason.
-        """
-        deltas, ops = self._counted_compile(*_workload("matmul_chain"))
-        extractions = deltas.get(READ_WRITES_EXTRACTIONS, 0)
-        misses = deltas.get(READ_WRITES_MISSES, 0)
-        self.assertGreaterEqual(
-            extractions,
-            misses,
-            f"{extractions} extractions against {misses} memo misses: every "
-            "miss goes on to extract, so extractions cannot be the smaller "
-            "number. The counters disagree, which is an instrumentation fault "
-            "rather than a work regression.",
-        )
+#: Per workload, because this is the bound a bypass has to breach and a single
+#: figure covering both has to sit above the looser one. Measured 102.00 and
+#: 107.03; 1.27x headroom, which is what it takes to catch the 11-site bypass
+#: in the test plan (133.25 and 165.97). A counter this reproducible -- 0.03%
+#: p90 across the sweep -- can carry a tight bound; a legitimate change that
+#: breaches it should re-measure and move it rather than widen it blindly.
+MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 130.0, "elementwise_chain": 135.0}
+#: Measured 27-31 here, 39.1 on the sweep. Unmemoized, so the count is the work.
+MAX_DEVICE_COORDS_PER_OP = 100.0
 
 
 def _workload(shape: str):
     """Two graphs that exercise the analysis differently.
 
-    ``matmul_chain`` carries the layout and coordinate work (the sweep's model
-    shapes spend 160 ms a buffer in buffer preparation); ``elementwise_chain``
-    carries the op count. A bound that holds for both is not shape-specific.
+    ``matmul_chain`` carries the layout and coordinate work; ``elementwise_chain``
+    carries the operation count. A bound holding for both is not shape-specific.
     """
     dtype = torch.float16
     if shape == "matmul_chain":
@@ -214,6 +114,162 @@ def _workload(shape: str):
         return out
 
     return fn, (x,)
+
+
+def _counted_compile(fn, args) -> tuple[dict[str, int], int]:
+    """Compile once, cold, and return (counter deltas, operations).
+
+    The operation count is the sum of ``len(graph.operations)`` at
+    pre-scheduling-pipeline entry over every run of that pipeline, because the
+    counters sum the same way -- a graph that lowers through two pipeline runs
+    contributes to both. The pipeline is reached by swapping the module
+    attribute, which is what ``patches.enable_spyre_context`` resolves: it
+    imports the name inside the function and builds the instance there.
+
+    A cache hit skips the pipeline entirely, leaving every counter at zero and
+    every bound passing vacuously, so the compile is forced cold. The
+    PRECONDITION in ``_counts`` is the backstop if that stops working.
+    """
+    from unittest.mock import patch
+
+    from torch_spyre._inductor import passes
+
+    seen: list[int] = []
+
+    class _Capturing(passes.CustomPreSchedulingPasses):
+        def __call__(self, graph) -> None:
+            seen.append(len(graph.operations))
+            super().__call__(graph)
+
+    torch._dynamo.reset()
+    with (
+        patch.object(passes, "CustomPreSchedulingPasses", _Capturing),
+        torch._inductor.config.patch({"force_disable_caches": True}),
+    ):
+        # counted_region fills the dict on exit, so read it after the block.
+        with pass_counters.counted_region() as counts:
+            torch.compile(fn, fullgraph=True)(*args)
+    return dict(counts), sum(seen)
+
+
+class TestFrontendWorkBounds(TestCase):
+    """Bounds on the analysis work one compile does per graph operation.
+
+    One bound per test method, over a compile cached for the class. Stacking
+    bounds in one method is what made an earlier revision's verification hollow:
+    the first assertion failed and the rest never ran.
+    """
+
+    #: shape -> (counter deltas, operations). Cold compiles are expensive.
+    _measured: dict[str, tuple[dict[str, int], int]] = {}
+
+    @classmethod
+    def _counts(cls, shape: str) -> tuple[dict[str, int], int]:
+        if shape not in cls._measured:
+            cls._measured[shape] = _counted_compile(*_workload(shape))
+        deltas, ops = cls._measured[shape]
+        assert ops, (
+            f"PRECONDITION: the pre-scheduling pipeline never ran for {shape}, "
+            "so nothing was counted -- most likely a cache hit. Not a work "
+            "regression."
+        )
+        return deltas, ops
+
+    @parametrize("shape", WORKLOADS)
+    def test_memo_absorbs_repeat_asks(self, shape: str) -> None:
+        """Misses stay near one per operation however often a pass asks."""
+        deltas, ops = self._counts(shape)
+        misses = deltas.get(READ_WRITES_MISSES, 0)
+        requests = deltas.get(READ_WRITES_REQUESTS, 0)
+        self.assertGreater(
+            requests,
+            0,
+            f"PRECONDITION: no pass asked for a read/write set on {shape}, so "
+            "the memo was never exercised. Not a work regression.",
+        )
+        self.assertLessEqual(
+            misses / ops,
+            MAX_MISSES_PER_OP,
+            f"{shape}: the read-writes memo is no longer absorbing repeats -- "
+            f"{misses} misses over {ops} operations ({misses / ops:.2f} per op) "
+            f"against a bound of {MAX_MISSES_PER_OP}. A cold cache is 1.0 per "
+            "operation, so a figure far above that means a pass is re-deriving "
+            "rather than reusing.",
+        )
+
+    @parametrize("shape", WORKLOADS)
+    def test_extractions_per_operation_are_bounded(self, shape: str) -> None:
+        """The counter a memo bypass moves.
+
+        A caller switching from ``op_read_writes(op)`` to ``op.get_read_writes()``
+        leaves misses alone and raises this. Covers
+        ``ComputedBuffer.get_read_writes`` only: the scheduler extracts directly
+        in ``SchedulerNode._compute_attrs``, and so do several ``ir.py`` classes.
+
+        Scope, measured rather than claimed: bypassing 11 call sites in
+        ``scratchpad/utils.py`` raises this 31% on ``matmul_chain`` and 55% on
+        ``elementwise_chain``, which the bound catches. Bypassing a *single* site
+        moves it by a few percent and no bound with usable headroom would see it.
+        This guards wholesale memo failure and multi-site drift, not one call.
+        """
+        deltas, ops = self._counts(shape)
+        extractions = deltas.get(READ_WRITES_EXTRACTIONS, 0)
+        bound = MAX_EXTRACTIONS_PER_OP[shape]
+        self.assertGreater(
+            extractions,
+            0,
+            f"PRECONDITION: no read/write sets were extracted on {shape}. Not a "
+            "work regression.",
+        )
+        self.assertLessEqual(
+            extractions / ops,
+            bound,
+            f"{shape}: {extractions} read-writes extractions over {ops} "
+            f"operations ({extractions / ops:.1f} per op) against a bound of "
+            f"{bound}. Each costs a full index trace, so a jump "
+            "here is a caller reaching past op_read_writes to upstream's "
+            "uncached method.",
+        )
+
+    @parametrize("shape", WORKLOADS)
+    def test_coordinate_construction_is_bounded(self, shape: str) -> None:
+        """Device coordinates are unmemoized, so their count is their cost."""
+        deltas, ops = self._counts(shape)
+        coords = deltas.get(DEVICE_COORDINATES, 0)
+        self.assertGreater(
+            coords,
+            0,
+            f"PRECONDITION: no device coordinates were constructed on {shape}, "
+            "so this graph does not exercise layout analysis. Not a work "
+            "regression.",
+        )
+        self.assertLessEqual(
+            coords / ops,
+            MAX_DEVICE_COORDS_PER_OP,
+            f"{shape}: coordinate construction reached {coords / ops:.1f} per "
+            f"operation against a bound of {MAX_DEVICE_COORDS_PER_OP}. Nothing "
+            "memoizes these, so the count is the work.",
+        )
+
+
+def _calibrate() -> None:
+    """Print each bounded counter per operation, for setting the bounds above.
+
+    Not reachable as a flag on this file: ``common_utils`` parses ``sys.argv``
+    at import and rejects anything it does not know. Drive it from outside::
+
+        python3 -c "import sys; sys.argv=[sys.argv[0]]; \
+            sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
+            from test_frontend_work_bounds import _calibrate; _calibrate()"
+    """
+    keys = (READ_WRITES_MISSES, READ_WRITES_EXTRACTIONS, DEVICE_COORDINATES,
+            READ_WRITES_REQUESTS)
+    head = " ".join(f"{k.split('.')[-1]:>14}" for k in keys)
+    print(f"{'workload':<20} {'ops':>5} {head}")
+    for shape in WORKLOADS:
+        deltas, ops = _counted_compile(*_workload(shape))
+        per_op = " ".join(f"{deltas.get(k, 0) / ops:14.2f}" for k in keys)
+        print(f"{shape:<20} {ops:5d} {per_op}")
 
 
 instantiate_parametrized_tests(TestFrontendWorkBounds)
