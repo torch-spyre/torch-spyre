@@ -17,7 +17,8 @@
 
 Timing says a pass is slow. A counter says *why*: how many times it asked the
 same question. The two answer different things and fail differently -- a
-stopwatch is noisy and unassertable, while a count is exact and can be a test.
+stopwatch is noisy and unassertable, while a count is reproducible to a fraction
+of a percent and can carry a test bound.
 The #4113 fix was confirmed by a call count, not by a stopwatch, and the
 complexity audit (#4220) needs one falsifying counter per claim.
 
@@ -65,8 +66,10 @@ READ_WRITES_REQUESTS = "read_writes.requests"
 READ_WRITES_MISSES = "read_writes.misses"
 # ComputedBuffer.get_read_writes invocations: the sympy dependency extraction
 # that actually costs something, counting the direct callers that skip the memo.
-# A requests count far above this is a rescan that the memo is absorbing; a
-# misses count far below this is a pass going around the memo.
+# How much the memo absorbs is requests against *misses*, not against this:
+# most extractions come from direct callers, so extractions far above misses is
+# the normal state rather than a finding. Read this against a baseline record of
+# the same workload; a change in the relationship is what means something.
 READ_WRITES_EXTRACTIONS = "read_writes.extractions"
 # Coordinate construction, the second analysis tier. Nothing memoizes these, so
 # the count is the work.

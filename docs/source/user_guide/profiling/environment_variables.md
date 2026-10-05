@@ -98,7 +98,7 @@ Each pipeline and pass event also carries `meta` with the graph size it saw
 (`input_nodes` / `output_nodes`, or `input_operations` / `output_operations`
 for the pre-scheduling pipeline) and counts of the analysis calls it made.
 Timing says a pass is slow; the counts say how many times it asked the same
-question, and unlike a duration they are exact and repeatable. A counter that
+question, and unlike a duration they are reproducible to a fraction of a percent. A counter that
 did not move is omitted rather than recorded as zero.
 
 | Counter | Meaning |
@@ -110,7 +110,8 @@ did not move is omitted rather than recorded as zero.
 | `device_coordinates` | Device-space coordinate constructions |
 | `host_coordinates` | Host-space coordinate constructions |
 
-Both read-writes counters cover `ComputedBuffer.get_read_writes` only. The
+`read_writes.extractions` and `read_writes.extract_ns` cover
+`ComputedBuffer.get_read_writes` only. The
 scheduler extracts directly in `SchedulerNode._compute_attrs`, and so do several
 `ir.py` classes (`Loops`, `BaseView`, `TemplateBuffer`), so `extractions` is a
 lower bound on dependency extraction and `extract_ns` a lower bound on its cost.
@@ -118,9 +119,9 @@ lower bound on dependency extraction and `extract_ns` a lower bound on its cost.
 Read these against a baseline record of the same workload rather than in the
 absolute. Most extractions come from callers that reach past the memo by design,
 so misses sitting far below extractions is the normal state and not a finding; a
-*change* in that relationship for one workload is. Requests far above extractions
-is a rescan the memo is absorbing. Pipeline events carry the inclusive total, the
-same way `inclusive_ns` does.
+*change* in that relationship for one workload is. How much the memo absorbs is
+requests against misses, not against extractions. Pipeline events carry the
+inclusive total, the same way `inclusive_ns` does.
 
 ## FFDC (First Failure Data Capture)
 

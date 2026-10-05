@@ -46,6 +46,10 @@ matmul_chain          4      1.50        102.00               31.00    203.25
 elementwise_chain    32      1.03        107.03               26.81    214.31
 =================  ====  ========  ============  ==================  ========
 
+Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
+and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
+not float on the shell's environment.
+
 The sweep's figures over 4,443 operations counted at pre-scheduling-pipeline
 entry -- 1.32 misses, 90.7 extractions, 39.1 device coordinates, 705.9 requests
 per operation -- agree on everything except requests, which are far lower here
@@ -64,6 +68,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
+from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import pass_counters
 from torch_spyre._inductor.pass_counters import (
     DEVICE_COORDINATES,
@@ -145,6 +150,14 @@ def _counted_compile(fn, args) -> tuple[dict[str, int], int]:
     with (
         patch.object(passes, "CustomPreSchedulingPasses", _Capturing),
         torch._inductor.config.patch({"force_disable_caches": True}),
+        # Which passes run, and how much each does, comes from the environment.
+        # A bound with 1.27x headroom cannot float on whatever SENCORES or
+        # LAYOUT_SOLVER the shell happens to export, so pin the four that matter
+        # to the values the calibration was taken at.
+        ts_inductor_config.patch("sencores", 32),
+        ts_inductor_config.patch("lx_planning", True),
+        ts_inductor_config.patch("hbm_pool_planning", True),
+        ts_inductor_config.patch("layout_solver", "cpsat"),
     ):
         # counted_region fills the dict on exit, so read it after the block.
         with pass_counters.counted_region() as counts:
@@ -226,9 +239,11 @@ class TestFrontendWorkBounds(TestCase):
             bound,
             f"{shape}: {extractions} read-writes extractions over {ops} "
             f"operations ({extractions / ops:.1f} per op) against a bound of "
-            f"{bound}. Each costs a full index trace, so a jump "
-            "here is a caller reaching past op_read_writes to upstream's "
-            "uncached method.",
+            f"{bound}. Each costs a full index trace. The usual cause is a "
+            "caller reaching past op_read_writes to upstream's uncached method, "
+            "but the count also includes upstream's own calls, so a torch bump "
+            "or a legitimately heavier pass can breach it too. Re-measure with "
+            "_calibrate and move the bound if the new figure is the honest one.",
         )
 
     @parametrize("shape", WORKLOADS)
@@ -262,8 +277,12 @@ def _calibrate() -> None:
             sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
             from test_frontend_work_bounds import _calibrate; _calibrate()"
     """
-    keys = (READ_WRITES_MISSES, READ_WRITES_EXTRACTIONS, DEVICE_COORDINATES,
-            READ_WRITES_REQUESTS)
+    keys = (
+        READ_WRITES_MISSES,
+        READ_WRITES_EXTRACTIONS,
+        DEVICE_COORDINATES,
+        READ_WRITES_REQUESTS,
+    )
     head = " ".join(f"{k.split('.')[-1]:>14}" for k in keys)
     print(f"{'workload':<20} {'ops':>5} {head}")
     for shape in WORKLOADS:
