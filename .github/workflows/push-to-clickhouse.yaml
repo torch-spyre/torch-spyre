@@ -19,7 +19,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
+        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
       component:
@@ -177,6 +177,8 @@ jobs:
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      # Empty on a manual re-ingest, which then keeps first-write-wins.
+      TRIGGERING_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || '' }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
@@ -233,13 +235,15 @@ jobs:
           # Track the latest gh release rather than a pin: nothing here depends on a
           # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
           # drifting apart across workflows).
-          GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+          # github.com intermittently 403s release downloads from this runner pool.
+          CURL_RETRY=(--retry 5 --retry-delay 5 --retry-all-errors)
+          GH_CLI_VERSION="$(curl -fsSL "${CURL_RETRY[@]}" https://api.github.com/repos/cli/cli/releases/latest \
                               | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
           if [ -z "$GH_CLI_VERSION" ]; then
             echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
             GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
           fi
-          curl -fsSL \
+          curl -fsSL "${CURL_RETRY[@]}" \
             "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
             -o "${RUNNER_TEMP}/gh-cli.tar.gz"
           mkdir -p "${RUNNER_TEMP}/gh-cli"
@@ -271,7 +275,7 @@ jobs:
       # along are simply ignored.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # page, and a run with more jobs than that (e.g. the tests /
       # integration-tests matrices) silently lost every artifact past the
       # first page, with no error — rows just never showed up in ClickHouse.
       # `--paginate` applies `--jq` per page and concatenates the filtered
@@ -284,10 +288,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${TRIGGERING_REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | {id: .id, name: .name}' \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
+          # pipefail: a page that fails mid-listing must not pass as a shorter list.
+          set -o pipefail
+          for attempt in 1 2 3 4 5; do
+            if ARTIFACTS=$(gh api --paginate \
+                "/repos/${TRIGGERING_REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+                --jq '.artifacts[] | {id: .id, name: .name}' \
+                | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))"); then
+              break
+            fi
+            [ "$attempt" -eq 5 ] && exit 1
+            echo "[retry] listing attempt ${attempt} failed" >&2
+            sleep $((2 ** attempt))
+          done
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
@@ -299,19 +312,28 @@ jobs:
           mkdir -p xml_artifacts
           export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
           python3 <<'PYEOF'
-          import json, os, subprocess, sys
+          import json, os, subprocess, sys, time
           artifacts = json.loads(os.environ['ARTIFACTS'])
           # TRIGGERING_REPO, not GITHUB_REPOSITORY: on a called workflow the latter is the
           # CALLER, and the artifacts live in the repo whose run produced them.
           repo  = os.environ['TRIGGERING_REPO']
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
+              # A run has ~175 artifacts; one transient API error must not drop the whole ingest.
+              for attempt in range(1, 6):
+                  result = subprocess.run([
+                      "gh", "api",
+                      f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
+                  ], env={**os.environ}, capture_output=True)
+                  if result.returncode == 0:
+                      break
+                  print(f"[retry] attempt {attempt} failed: {result.stderr.decode(errors='replace').strip()}",
+                        file=sys.stderr)
+                  if attempt == 5:
+                      sys.exit(1)
+                  time.sleep(2 ** attempt)
               with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
-                result = subprocess.run([
-                    "gh", "api",
-                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                ], check=True, env={**os.environ}, capture_output=True)
-                f.write(result.stdout)
+                  f.write(result.stdout)
               subprocess.run([
                   "unzip", "-o", f"xml_artifacts/{a['name']}.zip",
                   "-d", "xml_artifacts/"
@@ -371,6 +393,7 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.

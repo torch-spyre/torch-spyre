@@ -46,6 +46,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
+    BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
@@ -67,6 +68,9 @@ from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
     _default_split,
+    _HBM_BW_GBS,
+    _matmul_split_cost,
+    adjust_it_space_for_sticks,
     enumerate_work_division_candidates,
     work_division_context_for_op,
     work_division_splits_are_legal,
@@ -112,9 +116,11 @@ def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
     return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
 
 
-def _tensor_dep(name, shape, symbols, element_arrangement=None):
+def _tensor_dep(name, shape, symbols, element_arrangement=None, dtype=torch.float16):
     """Build a real TensorDep for a contiguous access over ``symbols``."""
-    layout = _fixed_tiled_layout(shape, element_arrangement=element_arrangement)
+    layout = _fixed_tiled_layout(
+        shape, dtype=dtype, element_arrangement=element_arrangement
+    )
     index = sympy.Integer(0)
     for sym, stride in zip(symbols, layout.stride):
         index += sym * int(stride)
@@ -1296,6 +1302,207 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertGreater(unrestricted[batch], 1)
         self.assertEqual(restricted[batch], 1)
 
+    def test_fp8_cost_model_uses_correct_elems_per_stick(self):
+        """#4466: N_e/K_e must come from the FP8 operand's stick (128
+        elems/stick), not the FP16 output's (64) -- else they're halved."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep(
+                "act",
+                (8, 4096),
+                (m, k),
+                element_arrangement=ElementArrangement.QFP8CH,
+                dtype=torch.float8_e4m3fn,
+            ),
+            _tensor_dep(
+                "weight",
+                (4096, 12800),
+                (k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+                dtype=torch.float8_e4m3fn,
+            ),
+        ]
+        it_space = {m: 8, n: 12800, k: 4096}
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            it_space, input_tds + [output_td]
+        )
+
+        captured = {}
+
+        def capture_axes(_b_axis, _m_axis, n_axis, k_axis, *_args, **_kwargs):
+            captured["N_e"] = n_axis[0]
+            captured["K_e"] = k_axis[0]
+            return 1.0
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=capture_axes,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                stick_vars,
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+
+        self.assertEqual(captured["N_e"], 12800)
+        self.assertEqual(captured["K_e"], 4096)
+
+    def test_fp8_matmul_split_cost_uses_correct_byte_width(self):
+        """#4465: activation/weight bytes must come from their own FP8
+        elems_per_stick (1 byte/elem), not the flat fp16 _DTYPE_BYTES (2)."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep(
+                "act",
+                (8, 4096),
+                (m, k),
+                element_arrangement=ElementArrangement.QFP8CH,
+                dtype=torch.float8_e4m3fn,
+            ),
+            _tensor_dep(
+                "weight",
+                (4096, 12800),
+                (k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+                dtype=torch.float8_e4m3fn,
+            ),
+        ]
+        it_space_adjusted = {m: 8, n: 100, k: 32}
+
+        captured = {}
+
+        def capture_bytes(_b_axis, _m_axis, _n_axis, _k_axis, *_args, **kwargs):
+            captured["operand_bytes"] = kwargs.get("operand_bytes")
+            captured["output_bytes"] = kwargs.get("output_bytes")
+            return 1.0
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=capture_bytes,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                {n: 128},
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+
+        # Layer 1: planner must derive+pass these; reverted -> None != 1.0/2.0.
+        self.assertEqual(captured["operand_bytes"], 1.0)
+        self.assertEqual(captured["output_bytes"], 2.0)
+
+        # Layer 2: old no-kwargs callers (e.g. cost_model.py) keep the flat default.
+        B, M, K, N = 1, 8, 4096, 12800
+        sm, sn, sk = 4, 8, 1  # fanout_split=max(sm,sn)=8 keeps cohort_penalty == 1.0
+        legacy_cost_with_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+        )
+        legacy_cost_without_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            include_hbm=False,
+        )
+        legacy_bytes_total = (
+            (legacy_cost_with_hbm - legacy_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        self.assertAlmostEqual(legacy_bytes_total, 105_127_936, delta=1.0)
+
+        # Layer 3: the real (unmocked) function, given correct fp8 byte widths,
+        # must itself compute the correct bytes_total.
+        shared_cost_with_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        shared_cost_without_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            include_hbm=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        shared_bytes_total = (
+            (shared_cost_with_hbm - shared_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        self.assertAlmostEqual(shared_bytes_total, 52_666_368, delta=1.0)
+
+        # Separate-batched-weight branch (weight_batches=B, not 1): B=2,
+        # M=8, K=4096, N=12800. fanout_split = n (shared_weight=False), so
+        # n=8 again keeps cohort_penalty == 1.0.
+        B2, M2, K2, N2 = 2, 8, 4096, 12800
+        m2, n2, k2 = 1, 8, 1
+        separate_cost_with_hbm = _matmul_split_cost(
+            (B2, 1),
+            (M2, m2),
+            (N2, n2),
+            (K2, k2),
+            32,
+            shared_weight=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        separate_cost_without_hbm = _matmul_split_cost(
+            (B2, 1),
+            (M2, m2),
+            (N2, n2),
+            (K2, k2),
+            32,
+            shared_weight=False,
+            include_hbm=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        separate_bytes_total = (
+            (separate_cost_with_hbm - separate_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        # weight_batches=B2=2 (not shared): (B2*M2*K2 + B2*K2*N2)*1 + B2*M2*N2*2
+        self.assertAlmostEqual(separate_bytes_total, 105_332_736, delta=1.0)
+
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):
     """coordinate_mask_blocked_vars only reads reduction_vars/stick_vars/it_space,
@@ -2102,6 +2309,54 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                     [cd.splits for cd in self.consumer_divs],
                 ),
                 [(0, 0), (1, 1)],
+            )
+
+    def _carry_update(self):
+        """Make ``plain`` a loop carry updated by a new op ``update``."""
+        x = _isym("x")
+        storage_op = self.op_by_name["plain"]
+        update_op = self._op("update")
+        record = LoopCarryRecord(storage_name="plain", update_name="update")
+        storage_op._loop_carry_record = record
+        update_op._loop_carry_record = record
+        self.op_by_name["update"] = update_op
+        self.divisions["update"] = self.parent_divs
+        self.rw[update_op] = MagicMock(
+            writes=[MemoryDep("update", x, (x,), (8,))],
+            reads=[MemoryDep("plain", x, (x,), (8,))],
+        )
+        return update_op
+
+    def test_reading_a_loop_carry_update_is_an_edge_on_its_storage(self):
+        # The update writes through the carry's storage, so a later read of the
+        # update's name reads the storage's LX bytes: it needs the storage's
+        # ownership, although the update itself is never an LX buffer.
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        update_op = self._carry_update()
+        x = _isym("x")
+        self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))
+
+        with self._patches():
+            carry_edges = {
+                "update": allocator._loop_carry_update_edge(
+                    update_op, self.op_by_name, {}
+                )
+            }
+            edges = allocator._loop_carry_read_edges(self.consumer_op, carry_edges, {})
+            self.assertEqual(set(edges), {"plain"})
+            edge = edges["plain"]
+            self.assertIs(edge.consumer_op, self.consumer_op)
+            self.assertEqual(edge.read_dep.name, "plain")
+            self.assertEqual(
+                edge.match_pairs(
+                    [cd.splits for cd in self.parent_divs],
+                    [cd.splits for cd in self.consumer_divs],
+                ),
+                [(0, 0), (1, 1)],
+            )
+            # The update's own write is the carry edge, not a read edge.
+            self.assertEqual(
+                allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
             )
 
     @staticmethod

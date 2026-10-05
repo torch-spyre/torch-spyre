@@ -45,12 +45,24 @@ from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
 import sympy
 import torch
 import torch.nn.functional as F
+from torch import fx
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.exc import InductorError
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    FlexibleLayout,
+    InputBuffer,
+    Pointwise,
+    Reduction,
+    StorageBox,
+    TensorBox,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
@@ -61,6 +73,7 @@ from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import (
+    _apply_plan,
     coarse_tile_post_stickify,
     plan_coarse_tile_groups,
 )
@@ -164,6 +177,44 @@ def _reduction_op(shape, reduction_ranges=(64,), name="buf0", reduction_type="su
     op.get_read_writes = MagicMock(
         return_value=_default_read_writes_for_output(name, shape, layout)
     )
+    return op
+
+
+def _real_sum_op(reduction_ranges, name="buf0"):
+    """Return a real ComputedBuffer summing an ``[8, *reduction_ranges]`` input.
+
+    Unlike ``_reduction_op``, its read/write deps are Inductor's own, so the
+    loop variables are squeezed exactly as in a compile. Needs an active graph
+    handler, since the buffers are registered on ``V.graph``.
+    """
+    shape = [8, *reduction_ranges]
+    inp = InputBuffer(
+        name=f"in0_{name}",
+        layout=FixedLayout(
+            torch.device("cpu"),
+            torch.float32,
+            shape,
+            FlexibleLayout.contiguous_strides(shape),
+        ),
+    )
+    V.graph.name_to_buffer[inp.get_name()] = inp
+    loader = TensorBox(StorageBox(inp)).make_loader()
+    red = Reduction.create(
+        device=torch.device("cpu"),
+        dst_dtype=torch.float32,
+        src_dtype=torch.float32,
+        inner_fn=lambda index, rindex: loader([*index, *rindex]),
+        ranges=[sympy.Integer(8)],
+        reduction_ranges=[sympy.Integer(r) for r in reduction_ranges],
+        reduction_type="sum",
+    )
+    op = ComputedBuffer(
+        name=name,
+        layout=FixedLayout(torch.device("cpu"), torch.float32, [8], [1]),
+        data=red.data.data,  # TensorBox -> StorageBox -> Reduction
+    )
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
     return op
 
 
@@ -2530,7 +2581,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -2559,7 +2610,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -3075,7 +3126,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         op.layout = layout
 
-        with self.assertRaisesRegex(Unsupported, "maps to reduction range position 1"):
+        with self.assertRaisesRegex(
+            Unsupported, "maps to reduction range position None"
+        ):
             _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])
 
     def test_bmm_mixed_output_and_k_input_span_becomes_output_candidate(self):
@@ -3096,7 +3149,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + m, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=4_194_304),
@@ -3138,7 +3191,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[m, k, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=2),
@@ -3831,7 +3884,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value={m: 0, n: 1},
             ),
             patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._device_coordinates_for_span",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.device_coordinates",
                 return_value=[k, m, n],
             ),
             patch(
@@ -4235,7 +4288,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -4292,9 +4345,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 "_output_symbol_to_dim",
                 return_value={d0: 0, d1: 1, d2: 2, d3: 3, d4: 4},
             ),
-            patch.object(
-                soha, "_device_coordinates_for_span", return_value=device_coords
-            ),
+            patch.object(soha, "device_coordinates", return_value=device_coords),
         ):
             d1_only_infos = soha._input_span_infos_controlled_by_output_dims(
                 op,
@@ -4364,7 +4415,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -5058,7 +5109,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "MAX_SPAN_BYTES", 1024),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
-            patch.object(soha, "_device_coordinates_for_span", return_value=[m + k, k]),
+            patch.object(soha, "device_coordinates", return_value=[m + k, k]),
         ):
             enabled_infos = soha._input_span_infos_controlled_by_output_dims(
                 op, max_cores=1
@@ -5178,6 +5229,31 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         self.assertEqual(hints[0].split_count, 4)
         self.assertTrue(hints[0].is_reduction)
 
+    def test_adapter_places_reduction_level_past_a_size_1_reduction_dim(self):
+        # The planner's reduction host_dim counts only the non-size-1
+        # reduction dims (always 0 here), but the applier divides a
+        # reduction_ranges entry. On [1, 64] that entry is 1; dividing entry 0
+        # fails on "range 1 is not divisible by loop_count 2".
+        for reduction_ranges, tiled_pos, expected in (
+            ([1, 64], 1, [1, 32]),
+            ([64, 1], 0, [32, 1]),
+            ([64], 0, [32]),
+        ):
+            with (
+                self.subTest(reduction_ranges=reduction_ranges),
+                V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))),
+            ):
+                op = _real_sum_op(reduction_ranges)
+                op.dim_hints = _dims_to_hints(
+                    op, ((0, 2, True),), [_SPAN_OVERFLOW_HINT_ID]
+                )
+                levels = [(_SPAN_OVERFLOW_HINT_ID, sympy.Integer(2))]
+                plan = plan_coarse_tile_groups([op], [([op], levels)])
+                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+                self.assertEqual(op.loop_info.loop_count, [2])
+                self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[tiled_pos]])
+                self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
+
     def test_output_only_overflow_on_reduction_op_is_not_a_reduction_tile(self):
         # Sanity: when the *output* is what overflows, the plan is a normal
         # output-range tile, not a reduction-range one.
@@ -5276,7 +5352,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k0, 2 * m + k1, k1],
             ),
         ):
@@ -5321,7 +5397,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k, sympy.Mod(3 * h, 64), n],
             ),
         ):

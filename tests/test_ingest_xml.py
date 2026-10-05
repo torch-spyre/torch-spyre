@@ -131,6 +131,104 @@ def test_metrics_absent_from_the_xml_stay_null(ingest, tmp_path):
     assert row["mem_size_mb"] is None
 
 
+def test_uncaptured_zero_metrics_are_not_stored_as_measurements(ingest):
+    """A metric the harness zero-filled on every record is absent, not measured."""
+    records = [
+        {
+            "operation_name": "a",
+            "spyre_ms": 1.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+        {
+            "operation_name": "b",
+            "spyre_ms": 2.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+    ]
+    for entry in ingest._bench_entries(records):
+        assert set(entry["measurements"]) == {"spyre_ms"}
+
+
+def test_a_zero_beside_captured_values_is_kept(ingest):
+    records = [
+        {"operation_name": "a", "pt_util_percent": 0.0, "memory_transfer_mean_ms": 0.0},
+        {
+            "operation_name": "b",
+            "pt_util_percent": 42.0,
+            "memory_transfer_mean_ms": 0.0,
+        },
+    ]
+    a, b = ingest._bench_entries(records)
+    assert a["measurements"]["pt_util_percent"] == [0.0]
+    assert b["measurements"]["pt_util_percent"] == [42.0]
+    # Not a zero-filled metric: an all-zero column is still a measurement.
+    assert a["measurements"]["memory_transfer_mean_ms"] == [0.0]
+
+
+def test_torch_spyre_ms_is_not_duplicated_into_measurements(ingest):
+    (entry,) = ingest._bench_entries(
+        [
+            {
+                "operation_name": "a",
+                "metric": "spyre_kernel_ms",
+                "duration_ms": 3.0,
+                "torch_spyre_ms": 3.0,
+            }
+        ]
+    )
+    assert entry["measurements"] == {"duration_ms": [3.0]}
+    assert entry["backend"] == "spyre"
+
+
+def test_report_records_fall_back_to_the_spyre_backend(ingest):
+    (report,) = ingest._bench_entries([{"operation_name": "a", "spyre_ms": 1.0}])
+    (sendnn,) = ingest._bench_entries([{"operation_name": "a", "sendnn_ms": 1.0}])
+    assert report["backend"] == "spyre"
+    assert sendnn["backend"] == "sendnn"
+
+
+@pytest.mark.parametrize(
+    ("argv", "component"),
+    [([], "torch-spyre"), (["--component", "hf-adapters"], "hf-adapters")],
+)
+def test_benchmarks_are_stamped_with_the_callers_component(
+    ingest, monkeypatch, tmp_path, argv, component
+):
+    xml = _write_suite(
+        tmp_path,
+        _hf_case(f"perf_matmul_wall_clock_ms_{SHAPES}", "12.5"),
+        version_info=FULL_PROVENANCE,
+    )
+    written = []
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "v2")
+    monkeypatch.setattr(ingest, "benchmark_tables_present", lambda *a: True)
+    monkeypatch.setattr(ingest, "benchmarks_already_ingested", lambda *a: False)
+    monkeypatch.setattr(
+        ingest,
+        "insert_benchmarks",
+        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
+        or len(entries),
+    )
+    _run_main(
+        ingest,
+        monkeypatch,
+        xml,
+        FakeClient(dict(FULL_RUN_SCHEMA)),
+        extra_argv=[
+            "--trigger-type",
+            "perf",
+            "--schema",
+            "both",
+            "--gha-run-id",
+            "7",
+            *argv,
+        ],
+    )
+    assert written == [component]
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -164,6 +262,13 @@ FULL_PROVENANCE = {
     "flex": {"commit": "def5678", "branch": "main"},
     "deeptools": {"commit": "aaa111", "branch": "master"},
     "spyre-comms": {"commit": "bbb222", "branch": "main"},
+}
+
+RPM_PROVENANCE = {
+    "torch-spyre": {"commit": "abc1234", "branch": "main", "version": None},
+    "flex/ibm-flex": {"commit": "def5678", "branch": "main"},
+    "deeptools/ibm-deeptools": {"commit": "aaa111", "branch": "master"},
+    "spyre-comms/ibm-spyre-comms": {"commit": "bbb222", "branch": "main"},
 }
 
 
@@ -340,6 +445,33 @@ def test_full_provenance_is_valid_and_regression_eligible(ingest):
     quality, eligible = ingest.classify_run_quality(json.dumps(FULL_PROVENANCE))
     assert quality == "valid"
     assert eligible == 1
+
+
+def test_rpm_provenance_keys_are_valid_and_regression_eligible(ingest):
+    """Prod version_info uses flex/ibm-flex etc.; must not classify incomplete."""
+    quality, eligible = ingest.classify_run_quality(json.dumps(RPM_PROVENANCE))
+    assert quality == "valid"
+    assert eligible == 1
+
+
+def test_rpm_provenance_missing_commit_is_incomplete(ingest):
+    missing = dict(RPM_PROVENANCE)
+    missing["flex/ibm-flex"] = {"commit": "N/A"}
+    assert ingest.classify_run_quality(json.dumps(missing)) == ("incomplete", 0)
+    empty = dict(RPM_PROVENANCE)
+    empty["deeptools/ibm-deeptools"] = {"commit": ""}
+    assert ingest.classify_run_quality(json.dumps(empty)) == ("incomplete", 0)
+    absent = dict(RPM_PROVENANCE)
+    del absent["spyre-comms/ibm-spyre-comms"]
+    assert ingest.classify_run_quality(json.dumps(absent)) == ("incomplete", 0)
+
+
+def test_bare_bad_commit_falls_through_to_rpm_alias(ingest):
+    """OR semantics: bare N/A must not block a good RPM commit (#4896)."""
+    payload = dict(FULL_PROVENANCE)
+    payload["flex"] = {"commit": "N/A"}
+    payload["flex/ibm-flex"] = {"commit": "def5678"}
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("valid", 1)
 
 
 def test_incomplete_version_info_is_visible_not_regression_eligible(ingest):
@@ -660,6 +792,54 @@ def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
     assert row["artifact_id"] == _AID
 
 
+def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    (res,) = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert (res["test_type"], res["result_kind"]) == ("model_ops", "capability")
+
+
+def test_a_named_image_is_registered_tagged_and_judged(ingest):
+    # --artifact names what a Jenkins leg ran; the verdict lands on that image, tagged.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
+    image = "registry.example.com/team/hf-adapters-devel@sha256:" + "ab" * 32
+    args = _args(
+        artifact_id="",
+        artifact=f"image:{image}",
+        platform="s390x",
+        jenkins_run_key="job#1",
+        run_url="https://ci.example.com/job/1/",
+        tag=["release-2026-09-22"],
+        tag_family="release",
+    )
+    ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    assert (art["component"], art["artifact_name"], art["props"]["id12"]) == (
+        "hf-adapters",
+        "hf-adapters-devel",
+        "ab" * 6,
+    )
+    assert [t["tag"] for t in rows["artifact_tags"]] == ["release-2026-09-22"]
+    (res,) = rows["artifact_results"]
+    assert (res["artifact_id"], res["test_type"], res["state"]) == (
+        art["artifact_id"],
+        "svt",
+        "passed",
+    )
+    assert res["props"] == {
+        "run_url": "https://ci.example.com/job/1/",
+        "source": "jenkins",
+    }
+
+
 def test_no_artifact_id_writes_nothing(ingest):
     # Any image baked before the id was stamped: cases land, nothing claims an artifact.
     c = _ArtifactClient()
@@ -684,3 +864,74 @@ def test_a_write_failure_never_propagates(ingest):
 
     legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
     ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)
+
+
+def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_path):
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a' time='1'><failure message='x'/></testcase>"
+        "<testcase classname='c' name='test_b' time='2'/>"
+        "<testcase classname='c' name='test_a' time='3'/>"
+        "<testcase classname='c' name='test_B' time='4'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    by_name = {c["name"]: c for c in cases}
+    # Exact match only: test_b and test_B are different tests.
+    assert sorted(by_name) == ["test_B", "test_a", "test_b"]
+    assert by_name["test_a"]["status"] == "passed"
+    assert by_name["test_a"]["duration_s"] == 3.0
+    assert run["total_tests"] == 3
+    assert run["failed"] == 0
+
+
+def test_capability_cases_add_a_leg_per_declared_test_type(ingest):
+    def case(status, name="aten.mm"):
+        props = [
+            ("capability.test_type", "model_ops"),
+            ("capability.subject", "m"),
+            ("capability.name", name),
+        ]
+        return {"status": status, "duration_s": 1.5, "properties": props}
+
+    legs: dict = {}
+    plain = {"status": "passed", "properties": [("tag", "op__mm")]}
+    cases = [case("xfail"), case("failed"), case("skipped"), case("passed", ""), plain]
+    ingest._capability_legs(legs, "r1", cases)
+    assert legs == {("r1", "model_ops"): {"failed": 1, "total": 2, "duration_s": 3.0}}
+    assert [t for _, t, _ in ingest._admitted_legs(legs)] == ["model_ops"]
+
+
+def test_capability_legs_without_an_artifact_id_write_nothing(ingest):
+    # The verdicts themselves are written by insert_test_results; only the leg needs the id.
+    legs: dict = {}
+    props = [
+        ("capability.test_type", "model_ops"),
+        ("capability.subject", "m"),
+        ("capability.name", "aten.mm"),
+    ]
+    ingest._capability_legs(legs, _RUN_ID, [{"status": "passed", "properties": props}])
+    c = _ArtifactClient()
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert legs and c.inserts == []
+
+
+def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
+    # pytest-rerunfailures' shape: each failed attempt is a bare repeat of the testcase.
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest' tests='2'>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_flaky'/>"
+        "<testcase classname='c' name='test_once'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    props = {c["name"]: dict(c["properties"]) for c in cases}
+    assert props["test_flaky"] == {"result.reruns": "2"}
+    assert props["test_once"] == {}
+    assert run["total_tests"] == 2

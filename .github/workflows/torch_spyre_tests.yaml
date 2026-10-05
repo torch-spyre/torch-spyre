@@ -121,9 +121,12 @@ jobs:
   # ---------------------------------------------------------------------------
   run-tests:
     needs: changes
+    # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      needs.changes.outputs.integration_labeled != 'true'
+      needs.changes.outputs.integration_labeled != 'true' &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
+      github.event_name != 'merge_group'
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux

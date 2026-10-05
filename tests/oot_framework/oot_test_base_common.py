@@ -82,6 +82,7 @@ warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
 _OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
+assert _OOT_DEVICE_TYPE != "privateuse1"
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     See oot_test_config_schema.json for the full schema.
     """
 
-    device_type: str = "privateuse1"
+    device_type: str = _OOT_DEVICE_TYPE
     precision: float = DEFAULT_FLOATING_PRECISION
 
     # Exact-name lookup map: {base_method_name -> [TestEntry, ...]}
@@ -155,18 +156,6 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
     _FILE_LEVEL_EXCLUDED_MODULES: Optional[Set[str]] = None
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # PrivateUse1TestBase.setUpClass sets cls.device_type to the registered
-        # backend name (e.g. "spyre").  This mutates the base class's device_type,
-        # causing subsequent instantiate_device_type_tests calls to generate class
-        # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
-        # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
-        # Reset OOTTestBase.device_type to "privateuse1" so subsequent
-        # calls generate the correct class name.
-        OOTTestBase.device_type = "privateuse1"
 
     @classmethod
     def get_all_devices(cls):
@@ -947,7 +936,8 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         if _tags_to_write:
             _cfg = os.environ.get(ENV_TEST_CONFIG, "")
             if _cfg:
-                _sidecar = _cfg + ".markers.json"
+                # Per process: xdist workers and card-parallel shards write concurrently.
+                _sidecar = f"{_cfg}.markers.{os.getpid()}.json"
                 _existing_tags: dict = {}
                 try:
                     with open(_sidecar) as _sf:

@@ -53,6 +53,8 @@ class SchemaApplier:
     )
     # A file that belongs in a different database (e.g. otel) applies only when named.
     EXPLICIT = re.compile(r"^--\s*APPLY:\s*explicit\b", re.IGNORECASE | re.MULTILINE)
+    # A migration written to be repeated, e.g. to re-key rows that stale writers keep producing.
+    RERUNNABLE = re.compile(r"^--\s*RERUNNABLE\b", re.IGNORECASE | re.MULTILINE)
     CREATE = re.compile(
         r"^CREATE\s+(MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
         re.IGNORECASE,
@@ -63,7 +65,14 @@ class SchemaApplier:
         r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: TO \S+)?) \(.*?\) AS (SELECT|WITH)\b"
     )
     SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
-    ALTER = re.compile(r"\bALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
+    ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
+    ADDS = re.compile(
+        r"\bADD\s+(?:COLUMN|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
+    )
+    # A migration replaces a CHECK by DROP + ADD CONSTRAINT; the live table still has the old one.
+    ADDS_CONSTRAINT = re.compile(
+        r"\bADD\s+CONSTRAINT\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?", re.IGNORECASE
+    )
     LEDGER = "schema_migrations"
     LEDGER_DDL = (
         "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
@@ -174,11 +183,25 @@ class SchemaApplier:
         ).result_rows
         return {mid: chk for mid, chk in rows}
 
+    @staticmethod
+    def without_constraints(sql: str, names: set) -> str:
+        """A single-line CREATE with the named CONSTRAINT ... CHECK clauses removed."""
+        for n in names:
+            sql = re.sub(
+                rf",\s*CONSTRAINT\s+`?{re.escape(n)}`?\s+CHECK\s.*?"
+                r"(?=,\s*(?:CONSTRAINT|INDEX|PROJECTION)\s|\)\s*ENGINE\b)",
+                "",
+                sql,
+            )
+        return sql
+
     @classmethod
-    def differs(cls, client, obj: SchemaObject, stored: str, db: str) -> str:
-        """'' when `stored` matches the file, else a short unified diff of the two."""
-        want = cls.canonical(client, obj.sql, db)
-        have = cls.canonical(client, stored, db)
+    def differs(
+        cls, client, obj: SchemaObject, stored: str, db: str, ignore=frozenset()
+    ) -> str:
+        """'' when `stored` matches the file (less `ignore` constraints), else a short diff."""
+        want = cls.without_constraints(cls.canonical(client, obj.sql, db), ignore)
+        have = cls.without_constraints(cls.canonical(client, stored, db), ignore)
         if want == have:
             return ""
         split = lambda s: s.replace(", ", ",\n").splitlines()  # noqa: E731
@@ -188,18 +211,37 @@ class SchemaApplier:
         return "\n".join(list(diff)[:40])
 
     @classmethod
+    def pending_adds(cls, pending: list, pattern=None) -> dict:
+        """table -> column/index (or, given ADDS_CONSTRAINT, constraint) names pending migrations ADD."""
+        out: dict = {}
+        for p in pending:
+            for stmt in cls.statements(p.read_text()):
+                m = cls.ALTER.match(stmt)
+                if m:
+                    out.setdefault(m.group(1), set()).update(
+                        (pattern or cls.ADDS).findall(stmt)
+                    )
+        return out
+
+    @classmethod
+    def without(cls, obj: SchemaObject, names: set) -> SchemaObject:
+        """obj with the column/index definitions named in `names` removed (obj itself if none)."""
+        if not names:
+            return obj
+        alt = "|".join(re.escape(n) for n in names)
+        sql = re.sub(rf"(?m)^\s*(?:INDEX\s+)?`?(?:{alt})`?\s[^\n]*\n", "", obj.sql)
+        sql = re.sub(r",(\s*\))", r"\1", sql)
+        return SchemaObject(obj.kind, obj.name, sql, obj.file)
+
+    @classmethod
     def plan(cls, client, db: str, files: list, migrations: list) -> list:
         """(action, name, detail) for every change an apply would make, in order."""
         live = cls.live(client, db)
         done = cls.applied(client, db)
         objs = [o for path, text in files for o in cls.objects(path, text)]
         pending = [p for p in migrations if p.name not in done]
-        # A difference a pending migration ALTERs is expected; apply re-checks after migrating.
-        altered = {
-            m.group(1)
-            for p in pending
-            for m in cls.ALTER.finditer(cls.LINE_COMMENT.sub("", p.read_text()))
-        }
+        added = cls.pending_adds(pending)
+        replaced = cls.pending_adds(pending, cls.ADDS_CONSTRAINT)
         steps = []
         for o in objs:
             if o.kind == "view":
@@ -209,8 +251,20 @@ class SchemaApplier:
             else:
                 diff = cls.differs(client, o, live[o.name], db)
                 if diff:
-                    kind = "migrates" if o.name in altered else "drift"
-                    steps.append((kind, o.name, diff))
+                    # Expected only if the table matches once what a pending migration adds (and
+                    # the live table lacks: the ADDs are IF NOT EXISTS) is left out.
+                    stored = live[o.name]
+                    missing = {
+                        n
+                        for n in added.get(o.name, set())
+                        if not re.search(rf"\b{n}\b", stored)
+                    }
+                    before = cls.without(o, missing)
+                    ignore = replaced.get(o.name, set())
+                    resolved = (before is not o or bool(ignore)) and not cls.differs(
+                        client, before, stored, db, ignore
+                    )
+                    steps.append(("migrates" if resolved else "drift", o.name, diff))
         steps += [("migrate", p.name, "") for p in pending]
         for o in objs:
             if o.kind != "view":
@@ -272,6 +326,15 @@ class SchemaApplier:
                 steps.append(("recreate", o.name, o.file))
         return steps
 
+    @classmethod
+    def rerun(cls, client, path: Path) -> None:
+        """Run a migration again; refused unless it is marked `-- RERUNNABLE`."""
+        text = path.read_text()
+        if not cls.RERUNNABLE.search(text):
+            raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
+        for stmt in cls.statements(text):
+            client.command(stmt)
+
 
 SCHEMA_DIR = SchemaApplier.schema_dir()
 
@@ -308,6 +371,11 @@ def main() -> None:
         action="store_true",
         help="Print what an apply would change; exit 1 if anything would, 2 on drift",
     )
+    mode.add_argument(
+        "--rerun",
+        metavar="MIGRATION",
+        help="Run one -- RERUNNABLE migration again (e.g. 007_case_id_keep_name_case.sql)",
+    )
     args = parser.parse_args()
 
     if not SchemaApplier.sql_files(args.schema_dir):
@@ -331,6 +399,11 @@ def main() -> None:
     server = SchemaApplier.version_tuple(client.command("SELECT version()"))
     files = SchemaApplier.selected_files(args.schema_dir, args.include, server)
     print(f"[info] {ClickHouseEnv.host()}/{db}, ClickHouse {server[0]}.{server[1]}")
+
+    if args.rerun:
+        SchemaApplier.rerun(client, args.schema_dir / "migrations" / args.rerun)
+        print(f"[info] reran {args.rerun} on {db}")
+        return
 
     if args.check:
         steps = SchemaApplier.plan(client, db, files, migrations)

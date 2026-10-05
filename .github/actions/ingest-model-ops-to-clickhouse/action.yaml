@@ -1,3 +1,4 @@
+# v1 model-ops: delete once the dashboard reads v2 capabilities
 name: Ingest model-ops capability logs into ClickHouse
 description: >
   Download the model-ops job logs from a GHA run, parse them for operation-support variants
@@ -16,9 +17,7 @@ inputs:
       \bSpyre\b filter cannot tell apart from same-worded regression-matrix job names.
     required: true
   workflow-name:
-    description: >
-      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
-      input) -- e.g. 'model-ops-tests'.
+    description: Name of the triggering workflow, recorded against the rows.
     required: false
     default: model-ops-tests
   branch:
@@ -29,24 +28,6 @@ inputs:
     description: Commit sha recorded against the rows.
     required: false
     default: ''
-  component:
-    description: Component whose suite this is.
-    required: false
-    default: torch-spyre
-  arch:
-    description: >
-      Arch of the ANALYSED legs, never $(uname -m) (which would report the ingest runner);
-      arch is a run_id hash input, so a wrong value derives an id that joins nothing.
-    required: false
-    default: x86_64
-  jenkins-run-key:
-    description: Jenkins externalizable id ('folder/job#123'), when Jenkins dispatched this leg.
-    required: false
-    default: ''
-  schema:
-    description: Which schema generation to write -- v1 | v2 | both.
-    required: false
-    default: v1
   gh-token:
     description: Token `gh api` uses to list and download job logs.
     required: true
@@ -84,10 +65,6 @@ inputs:
     default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
-    required: false
-    default: ''
-  clickhouse-db-v2:
-    description: Schema-v2 database. Empty makes the v2 write a no-op.
     required: false
     default: ''
 
@@ -155,13 +132,35 @@ runs:
         source .venv/bin/activate
         mkdir -p raw_logs
 
-        gh api \
-          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
-          --paginate \
-          --jq '.jobs[]
-                | select(.name | startswith("model-ops / "))
-                | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
-        > /tmp/jobs.jsonl
+        # A nightly lists hundreds of jobs, and a transient 502 here dropped whole nights.
+        retry() {
+          # ~2 min of backoff: GitHub's 502 spells outlast 30s.
+          local max_attempts=7 attempt=1 delay=2
+          until "$@"; do
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "::error::command failed after ${attempt} attempts: $*" >&2
+              return 1
+            fi
+            echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
+
+        # Redirect inside the function so each retry starts from an empty file.
+        list_jobs() {
+          gh api \
+            --method GET \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --paginate \
+            -f per_page=100 \
+            --jq '.jobs[]
+                  | select(.name | startswith("model-ops / "))
+                  | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
+          > /tmp/jobs.jsonl
+        }
+        retry list_jobs
 
         if [ ! -s /tmp/jobs.jsonl ]; then
           echo "[info] no model-ops jobs in run ${RUN_ID} (no capability tier)."
@@ -243,7 +242,6 @@ runs:
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}
-        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
         RUN_ID: ${{ inputs.gha-run-id }}
       run: |
         set -euo pipefail
@@ -251,18 +249,9 @@ runs:
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
-        # --trigger-type is the RUN's test_type (a run_id hash input), not the capability
-        # analysis name -- the writer passes 'model_ops' for that itself.
         python3 "${ROOT}/.github/scripts/ingest_model_ops.py" \
           --json-file       "${JSON_FILE}" \
           --workflow        "${{ inputs.workflow-name }}" \
           --branch          "${{ inputs.branch }}" \
           --sha             "${{ inputs.sha }}" \
-          --run-id          "${RUN_ID}" \
-          --schema          "${{ inputs.schema }}" \
-          --component       "${{ inputs.component }}" \
-          --arch            "${{ inputs.arch }}" \
-          --gha-run-id      "${RUN_ID}" \
-          --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
-          --trigger-type    capability
+          --run-id          "${RUN_ID}"

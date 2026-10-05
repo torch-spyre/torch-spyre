@@ -154,14 +154,23 @@ def test_migration_can_resolve_drift_before_the_check(tmp_path):
     assert ("migrate", "001_widen.sql") in [(a, n) for a, n, _ in steps]
 
 
-def test_plan_labels_a_difference_a_pending_migration_alters(tmp_path):
+def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
+    wide = "CREATE TABLE IF NOT EXISTS {} (\n    a {},\n    b UInt8\n) ENGINE = MergeTree ORDER BY a"
     d = _schema(
         tmp_path,
-        {"10-t.sql": TABLE, "20-u.sql": TABLE.replace(" t ", " u ")},
-        {"001_add.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS a UInt8"},
+        {"10-t.sql": wide.format("t", "UInt8"), "20-u.sql": wide.format("u", "UInt8")},
+        {
+            "001_add.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8;\n"
+            "ALTER TABLE u ADD COLUMN IF NOT EXISTS b UInt8"
+        },
     )
-    narrow = "CREATE TABLE {} (a UInt16) ENGINE = MergeTree ORDER BY a"
-    server = FakeServer({"t": narrow.format("t"), "u": narrow.format("u")})
+    server = FakeServer(
+        {
+            # t lacks only the added column; u also has a different type for a.
+            "t": "CREATE TABLE t ( a UInt8 ) ENGINE = MergeTree ORDER BY a",
+            "u": "CREATE TABLE u ( a UInt16 ) ENGINE = MergeTree ORDER BY a",
+        }
+    )
     files = SchemaApplier.selected_files(d)
     steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
     assert [(a, n) for a, n, _ in steps] == [
@@ -169,6 +178,54 @@ def test_plan_labels_a_difference_a_pending_migration_alters(tmp_path):
         ("drift", "u"),
         ("migrate", "001_add.sql"),
     ]
+
+
+def test_a_constraint_a_pending_migration_replaces_is_not_drift(tmp_path):
+    new = (
+        "CREATE TABLE IF NOT EXISTS {} (\n    a String,\n"
+        "    CONSTRAINT chk_a CHECK a IN ('x', 'y')\n) ENGINE = MergeTree ORDER BY a"
+    )
+    old = "CREATE TABLE {} ( a String, CONSTRAINT chk_a CHECK a IN ('x') ) ENGINE = MergeTree ORDER BY a"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": new.format("t"), "20-u.sql": new.format("u")},
+        {
+            "001_chk.sql": "ALTER TABLE t DROP CONSTRAINT IF EXISTS chk_a;\n"
+            "ALTER TABLE t ADD CONSTRAINT chk_a CHECK a IN ('x', 'y')"
+        },
+    )
+    # u's CHECK differs too, but no migration replaces it.
+    server = FakeServer({"t": old.format("t"), "u": old.format("u")})
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps] == [
+        ("migrates", "t"),
+        ("drift", "u"),
+        ("migrate", "001_chk.sql"),
+    ]
+
+
+def test_an_addition_the_live_table_already_has_is_not_left_out(tmp_path):
+    d = _schema(
+        tmp_path,
+        {
+            "10-t.sql": "CREATE TABLE IF NOT EXISTS t (\n    a UInt8,\n    b UInt8,\n"
+            "    INDEX ix a TYPE minmax GRANULARITY 1\n) ENGINE = MergeTree ORDER BY a"
+        },
+        {
+            "001_ix.sql": "ALTER TABLE t ADD INDEX IF NOT EXISTS ix a TYPE minmax GRANULARITY 1",
+            "002_b.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8",
+        },
+    )
+    # ix already exists live (added by hand); only b is really missing.
+    server = FakeServer(
+        {
+            "t": "CREATE TABLE t ( a UInt8, INDEX ix a TYPE minmax GRANULARITY 1 ) ENGINE = MergeTree ORDER BY a"
+        }
+    )
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps][0] == ("migrates", "t")
 
 
 def test_non_create_statement_in_schema_is_rejected(tmp_path):
@@ -201,3 +258,45 @@ def test_repo_schema_parses_as_create_only():
     d = SchemaApplier.schema_dir()
     for path, text in SchemaApplier.selected_files(d, include=["80-otel.sql"]):
         assert SchemaApplier.objects(path, text)
+
+
+def test_the_writer_checks_the_values_the_ddl_and_last_migration_allow():
+    from spyre_clickhouse_ingest.schema import (
+        CAPABILITY_STATUS_VALUES,
+        RESULT_KIND_VALUES,
+        TEST_TYPE_VALUES,
+    )
+
+    def check(text, name, table=None):
+        prefix = rf"ALTER TABLE {table} ADD CONSTRAINT " if table else ""
+        found = re.findall(rf"{prefix}{name}\s+CHECK\s+\w+\s+IN\s*\(([^)]*)\)", text)
+        return set(re.findall(r"'([^']+)'", found[-1])) if found else None
+
+    d = SchemaApplier.schema_dir()
+    migs = [p.read_text() for p in SchemaApplier.migration_files(d)]
+    for ddl, table, name, values in (
+        ("20-artifacts.sql", "artifact_results", "chk_test_type", TEST_TYPE_VALUES),
+        ("20-artifacts.sql", "artifact_results", "chk_result_kind", RESULT_KIND_VALUES),
+        (
+            "46-capabilities.sql",
+            "capability_runs",
+            "chk_status",
+            CAPABILITY_STATUS_VALUES,
+        ),
+    ):
+        # A live database carries the last migration's CHECK, a fresh one the DDL's.
+        last = next(v for v in (check(m, name, table) for m in reversed(migs)) if v)
+        assert check((d / ddl).read_text(), name) == last == set(values), name
+
+
+def test_rerun_repeats_only_a_rerunnable_migration(tmp_path):
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE},
+        {"001_x.sql": "SELECT 1", "002_y.sql": "-- RERUNNABLE\nSELECT 2"},
+    )
+    server = FakeServer()
+    SchemaApplier.rerun(server, d / "migrations" / "002_y.sql")
+    assert server.log == ["SELECT 2"]
+    with pytest.raises(ValueError, match="RERUNNABLE"):
+        SchemaApplier.rerun(server, d / "migrations" / "001_x.sql")

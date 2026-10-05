@@ -29,7 +29,7 @@ AND the subgraph-local ``mul`` node. ``split_multi_ops`` picked
 ``next(iter(op.origins))``, which could return the parent's invoke_subgraph
 node; that node is not in the subgraph's ``gl.graph``, so
 ``gl.graph.inserting_before(orig_node)`` asserted. The fix
-(``split_multi_ops._origin_in_graph``) selects the origin whose ``.graph is
+(``pass_utils.origin_in_graph``) selects the origin whose ``.graph is
 gl.graph``.
 """
 

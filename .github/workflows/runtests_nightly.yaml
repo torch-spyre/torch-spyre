@@ -61,6 +61,7 @@ jobs:
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
       CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
+  # v1 model-ops: delete once the dashboard reads v2 capabilities
   # ---------------------------------------------------------------------------
   # Model-ops capability suites, as a tier of THIS nightly rather than a cron of
   # their own. The standalone model_ops_tests_nightly.yaml fired at the same
