@@ -63,8 +63,9 @@ default-layout tensor on the host and restickifying it later. The layout is
 selected from the tensor's role, which the wrapper infers from its
 checkpoint key and shape:
 
-- Two-dimensional embedding weights receive a gather-optimal layout for
-  indirect access.
+- Two-dimensional embedding weights whose hidden dimension is a multiple of
+  the dtype's stick width receive a gather-optimal layout for indirect access.
+  Tables that are not stick-aligned instead receive the default Spyre layout.
 - Two-dimensional Linear weights receive a matmul-optimal layout with
   `dim_order=[1, 0]`.
 - Every other tensor receives the default Spyre layout.

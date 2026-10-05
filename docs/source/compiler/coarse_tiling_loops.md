@@ -297,7 +297,7 @@ The Python wrapper emitted by `codegen_kernel()` contains all three tiled ops
 `LoopSpec`. Below is the actual output captured by
 `docs/tools/capture_for_each_tile_ir.py` at `sencores=4` (the
 `debug_handle=DebugHandle(...)` field each real `OpSpec` carries is shown in
-full below, since it is short enough here to be worth reading, it records
+full below, since it is short enough here to be worth reading. It records
 the full fusion/provenance chain back through `for_each_tile`'s own
 `scan`/`view` tracing):
 
@@ -401,7 +401,7 @@ sdsc_fused_add_copy__mul_select_view_0 = async_compile.sdsc('sdsc_fused_add_copy
 )
 ```
 
-(`debug_handle=DebugHandle(...)` is omitted above for brevity, it carries
+(`debug_handle=DebugHandle(...)` is omitted above for brevity. It carries
 the fusion/provenance chain, not tiling-relevant information.)
 
 Key observations:
@@ -2137,7 +2137,7 @@ Call sites, all following this exact shape:
 One site looks like an exception but is not: `_insert_copy_op`
 (in `coarse_tile.py`) builds a **new** `Pointwise` via
 `tiled_op.make_loader()` rather than editing `tiled_op`'s own `inner_fn`.
-This is IR-safe by construction, not a violation of the convention, it
+This is IR-safe by construction, not a violation of the convention. It
 reuses Inductor's own `make_loader()` (which itself returns a closure over
 the *existing* `inner_fn`/index machinery) instead of hand-assembling an
 index expression, so the same "never reconstruct a stale index" property
@@ -2173,8 +2173,8 @@ and they are staged deliberately rather than combined:
    (in `coarse_tile.py`) builds the substitution from old to new
    stride coefficients; `_retile_load_index_from_strides`
    (in `coarse_tile.py`) checks that the load index is affine and
-   separable in the rewritten variables before substituting, and, this is
-   a real, flagged soft spot rather than a proven bug, conservatively
+   separable in the rewritten variables before substituting. This is
+   a real, flagged soft spot rather than a proven bug: it conservatively
    *refuses and warns* rather than raising a hard compile error if a future
    index shape is not affine-separable. A refusal here degrades to a
    runtime warning plus likely-wrong output, not a caught error at compile

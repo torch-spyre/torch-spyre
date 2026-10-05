@@ -27,7 +27,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.rms_norm` | Y | Y | Spyre | Custom decomposition |
-| `torch.nn.functional.gelu` | Y | Y | Spyre | The GELU decomposition is registered through `register_spyre_decompositions`, so eager calls compile and dispatch it on-card |
+| `torch.nn.functional.gelu` | | Y | Spyre | Compiled only; the `spyre::gelu` custom op has no eager implementation |
 | `torch.nn.functional.silu` | Y | Y | Spyre | |
 | `torch.nn.functional.relu` | Y | Y | Spyre | |
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |

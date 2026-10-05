@@ -64,7 +64,7 @@ output = c_matmul(x, y)
 print(f"Output of matmul with torch.compile\n: {output}")
 ```
 
-# Running HuggingFace models
+## Running HuggingFace models
 
 To run a stock HuggingFace Transformers checkpoint on Spyre, use the
 [hf-adapters](https://github.com/torch-spyre/hf-adapters) project rather than

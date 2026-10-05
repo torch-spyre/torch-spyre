@@ -802,12 +802,15 @@ Environment Variables
      - Cache compiled Spyre kernels on disk and reuse them across
        invocations (default ``0``; set ``1`` to enable). When enabled,
        ``LIB_VERSION_FILE`` must point at the compiler version file, which
-       supplies the compiler version for the cache key; if it is unset the
-       cache raises ``RuntimeError``. Set ``SPYRE_KERNEL_CACHE=0`` to run
-       without caching when no version file is available
+       supplies the compiler version for the cache key. If it is unset, the
+       cache key cannot be computed: torch-spyre logs a warning and compiles
+       that kernel without caching instead of failing. Set
+       ``SPYRE_KERNEL_CACHE=0`` to run without caching when no version file is
+       available
    * - ``LIB_VERSION_FILE``
      - Path to the compiler version file read to form the kernel-cache key.
-       Required when ``SPYRE_KERNEL_CACHE=1``
+       Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
+       that kernel is compiled without caching and a warning is logged
    * - ``SPYRE_NUM_CPUS``
      - Override the CPU count CP-SAT uses to size its search worker pool.
        When unset the count is derived from the cgroup v2 quota, then

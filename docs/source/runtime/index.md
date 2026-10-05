@@ -248,11 +248,13 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
    `processComputeOnHostCommand` with compiler-supplied metadata (`Hcm`) and
    writes a small correction blob into a pinned host buffer. The closure
    captures the metadata, the destination CompositeAddresses, and the buffer
-   pointer. Each tensor's `kAddress` symbolic argument is resolved by
-   translating its `flex::CompositeAddress` to a concrete device address
-   through `SpyreAllocator::compositeAddressToDeviceAddress()`, so the
-   correction blob holds the final device addresses regardless of where the
-   allocator placed each tensor.
+   pointer. In `JobPlanStepHostCompute::construct` (`csrc/job_plan.cpp`), each
+   tensor's `kAddress` symbolic argument is populated by calling
+   `get_composite_address()` on the corresponding context tensor, and the
+   resulting `flex::CompositeAddress` values are passed to
+   `flex::createHostComputeParams()` as the host-compute argument list. The
+   `CompositeAddress` records where the allocator placed each tensor, so the
+   correction blob stays correct regardless of placement.
 2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
