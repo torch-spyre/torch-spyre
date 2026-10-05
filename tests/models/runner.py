@@ -35,19 +35,6 @@ DTYPE_MAP = {
 }
 
 
-# Ops whose output holds uninitialized memory. Their element values are
-# non-deterministic, so CPU and Spyre results can never be compared by value;
-# only tensor metadata (shape, dtype, layout) is checked for these.
-UNINITIALIZED_OUTPUT_OPS = {
-    "torch.empty",
-    "torch.empty_like",
-    "torch.empty_strided",
-    "torch.empty_permuted",
-    "torch.new_empty",
-    "torch.new_empty_strided",
-}
-
-
 def parse_py_value(expr: str):
     """
     Safely parse a restricted Python literal expression used in YAML.
@@ -198,9 +185,8 @@ def _normalize_out(out: Any) -> Any:
 
 
 def _assert_same_metadata(
-    testCase,
     ref_out: torch.Tensor,
-    test_out: torch.Tensor,
+    test_out: Any,
     *,
     case_name: str,
     description,
@@ -210,8 +196,17 @@ def _assert_same_metadata(
 
     Used for ops such as ``torch.empty_like`` whose output holds
     uninitialized memory: the values are non-deterministic by definition, so
-    only shape/dtype/layout are meaningful to check.
+    only shape/dtype/layout/stride are meaningful to check.
     """
+    if not torch.is_tensor(test_out):
+        raise AssertionError(
+            f"{case_name} FAILED since output type does not match the "
+            f"expected result\n"
+            f"type: expected {type(ref_out).__name__}, "
+            f"got {type(test_out).__name__}\n"
+            f"location in a model: {description}\n"
+        )
+
     mismatches = []
     if tuple(test_out.shape) != tuple(ref_out.shape):
         mismatches.append(
@@ -221,6 +216,10 @@ def _assert_same_metadata(
         mismatches.append(f"dtype: expected {ref_out.dtype}, got {test_out.dtype}")
     if test_out.layout != ref_out.layout:
         mismatches.append(f"layout: expected {ref_out.layout}, got {test_out.layout}")
+    if test_out.stride() != ref_out.stride():
+        mismatches.append(
+            f"stride: expected {ref_out.stride()}, got {test_out.stride()}"
+        )
 
     if mismatches:
         details = "\n".join(mismatches)
@@ -249,7 +248,6 @@ def _assert_same(
     if torch.is_tensor(ref_out):
         if metadata_only:
             _assert_same_metadata(
-                testCase,
                 ref_out,
                 test_out,
                 case_name=case_name,
@@ -547,5 +545,5 @@ def run_test(
         atol=atol,
         case_name=case_name,
         description=description,
-        metadata_only=op_name in UNINITIALIZED_OUTPUT_OPS,
+        metadata_only=adapter.uninitialized_output,
     )
