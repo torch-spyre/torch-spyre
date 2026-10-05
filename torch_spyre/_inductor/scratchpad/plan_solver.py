@@ -316,6 +316,10 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         default_factory=dict
     )
     chosen_division: Optional[int] = None
+    # One integer per ``core_divisions`` entry, higher preferred, used only to
+    # choose among divisions the cost objective prices equally (see
+    # ``_division_tie_break_scores``). Empty means no preference.
+    division_preference: list[int] = field(default_factory=list)
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
     # (:class:`RelayoutCopyBuffer`). Written back by the solver when this

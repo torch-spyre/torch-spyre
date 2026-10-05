@@ -1354,6 +1354,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
                 )
+            if config.cpsat_division_tie_break and not isinstance(
+                cp_cost, (int, float)
+            ):
+                self._break_division_ties(model, solver, tensors, cp_cost)
             return status
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
@@ -1370,6 +1374,68 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "objective_used": False,
             }
             return None
+
+    def _break_division_ties(
+        self,
+        model: "cp_model.CpModel",
+        solver: "cp_model.CpSolver",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        cp_cost,
+    ) -> None:
+        """Among equally priced optima, take the most preferred divisions.
+
+        Re-solve one lexicographic objective, ``weight * cost - preference +
+        candidate index``, with ``weight`` larger than any preference gain, so
+        no increase in cost can pay for a preference and equal-cost optima
+        resolve the same way on every compile. The cost stays in the objective
+        rather than becoming a constraint: the linearization keeps Max/Min and
+        product terms tight only while they are minimized. The first solution
+        seeds the hint; if the re-solve returns nothing, it is restored.
+        """
+        scored = [
+            t
+            for t in tensors.values()
+            if isinstance(t, _CoreDivisionBufferWithCpVars)
+            and len(t.buffer.division_preference) == len(t.buffer.core_divisions) > 1
+            and len(set(t.buffer.division_preference)) > 1
+        ]
+        if not scored:
+            return
+        first = list(solver.ResponseProto().solution)
+        index_span = sum(len(t.buffer.core_divisions) for t in scored)
+        index_weight = index_span + 1
+        preference_span = sum(
+            max(t.buffer.division_preference) - min(t.buffer.division_preference)
+            for t in scored
+        )
+        cost_weight = index_weight * (preference_span + 1) + index_span
+        preference = []
+        for t in scored:
+            prefs = list(t.buffer.division_preference)
+            var = model.new_int_var(min(prefs), max(prefs), f"pref_{t.buffer.name}")
+            model.add_element(t.division, prefs, var)
+            preference.append(var)
+        model.minimize(
+            cost_weight * cp_cost
+            - index_weight * sum(preference)
+            + sum(t.division for t in scored)
+        )
+        model.clear_hints()
+        for i, value in enumerate(first):
+            model.proto.solution_hint.vars.append(i)
+            model.proto.solution_hint.values.append(value)
+        status = self._solve_and_record(solver, model, objective=True)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return
+        model.clear_objective()
+        for i, value in enumerate(first):
+            model.proto.variables[i].ClearField("domain")
+            model.proto.variables[i].domain.extend([value, value])
+        if self._solve_and_record(solver, model, objective=True) not in (
+            cp_model.OPTIMAL,
+            cp_model.FEASIBLE,
+        ):
+            raise SolveError("CP-SAT lost the first plan while breaking ties")
 
     def _solve_and_record(
         self,

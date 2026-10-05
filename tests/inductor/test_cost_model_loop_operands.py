@@ -232,3 +232,74 @@ def test_stick_plane_geometry_measures_the_source_burst():
     assert run({b: 2}) == 64
     # The transport term keeps its default: no stick-plane walk.
     assert dcm._contiguous_device_run(coords, dims, space, {}) is None
+
+
+# ------------------------------------------------------- CP-SAT tie-break
+
+
+def test_tie_break_prefers_m_splits_that_keep_64_rows_per_core(monkeypatch):
+    from torch_spyre._inductor.scratchpad import allocator
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+
+    m, n = sympy.symbols("m n", integer=True, nonnegative=True)
+    monkeypatch.setattr(allocator, "_is_matmul_op", lambda op: True)
+    for rows, splits, expected in (
+        # 1024 rows: M splits count up to 16, n splits never do.
+        (1024, ({}, {m: 4}, {m: 16}, {m: 32}, {n: 32}), [0, 2, 4, 4, 0]),
+        # 128 rows: past 2 ways a core would hold fewer than 64 rows.
+        (128, ({}, {m: 2}, {m: 8}, {m: 32}), [0, 1, 1, 1]),
+    ):
+        monkeypatch.setattr(
+            allocator,
+            "_matmul_axis_parse",
+            lambda op, rows=rows: {"M": (m, rows, 1), "N": (n, 512, 1)},
+        )
+        divisions = [CoreDivision(splits=dict(s)) for s in splits]
+        assert allocator._division_tie_break_scores(object(), divisions) == expected
+    monkeypatch.setattr(allocator, "_is_matmul_op", lambda op: False)
+    assert allocator._division_tie_break_scores(object(), divisions) == []
+
+
+def test_tie_break_keeps_the_optimal_cost(monkeypatch, tmp_path):
+    """The re-solve may only choose among plans at the solved cost. Holding
+    the cost as a constraint let linearized Max/product terms go slack and the
+    true cost rise; keeping it in the objective must reproduce the optimum."""
+    import json
+
+    select = decompositions._select_sdpa_tiling
+
+    def four_blocks(**kwargs):
+        c = select(**kwargs)
+        return dataclasses.replace(
+            c,
+            strategy="work_divided_tiled",
+            num_batch_tiles=1,
+            num_head_tiles=1,
+            num_group_tiles=1,
+            num_q_tiles=1,
+            q_tile_size=kwargs["max_seqlen_q"],
+            num_kv_blocks=4,
+            kv_block_size=kwargs["max_seqlen_kv"] // 4,
+            kv_blocks_per_loop_group=4,
+        )
+
+    monkeypatch.setattr(decompositions, "_select_sdpa_tiling", four_blocks)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 2, 256, 64, dtype=torch.float16) for _ in range(3))
+    objectives = {}
+    for tie_break in (False, True):
+        dump = tmp_path / f"cost_{tie_break}.jsonl"
+        torch._inductor.codecache.FxGraphCache.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {"cpsat_division_tie_break": tie_break, "dump_cost_expr_file": str(dump)}
+        ):
+            out = torch.compile(F.scaled_dot_product_attention, dynamic=False)(
+                q.to("spyre"), k.to("spyre"), v.to("spyre")
+            )
+        ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        assert torch.allclose(out.cpu().float(), ref, rtol=2e-2, atol=2e-2)
+        records = [json.loads(line) for line in dump.read_text().splitlines()]
+        assert records, "the co-optimizer did not solve a priced plan"
+        objectives[tie_break] = [round(r["objective_ns"]) for r in records]
+    assert objectives[True] == objectives[False]
