@@ -118,6 +118,37 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+For compiled SDPA, maps over batch, head, group, or query positions use this
+carry-free form when K/V fits in one block: each map body computes stable
+softmax over its complete K/V range. Only a scan over multiple K/V blocks
+needs online-softmax running maximum, denominator, and output carries.
+
+The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
+a plan only if its resident floor fits in LX: the two co-live score tiles
+(the QK^T output and its exponentials), plus the scaled query, output carry,
+and per-block P@V for a multi-block scan. A spilled score costs far more than
+its HBM bytes, so such plans are rejected rather than priced. It also rejects
+plans the compiler cannot build: more than two nested maps, or more than 1024
+unrolled tile iterations (the backend unrolls every loop). If those limits
+leave no plan whose floor fits, it takes the buildable plan that spills the
+fewest score tiles; coarse tiling remains only for shapes with no buildable
+plan. Overflow above the floor is not charged: across the measured plans it
+had no measurable cost. The admitted plans are ranked by predicted device time
+from four measured terms: a fixed cost per outer map tile, an extra cost per
+tile when the plan splits query rows, the query-shaped carry each K/V scan
+step reads and writes, and HBM traffic that depends on the plan (K/V replay
+and head-tile staging). The coefficients come from forced-plan timings over
+full and chunked prefill, including Gemma 4 global and sliding layers. The
+selector chooses tiles before scratchpad planning, so it can only estimate the
+allocator's placement; a placement-aware selector would remove that gap.
+
+Sliding-window attention (`_select_swa_tiling`) applies the same resident
+floor to its per-query-block K/V window and takes the fewest blocks whose
+floor fits: each extra block adds a scan step that rescales the output carry.
+A tiling that covers the window exactly with an odd number of blocks is
+skipped, because the K/V loop then slices the cache view directly and its
+strides are not divisible by the tile count.
+
 ## Example: tiling `y = a + b; z = y * c`
 
 The example below tiles the same computation used throughout this document's

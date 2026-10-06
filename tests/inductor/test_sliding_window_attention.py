@@ -392,8 +392,10 @@ class TestSlidingWindowAttention(unittest.TestCase):
 
     def test_nondivisible_kv_extent_uses_for_each_tile(self):
         """A nondivisible K/V extent is padded into one counted loop."""
-        query, key, value = _inputs(1, 16, 8, 64, 1088)
-        mask = _attention_mask(1, 64, 1088, 1024)
+        # A 512-row query block keeps two 1088-row blocks resident, so the
+        # 2112-row window pads to 2176 instead of fitting in one block.
+        query, key, value = _inputs(1, 16, 8, 512, 2112)
+        mask = _attention_mask(1, 512, 2112, 1024)
         expected = _attention(query, key, value, mask, 1024)
 
         actual, sources = run_and_get_code(
