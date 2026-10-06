@@ -979,13 +979,14 @@ DECODE_MENU = [
     (2, 4, 4),
     (1, 8, 4),
 ]
-DECODE_DIVISION = sympy.Symbol("division_buf1", integer=True, nonnegative=True)
+SPLIT_M, SPLIT_N, SPLIT_K = sympy.symbols(
+    "split_m split_n split_k", integer=True, positive=True
+)
 
 
 def _decode_symbolic(M, *, weight_lx=False):
-    """The op as the co-optimizer extracts it: symbolic splits plus the table of
-    (m, k, cores) at each candidate division."""
-    m, n, k = sympy.symbols("split_m split_n split_k", integer=True, positive=True)
+    """The op as the co-optimizer extracts it: symbolic M, N and K splits."""
+    m, n, k = SPLIT_M, SPLIT_N, SPLIT_K
     op = _gate_up(M, 1, 1, 1, weight_lx=weight_lx)
     return dataclasses.replace(
         op,
@@ -998,22 +999,21 @@ def _decode_symbolic(M, *, weight_lx=False):
             dataclasses.replace(op.args[1], broadcast=True, replication=m),
             op.args[2],
         ],
-        division_menu=(
-            DECODE_DIVISION,
-            tuple((m_, k_, m_ * n_ * k_) for m_, n_, k_ in DECODE_MENU),
-        ),
     )
+
+
+def _at(m, n, k):
+    return {SPLIT_M: m, SPLIT_N: n, SPLIT_K: k}
 
 
 def test_the_symbolic_price_equals_the_concrete_price_at_every_candidate():
     expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
-    at = sympy.lambdify([DECODE_DIVISION], expr, modules="math")
-    for i, (m, n, k) in enumerate(DECODE_MENU):
-        assert at(i) == pytest.approx(_decode_expected(m, k, m * n * k), abs=1.0), (
-            m,
-            n,
-            k,
-        )
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K], expr, modules="math")
+    for m, n, k in DECODE_MENU:
+        expected = _decode_expected(m, k, m * n * k)
+        assert at(m, n, k) == pytest.approx(expected, abs=1.0), (m, n, k)
+        # The substituted node folds, and evalf (plan_solver's reading) agrees.
+        assert float(expr.xreplace(_at(m, n, k))) == pytest.approx(expected, abs=1.0)
 
 
 def test_a_resident_symbolic_weight_pays_nothing():
@@ -1021,58 +1021,85 @@ def test_a_resident_symbolic_weight_pays_nothing():
     expr = _decode_weight_delivery_excess(
         [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
     )
-    at = sympy.lambdify([DECODE_DIVISION, is_lx], expr, modules="math")
-    assert at(1, 1) == 0
-    assert at(1, 0) == pytest.approx(_decode_expected(8, 1, 32), abs=1.0)
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K, is_lx], expr, modules="math")
+    assert at(8, 4, 1, 1) == 0
+    assert at(8, 4, 1, 0) == pytest.approx(_decode_expected(8, 1, 32), abs=1.0)
+    assert expr.xreplace({is_lx: 1}) == 0
 
 
-def test_without_a_candidate_table_the_symbolic_split_stays_unpriced():
-    op = dataclasses.replace(_decode_symbolic(8), division_menu=None)
-    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+def _decode_buffer():
+    """A co-optimizer buffer whose candidates are ``DECODE_MENU``; a candidate
+    that does not split an axis reads 1 for it."""
+    keys = {"d0": SPLIT_M, "d1": SPLIT_N, "d2": SPLIT_K}
+    return types.SimpleNamespace(
+        sym_division=sympy.Symbol("division_buf1", integer=True, nonnegative=True),
+        sym_core_divs=keys,
+        core_divisions=[
+            types.SimpleNamespace(splits={d: v for d, v in zip(keys, mnk) if v != 1})
+            for mnk in DECODE_MENU
+        ],
+    )
 
 
-def test_cp_sat_keeps_the_price_at_every_candidate():
+@pytest.mark.parametrize("weight_lx", [False, True])
+def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
 
-    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    buffer = _decode_buffer()
     for i, (m, n, k) in enumerate(DECODE_MENU):
         model = cp_model.CpModel()
         division = model.new_int_var(0, len(DECODE_MENU) - 1, "div")
         model.add(division == i)
-        wrapper = types.SimpleNamespace(
-            division=division, buffer=types.SimpleNamespace(core_divisions=DECODE_MENU)
-        )
-        sym_map = {f"_division_of_{DECODE_DIVISION.name}": wrapper}
-        buffer_map = {}
+        resident = model.new_bool_var("resident")
+        model.add(resident == int(weight_lx))
+        wrapper = types.SimpleNamespace(division=division, buffer=buffer)
+        sym_map = {is_lx.name: resident}
+        buffer_map = {sym.name: (wrapper, ()) for sym in buffer.sym_core_divs.values()}
         model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
         solver = cp_model.CpSolver()
         assert solver.Solve(model) == cp_model.OPTIMAL
-        assert solver.ObjectiveValue() == pytest.approx(
-            _decode_expected(m, k, m * n * k), rel=2e-3, abs=2.0
-        ), (m, n, k)
+        expected = 0 if weight_lx else _decode_expected(m, k, m * n * k)
+        assert solver.ObjectiveValue() == pytest.approx(expected, rel=2e-3, abs=2.0), (
+            m,
+            n,
+            k,
+        )
 
 
-def test_the_allocator_tabulates_each_candidates_splits_in_order():
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
 
-    m, n = sympy.symbols("split_m split_n", integer=True, positive=True)
-    buffer = types.SimpleNamespace(
-        sym_division=DECODE_DIVISION,
-        sym_core_divs={"d0": m, "d1": n},
-        core_divisions=[
-            types.SimpleNamespace(splits={"d0": 4, "d1": 8}),
-            types.SimpleNamespace(splits={"d0": 8, "d1": 4}),
-            types.SimpleNamespace(splits={"d1": 16}),
-        ],
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    assert _SympyExprToCpSat(cp_model.CpModel(), {}, {}).convert(expr) == 0
+
+
+def test_cp_sat_gates_the_price_on_residency_without_a_product():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
     )
-    # A bare split symbol, a constant and a product: xreplace on a bare symbol
-    # hands back the substituted value itself, which must still read as an int.
-    features = types.SimpleNamespace(matmul_m_split=m, reduction_cores=1, cores=m * n)
-    assert CoOptimizingAllocator._matmul_division_menu(features, buffer) == (
-        DECODE_DIVISION,
-        ((4, 1, 32), (8, 1, 32), (1, 1, 16)),
+    buffer = _decode_buffer()
+    model = cp_model.CpModel()
+    wrapper = types.SimpleNamespace(
+        division=model.new_int_var(0, len(DECODE_MENU) - 1, "div"), buffer=buffer
     )
+    sym_map = {is_lx.name: model.new_bool_var("resident")}
+    buffer_map = {sym.name: (wrapper, ()) for sym in buffer.sym_core_divs.values()}
+    _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+    constraints = model.proto.constraints
+    # One lookup for the price, though ``expand`` repeats it under the gate,
+    # and the gate as enforced linear constraints rather than a product.
+    assert sum(c.has_element() for c in constraints) == 1
+    assert not any(c.has_int_prod() for c in constraints)
 
 
 @pytest.mark.parametrize("resident", [0, 1])

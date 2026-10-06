@@ -187,7 +187,9 @@ import dataclasses
 import math
 from collections.abc import Mapping, Sequence
 
+import regex
 import sympy
+from sympy.utilities.lambdify import implemented_function
 
 from .work_division import (
     _DECODE_MAX_ROWS,
@@ -435,11 +437,6 @@ class OpFeatures:
     # multiplier: the engine streams the whole strided span at ~K GB/s per core and a
     # core keeps 1/split of it (BW*split measured constant at 588/540/549).
     relayout_split: int = 0
-    # Co-optimizing path only: ``(division symbol, ((m, k, cores), ...))``, this op's
-    # M split, K split and core count at each candidate division, in the solver's
-    # candidate order. Lets a split-dependent price be a table over candidates
-    # (``DecodeDeliveryCharge``) instead of an expression the rewrite has to expand.
-    division_menu: tuple | None = None
 
     def read_bytes(self) -> int:
         """HBM bytes READ (input args). Each HBM arg is counted at its own device size,
@@ -1439,36 +1436,30 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     return total_bytes, ns
 
 
-class DecodeDeliveryCharge(sympy.Function):
-    """``DecodeDeliveryCharge(is_lx, division, price_0, ..., price_n)``: a decode
-    weight's delivery excess as one objective node, ``(1 - is_lx) * price[division]``.
+def _decode_delivery_price(weight_bytes, p: "CostParams"):
+    """A decode weight's delivery price as a functor of the work division: an
+    implemented function (``sympy.utilities.lambdify.implemented_function``) of the
+    op's M split, K split and core count whose ``_imp_`` is the ns to stream
+    ``weight_bytes`` at the delivery rate of that ``(m, k, cores)`` beyond their
+    time at the peak, clamped at zero and rounded to an integer.
 
-    The sibling of ``scratchpad.plan_solver.RelayoutCharge`` with the residency gate
-    inverted (a resident weight streams nothing). The price depends on the M split,
-    K split and core count together; as a Piecewise over those it took ~30 s to
-    rewrite and lower per matmul, as a table over the op's candidate divisions it is
-    one CP-SAT ``element`` lookup (``_SympyExprToCpSat._print_DecodeDeliveryCharge``)
-    and ``lambdify`` reads it through :meth:`_imp_`. An index past the table reads 0.
-    """
+    As a Piecewise over the splits the price took ~30 s to rewrite and lower per
+    matmul; as a functor each engine evaluates it at the divisions it considers:
+    CP-SAT calls it once per candidate of the owning buffer to build one
+    ``element`` lookup (``_SympyExprToCpSat._print_AppliedUndef``), ``lambdify``
+    and ``evalf`` call it at the chosen splits. Named by its two parameters, so
+    equal functors compare (and cache) equal."""
 
-    is_real = True
-    is_nonnegative = True
+    def price(m, k, cores):
+        bw = _decode_weight_delivery_gbps(round(cores), round(m), round(k))
+        return int(round(weight_bytes * max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)))
 
-    @classmethod
-    def eval(cls, is_lx, division, *prices):
-        if is_lx.is_Number:
-            if is_lx == 1:
-                return sympy.S.Zero
-            if division.is_Integer:
-                i = int(division)
-                price = prices[i] if 0 <= i < len(prices) else sympy.S.Zero
-                return (1 - is_lx) * price
-        return None
-
-    @staticmethod
-    def _imp_(is_lx, division, *prices):
-        i = int(round(division))
-        return (1 - is_lx) * (prices[i] if 0 <= i < len(prices) else 0)
+    # lambdify prints the name as a Python identifier.
+    tag = regex.sub(r"\W", "_", f"{weight_bytes}_{p.bw_peak_gbps!r}")
+    name = f"decode_delivery_price_{tag}"
+    return implemented_function(
+        sympy.Function(name, integer=True, nonnegative=True), price
+    )
 
 
 def _decode_weight(op) -> tuple | None:
@@ -1510,9 +1501,9 @@ def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
     ``_shared_operand_read_excess`` for this arg. Scope as ``_decode_weight``;
     single-pass bundles only, as for ``_partitioned_operand_read_excess``.
 
-    Under symbolic splits the price is one ``DecodeDeliveryCharge`` table over the
-    op's candidate divisions (``OpFeatures.division_menu``); without a menu the
-    split stays unpriced here, as before this term. Resident weights pay nothing."""
+    Under symbolic splits the price is a functor of the work division
+    (``_decode_delivery_price``), gated by residency; the engine evaluates it at
+    the op's candidate divisions. Resident weights pay nothing."""
     if not all(_is_single_pass(op) for op in ops):
         return 0.0
     total = 0.0
@@ -1533,15 +1524,10 @@ def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
 
         if not _is_sym(m_split, k_split, cores):
             excess = b * per_byte(m_split, k_split, cores)
-        elif op.division_menu is not None:
-            division, menu = op.division_menu
-            prices = [int(round(full * per_byte(m, k, c))) for m, k, c in menu]
-            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
-            excess = (
-                DecodeDeliveryCharge(is_lx, division, *prices) if any(prices) else 0
-            )
         else:
-            excess = 0.0
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            price = _decode_delivery_price(full, p)
+            excess = (1 - is_lx) * price(m_split, k_split, cores)
         if arg.is_graph_boundary:
             external[arg.name] = (
                 _max_traffic(external[arg.name], excess)
