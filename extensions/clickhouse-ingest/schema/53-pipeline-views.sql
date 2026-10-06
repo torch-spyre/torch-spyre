@@ -5,10 +5,11 @@ CREATE VIEW IF NOT EXISTS v_pipeline_runs AS
 SELECT *
 FROM pipeline_runs FINAL;
 
--- Orchestrator grain: each run with the child builds that failed under it and one outcome class.
--- own_component / other_component split on whether the PR's own repo is among the failed
--- builds; other_component is usually a dependency's broken main, but can be a real
--- downstream break the PR caused, so it is not labelled either way here.
+-- Top-level run grain (an orchestrator run or a GHA workflow run): each run with the child
+-- builds/jobs that failed under it and one outcome class. own_component / other_component split
+-- on whether the PR's own repo is among the failed builds; other_component is usually a
+-- dependency's broken main, but can be a real downstream break the PR caused, so it is not
+-- labelled either way here. A GHA run has no verdict: its conclusion stands in for one.
 CREATE VIEW IF NOT EXISTS v_pipeline_run_outcomes AS
 WITH children AS
 (
@@ -16,16 +17,17 @@ WITH children AS
         parent_run_key,
         count()                                                 AS child_builds,
         sum(duration_ms)                                        AS child_build_ms,
-        groupUniqArrayIf(component, result = 'failure')         AS failed_components,
-        groupArrayIf(tuple(component, arches, failed_stage, failure_reason), result = 'failure')
+        groupUniqArrayIf(component, result = 'failure' AND component != '') AS failed_components,
+        groupArrayIf(tuple(job_name, component, arches, failed_stage, failure_reason), result = 'failure')
                                                                 AS failed_builds,
         countIf(result = 'failure' AND failure_is_infra)        AS infra_failures
     FROM v_pipeline_runs
-    WHERE pipeline_type = 'component-build' AND parent_run_key != ''
+    WHERE pipeline_type IN ('component-build', 'gha-job') AND parent_run_key != ''
     GROUP BY parent_run_key
 )
 SELECT
-    r.run_key, r.job_name, r.build_number, r.build_url, r.started_at, r.ended_at,
+    r.run_key, r.source, r.pipeline_type, r.job_name, r.build_number, r.attempt, r.build_url,
+    r.started_at, r.ended_at,
     r.duration_ms, r.build_ms, r.test_ms, r.queue_ms,
     r.trigger_source, r.preset, r.repo, r.pr_number, r.sha, r.arches,
     r.state, r.result, r.verdict, r.superseded,
@@ -34,8 +36,8 @@ SELECT
     c.child_builds, c.child_build_ms, c.failed_components, c.failed_builds,
     multiIf(
         r.state = 'running',                                     'running',
-        r.superseded OR r.result = 'aborted',                    'superseded',
-        r.verdict = 'green',                                     'passed',
+        r.superseded OR r.result IN ('aborted', 'cancelled'),    'superseded',
+        r.verdict = 'green' OR (r.source = 'gha' AND r.result = 'success'), 'passed',
         r.failure_is_infra OR c.infra_failures > 0,              'infra',
         r.repo != '' AND has(c.failed_components, r.repo),       'own_component',
         notEmpty(c.failed_components),                           'other_component',
@@ -45,13 +47,14 @@ SELECT
     ) AS outcome
 FROM v_pipeline_runs AS r
 LEFT JOIN children AS c ON c.parent_run_key = r.run_key
-WHERE r.pipeline_type = 'orchestrator';
+WHERE r.pipeline_type IN ('orchestrator', 'gha-workflow');
 
--- Daily gate health per lane and repo: the stability, outcome mix and time split the CI report
--- draws. pass_rate leaves out superseded and running runs, which reached no verdict.
+-- Daily gate health per source, lane and repo: the stability, outcome mix and time split the CI
+-- report draws. pass_rate leaves out superseded and running runs, which reached no verdict.
 CREATE VIEW IF NOT EXISTS v_pipeline_gate_daily AS
 SELECT
     toDate(started_at)                                   AS day,
+    source,
     trigger_source,
     repo,
     count()                                              AS runs,
@@ -69,4 +72,4 @@ SELECT
     quantileIf(0.5)(build_ms, outcome = 'passed' AND build_ms > 0) / 60000 AS build_p50_min,
     quantileIf(0.5)(test_ms, outcome = 'passed' AND test_ms > 0) / 60000  AS test_p50_min
 FROM v_pipeline_run_outcomes
-GROUP BY day, trigger_source, repo;
+GROUP BY day, source, trigger_source, repo;
