@@ -211,10 +211,22 @@ enum class StepKind {
  * kAddress  – the slot carries the HBM device address of a tensor.
  *             value is resolved via compositeAddressToDeviceAddress() on
  *             inputs_outputs[tensor_id].
- * kDimension – the slot carries a runtime tensor dimension size,
- *             resolved by the frontend and stored in SymbolicArg::value.
- *             The consumer will TORCH_CHECK-fail on this kind until it
- *             is implemented.
+ * kDimension – the slot carries a runtime tensor dimension size, read at
+ *             launch as inputs_outputs[tensor_id].size(dim_index).
+ *
+ *             Read at launch rather than resolved by the frontend into
+ *             SymbolicArg::value, which is what an earlier version of this
+ *             comment described. The descriptor has to stay invariant across
+ *             launches -- it is built once when the kernel is prepared -- while
+ *             the size it names changes on every call, so the value cannot live
+ *             in the descriptor. SymbolicArg::value is unused for this kind.
+ *
+ *             It is the LOGICAL size, deliberately. Under a max-strided HBM
+ *             reservation the allocation is larger than the logical extent, and
+ *             it is the logical extent that varies per call and that a symbolic
+ *             loop's trip count has to track. Reading the allocated extent
+ *             would run the maximum number of trips on every call while
+ *             appearing to work.
  */
 enum class SymbolicArgKind : int32_t {
   kAddress = 0,
@@ -241,8 +253,11 @@ enum class SymbolicArgKind : int32_t {
  *   tensor_id  – index into LaunchContext::inputs_outputs.
  *   dim_index  – for kDimension: which dimension of that tensor.
  *                for kAddress:   unused (set to -1 by convention).
- *   value      – for kDimension: the front-end-resolved concrete dimension
- *                size. for kAddress:   unused (set to -1 by convention).
+ *   value      – unused by kAddress and kDimension, left at -1 for them.
+ *                kAddress resolves from tensor_id and kDimension reads the
+ *                size at launch; see the note on SymbolicArgKind above for why
+ *                a dimension's value cannot be carried here. kShardAddress
+ *                carries the expected per-shard device bytes in it.
  *
  */
 struct SymbolicArg {
@@ -566,7 +581,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   /**
    * @brief Resolve a symbolic_args payload to a vector of HostComputeArgs.
    *
-   * NOTE: kDimension is not yet implemented; only kAddress is supported.
+   * kAddress and kShardAddress resolve to a device address, kDimension to the
+   * logical size of inputs_outputs[tensor_id] along dim_index, read at launch.
    */
   static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
       const std::vector<at::Tensor>& tensors,
