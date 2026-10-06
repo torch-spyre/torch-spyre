@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS pipeline_runs
     ended_at          Nullable(DateTime64(3, 'UTC')),
     queue_ms          UInt64 DEFAULT 0,
     duration_ms       UInt64 DEFAULT 0,
-    -- Wall clock of the build and test phases, so build-vs-test needs no stage scrape.
+    -- Time before and during the tests (product-test is all test). An orchestrator's build_ms
+    -- spans its component builds, whose own test stages are split out on their rows.
     build_ms          UInt64 DEFAULT 0,
     test_ms           UInt64 DEFAULT 0,
 
