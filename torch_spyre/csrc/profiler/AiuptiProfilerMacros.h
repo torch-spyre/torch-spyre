@@ -27,15 +27,16 @@
 namespace KINETO_NAMESPACE {
 
 #define AIUPTI_CALL(returnCode)                                               \
-  {                                                                           \
-    if (returnCode != AIUPTI_SUCCESS) {                                       \
+  do {                                                                        \
+    const auto _aiupti_status = (returnCode);                                 \
+    if (_aiupti_status != AIUPTI_SUCCESS) {                                   \
       std::string funcMsg(__func__);                                          \
-      std::string codeMsg = std::to_string(returnCode);                       \
+      std::string codeMsg = std::to_string(_aiupti_status);                   \
       std::string HeadMsg("Kineto Profiler on AIU got error from function "); \
       std::string Msg(". The error code is ");                                \
       throw std::runtime_error(HeadMsg + funcMsg + Msg + codeMsg);            \
     }                                                                         \
-  }
+  } while (0)
 
 class AiuptiActivityApi;
 using DeviceIndex_t = int8_t;
