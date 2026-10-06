@@ -30,6 +30,9 @@ runs:
         PYTORCH_DIR: ${{ inputs.pytorch_dir }}
         PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
         SHA: ${{ inputs.sha }}
+        # Abort a stalled transfer so `retry` re-runs it instead of the job timing out.
+        GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+        GIT_HTTP_LOW_SPEED_TIME: '60'
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -87,7 +90,7 @@ runs:
           git remote add origin "$PYTORCH_REPO_URL"
         fi
 
-        retry git fetch --depth=1 origin "$FETCH_REF"
+        retry timeout 300 git fetch --depth=1 origin "$FETCH_REF"
 
         # Self-hosted runners may reuse a workspace across jobs; a previous
         # run's build (generated files, permission/line-ending changes from
@@ -99,7 +102,7 @@ runs:
 
         git submodule sync --recursive
         git submodule foreach --recursive 'git reset --hard HEAD && git clean -fdx' >/dev/null 2>&1 || true
-        retry git submodule update --init --recursive --depth 1 --jobs 8 --force
+        retry timeout 1200 git submodule update --init --recursive --depth 1 --jobs 8 --force
 
         git log -1 --oneline || true
 
