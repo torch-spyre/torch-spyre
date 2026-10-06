@@ -202,6 +202,20 @@ class TestResultWriter(RunWriter):
                 parameters=params,
             )
 
+    # run_case_counters_mv's columns; `recovered` exists only once migration 010 has run, and the
+    # writer is installed from main at run time, ahead of the schema.
+    _COUNTERS = {
+        "total_tests": "count()",
+        "passed": "countIf(status = 'passed')",
+        "failed": "countIf(status = 'failed')",
+        "errors": "countIf(status = 'error')",
+        "skipped": "countIf(status = 'skipped')",
+        "xfail": "countIf(status = 'xfail')",
+        "xpass": "countIf(status = 'xpass')",
+        "recovered": "countIf(status = 'passed' AND (props['result.prior_status'] IN "
+        "('failed', 'error') OR toUInt32OrZero(props['result.reruns']) > 0))",
+    }
+
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
         """Recount this run's run_case_counters from test_case_runs.
@@ -212,12 +226,18 @@ class TestResultWriter(RunWriter):
         counters = f"{db}.run_case_counters" if db else "run_case_counters"
         params = {"component": component, "run_id": run_id}
         where = "component = {component:String} AND run_id = {run_id:UUID}"
+        has_recovered = client.query(
+            "SELECT count() FROM system.columns WHERE table = 'run_case_counters' "
+            "AND name = 'recovered' AND database = "
+            + ("{db:String}" if db else "currentDatabase()"),
+            parameters={"db": db},
+        ).result_rows
+        recovered = bool(has_recovered and has_recovered[0][0])
+        cols = [c for c in cls._COUNTERS if c != "recovered" or recovered]
         client.command(f"DELETE FROM {counters} WHERE {where}", parameters=params)
         client.command(
-            f"INSERT INTO {counters} SELECT run_id, component, count(), "
-            "countIf(status = 'passed'), countIf(status = 'failed'), "
-            "countIf(status = 'error'), countIf(status = 'skipped'), "
-            "countIf(status = 'xfail'), countIf(status = 'xpass') "
+            f"INSERT INTO {counters} (run_id, component, {', '.join(cols)}) "
+            f"SELECT run_id, component, {', '.join(cls._COUNTERS[c] for c in cols)} "
             f"FROM {cls.fact_table.qualified(db)} WHERE {where} "
             "GROUP BY run_id, component",
             parameters=params,

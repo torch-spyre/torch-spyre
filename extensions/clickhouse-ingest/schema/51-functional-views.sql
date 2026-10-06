@@ -34,6 +34,9 @@ SELECT
     countIf(cr.status = 'passed') AS passed,
     countIf(cr.status IN ('failed', 'error')) AS failed,
     countIf(cr.status = 'skipped') AS skipped,
+    -- Of passed, as in run_case_counters.recovered.
+    countIf(cr.status = 'passed' AND (cr.props['result.prior_status'] IN ('failed', 'error')
+            OR toUInt32OrZero(cr.props['result.reruns']) > 0)) AS recovered,
     passed / runs AS pass_rate,
     avg(cr.duration_s) AS mean_duration_s,
     anyIf(cr.fail_message, cr.fail_message != '') AS sample_fail_message

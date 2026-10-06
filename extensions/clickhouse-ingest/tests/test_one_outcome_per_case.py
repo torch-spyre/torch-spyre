@@ -27,8 +27,9 @@ class HeldClient:
     """A client whose run already holds `held`: [(status, ran_in, run_attempt, source_file,
     [fail_message, prior_status, prior_message])]."""
 
-    def __init__(self, held=()):
+    def __init__(self, held=(), recovered=False):
         self.held = [(*h, "", "", "")[:7] for h in held]
+        self.recovered = recovered
         self.inserts, self.commands = [], []
 
     def insert(self, table, rows, column_names=None, database=None):
@@ -36,6 +37,8 @@ class HeldClient:
 
     def query(self, sql, parameters=None):
         rows = []
+        if "system.columns" in sql:
+            rows = [(int(self.recovered),)]
         if "audit_uuid" in sql:
             rows = [
                 (
@@ -132,6 +135,23 @@ def test_a_rerun_re_ingesting_an_unchanged_failure_records_no_prior_status():
     _write(c, "failed", attempt=2)
     assert _written(c) == ["failed"] and _deleted(c)
     assert "result.prior_status" not in _written_props(c)[0]
+
+
+def _recount(c):
+    return next(
+        s for s, _ in c.commands if s.startswith("INSERT INTO db.run_case_counters")
+    )
+
+
+def test_the_recount_names_its_columns_and_adds_recovered_only_once_it_exists():
+    for present in (False, True):
+        c = HeldClient([("failed", RUN, "1", "b.xml")], recovered=present)
+        _write(c, "passed", attempt=2)
+        sql = _recount(c)
+        assert sql.startswith(
+            "INSERT INTO db.run_case_counters (run_id, component, total_tests"
+        )
+        assert ("recovered" in sql) is present
 
 
 def test_an_older_attempt_arriving_late_is_not_written():
