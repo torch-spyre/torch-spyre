@@ -21,9 +21,8 @@ Three numbers come out of one symbolic count and they are easy to confuse. For
     the tile size              64   declared as ``granularity``, and the step
     the largest trip count      8   the SDSC's full pre-tiling extent
 
-The first two are carried on ``count_symbol_bounds``, which is what this file
-covers. The third is resolved separately, where the SDSC needs it. Mixing them
-up is silent: every one of the three is a plausible integer.
+The first two are carried on ``count_symbol_bounds``. The third is
+``max_trip_count``. Mixing them up is silent: every one is a plausible integer.
 
 
 The max and the tile size are resolved while the ShapeEnv exists and then
@@ -57,7 +56,9 @@ from torch_spyre._inductor.kernel_provenance import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import LoopSpec
 from torch_spyre._inductor.pass_utils import (
+    concretize_expr,
     decompose_tiled_count,
+    max_trip_count,
     symbolic_count_bounds,
 )
 from torch_spyre._inductor.spyre_kernel import (
@@ -105,6 +106,78 @@ def _graph_with_bounds(bounds, hint=None):
     if hint is not None:
         sizevars.optimization_hint = lambda _e: hint
     return SimpleNamespace(sizevars=sizevars)
+
+
+class TestTheThreeNumbersAreNotTheSameNumber(unittest.TestCase):
+    """One graph, two functions, two correct and different answers."""
+
+    def test_the_trip_count_and_the_dimension_ceiling_differ(self):
+        count = FloorDiv(_sym(), TILE)
+        graph = _graph_with_bounds(
+            {SYM: sympy.Integer(MAX), str(count): sympy.Integer(8)}
+        )
+
+        with V.set_graph_handler(graph):
+            trips = max_trip_count(count)
+            bounds = symbolic_count_bounds(count)
+
+        self.assertEqual(trips, 8)
+        self.assertEqual(bounds, {SYM: (MAX, TILE)})
+        self.assertNotEqual(trips, bounds[SYM][0])
+
+
+class TestMaxTripCount(unittest.TestCase):
+    def test_a_concrete_count_is_itself(self):
+        self.assertEqual(max_trip_count(sympy.Integer(4)), 4)
+        self.assertEqual(max_trip_count(4), 4)
+
+    def test_a_symbolic_count_takes_the_ceiling_not_the_hint(self):
+        """The hint is one call's size. Baking it in specialises the SDSC."""
+        count = FloorDiv(_sym(), TILE)
+        graph = _graph_with_bounds({str(count): sympy.Integer(8)}, hint=5)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(max_trip_count(count), 8)
+
+    def test_no_ceiling_refuses_and_names_the_symbol(self):
+        """There is no extent to describe, so guessing one is the wrong answer."""
+        count = FloorDiv(_sym(), TILE)
+
+        with V.set_graph_handler(_graph_with_bounds({})):
+            with self.assertRaises(Unsupported) as caught:
+                max_trip_count(count)
+
+        self.assertIn(SYM, str(caught.exception))
+        self.assertIn("no finite upper bound", str(caught.exception))
+
+
+class TestConcretizeExprPrefersTheDeclaredMax(unittest.TestCase):
+    """Geometry has to serve the range, not the warm-up call.
+
+    Measured the other way round: a binary built against a 320-row warm-up was
+    correct at 128 and 256 and wrong at 448 and 512. Over-declaring is
+    harmless, under-declaring is silently wrong.
+    """
+
+    def test_a_declared_symbol_resolves_to_its_ceiling(self):
+        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)}, hint=320)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(concretize_expr(_sym()), MAX)
+
+    def test_an_undeclared_symbol_still_takes_the_hint(self):
+        """The regression half. A dim that went dynamic by accident has no
+        ceiling, so nothing better than the hint exists and nothing changes."""
+        graph = _graph_with_bounds({}, hint=320)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(concretize_expr(_sym()), 320)
+
+    def test_concrete_values_are_untouched(self):
+        """Which is why this change cannot reach a static kernel: every
+        expression in one returns before the ShapeEnv is consulted at all."""
+        self.assertEqual(concretize_expr(64), 64)
+        self.assertEqual(concretize_expr(sympy.Integer(64)), 64)
 
 
 class TestTheProducer(unittest.TestCase):
