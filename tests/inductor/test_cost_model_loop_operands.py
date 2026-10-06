@@ -209,6 +209,83 @@ def test_burst_excess_follows_a_symbolic_split():
     assert float(expr.subs(split, 32)) > float(expr.subs(split, 1))
 
 
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_burst_price_agrees_before_and_after_replication_is_chosen(broadcast):
+    replication, split = sympy.symbols(
+        "split_bmm_m split_bmm_n", integer=True, positive=True
+    )
+    resident = sympy.Symbol("is_lx_buf0", integer=True)
+    p = CostParams()
+    op = _streamed(8 * p.transport_dma_word_bytes / split, resident=resident)
+    arg = dataclasses.replace(
+        op.args[1], replication=replication, broadcast=broadcast, loop_factor=TRIPS
+    )
+    op = dataclasses.replace(op, args=[op.args[0], arg])
+    expr = sympy.sympify(_read_burst_excess_ns([op], p))
+    for replicas in (1, 2, 8):
+        for divisor in (1, 8, 16):
+            for is_lx in (False, True):
+                concrete_arg = dataclasses.replace(
+                    arg,
+                    replication=replicas,
+                    read_run_bytes=8 * p.transport_dma_word_bytes / divisor,
+                    is_lx=is_lx,
+                )
+                concrete = dataclasses.replace(op, args=[op.args[0], concrete_arg])
+                expected = float(_read_burst_excess_ns([concrete], p))
+                actual = float(
+                    expr.subs(
+                        {replication: replicas, split: divisor, resident: int(is_lx)}
+                    )
+                )
+                assert actual == pytest.approx(expected)
+                if is_lx or (not broadcast and replicas > 1):
+                    assert expected == 0
+                elif divisor >= 8:
+                    assert expected > 0
+
+
+def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+
+    replication, split = sympy.symbols(
+        "split_bmm_m split_bmm_n", integer=True, positive=True
+    )
+    resident = sympy.Symbol("is_lx_buf0", integer=True)
+    p = CostParams()
+    op = _streamed(8 * p.transport_dma_word_bytes / split, resident=resident)
+    arg = dataclasses.replace(op.args[1], replication=replication)
+    op = dataclasses.replace(op, args=[op.args[0], arg])
+    expr = sympy.sympify(_read_burst_excess_ns([op], p))
+    model = cp_model.CpModel()
+    variables = {
+        replication.name: model.new_int_var(1, 2, replication.name),
+        split.name: model.new_int_var(1, 8, split.name),
+        resident.name: model.new_bool_var(resident.name),
+    }
+    model.minimize(_SympyExprToCpSat(model, variables, {}).convert(expr))
+    solver = cp_model.CpSolver()
+    for replicas, divisor, is_lx in ((1, 1, 0), (1, 8, 0), (2, 8, 0), (1, 8, 1)):
+        fixed = model.clone()
+        for symbol, value in (
+            (replication, replicas),
+            (split, divisor),
+            (resident, is_lx),
+        ):
+            fixed.add(variables[symbol.name] == value)
+        concrete_arg = dataclasses.replace(
+            arg,
+            replication=replicas,
+            read_run_bytes=8 * p.transport_dma_word_bytes / divisor,
+            is_lx=bool(is_lx),
+        )
+        concrete = dataclasses.replace(op, args=[op.args[0], concrete_arg])
+        expected = float(_read_burst_excess_ns([concrete], p))
+        assert solver.solve(fixed) == cp_model.OPTIMAL
+        assert solver.objective_value == pytest.approx(expected, abs=1)
+
+
 # ------------------------------------------------- stick-plane run geometry
 
 
@@ -313,6 +390,42 @@ def test_batch_split_cost_follows_symbolic_splits(monkeypatch):
     assert at(1, 1, 32) == pytest.approx(0, abs=1e-6)
     assert at(4, 2, 2) == pytest.approx(rate * 8 * 2)
     assert at(2, 1, 8) == pytest.approx(0, abs=1e-6)
+
+
+def test_batch_split_latency_changes_the_cost_and_is_explained():
+    # Equal work on 32 cores: 16 batch x 2 M versus 4 batch x 8 M. Keep HBM
+    # traffic out of this example so the compute-side correction is visible.
+    def bmm(m_split):
+        return OpFeatures(
+            name="bmm",
+            is_reduction=True,
+            is_matmul=True,
+            out_elems=16 * 1024 * 128,
+            cores=32,
+            dtype_bytes=2,
+            args=[],
+            matmul_macs=8 * 16 * 1024 * 128 * 512,
+            matmul_rows_per_core=1024 / m_split,
+            matmul_cols_per_core=128,
+            matmul_a_bytes=1024 * 512 * 2,
+            matmul_b_bytes=512 * 128 * 2,
+            matmul_m_split=m_split,
+            loop_trip=8,
+        )
+
+    p = CostParams(use_bundled_cost_model=False)
+    disabled = dataclasses.replace(p, mm_batch_split_ns_per_step=0)
+    batch, rows = bmm(2), bmm(8)
+    assert predict_ops([batch], disabled) == pytest.approx(
+        predict_ops([rows], disabled)
+    )
+    assert predict_ops([batch], p) > predict_ops([rows], p)
+    assert "batched-matmul batch splits: +64.00 us" in explain([batch], p)
+    assert "batched-matmul batch splits" not in explain([rows], p)
+    assert "batched-matmul batch splits" not in explain([batch], disabled)
+    assert "batched-matmul batch splits" not in explain(
+        [batch], dataclasses.replace(p, use_bundled_cost_model=True)
+    )
 
 
 def test_co_optimizer_prices_batch_splits_of_an_sdpa_scan(monkeypatch, tmp_path):

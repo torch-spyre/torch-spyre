@@ -936,10 +936,12 @@ class CostParams:
     # gives up by splitting its batch dims instead, at the same core count (the
     # batch-split preference of work_division._matmul_split_cost, made a
     # latency). Only M splits that keep mm_batch_split_min_m_rows rows per core
-    # count. Fitted to device kernel time over 71 compiles of 6 Granite GQA SDPA
-    # chunks, whose equally priced divisions differed only in how the scan
-    # matmuls split KV heads/groups vs query rows: 4.0 us per step
-    # (leave-one-graph-out 2.3-4.5 us); 0 disables it.
+    # count. Empirical: 71 compiles of 6 Granite GQA chunks gave 4.02 us per step
+    # with a 64-row bound (leave-one-graph-out 2.25-4.52 us). Only 3 graphs varied
+    # in this feature, and non-matmul divisions also varied, so the fit does not
+    # isolate matmul latency. Retained at 4 us for device validation with the
+    # 128-row bound below; refitting that bound gives 6.59 us (3.54-7.47 us),
+    # which has not been validated on device. 0 disables this correction.
     mm_batch_split_ns_per_step: float = 4000.0
     # Rows per core an M split must leave for its step to count. Empirical, not
     # a hardware constant: deeptools streams M in tiles of up to 64 rows, but
@@ -2250,9 +2252,8 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             run = getattr(arg, "read_run_bytes", None)
             if arg.role != "input" or run is None:
                 continue
-            if not arg.broadcast and not (
-                isinstance(arg.replication, int) and arg.replication == 1
-            ):
+            replication = sympy.sympify(arg.replication)
+            if not arg.broadcast and replication.is_number and replication != 1:
                 continue
             payload = arg.elems * op.dtype_bytes
             if payload <= 0:
@@ -2298,6 +2299,11 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 )
             else:
                 excess = for_run(requests)
+            if not arg.broadcast and replication != 1:
+                # The solver can choose an unreplicated read. Charge its bursts
+                # just as the concrete model does; only replicated per-core
+                # loads are already covered by _replicated_operand_reads.
+                excess = sympy.Piecewise((excess, sympy.Eq(replication, 1)), (0, True))
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
             total += (1 - is_lx) * lf * excess
@@ -2815,6 +2821,14 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             f"({p.mm_partitioned_read_gbps_per_core:g} GB/s per reading core; "
             "before compute overlap)"
         )
+    batch_split_extra = (
+        0.0 if p.use_bundled_cost_model else _matmul_batch_split_ns(ops, p)
+    )
+    if batch_split_extra:
+        lines.append(
+            f"     batched-matmul batch splits: +{float(batch_split_extra) / 1000:.2f} us "
+            "(empirical compute correction; before compute overlap)"
+        )
     burst_extra = _read_burst_excess_ns(ops, p)
     if burst_extra:
         lines.append(
@@ -2842,7 +2856,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
         )
-        compute_ns = 0.0
+        compute_ns = batch_split_extra
         for o in ops:
             if not getattr(o, "is_matmul", False):
                 continue
