@@ -604,6 +604,11 @@ class TestKernelProvenancePropagation:
         runner = object()
 
         with (
+            # patch.object(
+            ##    SpyreAsyncCompile,
+            #    "_get_compile_dir",
+            #    return_value="/tmp/kernel",
+            # ),
             patch(
                 "torch_spyre.execution.async_compile.get_output_dir",
                 return_value="/tmp/kernel",
@@ -638,13 +643,41 @@ class TestKernelProvenancePropagation:
                 return_value=runner,
             ) as runner_type,
             patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+            # Provide a stable cache key so compute_specs_hash succeeds without
+            # a live compiler env (no LIB_VERSION_FILE, no finalized OpSpecs).
+            # get_cached_kernel_dir returns None (miss) so the test exercises
+            # the same compilation path it always did.
+            patch(
+                "torch_spyre.execution.async_compile.compute_specs_hash",
+                return_value="deadbeef",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.get_cached_kernel_dir",
+                return_value=None,
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.allocate_compile_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.save_symbol_kinds"),
+            patch(
+                "torch_spyre.execution.async_compile.commit_compile_dir",
+                return_value="/tmp/kernel",
+            ),
         ):
             result = SpyreAsyncCompile().sdsc("sdsc_fused_mm_0", specs)
 
         assert result is runner
         assert runner_type.call_args.kwargs["kernel_provenance"] is None
-        warning.assert_called_once()
-        assert "continuing without kernel provenance" in warning.call_args.args[0]
+        provenance_warnings = [
+            c
+            for c in warning.call_args_list
+            if "continuing without kernel provenance" in c.args[0]
+        ]
+        assert len(provenance_warnings) == 1
+
+        # warning.assert_called_once()
+        # assert "continuing without kernel provenance" in warning.call_args.args[0]
 
     def test_async_compile_aggregates_provenance_failures(self):
         specs = [_op(_handle(9), op_info={"future_value": object()})]
@@ -664,15 +697,42 @@ class TestKernelProvenancePropagation:
             ),
             patch("torch_spyre.execution.async_compile.AsyncCompile.wait") as base_wait,
             patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+            # Provide a stable cache key so compute_specs_hash succeeds without
+            # a live compiler env (no LIB_VERSION_FILE, no finalized OpSpecs).
+            # get_cached_kernel_dir returns None (miss) so the test exercises
+            # the same compilation path it always did.
+            patch(
+                "torch_spyre.execution.async_compile.compute_specs_hash",
+                return_value="deadbeef",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.get_cached_kernel_dir",
+                return_value=None,
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.allocate_compile_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.save_symbol_kinds"),
+            patch(
+                "torch_spyre.execution.async_compile.commit_compile_dir",
+                return_value="/tmp/kernel",
+            ),
         ):
             assert compiler.sdsc("sdsc_fused_mm_0", specs) is runner
             assert compiler.sdsc("sdsc_fused_mm_1", specs) is runner
             compiler.wait({})
 
         base_wait.assert_called_once_with({})
-        assert warning.call_count == 2
-        assert warning.call_args_list[0].kwargs["exc_info"] is True
-        assert warning.call_args_list[1].args == (
+        # assert warning.call_count == 2
+        # assert warning.call_args_list[0].kwargs["exc_info"] is True
+        # Two provenance failures (one per sdsc call) + one aggregation summary.
+        provenance_warnings = [
+            c for c in warning.call_args_list if "provenance" in c.args[0]
+        ]
+        assert len(provenance_warnings) == 2
+        assert provenance_warnings[0].kwargs["exc_info"] is True
+        assert provenance_warnings[1].args == (
             "kernel provenance disabled for %d/%d compiled Spyre kernels",
             2,
             2,

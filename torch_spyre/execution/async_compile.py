@@ -338,9 +338,28 @@ class SpyreAsyncCompile(AsyncCompile):
                     specs, kernel_name=kernel_name, pool_size=pool_size
                 )
             except RuntimeError as e:
-                logger.warning(
-                    "Kernel cache disabled for %s: could not compute cache key: %s. "
-                    "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
+                # LIB_VERSION_FILE missing/unreadable — user-actionable.
+                # _get_dxp_version() already emits this warning once per
+                # process; disable the cache and fall through to a fresh
+                # compile.
+                use_cache = False
+                logger.debug(
+                    "Kernel cache disabled for %s: could not compute cache key: %s",
+                    kernel_name,
+                    e,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Specs contain an unserializable value, un-finalized OpSpec,
+                # unexpected import error, etc.  The provenance step already
+                # logged this if it also failed; silently skip the cache rather
+                # than double-warning.
+                use_cache = False
+                logger.debug(
+                    "Kernel cache disabled for %s: could not compute cache key: %s",
+                    # LIB_VERSION_FILE missing or unreadable — user-actionable.
+                    # logger.warning(
+                    #    "Kernel cache disabled for %s: could not compute cache key: %s. "
+                    #    "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
                     kernel_name,
                     e,
                 )
@@ -387,7 +406,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_provenance=kernel_provenance,
                         symbol_kinds=symbol_kinds,
                     )
-                except Exception:  # subprocess.CalledProcessError:
+                except Exception:  # noqa: BLE001
                     # Move the failed dir to failed/ for manual debugging
                     # rather than leaving .tmp. dirs accumulating in the root.
                     _move_to_failed_dir(compile_dir)

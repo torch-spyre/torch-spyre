@@ -800,17 +800,82 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
 
 @contextmanager
 def capture_backend_output_dirs():
-    """Record the backend output directory of every kernel compiled inside."""
+    """Record the final kernel directory for every kernel resolved inside the context.
+
+    Intercepts all three paths through SpyreAsyncCompile.sdsc():
+
+    - No-cache  (SPYRE_KERNEL_CACHE=0): patches ``get_output_dir``.
+    - Cache miss (first compile):        patches ``commit_compile_dir`` in
+      kernel_cache, which returns the committed directory after the rename.
+    - Cache hit  (binary already on disk): patches ``get_cached_kernel_dir``
+      in kernel_cache, which returns the existing directory.
+    """
+
     output_dirs = []
+
     get_output_dir = async_compile_module.get_output_dir
 
-    def capture(kernel_name):
+    def capture_fresh(kernel_name):
         output_dir = get_output_dir(kernel_name)
         output_dirs.append(Path(output_dir))
         return output_dir
 
-    with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
+    # async_compile imports get_cached_kernel_dir directly, so we must patch
+    # the binding on the async_compile module itself (not kernel_cache) to
+    # intercept cache hits when SPYRE_KERNEL_CACHE=1.
+    get_cached_kernel_dir = async_compile_module.get_cached_kernel_dir
+
+    def capture_cached(cache_key):
+        cached_dir = get_cached_kernel_dir(cache_key)
+        if cached_dir is not None:
+            output_dirs.append(Path(cached_dir))
+        return cached_dir
+
+    # Path 3: cache MISS → compile_dir is committed to the cache root via
+    # commit_compile_dir(tmp_dir, cache_key) which returns the final dir.
+    commit_compile_dir = async_compile_module.commit_compile_dir
+
+    def capture_committed(tmp_dir, cache_key):
+        final_dir = commit_compile_dir(tmp_dir, cache_key)
+        output_dirs.append(Path(final_dir))
+        return final_dir
+
+    with (
+        mock_patch.object(
+            async_compile_module, "get_output_dir", side_effect=capture_fresh
+        ),
+        mock_patch.object(
+            async_compile_module, "get_cached_kernel_dir", side_effect=capture_cached
+        ),
+        mock_patch.object(
+            async_compile_module, "commit_compile_dir", side_effect=capture_committed
+        ),
+    ):
         yield output_dirs
+    """
+    def _capture_(kernel_name):
+        d = _real_get_output_dir(kernel_name)
+        output_dirs.append(Path(d))
+        return d
+
+    def _capture_miss(tmp_dir, cache_key):
+        d = _real_commit(tmp_dir, cache_key)
+        output_dirs.append(Path(d))
+        return d
+
+    def _capture_hit(cache_key):
+        d = _real_get_cached(cache_key)
+        if d is not None:
+            output_dirs.append(Path(d))
+        return d
+
+    with (
+        mock_patch.object(async_compile_module, "get_output_dir", _capture_no_cache),
+        mock_patch.object(async_compile_module, "commit_compile_dir", _capture_miss),
+        mock_patch.object(async_compile_module, "get_cached_kernel_dir", _capture_hit),
+    ):
+        yield output_dirs
+    """
 
 
 def assert_lx_only_relayout_payload(output_dirs):

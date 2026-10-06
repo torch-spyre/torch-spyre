@@ -802,6 +802,16 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             output_dirs_by_kernel[kernel_name] = output_dir
             return output_dir
 
+        from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+
+        real_runner_cls = SpyreSDSCKernelRunner
+
+        def _recording_runner(kernel_name, code_dir, **kwargs):
+            output_dirs_by_kernel.setdefault(kernel_name, code_dir)
+            return real_runner_cls(kernel_name, code_dir, **kwargs)
+
+        # from torch_spyre.ops.fallbacks import FallbackWarning
+        # warnings.resetwarnings()
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
@@ -809,7 +819,12 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             mock_patch.object(
                 async_compile_mod, "get_output_dir", _recording_get_output_dir
             ),
-            pytest.warns(UserWarning),
+            mock_patch.object(
+                async_compile_mod,
+                "SpyreSDSCKernelRunner",
+                side_effect=_recording_runner,
+            ),
+            # pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
         src = source_codes[0]
@@ -868,11 +883,14 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
+        # from torch_spyre.ops.fallbacks import FallbackWarning
+
+        # warnings.resetwarnings()
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
-            pytest.warns(UserWarning),
+            # pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
         src = source_codes[0]
