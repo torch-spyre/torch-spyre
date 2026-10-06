@@ -28,7 +28,12 @@ from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    format_op_spec_list,
+    walk_loop_specs,
+)
 from torch_spyre._inductor.op_spec_validation import validate_op_specs
 
 
@@ -91,6 +96,44 @@ def _dedup_syms(
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+
+def _merge_loop_symbol_maps(specs, attr: str) -> dict:
+    """Union one per-symbol map across every LoopSpec in the tree.
+
+    Both ``count_symbol_bounds`` and ``count_symbol_sources`` are per-loop, but a
+    bundle declares ONE parameter per dimension, so the maps have to agree.
+
+    Conflicting values raise rather than silently picking one. For bounds that
+    means two loops disagree about a dimension's max or tile size, and the
+    parameter would be wrong for one of them. For sources it means two loops read
+    the same dimension off different launch arguments, and the parameter would
+    bind from the wrong tensor.
+
+    The bounds conflict becomes reachable the moment tile sizes are chosen per
+    kernel, and the right answer then is the lcm of the steps together with the
+    rule that every tile size divides the declared granularity. Until that
+    exists, refusing is correct and deliberately stricter than necessary: it also
+    rejects the legal case where both steps divide the granularity.
+
+    Values are normalised to tuples, because the reload path reconstructs them
+    from generated source and a sequence literal there is not required to come
+    back as the same type it went out as.
+    """
+    merged: dict = {}
+    for loop in walk_loop_specs(specs):
+        for sym_name, raw in (getattr(loop, attr, None) or {}).items():
+            value = tuple(raw)
+            existing = merged.get(sym_name)
+            if existing is not None and existing != value:
+                raise NotImplementedError(
+                    f"two loops in one kernel disagree about {sym_name}: "
+                    f"{attr} is {existing} on one and {value} on another. A "
+                    f"bundle declares one parameter per dimension, so it cannot "
+                    f"serve both. See _merge_loop_symbol_maps."
+                )
+            merged[sym_name] = value
+    return merged
 
 
 def generate_bundle(
@@ -285,6 +328,23 @@ def generate_bundle(
         for sym_idx in dimension_sym_indices
     }
 
+    # Loop-bound dimensions come from the SPEC TREE, not from symbol_kinds. That
+    # distinction is the whole reason this route exists: symbol_kinds is
+    # flattened from the compiled SDSCs above, and a loop dimension never enters
+    # an SDSC, so scanning it for one finds nothing, always. The dimension lives
+    # on the LoopSpec that needs it, as the bounds the scheduler resolved and the
+    # source it placed.
+    #
+    # Deduplicated across loops by symbol name, because the same shape variable
+    # reaches every loop that tiles on it and one bundle parameter serves them
+    # all. The name is the key for the reason it is everywhere else on this path:
+    # it is what survives the reload.
+    loop_dim_bounds = _merge_loop_symbol_maps(specs_list, "count_symbol_bounds")
+    loop_dim_sources = _merge_loop_symbol_maps(specs_list, "count_symbol_sources")
+    loop_dim_ssa: dict[str, str] = {
+        sym_name: f"%dim_{sym_name}" for sym_name in loop_dim_bounds
+    }
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 
@@ -318,6 +378,7 @@ def generate_bundle(
             or kernel_arg_sym_indices
             or shard_sym_indices
             or dimension_sym_indices
+            or loop_dim_bounds
         ):
             params = []
             if emit_pool_param:
@@ -338,6 +399,41 @@ def generate_bundle(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
+            # Last, so adding a loop dimension never shifts an existing
+            # parameter's position: the runtime fills these slots by order.
+            #
+            # The SymbolKind is CONSTRUCTED here rather than looked up, because
+            # this is the first point where everything it needs is in one place:
+            # the bounds from the scheduler, the source it placed, and the
+            # parameter position. param_symbol_kinds is what generate_bundle
+            # returns and what the launch path reads to build its argument
+            # payload, so a loop dimension has to appear in it or the runtime has
+            # nothing telling it to read a size rather than an address.
+            for sym_name, (max_value, granularity) in loop_dim_bounds.items():
+                source = loop_dim_sources.get(sym_name)
+                if source is None:
+                    raise NotImplementedError(
+                        f"symbolic loop dimension {sym_name} has bounds "
+                        f"{(max_value, granularity)} but no source, so nothing "
+                        f"at launch knows which tensor dimension to bind into "
+                        f"its parameter. SpyreKernel._resolve_loop_dimension_"
+                        f"sources is where that is worked out, and it logs the "
+                        f"launch arguments it looked at. Refusing to declare a "
+                        f"parameter nothing can fill, rather than binding a "
+                        f"wrong number on every launch."
+                    )
+                arg_index, dim_index = source
+                dim_kind = SymbolKind.loop_dimension(
+                    granularity=granularity,
+                    max_value=max_value,
+                    pytorch_sym=sym_name,
+                    arg_index=arg_index,
+                    dim_index=dim_index,
+                )
+                params.append(
+                    f"{loop_dim_ssa[sym_name]}_base: {_dim_input_arg_type(dim_kind)}"
+                )
+                param_symbol_kinds.append(dim_kind)
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -378,11 +474,23 @@ def generate_bundle(
                 f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
             )
 
-        # One LoopLevel per loop, in _collect_loop_bounds order. A concrete
-        # count keeps the constant-bound, step-1 form this emitter has always
-        # produced. A symbolic one needs an input_arg to read its dimension
-        # from, which nothing declares yet, so _loop_level refuses it.
-        loop_dim_ssa: dict[str, str] = {}
+        # Before the loop constants on purpose: a symbolic bound IS one of these
+        # SSA values, so it has to be in scope by the time the loop setup below
+        # refers to it.
+        for sym_name, (max_value, granularity) in loop_dim_bounds.items():
+            name = loop_dim_ssa[sym_name]
+            arg_type = (
+                f"!sdscbundle.input_arg<index, granularity={granularity}, "
+                f"max_value={max_value}>"
+            )
+            f.write(
+                f"\t\t{name} = sdscbundle.input_arg_extract value from"
+                f" {name}_base : {arg_type} -> index\n"
+            )
+
+        # One LoopLevel per loop, in _collect_loop_bounds order. A concrete count
+        # keeps the constant-bound, step-1 form this emitter has always produced;
+        # a symbolic one becomes "to <dim> step <G>". See _loop_level.
         loop_levels = [
             _loop_level(lb, lb_idx, loop_dim_ssa)
             for lb_idx, lb in enumerate(loop_bounds)
