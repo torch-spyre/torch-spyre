@@ -20,6 +20,12 @@ inputs:
       the pyproject.toml-derived release branch below.
     required: false
     default: ''
+  submodules:
+    description: |
+      Also fetch pytorch's submodules. Only a from-source build needs them;
+      tests read nothing outside ${TORCH_ROOT}/test.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -34,6 +40,7 @@ runs:
         # Abort a stalled transfer so `retry` re-runs it instead of the job timing out.
         GIT_HTTP_LOW_SPEED_LIMIT: '1000'
         GIT_HTTP_LOW_SPEED_TIME: '60'
+        SUBMODULES: ${{ inputs.submodules }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -113,9 +120,11 @@ runs:
         git clean -fdx >/dev/null 2>&1 || true
         git checkout --force --detach FETCH_HEAD
 
-        git submodule sync --recursive
-        git submodule foreach --recursive 'git reset --hard HEAD && git clean -fdx' >/dev/null 2>&1 || true
-        retry timeout 1200 git submodule update --init --recursive --depth 1 --jobs 8 --force
+        if [[ "$SUBMODULES" == "true" ]]; then
+          git submodule sync --recursive
+          git submodule foreach --recursive 'git reset --hard HEAD && git clean -fdx' >/dev/null 2>&1 || true
+          retry timeout 1200 git submodule update --init --recursive --depth 1 --jobs 8 --force
+        fi
 
         git log -1 --oneline || true
 
