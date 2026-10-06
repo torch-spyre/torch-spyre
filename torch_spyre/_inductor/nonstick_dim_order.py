@@ -12,16 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reorder non-stick device dimensions for better work division.
+"""Reorder non-stick device dimensions for correctness and performance.
 
-Runs between propagate_layouts and optimize_restickify. Walks the graph
-backward to find matmul inputs, then swaps the largest non-stick device dim
-into the slot between the two stick dims (outer_stick+1), so the most work
-is parallelised across the widest dimension.
+Runs after optimize_restickify_locations and before finalize_layouts. At that
+point each buffer has a single committed_stl chosen by the beam optimizer;
+stick choices are final and these rewrites affect only non-stick dim ordering.
+
+Two phases, in order:
+
+  Phase 1 — constraint transforms (run first, establish pinned_dims):
+    gather IA constraint
+      The indirectly-indexed dimension of a gather value tensor must sit at
+      device position 0.  This is a hardware requirement, not a hint.
+    scatter IA constraint
+      The scattered dimension of a scatter destination must sit at device
+      position 0.  Same reason.
+
+  Phase 2 — performance transforms (run second, respect pinned_dims):
+    matmul perf reorder
+      For factorised-stick layouts, swaps the largest non-pinned nonstick dim
+      into the slot between the two stick dims (outer_stick+1) so the widest
+      loop variable carries the most work.
+
+Each transform is tried independently per phase; constraint transforms run
+first and record which device positions they have fixed (pinned_dims).  The
+performance transform runs second and respects those pins.  This is correct
+today because the constraint and performance transforms target structurally
+different dimensions — the IA constraint fixes the indexed dim at position 0,
+while the matmul reorder moves the *largest remaining* dim into a different
+slot.  If a future use case requires more complex composition, extend
+pinned_dims or replace the two-phase structure with explicit dim-order
+constraint solving.
+pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on graph)
 """
 
-from torch._inductor.graph import GraphLowering
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Reduction
 from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
@@ -37,79 +63,71 @@ def _reorder_stl(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     name: str = "",
-) -> SpyreTensorLayout:
-    """Swap the largest non-stick dim into the slot between the two stick dims.
+    pinned: set[int] | None = None,
+) -> SpyreTensorLayout | None:
+    """Swap the largest non-pinned nonstick dim into the outer_stick+1 slot.
 
-    A factorised stick produces two dims that share the same loop variable:
-    floor(d/64) at position outer_stick and Mod(d/64) at the last position.
-    This function moves the largest remaining dim into outer_stick+1 — the
-    slot between them — so the compiler assigns the most iterations to the
-    widest loop variable.
+    Returns a new STL if a swap was made, or None if no change is needed.
+    pinned is a set of device positions that must not be moved or displaced.
     """
-    # Non-STANDARD element arrangements have hardware-defined dimension
-    # semantics; reordering them corrupts the DDL template matching.
     if stl.element_arrangement != ElementArrangement.STANDARD:
-        return stl
+        return None
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
     if n <= 2:
-        return stl
+        return None
 
     idc = try_device_coordinates(stl, dep, {})
     if idc is None:
-        return stl
+        return None
 
-    # Find the stick variable from the last dim's coordinate.
     stick_syms = idc[-1].free_symbols
     if not stick_syms:
-        # Degenerate/broadcast stick (constant 0): nothing to do.
-        return stl
+        return None
 
-    # Find the outer stick dim: the non-last dim that shares the stick variable.
     outer_stick = None
     for i in range(n - 2, -1, -1):
         if idc[i].free_symbols & stick_syms:
             outer_stick = i
             break
     if outer_stick is None:
-        return stl  # unsplit stick, no slot to fill
+        return None
 
     slot = outer_stick + 1
-    logger.debug(
-        "nonstick_dim_order: %s idc=%s outer_stick=%d slot=%d n=%d",
-        name,
-        [str(x) for x in idc],
-        outer_stick,
-        slot,
-        n,
-    )
     if slot >= n - 1:
-        logger.debug(
-            "nonstick_dim_order: skipping %s — no room between stick dims"
-            " (outer_stick=%d, n=%d)",
-            name,
-            outer_stick,
-            n,
-        )
-        return stl
+        return None
 
-    # Only move dims from outside (before outer_stick) into the slot,
-    # and only if the largest outside dim is bigger than what's already there.
-    # Exclude dims with constant (zero free-symbol) coordinates — these are
-    # padding/gap dims prepended by restickify/compact and must not be moved.
-    candidates = [d for d in range(outer_stick) if idc[d].free_symbols]
+    # If the slot itself is pinned, we cannot move anything into it.
+    if pinned and slot in pinned:
+        logger.debug("nonstick_dim_order: skipping %s — slot %d is pinned", name, slot)
+        return None
+
+    # Only consider dims before outer_stick with real (non-constant) coordinates
+    # that are not pinned.
+    candidates = [
+        d
+        for d in range(outer_stick)
+        if idc[d].free_symbols and (not pinned or d not in pinned)
+    ]
     if not candidates:
-        return stl
+        return None
     largest = max(candidates, key=lambda d: device_size[d])
     if device_size[largest] <= device_size[slot]:
-        return stl  # already optimal or nothing to gain
+        return None
 
-    # Swap largest into slot.
     new_order = list(range(n))
     new_order[slot], new_order[largest] = new_order[largest], new_order[slot]
     new_device_size = [device_size[d] for d in new_order]
     new_stride_map = [stride_map[d] for d in new_order]
+    logger.debug(
+        "[NDO] %s  %s -> %s  stride_map %s -> %s",
+        name,
+        device_size,
+        new_device_size,
+        list(stl.stride_map),
+        new_stride_map,
+    )
     return SpyreTensorLayout(
         device_size=new_device_size,
         stride_map=new_stride_map,
@@ -117,92 +135,87 @@ def _reorder_stl(
     )
 
 
-def _backward_pass(graph: GraphLowering) -> set[str]:
-    """Walk graph in reverse; collect names of matmul inputs to reorder."""
-    targets: set[str] = set()
+def _try_matmul_perf_reorder(
+    buf: ComputedBuffer,
+    pinned: set[int],
+) -> SpyreTensorLayout | None:
+    """Return a reordered STL for buf if matmul perf reorder applies, else None.
+
+    Uses the buffer's own write dep to compute device coordinates, matching
+    the index expressions the buffer was actually written with.
+    """
+    if not hasattr(buf, "committed_stl"):
+        return None
+    write_dep = next(iter(buf.get_read_writes().writes), None)
+    if write_dep is None:
+        return None
+    return _reorder_stl(buf.committed_stl, write_dep, buf.get_name(), pinned)
+
+
+def _collect_matmul_input_bufs(
+    graph: GraphLowering,
+) -> list[ComputedBuffer]:
+    """Walk graph backward; collect ComputedBuffers that feed matmul ops.
+
+    Returns a deduplicated list of ComputedBuffer instances that are read by
+    any matmul op and are not graph inputs.
+
+    Indirect-access (gather/scatter) candidates will be added in follow-up tasks.
+    """
+    seen: set[str] = set()
+    result: list[ComputedBuffer] = []
     graph_inputs = set(V.graph.graph_input_names)
     for op in reversed(graph.operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
         if not hasattr(op, "data"):
             continue
-        if not isinstance(op.data, Reduction):
-            continue
-        if op.data.reduction_type not in MATMUL_REDUCTION_OPS:
-            continue
-        out_name = op.get_name()
-        for dep in op.get_read_writes().reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            if dep.name in graph_inputs:
-                continue
-            targets.add(dep.name)
-            logger.debug(
-                "nonstick_dim_order: matmul %s requests reorder on %s",
-                out_name,
-                dep.name,
-            )
-    return targets
 
-
-def _forward_pass(targets: set[str]) -> None:
-    """Reorder candidate STLs for each target buffer.
-
-    Writes V.graph.nonstick_reorder_log: dict[str, list[SpyreTensorLayout]]
-    mapping each reordered buffer name to its new layouts list.
-    """
-    log: dict[str, list] = {}
-    for name in targets:
-        buf = V.graph.get_buffer(name)
-        if not hasattr(buf, "layouts"):
-            logger.debug(
-                "nonstick_dim_order: skipping %s — no .layouts attribute", name
-            )
-            continue
-        # Only reorder ComputedBuffer outputs. ExternKernel outputs (FallbackKernel,
-        # MultiOutput, etc.) have placeholder layouts whose actual arrangement is
-        # determined by the external op; reordering them corrupts DDL template matching.
-        if not isinstance(buf, ComputedBuffer):
-            logger.debug(
-                "nonstick_dim_order: skipping %s — not a ComputedBuffer (%s)",
-                name,
-                type(buf).__name__,
-            )
-            continue
-        # Use the buffer's write dep to compute device coordinates for each
-        # candidate STL, so we can identify the outer stick dim.
-        write_dep = next(iter(buf.get_read_writes().writes), None)
-        new_layouts = [
-            _reorder_stl(stl, write_dep, name) if write_dep is not None else stl
-            for stl in buf.layouts
-        ]
-        changed = any(
-            list(a.device_size) != list(b.device_size)
-            for a, b in zip(buf.layouts, new_layouts)
+        is_matmul = (
+            isinstance(op.data, Reduction)
+            and op.data.reduction_type in MATMUL_REDUCTION_OPS
         )
-        if changed:
-            for i, (old, new) in enumerate(zip(buf.layouts, new_layouts)):
-                if list(old.device_size) != list(new.device_size):
-                    logger.debug(
-                        "[NDO] %s[%d]  %s -> %s  stride_map %s -> %s",
-                        name,
-                        i,
-                        list(old.device_size),
-                        list(new.device_size),
-                        list(old.stride_map),
-                        list(new.stride_map),
-                    )
-            buf.layouts[:] = new_layouts
-            log[name] = list(buf.layouts)
-            logger.info(
-                "nonstick_dim_order: reordered %s (%d candidates)",
-                name,
-                len(buf.layouts),
-            )
-    V.graph.nonstick_reorder_log = log
+        if is_matmul:
+            for dep in op.get_read_writes().reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                if dep.name in graph_inputs:
+                    continue
+                if dep.name in seen:
+                    continue
+                buf = V.graph.get_buffer(dep.name)
+                if not isinstance(buf, ComputedBuffer):
+                    continue
+                seen.add(dep.name)
+                result.append(buf)
+
+    return result
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dims on matmul inputs for better work division."""
+    """Reorder non-stick dims on matmul inputs for better work division.
+
+    Phase 1 (constraint transforms) is a placeholder for now — gather/scatter
+    IA constraints will be added in a follow-up task.  Phase 2 (matmul perf
+    reorder) runs with an empty pinned_dims dict.
+    """
     V.graph.nonstick_reorder_log = {}
-    targets = _backward_pass(graph)
-    if targets:
-        _forward_pass(targets)
+    log: dict[str, SpyreTensorLayout] = {}
+
+    candidates = _collect_matmul_input_bufs(graph)
+
+    # Phase 1: constraint transforms (gather IA, scatter IA).
+    # pinned_dims maps buf_name -> set of device positions fixed by constraints.
+    pinned_dims: dict[str, set[int]] = {}
+    # (Constraint transforms will be added in the next task.)
+
+    # Phase 2: performance transforms.
+    for buf in candidates:
+        pinned = pinned_dims.get(buf.get_name(), set())
+        new_stl = _try_matmul_perf_reorder(buf, pinned)
+        if new_stl is not None:
+            buf.committed_stl = new_stl
+            log[buf.get_name()] = new_stl
+            logger.info("nonstick_dim_order: reordered %s", buf.get_name())
+
+    V.graph.nonstick_reorder_log = log
