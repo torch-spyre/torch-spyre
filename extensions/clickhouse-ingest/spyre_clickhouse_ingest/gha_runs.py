@@ -142,6 +142,7 @@ def _outcome(
     # The one GHA conclusion diagnose_failure.py's taxonomy covers without reading a log.
     if row["result"] == "timed_out":
         row["failure_reason"] = "infra_timeout"
+        row["failure_is_infra"] = True
 
 
 def run_key(repo: str, run_id: int, attempt: int) -> str:

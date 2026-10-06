@@ -151,9 +151,14 @@ def test_running_and_timed_out_rows():
         None,
     )
     timed_out = gha_runs.job_row(REPO, _run(), _job(conclusion="timed_out", steps=[]))
-    assert (timed_out["result"], timed_out["failure_reason"]) == (
+    assert (
+        timed_out["result"],
+        timed_out["failure_reason"],
+        timed_out["failure_is_infra"],
+    ) == (
         "timed_out",
         "infra_timeout",
+        True,
     )
 
 

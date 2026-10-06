@@ -17,10 +17,10 @@ WITH children AS
         parent_run_key,
         count()                                                 AS child_builds,
         sum(duration_ms)                                        AS child_build_ms,
-        groupUniqArrayIf(component, result = 'failure' AND component != '') AS failed_components,
-        groupArrayIf(tuple(job_name, component, arches, failed_stage, failure_reason), result = 'failure')
-                                                                AS failed_builds,
-        countIf(result = 'failure' AND failure_is_infra)        AS infra_failures
+        groupUniqArrayIf(component, result IN ('failure', 'timed_out') AND component != '') AS failed_components,
+        groupArrayIf(tuple(job_name, component, arches, failed_stage, failure_reason),
+                     result IN ('failure', 'timed_out'))       AS failed_builds,
+        countIf(result IN ('failure', 'timed_out') AND failure_is_infra) AS infra_failures
     FROM v_pipeline_runs
     WHERE pipeline_type IN ('component-build', 'gha-job') AND parent_run_key != ''
     GROUP BY parent_run_key
@@ -38,11 +38,15 @@ SELECT
         r.state = 'running',                                     'running',
         r.superseded OR r.result IN ('aborted', 'cancelled'),    'superseded',
         r.verdict = 'green' OR (r.source = 'gha' AND r.result = 'success'), 'passed',
+        -- A GHA run that did not run its jobs (an if: that did not match, a fork awaiting
+        -- approval) reached no verdict, like a superseded one.
+        r.source = 'gha' AND r.result IN ('skipped', 'neutral', 'action_required', 'stale'), 'skipped',
         r.failure_is_infra OR c.infra_failures > 0,              'infra',
+        r.source = 'gha' AND r.result = 'startup_failure',       'ci_crash',
         r.repo != '' AND has(c.failed_components, r.repo),       'own_component',
         notEmpty(c.failed_components),                           'other_component',
         r.tests_failed > 0 OR r.failure_reason = 'test_failure', 'test_failure',
-        r.duration_ms < 300000,                                  'ci_crash',
+        r.source = 'jenkins' AND r.duration_ms < 300000,         'ci_crash',
                                                                  'unattributed'
     ) AS outcome
 FROM v_pipeline_runs AS r
@@ -50,7 +54,7 @@ LEFT JOIN children AS c ON c.parent_run_key = r.run_key
 WHERE r.pipeline_type IN ('orchestrator', 'gha-workflow');
 
 -- Daily gate health per source, lane and repo: the stability, outcome mix and time split the CI
--- report draws. pass_rate leaves out superseded and running runs, which reached no verdict.
+-- report draws. pass_rate leaves out superseded, skipped and running runs, which reached no verdict.
 CREATE VIEW IF NOT EXISTS v_pipeline_gate_daily AS
 SELECT
     toDate(started_at)                                   AS day,
@@ -66,7 +70,9 @@ SELECT
     countIf(outcome = 'ci_crash')                        AS ci_crash,
     countIf(outcome = 'unattributed')                    AS unattributed,
     countIf(outcome = 'superseded')                      AS superseded,
-    passed / nullIf(runs - superseded - countIf(outcome = 'running'), 0) AS pass_rate,
+    countIf(outcome = 'skipped')                         AS skipped,
+    countIf(outcome = 'running')                         AS running,
+    passed / nullIf(runs - superseded - skipped - running, 0) AS pass_rate,
     quantileIf(0.5)(duration_ms, outcome = 'passed') / 60000 AS passed_p50_min,
     quantileIf(0.9)(duration_ms, outcome = 'passed') / 60000 AS passed_p90_min,
     quantileIf(0.5)(build_ms, outcome = 'passed' AND build_ms > 0) / 60000 AS build_p50_min,
