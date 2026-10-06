@@ -871,7 +871,7 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
     core a strided slice of the staggered operand that the matmul's K-fast
     cohort accumulation mis-addresses -- silent wrong results. This is the
     root cause of the co-optimization ``test_stagger_to_standard_ea`` width-128
-    failures, where the balance tie-break splits K of the ``mm(x_staggered, P)``
+    failures, where the balance tie-break splits K of the ``mm(x_staggered, I)``
     that ``spyre.stagger_to_standard_ea`` lowers to (the non-co-opt matmul cost
     model never picks that K-split, so the greedy path is unaffected).
     """

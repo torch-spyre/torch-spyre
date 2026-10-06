@@ -20,6 +20,7 @@ from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_STAGGERED_OP,
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
     FP8_2D_STICK_OPS,
@@ -422,6 +423,8 @@ def gen_coord_info_value(
                 ],
             },
         }
+    elif is_stick_dim and tensor_idx == 0 and opfunc == BATCH_MATMUL_STAGGERED_OP:
+        return _fp32_to_dl16_stick_coord_info(size, nsplits)
     else:
         return {
             "spatial": 3,
@@ -455,6 +458,48 @@ def gen_coord_info_value(
                 ],
             },
         }
+
+
+def _fp32_to_dl16_stick_coord_info(size: int, nsplits: int) -> dict:
+    """Coordinate info for a per-core stick dim of ``size`` in FP32_TO_DL16 order.
+
+    The on-device fp32 -> fp16 conversion fuses two fp32 sticks into one fp16
+    stick, interleaving their halves in runs of 4: physical slot 8k + 4h + j of
+    a stick holds logical element 32h + 4k + j. The elem_arr folds list that
+    order outermost first; each alpha is the logical step of its fold. DeepTools
+    addresses the matmul's kernel rows through these coordinates, so the operand
+    needs no reordering.
+    """
+    if size % 64 != 0:
+        # TODO: support a per-core K that is not whole fp16 sticks; the padding
+        # lanes of a staggered stick are interleaved with the live ones.
+        raise NotImplementedError(
+            f"FP32_TO_DL16 stick dim of per-core size {size} (not a multiple of 64)"
+        )
+    folds = [(size // 64, 64), (8, 4), (2, 32), (4, 1)]
+    return {
+        "spatial": 3,
+        "temporal": 0,
+        "elemArr": len(folds),
+        "padding": "nopad",
+        "folds": {
+            "dim_prop_func": [
+                {"Affine": {"alpha_": size, "beta_": 0}},
+                {"Affine": {"alpha_": 0, "beta_": 0}},
+                {"Affine": {"alpha_": 0, "beta_": 0}},
+            ]
+            + [{"Affine": {"alpha_": alpha, "beta_": 0}} for _, alpha in folds],
+            "dim_prop_attr": [
+                {"factor_": nsplits, "label_": "core_fold"},
+                {"factor_": 1, "label_": "corelet_fold"},
+                {"factor_": 1, "label_": "row_fold"},
+            ]
+            + [
+                {"factor_": factor, "label_": f"elem_arr_{len(folds) - 1 - i}"}
+                for i, (factor, _) in enumerate(folds)
+            ],
+        },
+    }
 
 
 # SDSC dim labels for the conv2d padding (output-spatial) axes.

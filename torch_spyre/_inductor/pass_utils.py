@@ -66,7 +66,7 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .provenance import preserve_provenance
@@ -2869,7 +2869,8 @@ def lower_pad_sequence(
     Only one dimension may differ between ``padded_size`` and the original shape.
 
     Uses torch.ops.aten.constant_pad_nd which lowers to a 4-op IR sequence:
-      1. ComputedBuffer - output buffer allocation (FixedLayout)
+      1. SpyreEmptyFallback - output buffer allocation (FixedLayout); a
+         ComputedBuffer when the output stride is not row-major
       2. SpyreConstantFallback - fill constant (FixedLayout)
       3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
       4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
@@ -3154,13 +3155,14 @@ def lower_pad_sequence(
     object.__setattr__(padded_buf, "origin_node", pad_fx)
 
     # Verify structure: constant_pad_nd lowers to 4 operations
-    #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
+    #   op0: SpyreEmptyFallback (ComputedBuffer for a non-row-major stride) -
+    #        output buffer allocation (FixedLayout)
     #   op1: SpyreConstantFallback - fill constant (FixedLayout)
     #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
     #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
     assert (
         len(new_ops) == 4
-        and isinstance(new_ops[0], ComputedBuffer)
+        and isinstance(new_ops[0], (SpyreEmptyFallback, ComputedBuffer))
         and isinstance(new_ops[0].get_layout(), FixedLayout)
         and isinstance(new_ops[1], SpyreConstantFallback)
         and isinstance(new_ops[1].get_layout(), FixedLayout)

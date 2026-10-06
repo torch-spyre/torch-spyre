@@ -21,6 +21,9 @@ IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
+# DeepTools opfunc for a BATCH_MATMUL_OP whose x (INPUT) is FP32_TO_DL16 with K
+# on the stick. Only the SDSC carries it; the graph keeps BATCH_MATMUL_OP.
+BATCH_MATMUL_STAGGERED_OP = "batchmatmulstaggered"
 KEEP_BY_INDEX_OP = "keepbyindex"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
