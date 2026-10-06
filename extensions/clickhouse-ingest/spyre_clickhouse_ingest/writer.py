@@ -471,7 +471,10 @@ class TestResultWriter(RunWriter):
             and h["ran_in"] in ("", str(run_id))
         ]
         for h in sorted(older, key=lambda h: h["attempt"], reverse=True):
-            if h["status"] in ("failed", "error"):
+            # A rerun attempt also re-ingests the reports it did not re-run: an unchanged outcome
+            # is the same execution, so only a prior mark it already carried moves forward.
+            rerun = any(h[k] != f[k] for k in ("status", "duration_s", "fail_message"))
+            if rerun and h["status"] in ("failed", "error"):
                 prior = (h["status"], h["fail_message"][:PRIOR_MESSAGE_MAX])
             elif h["prior"] and h["prior"][0]:
                 prior = h["prior"]

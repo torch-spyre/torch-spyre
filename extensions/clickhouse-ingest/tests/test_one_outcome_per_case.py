@@ -126,6 +126,14 @@ def test_a_replaced_pass_or_another_files_failure_leaves_no_prior_status():
     assert "result.prior_status" not in _written_props(c)[0]
 
 
+def test_a_rerun_re_ingesting_an_unchanged_failure_records_no_prior_status():
+    # Attempt 2 re-reads every report of the run, including ones it did not re-run.
+    c = HeldClient([("failed", RUN, "1", "b.xml")])
+    _write(c, "failed", attempt=2)
+    assert _written(c) == ["failed"] and _deleted(c)
+    assert "result.prior_status" not in _written_props(c)[0]
+
+
 def test_an_older_attempt_arriving_late_is_not_written():
     c = HeldClient([("passed", RUN, "2", "b.xml")])
     assert _write(c, "failed", attempt=1) == 0
