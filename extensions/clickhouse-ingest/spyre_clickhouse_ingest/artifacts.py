@@ -17,6 +17,11 @@
     python -m spyre_clickhouse_ingest.artifacts register --artifact image:<ref>@<digest> ...
     python -m spyre_clickhouse_ingest.artifacts release <manifest.json>
     python -m spyre_clickhouse_ingest.artifacts write <batch.json>
+    python -m spyre_clickhouse_ingest.artifacts resolve --image <repo>@<digest> --arch s390x
+
+`resolve` reads only the registry (ICR_USERNAME / ICR_PASSWORD) and prints, as JSON, the
+artifact a tested image is: artifact_id, the per-arch leaf `artifact` spec to register or
+ingest it by, and its supply-chain tag and tag_family (registry.resolve).
 
 A batch is what a pipeline writer (the Jenkins orchestrator) hands over in one call; every
 entry names its artifact by the four hash inputs plus kind and ref:
@@ -42,11 +47,14 @@ manifest list beside its per-arch images: a consumer that pulled by tag holds on
 
 import argparse
 import json
+import os
 import sys
+from datetime import date
 from itertools import zip_longest
 from pathlib import Path
 
 from .identity import ArtifactIdentity, DerivedId
+from .registry import CHANNELS, Registry, resolve
 from .writer import ArtifactWriter
 
 RELEASE_FAMILY = "release"
@@ -247,7 +255,33 @@ def main(argv=None) -> None:
     wr = sub.add_parser("write", help="a batch of artifacts, tags and results (JSON)")
     wr.add_argument("batch", type=Path)
 
+    res = sub.add_parser("resolve", help="a tested image's artifact id and tag (JSON)")
+    res.add_argument(
+        "--image", required=True, help="[image:]<host>/<repo>[:tag]@<digest>"
+    )
+    res.add_argument("--arch", required=True)
+    res.add_argument("--channel", default="", choices=["", *CHANNELS])
+    res.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        default=None,
+        help="the run's day: orders the search, and names the tag when no registry tag does",
+    )
+    res.add_argument("--name", default="", help="ci-cd-tech-preview: the release name")
+
     args = parser.parse_args(argv)
+    if args.cmd == "resolve":
+        registry = Registry(
+            username=os.environ.get("ICR_USERNAME", ""),
+            password=os.environ.get("ICR_PASSWORD", ""),
+        )
+        out = resolve(
+            registry, args.image, args.arch, args.channel, args.date, args.name
+        )
+        print(json.dumps(out, sort_keys=True))
+        if not out:
+            sys.exit(1)
+        return
     if args.cmd == "release" and args.dry_run:
         for i in release_identities(json.loads(args.manifest.read_text())):
             print(

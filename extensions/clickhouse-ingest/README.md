@@ -54,6 +54,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
 | `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |
 | `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
+| `registry.py` | a tested image -> its per-arch leaf, artifact_id and supply-chain tag (`artifacts resolve`) |
 
 ## Tables modelled
 
