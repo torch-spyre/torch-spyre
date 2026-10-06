@@ -1049,6 +1049,24 @@ def _canonical_stl_from_collapsed_host(
     )
 
 
+def _carries_var_as_tiled_stick(dev_coords: list, var: sympy.Symbol) -> bool:
+    """True if ``var`` is on the stick and only tiled across sticks elsewhere.
+
+    An outer coord may carry ``var`` only as the stick index ``floor(var/s)``
+    of the stick coord ``Mod(var, s)``; any other outer use (a factorized
+    layout such as SDPA's [L, D/64, H, 64]) is rejected.
+    """
+    stick = dev_coords[-1]
+    if var not in stick.free_symbols:
+        return False
+    outer = [c for c in dev_coords[:-1] if var in c.free_symbols]
+    if not outer:
+        return True
+    if len(outer) > 1 or not isinstance(stick, sympy.Mod) or stick.args[0] != var:
+        return False
+    return outer[0] == sympy.floor(var / stick.args[1])
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
@@ -1058,7 +1076,10 @@ def find_stick_compatible_input_layout(
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
     1. Return the first layout whose stick already carries reduction_var and no
-       outer axis also carries it (zero cost, no restickify needed).
+       outer axis also carries it (zero cost, no restickify needed). For
+       BATCH_MATMUL_OP an FP32_TO_DL16 layout qualifies when reduction_var is
+       its tiled stick; one that is staggered elsewhere raises
+       NotImplementedError if no other candidate exists.
     2. Else return the first layout that can be restickified to put reduction_var
        on the stick via compute_restickify_target_layout.
     3. (BATCH_MATMUL_OP only) Else collapse mixed-radix host dims and construct
@@ -1105,6 +1126,16 @@ def find_stick_compatible_input_layout(
     # structure; the backend handles them regardless of device coord shape,
     # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
+        if (
+            reduction_type == BATCH_MATMUL_OP
+            and stl.element_arrangement == ElementArrangement.FP32_TO_DL16
+        ):
+            # A staggered stick is read in place only when it is the matmul
+            # stick of this operand (x: K, y: N): codegen encodes x's K order
+            # in its coordinates, and y's N order carries over to the output.
+            if _carries_var_as_tiled_stick(dev_coords, reduction_var):
+                return stl
+            continue
         if stl.element_arrangement != ElementArrangement.STANDARD:
             # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
             # structure and are normally returned immediately.  However for
@@ -1126,6 +1157,21 @@ def find_stick_compatible_input_layout(
         ):
             continue
         return stl
+
+    if (
+        reduction_type == BATCH_MATMUL_OP
+        and candidates
+        and all(
+            stl.element_arrangement == ElementArrangement.FP32_TO_DL16
+            for stl, _ in candidates
+        )
+    ):
+        # TODO: restickify a staggered operand onto its matmul stick; needs the
+        # FP32_TO_DL16-aware restickify.
+        raise NotImplementedError(
+            f"{reduction_type}: {label} is FP32_TO_DL16 with {label}_var="
+            f"{reduction_var} off its stick"
+        )
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
@@ -1420,8 +1466,21 @@ def _matmul_layouts(
             x, y, output, output_dep, reduction_var, m_size, n_size
         )
         if flat_x_stl is not None:
+            if x_req_stl.element_arrangement == ElementArrangement.FP32_TO_DL16:
+                # TODO: flatten a staggered x; the flat layout is STANDARD.
+                raise NotImplementedError(
+                    f"{data.reduction_type}: flat projection of an FP32_TO_DL16 x"
+                )
             x_req_stl = flat_x_stl
             exact_input_indices.add(0)
+
+    # x's K order is encoded at codegen and leaves the output STANDARD; y's N
+    # order is the order the output columns come out in.
+    out_arrangement = (
+        ElementArrangement.FP32_TO_DL16
+        if y_req_stl.element_arrangement == ElementArrangement.FP32_TO_DL16
+        else ElementArrangement.STANDARD
+    )
 
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
@@ -1432,7 +1491,9 @@ def _matmul_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
-    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, out_dim_order, out_arrangement
+    )
 
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y],

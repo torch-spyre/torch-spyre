@@ -13,20 +13,23 @@
 # limitations under the License.
 
 """
-Test bidirectional FP16↔FP32 type conversion with ElementArrangement.
+Test staggered Element Arrangements (EA): the FP16↔FP32 conversions that
+produce them and the ops that consume them.
 
-Tests in mode: compile, eager
-FP16 types: FP16, BF16
-Tests all 4 conversion cases:
+Conversions, in mode compile and eager, for FP16 types FP16 and BF16:
 1. FP16→FP32 with STANDARD → DL16_TO_FP32
 2. FP16→FP32 with FP32_TO_DL16 → STANDARD
 3. FP32→FP16 with STANDARD → FP32_TO_DL16
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
+
+Consumers: ``spyre.stagger_to_standard_ea`` and fp16 matmul with
+FP32_TO_DL16 operands.
 """
 
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor.codegen import compute_ops
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
 
@@ -425,6 +428,204 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
 
     z32 = eager_to(y16, src_dev, torch.float32)
     assert_ea(z32, ea_of(src_dev))
+
+
+# ---------------------------------------------------------------------------
+# fp16 matmul with FP32_TO_DL16 operands, read in place
+#
+# A matmul reads a staggered operand without a restickify when the staggered
+# stick is the operand's matmul stick:
+#
+# - x staggered on K: codegen emits ``batchmatmulstaggered`` and encodes x's K
+#   order in its coordinates; the output is STANDARD.
+# - y staggered on N: the output columns come out in y's order, so the output
+#   is labelled FP32_TO_DL16.
+#
+# K and N need not be multiples of 64: a staggered y padded along K keeps its
+# arrangement, and x's padding lanes pair with y's zero rows.
+#
+# Inputs are small integers, so results are exact while (MOD - 1)**2 * K <= 1024
+# (DLFloat16 is exact for integers up to 1024).
+# ---------------------------------------------------------------------------
+
+FP16 = torch.float16
+
+# case: (x converted on device, y converted on device)
+CASES = {
+    "x_staggered": (True, False),
+    "y_staggered": (False, True),
+    "both_staggered": (True, True),
+    "standard": (False, False),
+}
+
+# (x shape, y shape, input modulus)
+SHAPES = {
+    "mm_64x128x64": ((64, 128), (128, 64), 3),
+    "mm_128x256x128": ((128, 256), (256, 128), 3),
+    "mm_64x64x64": ((64, 64), (64, 64), 3),
+    "mm_512x1024x256": ((512, 1024), (1024, 256), 2),
+    "bmm_2x64x128x64": ((2, 64, 128), (2, 128, 64), 3),
+    "bmm_4x128x256x192": ((4, 128, 256), (4, 256, 192), 2),
+    # K and N not multiples of 64
+    "mm_64x100x128": ((64, 100), (100, 128), 3),
+    "mm_64x127x100": ((64, 127), (127, 100), 3),
+    "mm_33x48x112": ((33, 48), (48, 112), 3),
+    "bmm_2x64x100x100": ((2, 64, 100), (2, 100, 100), 3),
+    # Need #5048: an odd number of fp32 sticks in a staggered dim, or a
+    # staggered N below 64 (see _needs_staggered_stick_padding).
+    "mm_64x96x64": ((64, 96), (96, 64), 3),
+    "mm_64x128x80": ((64, 128), (128, 80), 3),
+    "mm_64x128x48": ((64, 128), (128, 48), 3),
+}
+
+
+def _needs_staggered_stick_padding(case, shape):
+    """True for the staggered dims that need #5048's stick-group padding.
+
+    One fp16 FP32_TO_DL16 stick is fused from a pair of fp32 sticks: a
+    staggered dim with an odd number of fp32 sticks is refused by the
+    conversion, and a staggered N below 64 reads back wrong from the matmul.
+    """
+    x_on_device, y_on_device = case
+    k = shape[0][-1]
+    n = shape[1][-1]
+
+    def odd_fp32_sticks(extent):
+        return -(-extent // 32) % 2 == 1
+
+    return (x_on_device and odd_fp32_sticks(k)) or (
+        y_on_device and (odd_fp32_sticks(n) or n < 64)
+    )
+
+
+# TODO: drop the xfail once #5048 (stick-unaligned dtype conversions) lands.
+MATMUL_PARAMS = [
+    pytest.param(
+        case,
+        shape,
+        id=f"{case_id}-{shape_id}",
+        marks=pytest.mark.xfail(
+            strict=True, reason="needs staggered stick padding (#5048)"
+        )
+        if _needs_staggered_stick_padding(case, shape)
+        else (),
+    )
+    for case_id, case in CASES.items()
+    for shape_id, shape in SHAPES.items()
+]
+
+
+def _small_ints(shape, offset, mod):
+    n = 1
+    for s in shape:
+        n *= s
+    return ((torch.arange(n) + offset) % mod).reshape(shape).to(torch.float32)
+
+
+@pytest.fixture
+def staggered_stick_encodings(monkeypatch):
+    """Record each per-core K size that codegen encodes in FP32_TO_DL16 order."""
+    sizes = []
+    encode = compute_ops._fp32_to_dl16_stick_coord_info
+
+    def recording(size, nsplits):
+        sizes.append(size)
+        return encode(size, nsplits)
+
+    monkeypatch.setattr(compute_ops, "_fp32_to_dl16_stick_coord_info", recording)
+    return sizes
+
+
+@pytest.mark.parametrize("case, shape", MATMUL_PARAMS)
+def test_staggered_matmul(case, shape, staggered_stick_encodings):
+    x_on_device, y_on_device = case
+    x_shape, y_shape, mod = shape
+    x = _small_ints(x_shape, 0, mod)
+    y = _small_ints(y_shape, 1, mod)
+
+    def fn(a, b):
+        return (a.to(FP16) if x_on_device else a) @ (b.to(FP16) if y_on_device else b)
+
+    xd = (x if x_on_device else x.to(FP16)).to("spyre")
+    yd = (y if y_on_device else y.to(FP16)).to("spyre")
+    torch._dynamo.reset()
+    result = torch.compile(fn)(xd, yd)
+
+    expected_ea = (
+        ElementArrangement.FP32_TO_DL16 if y_on_device else ElementArrangement.STANDARD
+    )
+    assert get_spyre_tensor_layout(result).element_arrangement == expected_ea
+    # An FP32_TO_DL16 graph output reads back staggered; its conversion to
+    # fp32 is STANDARD.
+    if y_on_device:
+        result = result.to(torch.float32)
+    torch.testing.assert_close(result.cpu().to(torch.float32), x @ y, atol=0, rtol=0)
+
+    assert bool(staggered_stick_encodings) == x_on_device
+
+
+def test_staggered_matmul_chain(staggered_stick_encodings):
+    """A matmul whose result is staggered on N feeds the next matmul's K."""
+    x = _small_ints((64, 128), 0, 3)
+    y = _small_ints((128, 128), 1, 3)
+    w = _small_ints((128, 64), 2, 3)
+
+    def fn(a, b32, c):
+        return (a @ b32.to(FP16)) @ c
+
+    torch._dynamo.reset()
+    result = torch.compile(fn)(
+        x.to(FP16).to("spyre"), y.to("spyre"), w.to(FP16).to("spyre")
+    )
+    assert get_spyre_tensor_layout(result).element_arrangement == (
+        ElementArrangement.STANDARD
+    )
+    torch.testing.assert_close(
+        result.cpu().to(torch.float32), (x @ y) @ w, atol=0.5, rtol=1e-2
+    )
+    assert staggered_stick_encodings
+
+
+@pytest.mark.parametrize(
+    "fn,x,y",
+    [
+        (
+            lambda a32, b: a32.to(FP16).t() @ b,
+            torch.ones(128, 64),
+            torch.ones(128, 64, dtype=FP16),
+        ),
+        (
+            lambda a, b32: a @ b32.to(FP16).t(),
+            torch.ones(64, 128, dtype=FP16),
+            torch.ones(64, 128),
+        ),
+    ],
+    ids=["x_staggered_on_m", "y_staggered_on_k"],
+)
+def test_staggered_matmul_off_stick_unsupported(fn, x, y):
+    torch._dynamo.reset()
+    with pytest.raises(Exception, match="FP32_TO_DL16 with .* off its stick"):
+        torch.compile(fn)(x.to("spyre"), y.to("spyre"))
+
+
+def test_staggered_pad_keeps_ea():
+    """F.pad along a non-stick dim keeps a staggered input's arrangement."""
+    y = _small_ints((100, 64), 1, 3)
+
+    def fn(b):
+        return torch.nn.functional.pad(b.to(FP16), (0, 0, 0, 28))
+
+    torch._dynamo.reset()
+    result = torch.compile(fn)(y.to("spyre"))
+    assert get_spyre_tensor_layout(result).element_arrangement == (
+        ElementArrangement.FP32_TO_DL16
+    )
+    torch.testing.assert_close(
+        result.to(torch.float32).cpu(),
+        torch.nn.functional.pad(y, (0, 0, 0, 28)),
+        atol=0,
+        rtol=0,
+    )
 
 
 # Made with Bob

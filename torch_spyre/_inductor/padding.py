@@ -27,7 +27,8 @@ cannot be reconciled with a larger host extent.
 Only y is padded; x is left untouched.
 
 For y, the following IR sequence is emitted:
-  1. ComputedBuffer - output buffer allocation (FixedLayout)
+  1. SpyreEmptyFallback - output buffer allocation (FixedLayout), laid out
+     by its writers so a staggered y keeps its element arrangement
   2. SpyreConstantFallback - fill constant (FixedLayout)
   3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
   4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)

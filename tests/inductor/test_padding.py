@@ -41,7 +41,11 @@ from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
-from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
+from torch_spyre._inductor.ir import (
+    FixedTiledLayout,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+)
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.padding import (
     _compute_digits,
@@ -296,12 +300,13 @@ class TestInsertPaddingIR(unittest.TestCase):
         return operations[:idx]
 
     @staticmethod
-    def _padded_buf_ops(operations: list[Operation]) -> list[ComputedBuffer]:
-        """Return ComputedBuffer operations whose origin_node.target is aten.constant_pad_nd."""
+    def _padded_buf_ops(operations: list[Operation]) -> list[Operation]:
+        """Return padded-buffer allocations: ops whose origin_node.target is
+        aten.constant_pad_nd."""
         padded_buf_ops = []
         aten_op = torch.ops.aten.constant_pad_nd.default
         for op in operations:
-            if isinstance(op, ComputedBuffer):
+            if isinstance(op, (ComputedBuffer, SpyreEmptyFallback)):
                 if getattr(getattr(op, "origin_node", None), "target", None) == aten_op:
                     padded_buf_ops.append(op)
         return padded_buf_ops
@@ -327,7 +332,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         """Assert the constant_pad_nd 4-op pattern."""
 
         # Expected 4 operations (all with FixedTiledLayout):
-        # 1. ComputedBuffer: output buffer allocation
+        # 1. SpyreEmptyFallback: output buffer allocation
         # 2. SpyreConstantFallback: padding fill constant
         # 3. ComputedBuffer: fill padding region (reads constant, writes output)
         # 4. ComputedBuffer: copy input data (reads input, writes output)
@@ -341,9 +346,9 @@ class TestInsertPaddingIR(unittest.TestCase):
             )
 
         computed_buffer_ops = [op for op in ops if isinstance(op, ComputedBuffer)]
-        self.assertEqual(len(computed_buffer_ops), 3, "Expected 3 computed buffers")
+        self.assertEqual(len(computed_buffer_ops), 2, "Expected 2 computed buffers")
 
-        padded_buf_ops = next(iter(self._padded_buf_ops(computed_buffer_ops)), None)
+        padded_buf_ops = next(iter(self._padded_buf_ops(ops)), None)
         self.assertIsNotNone(padded_buf_ops, "Expected 1 output buffer")
 
         constant_op = next(iter(self._constant_ops(ops)), None)

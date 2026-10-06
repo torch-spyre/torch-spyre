@@ -23,6 +23,8 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_OP,
+    BATCH_MATMUL_STAGGERED_OP,
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
@@ -1645,7 +1647,17 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
-def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+def _get_op_func(
+    op: str,
+    is_reduction: bool,
+    output_scales: dict,
+    first_arg_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+) -> str:
+    if (
+        op == BATCH_MATMUL_OP
+        and first_arg_arrangement == ElementArrangement.FP32_TO_DL16
+    ):
+        return BATCH_MATMUL_STAGGERED_OP
     if _is_pool(op) or _is_conv(op):
         return op
     # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
@@ -2486,7 +2498,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             opfunc=(
                 "shuffle"
                 if is_relayout
-                else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
+                else _get_op_func(
+                    op_spec.op,
+                    op_spec.is_reduction,
+                    args[-1].scales,
+                    op_spec.args[0].element_arrangement,
+                )
             ),
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
             # matmul; depthwise conv2d (#3510) runs on the "sfp" unit. `is_conv`

@@ -1731,12 +1731,29 @@ def lower_constant_pad_nd(
 
     dtype = input.get_dtype()
     device = input.get_device()
-    if output_stride is not None:
-        output = lowering.empty_strided(
-            output_size, output_stride, dtype=dtype, device=device
+    contiguous = list(ir.FlexibleLayout.contiguous_strides(output_size))
+    row_major = output_stride is None or list(output_stride) == contiguous
+    if row_major and len(output_size) - 1 not in dims:
+        # A SpyreEmptyFallback takes its device layout from the writers that
+        # fill it, so the copy of a staggered input keeps its element
+        # arrangement (e.g. y of a matmul padded along K). A pad of the last
+        # dim keeps the plain allocation below: its offset copy along the stick
+        # needs the relocation the layout pass applies to plain mutation targets,
+        # and a staggered value cannot be padded along its stick anyway.
+        output = ir.TensorBox.create(
+            SpyreEmptyFallback(
+                torch.ops.spyre.empty.default, list(output_size), device, dtype
+            )
         )
     else:
-        output = lowering.empty(output_size, dtype=dtype, device=device)
+        # This allocation's device layout is fixed before the writers below are
+        # visited, so a staggered input loses its element arrangement here.
+        if output_stride is not None:
+            output = lowering.empty_strided(
+                output_size, output_stride, dtype=dtype, device=device
+            )
+        else:
+            output = lowering.empty(output_size, dtype=dtype, device=device)
     pad_constant = lower_constant(value, dtype, device)
 
     # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
