@@ -242,6 +242,13 @@ class SchemaApplier:
         pending = [p for p in migrations if p.name not in done]
         added = cls.pending_adds(pending)
         replaced = cls.pending_adds(pending, cls.ADDS_CONSTRAINT)
+        # An MV a pending migration drops and recreates matches its file once that migration runs.
+        recreated = {
+            m.group(2)
+            for p in pending
+            for stmt in cls.statements(p.read_text())
+            if (m := cls.CREATE.match(stmt))
+        }
         steps = []
         for o in objs:
             if o.kind == "view":
@@ -261,8 +268,9 @@ class SchemaApplier:
                     }
                     before = cls.without(o, missing)
                     ignore = replaced.get(o.name, set())
-                    resolved = (before is not o or bool(ignore)) and not cls.differs(
-                        client, before, stored, db, ignore
+                    resolved = o.name in recreated or (
+                        (before is not o or bool(ignore))
+                        and not cls.differs(client, before, stored, db, ignore)
                     )
                     steps.append(("migrates" if resolved else "drift", o.name, diff))
         steps += [("migrate", p.name, "") for p in pending]
