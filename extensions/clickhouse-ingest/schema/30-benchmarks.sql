@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS benchmarks
 (
     ts           DateTime DEFAULT now(),
 
-    -- uuid5(name|sorted(tags)|record_type,config_name,input_shapes,run_mode,kernel_name,is_total).
+    -- uuid5(name|sorted(tags)|record_type,config_name,input_shapes,run_mode,kernel_name,is_total),
+    -- a compiled kernel_name hashed as `<stem>@<rank>` (BenchmarkId.rank_kernels), not raw.
     -- Discriminators are IN the hash, not just props: one operation_name recurs across
     -- record_types (granite as both model and op), so name+tags alone would merge them.
     benchmark_id UUID,
