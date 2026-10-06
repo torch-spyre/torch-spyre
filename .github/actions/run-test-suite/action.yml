@@ -301,7 +301,9 @@ runs:
         _mark_retried() {
           local _xml="${{ inputs.junit_xml_path }}"
           # This action's own checkout first: a prebaked image's tree can predate the helper.
-          local _helper="${GITHUB_ACTION_PATH}/../../../tests/oot_framework/utils/mark_retried.py"
+          local _rel=extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+          local _helper="${GITHUB_ACTION_PATH}/../../../${_rel}"
+          [[ -f "$_helper" ]] || _helper="${TORCH_SPYRE_DIR}/${_rel}"
           [[ -f "$_helper" ]] || _helper="${TORCH_SPYRE_DIR}/tests/oot_framework/utils/mark_retried.py"
           [[ -n "$_xml" && -f "$_xml" && -f "$_helper" ]] || return 0
           [[ $_STALL_RETRIED -eq 1 ]] && python3 "$_helper" stall "$_xml"
