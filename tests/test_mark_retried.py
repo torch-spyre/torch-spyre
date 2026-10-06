@@ -51,7 +51,7 @@ def _props(path):
 
 def test_every_testcase_is_marked_and_existing_properties_kept(tmp_path):
     path = _write(tmp_path)
-    assert mark_retried.mark(str(path), "stall") == 2
+    assert mark_retried.mark(str(path), "stall") == (2, 0)
     props = _props(path)
     assert props["test_a"] == [("tag", "testtype__unit"), ("result.retried", "stall")]
     assert props["test_b"] == [("result.retried", "stall")]
@@ -67,6 +67,57 @@ def test_retries_nest_innermost_first_and_repeat_once(tmp_path):
     for kind in ("signal", "stall", "pod", "stall"):
         mark_retried.mark(str(path), kind)
     assert dict(_props(path)["test_b"])["result.retried"] == "signal,stall,pod"
+
+
+def test_a_failure_the_retry_replaced_is_recorded_on_that_case(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a'><failure message='mismatch'>trace</failure></testcase>"
+        "<testcase classname='c' name='test_b'><error>setup fault</error></testcase>"
+        "<testcase classname='c' name='test_gone'><failure message='m'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (2, 2)
+    props = {name: dict(p) for name, p in _props(path).items()}
+    assert props["test_a"] == {
+        "tag": "testtype__unit",
+        "result.retried": "pod",
+        "result.prior_status": "failed",
+        "result.prior_message": "mismatch",
+    }
+    assert props["test_b"]["result.prior_status"] == "error"
+    assert props["test_b"]["result.prior_message"] == "setup fault"
+
+
+def test_a_case_that_passed_before_the_retry_gets_no_prior_status(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a'/>"
+        "<testcase classname='c' name='test_b'><skipped message='s'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (2, 0)
+    assert "result.prior_status" not in path.read_text()
+
+
+def test_a_long_prior_message_is_truncated(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        f"<testcase classname='c' name='test_a'><failure message='{'x' * 5000}'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    mark_retried.mark(str(path), "pod", str(replaced))
+    message = dict(_props(path)["test_a"])["result.prior_message"]
+    assert len(message) == mark_retried.PRIOR_MESSAGE_MAX
 
 
 def test_an_unknown_kind_is_refused(tmp_path):
