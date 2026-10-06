@@ -48,7 +48,13 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Reduction, Scatter
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Reduction,
+    ReinterpretView,
+    Scatter,
+)
 from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
@@ -59,6 +65,7 @@ from .op_spec import IndirectAccess
 from .pass_utils import (
     device_coordinates,
     indirect_info_from_op,
+    loop_var_ranges_from_dim_hints,
     try_device_coordinates,
 )
 
@@ -233,6 +240,63 @@ def _try_gather_ia_constraint(
     return new_stl, {0}
 
 
+def _try_scatter_ia_constraint(
+    buf: ComputedBuffer,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+) -> tuple[SpyreTensorLayout, set[int]] | None:
+    """Rotate the scattered dim of a scatter destination to device position 0.
+
+    buf is the scatter destination buffer (resolved by _collect_triples);
+    dep is the write dep. Does not re-resolve the destination.
+    Returns (new_stl, {0}) if rotation needed, None if compliant or not applicable.
+    """
+    if not hasattr(buf, "committed_stl"):
+        return None
+    stl = buf.committed_stl
+
+    # Extract scatter index symbols: symbols in dep.index that are not loop
+    # range keys and not WhileLoop splice vars.
+    all_write_syms = dep.index.free_symbols
+    loop_syms = set(dep.ranges.keys())
+    loop_syms |= set(loop_var_ranges_from_dim_hints(op))
+    scatter_syms = all_write_syms - loop_syms
+    if not scatter_syms:
+        return None
+
+    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
+
+    try:
+        write_coords = device_coordinates(stl, dep, None)
+    except (Unsupported, Exception):
+        return None
+
+    indirect_stride_idxs = []
+    for idx, coord in enumerate(reversed(write_coords)):
+        substituted = coord.xreplace(scatter_access_subs)
+        if hasattr(substituted, "has") and substituted.has(IndirectAccess):
+            indirect_stride_idxs.append(idx)
+
+    if not indirect_stride_idxs:
+        return None
+
+    indirect_device_pos = sorted(
+        len(stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
+    )
+    expected_pos = list(range(len(indirect_stride_idxs)))
+    if indirect_device_pos == expected_pos:
+        return None  # already compliant
+
+    # Rotate the first indirect dim to position 0.
+    new_stl = _build_required_stl(stl, indirect_device_pos[0])
+    logger.info(
+        "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
+        buf.get_name(),
+        indirect_device_pos[0],
+    )
+    return new_stl, {0}
+
+
 def _collect_triples(
     graph: GraphLowering,
 ) -> list[tuple[ComputedBuffer, MemoryDep, ComputedBuffer]]:
@@ -274,6 +338,22 @@ def _collect_triples(
                 seen.add(key)
                 triples.append((buf, dep, op))
 
+        # Indirect-access ops (scatter): collect destination buf.
+        is_scatter = isinstance(op.data, Scatter)
+        if is_scatter and isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            write_deps = [
+                d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
+            ]
+            if write_deps:
+                write_dep = write_deps[0]
+                # Resolve destination from MutationLayoutSHOULDREMOVE target.
+                target = op.layout.target
+                while isinstance(target, ReinterpretView):
+                    target = target.data
+                dest_buf = target if isinstance(target, ComputedBuffer) else None
+                if dest_buf is not None and hasattr(dest_buf, "committed_stl"):
+                    triples.append((dest_buf, write_dep, op))
+
         # Matmul ops: collect all ComputedBuffer inputs.
         is_matmul = (
             isinstance(op.data, Reduction)
@@ -313,15 +393,13 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
     pinned_dims: dict[str, set[int]] = {}
     for buf, dep, op in triples:
         result = _try_gather_ia_constraint(buf, dep, op)
+        if result is None and isinstance(op.data, Scatter):
+            result = _try_scatter_ia_constraint(buf, dep, op)
         if result is not None:
             new_stl, pinned = result
             buf.committed_stl = new_stl
             log[buf.get_name()] = new_stl
             pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
-            logger.info(
-                "nonstick_dim_order: gather IA constraint applied to %s",
-                buf.get_name(),
-            )
 
     # Phase 2: performance transforms.
     # Collect unique bufs that appeared in matmul triples for perf reorder.
