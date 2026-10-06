@@ -930,18 +930,44 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
         flat = attention.transpose(1, 2).reshape(M, K)
         return F.linear(flat, weight)
 
-    result, plan = _compile_and_run_plan_capture(fn, q, k, v, weight)
-    target_stls = [
-        entry.target_layout.device_layout
-        for entries in plan.values()
-        for entry in entries
-    ]
+    import torch_spyre._inductor.passes as _passes
 
-    assert any(
-        list(layout.device_size) == [K // 64, M, 64]
-        and list(layout.stride_map) == [64, K, 1]
-        for layout in target_stls
-    ), f"expected an exact flat-M restickify target, got {target_stls}"
+    captured_layouts: dict[str, object] = {}
+    _orig_finalize = _passes.finalize_layouts
+
+    def capturing_finalize(graph):
+        _orig_finalize(graph)
+        # After finalize, op.layout is a FixedTiledLayout whose device_layout is
+        # the committed STL (or op_layouts[0] for ops without a cost_fn).
+        for op in graph.operations:
+            layout = getattr(op, "layout", None)
+            if hasattr(layout, "device_layout"):
+                captured_layouts[op.get_name()] = layout.device_layout
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize):
+        result = _compile_and_run(
+            fn, (q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), weight.to(DEVICE)), DEVICE
+        )
+
+    # The SDPA output is committed to a flat-M layout with host shape [M, K]=[128,128].
+    # After stickification that is device_size=[K//64, M, 64] = [2, 128, 64]
+    # with stride_map=[64, K, 1] = [64, 128, 1].
+    # This is the layout the projection matmul actually receives as its x input
+    # (either directly as the SDPA op's committed layout, or via a restickify).
+    flat_m_stl = next(
+        (
+            stl
+            for stl in captured_layouts.values()
+            if list(stl.device_size) == [K // 64, M, 64]
+            and list(stl.stride_map) == [64, K, 1]
+        ),
+        None,
+    )
+    assert flat_m_stl is not None, (
+        f"expected a committed flat-M layout device_size=[{K // 64}, {M}, 64] "
+        f"stride_map=[64, {K}, 1] in finalized ops, got "
+        f"{[(n, list(s.device_size), list(s.stride_map)) for n, s in captured_layouts.items()]}"
+    )
     compare_with_cpu(
         fn,
         q,
@@ -2732,7 +2758,7 @@ def test_nonstick_no_reorder_when_large_dim_already_at_slot():
 
     assert not nonstick_log, (
         "Expected no reorder when large dim is already at slot, "
-        f"but got: {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"but got: {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
 
 
@@ -2767,20 +2793,62 @@ def test_nonstick_reorder_pointwise_into_matmul():
     # x=[2,55,2] → device_size=[55,2,2,64] → outer_stick=1, slot=2 → [2,2,55,64].
     assert nonstick_log, "Expected nonstick_reorder_log to be non-empty"
     reordered_any = False
-    for buf_name, stl_list in nonstick_log.items():
-        for stl in stl_list:
-            device_size = list(stl.device_size)
-            if len(device_size) < 3:
-                continue
-            nonstick = device_size[:-1]
-            # For the 2D-stick shape used here (4 device dims, outer_stick=1,
-            # slot=2), the sandwich slot is device_size[-2].  Only check
-            # buffers where the slot dim is actually the largest — buffers
-            # whose idc couldn't be resolved are left unchanged.
-            if device_size[-2] != max(nonstick):
-                continue
-            reordered_any = True
+    for buf_name, stl in nonstick_log.items():
+        device_size = list(stl.device_size)
+        if len(device_size) < 3:
+            continue
+        nonstick = device_size[:-1]
+        # For the 2D-stick shape used here (4 device dims, outer_stick=1,
+        # slot=2), the sandwich slot is device_size[-2].  Only check
+        # buffers where the slot dim is actually the largest — buffers
+        # whose idc couldn't be resolved are left unchanged.
+        if device_size[-2] != max(nonstick):
+            continue
+        reordered_any = True
     assert reordered_any, (
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
-        f"nonstick_log={[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_flat_dense_projection_collapses_outer_dims():
+    """NDO should collapse a BLHD view into flat [M,K] for a dense o_proj."""
+    import torch.nn.functional as F
+
+    B, H, L, D = 2, 2, 64, 64
+    M, K = B * L, H * D
+    q, k, v = _make_tensors(3, B, H, L, D)
+    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=D**-0.5
+        )
+        flat = attention.transpose(1, 2).reshape(M, K)
+        return F.linear(flat, weight)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn, q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), weight.to(DEVICE)
+    )
+
+    # NDO must have rewritten the BLHD buffer's layouts to the flat [M, K] shape.
+    # After stickification that is device_size=[K//64, M, 64].
+    assert nonstick_log, "expected NDO to rewrite at least one buffer"
+    flat_m_found = any(
+        list(stl.device_size) == [K // 64, M, 64] for stl in nonstick_log.values()
+    )
+    assert flat_m_found, (
+        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
+        f"got {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
     )

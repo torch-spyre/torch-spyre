@@ -49,9 +49,7 @@ class EdgeCostMap:
 
     Entries are computed on demand by compute_restickify_needed. `dep` is the
     MemoryDep for this input; it is not used locally but is forwarded to
-    compute_restickify_needed in pass_utils. ``require_exact`` makes physical
-    layout equality, rather than ordinary stick compatibility, the zero-cost
-    condition for this edge.
+    compute_restickify_needed in pass_utils.
     """
 
     def __init__(
@@ -62,14 +60,12 @@ class EdgeCostMap:
         target_dep: "MemoryDep",
         op,
         forbidden_stick_sym: "sympy.Symbol | None" = None,
-        require_exact: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
-        self._require_exact = require_exact
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
         self._forbidden_stick_sym = forbidden_stick_sym
@@ -107,7 +103,6 @@ class EdgeCostMap:
             target_stl,
             self._target_dep,
             self._op,
-            require_exact=self._require_exact,
         )
         if not needed and self._forbidden_stick_sym is not None:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
@@ -316,9 +311,8 @@ class FixedInOutNode(RestickNodeCost):
         self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op, out_dep, exact_input_indices=None):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
-        exact_input_indices = exact_input_indices or set()
         edge_costs = [
             EdgeCostMap(
                 arg.dep,
@@ -326,9 +320,8 @@ class FixedInOutNode(RestickNodeCost):
                 [req],
                 arg.dep,
                 op,
-                require_exact=i in exact_input_indices,
             )
-            for i, (arg, req) in enumerate(zip(args, req_stls))
+            for arg, req in zip(args, req_stls)
         ]
         return cls(
             edge_costs,

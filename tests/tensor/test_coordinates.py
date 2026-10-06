@@ -41,9 +41,9 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
-    _flat_dense_projection_x_layout,
     find_stick_compatible_input_layout,
 )
+from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
     align_tensors,
@@ -854,21 +854,13 @@ class TestFactorizedMatmulCandidates(TestCase):
                 [sympy.floor(contraction / 64), m, sympy.Mod(contraction, 64)],
             )
 
+            # Without an op, _is_matmul_op returns False so factorized_layout_mismatch
+            # does not fire. stick_compatible passes for this pair (same stick variable).
             compatible, compatible_target = compute_restickify_needed(
                 source, x_host, x_dep, result, x_dep
             )
-            needed, target = compute_restickify_needed(
-                source,
-                x_host,
-                x_dep,
-                result,
-                x_dep,
-                require_exact=True,
-            )
         self.assertFalse(compatible)
         self.assertIsNone(compatible_target)
-        self.assertTrue(needed)
-        self.assertEqual(target, expected)
 
         strided_x = PropArg(
             x_dep,
