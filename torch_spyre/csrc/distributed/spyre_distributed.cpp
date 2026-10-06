@@ -516,12 +516,13 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
   }
 
   // Lock released — concurrent wait_work and run ops can now proceed.
-  // The wait is skipped only when opted in with TORCH_SPYRE_DIST_ENFORCE_WAIT=0
-  // and the current stream is the default Flex stream that Spyre Comms uses
-  // (see ensure_context()).  Other streams are not ordered with it.
+  // The wait is enforced only when opted in with
+  // TORCH_SPYRE_DIST_ENFORCE_WAIT=1 and the current stream is the default Flex
+  // stream that Spyre Comms uses (see ensure_context()).  Other streams are not
+  // ordered with it.
   static const bool enforce_wait = []() {
     const char* env = std::getenv("TORCH_SPYRE_DIST_ENFORCE_WAIT");
-    return !(env && std::string(env) == "0");
+    return env && std::string(env) == "1";
   }();
 
   if (pending.work) {
