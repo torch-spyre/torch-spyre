@@ -28,6 +28,7 @@ from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
+    ElementArrangement,
 )
 from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.compute_ops import (
@@ -955,3 +956,61 @@ class TestMaskingConstId(InductorTestCase):
             self.assertEqual(
                 self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
             )
+
+
+class TestConversionPaddingAcrossStickWidths(InductorTestCase):
+    """Padding of a dim is measured from its extent before any arg padded it.
+
+    In an fp32 <-> fp16 conversion both args pad the same stick dim, each by its
+    own stick width, so the extent of a size-1 stick goes 1 -> 32 -> 64 when the
+    fp32 arg pads first. The OpSpecs mirror what x.to(dtype) compiles to on
+    (64, 1).
+    """
+
+    def _conversion_spec(self, op, src, dst, src_ea, dst_ea) -> OpSpec:
+        row = sympy.Symbol("c0")
+        iteration_space = {row: (sympy.Integer(64), 1)}
+        return OpSpec(
+            op=op,
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=arg_index,
+                    device_dtype=dtype,
+                    device_size=[1, 64, dtype.elems_per_stick()],
+                    device_coordinates=[sympy.S.Zero, row, sympy.S.Zero],
+                    allocation={"hbm": address},
+                    element_arrangement=ea,
+                )
+                for arg_index, (is_input, dtype, ea, address) in enumerate(
+                    [(True, src, src_ea, 0), (False, dst, dst_ea, 0x100000)]
+                )
+            ],
+            op_info={},
+        )
+
+    def test_padding_counts_every_arg_increment(self):
+        fp32, fp16 = DataFormats.IEEE_FP32, DataFormats.SEN169_FP16
+        cases = {
+            "fp32todl16": (
+                fp32,
+                fp16,
+                ElementArrangement.STANDARD,
+                ElementArrangement.FP32_TO_DL16,
+            ),
+            "dl16tofp32": (
+                fp16,
+                fp32,
+                ElementArrangement.STANDARD,
+                ElementArrangement.DL16_TO_FP32,
+            ),
+        }
+        for op, args in cases.items():
+            with self.subTest(op=op):
+                sdsc_spec, _ = parse_op_spec(self._conversion_spec(op, *args))
+                (stick,) = sdsc_spec.padding
+                self.assertEqual(sdsc_spec.iteration_space[stick], 64)
+                self.assertEqual(sdsc_spec.padding[stick], 63)

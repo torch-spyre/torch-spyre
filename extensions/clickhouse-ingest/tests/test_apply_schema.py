@@ -180,6 +180,29 @@ def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
     ]
 
 
+def test_an_mv_a_pending_migration_recreates_is_not_drift(tmp_path):
+    mv = "CREATE MATERIALIZED VIEW IF NOT EXISTS m TO t AS SELECT {} AS a FROM t"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE + ";\n" + mv.format("a + 1")},
+        {
+            "001_mv.sql": "DROP VIEW IF EXISTS m;\n"
+            + mv.format("a + 1").replace("IF NOT EXISTS ", "")
+        },
+    )
+    live = {
+        "t": TABLE.replace("IF NOT EXISTS ", ""),
+        "m": mv.format("a").replace("IF NOT EXISTS ", ""),
+    }
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(
+        FakeServer(live), DB, files, SchemaApplier.migration_files(d)
+    )
+    assert ("migrates", "m") in [(a, n) for a, n, _ in steps]
+    steps = _run(FakeServer(live), d)
+    assert ("migrate", "001_mv.sql") in [(a, n) for a, n, _ in steps]
+
+
 def test_a_constraint_a_pending_migration_replaces_is_not_drift(tmp_path):
     new = (
         "CREATE TABLE IF NOT EXISTS {} (\n    a String,\n"
