@@ -74,6 +74,7 @@ from .pass_utils import (
     concretize_expr,
     op_read_writes,
     compute_symbolic_bounds,
+    max_trip_count,
     symbolic_count_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -1151,18 +1152,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    count = loop_count[lvl]
-                    # A symbolic count needs its op geometry built at the declared
-                    # maximum, and a launch slot that reads the size, before it
-                    # can run. Neither exists yet, so say that plainly here
-                    # instead of failing in int() with "Cannot convert symbols".
-                    if getattr(count, "free_symbols", None):
-                        raise Unsupported(
-                            f"{op_name} inside a for_each_tile loop whose trip "
-                            f"count {count} depends on a varying size. Building its "
-                            "geometry at the declared maximum is not implemented yet"
-                        )
-                    trip_count = int(count)
+                    # Not int(): a symbolic count has no single value and int()
+                    # on one raises. What the SDSC needs here is the dimension's
+                    # largest extent. See max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.

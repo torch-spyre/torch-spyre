@@ -341,12 +341,30 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     output expressions are never touched, so the generated coordinate
     expressions remain symbolic and will carry through to the SDSC when
     symbolic SDSC generation is implemented.
+
+    A structural parameter that depends on a varying dimension resolves to that
+    dimension's DECLARED MAXIMUM, not to this call's hint. One binary has to stay
+    valid for every size in the range, and the hint is one warm-up call's size.
+    Measured: a binary built against a 320-row warm-up was correct at 128 and 256
+    and wrong at 448 and 512, relative error 3.96 and 4.37. Over-declaring the
+    geometry is harmless and under-declaring it is a silent wrong answer, which
+    puts the maximum at the safe end.
+
+    This changes nothing for anything else: a concrete expression returns early
+    above, and a symbol that went dynamic without a declared range has no finite
+    bound and still takes the hint.
+
+    Depends on the max-strided reservation (#5179). Geometry sized from the
+    maximum is only addressable because the buffer was reserved for the maximum.
     """
     if isinstance(expr, int):
         return expr
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
+        upper = finite_upper_or_none(expr)
+        if upper is not None:
+            return upper
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
@@ -502,6 +520,54 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
         tile_size,
     )
     return {str(symbol): (upper, tile_size)}
+
+
+def max_trip_count(count) -> int:
+    """The largest number of iterations one loop level can run.
+
+    SDSC codegen multiplies a tiled tensor's per-step device advance by this to
+    get that dimension's full pre-tiling extent, which is what
+    ``OpSpec.tiled_symbol_trip_counts`` carries. A symbolic count has no single
+    value and the extent has to be the LARGEST one, because the HBM buffer is
+    reserved at the maximum and the bundle's own loop bound is what limits how
+    many iterations actually run.
+
+    So this takes the ShapeEnv upper bound and never the hint. Baking in one
+    call's size specialises the SDSC to it while the binary claims to serve the
+    whole range, and that is invisible at the warm-up size.
+
+    NOT the same number as ``symbolic_count_bounds`` carries, which is easy to
+    confuse because both are "the max". For ``FloorDiv(s, 64)`` with ``s <= 512``
+    this is 8, the trip count, while the bounds carry 512, the dimension's own
+    ceiling that the bundle declares as ``max_value``.
+
+    Depends on the max-strided reservation (#5179), for the same reason
+    ``concretize_expr`` does: an extent sized from the maximum is only
+    addressable because the buffer was reserved for it.
+
+    Raises:
+        Unsupported: the count is symbolic with no finite upper bound, so there
+            is no extent to describe. The message names the symbol.
+    """
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return int(count)
+
+    upper = finite_upper_or_none(count)
+    if upper is None:
+        raise Unsupported(
+            f"symbolic loop count {count} has no finite upper bound, so SDSC "
+            f"codegen cannot describe the tiled dimension's extent. Declare the "
+            f"range for {sorted(map(str, count.free_symbols))} in the traced "
+            f"region"
+        )
+    logger.info(
+        "[symbolic-loop] max_trip_count(%s) = %d, from the ShapeEnv upper bound. "
+        "This is the SDSC's full extent, NOT how many iterations run: that comes "
+        "from the bundle's own loop bound at launch",
+        count,
+        upper,
+    )
+    return upper
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
