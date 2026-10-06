@@ -118,8 +118,28 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
-Set `DXP_LOOP_UNROLL=0` to keep counted loops in the backend compiler. The setting
-is part of the kernel cache key, so changing it cannot reuse an unrolled artifact.
+Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
+loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
+`1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).
+`DXP_LOOP_UNROLL` remains a compatibility alias; `SPYRE_BACKEND_LOOP_UNROLL` takes
+precedence when both are set. Invalid values raise an error.
+
+Python callers can override the resolved setting during compilation:
+
+```python
+from torch_spyre._inductor import config
+
+with config.patch(backend_loop_unroll=False):
+    result = compiled_model(inputs)  # First call triggers compilation.
+```
+
+The resolved boolean is included in the kernel cache key and passed explicitly
+to each compile worker as `dbo-opt --enable-loop-unroll=0` or `1`. Equivalent
+environment spellings share a cache key; changing the effective setting cannot
+reuse an artifact compiled with the other setting. This controls the SDSC-bundle
+frontend only, not the direct `--from-ktir` path or every loop optimization.
+Preserving device loops requires autopilot; Deeptools rejects disabling unrolling
+with `DT_OPT=autopilot=0`.
 
 For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable

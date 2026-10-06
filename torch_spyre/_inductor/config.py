@@ -18,6 +18,26 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
+
+def _backend_loop_unroll_from_env() -> bool:
+    for name in ("SPYRE_BACKEND_LOOP_UNROLL", "DXP_LOOP_UNROLL"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes"):
+            return True
+        if normalized in ("0", "false", "no"):
+            return False
+        raise ValueError(f"{name} must be 1/true/yes or 0/false/no, got {value!r}")
+    return True
+
+
+# Controls dbo-opt's SDSC-bundle loop unrolling, not the direct KTIR path.
+# Resolve at import like the other options; config.patch can override it.
+# The Spyre spelling takes precedence over the legacy DXP compatibility alias.
+backend_loop_unroll: bool = _backend_loop_unroll_from_env()
+
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"

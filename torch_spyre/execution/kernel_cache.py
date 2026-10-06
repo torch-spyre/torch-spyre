@@ -234,7 +234,11 @@ def _strip_debug_handles(obj):
 
 
 def compute_specs_hash(
-    specs: Sequence, kernel_name: str = "", pool_size: int = 0
+    specs: Sequence,
+    kernel_name: str = "",
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
 
@@ -252,11 +256,15 @@ def compute_specs_hash(
                      ``sdscbundle.device_mem_allocate`` in bundle.mlir.
                      Must be included so that kernels that differ only in
                      their pool size get different cache keys.
+        backend_loop_unroll: Resolved setting passed to the backend compiler.
+                             Defaults to the active Spyre config.
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor import config as _spyre_config
 
+    if backend_loop_unroll is None:
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -383,7 +391,7 @@ def compute_specs_hash(
     content_parts.append(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
-    content_parts.append(f"loop_unroll:{os.getenv('DXP_LOOP_UNROLL', '1')}".encode())
+    content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(
