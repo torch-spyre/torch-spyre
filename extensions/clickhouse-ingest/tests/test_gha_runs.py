@@ -282,3 +282,27 @@ def test_backoff_waits_out_the_rate_limit_and_gives_up_on_client_errors():
     assert (
         gha_runs.GitHub._backoff(err(403, **{"X-RateLimit-Remaining": "12"}), 0) is None
     )
+
+
+def test_get_retries_a_truncated_response(monkeypatch):
+    import http.client
+    import io
+
+    calls = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout):
+        calls.append(1)
+        if len(calls) == 1:
+            raise http.client.IncompleteRead(b"{", 10)
+        return Resp(b'{"ok": true}')
+
+    monkeypatch.setattr(gha_runs.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gha_runs.time, "sleep", lambda s: None)
+    assert gha_runs.GitHub("t").get("/x") == {"ok": True} and len(calls) == 2

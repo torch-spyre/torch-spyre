@@ -25,6 +25,7 @@ by (run, attempt), so overlapping windows are harmless. Needs GITHUB_TOKEN.
 """
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -276,7 +277,13 @@ class GitHub:
                 wait = self._backoff(err, attempt)
                 if wait is None:
                     raise
-            except (urllib.error.URLError, TimeoutError):
+            # A truncated body or dropped connection is transient, like a 5xx.
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionError,
+                http.client.IncompleteRead,
+            ):
                 wait = 2**attempt
             time.sleep(wait)
         raise SystemExit(
