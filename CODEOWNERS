@@ -1,6 +1,6 @@
 #####################################################
 #
-# List of approvers for torch-spyre repository
+# List of approvers for torch-spyre repository release-0.5 branch
 #
 #####################################################
 #
@@ -8,56 +8,4 @@
 #  https://help.github.com/en/articles/about-code-owners
 #
 
-# Default owners (fallback for anything not matched below)
-*  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
-
-# torch_spyre top-level files (runtime infrastructure)
-/torch_spyre/*       @JRosenkranz @thoangtrvn @ani300
-
-# Inductor / compiler backend
-/torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
-/torch_spyre/inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
-
-# Device, execution, memory, and C++ runtime
-/torch_spyre/device/     @JRosenkranz @thoangtrvn @ani300
-/torch_spyre/execution/  @JRosenkranz @thoangtrvn @ani300
-/torch_spyre/memory/     @JRosenkranz @thoangtrvn @ani300
-/torch_spyre/csrc/       @JRosenkranz @thoangtrvn @ani300
-
-# Distributed / collective communication (spyre_ccl)
-/torch_spyre/csrc/distributed/  @jjhursey @JRosenkranz @thoangtrvn
-
-# Profiler
-/torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
-
-# Operations (eager ops and fallbacks)
-/torch_spyre/ops/        @ani300 @moriohara @pradghos
-/codegen/                @ani300 @moriohara @pradghos
-
-# Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion @thoangtrvn @cyang49 @marnold-ibm @jjhursey
-
-# Distributed tests (more specific than /tests/ above — must come after it so
-# the last-matching-pattern rule gives these owners precedence)
-/tests/distributed/      @jjhursey @thoangtrvn @avery-blanchard
-
-# Documentation
-/docs/                   @kaoutar55 @dgrove-oss @tardieu @mudhakar @raghukiran1224 @viji560 @tehbone
-
-# CI/CD
-/.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
-/.pre-commit-config.yaml  @ashokponkumar @jabostian @anubhavjana @n-marion
-/pytest.ini               @ashokponkumar @jabostian @anubhavjana @n-marion
-/pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
-/Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
-
-/extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
-
-# ktir-mlir-frontend pin and its installer.  Two files rather than /tools/, which
-# is otherwise CI's: which frontend revision the OpSpec->KTIR emitter is tested
-# against is a fact about /torch_spyre/_inductor/.
-/tools/ktir-mlir-frontend.pin  @dgrove-oss @avery-blanchard @tardieu
-/tools/install-ktir.sh         @dgrove-oss @avery-blanchard @tardieu
-
-# tools used to tune/refresh the cost model used in inductor
-/tools/cost_model/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
+* @dgrove-oss @tardieu @JRosenkranz @ani300 @ashokponkumar @mudhakar @tehbone @svaidy 
