@@ -19,6 +19,7 @@ from collections import Counter
 import sys
 
 from . import schema
+from .mark_retried import PRIOR_MESSAGE, PRIOR_MESSAGE_MAX, PRIOR_STATUS
 from .identity import (
     ArtifactIdentity,
     BenchmarkId,
@@ -418,9 +419,10 @@ class TestResultWriter(RunWriter):
         ids = list(batch)
         held: dict = {}
         for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
-            for tcid, uuid, status, dur, msg, ran_in, attempt, sf in client.query(
+            found = client.query(
                 "SELECT test_case_id, audit_uuid, status, duration_s, fail_message, "
-                "props['ran_in'], props['run_attempt'], props['source_file'] "
+                "props['ran_in'], props['run_attempt'], props['source_file'], "
+                f"props['{PRIOR_STATUS}'], props['{PRIOR_MESSAGE}'] "
                 f"FROM {cls.fact_table.qualified(db)} "
                 "WHERE component = {component:String} AND run_id = {run_id:UUID} "
                 "AND test_case_id IN {ids:Array(UUID)}",
@@ -429,7 +431,8 @@ class TestResultWriter(RunWriter):
                     "run_id": run_id,
                     "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
                 },
-            ).result_rows:
+            ).result_rows
+            for tcid, uuid, status, dur, msg, ran_in, attempt, sf, *prior in found:
                 held.setdefault(str(tcid), []).append(
                     {
                         "audit_uuid": str(uuid),
@@ -439,6 +442,7 @@ class TestResultWriter(RunWriter):
                         "ran_in": ran_in,
                         "attempt": int(attempt or 0),
                         "source_file": sf,
+                        "prior": tuple(prior),
                     }
                 )
         keep, superseded = [], set()
@@ -449,10 +453,32 @@ class TestResultWriter(RunWriter):
                 if any(cls._restates(run_id, h, f) for h in rows_held):
                     continue
                 keep.append(r)
-                superseded |= {
-                    h["audit_uuid"] for h in rows_held if cls._restates(run_id, f, h)
-                }
+                replaced = [h for h in rows_held if cls._restates(run_id, f, h)]
+                superseded |= {h["audit_uuid"] for h in replaced}
+                cls._keep_prior(run_id, r, f, replaced)
         return keep, sorted(superseded)
+
+    @staticmethod
+    def _keep_prior(run_id: str, row: dict, f: dict, replaced: list) -> None:
+        """Stamp on `row` the newest failure of an older attempt it replaces, else it is lost."""
+        if row["props"].get(PRIOR_STATUS):
+            return
+        older = [
+            h
+            for h in replaced
+            if h["attempt"] < f["attempt"]
+            and h["source_file"] == f["source_file"]
+            and h["ran_in"] in ("", str(run_id))
+        ]
+        for h in sorted(older, key=lambda h: h["attempt"], reverse=True):
+            if h["status"] in ("failed", "error"):
+                prior = (h["status"], h["fail_message"][:PRIOR_MESSAGE_MAX])
+            elif h["prior"] and h["prior"][0]:
+                prior = h["prior"]
+            else:
+                continue
+            row["props"][PRIOR_STATUS], row["props"][PRIOR_MESSAGE] = prior
+            return
 
     @staticmethod
     def _recorded(case: dict) -> tuple:

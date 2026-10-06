@@ -49,6 +49,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `client.py` | `get_client`, `target_database`, `tables_present` |
 | `writer.py` | `insert_test_results`, `cases_already_ingested`, `insert_gha_artifact_result` |
 | `junit.py` | JUnit helpers + CI run-coordinate resolution |
+| `mark_retried.py` | stamps `result.retried` / `result.prior_*` on a retry's JUnit XML (stdlib-only; `spyre-mark-retried`) |
 | `hw_parse.py` | GHA log → `hw_failure_diagnostics` records (RAS events, phases, pytest counts) |
 | `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
 | `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |

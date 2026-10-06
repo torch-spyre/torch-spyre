@@ -24,10 +24,11 @@ TCID = CaseId.derive("torch-spyre", "T", "test_x", [])
 
 
 class HeldClient:
-    """A client whose run already holds `held`: [(status, ran_in, run_attempt, source_file)]."""
+    """A client whose run already holds `held`: [(status, ran_in, run_attempt, source_file,
+    [fail_message, prior_status, prior_message])]."""
 
     def __init__(self, held=()):
-        self.held = list(held)
+        self.held = [(*h, "", "", "")[:7] for h in held]
         self.inserts, self.commands = [], []
 
     def insert(self, table, rows, column_names=None, database=None):
@@ -37,8 +38,17 @@ class HeldClient:
         rows = []
         if "audit_uuid" in sql:
             rows = [
-                (TCID, f"00000000-0000-7000-8000-00000000000{i}", h[0], 0.0, "", *h[1:])
-                for i, h in enumerate(self.held)
+                (
+                    TCID,
+                    f"00000000-0000-7000-8000-00000000000{i}",
+                    st,
+                    0.0,
+                    msg,
+                    *rest,
+                    ps,
+                    pm,
+                )
+                for i, (st, *rest, msg, ps, pm) in enumerate(self.held)
             ]
 
         class R:
@@ -82,6 +92,38 @@ def test_a_newer_attempt_of_the_file_replaces_the_older_and_recounts():
     assert any(
         sql.startswith("INSERT INTO db.run_case_counters") for sql, _ in c.commands
     )
+
+
+def _written_props(c):
+    return [
+        dict(zip(cols, r))["props"]
+        for t, rows, cols in c.inserts
+        if t == TEST_CASE_RUNS.name
+        for r in rows
+    ]
+
+
+def test_a_newer_attempt_keeps_the_failure_it_replaces_as_prior_status():
+    c = HeldClient([("failed", RUN, "1", "b.xml", "AssertionError: mismatch")])
+    _write(c, "passed", attempt=2)
+    props = _written_props(c)[0]
+    assert props["result.prior_status"] == "failed"
+    assert props["result.prior_message"] == "AssertionError: mismatch"
+
+
+def test_a_prior_mark_on_the_replaced_attempt_carries_forward():
+    c = HeldClient([("passed", RUN, "1", "b.xml", "", "error", "card fault")])
+    _write(c, "passed", attempt=2)
+    assert _written_props(c)[0]["result.prior_status"] == "error"
+
+
+def test_a_replaced_pass_or_another_files_failure_leaves_no_prior_status():
+    c = HeldClient([("passed", RUN, "1", "b.xml")])
+    _write(c, "passed", attempt=2)
+    assert "result.prior_status" not in _written_props(c)[0]
+    c = HeldClient([("failed", OTHER, "1", "b.xml", "reused")])
+    _write(c, "passed", attempt=2)
+    assert "result.prior_status" not in _written_props(c)[0]
 
 
 def test_an_older_attempt_arriving_late_is_not_written():

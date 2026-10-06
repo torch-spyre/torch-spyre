@@ -15,6 +15,9 @@ dependencies = [
     "regex",
 ]
 
+[project.scripts]
+spyre-mark-retried = "spyre_clickhouse_ingest.mark_retried:main"
+
 [project.optional-dependencies]
 # Only the self-serve sandbox server (sandbox_server.py) needs these; the ingests never import it.
 server = [
