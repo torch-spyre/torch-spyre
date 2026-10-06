@@ -48,13 +48,19 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Reduction
+from torch._inductor.ir import ComputedBuffer, Reduction, Scatter
 from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 
 from .constants import MATMUL_REDUCTION_OPS
+from .errors import Unsupported
 from .logging_utils import get_inductor_logger
-from .pass_utils import try_device_coordinates
+from .op_spec import IndirectAccess
+from .pass_utils import (
+    device_coordinates,
+    indirect_info_from_op,
+    try_device_coordinates,
+)
 
 logger = get_inductor_logger("nonstick_dim_order")
 
@@ -152,18 +158,97 @@ def _try_matmul_perf_reorder(
     return _reorder_stl(buf.committed_stl, write_dep, buf.get_name(), pinned)
 
 
-def _collect_matmul_input_bufs(
-    graph: GraphLowering,
-) -> list[ComputedBuffer]:
-    """Walk graph backward; collect ComputedBuffers that feed matmul ops.
+def _indirect_stride_idx(
+    coords: list,
+    access_subs: dict,
+) -> int | None:
+    """Return the stride_idx (from right, 0-indexed) of the first IndirectAccess
+    coordinate, or None if coords carry no indirect symbol."""
+    for idx, coord in enumerate(reversed(coords)):
+        substituted = coord.xreplace(access_subs) if access_subs else coord
+        if hasattr(substituted, "has") and substituted.has(IndirectAccess):
+            return idx
+    return None
 
-    Returns a deduplicated list of ComputedBuffer instances that are read by
-    any matmul op and are not graph inputs.
 
-    Indirect-access (gather/scatter) candidates will be added in follow-up tasks.
+def _build_required_stl(
+    stl: SpyreTensorLayout,
+    indirect_device_pos: int,
+) -> SpyreTensorLayout:
+    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+    n = len(device_size)
+    stick_pos = n - 1
+
+    if indirect_device_pos == 0:
+        return stl
+
+    order = (
+        [indirect_device_pos]
+        + [i for i in range(n) if i != indirect_device_pos and i != stick_pos]
+        + [stick_pos]
+    )
+    return SpyreTensorLayout(
+        device_size=[device_size[i] for i in order],
+        stride_map=[stride_map[i] for i in order],
+        device_dtype=stl.device_dtype,
+    )
+
+
+def _try_gather_ia_constraint(
+    buf: ComputedBuffer,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+) -> tuple[SpyreTensorLayout, set[int]] | None:
+    """Rotate the indirectly-indexed dim of a gather value tensor to device position 0.
+
+    buf is the value tensor (indirectly-indexed buffer); dep is its read dep.
+    Returns (new_stl, {0}) if a rotation is needed, None if already compliant
+    or not applicable.
     """
-    seen: set[str] = set()
-    result: list[ComputedBuffer] = []
+    if not hasattr(buf, "committed_stl"):
+        return None
+    _, access_subs, sizes = indirect_info_from_op(op)
+    if not access_subs:
+        return None
+    stl = buf.committed_stl
+    try:
+        coords = device_coordinates(stl, dep, sizes, op=op)
+    except (Unsupported, Exception):
+        return None
+    coords_substituted = [c.xreplace(access_subs) for c in coords]
+    stride_idx = _indirect_stride_idx(coords_substituted, access_subs)
+    if stride_idx is None:
+        return None
+    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
+    if indirect_device_pos == 0:
+        return None
+    new_stl = _build_required_stl(stl, indirect_device_pos)
+    logger.info(
+        "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
+        buf.get_name(),
+        indirect_device_pos,
+    )
+    return new_stl, {0}
+
+
+def _collect_triples(
+    graph: GraphLowering,
+) -> list[tuple[ComputedBuffer, MemoryDep, ComputedBuffer]]:
+    """Walk graph; collect (buf, dep, op) triples for constraint and perf transforms.
+
+    Returns triples where:
+      buf — the ComputedBuffer to potentially reorder
+      dep — the MemoryDep describing the access from op to buf
+      op  — the ComputedBuffer that reads buf
+
+    Collects:
+      - Indirect-access gather ops: value tensor deps where dep.name in dep_names.
+      - Matmul ops: all ComputedBuffer inputs.
+    """
+    seen: set[tuple[str, str]] = set()
+    triples: list[tuple[ComputedBuffer, MemoryDep, ComputedBuffer]] = []
     graph_inputs = set(V.graph.graph_input_names)
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
@@ -171,6 +256,25 @@ def _collect_matmul_input_bufs(
         if not hasattr(op, "data"):
             continue
 
+        # Indirect-access ops (gather): collect value tensor deps.
+        dep_names, access_subs, sizes = indirect_info_from_op(op)
+        is_indirect = bool(dep_names) and not isinstance(op.data, Scatter)
+        if is_indirect:
+            for dep in op.get_read_writes().reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                if dep.name not in dep_names:
+                    continue
+                buf = V.graph.get_buffer(dep.name)
+                if not isinstance(buf, ComputedBuffer):
+                    continue
+                key = (dep.name, op.get_name())
+                if key in seen:
+                    continue
+                seen.add(key)
+                triples.append((buf, dep, op))
+
+        # Matmul ops: collect all ComputedBuffer inputs.
         is_matmul = (
             isinstance(op.data, Reduction)
             and op.data.reduction_type in MATMUL_REDUCTION_OPS
@@ -181,41 +285,57 @@ def _collect_matmul_input_bufs(
                     continue
                 if dep.name in graph_inputs:
                     continue
-                if dep.name in seen:
-                    continue
                 buf = V.graph.get_buffer(dep.name)
                 if not isinstance(buf, ComputedBuffer):
                     continue
-                seen.add(dep.name)
-                result.append(buf)
+                key = (dep.name, op.get_name())
+                if key in seen:
+                    continue
+                seen.add(key)
+                triples.append((buf, dep, op))
 
-    return result
+    return triples
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dims on matmul inputs for better work division.
+    """Reorder non-stick dims for correctness (phase 1) and performance (phase 2).
 
-    Phase 1 (constraint transforms) is a placeholder for now — gather/scatter
-    IA constraints will be added in a follow-up task.  Phase 2 (matmul perf
-    reorder) runs with an empty pinned_dims dict.
+    Phase 1 applies constraint transforms (gather IA).
+    Phase 2 applies performance transforms (matmul perf reorder), respecting
+    pinned_dims set by phase 1.
     """
     V.graph.nonstick_reorder_log = {}
     log: dict[str, SpyreTensorLayout] = {}
 
-    candidates = _collect_matmul_input_bufs(graph)
+    triples = _collect_triples(graph)
 
-    # Phase 1: constraint transforms (gather IA, scatter IA).
-    # pinned_dims maps buf_name -> set of device positions fixed by constraints.
+    # Phase 1: constraint transforms.
     pinned_dims: dict[str, set[int]] = {}
-    # (Constraint transforms will be added in the next task.)
-
-    # Phase 2: performance transforms.
-    for buf in candidates:
-        pinned = pinned_dims.get(buf.get_name(), set())
-        new_stl = _try_matmul_perf_reorder(buf, pinned)
-        if new_stl is not None:
+    for buf, dep, op in triples:
+        result = _try_gather_ia_constraint(buf, dep, op)
+        if result is not None:
+            new_stl, pinned = result
             buf.committed_stl = new_stl
             log[buf.get_name()] = new_stl
-            logger.info("nonstick_dim_order: reordered %s", buf.get_name())
+            pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
+            logger.info(
+                "nonstick_dim_order: gather IA constraint applied to %s",
+                buf.get_name(),
+            )
+
+    # Phase 2: performance transforms.
+    # Collect unique bufs that appeared in matmul triples for perf reorder.
+    seen_bufs: set[str] = set()
+    for buf, dep, op in triples:
+        name = buf.get_name()
+        if name in seen_bufs:
+            continue
+        seen_bufs.add(name)
+        pinned = pinned_dims.get(name, set())
+        reordered_stl = _try_matmul_perf_reorder(buf, pinned)
+        if reordered_stl is not None:
+            buf.committed_stl = reordered_stl
+            log[name] = reordered_stl
+            logger.info("nonstick_dim_order: reordered %s", name)
 
     V.graph.nonstick_reorder_log = log
