@@ -115,6 +115,8 @@ SELECT
     -- Previously omitted, leaving pass_rate at 92.11% instead of 97.88% (72,887 prod rows).
     coalesce(c.xfail, 0)       AS xfail,
     coalesce(c.xpass, 0)       AS xpass,
+    -- Of passed: an earlier attempt of the case failed.
+    coalesce(c.recovered, 0)   AS recovered,
     r.duration_s     AS duration_s,
     -- Denominator excludes xfail/xpass: of the cases whose outcome was in question, how many passed.
     if(total_tests - xfail - xpass > 0,
@@ -137,7 +139,8 @@ LEFT JOIN (
         sum(errors)      AS errors,
         sum(skipped)     AS skipped,
         sum(xfail)       AS xfail,
-        sum(xpass)       AS xpass
+        sum(xpass)       AS xpass,
+        sum(recovered)   AS recovered
     FROM run_case_counters
     GROUP BY run_id
 ) AS c ON c.run_id = r.run_id;
@@ -225,6 +228,7 @@ SELECT
     sum(e.skipped)          AS skipped,
     sum(e.xfail)            AS xfail,
     sum(e.xpass)            AS xpass,
+    sum(e.recovered)        AS recovered,
     -- Same denominator as v_artifact_results_enriched: xfail/xpass excluded.
     if(sum(e.total_tests) - sum(e.xfail) - sum(e.xpass) > 0,
        sum(e.passed) / (sum(e.total_tests) - sum(e.xfail) - sum(e.xpass)), NULL) AS pass_rate,

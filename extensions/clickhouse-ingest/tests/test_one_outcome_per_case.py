@@ -26,8 +26,9 @@ TCID = CaseId.derive("torch-spyre", "T", "test_x", [])
 class HeldClient:
     """A client whose run already holds `held`: [(status, ran_in, run_attempt, source_file)]."""
 
-    def __init__(self, held=()):
+    def __init__(self, held=(), recovered=False):
         self.held = list(held)
+        self.recovered = recovered
         self.inserts, self.commands = [], []
 
     def insert(self, table, rows, column_names=None, database=None):
@@ -35,6 +36,8 @@ class HeldClient:
 
     def query(self, sql, parameters=None):
         rows = []
+        if "system.columns" in sql:
+            rows = [(int(self.recovered),)]
         if "audit_uuid" in sql:
             rows = [
                 (TCID, f"00000000-0000-7000-8000-00000000000{i}", h[0], 0.0, "", *h[1:])
@@ -82,6 +85,23 @@ def test_a_newer_attempt_of_the_file_replaces_the_older_and_recounts():
     assert any(
         sql.startswith("INSERT INTO db.run_case_counters") for sql, _ in c.commands
     )
+
+
+def _recount(c):
+    return next(
+        s for s, _ in c.commands if s.startswith("INSERT INTO db.run_case_counters")
+    )
+
+
+def test_the_recount_names_its_columns_and_adds_recovered_only_once_it_exists():
+    for present in (False, True):
+        c = HeldClient([("failed", RUN, "1", "b.xml")], recovered=present)
+        _write(c, "passed", attempt=2)
+        sql = _recount(c)
+        assert sql.startswith(
+            "INSERT INTO db.run_case_counters (run_id, component, total_tests"
+        )
+        assert ("recovered" in sql) is present
 
 
 def test_an_older_attempt_arriving_late_is_not_written():
