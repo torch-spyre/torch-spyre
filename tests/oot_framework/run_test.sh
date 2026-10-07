@@ -1021,6 +1021,21 @@ _cleanup_wrappers() {
 }
 trap _cleanup_wrappers EXIT
 
+# _is_upstream_pytorch_test <test_file>
+# True when the nearest checkout enclosing the file is PyTorch rather than
+# torch-spyre (same sentinels used to resolve TORCH_ROOT / TORCH_DEVICE_ROOT),
+# so it holds however the two checkouts are nested.
+_is_upstream_pytorch_test() {
+    local dir
+    dir="$(realpath "$(dirname "$1")")"
+    while [[ "$dir" != "/" ]]; do
+        [[ -e "$dir/tests/oot_framework/oot_test_base_common.py" ]] && return 1
+        [[ -e "$dir/test/test_binary_ufuncs.py" ]] && return 0
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
 # generate_wrapper_if_needed <test_file>
 # Sets global _RUN_FILE to the path pytest should actually run.
 # generate_wrapper_if_needed <test_file>
@@ -1401,6 +1416,36 @@ ${cleanup_block}
 
 WRAPPER_EOF
 
+    # Upstream PyTorch tests never mean their subprocesses to use Spyre (e.g.
+    # test_codecache's "python -c" CPU compile steps), but torch-spyre's own
+    # tests do (spyreccl_backend.py checks LOCAL_RANK validation in a child that
+    # starts the runtime), so only upstream files get this hook.
+    local subprocess_hook=""
+    if _is_upstream_pytorch_test "$test_file"; then
+        subprocess_hook=$(cat <<'HOOK_EOF'
+
+
+import pytest
+
+
+# This pytest process owns its Spyre card and a card serves one process, so a
+# subprocess a test starts must not try to open it -- it fails with "Device or
+# resource busy". torch_spyre treats IS_INDUCTOR_SPAWNED_SUBPROCESS=1 as "not
+# the owner" (no runtime, no device) and reads it once at import, so setting it
+# only while a test runs reaches child processes and never this one.
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    prev = os.environ.get("IS_INDUCTOR_SPAWNED_SUBPROCESS")
+    os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = "1"
+    yield
+    if prev is None:
+        os.environ.pop("IS_INDUCTOR_SPAWNED_SUBPROCESS", None)
+    else:
+        os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = prev
+HOOK_EOF
+)
+    fi
+
     # Generate a conftest.py that patches DEVICE_LIST_SUPPORT_PROFILING_TEST
     # before pytest collects any tests. This is the only reliable point to
     # patch it: conftest.py runs before module import during collection, so
@@ -1428,26 +1473,7 @@ def _xfail_failure_message(report):
 def pytest_runtest_logreport(report):
     if report.when == "call" and report.skipped and getattr(report, "wasxfail", None) is not None:
         os.write(1, f"  [XFAIL ERROR = {_xfail_failure_message(report)}]\n".encode())
-
-
-import pytest
-
-
-# This pytest process owns its Spyre card and a card serves one process, so a
-# subprocess a test starts (e.g. test_codecache's "python -c" compile steps)
-# must not try to open it -- it fails with "Device or resource busy". torch_spyre
-# treats IS_INDUCTOR_SPAWNED_SUBPROCESS=1 as "not the owner" (no runtime, no
-# device) and reads it once at import, so setting it only while a test runs
-# reaches child processes and never this one.
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item, nextitem):
-    prev = os.environ.get("IS_INDUCTOR_SPAWNED_SUBPROCESS")
-    os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = "1"
-    yield
-    if prev is None:
-        os.environ.pop("IS_INDUCTOR_SPAWNED_SUBPROCESS", None)
-    else:
-        os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = prev
+${subprocess_hook}
 CONFTEST_EOF
 
     WRAPPER_FILES+=("$wrapper_path" "$conftest_path")
