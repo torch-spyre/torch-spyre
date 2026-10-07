@@ -1108,3 +1108,30 @@ def test_a_delivery_stream_records_its_list_and_leaves_under_the_stream_tag():
             (stream, "ci-cd-tech-preview", leaf["artifact_id"]),
         ]
     )
+
+
+def test_a_recorded_digest_still_takes_its_family_tag_from_the_registry():
+    recorded = _row("torch-spyre", "torch-spyre-devel", LEAF[7:19], "s390x", "image")
+    reg = FakeRegistry(
+        {**LISTED, "nightly-20260926": (LIST, LISTED[LIST][1])}, ["nightly-20260926"]
+    )
+    lookup = FakeLookup([recorded], digest=recorded[0])
+    out = resolve(
+        f"image:{IMAGE}@{LEAF}",
+        "s390x",
+        registry=reg,
+        lookup=lookup,
+        tag_family="nightly-supply-chain",
+    )
+    assert (out["artifact_id"], out["source"], out["tag"]) == (
+        recorded[0],
+        "existing",
+        "nightly-supply-chain-2026-09-26",
+    )
+    # No registry answer: the id still comes from the record, the tag from the date.
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=Unauthorized(), lookup=lookup,
+                  tag_family="nightly-supply-chain", tag_date=DAY)  # fmt: skip
+    assert (out["artifact_id"], out["tag"]) == (
+        recorded[0],
+        "nightly-supply-chain-2026-10-04",
+    )

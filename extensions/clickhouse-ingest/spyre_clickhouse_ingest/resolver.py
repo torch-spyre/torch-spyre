@@ -501,10 +501,14 @@ class _Resolver:
             )
             return self.result(identity, "derived", body, resolved, manifest_list=digest if multi else "",
                                registry_tag=registry_tag)  # fmt: skip
-        # A recorded digest needs no registry, and its record keeps the id it was filed under.
+        # A recorded digest needs no registry for its id (the record keeps the id it was filed
+        # under); the registry, when it answers, still names its tag in tag_family.
         row = digest and self.lookup.by_digest(self.arch, digest)
         if row:
-            return self.existing(row, body)
+            resolved, registry_tag = self.tagged(path, digest)
+            return self.result(
+                _identity_of(row), "existing", body, resolved, registry_tag=registry_tag
+            )
         try:
             registry = self.registry(f"{spec!r} needs its per-arch leaf")
             if not digest and tag:
