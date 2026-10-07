@@ -27,7 +27,7 @@ import regex as re
 
 @dataclass(frozen=True)
 class SchemaObject:
-    """One CREATE statement: kind is 'table', 'mv' or 'view'."""
+    """One CREATE statement: kind is 'table', 'mv', 'refresh' (a refreshable MV) or 'view'."""
 
     kind: str
     name: str
@@ -64,10 +64,18 @@ class SchemaApplier:
         r"^CREATE\s+(MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
         re.IGNORECASE,
     )
-    # The server stores a view with its resolved column list and adds default settings;
-    # both are stripped so a stored definition compares equal to the file that made it.
+    # A refreshable MV runs a query, so unlike an insert-triggered one it may read views; it is
+    # created after them.
+    REFRESHABLE = re.compile(
+        r"^CREATE\s+MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+REFRESH\b",
+        re.IGNORECASE,
+    )
+    # The server stores a view with its resolved column list (a refreshable MV also with its
+    # default DEFINER) and adds default settings; all are stripped so a stored definition
+    # compares equal to the file that made it.
     VIEW_COLUMNS = re.compile(
-        r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: TO \S+)?) \(.*?\) AS (SELECT|WITH)\b"
+        r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: REFRESH [^(]*?)?(?: TO \S+)?) \(.*?\)"
+        r"(?: DEFINER = \S+ SQL SECURITY DEFINER)? AS (SELECT|WITH)\b"
     )
     SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
     ALTER = re.compile(r"^ALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
@@ -145,6 +153,8 @@ class SchemaApplier:
                     f"'{stmt.splitlines()[0][:80]}' to schema/migrations/"
                 )
             kind = {"table": "table", "view": "view"}.get(m.group(1).lower(), "mv")
+            if cls.REFRESHABLE.match(stmt):
+                kind = "refresh"
             out.append(SchemaObject(kind, m.group(2), stmt, path.name))
         return out
 
@@ -267,7 +277,7 @@ class SchemaApplier:
         }
         steps = []
         for o in objs:
-            if o.kind == "view":
+            if o.kind == "view" or (o.kind == "refresh" and o.name not in live):
                 continue
             if o.name not in live:
                 steps.append(("create", o.name, o.file))
@@ -297,17 +307,22 @@ class SchemaApplier:
                 steps.append(("create", o.name, o.file))
             elif cls.differs(client, o, live[o.name], db):
                 steps.append(("recreate", o.name, o.file))
+        steps += [
+            ("create", o.name, o.file)
+            for o in objs
+            if o.kind == "refresh" and o.name not in live
+        ]
         return steps
 
     @classmethod
     def apply(cls, client, db: str, files: list, migrations: list) -> list:
-        """Converge `db` on the files. Tables/MVs, then migrations, then views."""
+        """Converge `db` on the files. Tables/MVs, then migrations, then views, then refreshable MVs."""
         client.command(cls.LEDGER_DDL)
         objs = [o for path, text in files for o in cls.objects(path, text)]
         steps = []
         live = cls.live(client, db)
         for o in objs:
-            if o.kind != "view" and o.name not in live:
+            if o.kind in ("table", "mv") and o.name not in live:
                 client.command(o.sql)
                 steps.append(("create", o.name, o.file))
         done = cls.applied(client, db)
@@ -329,7 +344,9 @@ class SchemaApplier:
         drift = [
             (o.name, d)
             for o in objs
-            if o.kind != "view" and (d := cls.differs(client, o, live[o.name], db))
+            if o.kind != "view"
+            and o.name in live
+            and (d := cls.differs(client, o, live[o.name], db))
         ]
         if drift:
             raise SchemaDrift(
@@ -347,6 +364,10 @@ class SchemaApplier:
                 client.command(f"DROP VIEW IF EXISTS {o.name}")
                 client.command(o.sql)
                 steps.append(("recreate", o.name, o.file))
+        for o in objs:
+            if o.kind == "refresh" and o.name not in live:
+                client.command(o.sql)
+                steps.append(("create", o.name, o.file))
         return steps
 
     @classmethod

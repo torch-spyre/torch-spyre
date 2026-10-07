@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS benchmark_runs
 
 
     -- regression_status is deliberately absent: a stored verdict with no baseline can't be
-    -- checked. Derived in v_benchmark_regression against an explicit baseline run_id.
+    -- checked. Derived in v_benchmark_metric_verdicts against each series' recorded baseline runs.
     CONSTRAINT chk_measurements CHECK length(measurements) > 0
 )
 ENGINE = MergeTree()

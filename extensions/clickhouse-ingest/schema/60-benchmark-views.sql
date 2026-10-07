@@ -1,5 +1,5 @@
--- Views over benchmarks / benchmark_runs. Two jobs: present the wide shape the dashboard
--- already speaks, and derive the two verdicts v1 stored as columns.
+-- Views over benchmarks / benchmark_runs: the wide shape the dashboard already speaks, and the
+-- backend ratio v1 stored as a column. Regression verdicts are 62-benchmark-verdicts.sql.
 
 -- Every benchmark measurement with its identity, run context and tag resolved -- the base join
 -- for everything below.
@@ -123,46 +123,6 @@ ASOF INNER JOIN
 ON t.component = s.component AND t.benchmark_id = s.benchmark_id AND t.arch = s.arch
    AND t.metric = s.metric AND t.run_ts >= s.run_ts
 WHERE t.run_ts - s.run_ts <= 7 * 86400;
-
--- Replaces perf_benchmarks.regression_status with a verdict against the previous run of the same
--- benchmark, backend, arch and producing job, in run time, via a window function (an all-pairs
--- self-join costs runs^2). Threshold matches the dashboard's +/-5%. A metric named *throughput*
--- or *_per_second, or pt_util_percent, is higher-is-better; every other metric lower-is-better.
-CREATE VIEW IF NOT EXISTS v_benchmark_regression AS
-SELECT
-    run_id, benchmark_id, component, backend, name, arch, source_job,
-    record_type, config_name, input_shapes,
-    run_ts AS ts, ts_source,
-    baseline_run_id, baseline_ts,
-    metric, higher_is_better, new_value, baseline_value,
-    round((new_value - baseline_value) / abs(baseline_value) * 100 AS change_pct, 1) AS delta_pct,
-    multiIf(baseline_value IS NULL, 'no_baseline',
-            if(higher_is_better, -change_pct, change_pct) >  5, 'regressed',
-            if(higher_is_better, -change_pct, change_pct) < -5, 'improved',
-            'unchanged') AS regression_status
-FROM (
-    SELECT
-        *,
-        match(metric, 'throughput|_per_second$') OR metric = 'pt_util_percent' AS higher_is_better,
-        lagInFrame(toNullable(new_value)) OVER w AS baseline_value,
-        lagInFrame(toNullable(run_id))    OVER w AS baseline_run_id,
-        lagInFrame(toNullable(run_ts))    OVER w AS baseline_ts
-    FROM (
-        -- One value per run and metric, so a re-ingested run is never its own baseline. Zeros
-        -- are dropped: producers write 0 for a metric they did not measure.
-        SELECT run_id, benchmark_id, component, backend, arch, source_job,
-               any(name) AS name, any(record_type) AS record_type,
-               any(config_name) AS config_name, any(input_shapes) AS input_shapes,
-               min(run_ts) AS run_ts, any(ts_source) AS ts_source,
-               m.1 AS metric, avg(m.2) AS new_value
-        FROM v_benchmark_results_enriched
-        ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
-        WHERE m.2 != 0
-        GROUP BY run_id, benchmark_id, component, backend, arch, source_job, metric
-    )
-    WINDOW w AS (PARTITION BY component, benchmark_id, backend, arch, source_job, metric
-                 ORDER BY run_ts, run_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-);
 
 -- Per-arch trend for one benchmark+metric: the platform comparison the dashboard draws.
 CREATE VIEW IF NOT EXISTS v_benchmark_trend AS
