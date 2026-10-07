@@ -54,11 +54,13 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Reduction,
     ReinterpretView,
     Scatter,
     StorageBox,
+    TensorBox,
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
@@ -290,25 +292,40 @@ def _try_gather_ia_constraint(
 
 
 def _try_scatter_ia_constraint(
-    buf: ComputedBuffer,
+    buf: ComputedBuffer | InputBuffer,
     op: ComputedBuffer,
 ) -> tuple[SpyreTensorLayout, set[int]] | None:
     """Rotate the scattered dim of a scatter destination to device position 0.
 
-    buf is the scatter destination buffer; op is the scatter op.
-    Uses indirect_info_from_op to identify scatter dims without parsing write deps.
-    Returns (new_stl, {0}) if rotation needed, None if compliant or not applicable.
+    buf is the scatter destination buffer (ComputedBuffer or InputBuffer); op is
+    the scatter op. Uses buf.get_layout() (not _real_layout) because at phase 1
+    time buf may still have FlexibleLayout or FixedLayout — both have concrete
+    .size and .stride sufficient to extract scatter symbol sizes via
+    _scatter_access_subs_and_sizes. Returns (new_stl, {0}) if rotation needed,
+    None if already compliant or not applicable.
     """
     stl = _buf_stl(buf)
     if stl is None:
-        return None
-    _, access_subs, sizes = indirect_info_from_op(op)
-    if not access_subs:
         return None
     write_deps = [d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)]
     if not write_deps:
         return None
     write_dep = write_deps[0]
+    # Use get_layout() rather than _real_layout() because at phase 1 time
+    # (before finalize_layouts) dest_buf has FlexibleLayout, not FixedTiledLayout.
+    # FlexibleLayout has concrete .size and .stride, which is all we need to
+    # extract scatter symbol sizes from write_dep.index coefficients.
+    buf_layout = buf.get_layout()
+    if buf_layout is None or not (
+        getattr(buf_layout, "size", None) and getattr(buf_layout, "stride", None)
+    ):
+        return None
+    try:
+        access_subs, sizes = _scatter_access_subs_and_sizes(op, buf_layout, write_dep)
+    except Exception:
+        return None
+    if not access_subs:
+        return None
     try:
         write_coords = device_coordinates(stl, write_dep, sizes)
     except (Unsupported, Exception):
@@ -418,17 +435,24 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             op.layout, MutationLayoutSHOULDREMOVE
         ):
             target = op.layout.target
-            while isinstance(target, ReinterpretView):
+            while isinstance(target, (ReinterpretView, TensorBox, StorageBox)):
                 target = target.data
-            dest_buf = target if isinstance(target, ComputedBuffer) else None
+            dest_buf = (
+                target if isinstance(target, (ComputedBuffer, InputBuffer)) else None
+            )
             if dest_buf is not None:
                 dest_stl = _buf_stl(dest_buf)
                 if dest_stl is not None:
                     result = _try_scatter_ia_constraint(dest_buf, op)
                     if result is not None:
                         new_stl, pinned = result
-                        dest_buf.committed_stl = new_stl
-                        log[dest_buf.get_name()] = new_stl
+                        # Do NOT update dest_buf.committed_stl here: the scatter
+                        # destination's layout transformation is applied at phase 2
+                        # via _insert_mutation_relayout_copy, which needs to see the
+                        # original (pre-rotation) target layout from finalize_layouts.
+                        # Updating committed_stl now would cause finalize_layouts to
+                        # create a FixedTiledLayout with the rotated STL, making
+                        # _insert_mutation_relayout_copy a no-op copy.
                         pinned_dims.setdefault(dest_buf.get_name(), set()).update(
                             pinned
                         )
