@@ -49,7 +49,8 @@ FROM
     FROM
     (
         SELECT *,
-            row_number() OVER (
+            -- Dense: a rerun after a partial pass sees each kernel under both ids, which tie.
+            dense_rank() OVER (
                 PARTITION BY run_id, source_file, prefix, lowerUTF8(trimBoth(stem, ws)),
                              arrayMap(k -> lowerUTF8(trimBoth(props[k], ws)),
                                       arrayFilter(k -> k != 'kernel_name', keys))
@@ -132,9 +133,15 @@ WHERE (v.component, v.run_id, k.new_id, v.backend, v.arch, v.source_job, v.metri
     FROM benchmark_metric_verdicts
     WHERE benchmark_id IN (SELECT new_id FROM benchmark_id_rekey));
 
+-- The second arm sweeps what a pass stopped after moving the runs left behind; the hour keeps
+-- it off a stale writer's identity row whose runs have not landed yet.
 DELETE FROM benchmarks
-WHERE benchmark_id IN (SELECT old_id FROM benchmark_id_rekey)
-  AND benchmark_id NOT IN (SELECT benchmark_id FROM benchmark_runs);
+WHERE benchmark_id NOT IN (SELECT benchmark_id FROM benchmark_runs)
+  AND (benchmark_id IN (SELECT old_id FROM benchmark_id_rekey)
+       OR (NOT mapContains(props, 'kernel_key')
+           AND startsWith(props['kernel_name'], 'spyre_kernel_')
+           AND match(props['kernel_name'], '_[a-z0-9]{16}(#[0-9]+)?$')
+           AND audit_timestamp < now64(3) - INTERVAL 1 HOUR));
 
 -- Also drops what a refresh racing this pass wrote under an old id: its runs are inside the
 -- refresh window, so the next refresh evaluates them under the new id.
