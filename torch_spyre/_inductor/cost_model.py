@@ -187,6 +187,8 @@ from typing import Optional
 import sympy
 
 from .work_division import (
+    _DECODE_MAX_ROWS,
+    _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
     min,
@@ -401,6 +403,11 @@ class OpFeatures:
     # multiplier: the engine streams the whole strided span at ~K GB/s per core and a
     # core keeps 1/split of it (BW*split measured constant at 588/540/549).
     relayout_split: int = 0
+    # Co-optimizing path only: ``(division symbol, ((m, k, cores), ...))``, this op's
+    # M split, K split and core count at each candidate division, in the solver's
+    # candidate order. Lets a split-dependent price be a table over candidates
+    # (``DecodeDeliveryCharge``) instead of an expression the rewrite has to expand.
+    division_menu: tuple | None = None
 
     def read_bytes(self) -> int:
         """HBM bytes READ (input args). Each HBM arg is counted at its own device size,
@@ -1380,19 +1387,137 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     return total_bytes, ns
 
 
+class DecodeDeliveryCharge(sympy.Function):
+    """``DecodeDeliveryCharge(is_lx, division, price_0, ..., price_n)``: a decode
+    weight's delivery excess as one objective node, ``(1 - is_lx) * price[division]``.
+
+    The sibling of ``scratchpad.plan_solver.RelayoutCharge`` with the residency gate
+    inverted (a resident weight streams nothing). The price depends on the M split,
+    K split and core count together; as a Piecewise over those it took ~30 s to
+    rewrite and lower per matmul, as a table over the op's candidate divisions it is
+    one CP-SAT ``element`` lookup (``_SympyExprToCpSat._print_DecodeDeliveryCharge``)
+    and ``lambdify`` reads it through :meth:`_imp_`. An index past the table reads 0.
+    """
+
+    is_real = True
+    is_nonnegative = True
+
+    @classmethod
+    def eval(cls, is_lx, division, *prices):
+        if is_lx.is_Number:
+            if is_lx == 1:
+                return sympy.S.Zero
+            if division.is_Integer:
+                i = int(division)
+                price = prices[i] if 0 <= i < len(prices) else sympy.S.Zero
+                return (1 - is_lx) * price
+        return None
+
+    @staticmethod
+    def _imp_(is_lx, division, *prices):
+        i = int(round(division))
+        return (1 - is_lx) * (prices[i] if 0 <= i < len(prices) else 0)
+
+
+def _decode_weight(op) -> tuple | None:
+    """``(arg, rows)`` for a matmul's shared 2D weight reused over 2..32 rows.
+
+    That is the small-M decode projection ``work_division._decode_weight_delivery_us``
+    was measured on. Rows are MACs per weight element. A shared weight has
+    K * N = (A / rows) * (out / rows) elements; a per-batch operand (attention's K or
+    V) has B times more, and a B^2 test separates the two. Symbolic or unknown
+    counts do not qualify."""
+    if (
+        not op.is_matmul
+        or op.dtype_bytes != 2  # the sweep measured fp16 weights only
+        or _is_sym(op.matmul_macs, op.out_elems, op.matmul_a_bytes)
+    ):
+        return None
+    a_elems = op.matmul_a_bytes / max(1, op.dtype_bytes)
+    for arg in op.args:
+        if arg.role != "input" or _is_sym(arg.elems) or arg.elems <= 0:
+            continue
+        rows = round(op.matmul_macs / arg.elems)
+        if not 1 < rows <= _DECODE_MAX_ROWS:
+            continue
+        shared_elems = (a_elems / rows) * (op.out_elems / rows)
+        if abs(shared_elems - arg.elems) <= 0.05 * arg.elems:
+            return arg, rows
+    return None
+
+
+def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
+    """Extra time for a decode projection to stream its shared weight.
+
+    The base memory term charges the weight's bytes B at the shared peak. Under a
+    split, ``m`` cores splitting M share each slice and the ``n * k`` distinct
+    slices stream in parallel; the measured rate is
+    ``work_division._decode_weight_delivery_gbps(cores, m, k)``. Add B at that rate
+    minus B at the peak, clamped at zero, so the co-optimizer prices the split the
+    way the work-division planner ranks it. It replaces the cohort excess of
+    ``_shared_operand_read_excess`` for this arg. Scope as ``_decode_weight``;
+    single-pass bundles only, as for ``_partitioned_operand_read_excess``.
+
+    Under symbolic splits the price is one ``DecodeDeliveryCharge`` table over the
+    op's candidate divisions (``OpFeatures.division_menu``); without a menu the
+    split stays unpriced here, as before this term. Resident weights pay nothing."""
+    if not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
+    for op in ops:
+        found = _decode_weight(op)
+        if found is None:
+            continue
+        arg, rows = found
+        # Weight bytes per unit of HBM residency: the one gate that stays symbolic.
+        b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
+        full = arg.elems * arg.loop_factor * op.dtype_bytes
+        m_split, k_split, cores = op.matmul_m_split, op.reduction_cores, op.cores
+
+        def per_byte(m, k, c):
+            bw = _decode_weight_delivery_gbps(c, m, k)
+            return max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)
+
+        if not _is_sym(m_split, k_split, cores):
+            excess = b * per_byte(m_split, k_split, cores)
+        elif op.division_menu is not None:
+            division, menu = op.division_menu
+            prices = [int(round(full * per_byte(m, k, c))) for m, k, c in menu]
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            excess = (
+                DecodeDeliveryCharge(is_lx, division, *prices) if any(prices) else 0
+            )
+        else:
+            excess = 0.0
+        if arg.is_graph_boundary:
+            external[arg.name] = (
+                _max_traffic(external[arg.name], excess)
+                if arg.name in external
+                else excess
+            )
+        else:
+            total += excess
+    return total + sum(external.values())
+
+
 def _shared_operand_read_excess(ops: list, p: "CostParams"):
     """Extra delivery time for a shared HBM load, beyond its one base read.
 
     Keep physical bytes unchanged and price each operand's own consumer degree.
     Resident operands vanish through hbm_elems; boundary clone loads stay separate.
+    A small-M decode weight is priced by ``_decode_weight_delivery_excess`` instead.
     """
     total = 0
     external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if not op.is_matmul:
             continue
+        decode = _decode_weight(op) if all(_is_single_pass(o) for o in ops) else None
         for arg in op.args:
             if arg.role != "input" or not arg.broadcast or arg.replication == 1:
+                continue
+            if decode is not None and arg is decode[0]:
                 continue
             excess = (
                 arg.hbm_elems()
@@ -2235,6 +2360,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + rep_ns
         + _shared_operand_read_excess(ops, p)
         + _partitioned_operand_read_excess(ops, p)
+        + _decode_weight_delivery_excess(ops, p)
     )
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
@@ -2614,6 +2740,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             f"     partitioned-read core limit: +{partitioned_extra / 1000:.2f} us "
             f"({p.mm_partitioned_read_gbps_per_core:g} GB/s per reading core; "
             "before compute overlap)"
+        )
+    decode_extra = _decode_weight_delivery_excess(ops, p)
+    if decode_extra:
+        lines.append(
+            f"     decode weight delivery: +{decode_extra / 1000:.2f} us "
+            "(shared-weight split rate, before compute overlap)"
         )
     restickify_extra = _transport_dma_excess_ns(ops, p)
     if restickify_extra:

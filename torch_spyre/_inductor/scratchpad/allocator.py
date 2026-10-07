@@ -2499,7 +2499,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        features = extract_op_features(op, ws, is_lx=is_lx)
+        if features.is_matmul and getattr(buffer, "core_divisions", None):
+            features.division_menu = self._matmul_division_menu(features, buffer)
+        return features
+
+    @staticmethod
+    def _matmul_division_menu(features, buffer) -> tuple | None:
+        """``(division symbol, ((m, k, cores), ...))`` for a matmul's candidates.
+
+        Substitutes each candidate division's splits into the symbolic M split,
+        K split and core count, in candidate order, so ``cost_model`` can price a
+        split-dependent term as a table (``DecodeDeliveryCharge``). ``None`` when a
+        candidate leaves one of them unresolved."""
+        rows = []
+        for cd in buffer.core_divisions:
+            subs = {
+                sym: sympy.Integer(cd.splits.get(key, 1))
+                for key, sym in buffer.sym_core_divs.items()
+            }
+            row = []
+            for value in (
+                features.matmul_m_split,
+                features.reduction_cores,
+                features.cores,
+            ):
+                resolved = sympy.sympify(value).xreplace(subs)
+                if not resolved.is_Integer:
+                    return None
+                row.append(int(resolved))
+            rows.append(tuple(row))
+        return buffer.sym_division, tuple(rows)
 
     def _finalize_lx_relayout_allocation(
         self,
