@@ -7830,15 +7830,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.logsumexp (stable error signature: InductorError: "
-            "IndexError: list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_logsumexp_keepdim0_known_xfail(self):
+    def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(
             lambda x: torch.logsumexp(x, dim=0, keepdim=False),
