@@ -83,7 +83,9 @@ from .pass_utils import (
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
 # import is safe at module level.
 from .enforce_indirect_access_layout import (
+    _dim_order_is_compliant,
     _get_indirect_access_dim_order_requirements,
+    _insert_relayout_copy,
     _output_real_layout,
     _real_layout,
     _resolve_mutation_target,
@@ -348,10 +350,19 @@ def _collect_triples(
             for dep in op.get_read_writes().reads:
                 if not isinstance(dep, MemoryDep):
                     continue
-                if dep.name not in dep_names:
-                    continue
                 buf = V.graph.get_buffer(dep.name)
                 if not isinstance(buf, ComputedBuffer):
+                    continue
+                if not hasattr(buf, "committed_stl"):
+                    continue
+                try:
+                    coords = device_coordinates(buf.committed_stl, dep, sizes)
+                except Exception:
+                    continue
+                coords_sub = [c.xreplace(access_subs) for c in coords]
+                if not any(
+                    hasattr(c, "has") and c.has(IndirectAccess) for c in coords_sub
+                ):
                     continue
                 key = (dep.name, op.get_name())
                 if key in seen:
@@ -800,3 +811,41 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
         if not requirement:
             continue
         _enforce_scatter_destination_layout(graph, op, requirement)
+
+    # Handle gather graph-input value tensors post-insert_restickify.
+    # Phase 1 of reorder_nonstick_dims skips graph inputs (no committed_stl).
+    # Here every buffer has a FixedTiledLayout so we can insert relayout copies.
+    for op in list(graph.operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if isinstance(op.data, Scatter):
+            continue  # scatter handled above
+        dep_names, access_subs, sizes = indirect_info_from_op(op)
+        if not dep_names:
+            continue
+        for dep in op.get_read_writes().reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            buf = graph.get_buffer(dep.name)
+            if buf is None:
+                continue
+            if isinstance(buf, ComputedBuffer):
+                continue  # handled by phase 1 of reorder_nonstick_dims
+            layout = _real_layout(buf)
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+            value_stl = layout.device_layout
+            try:
+                coords = device_coordinates(value_stl, dep, sizes)
+            except Exception:
+                continue
+            coords_sub = [c.xreplace(access_subs) for c in coords]
+            stride_idx = _indirect_stride_idx(coords_sub, {})
+            if stride_idx is None:
+                continue
+            if _dim_order_is_compliant(value_stl, stride_idx):
+                continue
+            indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
+            required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            required_layout = _fixed_tiled(layout, required_stl)
+            op = _insert_relayout_copy(graph, op, buf, required_layout)

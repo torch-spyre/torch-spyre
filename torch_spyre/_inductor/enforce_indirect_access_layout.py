@@ -56,7 +56,6 @@ from .pass_utils import (
     _find_scatter_index_buf_names,
     build_operation_alignment_inputs,
     concretize_expr,
-    device_coordinates,
     indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
@@ -435,31 +434,6 @@ def _materialize_unaligned_scatter_source(
     raise alignment_error
 
 
-def _value_bufs_for_op(
-    graph: GraphLowering,
-    op: ComputedBuffer,
-    access_subs: dict,
-    sizes: dict | None,
-) -> list:
-    """Return the value-tensor buffers this op indirectly reads (gather:
-    any read dep whose device_coordinates contain an IndirectAccess)."""
-    value_bufs: list = []
-    for dep in op.get_read_writes().reads:
-        if not isinstance(dep, MemoryDep):
-            continue
-        buf = graph.get_buffer(dep.name)
-        layout = _real_layout(buf)
-        if not isinstance(layout, FixedTiledLayout):
-            continue
-        coords = [
-            c.xreplace(access_subs)
-            for c in device_coordinates(layout.device_layout, dep, sizes, op=op)
-        ]
-        if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
-            value_bufs.append(buf)
-    return value_bufs
-
-
 def _output_real_layout(op: ComputedBuffer) -> FixedTiledLayout:
     """Resolve an op's committed output layout, unwrapping a genuine mutation
     target (unlike _real_layout, which asserts mutation layouts only appear on
@@ -507,13 +481,10 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
 
     Handles IA-specific fixups that require committed FixedTiledLayout:
       - pad gather output's index-entry dim for stick-aligned multi-core split
-      - reorder gather value tensor dims (fallback): graph inputs (TensorBox)
-        and any ComputedBuffer gather source not already handled by
-        reorder_nonstick_dims (e.g. when the index buffer is a graph input so
-        _collect_triples did not find the value-tensor dep via dep_names).
-        Already-compliant buffers are skipped cheaply.
       - materialize unaligned scatter source when it cuts through an index stick
 
+    Gather value tensor dim reordering is handled by reorder_nonstick_dims
+    (ComputedBuffer sources) and reorder_nonstick_dims_mutation (graph inputs).
     Scatter destination dim ordering for mutation targets is handled by
     reorder_nonstick_dims_mutation (after insert_restickify).
     """
@@ -525,7 +496,7 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
         requirement = _get_indirect_access_dim_order_requirements(original_op)
         if not requirement:
             continue
-        dep_names, access_subs, sizes = requirement
+        dep_names = requirement[0]
 
         _pad_output_for_stick_aligned_split(original_op)
 
@@ -535,38 +506,4 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
             if op is not original_op:
                 requirement = _get_indirect_access_dim_order_requirements(op)
                 assert requirement is not None
-                dep_names, access_subs, sizes = requirement
-
-        # Fix gather value tensor dim ordering.
-        # reorder_nonstick_dims handles ComputedBuffer gather sources that have
-        # committed_stl (set by optimize_restickify). This loop is the fallback
-        # for any value tensor whose indexed dim is still not outermost here:
-        # graph inputs (TensorBox, no committed_stl) and ComputedBuffer sources
-        # that _collect_triples did not reach (e.g. when the index tensor is a
-        # graph input so dep_names did not match the value tensor dep).
-        # Already-compliant buffers are skipped via _dim_order_is_compliant.
-        if not is_scatter:
-            value_bufs = _value_bufs_for_op(graph, op, access_subs, sizes)
-            for value_buf in value_bufs:
-                value_layout = _real_layout(value_buf)
-                if not isinstance(value_layout, FixedTiledLayout):
-                    continue
-                value_stl = value_layout.device_layout
-
-                value_dep = next(
-                    d
-                    for d in op.get_read_writes().reads
-                    if isinstance(d, MemoryDep) and d.name == value_buf.get_name()
-                )
-                value_coords = device_coordinates(value_stl, value_dep, sizes)
-                stride_idx = _indirect_stride_idx(value_coords, access_subs)
-                if stride_idx is None:
-                    continue
-
-                if _dim_order_is_compliant(value_stl, stride_idx):
-                    continue
-
-                indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-                required_stl = _build_required_stl(value_stl, indirect_device_pos)
-                required_layout = _fixed_tiled(value_layout, required_stl)
-                op = _insert_relayout_copy(graph, op, value_buf, required_layout)
+                dep_names = requirement[0]
