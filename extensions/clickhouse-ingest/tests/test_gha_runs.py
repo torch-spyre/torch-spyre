@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -330,8 +331,11 @@ class FakeAPI(gha_runs.GitHub):
     Listing takes 2 calls (a full page, then an empty one); each run then costs 1 (its jobs).
     """
 
-    def __init__(self, runs, limit=100, remaining=100, clock=None, **kw):
+    def __init__(
+        self, runs, limit=100, remaining=100, clock=None, expire_after=None, **kw
+    ):
         super().__init__("t", **kw)
+        self.expire_after = expire_after
         self.by_repo = runs if isinstance(runs, dict) else {REPO: runs}
         self.all = [r for rs in self.by_repo.values() for r in rs]
         self.quota, self.left = limit, remaining
@@ -353,6 +357,14 @@ class FakeAPI(gha_runs.GitHub):
             # Lags behind the per-response headers, as GitHub's does.
             core = {"limit": self.quota, "remaining": self.quota, "reset": 0}
             return {"resources": {"core": core}}, headers
+        if self.expire_after is not None and self.requests > self.expire_after:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                401,
+                "Unauthorized",
+                headers,
+                None,
+            )
         self.left -= 1
         self.clock.now += 60
         headers["X-RateLimit-Remaining"] = str(self.left)
@@ -537,9 +549,11 @@ def test_cli_ends_a_stopped_poll_with_a_notice_not_an_error(clock, monkeypatch, 
         "GitHub",
         lambda token, **kw: FakeAPI(runs, remaining=53, clock=clock, **kw),
     )
-    gha_runs.main(
-        ["poll", "--repo", REPO, "--repo", "torch-spyre/hf-adapters", "--dry-run"]
-    )
+    with pytest.raises(SystemExit) as stopped:
+        gha_runs.main(
+            ["poll", "--repo", REPO, "--repo", "torch-spyre/hf-adapters", "--dry-run"]
+        )
+    assert stopped.value.code == gha_runs.EXIT_MORE
     err = capsys.readouterr().err
     assert (
         "[notice] torch-spyre/torch-spyre: budget reached at 50 remaining; resume next run"
@@ -584,13 +598,18 @@ REPOS = (
 )
 
 
-def _cli(monkeypatch, clock, runs, order):
+def _cli(monkeypatch, clock, runs, order, **api):
+    """main's exit status: 0 when every window is done."""
     monkeypatch.setenv("GITHUB_TOKEN", "t")
     monkeypatch.setattr(
-        gha_runs, "GitHub", lambda token, **kw: FakeAPI(runs, clock=clock, **kw)
+        gha_runs, "GitHub", lambda token, **kw: FakeAPI(runs, clock=clock, **api, **kw)
     )
     argv = ["poll", "--deadline-minutes", "12", "--dry-run"]
-    gha_runs.main(argv + [a for repo in order for a in ("--repo", repo)])
+    try:
+        gha_runs.main(argv + [a for repo in order for a in ("--repo", repo)])
+    except SystemExit as stop:
+        return stop.code
+    return 0
 
 
 def test_a_busy_repo_gets_its_share_of_the_deadline_not_all_of_it(
@@ -599,13 +618,37 @@ def test_a_busy_repo_gets_its_share_of_the_deadline_not_all_of_it(
     # Each call takes a minute; listing is 2 calls and each run 1 more.
     busy, hf, si = REPOS
     runs = {busy: _recent(1, 50), hf: _recent(2, 1), si: _recent(3, 1)}
-    _cli(monkeypatch, clock, runs, REPOS)
+    assert _cli(monkeypatch, clock, runs, REPOS) == gha_runs.EXIT_MORE
     assert _attempts_by_repo(capsys.readouterr().out) == {busy: 2, hf: 1, si: 1}
 
 
 def test_time_a_repo_leaves_unused_passes_to_the_next(clock, monkeypatch, capsys):
     busy, hf, si = REPOS
     runs = {busy: _recent(1, 50), hf: _recent(2, 1), si: _recent(3, 1)}
-    _cli(monkeypatch, clock, runs, (hf, si, busy))
+    assert _cli(monkeypatch, clock, runs, (hf, si, busy)) == gha_runs.EXIT_MORE
     # hf and si take 3 minutes each of their 4 and 4.5, leaving the busy repo 6, not 4.
     assert _attempts_by_repo(capsys.readouterr().out) == {busy: 4, hf: 1, si: 1}
+
+
+def test_an_expired_token_stops_the_run_cleanly(clock, monkeypatch, capsys):
+    busy, hf, si = REPOS
+    runs = {busy: _recent(1, 20), hf: _recent(2, 1), si: _recent(3, 1)}
+    # The 4th call is refused, inside the repo's 4-minute share: the listing and 1 run got through.
+    code = _cli(monkeypatch, clock, runs, REPOS, expire_after=3)
+    out, err = capsys.readouterr()
+    assert code == gha_runs.EXIT_MORE
+    assert f"[notice] {busy}: token expired; resume next run" in err
+    # The token is shared, so the other repos are not started.
+    assert _attempts_by_repo(out) == {busy: 1, hf: 0, si: 0}
+
+
+def test_a_401_before_any_success_is_a_bad_credential_not_an_expiry(clock):
+    api = FakeAPI(_runs(3), clock=clock, expire_after=0)
+    with pytest.raises(urllib.error.HTTPError):
+        _poll(api, Store())
+
+
+def test_a_poll_that_finishes_every_window_exits_0(clock, monkeypatch, capsys):
+    runs = {repo: _recent(n, 1) for n, repo in enumerate(REPOS, 1)}
+    assert _cli(monkeypatch, clock, runs, REPOS) == 0
+    assert set(_attempts_by_repo(capsys.readouterr().out).values()) == {1}

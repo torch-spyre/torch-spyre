@@ -29,7 +29,9 @@ The token is shared with other jobs, so a poll stops cleanly (flush, notice, exi
 rate limit's remaining falls to --reserve of it. --deadline-minutes is split evenly over the
 repos still to poll, so one busy repo cannot starve the rest; time a repo leaves unused passes
 on. The next poll continues either way. --wait-for-reset sleeps to the reset instead, for a
-manual backfill. Needs GITHUB_TOKEN.
+manual backfill. A token that expires mid-poll (an App installation token lives an hour)
+stops it the same way. A poll that stopped early exits 3, one that finished exits 0.
+Needs GITHUB_TOKEN.
 """
 
 import argparse
@@ -52,6 +54,8 @@ API = "https://api.github.com"
 LIST_CAP = 1000
 PAGE = 100
 RETRIES = 6
+# Exit status of a poll that stopped early with more to do; 0 means the windows are done.
+EXIT_MORE = 3
 
 # Lane names match the Jenkins trigger_source values, so one gate view covers both systems.
 # pull_request is the PR-validation lane, which Jenkins calls spyre-test.
@@ -262,7 +266,7 @@ def job_row(
 
 
 class Stop(Exception):
-    """The poll must end here, cleanly: the rate budget or the deadline is used up."""
+    """The poll must end here, cleanly: the budget, the deadline or the token is used up."""
 
 
 class GitHub:
@@ -281,6 +285,7 @@ class GitHub:
         self.wait_for_reset = wait_for_reset
         self.limit = self.remaining = self.reset = None
         self.requests, self.first = 0, ""
+        self.authed = self.expired = False
 
     def get(self, path: str, **query: Any) -> dict[str, Any]:
         url = f"{API}{path}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
@@ -298,8 +303,14 @@ class GitHub:
             try:
                 body, headers = self._fetch(req)
                 self._note(headers)
+                self.authed = True
                 return body
             except urllib.error.HTTPError as err:
+                # An installation token lives an hour, so a long poll outlives it; a 401
+                # before any success is a bad credential and stays an error.
+                if err.code == 401 and self.authed:
+                    self.expired = True
+                    raise Stop("token expired") from err
                 self._note(err.headers)
                 wait = self._backoff(err, attempt)
                 if wait is None:
@@ -581,7 +592,7 @@ def main(argv=None) -> None:
         else None,
         wait_for_reset=args.wait_for_reset,
     )
-    end_all = gh.deadline
+    end_all, stopped = gh.deadline, False
     for i, repo in enumerate(args.repo):
         # An even share of the time left; what a repo leaves unused passes on.
         if end_all is not None:
@@ -603,15 +614,18 @@ def main(argv=None) -> None:
             f"[info] {repo}: {attempts} run attempt(s), {rows} row(s)", file=sys.stderr
         )
         if reason:
+            stopped = True
             print(f"[notice] {repo}: {reason}; resume next run", file=sys.stderr)
-            # The budget is shared by every repo; a deadline share is not.
-            if gh.exhausted() and not gh.wait_for_reset:
+            # The budget and the token are shared by every repo; a deadline share is not.
+            if gh.expired or (gh.exhausted() and not gh.wait_for_reset):
                 break
     print(
         f"[info] rate limit {gh.first or 'unseen'} at the first response, "
         f"{gh.rate()} at the last, {gh.requests} request(s)",
         file=sys.stderr,
     )
+    if stopped:
+        sys.exit(EXIT_MORE)
 
 
 if __name__ == "__main__":
