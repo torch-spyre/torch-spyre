@@ -2,18 +2,18 @@ name: Resolve or record a v2 artifact
 description: >
   Name an artifact by spec and get its one spyre_v2 artifact_id: the existing record when there
   is one, else the identity registration derives, recorded and tagged
-  (`spyre_clickhouse_ingest.artifacts ensure`). Specs: image:, rpm:, wheel:, generic:,
-  gha:<id>|<base>|<installed>, or a bare artifact_id. A failure is reported as an error
-  annotation and leaves the outputs empty; it fails the job only with `strict: true`.
+  (`python -m spyre_clickhouse_ingest artifacts ensure`). Specs: image:, rpm:, wheel:,
+  generic:, gha:<id>|<base>|<installed>;component=<c>, id:<id> or a bare artifact_id. A failure
+  is reported as an error annotation and leaves the outputs empty; it fails the job only with
+  `strict: true`.
 
 inputs:
   artifact:
-    description: The spec, e.g. image:icr.io/<repo>@sha256:<digest> or derive-gha-artifact-id's gha:<record>.
+    description: The spec, e.g. image:icr.io/<repo>@sha256:<digest> or gha:<record>;component=<c>.
     required: true
   arch:
-    description: Arch of the leaf the spec names; `multi` keeps a manifest list. Not needed for an id or gha spec.
-    required: false
-    default: ''
+    description: The artifact's arch (an identity input of a gha record); `multi` keeps a manifest list.
+    required: true
   tag-family:
     description: A tag family (snap-supply-chain, nightly-supply-chain, ...); resolves and records its tag.
     required: false
@@ -39,7 +39,7 @@ inputs:
     required: false
     default: built
   source:
-    description: props.source of a new record (e.g. gha).
+    description: The repo@[ref@]sha a new record was built from, one per line.
     required: false
     default: ''
   identity-dep:
@@ -63,7 +63,7 @@ inputs:
     required: false
     default: ''
   dry-run:
-    description: Resolve and print what would be written; write nothing.
+    description: Resolve and print what would be written; write nothing. Without a ClickHouse host it derives only.
     required: false
     default: 'false'
   strict:
@@ -203,9 +203,13 @@ runs:
         ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
       run: |
         set -uo pipefail
-        if [ -z "${CLICKHOUSE_HOST}" ] && [ "${DRY_RUN}" != "true" ]; then
-          echo "::notice title=v2 artifact::no clickhouse-v2-host; ${ARTIFACT} not recorded."
-          exit 0
+        cmd=ensure
+        if [ -z "${CLICKHOUSE_HOST}" ]; then
+          if [ "${DRY_RUN}" != "true" ]; then
+            echo "::notice title=v2 artifact::no clickhouse-v2-host; ${ARTIFACT} not recorded."
+            exit 0
+          fi
+          cmd=resolve LOOKUP=off
         fi
         if [ -z "${V2_HOST}" ] && [ -n "${CLICKHOUSE_HOST}" ]; then
           # v2 fallback onto the shared connection: remove once every repo has CLICKHOUSE_V2_*.
@@ -213,12 +217,10 @@ runs:
                "add CLICKHOUSE_V2_HOST/PORT/USER/PASS/DB to give v2 its own."
         fi
         export CLICKHOUSE_DB="${CLICKHOUSE_DB_V2}"
-        args=(--artifact "${ARTIFACT}" --lookup "${LOOKUP}" --registry "${REGISTRY}"
-              --origin "${ORIGIN}" --run-url "${RUN_URL}")
-        [ -n "${ARCH}" ] && args+=(--arch "${ARCH}")
+        args=(--artifact "${ARTIFACT}" --arch "${ARCH}" --lookup "${LOOKUP}"
+              --registry "${REGISTRY}" --origin "${ORIGIN}" --run-url "${RUN_URL}")
         [ -n "${TAG_FAMILY}" ] && args+=(--tag-family "${TAG_FAMILY}")
         [ -n "${TAG_DATE}" ] && args+=(--tag-date "${TAG_DATE}")
-        [ -n "${SOURCE}" ] && args+=(--source "${SOURCE}")
         [ "${DRY_RUN}" = "true" ] && args+=(--dry-run)
         repeat() {
           local v
@@ -228,13 +230,14 @@ runs:
           done <<< "$2"
         }
         repeat --tag "${TAGS}"
+        repeat --source "${SOURCE}"
         repeat --identity-dep "${IDENTITY_DEPS}"
         repeat --context-dep "${CONTEXT_DEPS}"
         repeat --prop "${PROPS}"
         repeat --tag-prop "${TAG_PROPS}"
 
         out="$(mktemp)"
-        if "${VENV}/bin/python" -m spyre_clickhouse_ingest.artifacts ensure "${args[@]}" > "${out}"; then
+        if "${VENV}/bin/python" -m spyre_clickhouse_ingest artifacts "${cmd}" "${args[@]}" > "${out}"; then
           "${VENV}/bin/python" - "${out}" >> "$GITHUB_OUTPUT" <<'PY'
         import json, sys
         r = json.load(open(sys.argv[1]))
