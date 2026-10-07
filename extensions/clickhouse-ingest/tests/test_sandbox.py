@@ -90,6 +90,7 @@ def test_seed_covers_every_base_table_in_schema():
         "run_case_counters",
         "oss_ci_benchmark_v3",
         "oss_ci_benchmark_metadata",
+        "benchmark_metric_verdicts",
     }
     unseeded = declared - {t for t, _, _ in Sandbox.SEED} - filled_by_mv
     assert {t for t in unseeded if not t.startswith("otel_")} == set()
