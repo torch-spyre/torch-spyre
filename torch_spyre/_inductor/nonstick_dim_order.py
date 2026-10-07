@@ -85,7 +85,6 @@ from .pass_utils import (
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
 # import is safe at module level.
 from .enforce_indirect_access_layout import (
-    _get_indirect_access_dim_order_requirements,
     _insert_relayout_copy,
     _output_real_layout,
     _real_layout,
@@ -515,51 +514,15 @@ def _rewrite_producer_layout(value_buf, required_stl: SpyreTensorLayout) -> None
 def _insert_mutation_relayout_copy(
     graph: GraphLowering,
     mutation_op: ComputedBuffer,
-    write_dep: MemoryDep,
-    access_subs: dict,
-    sizes: dict | None,
+    required_stl: SpyreTensorLayout,
 ) -> None:
-    """Fix a non-compliant indirect-write layout on a MutationLayoutSHOULDREMOVE op.
+    """Insert copy-in / retarget / copy-back for a scatter mutation op.
 
-    Inserts a copy-in / retarget / copy-back sequence around the mutation.
-    For scatter ops, uses buf_tmp as the metadata source for copy-back to
-    avoid inheriting the index tensor dependency from the scatter op.
+    required_stl is the layout the destination must have for the scatter to be
+    hardware-compliant. Determined by reorder_nonstick_dims (phase 1).
+    Uses buf_tmp as the metadata source for copy-back to avoid inheriting the
+    index tensor dependency from the scatter op.
     """
-    is_scatter_op = (
-        any(isinstance(v, IndirectAccess) for v in access_subs.values())
-        if access_subs
-        else False
-    )
-    is_scatter_op = is_scatter_op or isinstance(mutation_op.data, Scatter)
-
-    output_stl = _output_real_layout(mutation_op).device_layout
-
-    write_stride_idx: int | None = None
-    if is_scatter_op:
-        logger.debug(
-            "nonstick_dim_order: scatter op device_size=%s, stride_map=%s",
-            output_stl.device_size,
-            output_stl.stride_map,
-        )
-        # For scatter, get access subs and sizes, then find indirect in write coords
-        scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
-            mutation_op, _output_real_layout(mutation_op), write_dep
-        )
-        write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, scatter_sizes),
-            scatter_access_subs,
-        )
-    else:
-        write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, sizes), access_subs
-        )
-        assert write_stride_idx is not None, (
-            f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
-        )
-    assert write_stride_idx is not None
-    output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _ia_rotate_stl(output_stl, output_indirect_pos)
-
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
         raise AssertionError(
@@ -608,10 +571,8 @@ def _insert_mutation_relayout_copy(
     operations.remove(buf_tmp)
     operations.insert(mutation_op_index, buf_tmp)
 
-    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout)
+    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout).
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
-    # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
-    copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
     _, buf_copyback = _create_restickify_node(
         RestickifyArgInfo(
             arg_name=buf_tmp_name,
@@ -619,7 +580,7 @@ def _insert_mutation_relayout_copy(
             occurrence=0,
             target_layout=buf_copyback_layout,
         ),
-        copyback_metadata_op,
+        buf_tmp,  # use buf_tmp as metadata source, not mutation_op
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
     operations.remove(buf_copyback)
@@ -821,45 +782,30 @@ def _enforce_scatter_destination_layout(
             "scatter_destination_check: inserting mutation relayout copy for %s",
             scatter_op.get_name(),
         )
-        _insert_mutation_relayout_copy(graph, scatter_op, write_dep, {}, None)
+        write_stride_idx = indirect_stride_idxs[0]
+        indirect_pos = len(target_stl.stride_map) - 1 - write_stride_idx
+        required_stl = _ia_rotate_stl(target_stl, indirect_pos)
+        _insert_mutation_relayout_copy(graph, scatter_op, required_stl)
 
 
 def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
-    """Second phase of nonstick dim reordering for mutation targets.
+    """Execute deferred dim-order reorders recorded by reorder_nonstick_dims.
 
-    reorder_nonstick_dims (before finalize_layouts) cannot handle mutation
-    targets because finalize_layouts skips MutationLayoutSHOULDREMOVE ops.
-    This pass runs after insert_restickify when every buffer has a committed
-    FixedTiledLayout and inserts copy-in/copy-back pairs for scatter
-    destinations whose dim order does not satisfy the IA constraint.
-
-    Mirrors the propagate_layouts / propagate_mutation_layouts pattern.
+    Runs after insert_restickify when every buffer has a committed FixedTiledLayout.
+    Iterates V.graph.nonstick_deferred and inserts copy nodes or rewrites producer
+    layouts as decided by phase 1.
     """
-    for op in list(graph.operations):
-        if not isinstance(op, ComputedBuffer):
-            continue
-        if not isinstance(op.data, Scatter):
-            continue
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            continue
-        requirement = _get_indirect_access_dim_order_requirements(op)
-        if not requirement:
-            continue
-        _enforce_scatter_destination_layout(graph, op, requirement)
-
-    # Execute deferred gather copy entries recorded by phase 1.
-    # Phase 1 records "copy" entries for graph-input gather value tensors;
-    # here every buffer has a FixedTiledLayout so we can insert relayout copies.
     for entry in getattr(V.graph, "nonstick_deferred", []):
-        if entry.kind != "copy":
-            continue
-        if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
-            continue  # scatter mutation copies handled by scatter loop above
         buf = graph.try_get_buffer(entry.buf_name)
         if buf is None:
             continue
-        layout = _real_layout(buf)
-        if not isinstance(layout, FixedTiledLayout):
-            continue
-        required_layout = _fixed_tiled(layout, entry.required_stl)
-        _insert_relayout_copy(graph, entry.op, buf, required_layout)
+        if entry.kind == "producer_rewrite":
+            _rewrite_producer_layout(buf, entry.required_stl)
+        elif entry.kind == "copy":
+            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
+                _insert_mutation_relayout_copy(graph, entry.op, entry.required_stl)
+            else:
+                layout = _real_layout(buf)
+                if isinstance(layout, FixedTiledLayout):
+                    required_layout = _fixed_tiled(layout, entry.required_stl)
+                    _insert_relayout_copy(graph, entry.op, buf, required_layout)
