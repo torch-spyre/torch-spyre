@@ -156,9 +156,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   }
 
-  auto* params = flex::createHostComputeParams(
-      handle_.get(), correction_size_, &device_address_, input_buffer_,
-      std::move(args), pipeline_barrier_);
+  auto* params = flex::createHostComputeParams(handle_.get(), correction_size_,
+                                               input_buffer_, std::move(args));
 
   struct Guard {
     flex::HostComputeParams* p;
@@ -167,7 +166,36 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  stream.launchHostCompute(params);
+  // Create a managed shared_ptr to ensure the host buffer's lifetime is tied to
+  // callback destruction.
+  std::shared_ptr<flex::HostComputeBuffer> host_buffer(
+      stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
+
+  // Enforce that the host buffer correction size matches the expected device
+  // allocation size.
+  TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  // Create DmaParams to transfer the host buffer.
+  auto* dma_params =
+      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
+                            /*to_device=*/true, &device_address_);
+  dma_params->pipeline_barrier = pipeline_barrier_;
+  // The managed buffer is freed when the callback is destroyed, which happens
+  // after the DMA completes or is cancelled.
+  dma_params->callback = [host_buffer](void*) {};
+
+  try {
+    stream.launchH2D(dma_params);
+  }
+  catch (...) {
+    flex::destroyDmaParams(dma_params);
+    throw;
+  }
+  flex::destroyDmaParams(dma_params);
+
+  // managed goes out of scope here, leaving the callback with the only
+  // remaining reference to the host buffer. The buffer will be freed when the
+  // callback is destroyed.
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {

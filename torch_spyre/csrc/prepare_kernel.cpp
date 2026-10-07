@@ -379,7 +379,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // same chunk (the owning CompositeAddress stays in job_allocation_, which is
   // later moved into the JobPlan and outlives this step). flex bounds the
   // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
-  // -- instead of the 16GB MAX_REGION_SIZE. The size grows automatically
+  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically
   // if/when deeptools grows the Allocate, requiring no further change here.
   TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
               "job_allocation must have 1 chunk");
