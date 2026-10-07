@@ -102,7 +102,7 @@ def test_a_drop_recounts_the_run_counters_the_insert_only_mv_cannot_subtract():
     drop_older_case_attempts(c, "db", RUN, "torch-spyre", "a.xml", 2)
     sqls = [sql for sql, _ in c.commands]
     assert sqls[1].startswith("DELETE FROM db.run_case_counters")
-    assert sqls[2].startswith("INSERT INTO db.run_case_counters SELECT")
+    assert sqls[2].startswith("INSERT INTO db.run_case_counters (run_id, component, ")
     assert "FROM db.test_case_runs" in sqls[2]
     # Recounted per run, not per file: the counters hold one row per run.
     assert "source_file" not in sqls[2]
