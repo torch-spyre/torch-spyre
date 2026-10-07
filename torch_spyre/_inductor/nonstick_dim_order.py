@@ -14,11 +14,17 @@
 
 """Reorder non-stick device dimensions for correctness and performance.
 
-Runs after optimize_restickify_locations and before finalize_layouts. At that
-point each buffer has a single committed_stl chosen by the beam optimizer;
-stick choices are final and these rewrites affect only non-stick dim ordering.
+Two-pass design: ``reorder_nonstick_dims`` (pass 1) makes all dim-order
+decisions and records deferred work; ``reorder_nonstick_dims_mutation``
+(pass 2) executes that work.
 
-Two phases, in order:
+Pass 1 — ``reorder_nonstick_dims``
+  Runs after optimize_restickify_locations and before finalize_layouts. At
+  that point each buffer has a single committed_stl chosen by the beam
+  optimizer; stick choices are final and these rewrites affect only non-stick
+  dim ordering.
+
+  Internally two phases, in order:
 
   Phase 1 — constraint transforms (run first, establish pinned_dims):
     gather IA constraint
@@ -34,15 +40,16 @@ Two phases, in order:
       into the slot between the two stick dims (outer_stick+1) so the widest
       loop variable carries the most work.
 
-Each transform is tried independently per phase; constraint transforms run
-first and record which device positions they have fixed (pinned_dims).  The
-performance transform runs second and respects those pins.  This is correct
-today because the constraint and performance transforms target structurally
-different dimensions — the IA constraint fixes the indexed dim at position 0,
-while the matmul reorder moves the *largest remaining* dim into a different
-slot.  If a future use case requires more complex composition, extend
-pinned_dims or replace the two-phase structure with explicit dim-order
-constraint solving.
+  Decisions that cannot be executed in pass 1 (mutation targets, graph
+  inputs) are stored on V.graph.nonstick_deferred as _DeferredReorder entries.
+
+Pass 2 — ``reorder_nonstick_dims_mutation``
+  Runs after insert_restickify, when every buffer has a committed
+  FixedTiledLayout. Iterates V.graph.nonstick_deferred and executes each
+  entry by calling ``_rewrite_producer_layout`` or inserting copy nodes via
+  ``_insert_relayout_copy`` / ``_insert_mutation_relayout_copy``. No
+  analysis logic — purely mechanical execution of pass 1 decisions.
+
 pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on graph)
 """
 
