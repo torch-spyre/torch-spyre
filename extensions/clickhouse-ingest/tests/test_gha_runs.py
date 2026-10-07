@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from spyre_clickhouse_ingest import gha_runs
 from spyre_clickhouse_ingest.schema import PipelineRuns
 
@@ -200,7 +202,7 @@ def _window():
 
 def test_poll_writes_every_attempt_of_a_rerun():
     gh, client = FakeGitHub([_run(run_attempt=2, conclusion="success")]), FakeClient()
-    attempts, rows = gha_runs.poll(gh, client, "db", REPO, *_window())
+    attempts, rows, _ = gha_runs.poll(gh, client, "db", REPO, *_window())
     keys = sorted(
         r["run_key"] for r in client.inserted if r["pipeline_type"] == "gha-workflow"
     )
@@ -218,7 +220,7 @@ def test_poll_skips_finished_attempts_it_already_holds():
         ("gha:torch-spyre/torch-spyre/900001#2", updated, "finished"),
     ]
     gh = FakeGitHub([_run(run_attempt=2, conclusion="success")])
-    assert gha_runs.poll(gh, FakeClient(held), "db", REPO, *_window()) == (0, 0)
+    assert gha_runs.poll(gh, FakeClient(held), "db", REPO, *_window()) == (0, 0, "")
     assert gh.calls == []
 
 
@@ -231,7 +233,11 @@ def test_poll_rewrites_an_attempt_held_as_running():
         )
     ]
     client = FakeClient(held)
-    assert gha_runs.poll(FakeGitHub([_run()]), client, "db", REPO, *_window()) == (1, 2)
+    assert gha_runs.poll(FakeGitHub([_run()]), client, "db", REPO, *_window()) == (
+        1,
+        2,
+        "",
+    )
     assert client.inserted[0]["state"] == "finished"
 
 
@@ -291,6 +297,8 @@ def test_get_retries_a_truncated_response(monkeypatch):
     calls = []
 
     class Resp(io.BytesIO):
+        headers: dict = {}
+
         def __enter__(self):
             return self
 
@@ -306,3 +314,229 @@ def test_get_retries_a_truncated_response(monkeypatch):
     monkeypatch.setattr(gha_runs.urllib.request, "urlopen", urlopen)
     monkeypatch.setattr(gha_runs.time, "sleep", lambda s: None)
     assert gha_runs.GitHub("t").get("/x") == {"ok": True} and len(calls) == 2
+
+
+NOW = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+
+
+def _created(i):
+    return f"{NOW - timedelta(hours=7) + timedelta(minutes=10 * i):%Y-%m-%dT%H:%M:%SZ}"
+
+
+class FakeAPI(gha_runs.GitHub):
+    """The Actions endpoints over a list of runs; every counted call costs 1 quota, 1 minute.
+
+    Listing takes 2 calls (a full page, then an empty one); each run then costs 1 (its jobs).
+    """
+
+    def __init__(self, runs, limit=100, remaining=100, clock=None, **kw):
+        super().__init__("t", **kw)
+        self.all, self.quota, self.left = runs, limit, remaining
+        self.clock, self.paths = clock, []
+        self.reset_at = clock.now + 3600
+
+    def _fetch(self, req):
+        url = urllib.parse.urlparse(req.full_url)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        if self.clock.now >= self.reset_at:
+            self.left, self.reset_at = self.quota, self.reset_at + 3600
+        headers = {
+            "X-RateLimit-Limit": str(self.quota),
+            "X-RateLimit-Remaining": str(self.left),
+            "X-RateLimit-Reset": str(self.reset_at),
+        }
+        if url.path == "/rate_limit":
+            core = {"limit": self.quota, "remaining": self.left, "reset": 0}
+            return {"resources": {"core": core}}, headers
+        self.left -= 1
+        self.clock.now += 60
+        headers["X-RateLimit-Remaining"] = str(self.left)
+        self.paths.append(url.path)
+        if url.path.endswith("/actions/runs"):
+            lo, hi = q["created"].split("..")
+            hit = sorted(
+                (r for r in self.all if lo <= r["created_at"] <= hi),
+                key=lambda r: r["created_at"],
+                reverse=True,
+            )
+            page = int(q["page"])
+            return {
+                "total_count": len(hit),
+                "workflow_runs": hit[(page - 1) * 100 : page * 100],
+            }, headers
+        run_id, attempt = (int(x) for x in url.path.split("/")[6:9:2])
+        if url.path.endswith("/jobs"):
+            return {"total_count": 1, "jobs": [_job(id=run_id * 10)]}, headers
+        return next(r for r in self.all if r["id"] == run_id), headers
+
+
+class Clock:
+    def __init__(self):
+        self.now = NOW.timestamp()
+        self.slept = []
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.now += s
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = Clock()
+    monkeypatch.setattr(gha_runs.time, "time", lambda: c.now)
+    monkeypatch.setattr(gha_runs.time, "sleep", c.sleep)
+    return c
+
+
+class Store:
+    """A pipeline_runs stand-in answering the poller's stored() and watermark() reads."""
+
+    def __init__(self):
+        self.rows = []
+
+    def insert(self, table, rows, column_names=None, database=None):
+        self.rows += [dict(zip(column_names, r)) for r in rows]
+
+    def query(self, sql, parameters=None):
+        wf = [r for r in self.rows if r["pipeline_type"] == "gha-workflow"]
+        if "count()" in sql:
+            first = [
+                r["started_at"] - timedelta(milliseconds=r["queue_ms"])
+                for r in wf
+                if r["run_key"].endswith("#1")
+            ]
+            rows = [(len(first), max(first) if first else None)]
+        else:
+            rows = [(r["run_key"], r["updated_at"], r["state"]) for r in wf]
+        return type("R", (), {"result_rows": rows})()
+
+    def keys(self):
+        return [r["run_key"] for r in self.rows if r["pipeline_type"] == "gha-workflow"]
+
+
+def _runs(n):
+    return [
+        _run(
+            id=1000 + i,
+            created_at=_created(i),
+            run_started_at=_created(i),
+            updated_at=_created(i),
+        )
+        for i in range(n)
+    ]
+
+
+def _key(i):
+    return f"gha:{REPO}/{1000 + i}#1"
+
+
+def _poll(api, store, start=None):
+    api.rate()
+    return gha_runs.poll(api, store, "db", REPO, start or NOW - timedelta(hours=8), NOW)
+
+
+def test_poll_stops_at_the_reserve_and_keeps_what_it_finished(clock):
+    # 60 left with half reserved leaves 10 calls: the listing, then 8 runs.
+    api, store = FakeAPI(_runs(20), remaining=60, clock=clock), Store()
+    attempts, rows, reason = _poll(api, store)
+    assert reason == "budget reached at 50 remaining"
+    assert api.left == 50 and attempts == 8
+    assert store.keys() == [_key(i) for i in range(8)]
+
+
+def test_poll_stops_at_the_deadline(clock):
+    api = FakeAPI(_runs(20), clock=clock, deadline=clock.now + 7 * 60)
+    attempts, _, reason = _poll(api, Store())
+    assert reason == "deadline reached" and attempts == 5
+
+
+def test_poll_works_oldest_first_and_resumes_without_a_hole(clock):
+    runs, store = _runs(20), Store()
+    api = FakeAPI(runs, remaining=60, clock=clock)
+    assert _poll(api, store)[2]
+    # The next run gets a fresh quota and starts from the watermark.
+    mark = gha_runs.watermark(store, "db", REPO)
+    assert mark == gha_runs._ts(_created(7))
+    start, resumed = gha_runs.window_start(
+        NOW, timedelta(minutes=30), mark, timedelta(hours=6), timedelta(days=90)
+    )
+    assert resumed
+    attempts, _, reason = _poll(FakeAPI(runs, clock=clock), store, start)
+    assert reason == "" and attempts == 12
+    assert store.keys() == [_key(i) for i in range(20)]
+
+
+def test_the_watermark_extends_the_window_after_an_outage():
+    day = timedelta(days=1)
+    args = (timedelta(hours=6), timedelta(days=90))
+    # Polling as usual: the watermark is recent and --hours already reaches past it.
+    assert gha_runs.window_start(
+        NOW, timedelta(hours=8), NOW - timedelta(minutes=15), *args
+    ) == (NOW - timedelta(hours=8), False)
+    assert gha_runs.window_start(NOW, timedelta(hours=8), NOW - 3 * day, *args) == (
+        NOW - 3 * day - timedelta(hours=6),
+        True,
+    )
+    assert gha_runs.window_start(NOW, timedelta(hours=8), None, *args) == (
+        NOW - timedelta(hours=8),
+        False,
+    )
+
+
+def test_catch_up_is_capped_but_an_explicit_backfill_is_not():
+    day = timedelta(days=1)
+    args = (timedelta(hours=6), timedelta(days=90))
+    assert gha_runs.window_start(NOW, timedelta(hours=8), NOW - 200 * day, *args) == (
+        NOW - 90 * day,
+        True,
+    )
+    assert gha_runs.window_start(NOW, 120 * day, NOW - 200 * day, *args) == (
+        NOW - 120 * day,
+        False,
+    )
+
+
+def test_wait_for_reset_sleeps_instead_of_stopping(clock):
+    api = FakeAPI(_runs(20), remaining=60, clock=clock, wait_for_reset=True)
+    store = Store()
+    attempts, _, reason = _poll(api, store)
+    assert reason == "" and attempts == 20
+    # 10 calls at 1 minute each, then a sleep to the hourly reset.
+    assert clock.slept == [3600 - 10 * 60 + 1]
+    assert store.keys() == [_key(i) for i in range(20)]
+
+
+def test_wait_for_reset_still_honours_the_deadline(clock):
+    api = FakeAPI(
+        _runs(20),
+        remaining=60,
+        clock=clock,
+        wait_for_reset=True,
+        deadline=clock.now + 30 * 60,
+    )
+    assert _poll(api, Store())[2] == "deadline reached"
+    assert clock.slept == []
+
+
+def test_cli_ends_a_stopped_poll_with_a_notice_not_an_error(clock, monkeypatch, capsys):
+    now = datetime.now(timezone.utc)
+    runs = [
+        _run(
+            id=1000 + i,
+            created_at=f"{now - timedelta(minutes=60 - i):%Y-%m-%dT%H:%M:%SZ}",
+        )
+        for i in range(5)
+    ]
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setattr(
+        gha_runs,
+        "GitHub",
+        lambda token, **kw: FakeAPI(runs, remaining=53, clock=clock, **kw),
+    )
+    gha_runs.main(
+        ["poll", "--repo", REPO, "--repo", "torch-spyre/hf-adapters", "--dry-run"]
+    )
+    err = capsys.readouterr().err
+    assert "[info] rate limit 53/100 at start" in err
+    assert "[notice] budget reached at 50 remaining; resume next run" in err
+    assert "hf-adapters" not in err and "rate limit 50/100 at end" in err
