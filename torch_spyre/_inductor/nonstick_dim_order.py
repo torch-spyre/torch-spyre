@@ -85,7 +85,6 @@ from .pass_utils import (
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
 # import is safe at module level.
 from .enforce_indirect_access_layout import (
-    _dim_order_is_compliant,
     _get_indirect_access_dim_order_requirements,
     _insert_relayout_copy,
     _output_real_layout,
@@ -367,7 +366,32 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     continue
                 buf = V.graph.get_buffer(dep.name)
                 if not isinstance(buf, ComputedBuffer):
+                    # Graph input or other non-ComputedBuffer: use _buf_stl,
+                    # cannot update in place — record for phase 2 execution.
+                    stl = _buf_stl(buf)
+                    if stl is None:
+                        continue
+                    try:
+                        coords = device_coordinates(stl, dep, sizes)
+                    except Exception:
+                        continue
+                    coords_sub = [c.xreplace(access_subs) for c in coords]
+                    stride_idx = _indirect_stride_idx(coords_sub, access_subs)
+                    if stride_idx is None:
+                        continue
+                    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
+                    if indirect_device_pos == 0:
+                        continue  # already compliant
+                    required_stl = _ia_rotate_stl(stl, indirect_device_pos)
+                    key = (dep.name, op.get_name())
+                    if key in seen_p1:
+                        continue
+                    seen_p1.add(key)
+                    V.graph.nonstick_deferred.append(
+                        _DeferredReorder(op, dep.name, required_stl, "copy")
+                    )
                     continue
+                # ComputedBuffer path continues below.
                 if not hasattr(buf, "committed_stl"):
                     continue
                 try:
@@ -823,40 +847,19 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
             continue
         _enforce_scatter_destination_layout(graph, op, requirement)
 
-    # Handle gather graph-input value tensors post-insert_restickify.
-    # Phase 1 of reorder_nonstick_dims skips graph inputs (no committed_stl).
-    # Here every buffer has a FixedTiledLayout so we can insert relayout copies.
-    for op in list(graph.operations):
-        if not isinstance(op, ComputedBuffer):
+    # Execute deferred gather copy entries recorded by phase 1.
+    # Phase 1 records "copy" entries for graph-input gather value tensors;
+    # here every buffer has a FixedTiledLayout so we can insert relayout copies.
+    for entry in getattr(V.graph, "nonstick_deferred", []):
+        if entry.kind != "copy":
             continue
-        if isinstance(op.data, Scatter):
-            continue  # scatter handled above
-        dep_names, access_subs, sizes = indirect_info_from_op(op)
-        if not dep_names:
+        if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
+            continue  # scatter mutation copies handled by scatter loop above
+        buf = graph.try_get_buffer(entry.buf_name)
+        if buf is None:
             continue
-        for dep in op.get_read_writes().reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            buf = graph.get_buffer(dep.name)
-            if buf is None:
-                continue
-            if isinstance(buf, ComputedBuffer):
-                continue  # handled by phase 1 of reorder_nonstick_dims
-            layout = _real_layout(buf)
-            if not isinstance(layout, FixedTiledLayout):
-                continue
-            value_stl = layout.device_layout
-            try:
-                coords = device_coordinates(value_stl, dep, sizes)
-            except Exception:
-                continue
-            coords_sub = [c.xreplace(access_subs) for c in coords]
-            stride_idx = _indirect_stride_idx(coords_sub, {})
-            if stride_idx is None:
-                continue
-            if _dim_order_is_compliant(value_stl, stride_idx):
-                continue
-            indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-            required_stl = _ia_rotate_stl(value_stl, indirect_device_pos)
-            required_layout = _fixed_tiled(layout, required_stl)
-            op = _insert_relayout_copy(graph, op, buf, required_layout)
+        layout = _real_layout(buf)
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        required_layout = _fixed_tiled(layout, entry.required_stl)
+        _insert_relayout_copy(graph, entry.op, buf, required_layout)
