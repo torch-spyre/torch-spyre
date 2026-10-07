@@ -48,7 +48,6 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 
 from typing import Literal, NamedTuple
 
-import sympy
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -78,17 +77,14 @@ from .op_spec import IndirectAccess
 from .pass_utils import (
     device_coordinates,
     indirect_info_from_op,
-    loop_var_ranges_from_dim_hints,
     try_device_coordinates,
 )
 
-# Import helpers that remain in enforce_indirect_access_layout and are used by
-# the mutation-target dim-order enforcement functions moved here in Task 4.
+# Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
 # import is safe at module level.
 from .enforce_indirect_access_layout import (
     _insert_relayout_copy,
-    _output_real_layout,
     _real_layout,
     _resolve_mutation_target,
     _scatter_access_subs_and_sizes,
@@ -619,197 +615,6 @@ def _insert_mutation_relayout_copy(
         buf_tmp_name,
         target_name,
     )
-
-
-def _enforce_scatter_destination_layout(
-    graph: GraphLowering,
-    scatter_op: ComputedBuffer,
-    requirement: tuple[set[str], dict, dict[sympy.Symbol, int] | None] | None,
-) -> None:
-    """Ensure a scatter's destination has its scattered dim outermost.
-
-    Unlike gather, whose read side is a plain ComputedBuffer, a scatter's
-    write side is expressed as a MutationLayoutSHOULDREMOVE on the value
-    tensor -- so the "does the indexed dim sit outermost" check that the main
-    pass loop already does for read coordinates has to be redone here against
-    write coordinates, against the *target's* committed layout rather than
-    the op's own.
-
-    Preferring a producer rewrite over a destination copy: if the mutation
-    target is itself a ComputedBuffer we can still rewrite in place (not a
-    graph output, not already a mutation), retargeting its layout to match
-    the scatter output's layout is free -- no new copy node -- and makes the
-    destination trivially compliant, since target and output share one
-    layout. Only fall back to inserting a copy-in/copy-back pair (via
-    _insert_mutation_relayout_copy) when that rewrite isn't available and the
-    destination's own layout doesn't already satisfy the requirement.
-    """
-    write_dep = next(
-        (d for d in scatter_op.get_read_writes().writes if isinstance(d, MemoryDep)),
-        None,
-    )
-    if write_dep is None:
-        return
-    output_layout = _output_real_layout(scatter_op)
-    if isinstance(output_layout, FixedTiledLayout):
-        output_stl = output_layout.device_layout
-    else:
-        # For non-tiled layouts (e.g., FixedLayout), skip enforcement.
-        return
-
-    # The scatter mutates its input (the value tensor); the mutation target is
-    # the value producer. Resolve and look up the actual buffer.
-    target_name, _ = _resolve_mutation_target(scatter_op)
-    target_buf = graph.get_buffer(target_name)
-    logger.debug(
-        "scatter_destination_check: target_name=%r, target_buf type=%s",
-        target_name,
-        type(target_buf).__name__ if target_buf else "None",
-    )
-    value_producer_rewritten = False
-    if isinstance(target_buf, ComputedBuffer) and _can_mutate_producer_in_place(
-        target_buf, graph.get_output_names()
-    ):
-        value_layout = _real_layout(target_buf)
-        if isinstance(value_layout, FixedTiledLayout):
-            value_stl = value_layout.device_layout
-            if value_stl != output_stl:
-                _rewrite_producer_layout(target_buf, output_stl)
-                value_producer_rewritten = True
-                logger.info(
-                    "scatter_value_check: rewrote mutation target %s layout "
-                    "to match scatter output layout",
-                    target_buf.get_name(),
-                )
-
-    if value_producer_rewritten:
-        # Target and output now share a layout, so the destination check
-        # below is automatically satisfied -- skip it.
-        return
-
-    # Check scatter destination compliance: scatter index dimensions must be outermost.
-    # Detect scatter index symbols (non-loop symbols in write_dep.index).
-    #
-    # A WhileLoop-splice per-iteration loop_var (e.g. u0, see
-    # wsr/for_each_tile_lowering.py's _synthesize_dim_hints_for_group) is
-    # deliberately folded into write_dep.index without ever being a
-    # write_dep.ranges key -- see pass_utils.py's
-    # loop_var_ranges_from_dim_hints -- so it looks exactly like a scatter
-    # index symbol by this "not a loop range key" test alone. Excluding it
-    # explicitly matches _build_indirect_store_subs's identical exclusion
-    # for the read-side version of this same inference; without it, a
-    # scatter nested inside a spliced WhileLoop body would misclassify its
-    # own tile-advancing loop_var as a scatter index and corrupt the
-    # dim-order compliance check below.
-    all_write_syms = write_dep.index.free_symbols
-    loop_syms = set(write_dep.ranges.keys())
-    loop_syms |= set(loop_var_ranges_from_dim_hints(scatter_op))
-    scatter_syms = all_write_syms - loop_syms
-
-    if not scatter_syms:
-        # No scatter index symbols found (shouldn't happen for a real scatter).
-        logger.debug(
-            "scatter_destination_check: no scatter symbols found for %s",
-            scatter_op.get_name(),
-        )
-        return
-
-    # Build substitutions mapping scatter symbols to IndirectAccess markers.
-    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
-
-    # For scatter destination compliance, check against the *target's* layout,
-    # not the output layout. The write side must conform to the target's committed
-    # device layout, which is where the scatter actually writes.
-    target_layout = target_buf.get_layout()
-    target_stl = None
-    target_fixed_tiled_layout = None
-    if isinstance(target_layout, FixedTiledLayout):
-        target_stl = target_layout.device_layout
-        target_fixed_tiled_layout = target_layout
-    else:
-        # For non-tiled layouts (e.g., FixedLayout on graph inputs), try to get
-        # the SpyreTensorLayout from the TensorBox's .layouts attribute.
-        layouts = getattr(target_buf, "layouts", None)
-        if layouts:
-            target_stl = next(iter(layouts))
-        else:
-            # Target is a graph input with no device layout propagated yet,
-            # or some other non-tiled layout we cannot enforce on.
-            logger.debug(
-                "scatter_destination_check: skipping %s: mutation target %r has %s "
-                "with no device layout (cannot enforce)",
-                scatter_op.get_name(),
-                target_name,
-                type(target_layout).__name__,
-            )
-            return
-
-    if target_stl is None:
-        # Target is a graph input (FixedLayout) or other non-tiled layout.
-        # We cannot modify graph inputs, so skip enforcement.
-        logger.debug(
-            "scatter_destination_check: skipping %s: mutation target %r has %s "
-            "(not FixedTiledLayout, cannot enforce)",
-            scatter_op.get_name(),
-            target_name,
-            type(target_layout).__name__,
-        )
-        return
-
-    # Compute write coordinates against target layout. Sizes must be resolved
-    # against target's strides (not output's), since coordinates are computed
-    # against target_stl.
-    if target_fixed_tiled_layout is not None:
-        subs_from_op, scatter_sizes = _scatter_access_subs_and_sizes(
-            scatter_op, target_fixed_tiled_layout, write_dep
-        )
-        if subs_from_op:
-            scatter_access_subs = subs_from_op
-    else:
-        logger.debug(
-            "scatter_destination_check: skipping %s: target is non-FixedTiledLayout",
-            scatter_op.get_name(),
-        )
-        return
-    try:
-        write_coords = device_coordinates(target_stl, write_dep, scatter_sizes)
-    except Unsupported as e:
-        logger.debug(
-            "scatter_destination_check: skipping %s: could not resolve sizes: %s",
-            scatter_op.get_name(),
-            str(e),
-        )
-        return
-    indirect_stride_idxs = []
-    for idx, coord in enumerate(reversed(write_coords)):
-        substituted = coord.xreplace(scatter_access_subs)
-        if hasattr(substituted, "has") and substituted.has(IndirectAccess):
-            indirect_stride_idxs.append(idx)
-
-    is_compliant = False
-    if indirect_stride_idxs:
-        indirect_device_pos = sorted(
-            len(target_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
-        )
-        expected_pos = list(range(len(indirect_stride_idxs)))
-        is_compliant = indirect_device_pos == expected_pos
-        logger.debug(
-            "scatter_destination_check: %s indirect_device_pos=%s, expected=%s, compliant=%s",
-            scatter_op.get_name(),
-            indirect_device_pos,
-            expected_pos,
-            is_compliant,
-        )
-
-    if not is_compliant:
-        logger.info(
-            "scatter_destination_check: inserting mutation relayout copy for %s",
-            scatter_op.get_name(),
-        )
-        write_stride_idx = indirect_stride_idxs[0]
-        indirect_pos = len(target_stl.stride_map) - 1 - write_stride_idx
-        required_stl = _ia_rotate_stl(target_stl, indirect_pos)
-        _insert_mutation_relayout_copy(graph, scatter_op, required_stl)
 
 
 def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
