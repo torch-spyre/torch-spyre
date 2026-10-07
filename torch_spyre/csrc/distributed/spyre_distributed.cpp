@@ -42,7 +42,7 @@ enum class CollectiveKind { Broadcast, AllGather, AllReduce };
 // Structure to hold pending async work
 struct PendingWork {
   CollectiveKind kind;
-  std::shared_ptr<spyre_comms::WorkSchedule> work;
+  std::unique_ptr<spyre_comms::WorkSchedule> work;
   std::vector<at::Tensor> rank_outputs;
   int64_t chunk_size = 0;
   std::vector<at::Tensor> hold_tensors;
@@ -55,15 +55,6 @@ struct PendingWork {
 static std::unordered_map<spyre::SharedOwnerCtx*, PendingWork>
     pending_work_map_;
 static std::mutex work_map_mutex_;
-
-static std::vector<std::shared_ptr<spyre_comms::WorkSchedule>>
-    retained_work_schedules_;
-static std::mutex retained_work_mutex_;
-
-void clear_retained_work_schedules() {
-  std::lock_guard<std::mutex> lock(retained_work_mutex_);
-  retained_work_schedules_.clear();
-}
 
 // spyre-comms does not report failures through WorkSchedule::wait(), so check
 // the schedule state and the Flex stream error flag instead.
@@ -535,19 +526,12 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
       check_collective_errors(*pending.work);
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
     } else {
-      // If we are skipping the wait, then we need to retain the object to
-      // prevent the WorkSchedule destructor from firing when this function
-      // completes. The WorkSchedule destructor will force the wait() to
-      // complete. This will negate the performance improvements of avoiding
-      // the wait().
+      // If we are skipping the wait, relinquish ownership to spyre-comms so
+      // the WorkSchedule stays alive until finalize_library() drains it.
+      // This prevents ~WorkSchedule() from firing inline here and forcing an
+      // unwanted synchronous wait().
       check_collective_errors(*pending.work);
-      std::lock_guard<std::mutex> lock(retained_work_mutex_);
-      // Release finished schedules so their buffers do not accumulate.
-      std::erase_if(retained_work_schedules_, [](const auto& w) {
-        return w->getState() ==
-               spyre_comms::WorkScheduleState::State::DONE_SUCCESS;
-      });
-      retained_work_schedules_.push_back(std::move(pending.work));
+      spyre_comms::relinquish_work_schedule(std::move(pending.work));
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
     }
   }
