@@ -11,7 +11,8 @@
 -- -> d1ebd21d-1a04-5c64-9e52-5dd2c542cb36.
 --
 -- Safe to repeat: rows the ingest already keyed this way hash to their own id and are skipped;
--- rows written after the snapshot wait for the next pass.
+-- rows written after the snapshot wait for the next pass. Order-independent with
+-- 62-benchmark-verdicts.sql: its verdict table is re-keyed when it exists, skipped when not.
 
 DROP TABLE IF EXISTS benchmark_id_rekey;
 
@@ -114,8 +115,31 @@ WHERE benchmark_id IN (SELECT old_id FROM benchmark_id_rekey)
   AND audit_uuid IN (SELECT audit_uuid FROM benchmark_runs
                      WHERE benchmark_id IN (SELECT new_id FROM benchmark_id_rekey));
 
+-- benchmark_metric_verdicts (62-benchmark-verdicts.sql) keys its series by benchmark_id, so its
+-- history moves too. A key already held under the new id is a newer evaluation, and stays.
+-- IF TABLE EXISTS: benchmark_metric_verdicts
+INSERT INTO benchmark_metric_verdicts
+SELECT v.* REPLACE (k.new_id AS benchmark_id)
+FROM benchmark_metric_verdicts AS v
+INNER JOIN
+(
+    SELECT run_id, old_id, any(new_id) AS new_id FROM benchmark_id_rekey GROUP BY run_id, old_id
+) AS k ON k.run_id = v.run_id AND k.old_id = v.benchmark_id
+WHERE (v.component, v.run_id, k.new_id, v.backend, v.arch, v.source_job, v.metric,
+       v.baseline_kind, v.policy_version) NOT IN (
+    SELECT component, run_id, benchmark_id, backend, arch, source_job, metric, baseline_kind,
+           policy_version
+    FROM benchmark_metric_verdicts
+    WHERE benchmark_id IN (SELECT new_id FROM benchmark_id_rekey));
+
 DELETE FROM benchmarks
 WHERE benchmark_id IN (SELECT old_id FROM benchmark_id_rekey)
   AND benchmark_id NOT IN (SELECT benchmark_id FROM benchmark_runs);
+
+-- Also drops what a refresh racing this pass wrote under an old id: its runs are inside the
+-- refresh window, so the next refresh evaluates them under the new id.
+-- IF TABLE EXISTS: benchmark_metric_verdicts
+DELETE FROM benchmark_metric_verdicts
+WHERE benchmark_id NOT IN (SELECT benchmark_id FROM benchmarks);
 
 DROP TABLE benchmark_id_rekey;
