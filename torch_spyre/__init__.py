@@ -31,7 +31,6 @@ class _SpyreImpl:
     def __init__(self):
         self._initialized = False
         self._in_bad_fork = False
-        self._spawned_subprocess = False
         self._pending_device_idx = None
 
         # When spawning a supprocess from inductor, ensure that IS_INDUCTOR_SPAWNED_SUBPROCESS=1
@@ -42,7 +41,6 @@ class _SpyreImpl:
             # so, we want only the main process can have access to the actual device
             self._in_bad_fork = True
             self._initialized = True
-            self._spawned_subprocess = True
         try:
             os.register_at_fork(after_in_child=self._mark_after_fork)
         except Exception:
@@ -140,16 +138,14 @@ class _SpyreImpl:
         return default_generator.initial_seed()
 
     def is_available(self) -> bool:
-        # A spawned subprocess never starts the runtime, so it has no usable
-        # device. Reporting one makes torch.accelerator callers (e.g. Dynamo's
-        # stream tracking on every compile) reach stream code that needs the
-        # runtime, and the process aborts even when compiling CPU-only code.
-        if self._spawned_subprocess:
-            return False
+        # A process that doesn't own the card (forked, or started with
+        # IS_INDUCTOR_SPAWNED_SUBPROCESS=1) never starts the runtime, so it has
+        # no usable device. Reporting one makes torch.accelerator callers (e.g.
+        # Dynamo's stream tracking on every compile) reach stream code that
+        # needs the runtime, and the process aborts even for CPU-only code.
         if self._is_in_bad_fork():
-            return True
-        else:
-            return self.device_count() > 0
+            return False
+        return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()
