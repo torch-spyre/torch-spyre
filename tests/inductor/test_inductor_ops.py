@@ -399,17 +399,19 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
+# fp32 and int32 share a stick width, so their conversions have no stick pairs to
+# keep together and are exempt from the shapes above.
+_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
     if (
-        shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
+        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
         or (
             DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst)
-            not in [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+            and (src, dst) not in _SAME_WIDTH_PAIRS
         )
         # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
         # so there's no width change to trip the fp16-stick boundary.
@@ -432,12 +434,23 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
-TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+]
+
+# Explicit round trips that pass on a stick ending inside a stick; the rest of the
+# unaligned shapes need the consumer of the upcast value padded to whole stick
+# pairs (see test_upcast_consumed_on_partial_stick). The implicit round
+# trip still hits an unsupported op on these shapes.
+_ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
+TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+    case
+    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+    if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -5590,6 +5603,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (67, 71, 256),
                     ),
                 ),
+                # Stick dims shorter than one stick; size 1 has no loop variable.
+                "67x1": (cached_randn((67, 1)),),
+                "67x2": (cached_randn((67, 2)),),
+                "1": (cached_randn((1,)),),
                 "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
                 "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
                 # Only exp(23) overflows DLFloat16 itself. The LX pointwise
@@ -6048,7 +6065,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",

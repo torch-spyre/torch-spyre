@@ -541,8 +541,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
-    // its barrier. The inline synchronize() it triggers only drains S_prep, so
-    // it never blocks device compute on S_dev.
+    // its barrier.
     role_ = StreamRole::Prep;
 
     // Create the host compute handle at construction time.
