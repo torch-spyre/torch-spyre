@@ -293,52 +293,41 @@ def _try_gather_ia_constraint(
 
 def _try_scatter_ia_constraint(
     buf: ComputedBuffer,
-    dep: MemoryDep,
     op: ComputedBuffer,
 ) -> tuple[SpyreTensorLayout, set[int]] | None:
     """Rotate the scattered dim of a scatter destination to device position 0.
 
-    buf is the scatter destination buffer (resolved by the caller);
-    dep is the write dep. Does not re-resolve the destination.
+    buf is the scatter destination buffer; op is the scatter op.
+    Uses indirect_info_from_op to identify scatter dims without parsing write deps.
     Returns (new_stl, {0}) if rotation needed, None if compliant or not applicable.
     """
-    if not hasattr(buf, "committed_stl"):
+    stl = _buf_stl(buf)
+    if stl is None:
         return None
-    stl = buf.committed_stl
-
-    # Extract scatter index symbols: symbols in dep.index that are not loop
-    # range keys and not WhileLoop splice vars.
-    all_write_syms = dep.index.free_symbols
-    loop_syms = set(dep.ranges.keys())
-    loop_syms |= set(loop_var_ranges_from_dim_hints(op))
-    scatter_syms = all_write_syms - loop_syms
-    if not scatter_syms:
+    _, access_subs, sizes = indirect_info_from_op(op)
+    if not access_subs:
         return None
-
-    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
-
+    write_deps = [d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)]
+    if not write_deps:
+        return None
+    write_dep = write_deps[0]
     try:
-        write_coords = device_coordinates(stl, dep, None)
+        write_coords = device_coordinates(stl, write_dep, sizes)
     except (Unsupported, Exception):
         return None
-
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
-        substituted = coord.xreplace(scatter_access_subs)
+        substituted = coord.xreplace(access_subs)
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
             indirect_stride_idxs.append(idx)
-
     if not indirect_stride_idxs:
         return None
-
     indirect_device_pos = sorted(
         len(stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
     )
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
-        return None  # already compliant
-
-    # Rotate the first indirect dim to position 0.
+        return None
     new_stl = _ia_rotate_stl(stl, indirect_device_pos[0])
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
@@ -405,17 +394,14 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
         if isinstance(op.data, Scatter) and isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
         ):
-            write_deps = [
-                d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
-            ]
-            if write_deps:
-                write_dep = write_deps[0]
-                target = op.layout.target
-                while isinstance(target, ReinterpretView):
-                    target = target.data
-                dest_buf = target if isinstance(target, ComputedBuffer) else None
-                if dest_buf is not None and hasattr(dest_buf, "committed_stl"):
-                    result = _try_scatter_ia_constraint(dest_buf, write_dep, op)
+            target = op.layout.target
+            while isinstance(target, ReinterpretView):
+                target = target.data
+            dest_buf = target if isinstance(target, ComputedBuffer) else None
+            if dest_buf is not None:
+                dest_stl = _buf_stl(dest_buf)
+                if dest_stl is not None:
+                    result = _try_scatter_ia_constraint(dest_buf, op)
                     if result is not None:
                         new_stl, pinned = result
                         dest_buf.committed_stl = new_stl
@@ -423,6 +409,24 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                         pinned_dims.setdefault(dest_buf.get_name(), set()).update(
                             pinned
                         )
+                        # Decide execution strategy for phase 2.
+                        if _can_mutate_producer_in_place(
+                            dest_buf, set(graph.get_output_names())
+                        ):
+                            V.graph.nonstick_deferred.append(
+                                _DeferredReorder(
+                                    op,
+                                    dest_buf.get_name(),
+                                    new_stl,
+                                    "producer_rewrite",
+                                )
+                            )
+                        else:
+                            V.graph.nonstick_deferred.append(
+                                _DeferredReorder(
+                                    op, dest_buf.get_name(), new_stl, "copy"
+                                )
+                            )
 
     # Phase 2: performance transforms (matmul perf reorder).
     seen_p2: set[str] = set()
