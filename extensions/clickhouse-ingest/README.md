@@ -86,10 +86,16 @@ python -m spyre_clickhouse_ingest artifacts ensure \
 ```
 
 `--lookup auto|off|only`: an existing record wins / derive only, read no database / it must be
-recorded. `--registry auto|off`: called only when the spec needs it / never. With no registry
-answer (off, or unreachable: no `ICR_*` credentials) an image is found by its digest or by a tag
-ending in its id12 (`s390x-dev-<id12>`) held by one record, else derived from its digest; an
-image named only by any other tag then fails. The output's `registry` says which happened.
+recorded. `--registry auto|off`: called only when the spec needs it / never. A recorded image
+digest is answered from the database with no registry call. With no registry answer (off, or
+unreachable: no `ICR_*` credentials) an unrecorded image is found by a tag ending in its id12
+(`s390x-dev-<id12>`) held by one record, else derived from its digest; an image named only by
+any other tag then fails. The output's `registry` says which happened.
+
+`results` files a `--tag` with no family under `release` (`--tag-family` defaults to it there,
+as before the resolver); a tag it still cannot file is dropped with a warning and the verdicts
+are recorded regardless. `--strict` makes `results` exit 1 when a named artifact's verdicts
+were not all recorded.
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
 URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
 digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and

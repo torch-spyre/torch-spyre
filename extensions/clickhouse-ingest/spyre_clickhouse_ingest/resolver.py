@@ -28,9 +28,10 @@ Specs, simple -> advanced (README: "Naming an artifact"):
 
 An under-specified spec is looked up first and the existing record wins; only immutable refs
 (a digest, name==version, an rpm NEVRA or glob, a generic sha) are looked up, never a moving
-tag or a bare name. With no registry answer (off, or no credentials) an image is found by its
-digest or by a tag ending in its id12, else derived from its digest. An authoritative identity is derived from its inputs with no registry call
-and never rebound; a gha: record or an explicit id is verified, never guessed.
+tag or a bare name. A recorded image digest is answered with no registry call; with no registry
+answer (off, or no credentials) an unrecorded image is found by a tag ending in its id12, else
+derived from its digest. An authoritative identity is derived from its inputs with no registry
+call and never rebound; a gha: record or an explicit id is verified, never guessed.
 
 Tags: `tag_family` (tag_families.yaml) names the artifact by that family's registry tag, else
 by `tag_date`; each full `tag` takes the family its prefix names, else `tag_family` (a tag
@@ -47,7 +48,15 @@ import urllib.request
 import uuid
 
 from .identity import ID_SEP, ArtifactIdentity, DerivedId, _hex_token
-from .registry import Registry, dated_tag, family_of, split_image, tag_families, tag_of
+from .registry import (
+    ICR_HOST,
+    Registry,
+    dated_tag,
+    family_of,
+    split_image,
+    tag_families,
+    tag_of,
+)
 from .writer import ArtifactWriter
 
 KINDS = ("image", "rpm", "wheel", "generic")
@@ -446,7 +455,7 @@ class _Resolver:
     def image(self, body: str, over: dict, spec: str):
         host, path, tag, digest = split_image(body)
         multi = DerivedId.arch(self.arch) == "multi"
-        if multi or host != (self._registry.host if self._registry else "icr.io"):
+        if multi or host != (self._registry.host if self._registry else ICR_HOST):
             # A manifest list (or another registry's image) is its own digest: no leaf to find.
             if not digest:
                 raise ValueError(
@@ -465,6 +474,10 @@ class _Resolver:
             )
             return self.result(identity, "derived", body, resolved, manifest_list=digest if multi else "",
                                registry_tag=registry_tag)  # fmt: skip
+        # A recorded digest needs no registry, and its record keeps the id it was filed under.
+        row = digest and self.lookup.by_digest(self.arch, digest)
+        if row:
+            return self.existing(row, body)
         try:
             registry = self.registry(f"{spec!r} needs its per-arch leaf")
             if not digest and tag:
@@ -512,12 +525,10 @@ class _Resolver:
         return r
 
     def offline(self, host, path, tag, digest, over, body, spec, why):
-        """No registry answer (off, or unreachable, e.g. no credentials): the record of the
-        digest or of a content-addressed tag, else the digest as given, as before the registry."""
+        """No registry answer (off, or unreachable, e.g. no credentials) for an unrecorded
+        digest: the record of a content-addressed tag, else the digest as given."""
         state = "off" if self.registry_mode == "off" else f"unreachable: {why}"
-        row = (digest and self.lookup.by_digest(self.arch, digest)) or (
-            tag and self.lookup.by_tag(self.arch, f"{host}/{path}:{tag}")
-        )
+        row = tag and self.lookup.by_tag(self.arch, f"{host}/{path}:{tag}")
         if row:
             return self.existing(row, body, registry=state)
         if self.lookup_mode == "only":

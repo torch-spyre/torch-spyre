@@ -49,6 +49,7 @@ def add_artifact_options(
     tag_date_help: str = "default with a dated --tag-family: today (UTC)",
     platform_alias: bool = False,
     arch_required: bool = True,
+    tag_family: str = "",
     group_title: str = "artifact",
 ):
     """Add every artifact flag to `parser` (one argparse group)."""
@@ -77,7 +78,7 @@ def add_artifact_options(
     )
     g.add_argument(
         "--tag-family",
-        default="",
+        default=tag_family,
         help="tag it in this tag_families.yaml family: its registry tag, else dated by --tag-date; "
         "also the family of each --tag whose prefix names none",
     )

@@ -1,3 +1,17 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """`python -m spyre_clickhouse_ingest results`: parses pytest JUnit XML files produced by the
 Spyre CI pipelines and batch-inserts the results into ClickHouse.
 
@@ -55,7 +69,7 @@ from spyre_clickhouse_ingest.options import (
     artifact_options,
     artifact_spec,
 )
-from spyre_clickhouse_ingest.resolver import ensure
+from spyre_clickhouse_ingest.resolver import ensure, named
 import regex as re
 
 # ---------------------------------------------------------------------------
@@ -1268,18 +1282,20 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
         acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
-def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
-    """Write the artifact and one artifact_results row per (run_id, tier) of this leg."""
+def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
+    """Write the artifact and one artifact_results row per (run_id, tier) of this leg; False
+    when a named artifact's verdicts were not all recorded."""
     if not legs or not v2db or not (artifact_spec(args)):
-        return
+        return True
     try:
-        _write_named_artifact_verdicts(client, v2db, args, legs)
+        return _write_named_artifact_verdicts(client, v2db, args, legs)
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
             f"  [warn] v2: artifact verdict write failed, rows unaffected: {err!r}",
             file=sys.stderr,
         )
+        return False
 
 
 def _admitted_legs(legs: dict):
@@ -1298,7 +1314,7 @@ def _admitted_legs(legs: dict):
         yield run_id, tier, acc
 
 
-def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
+def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
     source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
@@ -1306,8 +1322,14 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
     admitted = list(_admitted_legs(legs))
     if not (admitted or _opt(args, "artifact")):
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
-        return
+        return True
     options = artifact_options(args)
+    try:
+        named("", options["tag_family"], options["tags"])
+    except ValueError as err:
+        # A bad tag costs the tag, never the verdicts.
+        print(f"  [warn] v2: {err}; recording no tags", file=sys.stderr)
+        options["tag_family"], options["tags"] = "", []
     # A test leg did not build what it ran; the build's own record (write-once) wins.
     # A GHA delta is the leg's own build.
     if spec.startswith("gha:"):
@@ -1329,12 +1351,13 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
         print(
             f"  [warn] v2: artifact {spec!r} names no artifact: {err}", file=sys.stderr
         )
-        return
+        return False
     if r.dry_run:
         print(f"  v2: dry run -- {r.artifact_id} [{r.source}], nothing written")
-        return
+        return True
     identity = r.identity
     aid = identity.artifact_id
+    recorded = True
     for run_id, tier, acc in admitted:
         state = _leg_state(acc["failed"], acc["total"])
         if insert_artifact_result(
@@ -1352,6 +1375,9 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
             print(
                 f"  v2: artifact_results {aid} [{tier}] state={state} under run_id={run_id}"
             )
+        else:
+            recorded = False
+    return recorded
 
 
 def _gha_run_url(args) -> str:
@@ -1415,6 +1441,14 @@ def main(argv=None):
         tag_date_help="default: the run's start day (its earliest suite timestamp), else today (UTC)",
         platform_alias=True,
         arch_required=False,
+        # As before the resolver: a free-form --tag is filed under release.
+        tag_family="release",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
+        "all recorded; by default that is a warning and the cases still land",
     )
     # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
     # behaving exactly as before -- this script runs from inside a BAKED image, so old images
@@ -1822,7 +1856,7 @@ def main(argv=None):
     if not _opt(args, "tag_date"):
         # The run's own day, not the ingest's: a run past midnight keeps its start date.
         args.tag_date = (run_started or datetime.now(UTC)).date()
-    _write_artifact_verdicts(client, v2db, args, artifact_legs)
+    verdicts_recorded = _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
@@ -1835,6 +1869,11 @@ def main(argv=None):
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
         )
+    if args.strict and not verdicts_recorded:
+        print(
+            "  [error] v2: --strict, and the artifact's verdicts were not all recorded"
+        )
+        sys.exit(1)
     _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
 
 

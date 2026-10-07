@@ -747,7 +747,11 @@ def _args(**kw):
 
     parser = argparse.ArgumentParser()
     add_artifact_options(
-        parser, origin="promoted", platform_alias=True, arch_required=False
+        parser,
+        origin="promoted",
+        platform_alias=True,
+        arch_required=False,
+        tag_family="release",
     )
     a = parser.parse_args([])
     a.__dict__.update(
@@ -880,6 +884,45 @@ def test_an_icr_image_with_no_registry_credentials_still_gets_its_verdict(
         "ab" * 6,
     )
     assert res["artifact_id"] == art["artifact_id"]
+
+
+def _named_image_args(**kw):
+    image = "registry.example.com/team/hf-adapters-devel@sha256:" + "ab" * 32
+    return _args(artifact_id="", artifact=f"image:{image}", arch="s390x",
+                 jenkins_run_key="job#1", **kw)  # fmt: skip
+
+
+def test_a_free_form_tag_is_filed_under_release_as_before(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    assert ingest._write_artifact_verdicts(
+        c, "db", _named_image_args(tags=["v1.2"]), legs
+    )
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        ("v1.2", "release")
+    ]
+    assert len(rows["artifact_results"]) == 1
+
+
+def test_a_tag_that_cannot_be_filed_costs_the_tag_not_the_verdicts(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["v1.2"], tag_family="no-such-family")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert "artifact_tags" not in rows
+    assert len(rows["artifact_results"]) == 1
+
+
+def test_verdicts_that_were_not_recorded_are_reported_for_strict(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    unrecorded = "6f1ab3e2-0000-5000-8000-000000000000"
+    assert not ingest._write_artifact_verdicts(
+        c, "db", _args(artifact_id=unrecorded), legs
+    )
+    assert ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
 
 
 def test_no_artifact_id_writes_nothing(ingest):

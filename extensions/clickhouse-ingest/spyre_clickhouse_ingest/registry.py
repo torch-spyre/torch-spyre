@@ -30,6 +30,7 @@ import regex
 OCI_ARCH = {"x86_64": "amd64"}
 # Registry manifest reads one resolution may spend searching for a family's tag.
 MAX_TAG_READS = 80
+ICR_HOST = "icr.io"
 TAG_FAMILIES_ENV = "SPYRE_TAG_FAMILIES"
 TEMPLATE_FIELDS = frozenset(
     {"family", "date", "time", "build", "iso_year", "iso_week", "registry_tag"}
@@ -240,7 +241,7 @@ class Registry:
         )
     )
 
-    def __init__(self, host: str = "icr.io", username: str = "", password: str = ""):
+    def __init__(self, host: str = ICR_HOST, username: str = "", password: str = ""):
         self.host, self.username, self.password = host, username, password
         self._tokens: dict = {}
         self._tags: dict = {}

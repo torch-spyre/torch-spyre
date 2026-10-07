@@ -1016,3 +1016,14 @@ def test_ensure_records_a_digest_pinned_image_with_no_registry_credentials(monke
         out["artifact_id"]
         == ArtifactIdentity.from_image(f"{IMAGE}@{LEAF}", "s390x").artifact_id
     )
+
+
+def test_a_recorded_digest_is_answered_before_the_registry_is_asked():
+    recorded = _row("torch-spyre", "torch-spyre-devel", LIST[7:19], "s390x", "image")
+    out = resolve(f"image:{IMAGE}@{LIST}", "s390x", registry=NoRegistry(),
+                  lookup=FakeLookup([recorded], digest=recorded[0]))  # fmt: skip
+    assert (out["artifact_id"], out["source"], out["registry"]) == (
+        recorded[0],
+        "existing",
+        "",
+    )
