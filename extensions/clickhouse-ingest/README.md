@@ -92,8 +92,8 @@ unreachable: no `ICR_*` credentials) an unrecorded image is found by a tag endin
 (`s390x-dev-<id12>`) held by one record, else derived from its digest; an image named only by
 any other tag then fails. The output's `registry` says which happened.
 
-`results` files a `--tag` with no family under `release` (`--tag-family` defaults to it there,
-as before the resolver); a tag it still cannot file is dropped with a warning and the verdicts
+`results` files a `--tag` whose prefix names no family under `snap` (`--tag-family` defaults to
+it there); a tag it still cannot file is dropped with a warning and the verdicts
 are recorded regardless. `--strict` makes `results` exit 1 when a named artifact's verdicts
 were not all recorded.
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic

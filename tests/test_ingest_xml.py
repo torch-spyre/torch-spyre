@@ -751,7 +751,7 @@ def _args(**kw):
         origin="promoted",
         platform_alias=True,
         arch_required=False,
-        tag_family="release",
+        tag_family="snap",
     )
     a = parser.parse_args([])
     a.__dict__.update(
@@ -892,7 +892,7 @@ def _named_image_args(**kw):
                  jenkins_run_key="job#1", **kw)  # fmt: skip
 
 
-def test_a_free_form_tag_is_filed_under_release_as_before(ingest):
+def test_a_free_form_tag_is_filed_under_snap(ingest):
     c = _ArtifactClient()
     legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
     assert ingest._write_artifact_verdicts(
@@ -900,7 +900,7 @@ def test_a_free_form_tag_is_filed_under_release_as_before(ingest):
     )
     rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
     assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
-        ("v1.2", "release")
+        ("v1.2", "snap")
     ]
     assert len(rows["artifact_results"]) == 1
 

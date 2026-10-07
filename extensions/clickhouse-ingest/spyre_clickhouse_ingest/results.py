@@ -1441,8 +1441,8 @@ def main(argv=None):
         tag_date_help="default: the run's start day (its earliest suite timestamp), else today (UTC)",
         platform_alias=True,
         arch_required=False,
-        # As before the resolver: a free-form --tag is filed under release.
-        tag_family="release",
+        # A free-form --tag (one whose prefix names no family) is filed under snap.
+        tag_family="snap",
     )
     parser.add_argument(
         "--strict",
