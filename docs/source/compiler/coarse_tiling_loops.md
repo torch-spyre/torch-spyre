@@ -1047,8 +1047,9 @@ is no longer a direct-mutation treatment: an earlier version of this pass
 directly into the full buffer via `MutationLayoutSHOULDREMOVE` whenever it
 had no inside consumers and no loop-internal real input. That treatment
 had a genuine post-stickify safety gap: `_allocate_full_buffer`'s
-post-stickify branch derives the full buffer's device layout by scaling
-the tiled op's own already-committed output layout, without ever
+post-stickify branch takes the full buffer's device layout from the tiled
+op's own already-committed output layout (the layout planning recorded
+before the divide, `PropagationPlan.full_device_layout`), without ever
 consulting the op's *input* layouts, and — unlike the pre-stickify path,
 which goes through `finalize_layouts`'s explicit
 `is_elided`/`is_carry_into_accum` compatibility assert — there was no
