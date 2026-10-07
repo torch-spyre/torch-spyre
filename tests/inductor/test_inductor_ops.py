@@ -6443,13 +6443,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # max_pool2d lowers to a native maxpoolfwd SDSC (lower_max_pool2d_with_indices).
-        # Coverage mirrors avg_pool2d because both share the one pool datapath, whose
-        # DDL only accepts non-overlapping windows: stride < kernel fails in
-        # distributeElemArrToTemporalLoops ("Not enough elements to distribute") for
-        # maxpool and avgpool alike, so every case here keeps stride == kernel.
+        # Coverage mirrors avg_pool2d because both share the one pool datapath.
+        # stride < kernel is unsupported as yet, so every case here keeps stride == kernel.
         # Non-square k/s is exercised since the H and W window dims are independent
-        # SDSC fields.  padding>0 is not covered: the lowering raises Unsupported
-        # because the pad halo cannot be materialized on the physically-NHWC input.
+        # SDSC fields.  padding>0 is not covered as it is still unsupported.
         ("test_max_pool2d", "test_max_pool2d_base"): {
             "ops_dict": {
                 "k2s2": lambda x: F.max_pool2d(x, kernel_size=2, stride=2),
