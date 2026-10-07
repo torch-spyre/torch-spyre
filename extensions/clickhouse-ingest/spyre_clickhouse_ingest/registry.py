@@ -32,6 +32,8 @@ OCI_ARCH = {"x86_64": "amd64"}
 MAX_TAG_READS = 80
 ICR_HOST = "icr.io"
 TAG_FAMILIES_ENV = "SPYRE_TAG_FAMILIES"
+# The family of a --tag that names none and was given none.
+MISC = "misc"
 TEMPLATE_FIELDS = frozenset(
     {"family", "date", "time", "build", "iso_year", "iso_week", "registry_tag"}
 )
@@ -191,6 +193,10 @@ def load_tag_families(path: str = "") -> dict:
             dated=bool(entry.get("dated")),
             nearest=bool(entry.get("nearest")),
             prefix=bool(entry.get("prefix")),
+        )
+    if MISC not in out:
+        raise ValueError(
+            f"{where}: needs a {MISC!r} family (where a tag naming none is filed)"
         )
     return out
 

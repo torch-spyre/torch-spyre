@@ -290,9 +290,9 @@ def test_a_full_tag_takes_its_family_from_its_prefix():
         f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["release-2026-10-04"]
     )
     assert out["tags"] == [["release-2026-10-04", "release"]]
-    # A tag no family prefix names needs its family; it never defaults to release.
-    with pytest.raises(ValueError, match="names no tag family"):
-        resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["rc1"])
+    # A tag no family prefix names, given none, lands in misc -- never in release.
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["rc1"])
+    assert out["tags"] == [["rc1", "misc"]]
     for family in ("pr", "release"):
         out = resolve(
             f"image:{IMAGE}@{LEAF}",
@@ -623,11 +623,16 @@ def test_the_cli_dates_a_family_tag_today_unless_given_a_tag_date(monkeypatch, c
 def test_the_packaged_families_are_the_recorded_ones():
     supply_chain = {"snap-supply-chain", "nightly-supply-chain", "weekly-supply-chain"}
     assert set(tag_families()) == supply_chain | {
-        "ci-cd-tech-preview", "release", "pr", "main", "nightly", "weekly", "snap"
+        "ci-cd-tech-preview", "release", "pr", "main", "nightly", "weekly", "snap", "misc"
     }  # fmt: skip
     assert {f for f in tag_families() if dated(f)} == supply_chain
     # A family with no registry tag and no fallback is named only by an explicit --tag.
     assert dated_tag("pr", DAY) == "" and family_tag("main", "main-1") == ""
+    assert (dated("misc"), dated_tag("misc", DAY), family_of("misc-1")) == (
+        False,
+        "",
+        "",
+    )
 
 
 def test_an_override_file_replaces_the_families(tmp_path, monkeypatch):
@@ -639,9 +644,10 @@ def test_an_override_file_replaces_the_families(tmp_path, monkeypatch):
         "  fallback: '{family}-{date:%Y%m%d}'\n"
         "  dated: true\n"
         "  prefix: true\n"
+        "misc: {}\n"
     )
     monkeypatch.setenv(TAG_FAMILIES_ENV, str(path))
-    assert set(tag_families()) == {"rc"}
+    assert set(tag_families()) == {"rc", "misc"}
     assert (family_of("rc-9"), family_of("nightly-supply-chain-2026-10-04")) == (
         "rc",
         "",
@@ -660,11 +666,12 @@ def test_an_override_file_replaces_the_families(tmp_path, monkeypatch):
         ("x:\n  colour: red\n", "unknown key"),
         ("x: {}\nx: {}\n", "duplicate key"),
         ("x:\n  registry_tag: '^x$'\n", "needs a tag"),
+        ("x: {}\n", "needs a 'misc' family"),
     ],
 )
 def test_a_malformed_families_file_fails_loudly(tmp_path, text, fault):
     path = tmp_path / "families.yaml"
-    path.write_text(text)
+    path.write_text(text if "misc" in fault else text + "misc: {}\n")
     with pytest.raises(ValueError, match=fault):
         load_tag_families(str(path))
 
@@ -1027,3 +1034,36 @@ def test_a_recorded_digest_is_answered_before_the_registry_is_asked():
         "existing",
         "",
     )
+
+
+def test_a_tag_naming_no_family_lands_in_misc_with_a_warning(capsys):
+    reg = FakeRegistry(LISTED)
+    for tag in ("v1.2", "nighlty-2026-10-08"):
+        out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=[tag])
+        assert out["tags"] == [[tag, "misc"]]
+        assert f"tag {tag!r} names no tag family" in capsys.readouterr().err
+    # Explicitly in misc: no warning. An unknown family is refused, release keeps its prefix.
+    out = resolve(
+        f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tag_family="misc", tags=["v1.2"]
+    )
+    assert (out["tag"], out["tag_family"]) == ("v1.2", "misc")
+    assert capsys.readouterr().err == ""
+    with pytest.raises(ValueError, match="unknown tag_family"):
+        resolve(
+            f"image:{IMAGE}@{LEAF}",
+            "s390x",
+            registry=reg,
+            tag_family="nightlyy",
+            tags=["v1.2"],
+        )
+    assert resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["releasex"])[
+        "tags"
+    ] == [["releasex", "misc"]]
+
+
+def test_ensure_files_a_tag_naming_no_family_under_misc():
+    client = FakeClient()
+    ensure(client, "db", WHEEL, "ppc64le", tags=["v1.2"])
+    assert [(t["tag"], t["tag_family"]) for t in client.tables[ARTIFACT_TAGS.name]] == [
+        ("v1.2", "misc")
+    ]

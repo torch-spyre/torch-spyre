@@ -92,10 +92,9 @@ unreachable: no `ICR_*` credentials) an unrecorded image is found by a tag endin
 (`s390x-dev-<id12>`) held by one record, else derived from its digest; an image named only by
 any other tag then fails. The output's `registry` says which happened.
 
-`results` files a `--tag` whose prefix names no family under `snap` (`--tag-family` defaults to
-it there); a tag it still cannot file is dropped with a warning and the verdicts
-are recorded regardless. `--strict` makes `results` exit 1 when a named artifact's verdicts
-were not all recorded.
+In `results` a tag it cannot file (an unknown `--tag-family`) is dropped with a warning; the
+other tags and the verdicts are recorded regardless. `--strict` makes `results` exit 1 when a
+named artifact's verdicts were not all recorded, or when a tag fell back to `misc`.
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
 URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
 digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and
@@ -127,8 +126,10 @@ through `ensure` too.
 `tag_families.yaml` (its header documents every key and template field) maps a family to the
 registry tag that names an image in it and the v2 tag it is recorded as. `SPYRE_TAG_FAMILIES=<path>`
 replaces the whole file; a bad regex, an unknown key or template field, or a duplicate family
-fails at load. A `--tag` whose prefix names no family needs `--tag-family` (`pr`, `main`, ...);
-it is refused rather than filed under `release`.
+fails at load, as does a file with no `misc` family. A `--tag` whose prefix names no family and
+is given no `--tag-family` is filed under `misc`, with a warning naming the tag -- never under
+`release`, which takes only `release-*` tags. `misc` is never matched by prefix or dated; pass the
+real family (`pr`, `main`, `nightly`, ...) instead, or `--tag-family misc` to mean it.
 
 ## Moving off ingest_xml.py
 

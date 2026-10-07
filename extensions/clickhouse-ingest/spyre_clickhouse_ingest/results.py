@@ -69,8 +69,13 @@ from spyre_clickhouse_ingest.options import (
     artifact_options,
     artifact_spec,
 )
-from spyre_clickhouse_ingest.registry import tag_families
-from spyre_clickhouse_ingest.resolver import ensure, named
+from spyre_clickhouse_ingest.registry import MISC, tag_families
+from spyre_clickhouse_ingest.resolver import (
+    ensure,
+    is_misc_fallback,
+    misc_warning,
+    named,
+)
 import regex as re
 
 # ---------------------------------------------------------------------------
@@ -1326,20 +1331,25 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         return True
     options = artifact_options(args)
     # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
-    if options["tag_family"] and options["tag_family"] not in tag_families():
-        print(
-            f"  [warn] v2: unknown --tag-family {options['tag_family']!r}; ignored",
-            file=sys.stderr,
-        )
-        options["tag_family"] = ""
-    kept = []
+    kept, args.misc_tags = [], []
     for tag in options["tags"]:
+        if is_misc_fallback(tag, options["tag_family"]):
+            # Warned once here; --strict fails on it.
+            print(misc_warning(tag), file=sys.stderr)
+            args.misc_tags.append(tag)
+            tag = (tag, MISC)
         try:
             named("", options["tag_family"], [tag])
             kept.append(tag)
         except ValueError as err:
             print(f"  [warn] v2: {err}; tag skipped", file=sys.stderr)
     options["tags"] = kept
+    if options["tag_family"] and options["tag_family"] not in tag_families():
+        print(
+            f"  [warn] v2: unknown --tag-family {options['tag_family']!r}; ignored",
+            file=sys.stderr,
+        )
+        options["tag_family"] = ""
     # A test leg did not build what it ran; the build's own record (write-once) wins.
     # A GHA delta is the leg's own build.
     if spec.startswith("gha:"):
@@ -1451,8 +1461,6 @@ def main(argv=None):
         tag_date_help="default: the run's start day (its earliest suite timestamp), else today (UTC)",
         platform_alias=True,
         arch_required=False,
-        # A free-form --tag (one whose prefix names no family) is filed under snap.
-        tag_family="snap",
     )
     parser.add_argument(
         "--strict",
@@ -1883,6 +1891,9 @@ def main(argv=None):
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"
         )
+        sys.exit(1)
+    if args.strict and getattr(args, "misc_tags", None):
+        print(f"  [error] v2: --strict, and tag(s) {args.misc_tags} fell back to misc")
         sys.exit(1)
     _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
 

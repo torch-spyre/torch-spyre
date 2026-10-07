@@ -43,6 +43,7 @@ import dataclasses
 import fnmatch
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 import uuid
@@ -50,6 +51,7 @@ import uuid
 from .identity import ID_SEP, ArtifactIdentity, DerivedId, _hex_token
 from .registry import (
     ICR_HOST,
+    MISC,
     Registry,
     dated_tag,
     family_of,
@@ -291,12 +293,25 @@ def _options(spec: str) -> tuple:
     return body.strip(), over
 
 
+def misc_warning(tag: str) -> str:
+    return (
+        f"  [warn] tag {tag!r} names no tag family by its prefix and was given none: filed "
+        f"under {MISC!r}; pass its real family (--tag-family pr|main|nightly|weekly|snap|release)"
+    )
+
+
+def is_misc_fallback(tag, tag_family: str) -> bool:
+    """Would `named` file this tag under misc for want of any family?"""
+    tag, family = (tag, "") if isinstance(tag, str) else tag
+    return bool(tag) and not (family_of(tag) or family or tag_family)
+
+
 def named(resolved_tag: str, tag_family: str, tags=()) -> list:
     """Every (tag, tag_family) an artifact is tagged by.
 
     Each of `tags` (a tag, or a (tag, family) pair) takes the family its prefix names, else
-    the given family, else `tag_family`; one with none (or an unknown one) raises ValueError.
-    One in `tag_family` replaces
+    the given family, else `tag_family`, else misc (with a warning); an unknown family raises
+    ValueError. One in `tag_family` replaces
     `resolved_tag`, the tag the registry or the date gave that family; the rest are added.
     """
     given = []
@@ -307,9 +322,8 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
             continue
         family = family_of(tag) or family or tag_family
         if not family:
-            raise ValueError(
-                f"tag {tag!r} names no tag family by its prefix: pass its tag_family"
-            )
+            print(misc_warning(tag), file=sys.stderr)
+            family = MISC
         if family not in known:
             raise ValueError(f"tag {tag!r}: unknown tag_family {family!r}")
         given.append((tag, family))

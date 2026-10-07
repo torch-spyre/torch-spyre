@@ -751,7 +751,6 @@ def _args(**kw):
         origin="promoted",
         platform_alias=True,
         arch_required=False,
-        tag_family="snap",
     )
     a = parser.parse_args([])
     a.__dict__.update(
@@ -892,17 +891,51 @@ def _named_image_args(**kw):
                  jenkins_run_key="job#1", **kw)  # fmt: skip
 
 
-def test_a_free_form_tag_is_filed_under_snap(ingest):
+@pytest.mark.parametrize("tag", ["v1.2", "nighlty-2026-10-08"])
+def test_a_tag_naming_no_family_is_filed_under_misc_with_a_warning(ingest, capsys, tag):
     c = _ArtifactClient()
     legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
-    assert ingest._write_artifact_verdicts(
-        c, "db", _named_image_args(tags=["v1.2"]), legs
-    )
+    args = _named_image_args(tags=[tag])
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
     rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
     assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
-        ("v1.2", "snap")
+        (tag, "misc")
     ]
     assert len(rows["artifact_results"]) == 1
+    assert args.misc_tags == [tag]
+    assert capsys.readouterr().err.count(f"tag {tag!r} names no tag family") == 1
+
+
+def test_an_explicit_misc_tag_is_no_fallback(ingest, capsys):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["v1.2"], tag_family="misc")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        ("v1.2", "misc")
+    ]
+    assert args.misc_tags == [] and "names no tag family" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("strict, code", [(False, None), (True, 1)])
+def test_strict_fails_on_a_misc_fallback(ingest, monkeypatch, tmp_path, strict, code):
+    xml = tmp_path / "report.xml"
+    xml.write_text("<testsuites><testsuite name='pytest'><testcase classname='tests.test_ops' "
+                   "name='test_a' time='1'/></testsuite></testsuites>", encoding="utf-8")  # fmt: skip
+
+    def verdicts(c, db, args, legs):
+        args.misc_tags = ["v1.2"]
+        return True
+
+    monkeypatch.setattr(ingest, "_write_artifact_verdicts", verdicts)
+    argv = ["--strict"] if strict else []
+    if code is None:
+        _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)), argv)
+        return
+    with pytest.raises(SystemExit) as caught:
+        _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)), argv)
+    assert caught.value.code == code
 
 
 def test_a_tag_that_cannot_be_filed_costs_the_tag_not_the_verdicts(ingest):
