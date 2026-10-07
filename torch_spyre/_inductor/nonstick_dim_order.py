@@ -233,6 +233,13 @@ def _indirect_stride_idx(
     return None
 
 
+def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
+    """Check if indirect access is at the outermost (leftmost) device position."""
+    v_n = len(value_stl.stride_map)
+    v_indirect_pos = v_n - 1 - stride_idx
+    return v_indirect_pos == 0
+
+
 def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
@@ -284,7 +291,7 @@ def _try_gather_ia_constraint(
     if stride_idx is None:
         return None
     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
-    if indirect_device_pos == 0:
+    if _dim_order_is_compliant(stl, stride_idx):
         return None
     new_stl = _ia_rotate_stl(stl, indirect_device_pos)
     logger.info(
@@ -400,7 +407,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     if stride_idx is None:
                         continue
                     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
-                    if indirect_device_pos == 0:
+                    if _dim_order_is_compliant(stl, stride_idx):
                         continue  # already compliant
                     required_stl = _ia_rotate_stl(stl, indirect_device_pos)
                     key = (dep.name, op.get_name())
