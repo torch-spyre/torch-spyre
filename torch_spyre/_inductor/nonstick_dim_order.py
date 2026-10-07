@@ -46,7 +46,7 @@ constraint solving.
 pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on graph)
 """
 
-import dataclasses
+from typing import Literal, NamedTuple
 
 import sympy
 
@@ -116,12 +116,11 @@ def _buf_stl(buf) -> SpyreTensorLayout | None:
     return None
 
 
-@dataclasses.dataclass
-class _DeferredReorder:
+class _DeferredReorder(NamedTuple):
     op: ComputedBuffer  # the op that reads or writes buf
     buf_name: str  # name of buffer that needs reordering
     required_stl: SpyreTensorLayout
-    kind: str  # "copy" or "producer_rewrite"
+    kind: Literal["copy", "producer_rewrite"]
 
 
 def _matmul_reorder_stl(
