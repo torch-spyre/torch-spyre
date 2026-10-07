@@ -15,13 +15,19 @@
 """Poll GitHub Actions runs and their jobs into pipeline_runs (source='gha').
 
     python -m spyre_clickhouse_ingest.gha_runs poll --repo torch-spyre/torch-spyre --hours 8
-    python -m spyre_clickhouse_ingest.gha_runs poll --repo ... --days 90     # backfill
+    python -m spyre_clickhouse_ingest.gha_runs poll --repo ... --days 90 --wait-for-reset
 
-Each poll lists the runs CREATED in the window (the API has no updated-since filter), writes
-every attempt of each run plus its jobs, and skips a run whose stored row is already finished
-at the same updated_at. A re-run keeps its run's created_at, so a periodic short poll misses
-late attempts of older runs; a daily poll with a few days' window picks those up. Rows replace
-by (run, attempt), so overlapping windows are harmless. Needs GITHUB_TOKEN.
+Each poll lists the runs CREATED in the window (the API has no updated-since filter), oldest
+first, and writes every attempt of each run plus its jobs, skipping a run whose stored row is
+already finished at the same updated_at. So what is stored is always a prefix of the window,
+and the window starts at the earlier of now - --hours and the repo's watermark (newest stored
+run's created_at) minus --overlap-hours: a poll that stopped early, or an outage, is resumed
+from where it left off, back to at most --max-catchup-days. A re-run keeps its run's created_at,
+so late attempts of older runs need a periodic longer window. Rows replace by (run, attempt).
+
+The token is shared with other jobs, so a poll stops cleanly (flush, notice, exit 0) when the
+rate limit's remaining falls to --reserve of it or --deadline-minutes pass; the next poll
+continues. --wait-for-reset sleeps to the reset instead, for a manual backfill. Needs GITHUB_TOKEN.
 """
 
 import argparse
@@ -253,13 +259,27 @@ def job_row(
     return row
 
 
+class Stop(Exception):
+    """The poll must end here, cleanly: the rate budget or the deadline is used up."""
+
+
 class GitHub:
-    """The few Actions API reads the poller needs, over stdlib HTTP."""
+    """The few Actions API reads the poller needs, over stdlib HTTP, within a rate budget."""
 
-    def __init__(self, token: str):
+    def __init__(
+        self,
+        token: str,
+        reserve: float = 0.5,
+        deadline: float | None = None,
+        wait_for_reset: bool = False,
+    ):
         self.token = token
+        self.reserve = reserve
+        self.deadline = deadline
+        self.wait_for_reset = wait_for_reset
+        self.limit = self.remaining = self.reset = None
 
-    def get(self, path: str, **query: Any) -> dict[str, Any]:
+    def get(self, path: str, guard: bool = True, **query: Any) -> dict[str, Any]:
         url = f"{API}{path}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
         req = urllib.request.Request(
             url,
@@ -270,10 +290,14 @@ class GitHub:
             },
         )
         for attempt in range(RETRIES):
+            if guard:
+                self._guard()
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return json.load(resp)
+                body, headers = self._fetch(req)
+                self._note(headers)
+                return body
             except urllib.error.HTTPError as err:
+                self._note(err.headers)
                 wait = self._backoff(err, attempt)
                 if wait is None:
                     raise
@@ -285,16 +309,58 @@ class GitHub:
                 http.client.IncompleteRead,
             ):
                 wait = 2**attempt
-            time.sleep(wait)
+            self._sleep(wait)
         raise SystemExit(
             f"[error] GitHub API still failing after {RETRIES} tries: {url}"
         )
 
     @staticmethod
+    def _fetch(req) -> tuple[dict[str, Any], Mapping[str, str]]:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp), resp.headers
+
+    def _note(self, headers) -> None:
+        """Track the rate limit from a response's headers."""
+        if headers is None or headers.get("X-RateLimit-Limit") is None:
+            return
+        self.limit = int(headers["X-RateLimit-Limit"])
+        self.remaining = int(headers.get("X-RateLimit-Remaining", self.limit))
+        self.reset = float(headers.get("X-RateLimit-Reset", 0))
+
+    def _guard(self) -> None:
+        """Stop, or wait for the reset, before a request that would dip into the reserve."""
+        if self.deadline is not None and time.time() >= self.deadline:
+            raise Stop("deadline reached")
+        if self.limit is None or self.remaining > self.reserve * self.limit:
+            return
+        if not self.wait_for_reset:
+            raise Stop(f"budget reached at {self.remaining} remaining")
+        self._sleep(max(1.0, (self.reset or 0) - time.time() + 1))
+        self.remaining = self.limit
+
+    def _sleep(self, seconds: float) -> None:
+        if self.deadline is not None and time.time() + seconds > self.deadline:
+            raise Stop("deadline reached")
+        time.sleep(seconds)
+
+    def rate(self) -> str:
+        """remaining/limit of the core quota; reading it costs no quota."""
+        core = self.get("/rate_limit", guard=False).get("resources", {}).get("core", {})
+        self._note(
+            {
+                "X-RateLimit-Limit": core.get("limit"),
+                "X-RateLimit-Remaining": core.get("remaining"),
+                "X-RateLimit-Reset": core.get("reset", 0),
+            }
+            if core
+            else None
+        )
+        return f"{self.remaining}/{self.limit}"
+
+    @staticmethod
     def _backoff(err, attempt: int) -> float | None:
         """Seconds to wait before retrying, or None for an error retrying cannot fix."""
         if err.code in (403, 429) and err.headers.get("X-RateLimit-Remaining") == "0":
-            # A backfill outruns the hourly quota; sleep to the reset rather than fail.
             return max(
                 1.0, float(err.headers.get("X-RateLimit-Reset", "0")) - time.time() + 1
             )
@@ -305,7 +371,11 @@ class GitHub:
     def runs(
         self, repo: str, start: datetime, end: datetime
     ) -> Iterator[dict[str, Any]]:
-        """Every run created in [start, end], splitting the window under the list cap."""
+        """Every run created in [start, end], oldest first, listed one sub-window at a time.
+
+        A window over the list cap is split, older half first; each part is listed whole and
+        sorted, so a poll stopped mid-window has paid only for the part it was in.
+        """
         created = f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"
         first = self.get(
             f"/repos/{repo}/actions/runs", created=created, per_page=PAGE, page=1
@@ -317,13 +387,14 @@ class GitHub:
             yield from self.runs(repo, start, mid)
             yield from self.runs(repo, mid + timedelta(seconds=1), end)
             return
-        page, batch = 1, first
+        page, batch, listed = 1, first, []
         while batch.get("workflow_runs"):
-            yield from batch["workflow_runs"]
+            listed += batch["workflow_runs"]
             page += 1
             batch = self.get(
                 f"/repos/{repo}/actions/runs", created=created, per_page=PAGE, page=page
             )
+        yield from sorted(listed, key=lambda r: (r.get("created_at") or "", r["id"]))
 
     def attempt(self, repo: str, run_id: int, attempt: int) -> dict[str, Any]:
         return self.get(f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}")
@@ -358,6 +429,42 @@ def stored(
     }
 
 
+def watermark(client, db: str, repo: str) -> datetime | None:
+    """created_at of the newest run stored for repo, or None when it has none.
+
+    An attempt-1 row's started_at - queue_ms is its run's created_at, the key runs are
+    listed and processed in.
+    """
+    n, newest = client.query(
+        f"SELECT count(), max(started_at - toIntervalMillisecond(queue_ms)) "
+        f"FROM {db}.pipeline_runs "
+        "WHERE source = 'gha' AND pipeline_type = 'gha-workflow' "
+        "AND startsWith(run_key, {prefix:String}) AND endsWith(run_key, '#1')",
+        parameters={"prefix": f"gha:{repo}/"},
+    ).result_rows[0]
+    if not n:
+        return None
+    return newest.replace(tzinfo=timezone.utc) if newest.tzinfo is None else newest
+
+
+def window_start(
+    now: datetime,
+    base: timedelta,
+    mark: datetime | None,
+    overlap: timedelta,
+    max_catchup: timedelta,
+) -> tuple[datetime, bool]:
+    """(start, from_watermark): now - base, extended back to mark - overlap after a gap.
+
+    The extension stops at now - max_catchup; an explicit longer base is a backfill and wins.
+    """
+    start = now - base
+    if mark is None:
+        return start, False
+    resume = max(mark - overlap, now - max_catchup)
+    return (resume, True) if resume < start else (start, False)
+
+
 def poll(
     gh: GitHub,
     client,
@@ -366,36 +473,44 @@ def poll(
     start: datetime,
     end: datetime,
     dry_run: bool = False,
-) -> tuple[int, int]:
-    """Write every new or changed run attempt created in the window; (attempts, rows)."""
+) -> tuple[int, int, str]:
+    """Write every new or changed run attempt created in the window, oldest first.
+
+    Returns (attempts, rows, stop reason or ''). A stop keeps every attempt completed so far,
+    so what is stored stays a prefix of the window.
+    """
     known = (
         {}
         if client is None
         else stored(client, db or "", repo, start - timedelta(days=1))
     )
     attempts = rows = 0
+    reason = ""
     batch: list[dict[str, Any]] = []
-    for latest in gh.runs(repo, start, end):
-        n = int(latest.get("run_attempt") or 1)
-        for a in range(1, n + 1):
-            key = run_key(repo, latest["id"], a)
-            have = known.get(key)
-            run = latest if a == n else None
-            if (
-                have
-                and have[1] == "finished"
-                and (a < n or have[0] == _ts(latest.get("updated_at")))
-            ):
-                continue
-            run = run or gh.attempt(repo, latest["id"], a)
-            jobs = gh.jobs(repo, latest["id"], a)
-            batch.append(workflow_row(repo, run, jobs))
-            batch += [r for r in (job_row(repo, run, j) for j in jobs) if r]
-            attempts += 1
-        if len(batch) >= 500:
-            rows += _flush(client, db, batch, dry_run)
+    try:
+        for latest in gh.runs(repo, start, end):
+            n = int(latest.get("run_attempt") or 1)
+            for a in range(1, n + 1):
+                key = run_key(repo, latest["id"], a)
+                have = known.get(key)
+                run = latest if a == n else None
+                if (
+                    have
+                    and have[1] == "finished"
+                    and (a < n or have[0] == _ts(latest.get("updated_at")))
+                ):
+                    continue
+                run = run or gh.attempt(repo, latest["id"], a)
+                jobs = gh.jobs(repo, latest["id"], a)
+                batch.append(workflow_row(repo, run, jobs))
+                batch += [r for r in (job_row(repo, run, j) for j in jobs) if r]
+                attempts += 1
+            if len(batch) >= 500:
+                rows += _flush(client, db, batch, dry_run)
+    except Stop as stop:
+        reason = str(stop)
     rows += _flush(client, db, batch, dry_run)
-    return attempts, rows
+    return attempts, rows, reason
 
 
 def _flush(client, db: str | None, batch: list[dict[str, Any]], dry_run: bool) -> int:
@@ -421,6 +536,27 @@ def main(argv=None) -> None:
     window.add_argument("--hours", type=float, default=8.0)
     window.add_argument("--days", type=float)
     p.add_argument(
+        "--overlap-hours",
+        type=float,
+        default=6.0,
+        help="re-read this much before the watermark (runs that started late)",
+    )
+    p.add_argument("--max-catchup-days", type=float, default=90.0)
+    p.add_argument(
+        "--reserve",
+        type=float,
+        default=0.5,
+        help="fraction of the rate limit to leave for other jobs",
+    )
+    p.add_argument(
+        "--deadline-minutes", type=float, default=12.0, help="0 = no deadline"
+    )
+    p.add_argument(
+        "--wait-for-reset",
+        action="store_true",
+        help="at the reserve, sleep to the rate-limit reset instead of stopping",
+    )
+    p.add_argument(
         "--dry-run", action="store_true", help="print rows instead of writing"
     )
     args = parser.parse_args(argv)
@@ -428,10 +564,8 @@ def main(argv=None) -> None:
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
         sys.exit("[error] GITHUB_TOKEN is unset")
-    end = datetime.now(timezone.utc)
-    start = end - (
-        timedelta(days=args.days) if args.days else timedelta(hours=args.hours)
-    )
+    now = datetime.now(timezone.utc)
+    base = timedelta(days=args.days) if args.days else timedelta(hours=args.hours)
 
     client, db = None, None
     if not args.dry_run:
@@ -441,13 +575,36 @@ def main(argv=None) -> None:
         if not db:
             sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
         client = ClickHouse.connect(database=db)
-    gh = GitHub(token)
+    gh = GitHub(
+        token,
+        reserve=args.reserve,
+        deadline=time.time() + args.deadline_minutes * 60
+        if args.deadline_minutes
+        else None,
+        wait_for_reset=args.wait_for_reset,
+    )
+    print(f"[info] rate limit {gh.rate()} at start", file=sys.stderr)
     for repo in args.repo:
-        attempts, rows = poll(gh, client, db, repo, start, end, args.dry_run)
+        start, resumed = window_start(
+            now,
+            base,
+            watermark(client, db or "", repo) if client is not None else None,
+            timedelta(hours=args.overlap_hours),
+            timedelta(days=args.max_catchup_days),
+        )
         print(
-            f"[info] {repo}: {attempts} run attempt(s), {rows} row(s) since {start:%Y-%m-%dT%H:%MZ}",
+            f"[info] {repo}: from {start:%Y-%m-%dT%H:%MZ}"
+            + (" (watermark - overlap)" if resumed else ""),
             file=sys.stderr,
         )
+        attempts, rows, reason = poll(gh, client, db, repo, start, now, args.dry_run)
+        print(
+            f"[info] {repo}: {attempts} run attempt(s), {rows} row(s)", file=sys.stderr
+        )
+        if reason:
+            print(f"[notice] {reason}; resume next run", file=sys.stderr)
+            break
+    print(f"[info] rate limit {gh.rate()} at end", file=sys.stderr)
 
 
 if __name__ == "__main__":
