@@ -52,7 +52,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from itertools import zip_longest
 from pathlib import Path
 
@@ -273,7 +273,8 @@ def main(argv=None) -> None:
             "--date",
             type=date.fromisoformat,
             default=None,
-            help="the run's day: orders the tag search, and dates the tag when none names it",
+            help="the run's day: orders the tag search, and dates the tag when none names it "
+            "(default with --channel: today, UTC)",
         )
         p.add_argument(
             "--name", default="", help="ci-cd-tech-preview: the release name"
@@ -299,6 +300,8 @@ def main(argv=None) -> None:
         from .client import ClickHouse, ClickHouseEnv
 
         db = args.database or ClickHouseEnv.target_database()
+        if args.channel and args.date is None:
+            args.date = datetime.now(timezone.utc).date()
         if args.cmd == "resolve":
             lookup = Lookup()
             if not args.no_lookup and db and ClickHouseEnv.host():

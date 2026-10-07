@@ -16,7 +16,7 @@
 
 import json
 import urllib.error
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -450,3 +450,17 @@ def test_the_cli_prints_the_resolution_as_json(monkeypatch, capsys):
         artifacts.main(
             ["resolve", "--image", f"{IMAGE}@{OTHER}", "--arch", "s390x", "--no-lookup"]
         )
+
+
+def test_the_cli_dates_a_channel_tag_today_unless_given_a_date(monkeypatch, capsys):
+    monkeypatch.setattr(artifacts, "Registry", lambda **kw: FakeRegistry(LISTED))
+    base = ["resolve", "--image", f"{IMAGE}@{LIST}", "--arch", "s390x", "--no-lookup"]
+    artifacts.main([*base, "--channel", "nightly"])
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert json.loads(capsys.readouterr().out)["tag"] == f"nightly-supply-chain-{today}"
+    artifacts.main([*base, "--channel", "nightly", "--date", "2026-09-26"])
+    assert (
+        json.loads(capsys.readouterr().out)["tag"] == "nightly-supply-chain-2026-09-26"
+    )
+    artifacts.main(base)
+    assert json.loads(capsys.readouterr().out)["tag"] == ""

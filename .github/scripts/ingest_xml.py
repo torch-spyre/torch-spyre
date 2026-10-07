@@ -1458,7 +1458,8 @@ def main():
         "--artifact-date",
         type=date.fromisoformat,
         default=None,
-        help="The run's day (YYYY-MM-DD), dating the channel tag when the registry has none.",
+        help="The run's day (YYYY-MM-DD), dating the channel tag when the registry has none. "
+        "Default: the earliest suite timestamp of the XMLs, else today (UTC).",
     )
     parser.add_argument(
         "--run-url",
@@ -1563,6 +1564,7 @@ def main():
     # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
     # files under one run_id, so a per-file write would report only the first shard's verdict.
     artifact_legs = {}
+    run_started = None
 
     # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
     bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
@@ -1751,6 +1753,9 @@ def main():
             run, cases = parse_test_xml(xml_path)
             if run is None:
                 continue
+            _ts = run["triggered_at"]
+            _ts = _ts.astimezone(UTC) if _ts.tzinfo else _ts.replace(tzinfo=UTC)
+            run_started = min(run_started or _ts, _ts)
 
             # One run_id per TEST RUN, not per XML file: the dispatching orchestrator
             # generates a uuid and threads it down as --run-id, and stamps the SAME value on
@@ -1889,6 +1894,9 @@ def main():
                     f"{sum(len(c['properties']) for c in cases)} properties"
                 )
 
+    if not _opt(args, "artifact_date"):
+        # The run's own day, not the ingest's: a run past midnight keeps its start date.
+        args.artifact_date = (run_started or datetime.now(UTC)).date()
     _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
