@@ -270,7 +270,7 @@ def _try_scatter_ia_constraint(
 ) -> tuple[SpyreTensorLayout, set[int]] | None:
     """Rotate the scattered dim of a scatter destination to device position 0.
 
-    buf is the scatter destination buffer (resolved by _collect_triples);
+    buf is the scatter destination buffer (resolved by the caller);
     dep is the write dep. Does not re-resolve the destination.
     Returns (new_stl, {0}) if rotation needed, None if compliant or not applicable.
     """
@@ -320,33 +320,30 @@ def _try_scatter_ia_constraint(
     return new_stl, {0}
 
 
-def _collect_triples(
-    graph: GraphLowering,
-) -> list[tuple[ComputedBuffer, MemoryDep, ComputedBuffer]]:
-    """Walk graph; collect (buf, dep, op) triples for constraint and perf transforms.
+def reorder_nonstick_dims(graph: GraphLowering) -> None:
+    """Reorder non-stick dims for correctness (phase 1) and performance (phase 2).
 
-    Returns triples where:
-      buf — the ComputedBuffer to potentially reorder
-      dep — the MemoryDep describing the access from op to buf
-      op  — the ComputedBuffer that reads buf
-
-    Collects:
-      - Indirect-access gather ops: value tensor deps where dep.name in dep_names.
-      - Matmul ops: all ComputedBuffer inputs.
+    Phase 1 (one backward walk) applies constraint transforms: gather IA and
+    scatter IA constraints pin device positions in pinned_dims.
+    Phase 2 (second backward walk) applies performance transforms: matmul perf
+    reorder respects pinned_dims set by phase 1.
     """
-    seen: set[tuple[str, str]] = set()
-    triples: list[tuple[ComputedBuffer, MemoryDep, ComputedBuffer]] = []
+    V.graph.nonstick_reorder_log = {}
+    log: dict[str, SpyreTensorLayout] = {}
+    pinned_dims: dict[str, set[int]] = {}
     graph_inputs = set(V.graph.graph_input_names)
+
+    # Phase 1: constraint transforms (gather IA, scatter IA).
+    seen_p1: set[tuple[str, str]] = set()
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
             continue
         if not hasattr(op, "data"):
             continue
 
-        # Indirect-access ops (gather): collect value tensor deps.
+        # Gather IA: find value tensor deps with an IndirectAccess coordinate.
         dep_names, access_subs, sizes = indirect_info_from_op(op)
-        is_indirect = bool(dep_names) and not isinstance(op.data, Scatter)
-        if is_indirect:
+        if dep_names and not isinstance(op.data, Scatter):
             for dep in op.get_read_writes().reads:
                 if not isinstance(dep, MemoryDep):
                     continue
@@ -365,88 +362,69 @@ def _collect_triples(
                 ):
                     continue
                 key = (dep.name, op.get_name())
-                if key in seen:
+                if key in seen_p1:
                     continue
-                seen.add(key)
-                triples.append((buf, dep, op))
+                seen_p1.add(key)
+                result = _try_gather_ia_constraint(buf, dep, op)
+                if result is not None:
+                    new_stl, pinned = result
+                    buf.committed_stl = new_stl
+                    log[buf.get_name()] = new_stl
+                    pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
 
-        # Indirect-access ops (scatter): collect destination buf.
-        is_scatter = isinstance(op.data, Scatter)
-        if is_scatter and isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+        # Scatter IA: resolve destination and apply constraint.
+        if isinstance(op.data, Scatter) and isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        ):
             write_deps = [
                 d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
             ]
             if write_deps:
                 write_dep = write_deps[0]
-                # Resolve destination from MutationLayoutSHOULDREMOVE target.
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
                 dest_buf = target if isinstance(target, ComputedBuffer) else None
                 if dest_buf is not None and hasattr(dest_buf, "committed_stl"):
-                    triples.append((dest_buf, write_dep, op))
+                    result = _try_scatter_ia_constraint(dest_buf, write_dep, op)
+                    if result is not None:
+                        new_stl, pinned = result
+                        dest_buf.committed_stl = new_stl
+                        log[dest_buf.get_name()] = new_stl
+                        pinned_dims.setdefault(dest_buf.get_name(), set()).update(
+                            pinned
+                        )
 
-        # Matmul ops: collect all ComputedBuffer inputs.
-        is_matmul = (
+    # Phase 2: performance transforms (matmul perf reorder).
+    seen_p2: set[str] = set()
+    for op in reversed(graph.operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not hasattr(op, "data"):
+            continue
+        if not (
             isinstance(op.data, Reduction)
             and op.data.reduction_type in MATMUL_REDUCTION_OPS
-        )
-        if is_matmul:
-            for dep in op.get_read_writes().reads:
-                if not isinstance(dep, MemoryDep):
-                    continue
-                if dep.name in graph_inputs:
-                    continue
-                buf = V.graph.get_buffer(dep.name)
-                if not isinstance(buf, ComputedBuffer):
-                    continue
-                key = (dep.name, op.get_name())
-                if key in seen:
-                    continue
-                seen.add(key)
-                triples.append((buf, dep, op))
-
-    return triples
-
-
-def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dims for correctness (phase 1) and performance (phase 2).
-
-    Phase 1 applies constraint transforms (gather IA).
-    Phase 2 applies performance transforms (matmul perf reorder), respecting
-    pinned_dims set by phase 1.
-    """
-    V.graph.nonstick_reorder_log = {}
-    log: dict[str, SpyreTensorLayout] = {}
-
-    triples = _collect_triples(graph)
-
-    # Phase 1: constraint transforms.
-    pinned_dims: dict[str, set[int]] = {}
-    for buf, dep, op in triples:
-        result = _try_gather_ia_constraint(buf, dep, op)
-        if result is None and isinstance(op.data, Scatter):
-            result = _try_scatter_ia_constraint(buf, dep, op)
-        if result is not None:
-            new_stl, pinned = result
-            buf.committed_stl = new_stl
-            log[buf.get_name()] = new_stl
-            pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
-
-    # Phase 2: performance transforms.
-    # Collect unique bufs that appeared in matmul triples for perf reorder.
-    seen_bufs: set[str] = set()
-    for buf, dep, op in triples:
-        name = buf.get_name()
-        if name in seen_bufs:
+        ):
             continue
-        seen_bufs.add(name)
-        pinned = pinned_dims.get(name, set())
-        reordered_stl = _try_matmul_perf_reorder(buf, pinned)
-        if reordered_stl is not None:
-            buf.committed_stl = reordered_stl
-            log[name] = reordered_stl
-            logger.info("nonstick_dim_order: reordered %s", name)
+        for dep in op.get_read_writes().reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            if dep.name in graph_inputs:
+                continue
+            buf = V.graph.get_buffer(dep.name)
+            if not isinstance(buf, ComputedBuffer):
+                continue
+            name = buf.get_name()
+            if name in seen_p2:
+                continue
+            seen_p2.add(name)
+            pinned = pinned_dims.get(name, set())
+            reordered_stl = _try_matmul_perf_reorder(buf, pinned)
+            if reordered_stl is not None:
+                buf.committed_stl = reordered_stl
+                log[name] = reordered_stl
+                logger.info("nonstick_dim_order: reordered %s", name)
 
     V.graph.nonstick_reorder_log = log
 
