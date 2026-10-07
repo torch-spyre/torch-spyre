@@ -28,7 +28,6 @@ from string import Formatter
 import regex
 
 OCI_ARCH = {"x86_64": "amd64"}
-RELEASE = "release"
 # Registry manifest reads one resolution may spend searching for a family's tag.
 MAX_TAG_READS = 80
 TAG_FAMILIES_ENV = "SPYRE_TAG_FAMILIES"

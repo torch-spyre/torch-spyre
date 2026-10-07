@@ -282,10 +282,32 @@ def test_a_full_tag_takes_its_family_from_its_prefix():
         "nightly-supply-chain-2026-10-04",
         "nightly-supply-chain",
     )
+    reg = FakeRegistry(LISTED)
     out = resolve(
-        f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry(LISTED), tags=["rc1"]
+        f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["release-2026-10-04"]
     )
-    assert out["tags"] == [["rc1", "release"]]
+    assert out["tags"] == [["release-2026-10-04", "release"]]
+    # A tag no family prefix names needs its family; it never defaults to release.
+    with pytest.raises(ValueError, match="names no tag family"):
+        resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=["rc1"])
+    for family in ("pr", "release"):
+        out = resolve(
+            f"image:{IMAGE}@{LEAF}",
+            "s390x",
+            registry=reg,
+            tags=[("torch-spyre#5206", family)],
+        )
+        assert out["tags"] == [["torch-spyre#5206", family]]
+    out = resolve(
+        f"image:{IMAGE}@{LEAF}",
+        "s390x",
+        registry=reg,
+        tag_family="main",
+        tags=["torch-spyre@f7a6afb683d0"],
+    )
+    assert (out["tag"], out["tag_family"]) == ("torch-spyre@f7a6afb683d0", "main")
+    with pytest.raises(ValueError, match="unknown tag_family"):
+        resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, tags=[("rc1", "nope")])
 
 
 def test_a_tag_in_another_family_is_added_beside_the_resolved_one():
@@ -772,13 +794,17 @@ def test_a_moving_ref_is_never_looked_up():
 
 def test_a_dry_run_reports_what_it_would_write_and_writes_nothing():
     client = FakeClient()
-    out = ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"], dry_run=True)
+    out = ensure(
+        client, "db", WHEEL, "ppc64le", tags=[("rc1", "release")], dry_run=True
+    )
     assert (out["written"], out["dry_run"], out["tag"]) == (True, True, "rc1")
     assert client.tables == {"artifacts": [], "artifact_refs": [], "artifact_tags": []}
-    out = ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"])
+    out = ensure(client, "db", WHEEL, "ppc64le", tags=[("rc1", "release")])
     assert (out["written"], len(client.tables[ARTIFACTS.name])) == (True, 1)
     assert (
-        ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"], dry_run=True)["written"]
+        ensure(client, "db", WHEEL, "ppc64le", tags=[("rc1", "release")], dry_run=True)[
+            "written"
+        ]
         is False
     )
 
@@ -807,7 +833,11 @@ def test_a_batch_artifact_writes_what_insert_artifact_wrote():
 
 
 def test_a_batch_spec_entry_is_resolved_then_recorded():
-    batch = {"artifacts": [{"spec": WHEEL, "arch": "ppc64le", "tags": ["rc1"]}]}
+    batch = {
+        "artifacts": [
+            {"spec": WHEEL, "arch": "ppc64le", "tag_family": "release", "tags": ["rc1"]}
+        ]
+    }
     client = FakeClient()
     assert artifacts.write_batch(client, "db", batch)["artifacts"] == 1
     assert [r["tag"] for r in client.tables[ARTIFACT_TAGS.name]] == ["rc1"]
@@ -825,3 +855,91 @@ def test_a_gha_record_writes_what_insert_gha_result_wrote():
            run_url="https://gha/1")  # fmt: skip
     assert new.tables[ARTIFACTS.name] == old.tables[ARTIFACTS.name]
     assert new.tables[ARTIFACT_REFS.name] == []
+
+
+def test_a_rewrite_adds_no_ref_twice_and_a_later_tag_keeps_its_ref():
+    entry = {"artifact": {"component": "flex", "artifact_name": "ibm-flex", "id12": "c" * 12, "arch": "amd64",
+                          "kind": "rpm", "ref": f"ibm-flex-*.{'c' * 12}.*.x86_64"}}  # fmt: skip
+    client = FakeClient()
+    for _ in range(2):
+        artifacts.write_batch(client, "db", {"artifacts": [entry]})
+    (art,) = client.tables[ARTIFACTS.name]
+    assert art["arch"] == "x86_64"
+    assert len(client.tables[ARTIFACT_REFS.name]) == 1
+    ArtifactWriter.insert_artifact(
+        client, "db", artifacts.batch_identity(entry["artifact"])
+    )
+    assert len(client.tables[ARTIFACT_REFS.name]) == 1
+    ensure(
+        client,
+        "db",
+        artifacts.batch_identity(entry["artifact"]),
+        tags=[("rc1", "release")],
+    )
+    (tag,) = client.tables[ARTIFACT_TAGS.name]
+    assert [r[3] for r in tag["refs"]] == [entry["artifact"]["ref"]]
+    assert len(client.tables[ARTIFACT_REFS.name]) == 1
+
+
+def test_an_offline_dry_run_needs_no_database_and_shows_its_rows(monkeypatch, capsys):
+    out = ensure(
+        None,
+        "",
+        WHEEL,
+        "ppc64le",
+        lookup="off",
+        tags=[("rc1", "release")],
+        dry_run=True,
+    )
+    assert (out["written"], out["lookup"]) == (True, "none")
+    assert [r["artifact_id"] for r in out["rows"][ARTIFACTS.name]] == [
+        out["artifact_id"]
+    ]
+    assert [r["tag"] for r in out["rows"][ARTIFACT_TAGS.name]] == ["rc1"]
+    with pytest.raises(ValueError):
+        ensure(None, "", WHEEL, "ppc64le", lookup="off")
+    for var in ("CLICKHOUSE_HOST", "CLICKHOUSE_DB_V2"):
+        monkeypatch.delenv(var, raising=False)
+    artifacts.main(
+        [
+            "ensure",
+            "--artifact",
+            WHEEL,
+            "--arch",
+            "ppc64le",
+            "--lookup",
+            "off",
+            "--dry-run",
+        ]
+    )
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["dry_run"], printed["artifact_id"]) == (True, out["artifact_id"])
+    assert (
+        printed["rows"][ARTIFACT_REFS.name][0]["ref"]
+        == "apache-tvm-ffi==0.1.14.post1+146f67a53e78"
+    )
+    assert "rows" not in resolve(WHEEL, "ppc64le", lookup="off").as_dict()
+
+
+def test_a_gha_record_with_no_component_is_refused_by_name():
+    with pytest.raises(ValueError, match="needs ;component="):
+        resolve(GHA_RECORD, "x86_64", lookup="off")
+    assert (
+        resolve(f"{GHA_RECORD};component=hf-adapters", "x86_64", lookup="off")[
+            "artifact_id"
+        ]
+        == GHA_AID
+    )
+
+
+def test_a_given_manifest_list_is_recorded_as_given_with_no_leaf():
+    spec = f"image:{IMAGE}@{LIST};component=torch-spyre;name=torch-spyre-devel;id12={'9e' * 6}"
+    client = FakeClient()
+    out = ensure(client, "db", spec, "multi", origin="copied", registry=NoRegistry())
+    (art,) = client.tables[ARTIFACTS.name]
+    (ref,) = client.tables[ARTIFACT_REFS.name]
+    assert (out["source"], art["origin"], art["arch"]) == ("given", "copied", "multi")
+    assert (ref["ref"], ref["content_digest"]) == (f"{IMAGE}@{LIST}", LIST)
+    assert out["artifact_id"] == ArtifactId.derive(
+        "torch-spyre", "torch-spyre-devel", "9e" * 6, "multi"
+    )

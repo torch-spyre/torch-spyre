@@ -882,8 +882,8 @@ class ArtifactWriter:
             }
             cls.artifact_table.insert(client, [row], db=db)
         method, ref_kind = cls.ref_shape(identity.kind)
-        if identity.ref:
-            # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
+        # Checked, not left to the ReplacingMergeTree: unmerged repeats are read as duplicates.
+        if identity.ref and not cls.ref_recorded(client, db, aid, identity.ref):
             ref_row: schema.ArtifactRefRow = {
                 "artifact_id": aid,
                 "method": method,

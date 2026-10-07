@@ -331,9 +331,12 @@ def main(argv=None) -> None:
             if r is None:
                 sys.exit(1)
             return
-        if not db:
+        # A dry run that reads nothing needs no database: it prints the rows it would write.
+        offline = args.dry_run and args.lookup == "off"
+        if not (db or offline):
             sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
-        r = ensure(ClickHouse.connect(database=db), db, spec, args.arch, **options)
+        client = None if offline else ClickHouse.connect(database=db)
+        r = ensure(client, db, spec, args.arch, **options)
         print(json.dumps(r.as_dict(), sort_keys=True, default=str))
         return
     if args.cmd == "release" and args.dry_run:

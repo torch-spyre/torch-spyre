@@ -51,7 +51,10 @@ ci-cd-tech-preview:
   prefix: true
 
 # Families with no registry tag of their own: every tag in them is given in full.
-release: {}
+release:
+  prefix: true
+
+# Named only by an explicit --tag (<repo>#<pr>, <repo>#<pr>@<sha12>[+mq], <component>@<sha12>).
 pr: {}
 main: {}
 nightly: {}

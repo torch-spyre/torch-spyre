@@ -89,7 +89,8 @@ python -m spyre_clickhouse_ingest artifacts ensure \
 recorded. `--registry auto|off`: called only when the spec needs it / never (fails if needed).
 Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
 URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
-digest. `--dry-run` prints what would be written (`"written": true`) and writes nothing.
+digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and
+writes nothing; with `--lookup off` it needs no database.
 
 **Ingest** (`python -m spyre_clickhouse_ingest results ...`): the same flags name the artifact
 a run tested; `--platform` is a deprecated alias of `--arch`, and `--tag-date` defaults to the
@@ -117,7 +118,8 @@ through `ensure` too.
 `tag_families.yaml` (its header documents every key and template field) maps a family to the
 registry tag that names an image in it and the v2 tag it is recorded as. `SPYRE_TAG_FAMILIES=<path>`
 replaces the whole file; a bad regex, an unknown key or template field, or a duplicate family
-fails at load.
+fails at load. A `--tag` whose prefix names no family needs `--tag-family` (`pr`, `main`, ...);
+it is refused rather than filed under `release`.
 
 ## Moving off ingest_xml.py
 

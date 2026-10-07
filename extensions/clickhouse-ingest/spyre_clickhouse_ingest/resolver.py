@@ -32,8 +32,8 @@ tag or a bare name. An authoritative identity is derived from its inputs with no
 and never rebound; a gha: record or an explicit id is verified, never guessed.
 
 Tags: `tag_family` (tag_families.yaml) names the artifact by that family's registry tag, else
-by `tag_date`; each full `tag` takes the family its prefix names, else `tag_family`, else
-release, and replaces the resolved tag of its family.
+by `tag_date`; each full `tag` takes the family its prefix names, else `tag_family` (a tag
+with neither is refused), and replaces the resolved tag of its family.
 """
 
 import base64
@@ -46,7 +46,7 @@ import urllib.request
 import uuid
 
 from .identity import ID_SEP, ArtifactIdentity, DerivedId
-from .registry import RELEASE, Registry, dated_tag, family_of, split_image, tag_of
+from .registry import Registry, dated_tag, family_of, split_image, tag_families, tag_of
 from .writer import ArtifactWriter
 
 KINDS = ("image", "rpm", "wheel", "generic")
@@ -107,6 +107,8 @@ class Resolution:
     leaf: str = ""
     manifest_list: str = ""
     registry_tag: str = ""
+    # A dry run's would-be rows, table -> [row]; only printed for a dry run.
+    rows: dict = dataclasses.field(default_factory=dict)
     identity: ArtifactIdentity | None = dataclasses.field(
         default=None, repr=False, compare=False
     )
@@ -115,7 +117,7 @@ class Resolution:
         return {
             f.name: getattr(self, f.name)
             for f in dataclasses.fields(self)
-            if f.name != "identity"
+            if f.name != "identity" and (f.name != "rows" or self.dry_run)
         }
 
     def __getitem__(self, key):
@@ -266,14 +268,24 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
     """Every (tag, tag_family) an artifact is tagged by.
 
     Each of `tags` (a tag, or a (tag, family) pair) takes the family its prefix names, else
-    the given family, else `tag_family`, else release. One in `tag_family` replaces
+    the given family, else `tag_family`; one with none (or an unknown one) raises ValueError.
+    One in `tag_family` replaces
     `resolved_tag`, the tag the registry or the date gave that family; the rest are added.
     """
     given = []
+    known = tag_families()
     for t in tags:
         tag, family = (t, "") if isinstance(t, str) else t
-        if tag:
-            given.append((tag, family_of(tag) or family or tag_family or RELEASE))
+        if not tag:
+            continue
+        family = family_of(tag) or family or tag_family
+        if not family:
+            raise ValueError(
+                f"tag {tag!r} names no tag family by its prefix: pass its tag_family"
+            )
+        if family not in known:
+            raise ValueError(f"tag {tag!r}: unknown tag_family {family!r}")
+        given.append((tag, family))
     if tag_family and resolved_tag and not any(f == tag_family for _, f in given):
         given.insert(0, (resolved_tag, tag_family))
     return list(dict.fromkeys(given))
@@ -371,6 +383,7 @@ class _Resolver:
             arch=DerivedId.arch(self.arch),
             kind=kind,
             ref=body,
+            content_digest=split_image(body)[3] if kind == "image" else "",
         )
         return self.given_identity(identity, spec)
 
@@ -396,9 +409,12 @@ class _Resolver:
             return self.existing(row, "gha:" + body)
         if self.lookup_mode == "only":
             return None
-        derived = ArtifactIdentity.from_gha(
-            over.get("component") or self.component, base, installed, self.arch
-        )
+        component = over.get("component") or self.component
+        if base and not component:
+            raise ValueError(
+                f"gha: spec needs ;component=<c> (or a component): {spec!r}"
+            )
+        derived = ArtifactIdentity.from_gha(component, base, installed, self.arch)
         if not (base and derived.artifact_id):
             return None
         if derived.artifact_id != DerivedId.norm(aid):
@@ -646,8 +662,9 @@ def ensure(
     )  # fmt: skip
     if r is None:
         raise ValueError(f"{spec!r} names no artifact on {arch or 'any arch'}")
-    if isinstance(spec, ArtifactIdentity):
-        arch = spec.arch
+    if client is None and not dry_run:
+        raise ValueError("ensure writes through a client; without one, pass dry_run")
+    sink = _Capture(client) if dry_run else client
     identity = r.identity
     ref = (
         r.artifact.partition(":")[2]
@@ -655,20 +672,29 @@ def ensure(
         else identity.ref
     )
     new_ref = bool(ref) and not ArtifactWriter.ref_recorded(
-        client, db, identity.artifact_id, ref
+        sink, db, identity.artifact_id, ref
     )
     new_artifact = r.source != "existing" and not ArtifactWriter.artifact_recorded(
-        client, db, identity.artifact_id
+        sink, db, identity.artifact_id
     )
     tag_props = {**({"run_url": run_url} if run_url else {}), **(tag_props or {})}
     new_tags = [
         (t, f)
         for t, f in r.tags
-        if not ArtifactWriter.tag_recorded(client, db, t, identity.artifact_id)
+        if not ArtifactWriter.tag_recorded(sink, db, t, identity.artifact_id)
     ]
     r.written, r.dry_run = bool(new_artifact or new_ref or new_tags), dry_run
-    if dry_run or not r.written:
-        return r
+    if r.written:
+        _write(sink, db, r, identity, ref, new_tags, origin, sources, identity_deps,
+               context_deps, props, tag_props, run_url)  # fmt: skip
+    if dry_run:
+        r.rows = sink.rows
+    return r
+
+
+def _write(client, db, r, identity, ref, new_tags, origin, sources, identity_deps, context_deps,
+           props, tag_props, run_url) -> None:  # fmt: skip
+    """ensure's writes, existence-checked row by row."""
     base = dict(identity.inputs).get("base_artifact_id", "")
     if base:
         # A GHA delta is recorded as insert_gha_result records it, keyed on the record's id.
@@ -678,11 +704,9 @@ def ensure(
         )  # fmt: skip
         for t, f in new_tags:
             ArtifactWriter.insert_tag(client, db, identity, t, f, props=tag_props)
-        return r
+        return
     identity = dataclasses.replace(
-        identity,
-        ref=ref if new_ref else "",
-        content_digest=r.leaf or identity.content_digest,
+        identity, ref=ref, content_digest=r.leaf or identity.content_digest
     )
     ArtifactWriter.insert_artifact(
         client,
@@ -695,7 +719,26 @@ def ensure(
         props={**({"run_url": run_url} if run_url else {}), **(props or {})},
         tags=[(t, f, tag_props) for t, f in new_tags],
     )
-    return r
+
+
+class _Capture:
+    """A dry run's client: reads go to the database (none: nothing recorded), inserts are kept."""
+
+    def __init__(self, client):
+        self.client, self.rows = client, {}
+
+    def query(self, sql, parameters=None):
+        if self.client is not None:
+            return self.client.query(sql, parameters=parameters)
+        return _Rows([(0,)] if "count()" in sql else [])
+
+    def insert(self, table, rows, column_names=None, database=None, **kwargs):
+        self.rows.setdefault(table, []).extend(dict(zip(column_names, r)) for r in rows)
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.result_rows = rows
 
 
 def ensure_artifact(

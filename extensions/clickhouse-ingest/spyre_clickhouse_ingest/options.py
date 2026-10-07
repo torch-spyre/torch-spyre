@@ -86,8 +86,8 @@ def add_artifact_options(
         dest="tags",
         action="append",
         default=[],
-        help="a full tag, repeatable; it takes the family its prefix names, else --tag-family, "
-        "else release, and replaces the resolved tag of that family",
+        help="a full tag, repeatable; it takes the family its prefix names, else --tag-family "
+        "(refused with neither), and replaces the resolved tag of that family",
     )
     g.add_argument(
         "--tag-date",
