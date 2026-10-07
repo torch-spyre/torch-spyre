@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -331,13 +332,16 @@ class FakeAPI(gha_runs.GitHub):
 
     def __init__(self, runs, limit=100, remaining=100, clock=None, **kw):
         super().__init__("t", **kw)
-        self.all, self.quota, self.left = runs, limit, remaining
+        self.by_repo = runs if isinstance(runs, dict) else {REPO: runs}
+        self.all = [r for rs in self.by_repo.values() for r in rs]
+        self.quota, self.left = limit, remaining
         self.clock, self.paths = clock, []
         self.reset_at = clock.now + 3600
 
     def _fetch(self, req):
         url = urllib.parse.urlparse(req.full_url)
         q = dict(urllib.parse.parse_qsl(url.query))
+        self.paths.append(url.path)
         if self.clock.now >= self.reset_at:
             self.left, self.reset_at = self.quota, self.reset_at + 3600
         headers = {
@@ -346,16 +350,17 @@ class FakeAPI(gha_runs.GitHub):
             "X-RateLimit-Reset": str(self.reset_at),
         }
         if url.path == "/rate_limit":
-            core = {"limit": self.quota, "remaining": self.left, "reset": 0}
+            # Lags behind the per-response headers, as GitHub's does.
+            core = {"limit": self.quota, "remaining": self.quota, "reset": 0}
             return {"resources": {"core": core}}, headers
         self.left -= 1
         self.clock.now += 60
         headers["X-RateLimit-Remaining"] = str(self.left)
-        self.paths.append(url.path)
         if url.path.endswith("/actions/runs"):
             lo, hi = q["created"].split("..")
+            repo = "/".join(url.path.split("/")[2:4])
             hit = sorted(
-                (r for r in self.all if lo <= r["created_at"] <= hi),
+                (r for r in self.by_repo.get(repo, []) if lo <= r["created_at"] <= hi),
                 key=lambda r: r["created_at"],
                 reverse=True,
             )
@@ -431,7 +436,6 @@ def _key(i):
 
 
 def _poll(api, store, start=None):
-    api.rate()
     return gha_runs.poll(api, store, "db", REPO, start or NOW - timedelta(hours=8), NOW)
 
 
@@ -537,6 +541,71 @@ def test_cli_ends_a_stopped_poll_with_a_notice_not_an_error(clock, monkeypatch, 
         ["poll", "--repo", REPO, "--repo", "torch-spyre/hf-adapters", "--dry-run"]
     )
     err = capsys.readouterr().err
-    assert "[info] rate limit 53/100 at start" in err
-    assert "[notice] budget reached at 50 remaining; resume next run" in err
-    assert "hf-adapters" not in err and "rate limit 50/100 at end" in err
+    assert (
+        "[notice] torch-spyre/torch-spyre: budget reached at 50 remaining; resume next run"
+        in err
+    )
+    # The budget is shared, so the next repo is not started.
+    assert "hf-adapters" not in err
+    assert (
+        "rate limit 52/100 at the first response, 50/100 at the last, 3 request(s)"
+        in err
+    )
+
+
+def test_rate_is_read_from_the_responses_not_rate_limit(clock):
+    api = FakeAPI(_runs(5), remaining=80, clock=clock)
+    _poll(api, Store())
+    assert api.requests == 7 and api.rate() == "73/100" and api.first == "79/100"
+    assert "/rate_limit" not in api.paths
+
+
+def _recent(repo_id, n):
+    now = datetime.now(timezone.utc)
+    return [
+        _run(
+            id=repo_id * 1000 + i,
+            created_at=f"{now - timedelta(minutes=60 - i):%Y-%m-%dT%H:%M:%SZ}",
+        )
+        for i in range(n)
+    ]
+
+
+def _attempts_by_repo(out):
+    rows = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    keys = [r["run_key"] for r in rows if r["pipeline_type"] == "gha-workflow"]
+    return {repo: sum(k.startswith(f"gha:{repo}/") for k in keys) for repo in REPOS}
+
+
+REPOS = (
+    "torch-spyre/torch-spyre",
+    "torch-spyre/hf-adapters",
+    "torch-spyre/spyre-inference",
+)
+
+
+def _cli(monkeypatch, clock, runs, order):
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setattr(
+        gha_runs, "GitHub", lambda token, **kw: FakeAPI(runs, clock=clock, **kw)
+    )
+    argv = ["poll", "--deadline-minutes", "12", "--dry-run"]
+    gha_runs.main(argv + [a for repo in order for a in ("--repo", repo)])
+
+
+def test_a_busy_repo_gets_its_share_of_the_deadline_not_all_of_it(
+    clock, monkeypatch, capsys
+):
+    # Each call takes a minute; listing is 2 calls and each run 1 more.
+    busy, hf, si = REPOS
+    runs = {busy: _recent(1, 50), hf: _recent(2, 1), si: _recent(3, 1)}
+    _cli(monkeypatch, clock, runs, REPOS)
+    assert _attempts_by_repo(capsys.readouterr().out) == {busy: 2, hf: 1, si: 1}
+
+
+def test_time_a_repo_leaves_unused_passes_to_the_next(clock, monkeypatch, capsys):
+    busy, hf, si = REPOS
+    runs = {busy: _recent(1, 50), hf: _recent(2, 1), si: _recent(3, 1)}
+    _cli(monkeypatch, clock, runs, (hf, si, busy))
+    # hf and si take 3 minutes each of their 4 and 4.5, leaving the busy repo 6, not 4.
+    assert _attempts_by_repo(capsys.readouterr().out) == {busy: 4, hf: 1, si: 1}
