@@ -1,0 +1,227 @@
+name: Resolve or record a v2 artifact
+description: >
+  Name an artifact by spec and get its one spyre_v2 artifact_id: the existing record when there
+  is one, else the identity registration derives, recorded and tagged
+  (`spyre_clickhouse_ingest.artifacts ensure`). Specs: image:, rpm:, wheel:, generic:,
+  gha:<id>|<base>|<installed>, or a bare artifact_id. A failure is reported as an error
+  annotation and leaves the outputs empty; it fails the job only with `strict: true`.
+
+inputs:
+  artifact:
+    description: The spec, e.g. image:icr.io/<repo>@sha256:<digest> or derive-gha-artifact-id's gha:<record>.
+    required: true
+  arch:
+    description: Arch of the leaf the spec names; `multi` keeps a manifest list. Not needed for an id or gha spec.
+    required: false
+    default: ''
+  tag-family:
+    description: A tag family (snap-supply-chain, nightly-supply-chain, ...); resolves and records its tag.
+    required: false
+    default: ''
+  tag:
+    description: Full tags to record, one per line; one in a family replaces that family's resolved tag.
+    required: false
+    default: ''
+  tag-date:
+    description: YYYY-MM-DD dating a family's fallback tag. Empty = today (UTC) when the family is dated.
+    required: false
+    default: ''
+  lookup:
+    description: auto (an existing record wins) | off (derive only, no database) | only (must already exist).
+    required: false
+    default: auto
+  registry:
+    description: auto (call the registry only when the spec needs it) | off.
+    required: false
+    default: auto
+  origin:
+    description: artifacts.origin of a new record.
+    required: false
+    default: built
+  source:
+    description: props.source of a new record (e.g. gha).
+    required: false
+    default: ''
+  identity-dep:
+    description: identity_deps entries, one per line (e.g. base=<artifact_id>).
+    required: false
+    default: ''
+  context-dep:
+    description: context_deps entries, one per line.
+    required: false
+    default: ''
+  prop:
+    description: key=value props of a new record, one per line.
+    required: false
+    default: ''
+  tag-prop:
+    description: key=value props of each recorded tag, one per line.
+    required: false
+    default: ''
+  run-url:
+    description: The CI run behind the record. Empty = this workflow run.
+    required: false
+    default: ''
+  dry-run:
+    description: Resolve and print what would be written; write nothing.
+    required: false
+    default: 'false'
+  strict:
+    description: Fail the job when the artifact cannot be resolved or recorded.
+    required: false
+    default: 'false'
+  clickhouse-host:
+    description: ClickHouse host. Empty = no lookup and no write (dry-run and lookup off still resolve).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port.
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user.
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db-v2:
+    description: The spyre_v2 database.
+    required: false
+    default: ''
+  registry-username:
+    description: Registry user for image specs (ICR_USERNAME).
+    required: false
+    default: ''
+  registry-password:
+    description: Registry password for image specs (ICR_PASSWORD).
+    required: false
+    default: ''
+  artifactory-user:
+    description: Artifactory user for rpm/wheel/generic specs.
+    required: false
+    default: ''
+  artifactory-token:
+    description: Artifactory token for rpm/wheel/generic specs.
+    required: false
+    default: ''
+
+outputs:
+  artifact-id:
+    description: The artifact_id, or '' when the spec named nothing.
+    value: ${{ steps.ensure.outputs.artifact-id }}
+  tag:
+    description: The tag resolved for tag-family, or ''.
+    value: ${{ steps.ensure.outputs.tag }}
+  tag-family:
+    description: The family of that tag, or ''.
+    value: ${{ steps.ensure.outputs.tag-family }}
+  source:
+    description: 'Where the id came from: given, existing, label or derived.'
+    value: ${{ steps.ensure.outputs.source }}
+  json:
+    description: The full result, as `artifacts ensure` prints it.
+    value: ${{ steps.ensure.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        version: latest-known
+
+    # The package from this action's own tree, so a caller on @main or @<branch> gets that
+    # ref's code; @main is the fallback when the tree is not on disk.
+    - name: Install spyre-clickhouse-ingest
+      shell: bash
+      env:
+        CHLIB: ${{ github.action_path }}/../../../extensions/clickhouse-ingest
+        VENV: ${{ runner.temp }}/v2-artifact-venv
+      run: |
+        set -euo pipefail
+        if [ -f "${CHLIB}/pyproject.toml" ]; then
+          SPEC="${CHLIB}"
+        else
+          SPEC="git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
+        fi
+        uv venv -q "${VENV}"
+        VIRTUAL_ENV="${VENV}" uv pip install -q "${SPEC}"
+        echo "spyre-clickhouse-ingest: ${SPEC}"
+
+    - name: Ensure ${{ inputs.artifact }}
+      id: ensure
+      shell: bash
+      env:
+        VENV: ${{ runner.temp }}/v2-artifact-venv
+        ARTIFACT: ${{ inputs.artifact }}
+        ARCH: ${{ inputs.arch }}
+        TAG_FAMILY: ${{ inputs.tag-family }}
+        TAGS: ${{ inputs.tag }}
+        TAG_DATE: ${{ inputs.tag-date }}
+        LOOKUP: ${{ inputs.lookup }}
+        REGISTRY: ${{ inputs.registry }}
+        ORIGIN: ${{ inputs.origin }}
+        SOURCE: ${{ inputs.source }}
+        IDENTITY_DEPS: ${{ inputs.identity-dep }}
+        CONTEXT_DEPS: ${{ inputs.context-dep }}
+        PROPS: ${{ inputs.prop }}
+        TAG_PROPS: ${{ inputs.tag-prop }}
+        RUN_URL: ${{ inputs.run-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        STRICT: ${{ inputs.strict }}
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PORT: ${{ inputs.clickhouse-port }}
+        CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}
+        ICR_USERNAME: ${{ inputs.registry-username }}
+        ICR_PASSWORD: ${{ inputs.registry-password }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory-token }}
+      run: |
+        set -uo pipefail
+        if [ -z "${CLICKHOUSE_HOST}" ] && [ "${DRY_RUN}" != "true" ]; then
+          echo "::notice title=v2 artifact::no clickhouse-host; ${ARTIFACT} not recorded."
+          exit 0
+        fi
+        args=(--artifact "${ARTIFACT}" --lookup "${LOOKUP}" --registry "${REGISTRY}"
+              --origin "${ORIGIN}" --run-url "${RUN_URL}")
+        [ -n "${ARCH}" ] && args+=(--arch "${ARCH}")
+        [ -n "${TAG_FAMILY}" ] && args+=(--tag-family "${TAG_FAMILY}")
+        [ -n "${TAG_DATE}" ] && args+=(--tag-date "${TAG_DATE}")
+        [ -n "${SOURCE}" ] && args+=(--source "${SOURCE}")
+        [ "${DRY_RUN}" = "true" ] && args+=(--dry-run)
+        repeat() {
+          local v
+          while IFS= read -r v; do
+            v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+            [ -n "${v}" ] && args+=("$1" "${v}")
+          done <<< "$2"
+        }
+        repeat --tag "${TAGS}"
+        repeat --identity-dep "${IDENTITY_DEPS}"
+        repeat --context-dep "${CONTEXT_DEPS}"
+        repeat --prop "${PROPS}"
+        repeat --tag-prop "${TAG_PROPS}"
+
+        out="$(mktemp)"
+        if "${VENV}/bin/python" -m spyre_clickhouse_ingest.artifacts ensure "${args[@]}" > "${out}"; then
+          "${VENV}/bin/python" - "${out}" >> "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        r = json.load(open(sys.argv[1]))
+        for key, out in (("artifact_id", "artifact-id"), ("tag", "tag"),
+                         ("tag_family", "tag-family"), ("source", "source")):
+            print(f"{out}={r.get(key) or ''}")
+        print("json=" + json.dumps(r, sort_keys=True))
+        PY
+          echo "artifact: $(cat "${out}")"
+          echo "- v2 artifact \`${ARTIFACT}\`: \`$(cat "${out}")\`" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        msg="v2 artifact ${ARTIFACT} was not resolved or recorded (see the log above)."
+        echo "::error title=v2 artifact::${msg}"
+        echo "- :x: ${msg}" >> "$GITHUB_STEP_SUMMARY"
+        [ "${STRICT}" = "true" ] && exit 1
+        exit 0

@@ -49,6 +49,25 @@ inputs:
       empty (default) writes neither, leaving every existing caller unchanged.
     required: false
     default: ''
+  artifact:
+    description: >
+      What the leg ran, as a v2-artifact spec (image:, rpm:, wheel:, generic:, gha:<record>
+      or an artifact_id), when there is no artifact-id record. Registered, tagged with the
+      tag inputs, then given the leg's verdicts.
+    required: false
+    default: ''
+  tag-family:
+    description: Tag family for `artifact` (e.g. nightly-supply-chain); its resolved tag is recorded.
+    required: false
+    default: ''
+  tag:
+    description: Full tags for the leg's artifact, one per line.
+    required: false
+    default: ''
+  tag-date:
+    description: YYYY-MM-DD dating the family's fallback tag. Empty = the run's own day.
+    required: false
+    default: ''
   repository:
     description: >
       owner/repo the tested commit came from, recorded in artifacts.sources -- the column
@@ -273,6 +292,10 @@ runs:
         PLATFORM_IN: ${{ inputs.platform }}
         COMPONENT_IN: ${{ inputs.component }}
         ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
+        ARTIFACT_IN: ${{ inputs.artifact }}
+        TAG_FAMILY_IN: ${{ inputs.tag-family }}
+        TAGS_IN: ${{ inputs.tag }}
+        TAG_DATE_IN: ${{ inputs.tag-date }}
         REPOSITORY_IN: ${{ inputs.repository }}
         RUN_ATTEMPT_IN: ${{ inputs.run-attempt }}
       run: |
@@ -307,6 +330,20 @@ runs:
         elif [ -n "${ARTIFACT_ID_IN}" ]; then
           echo "::warning::ingest script predates --artifact-id; no artifact row will be" \
                "written for this run (id was ${ARTIFACT_ID_IN})."
+        fi
+        if [ -n "${ARTIFACT_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--tag-family"; then
+          ARTIFACT_ARGS+=(--artifact "${ARTIFACT_IN}")
+          [ -n "${REPOSITORY_IN}" ] && ARTIFACT_ARGS+=(--repository "${REPOSITORY_IN}")
+          [ -n "${TAG_FAMILY_IN}" ] && ARTIFACT_ARGS+=(--tag-family "${TAG_FAMILY_IN}")
+          [ -n "${TAG_DATE_IN}" ] && ARTIFACT_ARGS+=(--tag-date "${TAG_DATE_IN}")
+          while IFS= read -r t; do
+            t="${t//[[:space:]]/}"
+            [ -n "${t}" ] && ARTIFACT_ARGS+=(--tag "${t}")
+          done <<< "${TAGS_IN}"
+        elif [ -n "${ARTIFACT_IN}" ]; then
+          echo "::error::ingest script predates --artifact/--tag-family; no artifact row will be" \
+               "written for ${ARTIFACT_IN}."
         fi
         # Same --help probe: a prebaked image may carry a script predating --run-attempt.
         ATTEMPT_ARGS=()

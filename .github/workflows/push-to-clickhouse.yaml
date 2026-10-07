@@ -395,7 +395,7 @@ jobs:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
-          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          artifact: ${{ steps.leg-artifact-id.outputs.value && format('gha:{0}', steps.leg-artifact-id.outputs.value) || '' }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.
           repository: ${{ env.TRIGGERING_REPO }}
           component: ${{ inputs.component || 'torch-spyre' }}
