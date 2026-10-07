@@ -279,7 +279,9 @@ def _make_output_stl(
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
-    Returns None if the resulting stick expression has an offset.
+    Returns None if the resulting stick expression has an offset or is
+    unrepresentable (e.g. ``floor(d1/32)`` produced when the tensor was viewed
+    through a non-stick-aligned shape -- see torch-spyre#4443).
     """
     dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
@@ -288,8 +290,8 @@ def _make_output_stl(
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
-    coords = device_coordinates(stl, output_dep, None)
-    if is_stick_expr_offset_free(coords[-1], stick_size):
+    coords = try_device_coordinates(stl, output_dep, None)
+    if coords is not None and is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
     return None
 
@@ -2273,6 +2275,20 @@ def _scan_mutation_layout_inputs(
             first_read = next(iter(rw.reads), None)
             in_args = _get_prop_args([first_read], strict=False)
             in_arg = in_args[0] if in_args else None
+            # When a rank-changing view precedes the scatter (e.g.
+            # [8,32,32].view(8,1024) -> index_put_), the op writes in a
+            # different rank than the allocation.  The alt-stl mechanism and
+            # insert_post_mutation_restickify only handle same-rank slice offsets;
+            # a rank change cannot be bridged by an STL swap alone.  Raise
+            # Unsupported so torch.compile falls back to CPU for this pattern.
+            op_write_layout = _clean_mutation_op_output_layout(op)
+            if len(op_write_layout.size) != len(target_layout.size):
+                raise Unsupported(
+                    f"index_put_ into a rank-changing view of graph input "
+                    f"{name!r} is not supported on Spyre (write rank "
+                    f"{len(op_write_layout.size)} != allocation rank "
+                    f"{len(target_layout.size)})"
+                )
             alt_stl = _find_alt_target_stl(
                 target_layout, target_stl, output_dep, in_arg
             )
@@ -2305,17 +2321,27 @@ def _find_alt_target_stl(
     target, or None if the current layout already works; raises Unsupported if no
     alternative exists.
 
-    An offset write, or an offset-free sub-stick write (see
-    ``_is_substick_write``), needs its stick dim relocated. The first candidate
-    reachable from the write's input stick wins, meaning one an ordinary
-    stick-permutation restickify can produce, so a degenerate ``stick=0``
-    candidate cannot win a pairing the cost model would reject as a scatter.
-    Falls back to the first offset-free candidate.
+    An offset write, an offset-free sub-stick write (see ``_is_substick_write``),
+    or an entirely unrepresentable stick expression (e.g. ``Mod(d1, 32)`` when
+    the dtype requires ``Mod(var, 64)``, produced when the tensor was viewed
+    through a non-stick-aligned shape such as ``[8, 32, 32] -> [8, 1024]``)
+    all need their stick dim relocated.  The first candidate reachable from the
+    write's input stick wins, meaning one an ordinary stick-permutation
+    restickify can produce, so a degenerate ``stick=0`` candidate cannot win a
+    pairing the cost model would reject as a scatter.  Falls back to the first
+    offset-free candidate.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size) and not (
+    # Use try_device_coordinates so that an already-unrepresentable stick
+    # expression (e.g. Mod(d1, 32) for fp16 where 32 != elems_per_stick=64)
+    # does not raise here.  When it returns None the current layout is
+    # definitely unusable and we must find an alternative; pass sympy.S.Zero as
+    # the skip_stick_expr sentinel so _candidate_output_stls considers every
+    # dim (Zero has no free symbols, so _pick_stick_dim returns -1 = no skip).
+    coords = try_device_coordinates(target_stl, output_dep, None)
+    write_stick = coords[-1] if coords is not None else sympy.S.Zero
+    if coords is not None and is_stick_expr_offset_free(write_stick, stick_size) and not (
         _is_substick_write(write_stick, target_layout, output_dep, stick_size)
     ):
         return None
@@ -2820,10 +2846,15 @@ def propagate_spyre_tensor_layouts(
                 if alt_stl is not None:
                     assert isinstance(target_layout, FixedLayout)
                     if graph_input is not None:
-                        write_stick = device_coordinates(target_stl, output_dep, None)[
-                            -1
-                        ]
-                        if is_stick_expr_offset_free(
+                        # Use try_device_coordinates so an unrepresentable stick
+                        # expression (e.g. Mod(d1, 32) from a view through a
+                        # non-stick-aligned shape, torch-spyre#4443) does not raise.
+                        # A None result means the current layout is unrepresentable
+                        # and definitely needs the alt -- treat it the same as an
+                        # offset write (fall through to apply alt_stl below).
+                        _coords = try_device_coordinates(target_stl, output_dep, None)
+                        write_stick = _coords[-1] if _coords is not None else None
+                        if write_stick is not None and is_stick_expr_offset_free(
                             write_stick,
                             get_elem_in_stick(
                                 _mutation_layout_dtype(target_layout, target_stl)
