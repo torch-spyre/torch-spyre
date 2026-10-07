@@ -853,6 +853,35 @@ def test_a_named_image_is_registered_tagged_and_judged(ingest):
     }
 
 
+def test_an_icr_image_with_no_registry_credentials_still_gets_its_verdict(
+    ingest, monkeypatch
+):
+    # The spyre-test-framework shape: a per-arch icr.io digest, no ICR_* in the container.
+    import urllib.error
+
+    from spyre_clickhouse_ingest.registry import Registry
+
+    class Unauthorized(Registry):
+        def _get(self, repo, path, accept=""):
+            raise urllib.error.HTTPError(path, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(Registry, "from_env", lambda: Unauthorized())
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "fvt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
+    image = "icr.io/ai_sw_accel/2.0/prod/hf-adapters-devel@sha256:" + "ab" * 32
+    args = _args(artifact_id="", artifact=f"image:{image}", arch="s390x",
+                 jenkins_run_key="job#1", run_url="https://ci.example.com/job/1/")  # fmt: skip
+    ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    (res,) = rows["artifact_results"]
+    assert (art["artifact_name"], art["props"]["id12"]) == (
+        "hf-adapters-devel",
+        "ab" * 6,
+    )
+    assert res["artifact_id"] == art["artifact_id"]
+
+
 def test_no_artifact_id_writes_nothing(ingest):
     # Any image baked before the id was stamped: cases land, nothing claims an artifact.
     c = _ArtifactClient()

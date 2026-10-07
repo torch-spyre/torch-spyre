@@ -99,6 +99,9 @@ class FakeLookup(Lookup):
     def by_rpm_file(self, arch, filename, rpm_name):
         return self._hit("rpm_file", arch, filename, rpm_name)
 
+    def by_tag(self, arch, pullspec):
+        return self._hit("tag", arch, pullspec)
+
     def by_id12(self, kind, arch, name, id12):
         return self._hit("id12", kind, arch, name, id12)
 
@@ -722,9 +725,8 @@ def test_lookup_off_reads_nothing_and_only_resolves_nothing_unrecorded():
 
 def test_registry_off_never_calls_it_and_fails_when_the_spec_needs_it(monkeypatch):
     monkeypatch.setattr(Registry, "from_env", lambda: NoRegistry())
-    for spec in (f"image:{IMAGE}:nightly-latest", f"image:{IMAGE}@{LIST}"):
-        with pytest.raises(NeedsRegistry):
-            resolve(spec, "s390x", registry="off")
+    with pytest.raises(NeedsRegistry):
+        resolve(f"image:{IMAGE}:nightly-latest", "s390x", registry="off")
     url = "https://na.artifactory.swg-devops.com/artifactory/r/x.tgz"
     out = resolve(f"generic:{url}#{'ab' * 32};component=llvm", "x86_64", registry="off")
     assert out["source"] == "derived"
@@ -942,4 +944,75 @@ def test_a_given_manifest_list_is_recorded_as_given_with_no_leaf():
     assert (ref["ref"], ref["content_digest"]) == (f"{IMAGE}@{LIST}", LIST)
     assert out["artifact_id"] == ArtifactId.derive(
         "torch-spyre", "torch-spyre-devel", "9e" * 6, "multi"
+    )
+
+
+class Unauthorized(Registry):
+    """icr.io with no credentials: every request is refused."""
+
+    def _get(self, repo, path, accept=""):
+        raise urllib.error.HTTPError(path, 401, "Unauthorized", {}, None)
+
+
+@pytest.mark.parametrize("registry", ["off", Unauthorized()])
+def test_with_no_registry_a_digest_finds_its_record_else_derives_as_given(registry):
+    recorded = _row("torch-spyre", "torch-spyre-devel", LEAF[7:19], "s390x", "image")
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=registry,
+                  lookup=FakeLookup([recorded], digest=recorded[0]))  # fmt: skip
+    assert (out["artifact_id"], out["source"]) == (recorded[0], "existing")
+    out = resolve(
+        f"image:{IMAGE}@{LIST}", "s390x", registry=registry, lookup=FakeLookup()
+    )
+    # What the ingest recorded before it asked the registry: the digest it was given.
+    assert (out["artifact_id"], out["source"], out["leaf"]) == (
+        ArtifactIdentity.parse(f"image:{IMAGE}@{LIST}", "s390x", "x").artifact_id,
+        "derived",
+        "",
+    )
+    assert out["registry"].startswith("off" if registry == "off" else "unreachable")
+
+
+def test_with_no_registry_a_content_addressed_tag_finds_its_record():
+    tagged = f"icr.io/{REPO}:s390x-dev-28c3f5709879"
+    recorded = _row("torch-spyre", "torch-spyre-dev", "28c3f5709879", "s390x", "image")
+    lookup = FakeLookup([recorded], tag=recorded[0])
+    out = resolve(f"image:{tagged}", "s390x", registry=Unauthorized(), lookup=lookup)
+    assert (out["artifact_id"], out["source"]) == (recorded[0], "existing")
+    assert ("tag", ("s390x", tagged)) in lookup.asked
+    with pytest.raises(NeedsRegistry):
+        resolve(f"image:{tagged}", "s390x", registry="off", lookup=FakeLookup())
+
+
+class TagRows(Recording):
+    """A database whose artifact_refs hold one pullspec under `rows`."""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def query(self, sql, parameters=None):
+        out = super().query(sql, parameters)
+        out.result_rows = self.rows
+        return out
+
+
+def test_a_tag_lookup_takes_only_a_content_addressed_tag_held_once():
+    one = _row("torch-spyre", "torch-spyre-dev", "28c3f5709879", "s390x", "image")
+    two = _row("torch-spyre", "torch-spyre-dev", "28c3f5709879", "s390x", "image", "x")
+    spec = f"icr.io/{REPO}:s390x-dev-28c3f5709879"
+    assert Lookup(TagRows([one]), "db").by_tag("s390x", spec) == one
+    assert Lookup(TagRows([one, two]), "db").by_tag("s390x", spec) is None
+    db = TagRows([one])
+    assert Lookup(db, "db").by_tag("s390x", f"icr.io/{REPO}:nightly-latest") is None
+    assert db.params == []
+
+
+def test_ensure_records_a_digest_pinned_image_with_no_registry_credentials(monkeypatch):
+    monkeypatch.setattr(Registry, "from_env", lambda: Unauthorized())
+    client = FakeClient()
+    out = ensure(client, "db", f"image:{IMAGE}@{LEAF}", "s390x", origin="promoted")
+    assert (out["source"], out["written"]) == ("derived", True)
+    assert (
+        out["artifact_id"]
+        == ArtifactIdentity.from_image(f"{IMAGE}@{LEAF}", "s390x").artifact_id
     )

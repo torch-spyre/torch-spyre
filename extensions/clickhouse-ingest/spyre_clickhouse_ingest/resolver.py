@@ -28,7 +28,8 @@ Specs, simple -> advanced (README: "Naming an artifact"):
 
 An under-specified spec is looked up first and the existing record wins; only immutable refs
 (a digest, name==version, an rpm NEVRA or glob, a generic sha) are looked up, never a moving
-tag or a bare name. An authoritative identity is derived from its inputs with no registry call
+tag or a bare name. With no registry answer (off, or no credentials) an image is found by its
+digest or by a tag ending in its id12, else derived from its digest. An authoritative identity is derived from its inputs with no registry call
 and never rebound; a gha: record or an explicit id is verified, never guessed.
 
 Tags: `tag_family` (tag_families.yaml) names the artifact by that family's registry tag, else
@@ -45,7 +46,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .identity import ID_SEP, ArtifactIdentity, DerivedId
+from .identity import ID_SEP, ArtifactIdentity, DerivedId, _hex_token
 from .registry import Registry, dated_tag, family_of, split_image, tag_families, tag_of
 from .writer import ArtifactWriter
 
@@ -65,7 +66,7 @@ IDENTITY_OPTIONS = ("component", "name", "id12")
 
 
 class NeedsRegistry(ValueError):
-    """The spec cannot be resolved without the registry, and registry='off'."""
+    """The spec cannot be resolved without the registry, which is off or unreachable."""
 
 
 def _aliases(arch: str) -> list:
@@ -107,6 +108,8 @@ class Resolution:
     leaf: str = ""
     manifest_list: str = ""
     registry_tag: str = ""
+    # used | off | unreachable: <why>; '' when the spec needed no registry.
+    registry: str = ""
     # A dry run's would-be rows, table -> [row]; only printed for a dry run.
     rows: dict = dataclasses.field(default_factory=dict)
     identity: ArtifactIdentity | None = dataclasses.field(
@@ -210,6 +213,21 @@ class Lookup:
             arch,
             {"d": digest, "at": "@" + digest},
         )
+
+    def by_tag(self, arch: str, pullspec: str):
+        """The one image recorded under a content-addressed `pullspec` (its tag ends in the
+        record's id12); a tag with no id12 moves, and one held by several records moved."""
+        token = _hex_token(pullspec.rsplit(":", 1)[-1])
+        if self.client is None or not token:
+            return None
+        rows = self.client.query(
+            f"SELECT {self.COLS} FROM {self.db}.artifacts WHERE artifact_id IN "
+            f"(SELECT artifact_id FROM {self.db}.artifact_refs WHERE ref = {{r:String}}) "
+            "AND kind = 'image' AND props['id12'] = {i:String} AND arch IN {arch:Array(String)} "
+            "ORDER BY ts DESC LIMIT 1 BY artifact_id LIMIT 2",
+            parameters={"r": pullspec, "i": token, "arch": _aliases(arch)},
+        ).result_rows
+        return rows[0] if len(rows) == 1 else None
 
     def by_rpm_file(self, arch: str, filename: str, rpm_name: str):
         """The record whose dnf glob (`<name>-*.<id12>.*.<arch>`) matches the file. The glob's
@@ -440,31 +458,28 @@ class _Resolver:
             if self.lookup_mode == "only":
                 return None
             identity = ArtifactIdentity.from_image(body, self.arch, **_image_over(over))
-            resolved, registry_tag = "", ""
-            if multi and self.tag_family and self.registry_mode != "off":
-                resolved, registry_tag = tag_of(
-                    self.registry("tags"), path, digest, self.tag_family, self.tag_date
-                )
-            else:
-                resolved = dated_tag(self.tag_family, self.tag_date)
+            resolved, registry_tag = (
+                self.tagged(path, digest)
+                if multi
+                else (dated_tag(self.tag_family, self.tag_date), "")
+            )
             return self.result(identity, "derived", body, resolved, manifest_list=digest if multi else "",
                                registry_tag=registry_tag)  # fmt: skip
-        if not digest:
-            # A tag moves: only the registry's answer for it right now is an identity.
-            registry = self.registry(f"{spec!r} names an image by tag")
-            digest = registry.manifest(path, tag)[0] if tag else ""
-        if digest and self.registry_mode == "off":
-            # Pinned by digest but no registry: a per-arch digest is looked up as given.
-            row = self.lookup.by_digest(self.arch, digest)
-            if row:
-                return self.existing(row, body)
-            raise NeedsRegistry(f"registry='off', but {spec!r} may be a manifest list")
-        registry = self.registry(f"{spec!r} needs its per-arch leaf")
-        leaf, listed = registry.leaf(path, digest, self.arch) if digest else ("", "")
+        try:
+            registry = self.registry(f"{spec!r} needs its per-arch leaf")
+            if not digest and tag:
+                # A tag moves: only the registry's answer for it right now is an identity.
+                digest = registry.manifest(path, tag)[0]
+            leaf, listed = (
+                registry.leaf(path, digest, self.arch) if digest else ("", "")
+            )
+            labels = registry.labels(path, leaf) if leaf else {}
+        except (NeedsRegistry, OSError) as err:
+            return self.offline(host, path, tag, digest, over, body, spec, err)
         if not leaf:
             return None
         pinned = f"{host}/{path}@{leaf}"
-        labelled = _labelled(registry.labels(path, leaf), path, self.arch, over)
+        labelled = _labelled(labels, path, self.arch, over)
         row = (
             labelled and self.lookup.by_id(labelled.artifact_id)
         ) or self.lookup.by_digest(self.arch, leaf)
@@ -482,9 +497,7 @@ class _Resolver:
                 ArtifactIdentity.from_image(pinned, self.arch, **_image_over(over)),
                 "derived",
             )
-        resolved, registry_tag = tag_of(
-            registry, path, leaf, self.tag_family, self.tag_date
-        )
+        resolved, registry_tag = self.tagged(path, leaf)
         r = self.result(
             identity,
             source,
@@ -493,9 +506,43 @@ class _Resolver:
             leaf=leaf,
             manifest_list=listed,
             registry_tag=registry_tag,
+            registry="used",
         )
         r.artifact = f"image:{pinned}"
         return r
+
+    def offline(self, host, path, tag, digest, over, body, spec, why):
+        """No registry answer (off, or unreachable, e.g. no credentials): the record of the
+        digest or of a content-addressed tag, else the digest as given, as before the registry."""
+        state = "off" if self.registry_mode == "off" else f"unreachable: {why}"
+        row = (digest and self.lookup.by_digest(self.arch, digest)) or (
+            tag and self.lookup.by_tag(self.arch, f"{host}/{path}:{tag}")
+        )
+        if row:
+            return self.existing(row, body, registry=state)
+        if self.lookup_mode == "only":
+            return None
+        if not digest:
+            raise NeedsRegistry(
+                f"{spec!r}: its tag names no one record (one with no id12 moves), and "
+                f"the registry is {state}"
+            )
+        identity = ArtifactIdentity.from_image(body, self.arch, **_image_over(over))
+        return self.result(
+            identity, "derived", body, dated_tag(self.tag_family, self.tag_date),
+            registry=state,
+        )  # fmt: skip
+
+    def tagged(self, path: str, digest: str) -> tuple:
+        """(tag, registry_tag) of `digest` in tag_family: the registry's, else the dated one."""
+        if self.tag_family and self.registry_mode != "off":
+            try:
+                return tag_of(
+                    self.registry("tags"), path, digest, self.tag_family, self.tag_date
+                )
+            except OSError:
+                pass
+        return dated_tag(self.tag_family, self.tag_date), ""
 
     def file(self, kind: str, body: str, over: dict, spec: str):
         over.setdefault("component", self.component)
@@ -594,7 +641,8 @@ def resolve(
 
     lookup: 'auto' (existing record wins), 'off' (derive only, no database) or 'only' (must be
     recorded), or a Lookup; it reads `client`/`db`. registry: 'auto' (called only when the
-    spec needs it) or 'off' (never; NeedsRegistry when it is needed), or a Registry. Raises
+    spec needs it; unreachable, it is treated as off) or 'off' (never; NeedsRegistry when the
+    database cannot stand in for it), or a Registry. Raises
     ValueError for a malformed spec or a record that does not hash to its id.
     """
     if isinstance(lookup, str) and lookup != "off" and client is not None:
