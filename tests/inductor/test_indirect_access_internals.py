@@ -55,7 +55,7 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_output,
 )
 
-from torch_spyre._C import DataFormats  # noqa: E402
+from torch_spyre._C import DataFormats, SpyreTensorLayout  # noqa: E402
 from torch_spyre._inductor.op_spec import (  # noqa: E402
     IndirectAccess,
     LoopSpec,
@@ -785,6 +785,232 @@ class TestMaskedScatterRejectReason(IndirectAccessTestCase):
         reason = self._reason((1, 855, 5120), mask, (266, 5120))
         self.assertIsNotNone(reason)
         self.assertIn("rank", reason)
+
+
+# ===========================================================================
+# _p1_scatter_device_pos — unit tests for the P=1 singleton-placeholder helper
+# ===========================================================================
+class TestP1ScatterDevicePos(IndirectAccessTestCase):
+    """Device-free tests for _p1_scatter_device_pos.
+
+    The function scans stride_map for a non-stick entry that equals -1 with
+    a matching device_size of 1.  These tests cover the happy paths as well
+    as the ambiguous multi-singleton case called out in the review comment:
+    a tensor with more than one size-1 / stride=-1 device dimension, where
+    the function returns the *first* match, which may be wrong.
+    """
+
+    def _stl(self, device_size, stride_map):
+        """Build a SpyreTensorLayout with fp16 dtype (64 elems/stick)."""
+        return SpyreTensorLayout(
+            device_size=device_size,
+            stride_map=stride_map,
+            device_dtype=DataFormats.SEN169_FP16,
+        )
+
+    def _pos(self, device_size, stride_map):
+        from torch_spyre._inductor.enforce_indirect_access_layout import (
+            _p1_scatter_device_pos,
+        )
+
+        return _p1_scatter_device_pos(self._stl(device_size, stride_map))
+
+    # -- Basic correct cases ------------------------------------------------
+
+    def test_2d_tensor_singleton_at_pos0(self):
+        """[1, 64] fp16: device layout [1, 1, 64] — singleton at dev pos 0 (rows dim).
+        stride_map[0] == -1 (undefined, P=1), device_size[0] == 1."""
+        # device_size=[1, 1, 64], stride_map=[-1, 64, 1]  (stick=64 elems)
+        self.assertEqual(self._pos([1, 1, 64], [-1, 64, 1]), 0)
+
+    def test_3d_tensor_singleton_at_pos0(self):
+        """[1, 8, 128] fp16: scattered dim (size 1) is at device position 0."""
+        # Canonical layout: device_size=[1, 8, 2, 64], stride_map=[-1, 128, 64, 1]
+        self.assertEqual(self._pos([1, 8, 2, 64], [-1, 128, 64, 1]), 0)
+
+    def test_4d_tensor_singleton_at_pos1(self):
+        """[4, 1, 64, 256] fp16: scattered dim is dim 1 (H=1), at device pos 1.
+
+        This models test_index_put_4d_dim2_default_layout_destination: Bn=1, H=4,
+        M=1 (the scattered row), N=256.  Device layout puts M's singleton at pos 1,
+        behind H.  The function must return 1 so the caller knows enforcement is
+        required.
+        """
+        # shape [4, 1, 4, 64]: dims are [H=4, M=1, stick_count=4, stick=64]
+        # stride_map: H strides over M*N = 256, M is singleton (-1), sticks normal
+        self.assertEqual(self._pos([4, 1, 4, 64], [256, -1, 64, 1]), 1)
+
+    def test_no_singleton_returns_none(self):
+        """A layout with no stride_map == -1 entry returns None (P > 1 layout)."""
+        # [3, 8, 2, 64]: normal P=3 layout, all strides are real
+        self.assertIsNone(self._pos([3, 8, 2, 64], [1024, 128, 64, 1]))
+
+    def test_rank_1_layout_returns_none(self):
+        """A single-element layout (only the stick dim) returns None — too short
+        to have both a non-stick dim and a stick."""
+        # device_size=[64] — just one dim, the stick itself
+        self.assertIsNone(self._pos([64], [1]))
+
+    def test_singleton_only_in_last_dim_ignored(self):
+        """stride_map[-1] is the stick dim and is excluded from the scan; a
+        size-1 / stride=-1 entry there must not be returned."""
+        # Construct a layout where only the last (stick) dim has stride -1.
+        # The function skips range(n-1), so this returns None.
+        self.assertIsNone(self._pos([8, 2, 1], [128, 64, -1]))
+
+    # -- Multi-singleton ambiguity (the review comment scenario) ------------
+
+    def test_multi_singleton_returns_first_match(self):
+        """[1, 1, 8, 128] fp16: TWO size-1 dims both have stride_map == -1.
+
+        When no write_dep / target_layout is provided to disambiguate,
+        fallback behaviour returns the first match.
+        """
+        result = self._pos([1, 1, 8, 2, 64], [-1, -1, 128, 64, 1])
+        self.assertEqual(result, 0)
+
+    def test_multi_singleton_disambiguated_by_write_offset(self):
+        """[1, 1, 8, 128] fp16: TWO size-1 dims have stride_map == -1, but a write
+        offset into dim 1 (num_heads or seq) disambiguates to dev_pos=1."""
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.enforce_indirect_access_layout import (
+            _p1_scatter_device_pos,
+        )
+        import sympy
+        from torch._inductor.ir import FixedLayout
+
+        stl = self._stl([1, 1, 8, 2, 64], [-1, -1, 128, 64, 1])
+        target_layout = FixedLayout(
+            torch.device("spyre"),
+            torch.float16,
+            [1, 1, 8, 128],
+            [1024, 1024, 128, 1],
+        )
+        d0 = sympy.Symbol("d0")
+        d1 = sympy.Symbol("d1")
+        # Write to dim 1 with offset 1024 + 128*d0 + d1
+        write_dep = MemoryDep("buf", 1024 + 128 * d0 + d1, (d0, d1), (8, 128))
+        pos = _p1_scatter_device_pos(
+            stl, write_dep=write_dep, target_layout=target_layout
+        )
+        self.assertEqual(pos, 1)
+
+    def test_multi_singleton_second_is_scatter_dim(self):
+        """[4, 1, 8, 128] fp16: only dev_pos=1 has stride=-1; dev_pos=0 has a
+        real stride (size 4, stride 1024).  Single unambiguous match at pos 1.
+
+        This is the *non-ambiguous* counterpart: only one dim has the singleton
+        placeholder, so the function returns the correct position regardless.
+        """
+        # device_size=[4, 1, 8, 2, 64], stride_map=[1024, -1, 128, 64, 1]
+        self.assertEqual(self._pos([4, 1, 8, 2, 64], [1024, -1, 128, 64, 1]), 1)
+
+    def test_size1_with_real_stride_not_matched(self):
+        """A size-1 dim with a real (non -1) stride is NOT the singleton
+        placeholder and must not be returned.
+
+        Some tensors have genuine size-1 dimensions with real strides (e.g. a
+        batch dim of 1 on a non-P=1 tensor). The function must only fire on
+        stride_map == -1, not on device_size == 1 alone.
+        """
+        # device_size=[1, 8, 2, 64], stride_map=[1024, 128, 64, 1]
+        # The leading 1 has stride 1024 (a real stride), so no singleton placeholder.
+        self.assertIsNone(self._pos([1, 8, 2, 64], [1024, 128, 64, 1]))
+
+    def test_multi_singleton_disambiguated_by_absent_loop_stride(self):
+        """[1, 1, 8, 128] fp16: dev_pos=0 and dev_pos=1 are size-1 with stride=-1.
+        Write dep has loop variables indexing host dim 2 (128*d0) and dim 3 (d1),
+        leaving both singleton dims (host dim 0 and 1) unindexed in loop ranges.
+        In this scenario, the non-batch innermost singleton dim 1 (dev_pos=1) is selected.
+        """
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.enforce_indirect_access_layout import (
+            _p1_scatter_device_pos,
+        )
+        import sympy
+        from torch._inductor.ir import FixedLayout
+
+        stl = self._stl([1, 1, 8, 2, 64], [-1, -1, 128, 64, 1])
+        target_layout = FixedLayout(
+            torch.device("spyre"),
+            torch.float16,
+            [1, 1, 8, 128],
+            [1024, 1024, 128, 1],
+        )
+        d0 = sympy.Symbol("d0")
+        d1 = sympy.Symbol("d1")
+        # Loop variables index dim 2 (128*d0) and dim 3 (d1); singleton host dims 0 & 1 have stride 1024
+        # and are not present in loop variable coefficients.
+        write_dep = MemoryDep("buf", 128 * d0 + d1, (d0, d1), (8, 128))
+        pos = _p1_scatter_device_pos(
+            stl, write_dep=write_dep, target_layout=target_layout
+        )
+        self.assertEqual(pos, 1)
+
+    def test_p1_scatter_requires_mutation_layout_invariant(self):
+        """Verify that scatter ops in Inductor (including functional forms) are mutating operations.
+
+        In PyTorch Inductor and torch-spyre:
+        - All indirect store / scatter operations (e.g. out[idx] = src, scatter, scatter_add)
+          are represented as Scatter ops with MutationLayoutSHOULDREMOVE.
+        - Non-mutating indirect operations are gathers/loads (reads).
+        - When P=1 loop elimination occurs on a scatter store, is_mutation is True.
+        - _enforce_scatter_destination_layout and _insert_mutation_relayout_copy rely on
+          MutationLayoutSHOULDREMOVE to unwrap and retarget the destination buffer.
+        """
+        from unittest.mock import MagicMock
+        import torch.fx as fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            MutationLayoutSHOULDREMOVE,
+            Scatter,
+        )
+        from torch_spyre._inductor.enforce_indirect_access_layout import (
+            _get_indirect_access_dim_order_requirements,
+            _resolve_mutation_target,
+        )
+
+        # MutationLayoutSHOULDREMOVE.__init__ registers buffer mutation in V.graph
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)):
+            mock_scatter_data = MagicMock(spec=Scatter)
+            mock_target_buf = MagicMock(spec=ComputedBuffer)
+            mock_target_buf.get_name.return_value = "target_buf"
+            mock_target_buf.get_device_or_error.return_value = torch.device("cpu")
+            mock_target_buf.get_dtype.return_value = torch.float32
+            mock_target_buf.get_size.return_value = [8]
+
+            mutation_layout = MutationLayoutSHOULDREMOVE(mock_target_buf)
+
+        # 1. Verify that a Scatter op with MutationLayoutSHOULDREMOVE is recognized as is_mutation
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = mock_scatter_data
+        op.layout = mutation_layout
+
+        is_scatter = isinstance(op.data, Scatter)
+        is_mutation = isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+        self.assertTrue(is_scatter)
+        self.assertTrue(is_mutation)
+
+        # 2. When P=1, requirement is None because there are no scatter index symbols
+        op.get_read_writes.return_value.writes = []
+        op.get_read_writes.return_value.reads = []
+        requirement = _get_indirect_access_dim_order_requirements(op)
+        self.assertIsNone(requirement)
+
+        # 3. Verify that _resolve_mutation_target strictly requires MutationLayoutSHOULDREMOVE
+        resolved_name, resolved_target = _resolve_mutation_target(op)
+        self.assertEqual(resolved_name, "target_buf")
+        self.assertIs(resolved_target, mock_target_buf)
+
+        # 4. If an op lacked MutationLayoutSHOULDREMOVE, unwrapping target for destination
+        # enforcement would fail an assertion by design.
+        op_non_mutation = MagicMock(spec=ComputedBuffer)
+        op_non_mutation.layout = MagicMock()  # not MutationLayoutSHOULDREMOVE
+        with self.assertRaises(AssertionError):
+            _resolve_mutation_target(op_non_mutation)
 
 
 if __name__ == "__main__":
