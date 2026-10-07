@@ -46,13 +46,14 @@ SELECT
 FROM benchmark_runs AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
 -- Deduped to one artifact_results row per run first: a plain MergeTree with no dedup key would
--- otherwise let a re-ingested leg double every measurement. argMax on ts keeps the latest row.
+-- otherwise let a re-ingested leg double every measurement. Latest by (ts, audit_timestamp): a
+-- 'running' seed and its final state can share a second of ts.
 LEFT JOIN (
     SELECT run_id,
-           argMax(artifact_id, ts) AS artifact_id,
-           argMax(arch, ts)        AS arch,
-           argMax(test_type, ts)   AS test_type,
-           argMax(state, ts)       AS state
+           argMax(artifact_id, (ts, audit_timestamp)) AS artifact_id,
+           argMax(arch, (ts, audit_timestamp))        AS arch,
+           argMax(test_type, (ts, audit_timestamp))   AS test_type,
+           argMax(state, (ts, audit_timestamp))       AS state
     FROM artifact_results
     WHERE result_kind = 'performance'
     GROUP BY run_id
