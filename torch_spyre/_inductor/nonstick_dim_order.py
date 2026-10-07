@@ -46,6 +46,8 @@ constraint solving.
 pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on graph)
 """
 
+import dataclasses
+
 import sympy
 
 from torch._inductor.dependencies import MemoryDep
@@ -112,6 +114,14 @@ def _buf_stl(buf) -> SpyreTensorLayout | None:
     if isinstance(layout, FixedTiledLayout):
         return layout.device_layout
     return None
+
+
+@dataclasses.dataclass
+class _DeferredReorder:
+    op: ComputedBuffer  # the op that reads or writes buf
+    buf_name: str  # name of buffer that needs reordering
+    required_stl: SpyreTensorLayout
+    kind: str  # "copy" or "producer_rewrite"
 
 
 def _matmul_reorder_stl(
@@ -348,6 +358,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
     reorder respects pinned_dims set by phase 1.
     """
     V.graph.nonstick_reorder_log = {}
+    V.graph.nonstick_deferred = []  # list[_DeferredReorder]
     log: dict[str, SpyreTensorLayout] = {}
     pinned_dims: dict[str, set[int]] = {}
     graph_inputs = set(V.graph.graph_input_names)
