@@ -59,16 +59,20 @@ each symbol's coefficient in the write index, so a `CoreDivision` carried across
 uninterpretable rather than merely illegal. The tiling half of the space is `TilingSpace`
 (`wsr/enumerate_tilings.py`), whose predicates `enumerate_tile_options` is the cross product over.
 
-The space is **ragged**, and in one direction only. A tile level cuts its axis's per-tile extent, so
-a core split of that axis must divide the smaller extent — `WorkDivisionContext.factor_domain(axis,
-tile_count)` drops the *large* factors that no longer divide. The mirror image is deliberately not
-modelled: a tiling also shrinks the per-core span, so `MAX_SPAN_BYTES` and the floor
-`span_reduction_pass` commits would admit *smaller* splits, but the span arithmetic runs off the
-untiled op's tensor deps and the floor is already committed by `apply_splits`. So every tiled domain
-is nested inside the untiled one, which `_split_key`, the write-back's `_menu_position` append and
-`_commit_divisions` rely on. That costs an option, never a verdict — but span relief is the in-tree
-reason coarse tiling exists (pass 448), so this search only finds tilings that pay through LX
-residency.
+The space is **ragged**. Each tiling is judged in its own per-tile frame, the context
+`work_division_context_for_op(op, max_cores, tiling)` builds, as the CP-SAT menu is. A tile level
+cuts its axis's extent, so a core split of that axis must divide the smaller extent; it cuts the
+per-core span too, so `MAX_SPAN_BYTES` can admit a split map the untiled op cannot take. The per-axis
+domains are nested — a divisor of the per-tile extent divides the whole one, and the committed span
+floors bind both — so the untiled ones are the widest and the view inverse searching them misses
+nothing. The joint verdict is not nested, so whatever falls back from a tiled config to its untiled
+twin checks the twin, as the recolor anchor does.
+
+In practice that difference is empty. An op that fits untiled at some split fits at any split
+meeting the committed floors, which every tiled-admitted split meets. An op that fits at none never
+reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in span-overflow pass
+has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
+tilings that pay through LX residency.
 
 That payoff is not a cost term. Every tiling-sensitive term in the cost model is a derate bounded by
 1.0 and an untiled op has a working set of 0, so the objective can rank tilings against each other

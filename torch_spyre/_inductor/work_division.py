@@ -19,9 +19,8 @@ import itertools
 import sympy
 import logging
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Optional, TYPE_CHECKING
-from types import MappingProxyType
 
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import Dep, MemoryDep
@@ -845,9 +844,8 @@ class WorkDivisionContext:
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
     # factor_domain is asked once per axis by the enumeration and again per
-    # candidate by is_legal; the derivation is sympy-heavy, so memoize it --
-    # keyed by (axis, tile count), since a coarse tiling narrows the domain.
-    _factor_domains: dict[tuple[Symbol, int], list[int]] = dataclasses.field(
+    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
 
@@ -856,7 +854,7 @@ class WorkDivisionContext:
         """The divisible axes, in the order a candidate split is keyed by."""
         return list(self.it_space_adjusted)
 
-    def factor_domain(self, v: Symbol, tile_count: int = 1) -> list[int]:
+    def factor_domain(self, v: Symbol) -> list[int]:
         """Ascending legal per-dim factors for axis ``v``: those that divide it.
 
         Mirrors ``must_split_vars.valid_splits``, minus that helper's own
@@ -864,49 +862,27 @@ class WorkDivisionContext:
         allowed-split domains and by any span floor ``span_reduction_pass``
         committed. The committed floor is applied here, so ``1`` is absent
         wherever a floor or an exact domain excludes it.
-
-        ``tile_count`` is the number of coarse loop tiles the axis is cut into,
-        so the factors must divide the *per-tile* extent: a core split still
-        has to be exact, and ``coarse_tile`` emits equal tiles. An axis whose
-        basis the tile count does not divide (the basis can be a stick count or
-        a granularity where the tiling counts elements) is treated as
-        unsplittable rather than approximated -- conservative, and only
-        reachable off the stick dim, which is untileable anyway.
         """
-        key = (v, tile_count)
-        if key not in self._factor_domains:
+        if v not in self._factor_domains:
             if v in self.symbol_meta:
                 basis = self.symbol_meta[v][1]  # granularity
             elif v in self.stick_vars:
                 basis = concretize_expr(self.it_space_adjusted[v])  # stick count
             else:
                 basis = concretize_expr(self.it_space[v])  # element count
-            if tile_count > 1 and basis % tile_count:
-                domain = [1] if 1 in self.factor_domain(v) else []
-            else:
-                domain = _legal_split_factors(
-                    v,
-                    basis // tile_count,
-                    self.constraints.allowed_splits,
-                    self.span_min_splits,
-                )
-            self._factor_domains[key] = domain
-        return self._factor_domains[key]
+            self._factor_domains[v] = _legal_split_factors(
+                v, basis, self.constraints.allowed_splits, self.span_min_splits
+            )
+        return self._factor_domains[v]
 
-    def is_legal(
-        self,
-        splits: dict[Symbol, int],
-        tile_counts: Mapping[Symbol, int] = MappingProxyType({}),
-    ) -> bool:
+    def is_legal(self, splits: dict[Symbol, int]) -> bool:
         """Whether a proposed split is permissible, on every count.
 
         Total, so a caller proposing a split it did not enumerate gets the same
         verdict as one drawing its factors from :meth:`factor_domain`.
-
-        ``tile_counts`` narrows exact divisibility only; see :class:`OpSplitSpace`.
         """
         return (
-            self._factors_in_domain(splits, tile_counts)
+            self._factors_in_domain(splits)
             and self._within_core_budget(splits)
             and self._one_reduction_split_at_most(splits)
             and self._spans_within_cap(splits)
@@ -937,9 +913,7 @@ class WorkDivisionContext:
             splits.get(v, 1) >= minimum for v, minimum in self.span_min_splits.items()
         )
 
-    def _factors_in_domain(
-        self, splits: dict[Symbol, int], tile_counts: Mapping[Symbol, int]
-    ) -> bool:
+    def _factors_in_domain(self, splits: dict[Symbol, int]) -> bool:
         """Nothing else in :meth:`is_legal` rejects a factor that simply does
         not divide its axis: :meth:`_in_split_domains` iterates the op's *hard*
         domains, which for most axes are empty. Only a caller proposing a split
@@ -947,8 +921,7 @@ class WorkDivisionContext:
         arithmetic divides by the factors.
         """
         return all(
-            v in self.it_space_adjusted
-            and factor in self.factor_domain(v, tile_counts.get(v, 1))
+            v in self.it_space_adjusted and factor in self.factor_domain(v)
             for v, factor in splits.items()
         )
 
@@ -1197,27 +1170,20 @@ class OpSplitSpace:
     ``splits_by_index_coeff`` keys the output splits by each symbol's
     coefficient in the write index, so a :class:`CoreDivision` carried across
     tilings is uninterpretable rather than merely illegal -- the two have to be
-    chosen together. That makes the space two-level and ragged: a tile level
-    cuts its axis's per-tile extent, so the core splits that still divide it
-    exactly are a strictly *narrower* set than the untiled one.
+    chosen together. That makes the space two-level and ragged: each tiling
+    is judged in its own per-tile frame (:func:`work_division_context_for_op`
+    with that tiling), as the CP-SAT menu is. A tile level cuts its axis's
+    extent, so the core splits that still divide it exactly are narrower; it
+    cuts the per-core span too, so ``MAX_SPAN_BYTES`` may admit a split map the
+    untiled op cannot take.
 
-    Narrower in one direction only, and deliberately. A tiling also shrinks the
-    per-core span, which would let ``MAX_SPAN_BYTES`` and the floor
-    ``span_reduction_pass`` committed admit *smaller* split counts than they do
-    untiled -- so the honest tiled domain drops large factors and gains small
-    ones, and would be incomparable to the untiled one rather than a subset of
-    it. That half is not modelled -- the span arithmetic runs off the untiled
-    op's tensor deps, and ``span_reduction_pass``'s floor is already committed
-    rather than a filter to relax -- so these domains are nested.
-
-    **That nesting is an invariant, not an apology.** Three things depend on a
-    tiled domain being a strict *subset* of the untiled one, and none of them
-    would catch a violation: ``_split_key`` and ``_TableRelation`` assume a
-    tiled config's split half is a key the untiled menu already carries; the
-    write-back's ``_menu_position`` append assumes the same; and
-    ``_commit_divisions`` commits the split half of a tiled-but-unapplied config
-    into an untiled graph, which is legal only because the tiled domain is a
-    subset. Modelling the span-relief half would have to come with those three.
+    So the per-axis domains are nested -- a divisor of the per-tile extent
+    divides the whole one, and the committed span floors bind both -- and
+    :attr:`factor_domains`, the untiled ones, are the widest: the view inverse
+    searching them misses nothing. The joint verdict is not nested. A split
+    map legal under a tiling can be illegal untiled, where the untiled op
+    overflows the span cap at that map, so falling back from a tiled config to
+    its untiled twin has to check the twin.
     """
 
     op: Operation
@@ -1232,11 +1198,9 @@ class OpSplitSpace:
     # caller's to choose -- which pins every division here to untiled, and is
     # what every engine but the SA co-optimizer gets.
     tiling: Optional["TilingSpace"] = None
-    # Output host dim -> the iteration axis it cuts (:func:`_axis_by_host_dim`).
-    # ``tiling`` offers only these dims.
-    axis_by_host_dim: dict[int, sympy.Symbol] = dataclasses.field(default_factory=dict)
-    # Memoized: :meth:`admits` asks it on every probe.
-    _tile_counts: dict[TileSpec, dict] = dataclasses.field(
+    # Per tiling, the context of its per-tile frame, or ``None`` where it has
+    # none. Built on first use: a search visits few of an op's tilings.
+    _contexts: dict[TileSpec, Optional[WorkDivisionContext]] = dataclasses.field(
         default_factory=dict, repr=False, compare=False
     )
 
@@ -1265,40 +1229,43 @@ class OpSplitSpace:
             tiling=tiling,
         )
 
-    def tile_counts(self, tiling: TileSpec) -> dict[sympy.Symbol, int]:
-        """``tiling``'s split counts keyed by the iteration axis each level
-        cuts -- the extent a core split on that axis then has to divide. Only
-        for a spec :meth:`admits_tiling` accepts. Memoized per spec."""
-        if tiling not in self._tile_counts:
-            self._tile_counts[tiling] = {
-                self.axis_by_host_dim[level.host_dim]: level.count
-                for level in tiling.axes
-            }
-        return self._tile_counts[tiling]
+    def _context(self, tiling: TileSpec) -> Optional[WorkDivisionContext]:
+        """The context ``tiling``'s divisions are judged in."""
+        if tiling.is_untiled:
+            return self.context
+        if tiling not in self._contexts:
+            try:
+                context = work_division_context_for_op(
+                    self.op, self.context.max_cores, tiling
+                )
+            except Unsupported:
+                context = None
+            self._contexts[tiling] = context
+        return self._contexts[tiling]
 
     def factor_domain(
         self, axis: sympy.Symbol, tiling: TileSpec = UNTILED
     ) -> list[int]:
-        """The legal factors for ``axis`` under ``tiling`` -- the untiled domain
-        when nothing tiles that axis, narrowed to the divisors of the per-tile
-        extent when something does."""
-        return self.context.factor_domain(axis, self.tile_counts(tiling).get(axis, 1))
+        """The legal factors for ``axis`` in ``tiling``'s per-tile frame; empty
+        for a tiling with none."""
+        context = self._context(tiling)
+        return [] if context is None else context.factor_domain(axis)
 
     def admits_tiling(self, tiling: TileSpec) -> bool:
-        """Whether this op may take ``tiling`` at all, splits aside. Untiled is
-        the only answer for a space built without a tiling half."""
+        """Whether this op may take ``tiling`` at all, splits aside: on offer,
+        with a per-tile frame. Untiled is the only answer for a space built
+        without a tiling half."""
         if self.tiling is None:
             return tiling.is_untiled
-        return self.tiling.admits(tiling)
+        return self.tiling.admits(tiling) and self._context(tiling) is not None
 
     def admits(
         self, splits: dict[sympy.Symbol, int], tiling: TileSpec = UNTILED
     ) -> bool:
-        """Whether this op may take ``splits`` under ``tiling``: both legal on
-        every count the contexts know, and jointly exact."""
-        if not self.admits_tiling(tiling):
-            return False
-        return self.context.is_legal(splits, self.tile_counts(tiling))
+        """Whether this op may take ``splits`` under ``tiling``: the tiling on
+        offer, and the splits legal in its per-tile frame."""
+        context = self._context(tiling) if self.admits_tiling(tiling) else None
+        return context is not None and context.is_legal(splits)
 
     def tiling_options(self, tiling: TileSpec) -> list[TileSpec]:
         """The tilings one level-edit from ``tiling`` -- add or remove a level,
@@ -1394,8 +1361,8 @@ def build_op_split_space(
     if write is None or context is None:
         return None
     axes = context.axes
-    axis_by_host_dim: dict[int, sympy.Symbol] = {}
     if tiling is not None:
+        # Offer only the dims the lowering resolves to one of the axes.
         axis_by_host_dim = _axis_by_host_dim(op, axes)
         tiling = dataclasses.replace(
             tiling,
@@ -1409,7 +1376,6 @@ def build_op_split_space(
         output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
         factor_domains={axis: context.factor_domain(axis) for axis in axes},
         tiling=tiling,
-        axis_by_host_dim=axis_by_host_dim,
     )
 
 

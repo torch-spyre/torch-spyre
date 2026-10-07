@@ -949,18 +949,16 @@ def mock_op_split_space(
 
     context = MagicMock()
     context.axes = list(domains)
-    rule = legal or (lambda splits: True)
-    # The context takes the tiling's per-axis counts too; ``legal`` is a rule
-    # over the splits. How a tile count *narrows* a domain is the real
-    # context's business, so here the domain is tiling-independent.
-    context.is_legal.side_effect = lambda splits, tile_counts=None: rule(splits)
-    context.factor_domain.side_effect = lambda axis, tile_count=1: domains[axis]
-    return OpSplitSpace(
+    context.is_legal.side_effect = legal or (lambda splits: True)
+    context.factor_domain.side_effect = domains.__getitem__
+    space = OpSplitSpace(
         op=MagicMock() if op is None else op,
         context=context,
         output_axes=frozenset(output_axes),
         factor_domains=domains,
         tiling=tiling,
-        # Output host dim i is the i-th iteration axis, as it is for a real op.
-        axis_by_host_dim=dict(enumerate(domains)),
     )
+    # Every tiling is judged in this one context: how a per-tile frame narrows
+    # a domain is the real context's business.
+    space._context = lambda tiling: context  # type: ignore[method-assign]
+    return space

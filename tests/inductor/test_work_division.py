@@ -3206,6 +3206,38 @@ _SPEC_ON_DIM_0 = TileSpec((TileAxis(host_dim=0, count=2),))
 _SPEC_ON_DIM_1 = TileSpec((TileAxis(host_dim=1, count=2),))
 
 
+class TestOpSplitSpacePerTileFrame(unittest.TestCase):
+    """A tiled division is judged in its per-tile frame. #4768's end-to-end
+    shape: fp16 ``(1, 8195, 256, 64)`` on 4 cores overflows ``MAX_SPAN_BYTES``
+    at every untiled split -- the span is measured on dim 1, and no factor of
+    8195 = 5 * 11 * 149 fits 4 cores -- while dim 1 tiled 5 ways fits."""
+
+    def test_a_tiling_admits_splits_the_untiled_op_cannot_take(self):
+        shape = (1, 8195, 256, 64)
+        op = _computed_buffer(shape)
+        syms = [Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(4)]
+        index = sum(sym * stride for sym, stride in zip(syms, op.layout.stride))
+        write = MemoryDep("buf0", index, tuple(syms), shape)
+        op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads=set(), writes={write})
+        )
+        space = work_division_module.build_op_split_space(
+            op, 4, tiling=TilingSpace(max_dims=1, output_counts={1: [5]})
+        )
+        by_5 = TileSpec((TileAxis(host_dim=1, count=5),))
+
+        def admitted(tiling):
+            domains = [space.factor_domain(axis, tiling) for axis in space.axes]
+            return [
+                list(factors)
+                for factors in itertools.product(*domains)
+                if space.admits(dict(zip(space.axes, factors)), tiling)
+            ]
+
+        self.assertEqual(admitted(TileSpec()), [])
+        self.assertEqual(admitted(by_5), [[1, 1, 1, 1], [1, 1, 2, 1], [1, 1, 4, 1]])
+
+
 class TestOpSplitSpaceTiling(unittest.TestCase):
     """The tiling half of the space: a coarse tiling and a core division are
     one candidate, and the tiling narrows what the division may be."""

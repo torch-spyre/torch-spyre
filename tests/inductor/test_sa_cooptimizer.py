@@ -51,9 +51,11 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     SaCoOptimizingSolver,
     _canonical_key,
     _GeneratedDivisions,
+    _MenuDivisions,
     _TableRelation,
     _ViewRelation,
     _one_axis_apart,
+    _table_relation,
 )
 from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 from torch_spyre._inductor.scratchpad.permutation_layout import (
@@ -1575,6 +1577,21 @@ class TilingInTheConfigTest(TestCase):
         }
         self.assertEqual(drawn, {TileSpec(), _TILE_2, _TILE_4})
 
+    def test_an_anchor_keeps_no_tiling_whose_splits_are_illegal_untiled(self):
+        """Splits legal under a tiling need not be legal untiled: where the
+        drawn tiling takes not even all-ones and the incoming splits are legal
+        only under their own tiling, there is no anchor."""
+        space = _two_axis_space(tiling=_tiling_space())
+        source = _GeneratedDivisions(space, _menu_seed())
+        tiled = source.config_for(space.division({_AXIS_0: 2}, _TILE_2))
+        with (
+            mock.patch.object(
+                space, "admits", side_effect=lambda splits, tiling: tiling == _TILE_2
+            ),
+            mock.patch.object(source, "_draw_tiling", return_value=_TILE_4),
+        ):
+            self.assertIsNone(source.anchor(tiled, rnd.Random(0)))
+
 
 class GeneratedWriteBackTest(TestCase):
     """A generated division carries no menu position, so the write-back is
@@ -1673,6 +1690,24 @@ class EdgeRelationTest(TestCase):
         ).config_for(_TWO_AXIS_MENU[1])
         self.assertIsNone(generated.menu_index)
         self.assertTrue(relation.compatible(generated, solver._sources[1].configs[1]))
+
+    def test_the_table_relation_reads_only_untiled_entries(self):
+        """A CP-SAT menu carries tiled entries too. The table answers for a
+        tiled config through its untiled twin, so a pair naming a tiled entry
+        is not projected: it would vouch for the twin."""
+        tiled = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2), menu_index=1)
+        parent = _MenuDivisions([_config(_axis_div(), menu_index=0), tiled], {})
+        child = _MenuDivisions(
+            [
+                _config(_axis_div(), menu_index=0),
+                _config(_axis_div(d0=2), menu_index=1),
+            ],
+            {},
+        )
+        relation = _table_relation([(0, 0), (1, 1)], parent, child)
+        self.assertTrue(relation.compatible(parent.configs[0], child.configs[0]))
+        self.assertFalse(relation.compatible(tiled, child.configs[1]))
+        self.assertIsNone(relation.child_for(tiled))
 
     def test_the_view_relation_is_taken_only_where_both_ends_generate(self):
         edge = mock.MagicMock()

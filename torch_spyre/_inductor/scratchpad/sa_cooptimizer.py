@@ -157,8 +157,8 @@ def _split_key(key: tuple) -> tuple:
     A per-core view is a function of the splits alone, so two configs differing
     only in their tiling slice the buffer identically and every edge relation
     owes them the same verdict. Projecting here is what lets the enumerated
-    pair table, whose entries are all untiled, answer for a tiled config at
-    all. (What a tiling does change about an edge -- a consumer in another
+    pair table, of which the relation reads only the untiled entries, answer
+    for a tiled config at all. (What a tiling does change about an edge -- a consumer in another
     tiling group reading the whole output rather than the per-tile scratch --
     is a *cost*, not a compatibility, and is not priced yet.)
 
@@ -419,9 +419,9 @@ class _GeneratedDivisions(_DivisionSource):
         the redraw that would supply them. Splits the drawn tiling cannot take
         are dropped to all-ones first, so the redraw climbs out of a legal
         state rather than never starting. If even all-ones is illegal there
-        (a committed span floor), the tiling is given up instead: the incoming
-        splits are legal untiled, since a tiled domain is a subset of the
-        untiled one.
+        (a committed span floor), the tiling is given up instead, where the
+        incoming splits are legal untiled -- splits legal under a tiling need
+        not be (see ``OpSplitSpace``) -- and the anchor otherwise.
         """
         splits = self.space.splits(config.division)
         tiling = self._draw_tiling(rng)
@@ -429,8 +429,10 @@ class _GeneratedDivisions(_DivisionSource):
             floor = dict.fromkeys(self.space.axes, 1)
             if self.space.admits(floor, tiling):
                 splits = floor
-            else:
+            elif self.space.admits(splits, _UNTILED):
                 tiling = _UNTILED
+            else:
+                return None
         axes = list(self.space.axes)
         rng.shuffle(axes)
         for axis in axes:
@@ -502,15 +504,16 @@ class _TableRelation(_EdgeRelation):
     re-keyed by choice.
 
     The table is keyed by menu position and the state is keyed by choice, so it
-    is projected onto keys once. That also makes it exact for a *generated*
-    config, which is why a graph where only some ops have a split space is not a
-    mixture of two answers: a generated division is one the enumeration would
-    have carried, so its key is a key the table knows.
+    is projected onto keys once. That also makes it exact for a generated
+    untiled config, which is why a graph where only some ops have a split space
+    is not a mixture of two answers: such a division is one the enumeration
+    would have carried, so its key is a key the table knows.
 
-    Every entry is untiled, since the enumeration carries no tilings, so the
-    projection is onto :func:`_split_key` -- the table answers for a tiled
-    config the same way it answers for its untiled twin, which is what the
-    geometry says. What it cannot do is *carry* a tiling across the edge: the
+    Only pairs of untiled entries are projected (a CP-SAT menu carries tiled
+    ones too), onto :func:`_split_key` -- the table answers for a tiled config
+    the way it answers for its untiled twin, which is what the geometry says.
+    Where the twin is illegal, its splits being legal only in the tiled frame,
+    the table does not know it and answers "incompatible": conservative. What it cannot do is *carry* a tiling across the edge: the
     division it hands back is a menu entry, so a flood crossing a table edge
     leaves the far side untiled. That is only ever a lost group, and the edges
     that take this path are the ones whose far side has no tiling space to
@@ -545,7 +548,11 @@ def _table_relation(
     which is what makes a flood independent of ``cd_parent_matches`` list order.
     """
     pc, cc = parent_menu.configs, child_menu.configs
-    pairs = sorted(set(pairs))
+    pairs = sorted(
+        (ip, ic)
+        for ip, ic in set(pairs)
+        if pc[ip].tiling.is_untiled and cc[ic].tiling.is_untiled
+    )
     key_pairs = frozenset(
         (_split_key(pc[ip].key), _split_key(cc[ic].key)) for ip, ic in pairs
     )
