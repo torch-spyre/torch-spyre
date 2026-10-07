@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Literal
 import sympy
 
 if TYPE_CHECKING:
+    import torch.fx
+
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
@@ -58,10 +60,21 @@ class LoopCarryRecord:
     into the carry's initial storage.  Recording both ends lets scratchpad
     planning distinguish that closed, compiler-created mutation from an
     arbitrary user mutation, which must remain in HBM.
+
+    ``loop_origin`` is the exact FX ``while_loop`` HOP node the carry belonged
+    to, captured and validated at the splice site (see
+    ``wsr/while_loop_bridge._validated_loop_origin``) before the WhileLoop IR
+    node is deleted.  It is optional internal compiler metadata: ``None``
+    whenever the origin could not be proven (nested loops, loops inside an
+    ``invoke_subgraph``, or a chained carry whose origins gather an earlier
+    loop's node), in which case the post-loop materialization plan declines
+    and the carry keeps today's HBM behavior.  No other consumer of this
+    record reads the field.
     """
 
     storage_name: str
     update_name: str
+    loop_origin: "torch.fx.Node | None" = None
 
 
 @dataclass(frozen=True)

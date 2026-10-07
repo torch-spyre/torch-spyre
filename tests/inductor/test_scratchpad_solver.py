@@ -165,6 +165,48 @@ class TestLxPlanningContract(TestCase):
                         _lx_planning_size()
 
 
+class TestDrainLifetimeBoundary(TestCase):
+    """The post-loop drain storage must stay live to the graph exit.
+
+    All solver intervals are on pre-insertion operation indices with a
+    half-open ``[start, end)`` convention.  The drain reads the storage after
+    the whole counted loop, so the storage's end is extended to
+    ``N = len(graph.operations)``; the failing boundary case is exactly a
+    buffer whose start equals the loop's textual end (``s_B = loop_end + 1``):
+    against the un-extended ``end = uses[-1] + 1`` it does not overlap and
+    could legally take the same address, clobbering the value.  These tests
+    pin the half-open arithmetic and the extension's effect.
+    """
+
+    def test_extended_end_excludes_the_loop_end_boundary_sharer(self):
+        # Storage fill at tick 0, tagged update read/write at tick 5
+        # (loop_end = 5, so N = 7 with the post-loop drain op's slot).
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5], lifetime_end_override=7)
+        self.assertEqual(storage.end_time, 7)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertTrue(
+            storage.overlaps_in_time(sharer),
+            "end=7 must overlap a buffer born at the loop's textual end",
+        )
+
+    def test_unextended_end_would_allow_the_boundary_sharer(self):
+        """Un-extended, the same pair shares: this is the bug the plan fix closes."""
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5])
+        self.assertEqual(storage.end_time, 6)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertFalse(storage.overlaps_in_time(sharer))
+
+    def test_override_extending_beyond_nominal_end_is_kept(self):
+        storage = LifetimeBoundBuffer("carry", 100, [0, 9], lifetime_end_override=12)
+        self.assertEqual(storage.end_time, 12)
+
+    def test_override_below_nominal_end_is_rejected(self):
+        # The extension helper takes a max(), so it can never build this; the
+        # constructor is the backstop for any other caller.
+        with self.assertRaises(AssertionError):
+            LifetimeBoundBuffer("bad", 100, [0, 9], lifetime_end_override=9)
+
+
 def _two_gap_buffers():
     """Buffers that leave two free gaps for x in a 120-byte scratchpad.
 

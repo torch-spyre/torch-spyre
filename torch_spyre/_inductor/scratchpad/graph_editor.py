@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from torch.fx import Node
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -127,8 +128,30 @@ class GraphEditor:
         input: bool,
         private: bool = False,
         lx_view: PerCoreView | None = None,
+        after_fx: Node | None = None,
+        lower_anchor: Operation | None = None,
+        lower_before: Operation | None = None,
     ) -> ComputedBuffer:
-        """Insert a clone; private clones rewire only ``buffer_users``."""
+        """Insert a clone; private clones rewire only ``buffer_users``.
+
+        ``after_fx`` and ``lower_anchor`` relocate the clone to run after
+        ``lower_anchor`` in the lowered operation order (and after ``after_fx``
+        in the FX graph) instead of after the producer.  They exist for the
+        post-loop drain of a resident loop carry, whose value only becomes
+        final after the whole counted loop: the drain must be inserted after the
+        loop's last member, not after the pre-loop initializer.  Both default
+        to ``None``, which keeps every existing caller byte-identical.
+
+        ``lower_before`` is the mirror image for an input clone: it places the
+        lowered clone immediately before ``lower_before`` (the entry of the
+        counted loop its consumers run in) instead of before its first
+        consumer, so a loop-invariant copy runs once rather than every trip.
+        The FX node already sits right after the input placeholder, so only the
+        lowered order moves.
+        """
+        assert lower_anchor is None or lower_before is None, (
+            "a clone has one position: lower_anchor and lower_before exclude each other"
+        )
         if input and lx_view is None:
             raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
@@ -165,7 +188,16 @@ class GraphEditor:
                 )
                 anchors.append(anchor)
             old_users = list(dict.fromkeys(anchors))
-        self.fx_graph.inserting_after(buf_fx)
+        if after_fx is not None:
+            # Post-loop drain: place the FX clone after the whole-loop anchor
+            # (the retained while_loop HOP node) while still reading only
+            # ``buf_fx``, so the loop's carried input is untouched and no cycle
+            # is possible.  The anchor must live in this lowering's graph; the
+            # allocator's plan already re-checked that before committing.
+            assert after_fx.graph is self.fx_graph, (
+                f"FX drain anchor {after_fx} is not in the current lowering graph"
+            )
+        self.fx_graph.inserting_after(after_fx if after_fx is not None else buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
         )
@@ -268,9 +300,21 @@ class GraphEditor:
                     )
 
         self.lowering.operations.remove(new_com_buf)
-        self.lowering.operations.insert(
-            self.lowering.operations.index(buffer_users[0]), new_com_buf
-        )
+        if lower_anchor is not None:
+            # Post-loop drain: insert after the loop's last member (an
+            # Operation object, not a saved index -- earlier clones in the same
+            # push only insert before/after existing ops, so the identity
+            # survives and a stale index cannot).
+            self.lowering.operations.insert(
+                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            )
+        else:
+            # A hoisted input clone goes before its consumers' loop entry; any
+            # other clone goes before its first consumer, as before.
+            before = lower_before if lower_before is not None else buffer_users[0]
+            self.lowering.operations.insert(
+                self.lowering.operations.index(before), new_com_buf
+            )
 
         return new_com_buf
 
