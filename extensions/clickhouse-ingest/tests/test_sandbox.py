@@ -73,6 +73,7 @@ def test_each_dimension_precedes_its_fact():
         ("capabilities", "capability_runs"),
         ("artifacts", "artifact_results"),
         ("artifacts", "artifact_tags"),
+        ("pipeline_runs", "pipeline_run_legs"),
     ):
         assert order.index(dim) < order.index(fact)
 

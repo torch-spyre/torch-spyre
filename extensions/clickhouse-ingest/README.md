@@ -56,11 +56,13 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
 | `resolver.py` | any artifact spec -> its one spyre_v2 artifact, existing or derived (`artifacts resolve` / `ensure`, `ensure_artifact`) |
 | `registry.py` | read-only registry access: an image's per-arch leaf, labels and supply-chain channel tag |
+| `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 
 ## Tables modelled
 
 `test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
-and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`).
+and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`),
+and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`).
 The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
 
 The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned
