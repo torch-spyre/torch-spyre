@@ -65,7 +65,7 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
-from .nonstick_dim_order import reorder_nonstick_dims
+from .nonstick_dim_order import reorder_nonstick_dims, reorder_nonstick_dims_mutation
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
     finalize_layouts,
@@ -565,6 +565,7 @@ class CustomPreSchedulingPasses:
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
+            reorder_nonstick_dims_mutation,
             insert_post_mutation_restickify,
             insert_restickify_padding,
             #
