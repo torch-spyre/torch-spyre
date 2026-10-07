@@ -338,10 +338,9 @@ and default stream. It does not own a separate runtime context.
 ### Compiled collectives and streams
 
 In compiled graphs, `wait_tensor` blocks the host until the collective
-finishes. Set `TORCH_SPYRE_DIST_ENFORCE_WAIT=1` to enforce that wait
-(experimental); when unset the wait is skipped and ordering relies on the
-default stream, where `spyre_comms` runs every collective. The wait is never
-skipped on a non-default stream.
+finishes. Set `TORCH_SPYRE_DIST_ENFORCE_WAIT=1` to enforce that wait;
+when unset the wait is skipped and ordering relies on the
+default stream, where `spyre_comms` runs every collective.
 
 ## More in This Section
 
