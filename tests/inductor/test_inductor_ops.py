@@ -423,6 +423,26 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     )
 ]
 
+# Cases the predicate above flags that now pass on every config (base and both LX
+# planning classes). Listing them here, rather than loosening the predicate, keeps
+# the still-failing cases generated from the same rule.
+_TO_DTYPE_OP_NOW_PASSING = {
+    "bfloat16_to_bool_4x68",
+    "bfloat16_to_bool_68",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "float16_to_bfloat16_4x68",
+    "float16_to_bfloat16_68",
+    "float16_to_bool_4x68",
+    "float16_to_bool_68",
+    "float32_to_bool_4x16",
+    "float32_to_bool_4x68",
+    "float32_to_bool_68",
+}
+TO_DTYPE_OP_EXPECT_FAIL = [
+    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
+]
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -447,10 +467,48 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
 # pairs (see test_upcast_consumed_on_partial_stick). The implicit round
 # trip still hits an unsupported op on these shapes.
 _ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
-TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
+]
+
+# Further round-trip cases that now pass on every config. They differ between the
+# add and copy variants, so each variant gets its own expect_fail list. The implicit
+# variant is the same as the shared implicit list minus its own passing cases.
+_ROUND_TRIP_ADD_NOW_PASSING = {
+    "bfloat16_to_float16_4x16",
+    "bfloat16_to_float16_4x32",
+    "bfloat16_to_float16_4x63",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "bfloat16_to_float32_4x63",
+    "float16_to_float32_4x63",
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
+    "bfloat16_to_float32_4x16",
+    "float16_to_float32_4x16",
+}
+_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_ADD_NOW_PASSING
+]
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_COPY_NOW_PASSING
+]
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
+    case
+    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1891,8 +1949,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "large_dim_0_1",
                 "large_dim_0_1_nopad",
-                "large_dim_0_2",
-                "large_dim_0_2_nopad",
                 "large_dim_1_2",
                 "large_dim_1_2_nopad",
             ],
@@ -2282,7 +2338,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44_scalar32"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_256_scalar128": (
@@ -2328,7 +2383,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_64": (
@@ -4057,7 +4111,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int_true": (torch.tensor([1], dtype=torch.int64),),
                 "int_false": (torch.tensor([0], dtype=torch.int64),),
             },
-            "expect_fail": ["float32_true", "float32_false", "negative_true"],
         },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
@@ -5055,10 +5108,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "fp16_3d_dim_2",
                 "fp16_3d_dim_neg1",
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
@@ -5828,7 +5877,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6045,7 +6094,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -7830,15 +7879,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.logsumexp (stable error signature: InductorError: "
-            "IndexError: list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_logsumexp_keepdim0_known_xfail(self):
+    def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(
             lambda x: torch.logsumexp(x, dim=0, keepdim=False),
