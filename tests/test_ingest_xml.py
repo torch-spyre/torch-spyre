@@ -758,7 +758,7 @@ class _ArtifactClient:
         self.inserts = []
 
     def query(self, sql, parameters=None):
-        return _Result([[0]])
+        return _Result([[0]] if "count()" in sql else [])
 
     def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))

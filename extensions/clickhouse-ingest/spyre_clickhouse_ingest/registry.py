@@ -12,23 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolve a tested image to its v2 artifact: the per-arch leaf, its id, and its channel tag.
-
-Every writer that names a supply-chain image (the image builds, the test jobs, the v1 bridge)
-resolves it here, so the same image gets the same artifact_id and tag whichever writer saw it.
-The id is derived, not looked up: ArtifactIdentity.from_image on the leaf ref, exactly what
-`artifacts register` and ingest_xml's --artifact record, so it holds before registration too.
-"""
+"""Read-only container registry access for `resolver`: an image's per-arch leaf, its config
+labels, and the supply-chain channel tag that names it."""
 
 import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from datetime import date
 
 import regex
 
-from .identity import ArtifactIdentity
 
 OCI_ARCH = {"x86_64": "amd64"}
 
@@ -103,6 +98,13 @@ class Registry:
         self._tags: dict = {}
         self._manifests: dict = {}
 
+    @classmethod
+    def from_env(cls) -> "Registry":
+        return cls(
+            username=os.environ.get("ICR_USERNAME", ""),
+            password=os.environ.get("ICR_PASSWORD", ""),
+        )
+
     def _get(self, repo: str, path: str, accept: str = ""):
         headers = {"Accept": accept} if accept else {}
         token = self._token(repo)
@@ -165,16 +167,28 @@ class Registry:
                 return m["digest"], digest
         return "", digest
 
+    def config(self, repo: str, leaf: str) -> dict:
+        """The leaf image's config blob (`created`, `config.Labels`); {} when unreadable."""
+        _, body = self.manifest(repo, leaf)
+        digest = ((body or {}).get("config") or {}).get("digest")
+        if not digest:
+            return {}
+        if (repo, digest) not in self._manifests:
+            try:
+                self._manifests[(repo, digest)] = (
+                    "",
+                    self._get(repo, f"blobs/{digest}")[1],
+                )
+            except urllib.error.HTTPError:
+                self._manifests[(repo, digest)] = ("", {})
+        return self._manifests[(repo, digest)][1] or {}
+
+    def labels(self, repo: str, leaf: str) -> dict:
+        return (self.config(repo, leaf).get("config") or {}).get("Labels") or {}
+
     def built(self, repo: str, leaf: str):
         """The UTC date the leaf image was built (its config's `created`), or None."""
-        _, body = self.manifest(repo, leaf)
-        config = ((body or {}).get("config") or {}).get("digest")
-        if not config:
-            return None
-        try:
-            created = self._get(repo, f"blobs/{config}")[1].get("created") or ""
-        except urllib.error.HTTPError:
-            return None
+        created = self.config(repo, leaf).get("created") or ""
         return date.fromisoformat(created[:10]) if len(created) >= 10 else None
 
     def names(self, repo: str, tag: str, leaf: str) -> bool:
@@ -197,32 +211,30 @@ def _candidates(tags: list, channel: str, day) -> list:
     return sorted((t for t, _ in found), reverse=True)
 
 
-def resolve(
+def split_image(image: str) -> tuple:
+    """(host, repository path, tag, digest) of `[image:]<host>/<repo>[:tag][@digest]`."""
+    ref = image.removeprefix("image:").split(";", 1)[0].strip()
+    repo, _, digest = ref.partition("@")
+    host, _, path = repo.partition("/")
+    path, _, tag = path.partition(":")
+    return host, path, tag, digest
+
+
+def channel_tag_of(
     registry: Registry,
-    image: str,
-    arch: str,
+    path: str,
+    leaf: str,
     channel: str = "",
     day=None,
     name: str = "",
-) -> dict:
-    """The v2 artifact of `image` (`[image:]<host>/<repo>[:tag]@<digest>`) on `arch`.
+) -> tuple:
+    """(tag, tag_family, registry_tag) naming `leaf`: the registry's channel tag, else the
+    run's own `fallback_tag`; ('', '', '') when neither applies.
 
-    The tag is the registry's channel tag naming the leaf, else the run's own `fallback_tag`.
-    {} when the image cannot be resolved.
+    A writer that knows its run's channel and day keeps the tag in that channel, dating it
+    itself when the registry has no such tag; one that knows neither takes any channel's.
     """
-    ref = image.removeprefix("image:")
-    repo, _, digest = ref.partition("@")
-    host, _, path = repo.partition("/")
-    path = path.split(":", 1)[0]
-    if host != registry.host or not digest:
-        return {}
-    leaf, listed = registry.leaf(path, digest, arch)
-    if not leaf:
-        return {}
-    identity = ArtifactIdentity.from_image(f"{host}/{path}@{leaf}", arch)
-    tag, registry_tag, reads = "", "", 0
-    # A writer that knows its run's channel and day keeps the tag in that channel, dating it
-    # itself when the registry has no such tag; one that knows neither takes any channel's.
+    reads = 0
     rest = [c for c in CHANNELS if c != channel]
     order = [channel] + ([] if day else rest) if channel in CHANNELS else rest
     for ch in order:
@@ -232,21 +244,6 @@ def resolve(
             reads += 1
             if registry.names(path, t, leaf):
                 built = registry.built(path, leaf) if ch == "weekly" else None
-                tag, registry_tag, channel = channel_tag(ch, t, built), t, ch
-                break
-        if tag:
-            break
-    if not tag:
-        tag = fallback_tag(channel, day, name)
-    return {
-        "artifact_id": identity.artifact_id,
-        "artifact": f"image:{identity.ref}",
-        "component": identity.component,
-        "artifact_name": identity.artifact_name,
-        "arch": identity.arch,
-        "leaf": leaf,
-        "manifest_list": listed,
-        "tag": tag,
-        "tag_family": FAMILIES.get(channel, "") if tag else "",
-        "registry_tag": registry_tag,
-    }
+                return channel_tag(ch, t, built), FAMILIES[ch], t
+    tag = fallback_tag(channel, day, name)
+    return (tag, FAMILIES[channel], "") if tag else ("", "", "")

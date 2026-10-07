@@ -54,7 +54,8 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
 | `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |
 | `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
-| `registry.py` | a tested image -> its per-arch leaf, artifact_id and supply-chain tag (`artifacts resolve`) |
+| `resolver.py` | any artifact spec -> its one spyre_v2 artifact, existing or derived (`artifacts resolve` / `ensure`, `ensure_artifact`) |
+| `registry.py` | read-only registry access: an image's per-arch leaf, labels and supply-chain channel tag |
 
 ## Tables modelled
 

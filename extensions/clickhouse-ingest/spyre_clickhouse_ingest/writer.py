@@ -771,6 +771,19 @@ class ArtifactWriter:
         )
 
     @classmethod
+    def ref_recorded(cls, client, db: str, artifact_id: str, ref: str) -> bool:
+        """Does `artifact_refs` already hold this ref for this artifact?"""
+        return bool(ref) and (
+            cls.ref_table.count_rows(
+                client,
+                db,
+                "artifact_id = {artifact_id:UUID} AND ref = {ref:String}",
+                {"artifact_id": artifact_id, "ref": ref},
+            )
+            > 0
+        )
+
+    @classmethod
     def tag_recorded(cls, client, db: str, tag: str, artifact_id: str) -> bool:
         """Does this tag already point at this artifact? (Also a plain MergeTree.)"""
         return (

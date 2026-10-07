@@ -31,6 +31,16 @@ def _is_hex(s: str, n: int) -> bool:
     return len(s) == n and all(c in "0123456789abcdef" for c in s)
 
 
+def _hex_token(text: str) -> str:
+    """The last 12-hex token of `text` delimited by `.`, `-`, `_` or `+`; '' when none."""
+    # str ops, not regex: derive-artifact-id imports this module with no third-party packages.
+    parts = (text or "").translate(str.maketrans("-_+", "...")).split(".")
+    for part in reversed(parts):
+        if _is_hex(part, 12):
+            return part
+    return ""
+
+
 def _strip_dev_suffix(name: str) -> str:
     for suffix in ("-devel", "-dev"):
         if name.endswith(suffix):
@@ -352,6 +362,53 @@ class ArtifactIdentity:
             kind="generic",
             ref=url,
             content_digest=f"sha256:{digest}",
+        )
+
+    @classmethod
+    def from_rpm(
+        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+    ) -> "ArtifactIdentity":
+        """An RPM by file name, URL, NEVRA or dnf glob; id12 is the 12-hex identity token the
+        producer puts in its release (`<name>-*.<id12>.*.<arch>`)."""
+        base = (ref or "").strip().rsplit("/", 1)[-1].removesuffix(".rpm")
+        rpm_name = name or (
+            base.split("-*", 1)[0] if "-*" in base else base.rsplit("-", 2)[0]
+        )
+        token = id12 or _hex_token(base)
+        if not (rpm_name and _is_hex(token, 12)):
+            raise ValueError(f"rpm needs a name and a 12-hex identity token: {ref!r}")
+        return cls(
+            component=component or rpm_name,
+            artifact_name=rpm_name,
+            id12=token,
+            arch=DerivedId.arch(arch),
+            kind="rpm",
+            ref=(ref or "").strip(),
+        )
+
+    @classmethod
+    def from_wheel(
+        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+    ) -> "ArtifactIdentity":
+        """A wheel by `name==version`, file name or URL; id12 is the 12-hex identity token
+        ending its local version (`+<id12>`, `+cpu.<id12>`)."""
+        raw = (ref or "").strip()
+        if "==" in raw:
+            dist, _, version = raw.partition("==")
+        else:
+            # PEP 427: `{distribution}-{version}-...whl`, `-` in the name escaped as `_`.
+            dist, version = (raw.rsplit("/", 1)[-1].split("-") + [""])[:2]
+        token = id12 or _hex_token(version.rpartition("+")[2])
+        dist = name or dist
+        if not (dist and version and _is_hex(token, 12)):
+            raise ValueError(f"wheel needs name==version+<12-hex id>: {ref!r}")
+        return cls(
+            component=component or dist,
+            artifact_name=dist,
+            id12=token,
+            arch=DerivedId.arch(arch),
+            kind="wheel",
+            ref=f"{dist}=={version}",
         )
 
     @classmethod

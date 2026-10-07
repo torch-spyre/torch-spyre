@@ -17,11 +17,14 @@
     python -m spyre_clickhouse_ingest.artifacts register --artifact image:<ref>@<digest> ...
     python -m spyre_clickhouse_ingest.artifacts release <manifest.json>
     python -m spyre_clickhouse_ingest.artifacts write <batch.json>
-    python -m spyre_clickhouse_ingest.artifacts resolve --image <repo>@<digest> --arch s390x
+    python -m spyre_clickhouse_ingest.artifacts resolve --artifact <spec> --arch s390x
+    python -m spyre_clickhouse_ingest.artifacts ensure --artifact <spec> --arch s390x ...
 
-`resolve` reads only the registry (ICR_USERNAME / ICR_PASSWORD) and prints, as JSON, the
-artifact a tested image is: artifact_id, the per-arch leaf `artifact` spec to register or
-ingest it by, and its supply-chain tag and tag_family (registry.resolve).
+`resolve` prints, as JSON, the one artifact a spec (resolver.py's grammar) names: the existing
+spyre_v2 record when there is one (read-only, from CLICKHOUSE_* + CLICKHOUSE_DB_V2; without
+them `lookup` is "none" and the id is derived), and for an image its per-arch leaf and
+supply-chain tag. `ensure` does the same and records it (resolver.ensure_artifact). Registry
+access: ICR_USERNAME / ICR_PASSWORD; Artifactory: ARTIFACTORY_USER / ARTIFACTORY_TOKEN.
 
 A batch is what a pipeline writer (the Jenkins orchestrator) hands over in one call; every
 entry names its artifact by the four hash inputs plus kind and ref:
@@ -54,7 +57,8 @@ from itertools import zip_longest
 from pathlib import Path
 
 from .identity import ArtifactIdentity, DerivedId
-from .registry import CHANNELS, Registry, resolve
+from .registry import CHANNELS, Registry
+from .resolver import Lookup, ensure_artifact, resolve
 from .writer import ArtifactWriter
 
 RELEASE_FAMILY = "release"
@@ -255,32 +259,85 @@ def main(argv=None) -> None:
     wr = sub.add_parser("write", help="a batch of artifacts, tags and results (JSON)")
     wr.add_argument("batch", type=Path)
 
-    res = sub.add_parser("resolve", help="a tested image's artifact id and tag (JSON)")
+    res = sub.add_parser("resolve", help="the artifact a spec names (JSON)")
+    ens = sub.add_parser("ensure", help="resolve a spec and record it, tagged (JSON)")
+    for p in (res, ens):
+        what = p.add_mutually_exclusive_group(required=True)
+        what.add_argument(
+            "--artifact", help="image:/rpm:/wheel:/generic: spec or an artifact_id"
+        )
+        what.add_argument("--image", help="shorthand for --artifact image:<ref>")
+        p.add_argument("--arch", required=True)
+        p.add_argument("--channel", default="", choices=["", *CHANNELS])
+        p.add_argument(
+            "--date",
+            type=date.fromisoformat,
+            default=None,
+            help="the run's day: orders the tag search, and dates the tag when none names it",
+        )
+        p.add_argument(
+            "--name", default="", help="ci-cd-tech-preview: the release name"
+        )
     res.add_argument(
-        "--image", required=True, help="[image:]<host>/<repo>[:tag]@<digest>"
+        "--no-lookup", action="store_true", help="derive only; read no database"
     )
-    res.add_argument("--arch", required=True)
-    res.add_argument("--channel", default="", choices=["", *CHANNELS])
-    res.add_argument(
-        "--date",
-        type=date.fromisoformat,
-        default=None,
-        help="the run's day: orders the search, and names the tag when no registry tag does",
+    ens.add_argument("--origin", default="built")
+    ens.add_argument("--tag", action="append", default=[], help="repeatable")
+    ens.add_argument("--tag-family", default=RELEASE_FAMILY)
+    ens.add_argument("--run-url", default="")
+    ens.add_argument(
+        "--identity-dep", action="append", default=[], help="e.g. base=<sha256>"
     )
-    res.add_argument("--name", default="", help="ci-cd-tech-preview: the release name")
 
     args = parser.parse_args(argv)
-    if args.cmd == "resolve":
+    if args.cmd in ("resolve", "ensure"):
+        spec = args.artifact or "image:" + args.image.removeprefix("image:")
         registry = Registry(
             username=os.environ.get("ICR_USERNAME", ""),
             password=os.environ.get("ICR_PASSWORD", ""),
         )
-        out = resolve(
-            registry, args.image, args.arch, args.channel, args.date, args.name
+        from .client import ClickHouse, ClickHouseEnv
+
+        db = args.database or ClickHouseEnv.target_database()
+        if args.cmd == "resolve":
+            lookup = Lookup()
+            if not args.no_lookup and db and ClickHouseEnv.host():
+                try:
+                    client = ClickHouse.connect(database=db)
+                    client.set_client_setting("readonly", "2")
+                    client.query("SELECT 1")
+                    lookup = Lookup(client, db)
+                except Exception as err:  # noqa: BLE001 -- derive-only is the documented fallback
+                    print(
+                        f"[warn] no spyre_v2 lookup ({err}); deriving only",
+                        file=sys.stderr,
+                    )
+                    lookup = Lookup()
+            out = resolve(
+                spec, args.arch, lookup=lookup, registry=registry,
+                channel=args.channel, day=args.date, name=args.name,
+            )  # fmt: skip
+            out.pop("identity", None)
+            print(json.dumps(out, sort_keys=True))
+            if not out:
+                sys.exit(1)
+            return
+        if not db:
+            sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
+        identity = ensure_artifact(
+            ClickHouse.connect(database=db), db, spec, args.arch,
+            origin=args.origin, tags=[(t, args.tag_family) for t in args.tag],
+            channel=args.channel, day=args.date, run_url=args.run_url,
+            name=args.name, identity_deps=args.identity_dep, registry=registry,
+        )  # fmt: skip
+        print(
+            json.dumps(
+                {
+                    "artifact_id": identity.artifact_id,
+                    "artifact": f"{identity.kind}:{identity.ref}",
+                }
+            )
         )
-        print(json.dumps(out, sort_keys=True))
-        if not out:
-            sys.exit(1)
         return
     if args.cmd == "release" and args.dry_run:
         for i in release_identities(json.loads(args.manifest.read_text())):

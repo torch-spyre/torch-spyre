@@ -28,7 +28,7 @@ import sys
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 
@@ -37,8 +37,7 @@ from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
     extract_properties,
     get_client,
-    ArtifactIdentity,
-    insert_artifact,
+    ensure_artifact,
     insert_artifact_result,
     insert_benchmarks,
     insert_gha_artifact_result,
@@ -1313,32 +1312,33 @@ def _admitted_legs(legs: dict):
 
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
     """--artifact: register what the spec names (and tag it), then its verdicts."""
-    component = component_of(args, COMPONENT_DEFAULT)
-    identity = ArtifactIdentity.parse(args.artifact, args.platform or "", component)
-    if identity is None:
+    run_url = _opt(args, "run_url") or _gha_run_url(args)
+    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    try:
+        # A test leg did not build what it ran; the build's own record (write-once) wins.
+        identity = ensure_artifact(
+            client,
+            v2db,
+            args.artifact,
+            args.platform or "",
+            origin="promoted",
+            tags=[
+                (t, _opt(args, "tag_family") or "release")
+                for t in _opt(args, "tag") or []
+            ],
+            channel=_opt(args, "artifact_channel") or None,
+            day=_opt(args, "artifact_date") or None,
+            run_url=run_url,
+            component=component_of(args, COMPONENT_DEFAULT),
+            sources=[(args.repository, args.branch, args.sha)],
+        )
+    except ValueError as err:
         print(
-            f"  [warn] v2: --artifact {args.artifact!r} names no identity",
+            f"  [warn] v2: --artifact {args.artifact!r} names no artifact: {err}",
             file=sys.stderr,
         )
         return
-    run_url = _opt(args, "run_url") or _gha_run_url(args)
-    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
-    tag_props = {"run_url": run_url, "source": source}
-    aid = insert_artifact(
-        client,
-        v2db,
-        identity,
-        # A test leg did not build what it ran; the build's own record (write-once) wins.
-        origin="promoted",
-        sources=[(args.repository, args.branch, args.sha)],
-        props={"run_url": run_url, "source": source},
-        tags=[
-            (t, _opt(args, "tag_family") or "release", tag_props)
-            for t in _opt(args, "tag") or []
-        ],
-    )
-    if not aid:
-        return
+    aid = identity.artifact_id
     for run_id, tier, acc in _admitted_legs(legs):
         state = _leg_state(acc["failed"], acc["total"])
         if insert_artifact_result(
@@ -1435,11 +1435,10 @@ def main():
     parser.add_argument(
         "--artifact",
         default="",
-        help="What this leg ran, when no derive-gha-artifact-id record exists: "
-        "'image:<repo>[:tag]@sha256:<digest>' (the per-arch image) or "
-        "'generic:<url>#<sha256>', each optionally followed by ';component=<c>', "
-        "';name=<n>' and (image) ';id12=<12 hex>' to match how its producer recorded it. "
-        "The artifact is registered (and tagged with --tag) before its verdicts are written.",
+        help="What this leg ran, when no derive-gha-artifact-id record exists: any "
+        "`artifacts resolve` spec -- image:<ref>[@digest], rpm:, wheel:, generic: or a bare "
+        "artifact_id. It resolves to the existing spyre_v2 record when there is one, else is "
+        "registered (and tagged with --tag / --artifact-channel) before its verdicts.",
     )
     parser.add_argument(
         "--tag",
@@ -1449,6 +1448,18 @@ def main():
         "(e.g. a dated tag and the producer's own name).",
     )
     parser.add_argument("--tag-family", default="release")
+    parser.add_argument(
+        "--artifact-channel",
+        default="",
+        help="--artifact's supply-chain channel (snap, nightly, weekly, ci-cd-tech-preview): "
+        "tags it by the channel tag that names it (see `artifacts resolve`).",
+    )
+    parser.add_argument(
+        "--artifact-date",
+        type=date.fromisoformat,
+        default=None,
+        help="The run's day (YYYY-MM-DD), dating the channel tag when the registry has none.",
+    )
     parser.add_argument(
         "--run-url",
         default="",
