@@ -915,6 +915,18 @@ def test_a_tag_that_cannot_be_filed_costs_the_tag_not_the_verdicts(ingest):
     assert len(rows["artifact_results"]) == 1
 
 
+def test_a_bad_tag_costs_only_itself(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    args = _named_image_args(tags=["release-2026-10-08", ("v1.2", "no-such-family")])
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    assert [(t["tag"], t["tag_family"]) for t in rows["artifact_tags"]] == [
+        ("release-2026-10-08", "release")
+    ]
+    assert len(rows["artifact_results"]) == 1
+
+
 def test_verdicts_that_were_not_recorded_are_reported_for_strict(ingest):
     c = _ArtifactClient()
     legs = {(_RUN_ID, "svt"): {"failed": 0, "total": 1, "duration_s": 1.0}}

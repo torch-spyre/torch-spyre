@@ -69,6 +69,7 @@ from spyre_clickhouse_ingest.options import (
     artifact_options,
     artifact_spec,
 )
+from spyre_clickhouse_ingest.registry import tag_families
 from spyre_clickhouse_ingest.resolver import ensure, named
 import regex as re
 
@@ -1324,12 +1325,21 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
         return True
     options = artifact_options(args)
-    try:
-        named("", options["tag_family"], options["tags"])
-    except ValueError as err:
-        # A bad tag costs the tag, never the verdicts.
-        print(f"  [warn] v2: {err}; recording no tags", file=sys.stderr)
-        options["tag_family"], options["tags"] = "", []
+    # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
+    if options["tag_family"] and options["tag_family"] not in tag_families():
+        print(
+            f"  [warn] v2: unknown --tag-family {options['tag_family']!r}; ignored",
+            file=sys.stderr,
+        )
+        options["tag_family"] = ""
+    kept = []
+    for tag in options["tags"]:
+        try:
+            named("", options["tag_family"], [tag])
+            kept.append(tag)
+        except ValueError as err:
+            print(f"  [warn] v2: {err}; tag skipped", file=sys.stderr)
+    options["tags"] = kept
     # A test leg did not build what it ran; the build's own record (write-once) wins.
     # A GHA delta is the leg's own build.
     if spec.startswith("gha:"):
