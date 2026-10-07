@@ -1067,3 +1067,44 @@ def test_ensure_files_a_tag_naming_no_family_under_misc():
     assert [(t["tag"], t["tag_family"]) for t in client.tables[ARTIFACT_TAGS.name]] == [
         ("v1.2", "misc")
     ]
+
+
+def test_a_delivery_stream_records_its_list_and_leaves_under_the_stream_tag():
+    stream = "cicd-tech-preview-v1"
+    served = {**LISTED, stream: (LIST, LISTED[LIST][1]), f"{stream}-s390x": (LEAF, {})}
+    reg = FakeRegistry(served, [stream, f"{stream}-s390x"])
+    assert (
+        family_of(stream),
+        family_of("ci-cd-tech-preview-v3"),
+        family_of("release-1.0"),
+    ) == (
+        "ci-cd-tech-preview",
+        "ci-cd-tech-preview",
+        "release",
+    )
+    client = FakeClient()
+    lst = ensure(
+        client,
+        "db",
+        f"image:{IMAGE}:{stream}",
+        "multi",
+        origin="promoted",
+        registry=reg,
+        tags=[stream],
+    )
+    leaf = ensure(client, "db", f"image:{IMAGE}:{stream}-s390x", "s390x", origin="promoted", registry=reg,
+                  tags=[stream])  # fmt: skip
+    assert (lst["arch"], lst["artifact"], leaf["artifact"]) == (
+        "multi",
+        f"image:{IMAGE}@{LIST}",
+        f"image:{IMAGE}@{LEAF}",
+    )
+    assert sorted(
+        (t["tag"], t["tag_family"], t["artifact_id"])
+        for t in client.tables[ARTIFACT_TAGS.name]
+    ) == sorted(
+        [
+            (stream, "ci-cd-tech-preview", lst["artifact_id"]),
+            (stream, "ci-cd-tech-preview", leaf["artifact_id"]),
+        ]
+    )

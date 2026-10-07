@@ -228,11 +228,18 @@ def family_tag(tag_family: str, registry_tag: str, built=None) -> str:
 
 
 def family_of(tag: str) -> str:
-    """The family a full v2 tag belongs to by its prefix, longest first; '' for none."""
-    names = sorted(
-        (f.name for f in tag_families().values() if f.prefix), key=len, reverse=True
-    )
-    return next((n for n in names if tag.startswith(n + "-")), "")
+    """The family a full v2 tag belongs to: by its prefix, longest first, else the family whose
+    v2 tag is the registry tag itself and whose pattern matches it; '' for none."""
+    families = tag_families().values()
+    names = sorted((f.name for f in families if f.prefix), key=len, reverse=True)
+    by_prefix = next((n for n in names if tag.startswith(n + "-")), "")
+    if by_prefix:
+        return by_prefix
+    return next(
+        (f.name for f in families
+         if f.tag == "{registry_tag}" and f.registry_tag is not None and f.registry_tag.match(tag)),
+        "",
+    )  # fmt: skip
 
 
 class Registry:

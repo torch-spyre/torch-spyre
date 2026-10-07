@@ -48,8 +48,9 @@ weekly-supply-chain:
   dated: true
   prefix: true
 
+# Its streams are promoted as ci-cd-tech-preview-vN and, by orch-spyre-delivery, cicd-tech-preview-vN.
 ci-cd-tech-preview:
-  registry_tag: ^ci-cd-tech-preview-v\d+$
+  registry_tag: ^(ci-cd|cicd)-tech-preview-v\d+$
   tag: '{registry_tag}'
   prefix: true
 

@@ -471,6 +471,19 @@ class _Resolver:
         multi = DerivedId.arch(self.arch) == "multi"
         if multi or host != (self._registry.host if self._registry else ICR_HOST):
             # A manifest list (or another registry's image) is its own digest: no leaf to find.
+            if (
+                multi
+                and tag
+                and not digest
+                and host == (self._registry.host if self._registry else ICR_HOST)
+            ):
+                # A list by tag (a promoted stream tag): the registry's digest for it now.
+                digest = self.registry(
+                    f"{spec!r} names a manifest list by tag"
+                ).manifest(path, tag)[0]
+                if not digest:
+                    return None
+                body = f"{host}/{path}@{digest}"
             if not digest:
                 raise ValueError(
                     f"{spec!r}: a manifest list or foreign image needs its @digest"
