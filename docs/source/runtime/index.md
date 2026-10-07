@@ -252,9 +252,11 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
    tensor's `kAddress` symbolic argument is populated by calling
    `get_composite_address()` on the corresponding context tensor, and the
    resulting `flex::CompositeAddress` values are passed to
-   `flex::createHostComputeParams()` as the host-compute argument list. The
-   `CompositeAddress` records where the allocator placed each tensor, so the
-   correction blob stays correct regardless of placement.
+   `flex::createHostComputeParams()` as the host-compute argument list. Each
+   `kAddress` slot is then resolved to a concrete HBM device address through
+   `compositeAddressToDeviceAddress()` on that tensor, using the allocator's
+   region map. The resolved address is what the correction blob carries, so it
+   stays correct regardless of where the allocator placed each tensor.
 2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
