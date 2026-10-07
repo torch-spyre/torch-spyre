@@ -95,6 +95,21 @@ from .enforce_indirect_access_layout import (
 logger = get_inductor_logger("nonstick_dim_order")
 
 
+def _buf_stl(buf) -> SpyreTensorLayout | None:
+    """Return the committed STL for any buffer type.
+
+    For ComputedBuffer: buf.committed_stl (set by optimize_restickify_locations).
+    For graph inputs and other buffers: read from the FixedTiledLayout directly.
+    Returns None if no STL is available.
+    """
+    if hasattr(buf, "committed_stl"):
+        return buf.committed_stl
+    layout = _real_layout(buf)
+    if isinstance(layout, FixedTiledLayout):
+        return layout.device_layout
+    return None
+
+
 def _matmul_reorder_stl(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
