@@ -696,6 +696,26 @@ def _compute_full_ranges_planned(
     return ranges
 
 
+def _planned_full_device_layout(
+    op: ComputedBuffer, full_ranges: list[Expr]
+) -> SpyreTensorLayout | None:
+    """The device layout a copy-out's full buffer or a reduction's full
+    accumulator takes: ``op``'s own, read before ``_divide_ranges`` replaces it
+    with the tile's.
+
+    ``None`` when ``op`` has no device layout yet (pre-stickify), or when the
+    full buffer is not ``op``'s own shape -- a WhileLoop-splice dim, which
+    ``_compute_full_ranges_planned`` multiplies up. ``_allocate_full_buffer``
+    then derives a layout from the tile instead.
+    """
+    layout = op.layout
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    if list(layout.size) != list(full_ranges):
+        return None
+    return layout.device_layout
+
+
 def _compute_per_tile_ranges_planned(
     op: ComputedBuffer, info: CoarseTileInfo
 ) -> list[Expr]:
@@ -994,6 +1014,9 @@ def _plan_tiling_propagation(
                     full_output_strides=full_output_strides,
                     per_tile_strides=per_tile_strides,
                     carried=carried,
+                    full_output_device_layout=_planned_full_device_layout(
+                        op, full_output_ranges
+                    ),
                 )
                 info.propagation = PropagationPlan(
                     kind="reduction",
@@ -1165,6 +1188,7 @@ def _plan_tiling_propagation(
                 kind="copy_out",
                 full_ranges=full_ranges,
                 full_strides=tuple(op.layout.stride),
+                full_device_layout=_planned_full_device_layout(op, full_ranges),
                 outside_consumer_names=tuple(all_consumer_names),
                 is_graph_output=is_graph_output,
             )
@@ -1800,6 +1824,60 @@ def _capture_predivision_unit_steps(
             for dep, tiled_dims in zip(read_deps, info.tiled_dims_per_read)
         )
     return result
+
+
+def _plan_direct_unit_steps(
+    operations: list[Operation],
+    plan: dict[int, CoarseTileInfo],
+) -> None:
+    """Move each read's unit-tile dims from ``tiled_dims_per_read`` to
+    ``squeezed_advance_per_read``, for a tiling that inserts no read copies.
+
+    A dim tiled down to a per-tile extent of 1 loses its ``d{i}`` symbol when
+    ``_apply_plan`` divides the op, and the surviving symbols are renumbered.
+    ``SpyreKernel._general_tile_advance`` substitutes into the divided
+    ``dep.index``, so a ``tiled_dims_per_read`` entry for such a dim would
+    advance whichever dim inherited its number, by that dim's stride. The step
+    is known only now, while the read index still has the dim, so it is
+    recorded here as the ``(host_stride, extent)`` term the squeezed channel
+    carries.
+
+    With read copies (``coarse_tile_pre_stickify``) the same step goes to the
+    read-copy planner instead: see ``_capture_predivision_unit_steps``. Must run
+    after ``_plan_tiling_propagation``, which empties the entries of reads that
+    stay on a producer's per-tile scratch and so do not advance.
+    """
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        info = plan.get(id(op))
+        if info is None or not info.tiled_dims_per_read:
+            continue
+        read_deps = [
+            dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        ]
+        steps_per_read = [
+            _predivision_unit_steps_for_dep(dep, tiled_dims, op)
+            for dep, tiled_dims in zip(read_deps, info.tiled_dims_per_read)
+        ]
+        if not any(any(steps) for steps in steps_per_read):
+            continue
+        squeezed_per_read = info.squeezed_advance_per_read or [
+            [[] for _ in info.loop_count] for _ in read_deps
+        ]
+        for dep_idx, steps in enumerate(steps_per_read):
+            if not any(steps):
+                continue
+            unit_dims = {dim for level in steps for dim, _stride, _extent in level}
+            info.tiled_dims_per_read[dep_idx] = [
+                [(dim, extent) for dim, extent in level if dim not in unit_dims]
+                for level in info.tiled_dims_per_read[dep_idx]
+            ]
+            squeezed_per_read[dep_idx] = [
+                [*squeezed, *((stride, extent) for _dim, stride, extent in level)]
+                for squeezed, level in zip(squeezed_per_read[dep_idx], steps)
+            ]
+        info.squeezed_advance_per_read = squeezed_per_read
 
 
 def _select_unit_steps(
@@ -3120,6 +3198,10 @@ def _coarse_tile_common(
     # / copy-out / reduction) with zero mutation, consumed by Pass 1/2/3
     # below.
     _plan_tiling_propagation(operations, groups, plan)
+    if not run_read_copies:
+        # No read copy will carry a unit-tile dim's step, so the op's own
+        # reads must.
+        _plan_direct_unit_steps(operations, plan)
     _log_propagation_plan(groups, plan)
 
     # Transformation: apply the plan. Only reached if planning didn't raise.
@@ -3805,7 +3887,12 @@ def _propagate_tiled_op(
         == outer_key
     )
     full_buf = _allocate_full_buffer(
-        op, full_ranges, full_strides, operations, group_start_idx
+        op,
+        full_ranges,
+        full_strides,
+        operations,
+        group_start_idx,
+        full_device_layout=propagation.full_device_layout,
     )
 
     # Capture before _insert_copy_op overwrites op.layout.
@@ -4112,6 +4199,7 @@ def _allocate_full_buffer(
     full_strides: tuple[Expr, ...],
     operations: list[Operation],
     insert_at_idx: int,
+    full_device_layout: SpyreTensorLayout | None = None,
 ) -> ComputedBuffer:
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
@@ -4119,6 +4207,12 @@ def _allocate_full_buffer(
     a layout matching tiled_op's layout type (FixedLayout pre-stickify,
     FixedTiledLayout post-stickify), splices it into operations at
     insert_at_idx, and returns the new ComputedBuffer.
+
+    ``full_device_layout`` is the device layout planning recorded for the full
+    buffer (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). Without
+    one, the layout is grown from the tile's, which is only sound while at most
+    one host dim of the tile has extent 1.
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
@@ -4154,7 +4248,18 @@ def _allocate_full_buffer(
     orig_layout = tiled_op.layout
     strides: list[Expr] = list(full_strides)
 
-    if isinstance(orig_layout, FixedTiledLayout):
+    layout: FixedTiledLayout | FixedLayout
+    if isinstance(orig_layout, FixedTiledLayout) and full_device_layout is not None:
+        # Post-stickify path, with the full buffer's device layout planned: it
+        # is the layout the op's output had before it was divided.
+        layout = FixedTiledLayout(
+            device,
+            dtype,
+            list(full_ranges),
+            strides,
+            full_device_layout,
+        )
+    elif isinstance(orig_layout, FixedTiledLayout):
         # Post-stickify path (span-overflow groups): stickification has already
         # run, so we must assign a FixedTiledLayout now.  Derive the full
         # buffer's device layout by scaling the per-tile device layout up to
@@ -4191,7 +4296,7 @@ def _allocate_full_buffer(
                 list(range(ndim_full)),
                 orig_layout.device_layout.element_arrangement,
             )
-        layout: FixedTiledLayout | FixedLayout = FixedTiledLayout(
+        layout = FixedTiledLayout(
             device,
             dtype,
             list(full_ranges),
@@ -6244,6 +6349,8 @@ def _insert_combine_op(
         tiled_op_info,
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
+        # tiled_op's entries are for tiled_op's reads, not these two.
+        squeezed_advance_per_read=[],
     )
     V.graph.name_to_buffer[combine_name] = combine_buf
 
@@ -6598,6 +6705,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
@@ -6617,6 +6725,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         fill_target = accum_full
         combine_target = accum_full

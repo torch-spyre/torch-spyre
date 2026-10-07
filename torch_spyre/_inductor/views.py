@@ -359,9 +359,7 @@ def compute_coordinates(
         # not leak a modular residual onto the stick coordinate (see
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
-        handled = not offset.free_symbols and _decompose_constant_offset(
-            offset, size, stride, coordinates
-        )
+        handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
@@ -389,9 +387,6 @@ def compute_coordinates(
         if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
             continue
 
-        # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
-
         if var in repeat_info:
             info = repeat_info[var]
             if info["kind"] == "mod":
@@ -408,9 +403,8 @@ def compute_coordinates(
                     )
             continue
 
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        step = term.xreplace({var: 1})
-        limit = term.xreplace({var: range_val})
+        # isolate current var
+        term = index.xreplace({v: 0 for v in vars - {var}})
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -418,6 +412,10 @@ def compute_coordinates(
                 f"variable {var} (range {range_val}) appears in multiple Mod "
                 f"expressions {mods_with_var} and cannot be mapped to coordinates."
             )
+
+        # compute index({var=1}) and index({var=var_ranges[var]})
+        step = term.xreplace({var: 1})
+        limit = term.xreplace({var: range_val})
 
         add_term(var=var, step=step, limit=limit)
 

@@ -123,6 +123,41 @@ def test_changed_view_is_dropped_and_recreated(tmp_path):
     assert "a + 1" in server.live["v"]
 
 
+REFRESH_MV = (
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS r REFRESH EVERY 30 MINUTE APPEND TO t "
+    "AS SELECT a FROM v"
+)
+
+
+def test_refreshable_mv_is_created_after_the_views_it_reads(tmp_path):
+    d = _schema(tmp_path, {"10-t.sql": TABLE + ";\n" + REFRESH_MV, "50-v.sql": VIEW})
+    files = SchemaApplier.selected_files(d)
+    assert [o.kind for p, t in files for o in SchemaApplier.objects(p, t)] == [
+        "table",
+        "refresh",
+        "view",
+    ]
+    planned = SchemaApplier.plan(FakeServer(), DB, files, [])
+    server = FakeServer()
+    steps = _run(server, d)
+    assert [(a, n) for a, n, _ in steps] == [
+        ("create", "t"),
+        ("create", "v"),
+        ("create", "r"),
+    ]
+    assert [(a, n) for a, n, _ in planned] == [(a, n) for a, n, _ in steps]
+    assert _run(server, d) == []
+
+
+def test_stored_refreshable_mv_compares_without_its_column_list():
+    stored = (
+        "CREATE MATERIALIZED VIEW db.r REFRESH EVERY 30 MINUTE APPEND TO db.t (`a` UInt8) "
+        "DEFINER = someone SQL SECURITY DEFINER AS SELECT a FROM db.v"
+    )
+    want = SchemaApplier.canonical(FakeServer(), REFRESH_MV, DB)
+    assert SchemaApplier.canonical(FakeServer(), stored, DB) == want
+
+
 def test_drifted_table_fails_without_altering(tmp_path):
     d = _schema(tmp_path, {"10-t.sql": TABLE})
     server = FakeServer(
@@ -178,6 +213,29 @@ def test_plan_labels_only_what_a_pending_migration_adds(tmp_path):
         ("drift", "u"),
         ("migrate", "001_add.sql"),
     ]
+
+
+def test_an_mv_a_pending_migration_recreates_is_not_drift(tmp_path):
+    mv = "CREATE MATERIALIZED VIEW IF NOT EXISTS m TO t AS SELECT {} AS a FROM t"
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE + ";\n" + mv.format("a + 1")},
+        {
+            "001_mv.sql": "DROP VIEW IF EXISTS m;\n"
+            + mv.format("a + 1").replace("IF NOT EXISTS ", "")
+        },
+    )
+    live = {
+        "t": TABLE.replace("IF NOT EXISTS ", ""),
+        "m": mv.format("a").replace("IF NOT EXISTS ", ""),
+    }
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(
+        FakeServer(live), DB, files, SchemaApplier.migration_files(d)
+    )
+    assert ("migrates", "m") in [(a, n) for a, n, _ in steps]
+    steps = _run(FakeServer(live), d)
+    assert ("migrate", "001_mv.sql") in [(a, n) for a, n, _ in steps]
 
 
 def test_a_constraint_a_pending_migration_replaces_is_not_drift(tmp_path):
