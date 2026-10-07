@@ -95,7 +95,7 @@ from .enforce_indirect_access_layout import (
 logger = get_inductor_logger("nonstick_dim_order")
 
 
-def _reorder_stl(
+def _matmul_reorder_stl(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     name: str = "",
@@ -185,7 +185,7 @@ def _try_matmul_perf_reorder(
     write_dep = next(iter(buf.get_read_writes().writes), None)
     if write_dep is None:
         return None
-    return _reorder_stl(buf.committed_stl, write_dep, buf.get_name(), pinned)
+    return _matmul_reorder_stl(buf.committed_stl, write_dep, buf.get_name(), pinned)
 
 
 def _indirect_stride_idx(
@@ -201,7 +201,7 @@ def _indirect_stride_idx(
     return None
 
 
-def _build_required_stl(
+def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
@@ -254,7 +254,7 @@ def _try_gather_ia_constraint(
     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
     if indirect_device_pos == 0:
         return None
-    new_stl = _build_required_stl(stl, indirect_device_pos)
+    new_stl = _ia_rotate_stl(stl, indirect_device_pos)
     logger.info(
         "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -311,7 +311,7 @@ def _try_scatter_ia_constraint(
         return None  # already compliant
 
     # Rotate the first indirect dim to position 0.
-    new_stl = _build_required_stl(stl, indirect_device_pos[0])
+    new_stl = _ia_rotate_stl(stl, indirect_device_pos[0])
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -501,7 +501,7 @@ def _insert_mutation_relayout_copy(
         )
     assert write_stride_idx is not None
     output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    required_stl = _ia_rotate_stl(output_stl, output_indirect_pos)
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -824,6 +824,6 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
             if _dim_order_is_compliant(value_stl, stride_idx):
                 continue
             indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-            required_stl = _build_required_stl(value_stl, indirect_device_pos)
+            required_stl = _ia_rotate_stl(value_stl, indirect_device_pos)
             required_layout = _fixed_tiled(layout, required_stl)
             op = _insert_relayout_copy(graph, op, buf, required_layout)
