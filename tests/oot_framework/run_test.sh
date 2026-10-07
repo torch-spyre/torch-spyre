@@ -1428,6 +1428,26 @@ def _xfail_failure_message(report):
 def pytest_runtest_logreport(report):
     if report.when == "call" and report.skipped and getattr(report, "wasxfail", None) is not None:
         os.write(1, f"  [XFAIL ERROR = {_xfail_failure_message(report)}]\n".encode())
+
+
+import pytest
+
+
+# This pytest process owns its Spyre card and a card serves one process, so a
+# subprocess a test starts (e.g. test_codecache's "python -c" compile steps)
+# must not try to open it -- it fails with "Device or resource busy". torch_spyre
+# treats IS_INDUCTOR_SPAWNED_SUBPROCESS=1 as "not the owner" (no runtime, no
+# device) and reads it once at import, so setting it only while a test runs
+# reaches child processes and never this one.
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    prev = os.environ.get("IS_INDUCTOR_SPAWNED_SUBPROCESS")
+    os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = "1"
+    yield
+    if prev is None:
+        os.environ.pop("IS_INDUCTOR_SPAWNED_SUBPROCESS", None)
+    else:
+        os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = prev
 CONFTEST_EOF
 
     WRAPPER_FILES+=("$wrapper_path" "$conftest_path")
