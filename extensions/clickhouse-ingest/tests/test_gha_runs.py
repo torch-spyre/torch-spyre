@@ -553,7 +553,8 @@ def test_cli_ends_a_stopped_poll_with_a_notice_not_an_error(clock, monkeypatch, 
         gha_runs.main(
             ["poll", "--repo", REPO, "--repo", "torch-spyre/hf-adapters", "--dry-run"]
         )
-    assert stopped.value.code == gha_runs.EXIT_MORE
+    # More to do, but not until the quota recovers.
+    assert stopped.value.code == gha_runs.EXIT_BUDGET
     err = capsys.readouterr().err
     assert (
         "[notice] torch-spyre/torch-spyre: budget reached at 50 remaining; resume next run"

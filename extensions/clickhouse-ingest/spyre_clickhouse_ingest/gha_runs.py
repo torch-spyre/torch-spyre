@@ -30,7 +30,8 @@ rate limit's remaining falls to --reserve of it. --deadline-minutes is split eve
 repos still to poll, so one busy repo cannot starve the rest; time a repo leaves unused passes
 on. The next poll continues either way. --wait-for-reset sleeps to the reset instead, for a
 manual backfill. A token that expires mid-poll (an App installation token lives an hour)
-stops it the same way. A poll that stopped early exits 3, one that finished exits 0.
+stops it the same way. A poll that finished exits 0; one that stopped early exits 3 (deadline
+or token: continue now) or 4 (rate reserve: continue in a later run).
 Needs GITHUB_TOKEN.
 """
 
@@ -54,8 +55,10 @@ API = "https://api.github.com"
 LIST_CAP = 1000
 PAGE = 100
 RETRIES = 6
-# Exit status of a poll that stopped early with more to do; 0 means the windows are done.
+# Exit status of a poll that stopped early with more to do: at its deadline or an expired token
+# (a caller may continue at once), or at the rate reserve (wait for a later run). 0 = done.
 EXIT_MORE = 3
+EXIT_BUDGET = 4
 
 # Lane names match the Jenkins trigger_source values, so one gate view covers both systems.
 # pull_request is the PR-validation lane, which Jenkins calls spyre-test.
@@ -625,7 +628,7 @@ def main(argv=None) -> None:
         file=sys.stderr,
     )
     if stopped:
-        sys.exit(EXIT_MORE)
+        sys.exit(EXIT_BUDGET if gh.exhausted() and not gh.wait_for_reset else EXIT_MORE)
 
 
 if __name__ == "__main__":
