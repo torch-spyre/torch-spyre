@@ -607,7 +607,7 @@ def _bench_entries(records: list) -> list:
     behind it.
 
     Dropped from v2 deliberately: regression_status and ratio (verdicts with no recorded
-    baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare instead), and
+    baseline -- derived in v_benchmark_metric_verdicts / v_benchmark_backend_compare instead), and
     every run-context column (reached through run_id).
     """
     uncaptured = {

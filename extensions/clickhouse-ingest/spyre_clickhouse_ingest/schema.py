@@ -44,6 +44,12 @@ CAPABILITY_STATUS_VALUES = frozenset(
     {"passed", "failed", "not_implemented", "undetermined"}
 )
 
+RUN_SOURCE_VALUES = frozenset({"jenkins", "gha"})
+PIPELINE_TYPE_VALUES = frozenset(
+    {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
+)
+RUN_STATE_VALUES = frozenset({"running", "finished"})
+
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
 # A dep entry is "<component>@<id12>", 'base=<sha256>', or a bare name -- NOT a uuid,
@@ -464,6 +470,67 @@ class ArtifactResults(Table):
     Row = ArtifactResultRow
 
 
+class PipelineRuns(Table):
+    """One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.
+
+    Jenkins rows arrive as JSONEachRow from vars/pushToClickhouse.groovy; this model is the
+    shape the gha_runs poller writes through.
+    """
+
+    name = "pipeline_runs"
+    columns = (
+        "run_key",
+        "updated_at",
+        "source",
+        "pipeline_type",
+        "state",
+        "job_name",
+        "build_number",
+        "attempt",
+        "build_url",
+        "agent",
+        "parent_run_key",
+        "started_at",
+        "ended_at",
+        "queue_ms",
+        "duration_ms",
+        "build_ms",
+        "test_ms",
+        "trigger_kind",
+        "trigger_source",
+        "preset",
+        "build_mode",
+        "repo",
+        "pr_number",
+        "sha",
+        "component",
+        "arches",
+        "result",
+        "verdict",
+        "superseded",
+        "reached_normal_completion",
+        "lane_results",
+        "nodes_built",
+        "nodes_reused",
+        "nodes_dropped",
+        "tests_total",
+        "tests_failed",
+        "ch_write_failures",
+        "failure_reason",
+        "failure_is_infra",
+        "failure_evidence",
+        "failed_stage",
+        "fail_log_tail",
+        "props",
+    )
+    required = ("run_key", "job_name")
+    enums = (
+        ("source", RUN_SOURCE_VALUES),
+        ("pipeline_type", PIPELINE_TYPE_VALUES),
+        ("state", RUN_STATE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -475,6 +542,7 @@ ARTIFACTS = Artifacts
 ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
+PIPELINE_RUNS = PipelineRuns
 
 TABLES = {
     t.name: t
@@ -489,6 +557,7 @@ TABLES = {
         ArtifactResults,
         Capabilities,
         CapabilityRuns,
+        PipelineRuns,
     )
 }
 

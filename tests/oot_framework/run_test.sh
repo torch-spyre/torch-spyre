@@ -2034,7 +2034,7 @@ _run_xdist_fallback() {
     # re-run overwrote the first attempt's XML.
     if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
-        python3 "${_SCRIPT_DIR}/utils/mark_retried.py" signal "$_shard_xml" || true
+        python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
     fi
 }
 
@@ -2096,6 +2096,22 @@ except Exception as e:
     echo 1
 }
 
+# Sets the caller's _probe_slot to a card slot in [0, $1) not held by a running probe, waiting if all are busy.
+_claim_probe_slot() {
+    local _n="$1" _s _pid _running
+    while :; do
+        _running=" $(jobs -rp | tr '\n' ' ') "
+        for (( _s=0; _s<_n; _s++ )); do
+            _pid="${_probe_slot_pids[$_s]:-}"
+            if [[ -z "$_pid" || "$_running" != *" $_pid "* ]]; then
+                _probe_slot=$_s
+                return
+            fi
+        done
+        wait -n 2>/dev/null || true
+    done
+}
+
 # ---------------------------------------------------------------------------
 # _run_parallel_across_cards
 #
@@ -2114,8 +2130,8 @@ except Exception as e:
 #
 # Collection uses `pytest --collect-only -q` run from the file's directory
 # so conftest.py and SPYRE_TEST_FILE / OOT_TEST_FILE are set up identically
-# to a real run.  Collection is done without SPYRE_DEVICES so the runtime
-# is not loaded.
+# to a real run.
+# Collection opens a card (upstream conftest seeds the RNG), so each concurrent probe gets its own card (#5150).
 #
 # Globals read:   RUN_FILES TEST_FILES _EXTRA_NO_XML _FINAL_XML_PATH
 #                 YAML_CONFIG _XML_INJECT_PY
@@ -2143,6 +2159,31 @@ _run_parallel_across_cards() {
     local _collect_start=$SECONDS
 
     # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    local _k
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
+    # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
     # Output of `pytest --collect-only -q` looks like:
@@ -2154,11 +2195,9 @@ _run_parallel_across_cards() {
     # We keep only lines that contain "::" (node IDs), discarding the
     # summary line and any warnings.
     #
-    # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
-    # framework can identify the config) but without SPYRE_DEVICES / hardware
-    # initialisation so collection is fast even on a login node.
+    # Per-file collection sets SPYRE_TEST_FILE so the OOT framework can identify the config.
     #
-    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # The per-file `--collect-only` probes
     # are fanned out as background jobs (bounded to _n_cards concurrent) and
     # each writes its raw node IDs to a per-file temp file. Running them
     # serially and foreground here was the dominant cost of --parallel (every
@@ -2188,8 +2227,9 @@ _run_parallel_across_cards() {
         done
     fi
 
-    # Fan out collection: one background probe per file, bounded to _n_cards
-    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    # Fan out collection: one background probe per file, each pinned to a free card slot.
+    local -a _probe_slot_pids=()
+    local _probe_slot
     local -a _collect_out_files=()
     # Parallel array to _collect_out_files, indexed the same way, holding each probe's stderr path.
     local -a _collect_err_files=()
@@ -2214,23 +2254,16 @@ _run_parallel_across_cards() {
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
+        # Blocks until a card slot is free -- this is also the concurrency throttle.
+        _claim_probe_slot "$_n_cards"
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
             set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
-            # Give this probe its own Inductor cache dir so concurrent collect-only imports
-            # don't share cache state. Bucketed by the same concurrency bound as the probe
-            # throttle (not by file), so only _n_cards dirs ever exist -- keying by file index
-            # instead was tried and measurably slower (every probe pays a cold-cache setup
-            # cost instead of most reusing an already-warmed slot's dir), without actually
-            # preventing failures: the same handful of heavy-import files still failed on a
-            # contended first attempt even with fully unique dirs, and it was the retry below
-            # (a fresh, less-contended attempt -- not cache-dir isolation) that reliably saved
-            # them. So slot bucketing stays naive here; a same-slot collision, if it ever
-            # happens, is caught by that retry instead of prevented up front.
+            export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
+            # One Inductor cache dir per slot (per-file dirs were measurably slower: cold cache each probe).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
-            _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
@@ -2240,11 +2273,7 @@ _run_parallel_across_cards() {
             echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
-
-        # Throttle to at most _n_cards concurrent probes.
-        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
-            wait -n 2>/dev/null || true
-        done
+        _probe_slot_pids[$_probe_slot]=$!
     done
 
     # Wait for any remaining probes to finish before reading their output.
@@ -2326,10 +2355,13 @@ _run_parallel_across_cards() {
             _retry_out_files[$i]="$_rout"
             _retry_err_files[$i]="$_rerr"
             _retry_exit_files[$i]="$_rexit"
+            # Same card pinning as the first pass, capped at this round's worker limit.
+            _claim_probe_slot "$_retry_workers"
             (
                 set +euo pipefail
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
+                export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
@@ -2339,9 +2371,7 @@ _run_parallel_across_cards() {
                 echo "${PIPESTATUS[0]}" > "$_rexit"
             ) &
             _retry_pids+=($!)
-            while [[ "$(jobs -rp | wc -l)" -ge "$_retry_workers" ]]; do
-                wait -n 2>/dev/null || true
-            done
+            _probe_slot_pids[$_probe_slot]=$!
         done
         for _rpid in "${_retry_pids[@]+"${_retry_pids[@]}"}"; do
             wait "$_rpid" 2>/dev/null || true
@@ -2451,7 +2481,6 @@ _run_parallel_across_cards() {
     # Format per line:  <file_idx>:<node_id>
     # -----------------------------------------------------------------------
     local -a _card_id_files=()
-    local _k
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _f="/tmp/_spyre_card_ids_${$}_${_k}.tmp"
         : > "$_f"
@@ -2463,31 +2492,7 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
-    # -----------------------------------------------------------------------
-    # Card-slot -> physical SPYRE_DEVICES index mapping.
-    #
-    # _n_cards is a count (e.g. 3), not a list of physical device indices.
-    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
-    # "1,5,7"), device_count() already narrows the detected count to match,
-    # but the physical indices are NOT 0..N-1 -- they are exactly the values
-    # listed. Each per-card subshell must export its real index, not its
-    # position in the round-robin loop, or it ends up targeting cards the
-    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
-    # -----------------------------------------------------------------------
-    local -a _CARD_DEVICE_IDS=()
-    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
-        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
-    fi
-    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
-        # No restriction (or a mismatched one) -- fall back to the natural
-        # 0..N-1 physical indexing.
-        _CARD_DEVICE_IDS=()
-        for (( _k=0; _k<_n_cards; _k++ )); do
-            _CARD_DEVICE_IDS+=("$_k")
-        done
-    fi
-
-    # Print the assignment summary.
+    # Print the assignment summary (card -> physical index from _CARD_DEVICE_IDS above).
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
@@ -2702,7 +2707,7 @@ _run_parallel_across_cards() {
                                 fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
-                                    python3 "${_SCRIPT_DIR}/utils/mark_retried.py" signal "$_shard_xml" || true
+                                    python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
                                 fi
                                 # Accumulate counts from xdist retry output.
                                 if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
