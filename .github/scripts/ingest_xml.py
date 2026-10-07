@@ -40,7 +40,6 @@ from spyre_clickhouse_ingest import (
     ensure_artifact,
     insert_artifact_result,
     insert_benchmarks,
-    insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
     capability_declaration,
@@ -1223,20 +1222,9 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
 
 
 # ---------------------------------------------------------------------------
-# The GHA leg's artifact, and its verdict. The id is derived on the RUNNER (only it can read
-# the image's stamped base id and knows the installed delta) and arrives as --artifact-id.
+# The leg's artifact, and its verdict. A GHA leg's id is derived on the RUNNER (only it can
+# read the image's stamped base id and knows the installed delta) and arrives as --artifact-id.
 # ---------------------------------------------------------------------------
-
-
-def _parse_artifact_record(raw: str):
-    """Split --artifact-id into (artifact_id, base_artifact_id, installed).
-
-    Tolerant both ways -- producer and parser are versioned independently, so a strict arity
-    check would turn a format bump into lost rows for every in-flight run.
-    """
-    parts = [f.strip() for f in (raw or "").split("|")]
-    parts += [""] * (3 - len(parts))
-    return parts[0], parts[1], parts[2]
 
 
 def _leg_state(failed: int, total: int) -> str:
@@ -1282,10 +1270,7 @@ def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
     if not legs or not v2db or not (args.artifact_id or _opt(args, "artifact")):
         return
     try:
-        if _opt(args, "artifact"):
-            _write_named_artifact_verdicts(client, v2db, args, legs)
-        else:
-            _write_gha_artifact_verdicts(client, v2db, args, legs)
+        _write_named_artifact_verdicts(client, v2db, args, legs)
     except Exception as err:
         # The cases are already in; losing the verdict must not also lose them.
         print(
@@ -1311,17 +1296,24 @@ def _admitted_legs(legs: dict):
 
 
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
-    """--artifact: register what the spec names (and tag it), then its verdicts."""
+    """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
     source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    record = args.artifact_id.strip()
+    spec = _opt(args, "artifact") or (f"gha:{record}" if "|" in record else record)
+    admitted = list(_admitted_legs(legs))
+    if not (admitted or _opt(args, "artifact")):
+        # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
+        return
     try:
-        # A test leg did not build what it ran; the build's own record (write-once) wins.
         identity = ensure_artifact(
             client,
             v2db,
-            args.artifact,
+            spec,
             args.platform or "",
-            origin="promoted",
+            # A test leg did not build what it ran; the build's own record (write-once) wins.
+            # A GHA delta is the leg's own build.
+            origin="promoted" if _opt(args, "artifact") else "built",
             tags=_opt(args, "tag") or [],
             tag_family=_opt(args, "tag_family") or None,
             tag_date=_opt(args, "tag_date") or None,
@@ -1331,12 +1323,12 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
         )
     except ValueError as err:
         print(
-            f"  [warn] v2: --artifact {args.artifact!r} names no artifact: {err}",
+            f"  [warn] v2: artifact {spec!r} names no artifact: {err}",
             file=sys.stderr,
         )
         return
     aid = identity.artifact_id
-    for run_id, tier, acc in _admitted_legs(legs):
+    for run_id, tier, acc in admitted:
         state = _leg_state(acc["failed"], acc["total"])
         if insert_artifact_result(
             client,
@@ -1348,42 +1340,10 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
             arch=args.platform or "",
             duration_s=acc["duration_s"],
             props={"run_url": run_url, "source": source},
+            attempt=getattr(args, "run_attempt", 0),
         ):
             print(
                 f"  v2: artifact_results {aid} [{tier}] state={state} under run_id={run_id}"
-            )
-
-
-def _write_gha_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
-    """--artifact-id: the GHA record derived on the runner (derive-gha-artifact-id)."""
-    artifact_id, base_id, installed = _parse_artifact_record(args.artifact_id)
-    if not artifact_id:
-        return
-    for run_id, tier, acc in _admitted_legs(legs):
-        wrote = insert_gha_artifact_result(
-            client,
-            v2db,
-            artifact_id=artifact_id,
-            component=component_of(args, COMPONENT_DEFAULT),
-            arch=args.platform or "",
-            run_id=run_id,
-            test_type=tier,
-            state=_leg_state(acc["failed"], acc["total"]),
-            duration_s=acc["duration_s"],
-            # Hash inputs, carried through the record -- unreachable from this job.
-            base_artifact_id=base_id,
-            installed=installed,
-            repo=args.repository,
-            git_ref=args.branch,
-            git_sha=args.sha,
-            run_url=_opt(args, "run_url") or _gha_run_url(args),
-            attempt=getattr(args, "run_attempt", 0),
-        )
-        if wrote:
-            print(
-                f"  v2: artifact_results {artifact_id} "
-                f"[{tier}] state={_leg_state(acc['failed'], acc['total'])} "
-                f"under run_id={run_id}"
             )
 
 

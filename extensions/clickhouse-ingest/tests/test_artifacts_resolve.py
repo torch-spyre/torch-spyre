@@ -417,6 +417,48 @@ def test_a_recorded_row_whose_inputs_do_not_hash_to_its_id_is_refused():
         resolve(bad[0], "s390x", lookup=FakeLookup([bad]))
 
 
+GHA_BASE = "d9e898d6-14b2-59c4-8bdf-7339ffaf553d"
+GHA_INSTALLED = "hf-adapters@fa67696108bd,torch-spyre@f7a6afb683d0"
+# A recorded prod row: what derive-gha-artifact-id uploaded for that leg.
+GHA_AID = "5f8462e0-4d76-5ccd-b5b4-41d66561dc85"
+GHA_RECORD = f"gha:{GHA_AID}|{GHA_BASE}|{GHA_INSTALLED}"
+
+
+def test_a_gha_record_derives_its_own_id_or_finds_its_row():
+    out = resolve(GHA_RECORD, "amd64", lookup=FakeLookup(), component="hf-adapters")
+    assert (out["source"], out["artifact_id"], out["refs"]) == (
+        "derived",
+        GHA_AID,
+        [],
+    )
+    row = (GHA_AID, "hf-adapters", GHA_BASE, "4b6dc1216d46", "x86_64", "image", "")
+    assert (
+        resolve(GHA_RECORD, "x86_64", lookup=FakeLookup([row]))["source"] == "existing"
+    )
+
+
+def test_a_gha_record_whose_fields_do_not_hash_to_its_id_is_refused():
+    with pytest.raises(ValueError):
+        resolve(GHA_RECORD, "x86_64", lookup=FakeLookup(), component="torch-spyre")
+    assert resolve(f"gha:{GHA_AID}", "x86_64", lookup=FakeLookup()) == {}
+
+
+def test_ensure_chains_a_gha_delta_on_its_base():
+    client = FakeClient()
+    for _ in range(2):
+        identity = ensure_artifact(client, "db", GHA_RECORD, "x86_64",
+                                   component="hf-adapters")  # fmt: skip
+    assert identity.artifact_id == GHA_AID
+    (art,) = client.tables[ARTIFACTS.name]
+    assert (art["kind"], art["artifact_name"], art["identity_deps"]) == (
+        "image",
+        GHA_BASE,
+        [f"base={GHA_BASE}"],
+    )
+    assert (art["props"]["id12"], art["props"]["source"]) == ("4b6dc1216d46", "gha")
+    assert client.tables[ARTIFACT_REFS.name] == []
+
+
 def test_an_unknown_spec_is_refused():
     with pytest.raises(ValueError):
         resolve("tarball:x", "s390x")

@@ -694,7 +694,7 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
         "component_of",
         "run_id_for",
         "cases_already_ingested",
-        "insert_gha_artifact_result",
+        "ensure_artifact",
         "insert_test_results",
         "extract_properties",
         "promote_xpass",
@@ -711,25 +711,8 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
 # These cover what the ingest side does with it.
 
 _BASE = "2b397099-6200-52fb-98c4-b603961a0582"
-_AID = "8a4c410c-320d-5711-b987-c15b50bec3fc"
+_AID = "80c2d876-ee96-5c37-a8c5-460cab0686b4"
 _RUN_ID = "1a6080e8-d061-547f-ab63-1af99b18ad0c"
-
-
-def test_artifact_record_splits_into_its_three_fields(ingest):
-    assert ingest._parse_artifact_record(
-        f"{_AID}|{_BASE}|torch-spyre@07379f50,lxml"
-    ) == (
-        _AID,
-        _BASE,
-        "torch-spyre@07379f50,lxml",
-    )
-
-
-def test_a_bare_id_still_parses(ingest):
-    # Producer and parser are versioned independently; a format bump must not lose rows.
-    assert ingest._parse_artifact_record(_AID) == (_AID, "", "")
-    assert ingest._parse_artifact_record(f"{_AID}|{_BASE}") == (_AID, _BASE, "")
-    assert ingest._parse_artifact_record("") == ("", "", "")
 
 
 def test_a_leg_with_no_cases_is_an_error_not_a_failure(ingest):
@@ -790,6 +773,29 @@ def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
     assert row["state"] == "failed"
     assert row["duration_s"] == 12.5
     assert row["artifact_id"] == _AID
+
+
+def test_a_gha_record_registers_the_delta_chained_on_its_base(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 2, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    rows = {t: [dict(zip(cols, r)) for r in rs] for t, rs, cols in c.inserts}
+    (art,) = rows["artifacts"]
+    assert (art["artifact_id"], art["origin"], art["identity_deps"]) == (
+        _AID,
+        "built",
+        [f"base={_BASE}"],
+    )
+    assert art["props"]["source"] == "gha"
+    assert "artifact_refs" not in rows
+
+
+def test_a_gha_record_minted_under_another_component_is_refused(ingest):
+    # Its fields hash to a different id: writing it would file a row its id cannot name.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 2, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(component="hf-adapters"), legs)
+    assert c.inserts == []
 
 
 def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):

@@ -21,6 +21,7 @@ Spec grammar (each optionally followed by `;component=`, `;name=`, `;id12=`):
     rpm:<file name | URL | NEVRA | dnf glob>
     wheel:<name==version | file name | URL>
     generic:<url>[#<sha256>]
+    gha:<artifact_id>|<base_artifact_id>|<installed>  derive-gha-artifact-id's record
     <artifact_id>                                  a bare uuid, which must exist
 
 Order: normalise (image -> per-arch leaf and its labels; Artifactory file -> its sha256 and
@@ -44,7 +45,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .identity import ArtifactIdentity, DerivedId
+from . import schema
+from .identity import ID_SEP, ArtifactIdentity, DerivedId
 from .registry import RELEASE, Registry, dated_tag, family_of, split_image, tag_of
 from .writer import ArtifactWriter
 
@@ -243,9 +245,11 @@ def resolve(
             return {}
         result = _result(out, _identity_of(row), "existing", spec)
         return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
+    if kind == "gha":
+        return _gha(out, rest, arch, lookup, component)
     if kind not in KINDS:
         raise ValueError(
-            f"spec must be image:, rpm:, wheel:, generic: or an artifact_id: {spec!r}"
+            f"spec must be image:, rpm:, wheel:, generic:, gha: or an artifact_id: {spec!r}"
         )
     body, over = _options(rest)
     if kind != "image":
@@ -337,6 +341,24 @@ def _named(result: dict, resolved_tag: str, tag_family: str, tags) -> dict:
     )
     result.update(tag=primary[0], tag_family=primary[1], tags=[list(p) for p in pairs])
     return result
+
+
+def _gha(out, rest, arch, lookup, component) -> dict:
+    """A GHA leg's delta on a prebaked image; refused when the record's fields do not hash
+    to its id (the component it was derived under is not the caller's)."""
+    body, over = _options(rest)
+    aid, base, installed = ([p.strip() for p in body.split(ID_SEP)] + ["", ""])[:3]
+    row = _is_uuid(aid) and lookup.by_id(aid)
+    if row:
+        return _result(out, _identity_of(row), "existing", "gha:" + body)
+    derived = ArtifactIdentity.from_gha(
+        over.get("component") or component, base, installed, arch
+    )
+    if not (base and derived.artifact_id):
+        return {}
+    if derived.artifact_id != DerivedId.norm(aid):
+        raise ValueError(f"gha record {aid}: its inputs hash to {derived.artifact_id}")
+    return _result(out, derived, "derived", "gha:" + body)
 
 
 def _image(out, body, over, arch, lookup, registry, tag_family, tag_date, tags) -> dict:
@@ -481,21 +503,34 @@ def ensure_artifact(
         raise ValueError(f"{spec!r} names no artifact on {arch}")
     identity = r["identity"]
     # The canonical ref (an image's pinned leaf) is added to an existing record once.
-    ref = r["artifact"].partition(":")[2] if ":" in r["artifact"] else identity.ref
+    ref = (
+        r["artifact"].partition(":")[2]
+        if r["artifact"].startswith(identity.kind + ":")
+        else identity.ref
+    )
     if ArtifactWriter.ref_recorded(client, db, identity.artifact_id, ref):
         ref = ""
     identity = dataclasses.replace(
         identity, ref=ref, content_digest=r.get("leaf", identity.content_digest)
     )
     props = {"run_url": run_url}
+    # A GHA delta is recorded as insert_gha_result records it: chained on its base image.
+    base = dict(identity.inputs).get("base_artifact_id", "")
     ArtifactWriter.insert_artifact(
         client,
         db,
         identity,
         origin=origin,
         sources=sources,
-        identity_deps=identity_deps,
-        props={"run_url": run_url, "resolved_from": r["source"]},
+        identity_deps=[
+            *identity_deps,
+            *([f"{schema.DEP_BASE_PREFIX}{base}"] if base else []),
+        ],
+        props={
+            "run_url": run_url,
+            "resolved_from": r["source"],
+            **({"source": "gha"} if base else {}),
+        },
         tags=[(t, f, props) for t, f in r["tags"]],
     )
     return dataclasses.replace(identity, ref=ref or r["identity"].ref)
