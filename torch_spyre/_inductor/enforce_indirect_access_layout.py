@@ -161,56 +161,6 @@ def _real_layout(buf) -> FixedTiledLayout:
     return layout
 
 
-def _indirect_stride_idx(coords: list[sympy.Expr], access_subs: dict) -> int | None:
-    """Return the stride_idx (from right, 0-indexed) of the first IndirectAccess
-    coordinate, or None if coords carry no indirect symbol.
-
-    # TODO: consolidate with _indirect_stride_idx in nonstick_dim_order into
-    # pass_utils — both files import it; the import cycle prevents EIA→NDO.
-    """
-    for idx, coord in enumerate(reversed(coords)):
-        substituted = coord.xreplace(access_subs) if access_subs else coord
-        if hasattr(substituted, "has") and substituted.has(IndirectAccess):
-            return idx
-    return None
-
-
-def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
-    """Check if indirect access is at the outermost (leftmost) device position."""
-    v_n = len(value_stl.stride_map)
-    v_indirect_pos = v_n - 1 - stride_idx
-    return v_indirect_pos == 0
-
-
-def _build_required_stl(
-    value_stl: SpyreTensorLayout,
-    indirect_device_pos: int,
-) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0.
-
-    # TODO: consolidate with _ia_rotate_stl in nonstick_dim_order into pass_utils
-    # — both files import it; the import cycle prevents EIA→NDO.
-    """
-    device_size = list(value_stl.device_size)
-    stride_map = list(value_stl.stride_map)
-    n = len(device_size)
-    stick_pos = n - 1
-
-    if indirect_device_pos == 0:
-        return value_stl
-
-    order = (
-        [indirect_device_pos]
-        + [i for i in range(n) if i != indirect_device_pos and i != stick_pos]
-        + [stick_pos]
-    )
-    return SpyreTensorLayout(
-        device_size=[device_size[i] for i in order],
-        stride_map=[stride_map[i] for i in order],
-        device_dtype=value_stl.device_dtype,
-    )
-
-
 def _insert_relayout_copy(
     graph: GraphLowering,
     consumer_op: ComputedBuffer,

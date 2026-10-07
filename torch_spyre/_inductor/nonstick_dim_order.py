@@ -225,9 +225,6 @@ def _indirect_stride_idx(
 ) -> int | None:
     """Return the stride_idx (from right, 0-indexed) of the first IndirectAccess
     coordinate, or None if coords carry no indirect symbol.
-
-    # TODO: consolidate with _indirect_stride_idx in enforce_indirect_access_layout
-    # into pass_utils — both files import it; the import cycle prevents EIA→NDO.
     """
     for idx, coord in enumerate(reversed(coords)):
         substituted = coord.xreplace(access_subs) if access_subs else coord
@@ -240,11 +237,7 @@ def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0.
-
-    # TODO: consolidate with _build_required_stl in enforce_indirect_access_layout
-    # into pass_utils — both files import it; the import cycle prevents EIA→NDO.
-    """
+    """Build a new STL with the indirect coordinate rotated to device position 0."""
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
