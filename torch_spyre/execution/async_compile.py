@@ -62,12 +62,23 @@ if TYPE_CHECKING:
 
 logger = get_inductor_logger("sdsc_compile")
 
-# Wall-clock ceiling on ONE backend-compiler invocation, applied to dbo-opt on
-# both the bundle and the KTIR path. It bounds a wedged compiler -- which would
-# otherwise block torch.compile forever with no diagnostic -- rather than
-# policing slowness: both finish in well under a second on a small kernel.
-# Raise it if a large bundle legitimately needs longer.
-_COMPILE_TIMEOUT_S = 60.0
+
+def _backend_compile_timeout() -> float | None:
+    """The dbo-opt timeout for ``subprocess.run``: None when the knob is <= 0.
+
+    See ``backend_compile_timeout_seconds`` in ``_inductor/config``.
+    """
+    timeout = _spyre_config.backend_compile_timeout_seconds
+    return timeout if timeout > 0 else None
+
+
+def _timeout_message(timeout: float | None) -> str:
+    return (
+        f"dbo-opt timed out after {timeout}s; raise "
+        "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS (config "
+        "backend_compile_timeout_seconds, <= 0 disables) if this kernel "
+        "legitimately needs longer."
+    )
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -212,6 +223,7 @@ def _run_backend_compiler(
     compile_dir: str,
     env: dict[str, str],
     backend_loop_unroll: bool,
+    timeout: float | None,
 ) -> str:
     """Compile one materialized bundle with dbo-opt and return its directory.
 
@@ -224,6 +236,8 @@ def _run_backend_compiler(
     the dbo-opt lookup below resolves the same binary the parent would.
     ``backend_loop_unroll`` is the resolved parent config used for the cache key;
     workers must not re-read it from their own config or environment.
+    ``timeout`` is likewise resolved in the parent (``_backend_compile_timeout``)
+    so a runtime config change reaches pool workers too.
     """
     _check_backend_compiler_on_path()
 
@@ -257,7 +271,7 @@ def _run_backend_compiler(
                 text=True,
                 check=True,
                 env=env,
-                timeout=_COMPILE_TIMEOUT_S,
+                timeout=timeout,
             )
             # The KTIR path (#3651) reports that dbo-opt can exit 0 having
             # written nothing, so treat the artifact -- not the return code --
@@ -282,8 +296,7 @@ def _run_backend_compiler(
                 code_dir=compile_dir,
             )
             raise RuntimeError(
-                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
-                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+                f"{_timeout_message(timeout)}\ncommand: {' '.join(cmd)}"
             ) from exc
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -441,11 +454,16 @@ class SpyreAsyncCompile(AsyncCompile):
                     compile_dir,
                     dict(os.environ),
                     backend_loop_unroll,
+                    _backend_compile_timeout(),
                 )
 
         with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
             _run_backend_compiler(
-                kernel_name, compile_dir, dict(os.environ), backend_loop_unroll
+                kernel_name,
+                compile_dir,
+                dict(os.environ),
+                backend_loop_unroll,
+                _backend_compile_timeout(),
             )
         return None
 
@@ -711,6 +729,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # problem to fix in the shell, not something to paper over per-child --
         # and a child-only path stopped being separable once a process commits
         # to one backend for its lifetime via ``ktir_emitter``.
+        timeout = _backend_compile_timeout()
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
                 with timing_recorder.stage(
@@ -721,7 +740,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         capture_output=True,
                         text=True,
                         check=True,
-                        timeout=_COMPILE_TIMEOUT_S,
+                        timeout=timeout,
                     )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
@@ -744,8 +763,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     code_dir=output_dir,
                 )
                 raise RuntimeError(
-                    f"OpSpec->KTIR: dbo-opt timed out after "
-                    f"{_COMPILE_TIMEOUT_S}s (_COMPILE_TIMEOUT_S).\n"
+                    f"OpSpec->KTIR: {_timeout_message(timeout)}\n"
                     f"command: {' '.join(cmd)}"
                 ) from exc
             except subprocess.CalledProcessError as exc:

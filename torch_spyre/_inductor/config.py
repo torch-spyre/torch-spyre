@@ -126,6 +126,27 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
+
+# Wall-clock ceiling, in seconds, on ONE backend-compiler (dbo-opt) invocation,
+# on both the bundle and the KTIR path. It bounds a wedged compiler -- which
+# would otherwise block torch.compile forever with no diagnostic -- rather than
+# policing slowness: a small kernel finishes in well under a second. Raise it if
+# a large bundle legitimately needs longer; non-positive values disable the
+# limit. The parent reads it and passes it to each compile, so a runtime
+# ``config.patch`` also reaches compiles in Inductor's subprocess pool.
+def _backend_compile_timeout_from_env() -> float:
+    value = os.environ.get("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", "60")
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds, "
+            f"got {value!r}"
+        ) from exc
+
+
+backend_compile_timeout_seconds: float = _backend_compile_timeout_from_env()
+
 # Enable certified LX ownership changes: movement, exact fused-axis views,
 # consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not

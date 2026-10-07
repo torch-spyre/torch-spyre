@@ -104,8 +104,30 @@ def test_loop_unroll_rejects_invalid_environment(monkeypatch, value):
         _load_config(monkeypatch)
 
 
+@pytest.mark.parametrize(
+    "value,expected", [(None, 60.0), ("90", 90.0), ("0", 0.0), ("-5", -5.0)]
+)
+def test_backend_compile_timeout_environment(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", value)
+    assert _load_config(monkeypatch).backend_compile_timeout_seconds == expected
+
+
+@pytest.mark.parametrize("value", ["", "abc"])
+def test_backend_compile_timeout_rejects_invalid_environment(monkeypatch, value):
+    monkeypatch.setenv("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", value)
+    with pytest.raises(
+        ValueError,
+        match="SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds",
+    ):
+        _load_config(monkeypatch)
+
+
 @pytest.mark.parametrize("unroll", [False, True])
-def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll):
+@pytest.mark.parametrize("timeout", [60.0, None])
+def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll, timeout):
     code_dir = tmp_path / "spyreCodeDir"
     code_dir.mkdir()
     (code_dir / "spyrecode.json").write_text("{}")
@@ -117,12 +139,13 @@ def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll):
         patch.object(async_compile_mod.subprocess, "run") as run,
     ):
         assert async_compile_mod._run_backend_compiler(
-            "kernel", str(tmp_path), env, unroll
+            "kernel", str(tmp_path), env, unroll, timeout
         ) == str(tmp_path)
     args = run.call_args.args[0]
     flags = [arg for arg in args if arg.startswith("--enable-loop-unroll=")]
     assert flags == [f"--enable-loop-unroll={int(unroll)}"]
     assert run.call_args.kwargs["env"] == env
+    assert run.call_args.kwargs["timeout"] == timeout
 
 
 @pytest.mark.parametrize("unroll", [False, True])
@@ -131,7 +154,9 @@ def test_single_worker_compiles_inline_without_starting_pool(unroll):
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
-        spyre_config.patch(backend_loop_unroll=unroll),
+        spyre_config.patch(
+            backend_loop_unroll=unroll, backend_compile_timeout_seconds=60.0
+        ),
         patch.object(compiler, "wait_pool_ready") as wait_ready,
         patch.object(compiler, "process_pool") as pool,
         patch.object(async_compile_mod, "_run_backend_compiler") as compile_backend,
@@ -142,8 +167,35 @@ def test_single_worker_compiles_inline_without_starting_pool(unroll):
     wait_ready.assert_not_called()
     pool.assert_not_called()
     compile_backend.assert_called_once_with(
-        "sdsc_0", "/tmp/kernel", dict(os.environ), unroll
+        "sdsc_0", "/tmp/kernel", dict(os.environ), unroll, 60.0
     )
+
+
+def test_backend_timeout_is_resolved_in_parent_for_pool_workers():
+    """A runtime config change must reach the pool, whose workers import config
+    fresh and would otherwise see only the env-derived default."""
+    pool = _RecordingPool()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    for configured, expected in ((900.0, 900.0), (0.0, None)):
+        with (
+            torch._inductor.config.patch({"compile_threads": 2}),
+            spyre_config.patch(
+                {
+                    "backend_compile_timeout_seconds": configured,
+                    "backend_loop_unroll": False,
+                }
+            ),
+            patch.object(compiler, "wait_pool_ready"),
+            patch.object(compiler, "use_process_pool", return_value=True),
+            patch.object(compiler, "process_pool", return_value=pool),
+        ):
+            compiler._submit_backend_compile("sdsc_0", "/tmp/kernel")
+
+        fn, args = pool.calls[-1]
+        assert fn is async_compile_mod._run_backend_compiler
+        assert args[3] is False
+        assert args[4] == expected
 
 
 def test_sdsc_submits_all_backend_jobs_before_wait():
@@ -245,7 +297,7 @@ def test_async_cache_commit_is_deferred_until_wait():
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
         assert hash_specs.call_args.kwargs["backend_loop_unroll"] is False
-        assert pool.calls[0][1][-1] is False
+        assert pool.calls[0][1][-2] is False
         commit.assert_not_called()
 
         pool.futures[0].set_result("compiled")
