@@ -163,7 +163,11 @@ def _real_layout(buf) -> FixedTiledLayout:
 
 def _indirect_stride_idx(coords: list[sympy.Expr], access_subs: dict) -> int | None:
     """Return the stride_idx (from right, 0-indexed) of the first IndirectAccess
-    coordinate, or None if coords carry no indirect symbol."""
+    coordinate, or None if coords carry no indirect symbol.
+
+    # TODO: consolidate with _indirect_stride_idx in nonstick_dim_order into
+    # pass_utils — both files import it; the import cycle prevents EIA→NDO.
+    """
     for idx, coord in enumerate(reversed(coords)):
         substituted = coord.xreplace(access_subs) if access_subs else coord
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
@@ -182,7 +186,11 @@ def _build_required_stl(
     value_stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    """Build a new STL with the indirect coordinate rotated to device position 0.
+
+    # TODO: consolidate with _ia_rotate_stl in nonstick_dim_order into pass_utils
+    # — both files import it; the import cycle prevents EIA→NDO.
+    """
     device_size = list(value_stl.device_size)
     stride_map = list(value_stl.stride_map)
     n = len(device_size)

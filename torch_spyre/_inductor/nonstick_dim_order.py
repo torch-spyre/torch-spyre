@@ -224,7 +224,11 @@ def _indirect_stride_idx(
     access_subs: dict,
 ) -> int | None:
     """Return the stride_idx (from right, 0-indexed) of the first IndirectAccess
-    coordinate, or None if coords carry no indirect symbol."""
+    coordinate, or None if coords carry no indirect symbol.
+
+    # TODO: consolidate with _indirect_stride_idx in enforce_indirect_access_layout
+    # into pass_utils — both files import it; the import cycle prevents EIA→NDO.
+    """
     for idx, coord in enumerate(reversed(coords)):
         substituted = coord.xreplace(access_subs) if access_subs else coord
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
@@ -236,7 +240,11 @@ def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    """Build a new STL with the indirect coordinate rotated to device position 0.
+
+    # TODO: consolidate with _build_required_stl in enforce_indirect_access_layout
+    # into pass_utils — both files import it; the import cycle prevents EIA→NDO.
+    """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
@@ -276,7 +284,7 @@ def _try_gather_ia_constraint(
     stl = buf.committed_stl
     try:
         coords = device_coordinates(stl, dep, sizes, op=op)
-    except (Unsupported, Exception):
+    except Unsupported:
         return None
     coords_substituted = [c.xreplace(access_subs) for c in coords]
     stride_idx = _indirect_stride_idx(coords_substituted, access_subs)
@@ -325,13 +333,13 @@ def _try_scatter_ia_constraint(
         return None
     try:
         access_subs, sizes = _scatter_access_subs_and_sizes(op, buf_layout, write_dep)
-    except Exception:
+    except Unsupported:
         return None
     if not access_subs:
         return None
     try:
         write_coords = device_coordinates(stl, write_dep, sizes)
-    except (Unsupported, Exception):
+    except Unsupported:
         return None
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
@@ -391,8 +399,8 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     if stl is None:
                         continue
                     try:
-                        coords = device_coordinates(stl, dep, sizes)
-                    except Exception:
+                        coords = device_coordinates(stl, dep, sizes, op=op)
+                    except Unsupported:
                         continue
                     coords_sub = [c.xreplace(access_subs) for c in coords]
                     stride_idx = _indirect_stride_idx(coords_sub, access_subs)
