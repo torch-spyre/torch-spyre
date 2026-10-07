@@ -12,28 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Any artifact spec -> its one spyre_v2 artifact: the existing record if there is one, else
-the identity registration would derive. Every writer that names an artifact goes through here
-(`resolve`, `ensure_artifact`), so one artifact gets one id whichever writer saw it first.
+"""Any artifact spec -> its one spyre_v2 artifact. Every writer that names an artifact goes
+through `resolve` (read-only) or `ensure` (records it), so one artifact gets one id whichever
+writer saw it first.
 
-Spec grammar (each optionally followed by `;component=`, `;name=`, `;id12=`):
-    image:<host>/<repo>[:tag][@sha256:<digest>]   a tag, manifest list or per-arch leaf
-    rpm:<file name | URL | NEVRA | dnf glob>
-    wheel:<name==version | file name | URL>
+Specs, simple -> advanced (README: "Naming an artifact"):
+    <artifact_id> | id:<artifact_id>              this exact artifact; it must be recorded
+    image:<host>/<repo>[:tag][@sha256:<digest>]   a list digest resolves to the per-arch leaf;
+                                                  arch `multi` keeps the list
+    rpm:<file | URL | NEVRA | dnf glob>
+    wheel:<name==version | file | URL>
     generic:<url>[#<sha256>]
-    gha:<artifact_id>|<base_artifact_id>|<installed>  derive-gha-artifact-id's record
-    <artifact_id>                                  a bare uuid, which must exist
+    gha:<artifact_id>|<base_artifact_id>|<installed>   derive-gha-artifact-id's record
+    any of the above + ;component=<c>;name=<n>;id12=<12 hex>   an authoritative identity
 
-Order: normalise (image -> per-arch leaf and its labels; Artifactory file -> its sha256 and
-`spyre.identity` property), then look the artifact up in spyre_v2 (a bare id; the image's
-`spyre.artifact.id` label; its refs: the exact ref, the leaf digest, an rpm glob matching the
-file; then name + id12), and only when none matches derive it with ArtifactIdentity.from_*.
-Orchestrator-built artifacts hash the orchestrator's inputs into id12, so for them only the
-lookup (or the label) reproduces the recorded id.
+An under-specified spec is looked up first and the existing record wins; only immutable refs
+(a digest, name==version, an rpm NEVRA or glob, a generic sha) are looked up, never a moving
+tag or a bare name. An authoritative identity is derived from its inputs with no registry call
+and never rebound; a gha: record or an explicit id is verified, never guessed.
 
-Tags: `tag_family` (snap-supply-chain, nightly-supply-chain, weekly-supply-chain,
-ci-cd-tech-preview, release) names the artifact by that family's tag in the registry, else by
-`tag_date` (weekly: its ISO week); full `tags` replace it when in that family, else add to it.
+Tags: `tag_family` (tag_families.yaml) names the artifact by that family's registry tag, else
+by `tag_date`; each full `tag` takes the family its prefix names, else `tag_family`, else
+release, and replaces the resolved tag of its family.
 """
 
 import base64
@@ -45,12 +45,13 @@ import urllib.error
 import urllib.request
 import uuid
 
-from . import schema
 from .identity import ID_SEP, ArtifactIdentity, DerivedId
 from .registry import RELEASE, Registry, dated_tag, family_of, split_image, tag_of
 from .writer import ArtifactWriter
 
 KINDS = ("image", "rpm", "wheel", "generic")
+LOOKUP_MODES = ("auto", "off", "only")
+REGISTRY_MODES = ("auto", "off")
 # Every spelling an arch is stored under; the identity hash folds them, the columns do not.
 ARCH_ALIASES = {"x86_64": ("x86_64", "amd64", "x86", "x86-64")}
 # The orchestrator's image labels: its own record of the artifact it built.
@@ -60,6 +61,11 @@ LABEL_ID, LABEL_ID12, LABEL_NAME = (
     "spyre.artifact.name",
 )
 FILE_IDENTITY_PROP = "spyre.identity"
+IDENTITY_OPTIONS = ("component", "name", "id12")
+
+
+class NeedsRegistry(ValueError):
+    """The spec cannot be resolved without the registry, and registry='off'."""
 
 
 def _aliases(arch: str) -> list:
@@ -73,6 +79,50 @@ def _is_uuid(value: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+@dataclasses.dataclass
+class Resolution:
+    """The one artifact a spec names, and (after `ensure`) whether anything was written.
+
+    The same fields are the JSON every surface prints (`as_dict`). It also reads like the
+    dict `resolve` used to return: `r["artifact_id"]`, `r.get("leaf")`.
+    """
+
+    artifact_id: str
+    artifact: str
+    kind: str
+    component: str
+    artifact_name: str
+    id12: str
+    arch: str
+    refs: list
+    source: str  # given | existing | label | derived
+    lookup: str  # db | none
+    tag: str = ""
+    tag_family: str = ""
+    tags: list = dataclasses.field(default_factory=list)
+    written: bool = False
+    dry_run: bool = False
+    leaf: str = ""
+    manifest_list: str = ""
+    registry_tag: str = ""
+    identity: ArtifactIdentity | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+
+    def as_dict(self) -> dict:
+        return {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if f.name != "identity"
+        }
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 class Artifactory:
@@ -121,10 +171,7 @@ class Artifactory:
 class Lookup:
     """Existing spyre_v2 artifacts, read on `client`; a no-op without one."""
 
-    COLS = (
-        "toString(artifact_id), component, artifact_name, props['id12'], arch, kind, "
-        "props['ref']"
-    )
+    COLS = "toString(artifact_id), component, artifact_name, props['id12'], arch, kind, props['ref']"
 
     def __init__(self, client=None, db: str = ""):
         self.client, self.db = client, db
@@ -133,8 +180,7 @@ class Lookup:
         if self.client is None:
             return None
         rows = self.client.query(
-            f"SELECT {self.COLS} FROM {self.db}.artifacts WHERE {where} "
-            "ORDER BY ts DESC LIMIT 1",
+            f"SELECT {self.COLS} FROM {self.db}.artifacts WHERE {where} ORDER BY ts DESC LIMIT 1",
             parameters=params,
         ).result_rows
         return rows[0] if rows else None
@@ -181,14 +227,12 @@ class Lookup:
         )
 
     def by_id12(self, kind: str, arch: str, name: str, id12: str):
-        return (
-            name
-            and id12
-            and self._one(
-                "kind = {kind:String} AND artifact_name = {n:String} "
-                "AND props['id12'] = {i:String} AND arch IN {arch:Array(String)}",
-                {"kind": kind, "n": name, "i": id12, "arch": _aliases(arch)},
-            )
+        if not (name and id12):
+            return None
+        return self._one(
+            "kind = {kind:String} AND artifact_name = {n:String} "
+            "AND props['id12'] = {i:String} AND arch IN {arch:Array(String)}",
+            {"kind": kind, "n": name, "i": id12, "arch": _aliases(arch)},
         )
 
 
@@ -213,108 +257,9 @@ def _identity_of(row) -> ArtifactIdentity:
 def _options(spec: str) -> tuple:
     body, *opts = spec.split(";")
     over = dict(o.split("=", 1) for o in opts if "=" in o)
-    if set(over) - {"component", "name", "id12"} or len(over) != len(opts):
+    if set(over) - set(IDENTITY_OPTIONS) or len(over) != len(opts):
         raise ValueError(f"unknown or malformed option(s) in {spec!r}")
-    return body, over
-
-
-def resolve(
-    spec: str,
-    arch: str,
-    *,
-    lookup: Lookup | None = None,
-    registry: Registry | None = None,
-    artifactory: Artifactory | None = None,
-    tag_family: str = "",
-    tag_date=None,
-    tags=(),
-    component: str = "",
-) -> dict:
-    """The artifact `spec` names on `arch`, as a dict (see the module docstring); {} when it
-    names nothing. `identity` is the ArtifactIdentity; every other value is JSON-ready.
-
-    `tag`/`tag_family` name it in `tag_family` (see `named`); `tags` lists every
-    [tag, tag_family] pair: that one plus the rest of `tags`."""
-    lookup = lookup or Lookup()
-    spec = (spec or "").strip()
-    kind, sep, rest = spec.partition(":")
-    out = {"lookup": "db" if lookup.client is not None else "none"}
-    if not sep and _is_uuid(spec):
-        row = lookup.by_id(spec)
-        if not row:
-            return {}
-        result = _result(out, _identity_of(row), "existing", spec)
-        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
-    if kind == "gha":
-        return _gha(out, rest, arch, lookup, component)
-    if kind not in KINDS:
-        raise ValueError(
-            f"spec must be image:, rpm:, wheel:, generic:, gha: or an artifact_id: {spec!r}"
-        )
-    body, over = _options(rest)
-    if kind != "image":
-        # An image names its own component; a file takes the caller's unless it says one.
-        over.setdefault("component", component)
-    if kind == "image":
-        return _image(
-            out,
-            body,
-            over,
-            arch,
-            lookup,
-            registry or Registry.from_env(),
-            tag_family,
-            tag_date,
-            tags,
-        )
-    file_url = body.split("#", 1)[0] if body.startswith("http") else ""
-    info = (artifactory or Artifactory.from_env()).info(file_url) if file_url else {}
-    prop_id12 = (info.get("properties", {}).get(FILE_IDENTITY_PROP) or "")[:12]
-    filename = body.split("#", 1)[0].rsplit("/", 1)[-1]
-    args = (
-        over.get("component", ""),
-        over.get("name", ""),
-        over.get("id12", "") or prop_id12,
-    )
-    try:
-        if kind == "rpm":
-            derived = ArtifactIdentity.from_rpm(file_url or body, arch, *args)
-        elif kind == "wheel":
-            derived = ArtifactIdentity.from_wheel(body, arch, *args)
-        else:
-            url, _, sha = body.partition("#")
-            derived = ArtifactIdentity.from_generic(
-                url, sha or info.get("sha256", ""), args[0], arch, args[1]
-            )
-    except ValueError:
-        derived = None
-    if derived is not None and not derived.artifact_id:
-        # Not derivable (no component, or a generic URL with no readable sha256): only a
-        # lookup names it.
-        derived = None
-    if kind == "rpm":
-        rpm_name = derived.artifact_name if derived else ""
-        row = lookup.by_refs("rpm", arch, [body, file_url]) or lookup.by_rpm_file(
-            arch, filename, rpm_name
-        )
-    elif kind == "wheel":
-        pins = [derived.ref] if derived else []
-        # A wheel's file name escapes `-` in its distribution name as `_`; pins keep either.
-        pins += [p.replace("_", "-") for p in pins] + [
-            p.replace("-", "_") for p in pins
-        ]
-        row = lookup.by_refs("wheel", arch, [*dict.fromkeys(pins), body, file_url])
-    else:
-        row = lookup.by_refs("generic", arch, [body.partition("#")[0]])
-    if not row and derived:
-        row = lookup.by_id12(kind, arch, derived.artifact_name, derived.id12)
-    if row:
-        result = _result(out, _identity_of(row), "existing", spec)
-    elif derived:
-        result = _result(out, derived, "derived", spec)
-    else:
-        return {}
-    return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
+    return body.strip(), over
 
 
 def named(resolved_tag: str, tag_family: str, tags=()) -> list:
@@ -334,91 +279,265 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
     return list(dict.fromkeys(given))
 
 
-def _named(result: dict, resolved_tag: str, tag_family: str, tags) -> dict:
-    pairs = named(resolved_tag, tag_family, tags)
-    primary = next(
-        (p for p in pairs if p[1] == tag_family), pairs[0] if pairs else ("", "")
-    )
-    result.update(tag=primary[0], tag_family=primary[1], tags=[list(p) for p in pairs])
-    return result
+class _Resolver:
+    """One resolution's settings: the lookup, the registry and Artifactory clients, the tag
+    options. Clients are built only when a spec needs them."""
 
+    def __init__(
+        self, arch, lookup, registry, artifactory, tag_family, tags, tag_date, component
+    ):
+        self.arch, self.component = arch, component
+        self.tag_family, self.tags, self.tag_date = (
+            tag_family or "",
+            list(tags or ()),
+            tag_date,
+        )
+        self.lookup_mode = lookup if isinstance(lookup, str) else "auto"
+        self.lookup = lookup if isinstance(lookup, Lookup) else Lookup()
+        if self.lookup_mode not in LOOKUP_MODES:
+            raise ValueError(f"lookup must be one of {LOOKUP_MODES}: {lookup!r}")
+        if self.lookup_mode == "off":
+            self.lookup = Lookup()
+        self.registry_mode = registry if isinstance(registry, str) else "auto"
+        if self.registry_mode not in REGISTRY_MODES:
+            raise ValueError(f"registry must be one of {REGISTRY_MODES}: {registry!r}")
+        self._registry = registry if isinstance(registry, Registry) else None
+        self._artifactory = artifactory
 
-def _gha(out, rest, arch, lookup, component) -> dict:
-    """A GHA leg's delta on a prebaked image; refused when the record's fields do not hash
-    to its id (the component it was derived under is not the caller's)."""
-    body, over = _options(rest)
-    aid, base, installed = ([p.strip() for p in body.split(ID_SEP)] + ["", ""])[:3]
-    row = _is_uuid(aid) and lookup.by_id(aid)
-    if row:
-        return _result(out, _identity_of(row), "existing", "gha:" + body)
-    derived = ArtifactIdentity.from_gha(
-        over.get("component") or component, base, installed, arch
-    )
-    if not (base and derived.artifact_id):
-        return {}
-    if derived.artifact_id != DerivedId.norm(aid):
-        raise ValueError(f"gha record {aid}: its inputs hash to {derived.artifact_id}")
-    return _result(out, derived, "derived", "gha:" + body)
+    def registry(self, why: str) -> Registry:
+        if self.registry_mode == "off":
+            raise NeedsRegistry(f"registry='off', but {why}")
+        if self._registry is None:
+            self._registry = Registry.from_env()
+        return self._registry
 
+    def artifactory(self) -> "Artifactory | None":
+        if self.registry_mode == "off":
+            return None
+        if self._artifactory is None:
+            self._artifactory = Artifactory.from_env()
+        return self._artifactory
 
-def _image(out, body, over, arch, lookup, registry, tag_family, tag_date, tags) -> dict:
-    host, path, tag, digest = split_image(body)
-    if host != registry.host:
-        row = lookup.by_refs("image", arch, [body])
+    def result(self, identity, source, spec, resolved_tag="", **extra) -> Resolution:
+        method, ref_kind = ArtifactWriter.ref_shape(identity.kind)
+        pairs = named(resolved_tag, self.tag_family, self.tags)
+        primary = next(
+            (p for p in pairs if p[1] == self.tag_family),
+            pairs[0] if pairs else ("", ""),
+        )
+        return Resolution(
+            artifact_id=identity.artifact_id,
+            artifact=f"{identity.kind}:{identity.ref}" if identity.ref else spec,
+            kind=identity.kind,
+            component=identity.component,
+            artifact_name=identity.artifact_name,
+            id12=identity.id12,
+            arch=identity.arch,
+            refs=[[method, ref_kind, identity.ref]] if identity.ref else [],
+            source=source,
+            lookup="db" if self.lookup.client is not None else "none",
+            tag=primary[0],
+            tag_family=primary[1],
+            tags=[list(p) for p in pairs],
+            identity=identity,
+            **extra,
+        )
+
+    def existing(self, row, spec, **extra) -> Resolution:
+        return self.result(
+            _identity_of(row),
+            "existing",
+            spec,
+            dated_tag(self.tag_family, self.tag_date),
+            **extra,
+        )
+
+    # -- forms ----------------------------------------------------------------------------
+
+    def by_id(self, aid: str, spec: str):
+        if self.lookup.client is None:
+            raise ValueError(
+                f"{spec!r} names an artifact_id, which only a lookup can verify"
+            )
+        row = self.lookup.by_id(aid)
+        return self.existing(row, spec) if row else None
+
+    def given(self, kind: str, body: str, over: dict, spec: str):
+        """An authoritative identity: derived from its inputs; a lookup only spots a duplicate."""
+        identity = ArtifactIdentity(
+            component=over["component"],
+            artifact_name=over["name"],
+            id12=over["id12"],
+            arch=DerivedId.arch(self.arch),
+            kind=kind,
+            ref=body,
+        )
+        return self.given_identity(identity, spec)
+
+    def given_identity(self, identity: ArtifactIdentity, spec: str):
+        if not identity.artifact_id:
+            raise ValueError(f"{spec!r}: its identity inputs derive no id")
+        row = self.lookup.by_id(identity.artifact_id)
         if row:
-            result = _result(out, _identity_of(row), "existing", body)
-        elif digest:
-            derived = ArtifactIdentity.from_image(body, arch, **_image_over(over))
-            result = _result(out, derived, "derived", body)
+            _identity_of(row)  # refuses a recorded row whose inputs are not these
+        elif self.lookup_mode == "only":
+            return None
+        return self.result(
+            identity, "given", spec, dated_tag(self.tag_family, self.tag_date)
+        )
+
+    def gha(self, rest: str, spec: str):
+        """A GHA leg's delta on a prebaked image; refused when the record's fields do not hash
+        to its id (the component it was derived under is not the caller's)."""
+        body, over = _options(rest)
+        aid, base, installed = ([p.strip() for p in body.split(ID_SEP)] + ["", ""])[:3]
+        row = _is_uuid(aid) and self.lookup.by_id(aid)
+        if row:
+            return self.existing(row, "gha:" + body)
+        if self.lookup_mode == "only":
+            return None
+        derived = ArtifactIdentity.from_gha(
+            over.get("component") or self.component, base, installed, self.arch
+        )
+        if not (base and derived.artifact_id):
+            return None
+        if derived.artifact_id != DerivedId.norm(aid):
+            raise ValueError(
+                f"gha record {aid}: its inputs hash to {derived.artifact_id}"
+            )
+        return self.result(
+            derived, "derived", "gha:" + body, dated_tag(self.tag_family, self.tag_date)
+        )
+
+    def image(self, body: str, over: dict, spec: str):
+        host, path, tag, digest = split_image(body)
+        multi = DerivedId.arch(self.arch) == "multi"
+        if multi or host != (self._registry.host if self._registry else "icr.io"):
+            # A manifest list (or another registry's image) is its own digest: no leaf to find.
+            if not digest:
+                raise ValueError(
+                    f"{spec!r}: a manifest list or foreign image needs its @digest"
+                )
+            row = self.lookup.by_digest(self.arch, digest)
+            if row:
+                return self.existing(row, body)
+            if self.lookup_mode == "only":
+                return None
+            identity = ArtifactIdentity.from_image(body, self.arch, **_image_over(over))
+            resolved, registry_tag = "", ""
+            if multi and self.tag_family and self.registry_mode != "off":
+                resolved, registry_tag = tag_of(
+                    self.registry("tags"), path, digest, self.tag_family, self.tag_date
+                )
+            else:
+                resolved = dated_tag(self.tag_family, self.tag_date)
+            return self.result(identity, "derived", body, resolved, manifest_list=digest if multi else "",
+                               registry_tag=registry_tag)  # fmt: skip
+        if not digest:
+            # A tag moves: only the registry's answer for it right now is an identity.
+            registry = self.registry(f"{spec!r} names an image by tag")
+            digest = registry.manifest(path, tag)[0] if tag else ""
+        if digest and self.registry_mode == "off":
+            # Pinned by digest but no registry: a per-arch digest is looked up as given.
+            row = self.lookup.by_digest(self.arch, digest)
+            if row:
+                return self.existing(row, body)
+            raise NeedsRegistry(f"registry='off', but {spec!r} may be a manifest list")
+        registry = self.registry(f"{spec!r} needs its per-arch leaf")
+        leaf, listed = registry.leaf(path, digest, self.arch) if digest else ("", "")
+        if not leaf:
+            return None
+        pinned = f"{host}/{path}@{leaf}"
+        labelled = _labelled(registry.labels(path, leaf), path, self.arch, over)
+        row = (
+            labelled and self.lookup.by_id(labelled.artifact_id)
+        ) or self.lookup.by_digest(self.arch, leaf)
+        if row:
+            identity, source = _identity_of(row), "existing"
+        elif self.lookup_mode == "only":
+            return None
+        elif labelled:
+            identity, source = (
+                dataclasses.replace(labelled, ref=pinned, content_digest=leaf),
+                "label",
+            )
         else:
-            return {}
-        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
-    if not digest and tag:
-        digest = registry.manifest(path, tag)[0]
-    leaf, listed = registry.leaf(path, digest, arch) if digest else ("", "")
-    if not leaf:
-        row = lookup.by_refs("image", arch, [body])
-        if not row:
-            return {}
-        result = _result(out, _identity_of(row), "existing", body)
-        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
-    pinned = f"{host}/{path}@{leaf}"
-    labels = registry.labels(path, leaf)
-    labelled = _labelled(labels, path, arch, over)
-    row = (
-        (labelled and lookup.by_id(labelled.artifact_id))
-        or lookup.by_refs("image", arch, [body, pinned])
-        or lookup.by_digest(arch, leaf)
-    )
-    if row:
-        identity, source = _identity_of(row), "existing"
-    elif labelled:
-        identity, source = (
-            dataclasses.replace(labelled, ref=pinned, content_digest=leaf),
-            "label",
+            identity, source = (
+                ArtifactIdentity.from_image(pinned, self.arch, **_image_over(over)),
+                "derived",
+            )
+        resolved, registry_tag = tag_of(
+            registry, path, leaf, self.tag_family, self.tag_date
         )
-    else:
-        identity, source = (
-            ArtifactIdentity.from_image(pinned, arch, **_image_over(over)),
-            "derived",
+        r = self.result(
+            identity,
+            source,
+            body,
+            resolved,
+            leaf=leaf,
+            manifest_list=listed,
+            registry_tag=registry_tag,
         )
-    result = _result(out, identity, source, body)
-    resolved_tag, registry_tag = tag_of(registry, path, leaf, tag_family, tag_date)
-    result.update(
-        artifact=f"image:{pinned}",
-        leaf=leaf,
-        manifest_list=listed,
-        registry_tag=registry_tag,
-    )
-    return _named(result, resolved_tag, tag_family, tags)
+        r.artifact = f"image:{pinned}"
+        return r
+
+    def file(self, kind: str, body: str, over: dict, spec: str):
+        over.setdefault("component", self.component)
+        file_url = body.split("#", 1)[0] if body.startswith("http") else ""
+        artifactory = self.artifactory() if file_url else None
+        info = artifactory.info(file_url) if artifactory else {}
+        prop_id12 = (info.get("properties", {}).get(FILE_IDENTITY_PROP) or "")[:12]
+        filename = body.split("#", 1)[0].rsplit("/", 1)[-1]
+        args = (
+            over.get("component", ""),
+            over.get("name", ""),
+            over.get("id12", "") or prop_id12,
+        )
+        url, _, sha = body.partition("#")
+        sha = sha or info.get("sha256", "")
+        try:
+            if kind == "rpm":
+                derived = ArtifactIdentity.from_rpm(file_url or body, self.arch, *args)
+            elif kind == "wheel":
+                derived = ArtifactIdentity.from_wheel(body, self.arch, *args)
+            else:
+                derived = ArtifactIdentity.from_generic(
+                    url, sha, args[0], self.arch, args[1]
+                )
+        except ValueError:
+            derived = None
+        if derived is not None and not derived.artifact_id:
+            derived = None  # no component, or a generic URL with no readable sha256
+        # Looked up only by immutable refs: never a bare wheel name or a generic URL alone.
+        if kind == "rpm":
+            rpm_name = derived.artifact_name if derived else ""
+            row = self.lookup.by_refs(
+                "rpm", self.arch, [body, file_url]
+            ) or self.lookup.by_rpm_file(self.arch, filename, rpm_name)
+        elif kind == "wheel":
+            pins = [derived.ref] if derived else [body] if "==" in body else []
+            # A wheel's file name escapes `-` in its distribution name as `_`; pins keep either.
+            pins += [p.replace("_", "-") for p in pins] + [
+                p.replace("-", "_") for p in pins
+            ]
+            row = self.lookup.by_refs("wheel", self.arch, list(dict.fromkeys(pins)))
+        else:
+            row = self.lookup.by_refs("generic", self.arch, [url]) if sha else None
+        if not row and derived is not None:
+            row = self.lookup.by_id12(
+                kind, self.arch, derived.artifact_name, derived.id12
+            )
+        if row:
+            return self.existing(row, spec)
+        if derived is None or self.lookup_mode == "only":
+            return None
+        return self.result(
+            derived, "derived", spec, dated_tag(self.tag_family, self.tag_date)
+        )
 
 
 def _image_over(over: dict) -> dict:
-    return {
-        "component": over.get("component", ""),
-        "name": over.get("name", ""),
-        "id12": over.get("id12", ""),
-    }
+    return {k: over.get(k, "") for k in IDENTITY_OPTIONS}
 
 
 def _labelled(labels: dict, path: str, arch: str, over: dict):
@@ -427,16 +546,11 @@ def _labelled(labels: dict, path: str, arch: str, over: dict):
     An image built FROM a labelled base inherits the base's labels; hashed with this image's
     component they do not reproduce the base's id, so they are ignored.
     """
-    aid, id12, name = (
-        labels.get(LABEL_ID),
-        labels.get(LABEL_ID12),
-        labels.get(LABEL_NAME),
-    )
+    aid, id12, name = (labels.get(k) for k in (LABEL_ID, LABEL_ID12, LABEL_NAME))
     if not (aid and id12 and name):
         return None
-    component = over.get("component") or path.rsplit("/", 1)[-1]
     identity = ArtifactIdentity(
-        component=component,
+        component=over.get("component") or path.rsplit("/", 1)[-1],
         artifact_name=name,
         id12=id12,
         arch=DerivedId.arch(labels.get("spyre.artifact.arch") or arch),
@@ -445,96 +559,150 @@ def _labelled(labels: dict, path: str, arch: str, over: dict):
     return identity if identity.artifact_id == aid else None
 
 
-def _result(out: dict, identity: ArtifactIdentity, source: str, spec: str) -> dict:
-    kind = identity.kind
-    method, ref_kind = ArtifactWriter.ref_shape(kind)
-    refs = [[method, ref_kind, identity.ref]] if identity.ref else []
-    return {
-        **out,
-        "artifact_id": identity.artifact_id,
-        "artifact": f"{kind}:{identity.ref}" if identity.ref else spec,
-        "component": identity.component,
-        "artifact_name": identity.artifact_name,
-        "arch": identity.arch,
-        "kind": kind,
-        "refs": refs,
-        "tag": "",
-        "tag_family": "",
-        "tags": [],
-        "source": source,
-        "identity": identity,
-    }
+def resolve(
+    spec: "str | ArtifactIdentity",
+    arch: str = "",
+    *,
+    client=None,
+    db: str = "",
+    lookup="auto",
+    registry="auto",
+    artifactory: Artifactory | None = None,
+    tag_family: str = "",
+    tags=(),
+    tag_date=None,
+    component: str = "",
+) -> "Resolution | None":
+    """The artifact `spec` names on `arch` (read-only); None when it names nothing. An
+    ArtifactIdentity as `spec` is an authoritative identity given field by field.
+
+    lookup: 'auto' (existing record wins), 'off' (derive only, no database) or 'only' (must be
+    recorded), or a Lookup; it reads `client`/`db`. registry: 'auto' (called only when the
+    spec needs it) or 'off' (never; NeedsRegistry when it is needed), or a Registry. Raises
+    ValueError for a malformed spec or a record that does not hash to its id.
+    """
+    if isinstance(lookup, str) and lookup != "off" and client is not None:
+        lookup_obj = Lookup(client, db)
+    else:
+        lookup_obj = lookup if isinstance(lookup, Lookup) else None
+    r = _Resolver(
+        arch, lookup, registry, artifactory, tag_family, tags, tag_date, component
+    )
+    if lookup_obj is not None and r.lookup_mode != "off":
+        r.lookup = lookup_obj
+    if r.lookup_mode == "only" and r.lookup.client is None:
+        raise ValueError("lookup='only' needs a database to look in")
+    if isinstance(spec, ArtifactIdentity):
+        return r.given_identity(spec, f"{spec.kind}:{spec.ref}")
+    spec = (spec or "").strip()
+    kind, sep, rest = spec.partition(":")
+    if not sep and _is_uuid(spec):
+        return r.by_id(spec, spec)
+    if kind == "id":
+        return r.by_id(rest.strip(), spec)
+    if kind == "gha":
+        return r.gha(rest, spec)
+    if kind not in KINDS:
+        raise ValueError(
+            f"spec must be id:, image:, rpm:, wheel:, generic:, gha: or an artifact_id: {spec!r}"
+        )
+    body, over = _options(rest)
+    if all(over.get(k) for k in IDENTITY_OPTIONS):
+        return r.given(kind, body, over, spec)
+    if kind == "image":
+        return r.image(body, over, spec)
+    return r.file(kind, body, over, spec)
 
 
-def ensure_artifact(
+def ensure(
     client,
     db: str,
-    spec: str,
-    arch: str,
+    spec: "str | ArtifactIdentity",
+    arch: str = "",
     *,
     origin: str = "built",
-    tags=(),
+    lookup="auto",
+    registry="auto",
+    artifactory: Artifactory | None = None,
     tag_family: str | None = None,
+    tags=(),
     tag_date=None,
-    run_url: str = "",
     component: str = "",
     sources=(),
     identity_deps=(),
-    registry: Registry | None = None,
-    artifactory: Artifactory | None = None,
-) -> ArtifactIdentity:
-    """Resolve `spec` and make sure spyre_v2 holds it: the artifact and its ref when new, and
-    each of its tags once -- `tag_family`'s tag (from the registry, else dated by `tag_date`)
-    and `tags`, combined as `named` describes (an explicit ci-cd-tech-preview-v3 replaces the
-    resolved tech-preview tag). Returns the identity; raises ValueError when the spec names
-    nothing."""
+    context_deps=(),
+    props=None,
+    tag_props=None,
+    run_url: str = "",
+    dry_run: bool = False,
+) -> Resolution:
+    """Resolve `spec` (as `resolve`, with lookups on `client`) and make sure spyre_v2 holds it:
+    the artifact with its recorded fields when new, its canonical ref, and each tag once.
+    `written` says whether anything was (with `dry_run`: would be) written. Raises ValueError
+    when the spec names nothing."""
     r = resolve(
-        spec,
-        arch,
-        lookup=Lookup(client, db),
-        registry=registry,
-        artifactory=artifactory,
-        tag_family=tag_family or "",
-        tag_date=tag_date,
-        tags=tags,
-        component=component,
-    )
-    if not r:
-        raise ValueError(f"{spec!r} names no artifact on {arch}")
-    identity = r["identity"]
-    # The canonical ref (an image's pinned leaf) is added to an existing record once.
+        spec, arch, client=client, db=db, lookup=lookup, registry=registry, artifactory=artifactory,
+        tag_family=tag_family or "", tags=tags, tag_date=tag_date, component=component,
+    )  # fmt: skip
+    if r is None:
+        raise ValueError(f"{spec!r} names no artifact on {arch or 'any arch'}")
+    if isinstance(spec, ArtifactIdentity):
+        arch = spec.arch
+    identity = r.identity
     ref = (
-        r["artifact"].partition(":")[2]
-        if r["artifact"].startswith(identity.kind + ":")
+        r.artifact.partition(":")[2]
+        if r.artifact.startswith(identity.kind + ":")
         else identity.ref
     )
-    if ArtifactWriter.ref_recorded(client, db, identity.artifact_id, ref):
-        ref = ""
-    identity = dataclasses.replace(
-        identity, ref=ref, content_digest=r.get("leaf", identity.content_digest)
+    new_ref = bool(ref) and not ArtifactWriter.ref_recorded(
+        client, db, identity.artifact_id, ref
     )
-    props = {"run_url": run_url}
-    # A GHA delta is recorded as insert_gha_result records it: chained on its base image.
+    new_artifact = r.source != "existing" and not ArtifactWriter.artifact_recorded(
+        client, db, identity.artifact_id
+    )
+    tag_props = {**({"run_url": run_url} if run_url else {}), **(tag_props or {})}
+    new_tags = [
+        (t, f)
+        for t, f in r.tags
+        if not ArtifactWriter.tag_recorded(client, db, t, identity.artifact_id)
+    ]
+    r.written, r.dry_run = bool(new_artifact or new_ref or new_tags), dry_run
+    if dry_run or not r.written:
+        return r
     base = dict(identity.inputs).get("base_artifact_id", "")
+    if base:
+        # A GHA delta is recorded as insert_gha_result records it, keyed on the record's id.
+        ArtifactWriter.insert_gha_artifact(
+            client, db, identity.artifact_id, identity.component, base,
+            dict(identity.inputs).get("installed", ""), identity.arch, sources=sources, run_url=run_url,
+        )  # fmt: skip
+        for t, f in new_tags:
+            ArtifactWriter.insert_tag(client, db, identity, t, f, props=tag_props)
+        return r
+    identity = dataclasses.replace(
+        identity,
+        ref=ref if new_ref else "",
+        content_digest=r.leaf or identity.content_digest,
+    )
     ArtifactWriter.insert_artifact(
         client,
         db,
         identity,
         origin=origin,
         sources=sources,
-        identity_deps=[
-            *identity_deps,
-            *([f"{schema.DEP_BASE_PREFIX}{base}"] if base else []),
-        ],
-        props={
-            "run_url": run_url,
-            "resolved_from": r["source"],
-            **({"source": "gha"} if base else {}),
-        },
-        tags=[(t, f, props) for t, f in r["tags"]],
+        identity_deps=identity_deps,
+        context_deps=context_deps,
+        props={**({"run_url": run_url} if run_url else {}), **(props or {})},
+        tags=[(t, f, tag_props) for t, f in new_tags],
     )
-    return dataclasses.replace(identity, ref=ref or r["identity"].ref)
+    return r
 
 
-# Function API name, beside ensure_artifact.
+def ensure_artifact(
+    client, db: str, spec: str, arch: str, **options
+) -> ArtifactIdentity:
+    """`ensure`, returning only the identity (the first API, kept for its callers)."""
+    return ensure(client, db, spec, arch, **options).identity
+
+
 resolve_artifact = resolve

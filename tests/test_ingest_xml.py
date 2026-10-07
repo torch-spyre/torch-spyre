@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parser and perf-dispatch tests for .github/scripts/ingest_xml.py.
+"""Parser and perf-dispatch tests for spyre_clickhouse_ingest.results.
 
 The script is not a package module, so it is loaded by path. clickhouse_connect
 is stubbed before import. Parse tests need no ClickHouse; dispatch tests use a
 FakeClient.
 """
 
-import importlib.util
+import argparse
+import importlib
 import json
+import os
+import subprocess
 import sys
 import types
 from datetime import UTC, datetime
@@ -29,10 +32,6 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 import pytest
-
-INGEST_PATH = (
-    Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
-)
 
 # The ingest imports the shared library from extensions/; it is in this repo, so put it on
 # sys.path rather than requiring an install for a parse-only test.
@@ -44,10 +43,7 @@ if str(_CHLIB) not in sys.path:
 @pytest.fixture(scope="module")
 def ingest():
     sys.modules.setdefault("clickhouse_connect", types.ModuleType("clickhouse_connect"))
-    spec = importlib.util.spec_from_file_location("ingest_xml", INGEST_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return importlib.import_module("spyre_clickhouse_ingest.results")
 
 
 def _write_xml(tmp_path, testcases: str) -> Path:
@@ -694,7 +690,6 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
         "component_of",
         "run_id_for",
         "cases_already_ingested",
-        "ensure_artifact",
         "insert_test_results",
         "extract_properties",
         "promote_xpass",
@@ -748,10 +743,17 @@ class _ArtifactClient:
 
 
 def _args(**kw):
-    a = types.SimpleNamespace(
+    from spyre_clickhouse_ingest.options import add_artifact_options
+
+    parser = argparse.ArgumentParser()
+    add_artifact_options(
+        parser, origin="promoted", platform_alias=True, arch_required=False
+    )
+    a = parser.parse_args([])
+    a.__dict__.update(
         artifact_id=f"{_AID}|{_BASE}|torch-spyre@07379f50",
         component="torch-spyre",
-        platform="x86_64",
+        arch="x86_64",
         repository="torch-spyre/torch-spyre",
         branch="main",
         sha="07379f50",
@@ -819,10 +821,10 @@ def test_a_named_image_is_registered_tagged_and_judged(ingest):
     args = _args(
         artifact_id="",
         artifact=f"image:{image}",
-        platform="s390x",
+        arch="s390x",
         jenkins_run_key="job#1",
         run_url="https://ci.example.com/job/1/",
-        tag=["release-2026-09-22"],
+        tags=["release-2026-09-22"],
         tag_family="release",
     )
     ingest._write_artifact_verdicts(c, "db", args, legs)
@@ -959,3 +961,14 @@ def test_the_tag_date_defaults_to_the_runs_start_day(ingest, monkeypatch, tmp_pa
     _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)),
               ["--tag-date", "2026-09-26"])  # fmt: skip
     assert [str(a.tag_date) for a in seen] == ["2026-10-04", "2026-09-26"]
+
+
+def test_the_deprecated_script_path_forwards_to_the_package():
+    shim = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
+    env = {**os.environ, "PYTHONPATH": str(_CHLIB)}
+    out = subprocess.run(
+        [sys.executable, str(shim), "--help"], env=env, capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr
+    assert "spyre_clickhouse_ingest results" in out.stdout
+    assert "[deprecated]" in out.stderr

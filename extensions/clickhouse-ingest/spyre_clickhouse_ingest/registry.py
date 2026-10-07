@@ -13,76 +13,220 @@
 # limitations under the License.
 
 """Read-only container registry access for `resolver`: an image's per-arch leaf, its config
-labels, and the supply-chain tag (in a tag_family) that names it."""
+labels, and the tag (in a tag_family from tag_families.yaml) that names it."""
 
 import base64
 import json
 import os
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, fields
 from datetime import date
+from importlib import resources
+from string import Formatter
 
 import regex
 
-
 OCI_ARCH = {"x86_64": "amd64"}
-
-SNAP, NIGHTLY, WEEKLY, TECH_PREVIEW = (
-    "snap-supply-chain",
-    "nightly-supply-chain",
-    "weekly-supply-chain",
-    "ci-cd-tech-preview",
-)
 RELEASE = "release"
-# The supply-chain tag families, each by the ICR tag its producer pushes to name an image.
-REGISTRY_TAGS = {
-    SNAP: regex.compile(r"^snap-(\d{8})(?:T(\d{6})_\d+)?$"),
-    NIGHTLY: regex.compile(r"^nightly-(\d{8})$"),
-    WEEKLY: regex.compile(r"^weekly-W(\d{2})$"),
-    TECH_PREVIEW: regex.compile(r"^ci-cd-tech-preview-v\d+$"),
-}
-FAMILIES = tuple(REGISTRY_TAGS)
-# Families whose tag is dated when the registry has none; a tech preview names its release.
-DATED = (SNAP, NIGHTLY, WEEKLY)
 # Registry manifest reads one resolution may spend searching for a family's tag.
 MAX_TAG_READS = 80
+TAG_FAMILIES_ENV = "SPYRE_TAG_FAMILIES"
+TEMPLATE_FIELDS = frozenset(
+    {"family", "date", "time", "build", "iso_year", "iso_week", "registry_tag"}
+)
+_OPTIONAL = regex.compile(r"\[([^\[\]]*)\]")
+
+
+def _fields_of(template: str) -> set:
+    return {
+        f.split(".")[0].split("[")[0] for _, f, _, _ in Formatter().parse(template) if f
+    }
 
 
 def _day(stamp: str) -> date:
     return date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
 
 
-def family_tag(tag_family: str, registry_tag: str, built=None) -> str:
-    """The v2 tag a registry tag stands for in `tag_family`; `built` (a date) gives a weekly
-    tag its ISO year. '' when the registry tag is not that family's."""
-    m = REGISTRY_TAGS[tag_family].match(registry_tag)
-    if not m:
-        return ""
-    if tag_family == TECH_PREVIEW:
-        return registry_tag
-    if tag_family == WEEKLY:
-        year, built_week, _ = (built or date.today()).isocalendar()
-        week = int(m[1])
-        # A W01 tag on an image built in late December belongs to the next ISO year.
-        year += 1 if week < built_week - 26 else -1 if week > built_week + 26 else 0
-        return f"{WEEKLY}-{year}-w{week:02d}"
-    time = m[2] if tag_family == SNAP else None
-    return f"{tag_family}-{_day(m[1]).isoformat()}" + (f"T{time}" if time else "")
+@dataclass(frozen=True)
+class TagFamily:
+    """One tag_families.yaml entry; that file's header documents each key and field."""
+
+    name: str
+    registry_tag: object = (
+        None  # compiled regex; None for a family with no registry tag
+    )
+    tag: str = ""
+    fallback: str = ""
+    dated: bool = False
+    nearest: bool = False
+    prefix: bool = False
+
+    @staticmethod
+    def render(template: str, values: dict) -> str:
+        """`template` from `values`: a [...] part drops out when any field in it is empty, the
+        whole tag is '' when a field outside one is."""
+
+        def part(text: str) -> str:
+            if any(values.get(f) in (None, "") for f in _fields_of(text)):
+                return ""
+            return text.format(**values)
+
+        return part(_OPTIONAL.sub(lambda m: part(m[1]), template))
+
+    def from_registry(self, registry_tag: str, built=None) -> str:
+        """The v2 tag a registry tag stands for in this family; `built` (the image's build
+        date) gives a week-only tag its ISO year. '' when it is not this family's tag."""
+        m = self.registry_tag.match(registry_tag) if self.registry_tag else None
+        if not m:
+            return ""
+        values: dict = {"family": self.name, "registry_tag": registry_tag}
+        values.update({k: v for k, v in m.groupdict().items() if v})
+        if "date" in values:
+            values["date"] = _day(values["date"])
+            iso_year, iso_week, _ = values["date"].isocalendar()
+            values.setdefault("iso_year", iso_year)
+            values.setdefault("iso_week", iso_week)
+        if "iso_week" in m.groupdict() and m["iso_week"]:
+            week = values["iso_week"] = int(m["iso_week"])
+            if not m.groupdict().get("date"):
+                year, built_week, _ = (built or date.today()).isocalendar()
+                # A W01 tag on an image built in late December belongs to the next ISO year.
+                year += (
+                    1 if week < built_week - 26 else -1 if week > built_week + 26 else 0
+                )
+                values["iso_year"] = year
+        return self.render(self.tag, values)
+
+    def from_date(self, tag_date) -> str:
+        """The v2 tag a run names itself by when the registry names its image by none."""
+        if not (self.fallback and tag_date):
+            return ""
+        iso_year, iso_week, _ = tag_date.isocalendar()
+        values = {
+            "family": self.name,
+            "date": tag_date,
+            "iso_year": iso_year,
+            "iso_week": iso_week,
+        }
+        return self.render(self.fallback, values)
+
+    def needs_build_date(self) -> bool:
+        return (
+            self.registry_tag is not None and "date" not in self.registry_tag.groupindex
+        )
+
+
+def _unique_keys_loader():
+    import yaml  # here, not at module top: identity and derive-artifact-id stay stdlib-only
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def mapping(loader, node, deep=False):
+        keys = [loader.construct_object(k, deep=deep) for k, _ in node.value]
+        dup = sorted({str(k) for k in keys if keys.count(k) > 1})
+        if dup:
+            raise ValueError(f"tag families: duplicate key(s) {dup}")
+        return loader.construct_mapping(node, deep=deep)
+
+    Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    return yaml, Loader
+
+
+def load_tag_families(path: str = "") -> dict:
+    """name -> TagFamily from `path` (default: the packaged tag_families.yaml), validated;
+    raises ValueError naming the entry at fault."""
+    if path:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = (
+            resources.files(__package__)
+            .joinpath("tag_families.yaml")
+            .read_text("utf-8")
+        )
+    yaml, Loader = _unique_keys_loader()
+    where = path or "tag_families.yaml"
+    try:
+        raw = yaml.load(text, Loader=Loader) or {}
+    except yaml.YAMLError as err:
+        raise ValueError(f"{where}: {err}") from None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: expected one mapping per tag family")
+    known = {f.name for f in fields(TagFamily)} - {"name"}
+    out = {}
+    for name, entry in raw.items():
+        entry = entry or {}
+        if not isinstance(entry, dict) or set(entry) - known:
+            extra = sorted(set(entry) - known) if isinstance(entry, dict) else entry
+            raise ValueError(f"{where}: tag family {name!r}: unknown key(s) {extra}")
+        try:
+            pattern = (
+                regex.compile(entry["registry_tag"])
+                if entry.get("registry_tag")
+                else None
+            )
+        except regex.error as err:
+            raise ValueError(
+                f"{where}: tag family {name!r}: bad registry_tag: {err}"
+            ) from None
+        for key in ("tag", "fallback"):
+            bad = (
+                _fields_of(_OPTIONAL.sub(r"\1", entry.get(key) or "")) - TEMPLATE_FIELDS
+            )
+            if bad:
+                raise ValueError(
+                    f"{where}: tag family {name!r}: {key} uses unknown field(s) {sorted(bad)}"
+                )
+        if pattern is not None and not entry.get("tag"):
+            raise ValueError(
+                f"{where}: tag family {name!r}: a registry_tag needs a tag"
+            )
+        out[str(name)] = TagFamily(
+            name=str(name),
+            registry_tag=pattern,
+            tag=entry.get("tag") or "",
+            fallback=entry.get("fallback") or "",
+            dated=bool(entry.get("dated")),
+            nearest=bool(entry.get("nearest")),
+            prefix=bool(entry.get("prefix")),
+        )
+    return out
+
+
+_LOADED: dict = {}
+
+
+def tag_families() -> dict:
+    """The active tag families: $SPYRE_TAG_FAMILIES, else the packaged file; loaded once."""
+    path = os.environ.get(TAG_FAMILIES_ENV, "")
+    if path not in _LOADED:
+        _LOADED[path] = load_tag_families(path)
+    return _LOADED[path]
+
+
+def dated(tag_family: str) -> bool:
+    family = tag_families().get(tag_family)
+    return bool(family and family.dated)
 
 
 def dated_tag(tag_family: str, tag_date=None) -> str:
-    """The v2 tag a run names itself by when the registry names its image by none."""
-    if tag_family not in DATED or not tag_date:
-        return ""
-    if tag_family == WEEKLY:
-        year, week, _ = tag_date.isocalendar()
-        return f"{WEEKLY}-{year}-w{week:02d}"
-    return f"{tag_family}-{tag_date.isoformat()}"
+    family = tag_families().get(tag_family)
+    return family.from_date(tag_date) if family else ""
+
+
+def family_tag(tag_family: str, registry_tag: str, built=None) -> str:
+    family = tag_families().get(tag_family)
+    return family.from_registry(registry_tag, built) if family else ""
 
 
 def family_of(tag: str) -> str:
-    """The supply-chain family a full v2 tag belongs to by its prefix; '' for any other tag."""
-    return next((f for f in FAMILIES if tag.startswith(f + "-")), "")
+    """The family a full v2 tag belongs to by its prefix, longest first; '' for none."""
+    names = sorted(
+        (f.name for f in tag_families().values() if f.prefix), key=len, reverse=True
+    )
+    return next((n for n in names if tag.startswith(n + "-")), "")
 
 
 class Registry:
@@ -123,10 +267,7 @@ class Registry:
 
     def _token(self, repo: str) -> str:
         if repo not in self._tokens:
-            url = (
-                f"https://{self.host}/oauth/token?service=registry"
-                f"&scope=repository:{repo}:pull"
-            )
+            url = f"https://{self.host}/oauth/token?service=registry&scope=repository:{repo}:pull"
             headers = {}
             if self.username:
                 cred = f"{self.username}:{self.password}".encode()
@@ -204,15 +345,15 @@ class Registry:
         )
 
 
-def _candidates(tags: list, tag_family: str, tag_date) -> list:
-    """`tag_family`'s registry tags, nearest to `tag_date` (else newest) first; a snap build's
-    own timed tag before its day's aggregate."""
-    found = [(t, m) for t in tags if (m := REGISTRY_TAGS[tag_family].match(t))]
-    if tag_family in (SNAP, NIGHTLY) and tag_date:
+def _candidates(tags: list, family: TagFamily, tag_date) -> list:
+    """`family`'s registry tags: with `nearest`, those nearest `tag_date` first and one with
+    more groups before one with fewer; otherwise newest first."""
+    found = [(t, m) for t in tags if (m := family.registry_tag.match(t))]
+    if family.nearest and tag_date and "date" in family.registry_tag.groupindex:
         found.sort(
             key=lambda x: (
-                abs((_day(x[1][1]) - tag_date).days),
-                x[1].lastindex < 2,
+                abs((_day(x[1]["date"]) - tag_date).days),
+                -sum(1 for g in x[1].groups() if g),
                 x[0],
             )
         )
@@ -229,17 +370,19 @@ def split_image(image: str) -> tuple:
     return host, path, tag, digest
 
 
-def tag_of(
-    registry: Registry, path: str, leaf: str, tag_family: str, tag_date=None
-) -> tuple:
+def tag_of(registry, path: str, leaf: str, tag_family: str, tag_date=None) -> tuple:
     """(tag, registry_tag) naming `leaf` in `tag_family`: the registry's tag of that family,
-    else the run's `dated_tag`; ('', '') when neither applies."""
-    if tag_family not in REGISTRY_TAGS:
+    else the run's dated fallback; ('', '') when neither applies. No registry, no search."""
+    family = tag_families().get(tag_family)
+    if family is None:
         return "", ""
-    for reads, t in enumerate(_candidates(registry.tags(path), tag_family, tag_date)):
-        if reads >= MAX_TAG_READS:
-            break
-        if registry.names(path, t, leaf):
-            built = registry.built(path, leaf) if tag_family == WEEKLY else None
-            return family_tag(tag_family, t, built), t
-    return dated_tag(tag_family, tag_date), ""
+    if registry is not None and family.registry_tag is not None:
+        for reads, t in enumerate(_candidates(registry.tags(path), family, tag_date)):
+            if reads >= MAX_TAG_READS:
+                break
+            if registry.names(path, t, leaf):
+                built = (
+                    registry.built(path, leaf) if family.needs_build_date() else None
+                )
+                return family.from_registry(t, built), t
+    return family.from_date(tag_date), ""

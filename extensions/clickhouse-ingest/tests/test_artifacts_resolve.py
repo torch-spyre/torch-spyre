@@ -22,8 +22,24 @@ import pytest
 
 from spyre_clickhouse_ingest import ArtifactIdentity, artifacts
 from spyre_clickhouse_ingest.identity import ArtifactId
-from spyre_clickhouse_ingest.registry import Registry, family_tag
-from spyre_clickhouse_ingest.resolver import Lookup, ensure_artifact, resolve
+from spyre_clickhouse_ingest.registry import (
+    TAG_FAMILIES_ENV,
+    Registry,
+    dated,
+    dated_tag,
+    family_of,
+    family_tag,
+    load_tag_families,
+    tag_families,
+)
+from spyre_clickhouse_ingest.resolver import (
+    Lookup,
+    NeedsRegistry,
+    ensure,
+    ensure_artifact,
+    resolve,
+)
+from spyre_clickhouse_ingest.writer import ArtifactWriter
 from spyre_clickhouse_ingest.schema import ARTIFACT_REFS, ARTIFACT_TAGS, ARTIFACTS
 
 REPO = "ai_sw_accel/2.0/prod/torch-spyre-devel"
@@ -303,9 +319,10 @@ def test_a_weekly_tag_takes_the_iso_year_of_the_image_build():
 
 
 def test_an_unresolvable_image_resolves_to_nothing():
-    assert resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry({})) == {}
+    assert resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry({})) is None
     assert (
-        resolve(f"image:{IMAGE}@{LIST}", "x86_64", registry=FakeRegistry(LISTED)) == {}
+        resolve(f"image:{IMAGE}@{LIST}", "x86_64", registry=FakeRegistry(LISTED))
+        is None
     )
 
 
@@ -370,18 +387,18 @@ def test_a_recorded_wheel_wins_even_with_another_component():
     assert (out["artifact_id"], out["component"]) == (recorded[0], "hf-adapters")
 
 
-def test_a_generic_file_is_found_by_url_else_derived_from_its_sha():
+def test_a_generic_file_is_found_by_url_and_sha_else_derived_from_its_sha():
     url = "https://na.artifactory.swg-devops.com/artifactory/r/next/noarch/llvm/llvm-src-080ddeea9a07.tgz"
     recorded = _row(
         "llvm", "llvm-src-080ddeea9a07.tgz", "080ddeea9a07", "x86_64", "generic", url
     )
-    assert (
-        resolve(
-            f"generic:{url}", "x86_64", lookup=FakeLookup([recorded], refs=recorded[0])
-        )["artifact_id"]
-        == recorded[0]
+    lookup = FakeLookup([recorded], refs=recorded[0])
+    found = resolve(
+        f"generic:{url}#{'ab' * 32}", "x86_64", lookup=lookup, registry="off"
     )
-    assert resolve(f"generic:{url}", "x86_64", lookup=FakeLookup()) == {}
+    assert found["artifact_id"] == recorded[0]
+    # A URL alone can be overwritten: it is not looked up.
+    assert resolve(f"generic:{url}", "x86_64", lookup=lookup, registry="off") is None
     out = resolve(f"generic:{url}#{'ab' * 32};component=llvm", "x86_64")
     assert (out["source"], out["artifact_id"]) == (
         "derived",
@@ -399,7 +416,7 @@ def test_a_bare_artifact_id_must_exist():
         resolve(
             ArtifactId.derive("a", "b", "c" * 12, "s390x"), "s390x", lookup=FakeLookup()
         )
-        == {}
+        is None
     )
 
 
@@ -440,7 +457,7 @@ def test_a_gha_record_derives_its_own_id_or_finds_its_row():
 def test_a_gha_record_whose_fields_do_not_hash_to_its_id_is_refused():
     with pytest.raises(ValueError):
         resolve(GHA_RECORD, "x86_64", lookup=FakeLookup(), component="torch-spyre")
-    assert resolve(f"gha:{GHA_AID}", "x86_64", lookup=FakeLookup()) == {}
+    assert resolve(f"gha:{GHA_AID}", "x86_64", lookup=FakeLookup()) is None
 
 
 def test_ensure_chains_a_gha_delta_on_its_base():
@@ -474,7 +491,9 @@ class FakeClient:
         self.tables = {"artifacts": [], "artifact_refs": [], "artifact_tags": []}
 
     def insert(self, table, rows, column_names=None, database=None):
-        self.tables[table] += [dict(zip(column_names, r)) for r in rows]
+        self.tables.setdefault(table, []).extend(
+            dict(zip(column_names, r)) for r in rows
+        )
 
     def query(self, sql, parameters=None):
         p = parameters or {}
@@ -534,7 +553,7 @@ def test_ensure_refuses_a_spec_that_names_nothing():
 
 
 def test_the_cli_prints_the_resolution_as_json(monkeypatch, capsys):
-    monkeypatch.setattr(artifacts, "Registry", lambda **kw: FakeRegistry(LISTED))
+    monkeypatch.setattr(Registry, "from_env", lambda: FakeRegistry(LISTED))
     artifacts.main(
         ["resolve", "--image", f"{IMAGE}@{LIST}", "--arch", "s390x", "--no-lookup"]
     )
@@ -551,7 +570,7 @@ def test_the_cli_prints_the_resolution_as_json(monkeypatch, capsys):
 
 
 def test_the_cli_dates_a_family_tag_today_unless_given_a_tag_date(monkeypatch, capsys):
-    monkeypatch.setattr(artifacts, "Registry", lambda **kw: FakeRegistry(LISTED))
+    monkeypatch.setattr(Registry, "from_env", lambda: FakeRegistry(LISTED))
     base = ["resolve", "--image", f"{IMAGE}@{LIST}", "--arch", "s390x", "--no-lookup"]
     artifacts.main([*base, "--tag-family", "nightly-supply-chain"])
     today = datetime.now(timezone.utc).date().isoformat()
@@ -571,3 +590,238 @@ def test_the_cli_dates_a_family_tag_today_unless_given_a_tag_date(monkeypatch, c
         "ci-cd-tech-preview",
     )
     assert "channel" not in out
+
+
+# -- tag_families.yaml ---------------------------------------------------------------------
+
+
+def test_the_packaged_families_are_the_recorded_ones():
+    supply_chain = {"snap-supply-chain", "nightly-supply-chain", "weekly-supply-chain"}
+    assert set(tag_families()) == supply_chain | {
+        "ci-cd-tech-preview", "release", "pr", "main", "nightly", "weekly", "snap"
+    }  # fmt: skip
+    assert {f for f in tag_families() if dated(f)} == supply_chain
+    # A family with no registry tag and no fallback is named only by an explicit --tag.
+    assert dated_tag("pr", DAY) == "" and family_tag("main", "main-1") == ""
+
+
+def test_an_override_file_replaces_the_families(tmp_path, monkeypatch):
+    path = tmp_path / "families.yaml"
+    path.write_text(
+        "rc:\n"
+        "  registry_tag: '^rc(?P<build>\\d+)$'\n"
+        "  tag: '{family}-{build}'\n"
+        "  fallback: '{family}-{date:%Y%m%d}'\n"
+        "  dated: true\n"
+        "  prefix: true\n"
+    )
+    monkeypatch.setenv(TAG_FAMILIES_ENV, str(path))
+    assert set(tag_families()) == {"rc"}
+    assert (family_of("rc-9"), family_of("nightly-supply-chain-2026-10-04")) == (
+        "rc",
+        "",
+    )
+    reg = FakeRegistry({**LISTED, "rc7": (LIST, LISTED[LIST][1])}, ["rc7"])
+    out = resolve(f"image:{IMAGE}@{LIST}", "s390x", registry=reg, tag_family="rc")
+    assert (out["tag"], out["tag_family"], out["registry_tag"]) == ("rc-7", "rc", "rc7")
+    assert dated_tag("rc", DAY) == "rc-20261004"
+
+
+@pytest.mark.parametrize(
+    "text, fault",
+    [
+        ("x:\n  registry_tag: '^(unclosed'\n  tag: '{family}'\n", "bad registry_tag"),
+        ("x:\n  fallback: '{family}-{branch}'\n", "unknown field"),
+        ("x:\n  colour: red\n", "unknown key"),
+        ("x: {}\nx: {}\n", "duplicate key"),
+        ("x:\n  registry_tag: '^x$'\n", "needs a tag"),
+    ],
+)
+def test_a_malformed_families_file_fails_loudly(tmp_path, text, fault):
+    path = tmp_path / "families.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match=fault):
+        load_tag_families(str(path))
+
+
+# -- modes ---------------------------------------------------------------------------------
+
+
+class Unreadable:
+    """A database that must not be read."""
+
+    def query(self, *args, **kwargs):
+        raise AssertionError("read the database")
+
+
+class Recording:
+    """A database holding nothing; keeps every query's parameters."""
+
+    def __init__(self):
+        self.params = []
+
+    def query(self, sql, parameters=None):
+        self.params.append(parameters or {})
+
+        class R:
+            result_rows = []
+
+        return R()
+
+
+class NoRegistry(Registry):
+    def _get(self, *args, **kwargs):
+        raise AssertionError("called the registry")
+
+
+WHEEL = "wheel:apache-tvm-ffi==0.1.14.post1+146f67a53e78"
+
+
+def test_an_id_is_verified_against_its_record_and_needs_a_database():
+    recorded = _row("llvm", "x.tgz", "080ddeea9a07", "x86_64", "generic")
+    for spec in (recorded[0], f"id:{recorded[0]}"):
+        out = resolve(spec, "x86_64", lookup=FakeLookup([recorded]))
+        assert (out["artifact_id"], out["source"], out["lookup"]) == (
+            recorded[0],
+            "existing",
+            "db",
+        )
+    for lookup in ("off", "only"):
+        with pytest.raises(ValueError):
+            resolve(f"id:{recorded[0]}", "x86_64", lookup=lookup)
+
+
+def test_lookup_off_reads_nothing_and_only_resolves_nothing_unrecorded():
+    out = resolve(WHEEL, "ppc64le", client=Unreadable(), db="db", lookup="off")
+    assert (out["source"], out["lookup"]) == ("derived", "none")
+    assert resolve(WHEEL, "ppc64le", client=Recording(), db="db", lookup="only") is None
+    assert resolve(WHEEL, "ppc64le", client=Recording(), db="db")["source"] == "derived"
+
+
+def test_registry_off_never_calls_it_and_fails_when_the_spec_needs_it(monkeypatch):
+    monkeypatch.setattr(Registry, "from_env", lambda: NoRegistry())
+    for spec in (f"image:{IMAGE}:nightly-latest", f"image:{IMAGE}@{LIST}"):
+        with pytest.raises(NeedsRegistry):
+            resolve(spec, "s390x", registry="off")
+    url = "https://na.artifactory.swg-devops.com/artifactory/r/x.tgz"
+    out = resolve(f"generic:{url}#{'ab' * 32};component=llvm", "x86_64", registry="off")
+    assert out["source"] == "derived"
+
+
+def test_a_complete_identity_makes_no_registry_call_and_is_never_rebound():
+    aid = ArtifactId.derive("torch-spyre", "torch-spyre-dev", "9e28cf2e5c48", "x86_64")
+    named_by = ";component=torch-spyre;name=torch-spyre-dev;id12=9e28cf2e5c48"
+    for spec in (
+        f"image:{IMAGE}:nightly-latest{named_by}",
+        f"generic:https://h/x.tgz{named_by}",
+    ):
+        out = resolve(spec, "amd64", registry=NoRegistry(), lookup=FakeLookup())
+        assert (out["artifact_id"], out["source"], out["arch"]) == (
+            aid,
+            "given",
+            "x86_64",
+        )
+    identity = ArtifactIdentity(component="flex", artifact_name="ibm-flex", id12="c" * 12,
+                                arch="x86_64", kind="rpm", ref=f"ibm-flex-*.{'c' * 12}.*.x86_64")  # fmt: skip
+    out = resolve(identity, registry=NoRegistry(), lookup=FakeLookup())
+    assert (out["artifact_id"], out["source"]) == (identity.artifact_id, "given")
+    # A row filed under that id with other inputs is corrupt, not a match.
+    bad = (
+        aid,
+        "torch-spyre",
+        "torch-spyre-devel",
+        "9e28cf2e5c48",
+        "x86_64",
+        "image",
+        "",
+    )
+    with pytest.raises(ValueError):
+        resolve(
+            f"image:{IMAGE}:nightly-latest{named_by}",
+            "x86_64",
+            lookup=FakeLookup([bad]),
+        )
+
+
+def test_a_multi_arch_image_keeps_its_list_digest():
+    out = resolve(
+        f"image:{IMAGE}@{LIST}", "multi", registry=NoRegistry(), lookup=FakeLookup()
+    )
+    assert (out["artifact"], out["arch"], out["manifest_list"]) == (
+        f"image:{IMAGE}@{LIST}",
+        "multi",
+        LIST,
+    )
+    assert (
+        out["artifact_id"]
+        == ArtifactIdentity.from_image(f"{IMAGE}@{LIST}", "multi").artifact_id
+    )
+
+
+def test_a_moving_ref_is_never_looked_up():
+    db = Recording()
+    reg = FakeRegistry({**LISTED, "nightly-latest": (LIST, LISTED[LIST][1])})
+    resolve(f"image:{IMAGE}:nightly-latest", "s390x", client=db, db="db", registry=reg)
+    assert db.params and not any("nightly-latest" in str(p) for p in db.params)
+    db = Recording()
+    assert resolve("wheel:apache-tvm-ffi", "ppc64le", client=db, db="db") is None
+    assert db.params == []
+    resolve("wheel:apache-tvm-ffi==0.1.14", "ppc64le", client=db, db="db")
+    assert db.params[0]["refs"] == ["apache-tvm-ffi==0.1.14", "apache_tvm_ffi==0.1.14"]
+
+
+def test_a_dry_run_reports_what_it_would_write_and_writes_nothing():
+    client = FakeClient()
+    out = ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"], dry_run=True)
+    assert (out["written"], out["dry_run"], out["tag"]) == (True, True, "rc1")
+    assert client.tables == {"artifacts": [], "artifact_refs": [], "artifact_tags": []}
+    out = ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"])
+    assert (out["written"], len(client.tables[ARTIFACTS.name])) == (True, 1)
+    assert (
+        ensure(client, "db", WHEEL, "ppc64le", tags=["rc1"], dry_run=True)["written"]
+        is False
+    )
+
+
+# -- one write path ------------------------------------------------------------------------
+
+
+def test_a_batch_artifact_writes_what_insert_artifact_wrote():
+    entry = {
+        "artifact": {"component": "flex", "artifact_name": "ibm-flex", "id12": "c" * 12,
+                     "arch": "x86_64", "kind": "rpm", "ref": f"ibm-flex-*.{'c' * 12}.*.x86_64"},
+        "origin": "built",
+        "sources": [{"repo": "ai-chip-toolchain/flex", "git_ref": "main", "git_sha": "ab12"}],
+        "identity_deps": ["base=x"],
+        "context_deps": ["ctx"],
+        "props": {"run_url": "https://ci/1"},
+    }  # fmt: skip
+    old, new = FakeClient(), FakeClient()
+    ArtifactWriter.insert_artifact(
+        old, "db", artifacts.batch_identity(entry["artifact"]), origin="built",
+        sources=[("ai-chip-toolchain/flex", "main", "ab12")], identity_deps=["base=x"],
+        context_deps=["ctx"], props={"run_url": "https://ci/1"},
+    )  # fmt: skip
+    assert artifacts.write_batch(new, "db", {"artifacts": [entry]})["artifacts"] == 1
+    assert new.tables == old.tables
+
+
+def test_a_batch_spec_entry_is_resolved_then_recorded():
+    batch = {"artifacts": [{"spec": WHEEL, "arch": "ppc64le", "tags": ["rc1"]}]}
+    client = FakeClient()
+    assert artifacts.write_batch(client, "db", batch)["artifacts"] == 1
+    assert [r["tag"] for r in client.tables[ARTIFACT_TAGS.name]] == ["rc1"]
+
+
+def test_a_gha_record_writes_what_insert_gha_result_wrote():
+    repo = ("torch-spyre/hf-adapters", "main", "fa67696108bd")
+    old, new = FakeClient(), FakeClient()
+    ArtifactWriter.insert_gha_result(
+        old, "db", artifact_id=GHA_AID, component="hf-adapters", arch="x86_64", run_id=GHA_BASE,
+        test_type="regression", state="passed", base_artifact_id=GHA_BASE, installed=GHA_INSTALLED,
+        repo=repo[0], git_ref=repo[1], git_sha=repo[2], run_url="https://gha/1",
+    )  # fmt: skip
+    ensure(new, "db", GHA_RECORD, "x86_64", component="hf-adapters", sources=[repo],
+           run_url="https://gha/1")  # fmt: skip
+    assert new.tables[ARTIFACTS.name] == old.tables[ARTIFACTS.name]
+    assert new.tables[ARTIFACT_REFS.name] == []
