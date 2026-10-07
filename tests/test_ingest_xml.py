@@ -836,6 +836,11 @@ def test_a_named_image_is_registered_tagged_and_judged(ingest):
         "ab" * 6,
     )
     assert [t["tag"] for t in rows["artifact_tags"]] == ["release-2026-09-22"]
+    assert (
+        art["props"]["source"]
+        == rows["artifact_tags"][0]["props"]["source"]
+        == "jenkins"
+    )
     (res,) = rows["artifact_results"]
     assert (res["artifact_id"], res["test_type"], res["state"]) == (
         art["artifact_id"],

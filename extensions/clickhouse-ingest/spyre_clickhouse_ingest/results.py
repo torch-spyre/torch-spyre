@@ -1314,6 +1314,8 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
         options["origin"] = "built"
     options["run_url"] = run_url
     options["sources"] = [(args.repository, args.branch, args.sha), *options["sources"]]
+    options["props"] = {"source": source, **options["props"]}
+    options["tag_props"] = {"source": source, **options["tag_props"]}
     try:
         r = ensure(
             client,
