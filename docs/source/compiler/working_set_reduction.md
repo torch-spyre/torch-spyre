@@ -121,8 +121,7 @@ pure per-tile map has no `init`.
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
 `1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).
-`DXP_LOOP_UNROLL` remains a compatibility alias; `SPYRE_BACKEND_LOOP_UNROLL` takes
-precedence when both are set. Invalid values raise an error.
+Invalid values raise an error.
 
 Python callers can override the resolved setting during compilation:
 

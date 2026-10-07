@@ -62,37 +62,22 @@ def _load_config(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "canonical,legacy,expected",
+    "value,expected",
     [
-        (None, None, True),
-        ("0", None, False),
-        ("false", None, False),
-        (" NO ", None, False),
-        ("1", None, True),
-        ("TRUE", None, True),
-        ("yes", None, True),
-        (None, "0", False),
-        (None, "False", False),
-        (None, "no", False),
-        (None, "1", True),
-        (None, "true", True),
-        (None, "YES", True),
-        ("0", "1", False),
-        ("1", "0", True),
-        ("1", "invalid", True),
+        (None, True),
+        ("0", False),
+        ("false", False),
+        (" NO ", False),
+        ("1", True),
+        ("TRUE", True),
+        ("yes", True),
     ],
 )
-def test_loop_unroll_environment_and_cache_key(
-    monkeypatch, canonical, legacy, expected
-):
-    for name, value in (
-        ("SPYRE_BACKEND_LOOP_UNROLL", canonical),
-        ("DXP_LOOP_UNROLL", legacy),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
+def test_loop_unroll_environment_and_cache_key(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("SPYRE_BACKEND_LOOP_UNROLL", raising=False)
+    else:
+        monkeypatch.setenv("SPYRE_BACKEND_LOOP_UNROLL", value)
     config = _load_config(monkeypatch)
     assert config.backend_loop_unroll is expected
 
@@ -112,13 +97,10 @@ def test_loop_unroll_environment_and_cache_key(
         )
 
 
-@pytest.mark.parametrize("name", ["SPYRE_BACKEND_LOOP_UNROLL", "DXP_LOOP_UNROLL"])
 @pytest.mark.parametrize("value", ["", "2", "invalid"])
-def test_loop_unroll_rejects_invalid_environment(monkeypatch, name, value):
-    monkeypatch.delenv("SPYRE_BACKEND_LOOP_UNROLL", raising=False)
-    monkeypatch.delenv("DXP_LOOP_UNROLL", raising=False)
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=f"{name} must be"):
+def test_loop_unroll_rejects_invalid_environment(monkeypatch, value):
+    monkeypatch.setenv("SPYRE_BACKEND_LOOP_UNROLL", value)
+    with pytest.raises(ValueError, match="SPYRE_BACKEND_LOOP_UNROLL must be"):
         _load_config(monkeypatch)
 
 
@@ -128,10 +110,7 @@ def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll):
     code_dir.mkdir()
     (code_dir / "spyrecode.json").write_text("{}")
     # A worker's environment and imported config may disagree with the parent.
-    env = {
-        "SPYRE_BACKEND_LOOP_UNROLL": str(int(not unroll)),
-        "DXP_LOOP_UNROLL": str(int(not unroll)),
-    }
+    env = {"SPYRE_BACKEND_LOOP_UNROLL": str(int(not unroll))}
     with (
         spyre_config.patch(backend_loop_unroll=not unroll),
         patch.object(async_compile_mod, "_check_backend_compiler_on_path"),
