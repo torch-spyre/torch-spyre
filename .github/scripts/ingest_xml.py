@@ -1322,12 +1322,9 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
             args.artifact,
             args.platform or "",
             origin="promoted",
-            tags=[
-                (t, _opt(args, "tag_family") or "release")
-                for t in _opt(args, "tag") or []
-            ],
-            channel=_opt(args, "artifact_channel") or None,
-            day=_opt(args, "artifact_date") or None,
+            tags=_opt(args, "tag") or [],
+            tag_family=_opt(args, "tag_family") or None,
+            tag_date=_opt(args, "tag_date") or None,
             run_url=run_url,
             component=component_of(args, COMPONENT_DEFAULT),
             sources=[(args.repository, args.branch, args.sha)],
@@ -1438,28 +1435,29 @@ def main():
         help="What this leg ran, when no derive-gha-artifact-id record exists: any "
         "`artifacts resolve` spec -- image:<ref>[@digest], rpm:, wheel:, generic: or a bare "
         "artifact_id. It resolves to the existing spyre_v2 record when there is one, else is "
-        "registered (and tagged with --tag / --artifact-channel) before its verdicts.",
+        "registered (and tagged per --tag-family / --tag) before its verdicts.",
     )
     parser.add_argument(
         "--tag",
         action="append",
         default=[],
-        help="artifact_tags tag for --artifact; repeat to tag it under several names "
-        "(e.g. a dated tag and the producer's own name).",
+        help="A full tag for --artifact; repeatable. One in --tag-family (given, or the family "
+        "its prefix names) replaces the resolved tag; any other is added.",
     )
-    parser.add_argument("--tag-family", default="release")
     parser.add_argument(
-        "--artifact-channel",
+        "--tag-family",
         default="",
-        help="--artifact's supply-chain channel (snap, nightly, weekly, ci-cd-tech-preview): "
-        "tags it by the channel tag that names it (see `artifacts resolve`).",
+        help="--artifact's tag_family (snap-supply-chain, nightly-supply-chain, "
+        "weekly-supply-chain, ci-cd-tech-preview, release): tags it by that family's tag in the "
+        "registry, else by --tag-date. Also the family of each --tag whose prefix names none.",
     )
     parser.add_argument(
-        "--artifact-date",
+        "--tag-date",
         type=date.fromisoformat,
         default=None,
-        help="The run's day (YYYY-MM-DD), dating the channel tag when the registry has none. "
-        "Default: the earliest suite timestamp of the XMLs, else today (UTC).",
+        help="The run's day (YYYY-MM-DD), dating --tag-family's tag when the registry has none "
+        "(weekly: its ISO week). Default: the earliest suite timestamp of the XMLs, else "
+        "today (UTC).",
     )
     parser.add_argument(
         "--run-url",
@@ -1894,9 +1892,9 @@ def main():
                     f"{sum(len(c['properties']) for c in cases)} properties"
                 )
 
-    if not _opt(args, "artifact_date"):
+    if not _opt(args, "tag_date"):
         # The run's own day, not the ingest's: a run past midnight keeps its start date.
-        args.artifact_date = (run_started or datetime.now(UTC)).date()
+        args.tag_date = (run_started or datetime.now(UTC)).date()
     _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")

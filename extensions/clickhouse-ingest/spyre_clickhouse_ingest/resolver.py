@@ -29,6 +29,10 @@ Order: normalise (image -> per-arch leaf and its labels; Artifactory file -> its
 file; then name + id12), and only when none matches derive it with ArtifactIdentity.from_*.
 Orchestrator-built artifacts hash the orchestrator's inputs into id12, so for them only the
 lookup (or the label) reproduces the recorded id.
+
+Tags: `tag_family` (snap-supply-chain, nightly-supply-chain, weekly-supply-chain,
+ci-cd-tech-preview, release) names the artifact by that family's tag in the registry, else by
+`tag_date` (weekly: its ISO week); full `tags` replace it when in that family, else add to it.
 """
 
 import base64
@@ -41,7 +45,7 @@ import urllib.request
 import uuid
 
 from .identity import ArtifactIdentity, DerivedId
-from .registry import FAMILIES, Registry, channel_tag_of, fallback_tag, split_image
+from .registry import RELEASE, Registry, dated_tag, family_of, split_image, tag_of
 from .writer import ArtifactWriter
 
 KINDS = ("image", "rpm", "wheel", "generic")
@@ -219,20 +223,26 @@ def resolve(
     lookup: Lookup | None = None,
     registry: Registry | None = None,
     artifactory: Artifactory | None = None,
-    channel: str = "",
-    day=None,
-    name: str = "",
+    tag_family: str = "",
+    tag_date=None,
+    tags=(),
     component: str = "",
 ) -> dict:
     """The artifact `spec` names on `arch`, as a dict (see the module docstring); {} when it
-    names nothing. `identity` is the ArtifactIdentity; every other value is JSON-ready."""
+    names nothing. `identity` is the ArtifactIdentity; every other value is JSON-ready.
+
+    `tag`/`tag_family` name it in `tag_family` (see `named`); `tags` lists every
+    [tag, tag_family] pair: that one plus the rest of `tags`."""
     lookup = lookup or Lookup()
     spec = (spec or "").strip()
     kind, sep, rest = spec.partition(":")
     out = {"lookup": "db" if lookup.client is not None else "none"}
     if not sep and _is_uuid(spec):
         row = lookup.by_id(spec)
-        return _result(out, _identity_of(row), "existing", spec) if row else {}
+        if not row:
+            return {}
+        result = _result(out, _identity_of(row), "existing", spec)
+        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
     if kind not in KINDS:
         raise ValueError(
             f"spec must be image:, rpm:, wheel:, generic: or an artifact_id: {spec!r}"
@@ -249,9 +259,9 @@ def resolve(
             arch,
             lookup,
             registry or Registry.from_env(),
-            channel,
-            day,
-            name,
+            tag_family,
+            tag_date,
+            tags,
         )
     file_url = body.split("#", 1)[0] if body.startswith("http") else ""
     info = (artifactory or Artifactory.from_env()).info(file_url) if file_url else {}
@@ -300,28 +310,56 @@ def resolve(
         result = _result(out, derived, "derived", spec)
     else:
         return {}
-    if channel:
-        tag = fallback_tag(channel, day, name)
-        result.update(tag=tag, tag_family=FAMILIES.get(channel, "") if tag else "")
+    return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
+
+
+def named(resolved_tag: str, tag_family: str, tags=()) -> list:
+    """Every (tag, tag_family) an artifact is tagged by.
+
+    Each of `tags` (a tag, or a (tag, family) pair) takes the family its prefix names, else
+    the given family, else `tag_family`, else release. One in `tag_family` replaces
+    `resolved_tag`, the tag the registry or the date gave that family; the rest are added.
+    """
+    given = []
+    for t in tags:
+        tag, family = (t, "") if isinstance(t, str) else t
+        if tag:
+            given.append((tag, family_of(tag) or family or tag_family or RELEASE))
+    if tag_family and resolved_tag and not any(f == tag_family for _, f in given):
+        given.insert(0, (resolved_tag, tag_family))
+    return list(dict.fromkeys(given))
+
+
+def _named(result: dict, resolved_tag: str, tag_family: str, tags) -> dict:
+    pairs = named(resolved_tag, tag_family, tags)
+    primary = next(
+        (p for p in pairs if p[1] == tag_family), pairs[0] if pairs else ("", "")
+    )
+    result.update(tag=primary[0], tag_family=primary[1], tags=[list(p) for p in pairs])
     return result
 
 
-def _image(out, body, over, arch, lookup, registry, channel, day, name) -> dict:
+def _image(out, body, over, arch, lookup, registry, tag_family, tag_date, tags) -> dict:
     host, path, tag, digest = split_image(body)
     if host != registry.host:
         row = lookup.by_refs("image", arch, [body])
         if row:
-            return _result(out, _identity_of(row), "existing", body)
-        if not digest:
+            result = _result(out, _identity_of(row), "existing", body)
+        elif digest:
+            derived = ArtifactIdentity.from_image(body, arch, **_image_over(over))
+            result = _result(out, derived, "derived", body)
+        else:
             return {}
-        derived = ArtifactIdentity.from_image(body, arch, **_image_over(over))
-        return _result(out, derived, "derived", body)
+        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
     if not digest and tag:
         digest = registry.manifest(path, tag)[0]
     leaf, listed = registry.leaf(path, digest, arch) if digest else ("", "")
     if not leaf:
         row = lookup.by_refs("image", arch, [body])
-        return _result(out, _identity_of(row), "existing", body) if row else {}
+        if not row:
+            return {}
+        result = _result(out, _identity_of(row), "existing", body)
+        return _named(result, dated_tag(tag_family, tag_date), tag_family, tags)
     pinned = f"{host}/{path}@{leaf}"
     labels = registry.labels(path, leaf)
     labelled = _labelled(labels, path, arch, over)
@@ -343,18 +381,14 @@ def _image(out, body, over, arch, lookup, registry, channel, day, name) -> dict:
             "derived",
         )
     result = _result(out, identity, source, body)
-    v2tag, family, registry_tag = channel_tag_of(
-        registry, path, leaf, channel, day, name
-    )
+    resolved_tag, registry_tag = tag_of(registry, path, leaf, tag_family, tag_date)
     result.update(
         artifact=f"image:{pinned}",
         leaf=leaf,
         manifest_list=listed,
-        tag=v2tag,
-        tag_family=family,
         registry_tag=registry_tag,
     )
-    return result
+    return _named(result, resolved_tag, tag_family, tags)
 
 
 def _image_over(over: dict) -> dict:
@@ -404,6 +438,7 @@ def _result(out: dict, identity: ArtifactIdentity, source: str, spec: str) -> di
         "refs": refs,
         "tag": "",
         "tag_family": "",
+        "tags": [],
         "source": source,
         "identity": identity,
     }
@@ -417,10 +452,9 @@ def ensure_artifact(
     *,
     origin: str = "built",
     tags=(),
-    channel: str | None = None,
-    day=None,
+    tag_family: str | None = None,
+    tag_date=None,
     run_url: str = "",
-    name: str = "",
     component: str = "",
     sources=(),
     identity_deps=(),
@@ -428,17 +462,19 @@ def ensure_artifact(
     artifactory: Artifactory | None = None,
 ) -> ArtifactIdentity:
     """Resolve `spec` and make sure spyre_v2 holds it: the artifact and its ref when new, and
-    each tag -- the resolved channel tag plus `tags` ((tag, family) pairs) -- once. Returns
-    the identity; raises ValueError when the spec names nothing."""
+    each of its tags once -- `tag_family`'s tag (from the registry, else dated by `tag_date`)
+    and `tags`, combined as `named` describes (an explicit ci-cd-tech-preview-v3 replaces the
+    resolved tech-preview tag). Returns the identity; raises ValueError when the spec names
+    nothing."""
     r = resolve(
         spec,
         arch,
         lookup=Lookup(client, db),
         registry=registry,
         artifactory=artifactory,
-        channel=channel or "",
-        day=day,
-        name=name,
+        tag_family=tag_family or "",
+        tag_date=tag_date,
+        tags=tags,
         component=component,
     )
     if not r:
@@ -451,7 +487,6 @@ def ensure_artifact(
     identity = dataclasses.replace(
         identity, ref=ref, content_digest=r.get("leaf", identity.content_digest)
     )
-    wanted = ([(r["tag"], r["tag_family"])] if r["tag"] else []) + list(tags)
     props = {"run_url": run_url}
     ArtifactWriter.insert_artifact(
         client,
@@ -461,7 +496,7 @@ def ensure_artifact(
         sources=sources,
         identity_deps=identity_deps,
         props={"run_url": run_url, "resolved_from": r["source"]},
-        tags=[(t, f, props) for t, f in dict.fromkeys(wanted) if t],
+        tags=[(t, f, props) for t, f in r["tags"]],
     )
     return dataclasses.replace(identity, ref=ref or r["identity"].ref)
 

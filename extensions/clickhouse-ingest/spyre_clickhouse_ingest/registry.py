@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Read-only container registry access for `resolver`: an image's per-arch leaf, its config
-labels, and the supply-chain channel tag that names it."""
+labels, and the supply-chain tag (in a tag_family) that names it."""
 
 import base64
 import json
@@ -27,20 +27,24 @@ import regex
 
 OCI_ARCH = {"x86_64": "amd64"}
 
-# The supply-chain channels: the dated ICR tag each pushes, and the v2 family it maps to.
-CHANNELS = {
-    "snap": regex.compile(r"^snap-(\d{8})(?:T(\d{6})_\d+)?$"),
-    "nightly": regex.compile(r"^nightly-(\d{8})$"),
-    "weekly": regex.compile(r"^weekly-W(\d{2})$"),
-    "ci-cd-tech-preview": regex.compile(r"^ci-cd-tech-preview-v\d+$"),
+SNAP, NIGHTLY, WEEKLY, TECH_PREVIEW = (
+    "snap-supply-chain",
+    "nightly-supply-chain",
+    "weekly-supply-chain",
+    "ci-cd-tech-preview",
+)
+RELEASE = "release"
+# The supply-chain tag families, each by the ICR tag its producer pushes to name an image.
+REGISTRY_TAGS = {
+    SNAP: regex.compile(r"^snap-(\d{8})(?:T(\d{6})_\d+)?$"),
+    NIGHTLY: regex.compile(r"^nightly-(\d{8})$"),
+    WEEKLY: regex.compile(r"^weekly-W(\d{2})$"),
+    TECH_PREVIEW: regex.compile(r"^ci-cd-tech-preview-v\d+$"),
 }
-FAMILIES = {
-    "snap": "snap-supply-chain",
-    "nightly": "nightly-supply-chain",
-    "weekly": "weekly-supply-chain",
-    "ci-cd-tech-preview": "ci-cd-tech-preview",
-}
-# Registry manifest reads one resolution may spend searching for a channel tag.
+FAMILIES = tuple(REGISTRY_TAGS)
+# Families whose tag is dated when the registry has none; a tech preview names its release.
+DATED = (SNAP, NIGHTLY, WEEKLY)
+# Registry manifest reads one resolution may spend searching for a family's tag.
 MAX_TAG_READS = 80
 
 
@@ -48,36 +52,37 @@ def _day(stamp: str) -> date:
     return date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
 
 
-def iso_week_tag(day: date) -> str:
-    year, week, _ = day.isocalendar()
-    return f"{FAMILIES['weekly']}-{year}-w{week:02d}"
-
-
-def channel_tag(channel: str, registry_tag: str, built=None) -> str:
-    """The v2 tag of a registry channel tag; `built` (a date) gives a weekly tag its year."""
-    m = CHANNELS[channel].match(registry_tag)
+def family_tag(tag_family: str, registry_tag: str, built=None) -> str:
+    """The v2 tag a registry tag stands for in `tag_family`; `built` (a date) gives a weekly
+    tag its ISO year. '' when the registry tag is not that family's."""
+    m = REGISTRY_TAGS[tag_family].match(registry_tag)
     if not m:
         return ""
-    if channel == "ci-cd-tech-preview":
+    if tag_family == TECH_PREVIEW:
         return registry_tag
-    if channel == "weekly":
+    if tag_family == WEEKLY:
         year, built_week, _ = (built or date.today()).isocalendar()
         week = int(m[1])
         # A W01 tag on an image built in late December belongs to the next ISO year.
         year += 1 if week < built_week - 26 else -1 if week > built_week + 26 else 0
-        return f"{FAMILIES['weekly']}-{year}-w{week:02d}"
-    d = _day(m[1]).isoformat()
-    time = m[2] if channel == "snap" else None
-    return f"{FAMILIES[channel]}-{d}" + (f"T{time}" if time else "")
+        return f"{WEEKLY}-{year}-w{week:02d}"
+    time = m[2] if tag_family == SNAP else None
+    return f"{tag_family}-{_day(m[1]).isoformat()}" + (f"T{time}" if time else "")
 
 
-def fallback_tag(channel: str, day=None, name: str = "") -> str:
-    """The v2 tag a run names when no registry tag names its image: from its own date."""
-    if channel == "ci-cd-tech-preview":
-        return name
-    if channel not in FAMILIES or not day:
+def dated_tag(tag_family: str, tag_date=None) -> str:
+    """The v2 tag a run names itself by when the registry names its image by none."""
+    if tag_family not in DATED or not tag_date:
         return ""
-    return iso_week_tag(day) if channel == "weekly" else f"{FAMILIES[channel]}-{day}"
+    if tag_family == WEEKLY:
+        year, week, _ = tag_date.isocalendar()
+        return f"{WEEKLY}-{year}-w{week:02d}"
+    return f"{tag_family}-{tag_date.isoformat()}"
+
+
+def family_of(tag: str) -> str:
+    """The supply-chain family a full v2 tag belongs to by its prefix; '' for any other tag."""
+    return next((f for f in FAMILIES if tag.startswith(f + "-")), "")
 
 
 class Registry:
@@ -199,13 +204,17 @@ class Registry:
         )
 
 
-def _candidates(tags: list, channel: str, day) -> list:
-    """`channel`'s registry tags, nearest to `day` (else newest) first; a snap build's own
-    timed tag before its day's aggregate."""
-    found = [(t, m) for t in tags if (m := CHANNELS[channel].match(t))]
-    if channel in ("snap", "nightly") and day:
+def _candidates(tags: list, tag_family: str, tag_date) -> list:
+    """`tag_family`'s registry tags, nearest to `tag_date` (else newest) first; a snap build's
+    own timed tag before its day's aggregate."""
+    found = [(t, m) for t in tags if (m := REGISTRY_TAGS[tag_family].match(t))]
+    if tag_family in (SNAP, NIGHTLY) and tag_date:
         found.sort(
-            key=lambda x: (abs((_day(x[1][1]) - day).days), x[1].lastindex < 2, x[0])
+            key=lambda x: (
+                abs((_day(x[1][1]) - tag_date).days),
+                x[1].lastindex < 2,
+                x[0],
+            )
         )
         return [t for t, _ in found]
     return sorted((t for t, _ in found), reverse=True)
@@ -220,30 +229,17 @@ def split_image(image: str) -> tuple:
     return host, path, tag, digest
 
 
-def channel_tag_of(
-    registry: Registry,
-    path: str,
-    leaf: str,
-    channel: str = "",
-    day=None,
-    name: str = "",
+def tag_of(
+    registry: Registry, path: str, leaf: str, tag_family: str, tag_date=None
 ) -> tuple:
-    """(tag, tag_family, registry_tag) naming `leaf`: the registry's channel tag, else the
-    run's own `fallback_tag`; ('', '', '') when neither applies.
-
-    A writer that knows its run's channel and day keeps the tag in that channel, dating it
-    itself when the registry has no such tag; one that knows neither takes any channel's.
-    """
-    reads = 0
-    rest = [c for c in CHANNELS if c != channel]
-    order = [channel] + ([] if day else rest) if channel in CHANNELS else rest
-    for ch in order:
-        for t in _candidates(registry.tags(path), ch, day):
-            if reads >= MAX_TAG_READS:
-                break
-            reads += 1
-            if registry.names(path, t, leaf):
-                built = registry.built(path, leaf) if ch == "weekly" else None
-                return channel_tag(ch, t, built), FAMILIES[ch], t
-    tag = fallback_tag(channel, day, name)
-    return (tag, FAMILIES[channel], "") if tag else ("", "", "")
+    """(tag, registry_tag) naming `leaf` in `tag_family`: the registry's tag of that family,
+    else the run's `dated_tag`; ('', '') when neither applies."""
+    if tag_family not in REGISTRY_TAGS:
+        return "", ""
+    for reads, t in enumerate(_candidates(registry.tags(path), tag_family, tag_date)):
+        if reads >= MAX_TAG_READS:
+            break
+        if registry.names(path, t, leaf):
+            built = registry.built(path, leaf) if tag_family == WEEKLY else None
+            return family_tag(tag_family, t, built), t
+    return dated_tag(tag_family, tag_date), ""

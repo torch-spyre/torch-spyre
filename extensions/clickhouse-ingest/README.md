@@ -55,7 +55,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |
 | `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
 | `resolver.py` | any artifact spec -> its one spyre_v2 artifact, existing or derived (`artifacts resolve` / `ensure`, `ensure_artifact`) |
-| `registry.py` | read-only registry access: an image's per-arch leaf, labels and supply-chain channel tag |
+| `registry.py` | read-only registry access: an image's per-arch leaf, labels and its tag in a supply-chain tag_family |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 
 ## Tables modelled

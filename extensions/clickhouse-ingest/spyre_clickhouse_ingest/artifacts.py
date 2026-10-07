@@ -17,13 +17,15 @@
     python -m spyre_clickhouse_ingest.artifacts register --artifact image:<ref>@<digest> ...
     python -m spyre_clickhouse_ingest.artifacts release <manifest.json>
     python -m spyre_clickhouse_ingest.artifacts write <batch.json>
-    python -m spyre_clickhouse_ingest.artifacts resolve --artifact <spec> --arch s390x
+    python -m spyre_clickhouse_ingest.artifacts resolve --artifact <spec> --arch s390x \
+        [--tag-family nightly-supply-chain] [--tag-date YYYY-MM-DD] [--tag <tag> ...]
     python -m spyre_clickhouse_ingest.artifacts ensure --artifact <spec> --arch s390x ...
 
 `resolve` prints, as JSON, the one artifact a spec (resolver.py's grammar) names: the existing
 spyre_v2 record when there is one (read-only, from CLICKHOUSE_* + CLICKHOUSE_DB_V2; without
-them `lookup` is "none" and the id is derived), and for an image its per-arch leaf and
-supply-chain tag. `ensure` does the same and records it (resolver.ensure_artifact). Registry
+them `lookup` is "none" and the id is derived), for an image its per-arch leaf, and its
+`tag` / `tag_family` (and every pair in `tags`). `ensure` does the same and records it,
+tagged (resolver.ensure_artifact). Registry
 access: ICR_USERNAME / ICR_PASSWORD; Artifactory: ARTIFACTORY_USER / ARTIFACTORY_TOKEN.
 
 A batch is what a pipeline writer (the Jenkins orchestrator) hands over in one call; every
@@ -57,7 +59,7 @@ from itertools import zip_longest
 from pathlib import Path
 
 from .identity import ArtifactIdentity, DerivedId
-from .registry import CHANNELS, Registry
+from .registry import DATED, FAMILIES, Registry
 from .resolver import Lookup, ensure_artifact, resolve
 from .writer import ArtifactWriter
 
@@ -268,23 +270,32 @@ def main(argv=None) -> None:
         )
         what.add_argument("--image", help="shorthand for --artifact image:<ref>")
         p.add_argument("--arch", required=True)
-        p.add_argument("--channel", default="", choices=["", *CHANNELS])
         p.add_argument(
-            "--date",
-            type=date.fromisoformat,
-            default=None,
-            help="the run's day: orders the tag search, and dates the tag when none names it "
-            "(default with --channel: today, UTC)",
+            "--tag-family",
+            default="",
+            choices=["", *FAMILIES, RELEASE_FAMILY],
+            help="the family to tag it in: its tag there comes from the registry, else from "
+            "--tag-date; also the family of each --tag whose prefix names none",
         )
         p.add_argument(
-            "--name", default="", help="ci-cd-tech-preview: the release name"
+            "--tag",
+            action="append",
+            default=[],
+            help="repeatable full tag; one in --tag-family (given, or its prefix's) replaces "
+            "the resolved tag, any other is added",
+        )
+        p.add_argument(
+            "--tag-date",
+            type=date.fromisoformat,
+            default=None,
+            help="the run's day: orders the registry search and dates the tag when the registry "
+            "has none; weekly tags take its ISO week (default with a dated --tag-family: "
+            "today, UTC)",
         )
     res.add_argument(
         "--no-lookup", action="store_true", help="derive only; read no database"
     )
     ens.add_argument("--origin", default="built")
-    ens.add_argument("--tag", action="append", default=[], help="repeatable")
-    ens.add_argument("--tag-family", default=RELEASE_FAMILY)
     ens.add_argument("--run-url", default="")
     ens.add_argument(
         "--identity-dep", action="append", default=[], help="e.g. base=<sha256>"
@@ -300,8 +311,8 @@ def main(argv=None) -> None:
         from .client import ClickHouse, ClickHouseEnv
 
         db = args.database or ClickHouseEnv.target_database()
-        if args.channel and args.date is None:
-            args.date = datetime.now(timezone.utc).date()
+        if args.tag_family in DATED and args.tag_date is None:
+            args.tag_date = datetime.now(timezone.utc).date()
         if args.cmd == "resolve":
             lookup = Lookup()
             if not args.no_lookup and db and ClickHouseEnv.host():
@@ -318,7 +329,7 @@ def main(argv=None) -> None:
                     lookup = Lookup()
             out = resolve(
                 spec, args.arch, lookup=lookup, registry=registry,
-                channel=args.channel, day=args.date, name=args.name,
+                tag_family=args.tag_family, tag_date=args.tag_date, tags=args.tag,
             )  # fmt: skip
             out.pop("identity", None)
             print(json.dumps(out, sort_keys=True))
@@ -329,9 +340,9 @@ def main(argv=None) -> None:
             sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
         identity = ensure_artifact(
             ClickHouse.connect(database=db), db, spec, args.arch,
-            origin=args.origin, tags=[(t, args.tag_family) for t in args.tag],
-            channel=args.channel, day=args.date, run_url=args.run_url,
-            name=args.name, identity_deps=args.identity_dep, registry=registry,
+            origin=args.origin, tags=args.tag, tag_family=args.tag_family,
+            tag_date=args.tag_date, run_url=args.run_url,
+            identity_deps=args.identity_dep, registry=registry,
         )  # fmt: skip
         print(
             json.dumps(

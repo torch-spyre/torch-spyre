@@ -22,7 +22,7 @@ import pytest
 
 from spyre_clickhouse_ingest import ArtifactIdentity, artifacts
 from spyre_clickhouse_ingest.identity import ArtifactId
-from spyre_clickhouse_ingest.registry import Registry, channel_tag
+from spyre_clickhouse_ingest.registry import Registry, family_tag
 from spyre_clickhouse_ingest.resolver import Lookup, ensure_artifact, resolve
 from spyre_clickhouse_ingest.schema import ARTIFACT_REFS, ARTIFACT_TAGS, ARTIFACTS
 
@@ -101,27 +101,39 @@ def _row(component, name, id12, arch, kind, ref=""):
 
 LISTED = {LIST: (LIST, _index(("ppc64le", OTHER), ("s390x", LEAF))), LEAF: (LEAF, {})}
 
-# -- channel tags --------------------------------------------------------------------------
+# -- family tags ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "channel, tag, built, expected",
+    "tag_family, tag, built, expected",
     [
-        ("nightly", "nightly-20261004", None, "nightly-supply-chain-2026-10-04"),
         (
-            "snap",
+            "nightly-supply-chain",
+            "nightly-20261004",
+            None,
+            "nightly-supply-chain-2026-10-04",
+        ),
+        (
+            "snap-supply-chain",
             "snap-20261004T002701_277",
             None,
             "snap-supply-chain-2026-10-04T002701",
         ),
-        ("snap", "snap-20261005", None, "snap-supply-chain-2026-10-05"),
-        ("weekly", "weekly-W40", DAY, "weekly-supply-chain-2026-w40"),
-        ("weekly", "weekly-W01", date(2026, 12, 30), "weekly-supply-chain-2027-w01"),
+        ("snap-supply-chain", "snap-20261005", None, "snap-supply-chain-2026-10-05"),
+        ("weekly-supply-chain", "weekly-W40", DAY, "weekly-supply-chain-2026-w40"),
+        (
+            "weekly-supply-chain",
+            "weekly-W01",
+            date(2026, 12, 30),
+            "weekly-supply-chain-2027-w01",
+        ),
         ("ci-cd-tech-preview", "ci-cd-tech-preview-v3", None, "ci-cd-tech-preview-v3"),
     ],
 )
-def test_each_registry_channel_tag_has_one_v2_name(channel, tag, built, expected):
-    assert channel_tag(channel, tag, built) == expected
+def test_each_registry_tag_has_one_v2_name_in_its_family(
+    tag_family, tag, built, expected
+):
+    assert family_tag(tag_family, tag, built) == expected
 
 
 # -- images --------------------------------------------------------------------------------
@@ -204,7 +216,7 @@ def test_the_snap_builds_own_tag_beats_the_days_aggregate():
     }
     tags = ["snap-20261003T000000_1", "snap-20261004", "snap-20261004T002701_277"]
     out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry(served, tags),
-                  channel="snap", day=DAY)  # fmt: skip
+                  tag_family="snap-supply-chain", tag_date=DAY)  # fmt: skip
     assert (out["tag"], out["tag_family"], out["registry_tag"]) == (
         "snap-supply-chain-2026-10-04T002701",
         "snap-supply-chain",
@@ -212,26 +224,69 @@ def test_the_snap_builds_own_tag_beats_the_days_aggregate():
     )
 
 
-def test_a_dated_run_stays_in_its_channel_when_the_registry_has_no_tag():
+def test_a_family_with_no_registry_tag_is_dated_by_the_tag_date():
     reg = FakeRegistry(
         {**LISTED, "ci-cd-tech-preview-v3": (LEAF, {})}, ["ci-cd-tech-preview-v3"]
     )
-    out = resolve(
-        f"image:{IMAGE}@{LEAF}",
-        "s390x",
-        registry=reg,
-        channel="snap",
-        day=date(2026, 10, 6),
-    )
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg,
+                  tag_family="snap-supply-chain", tag_date=date(2026, 10, 6))  # fmt: skip
     assert (out["tag"], out["tag_family"]) == (
         "snap-supply-chain-2026-10-06",
         "snap-supply-chain",
     )
-    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg, channel="nightly")
-    assert (out["tag"], out["tag_family"]) == (
-        "ci-cd-tech-preview-v3",
-        "ci-cd-tech-preview",
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=reg,
+                  tag_family="weekly-supply-chain", tag_date=date(2026, 10, 6))  # fmt: skip
+    assert out["tag"] == "weekly-supply-chain-2026-w41"
+    # Without a date, a family with no registry tag names none; another family's tag is not taken.
+    out = resolve(
+        f"image:{IMAGE}@{LEAF}",
+        "s390x",
+        registry=reg,
+        tag_family="nightly-supply-chain",
     )
+    assert (out["tag"], out["tags"]) == ("", [])
+
+
+def test_a_full_tech_preview_tag_replaces_the_resolved_one():
+    reg = FakeRegistry(
+        {**LISTED, "ci-cd-tech-preview-v2": (LEAF, {})}, ["ci-cd-tech-preview-v2"]
+    )
+    spec = f"image:{IMAGE}@{LEAF}"
+    out = resolve(spec, "s390x", registry=reg, tag_family="ci-cd-tech-preview")
+    assert out["tag"] == "ci-cd-tech-preview-v2"
+    out = resolve(spec, "s390x", registry=reg, tag_family="ci-cd-tech-preview",
+                  tags=["ci-cd-tech-preview-v3"])  # fmt: skip
+    assert out["tags"] == [["ci-cd-tech-preview-v3", "ci-cd-tech-preview"]]
+
+
+def test_a_full_tag_takes_its_family_from_its_prefix():
+    out = resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry(LISTED),
+                  tags=["nightly-supply-chain-2026-10-04"])  # fmt: skip
+    assert (out["tag"], out["tag_family"]) == (
+        "nightly-supply-chain-2026-10-04",
+        "nightly-supply-chain",
+    )
+    out = resolve(
+        f"image:{IMAGE}@{LEAF}", "s390x", registry=FakeRegistry(LISTED), tags=["rc1"]
+    )
+    assert out["tags"] == [["rc1", "release"]]
+
+
+def test_a_tag_in_another_family_is_added_beside_the_resolved_one():
+    reg = FakeRegistry(
+        {**LISTED, "nightly-20261004": (LIST, LISTED[LIST][1])}, ["nightly-20261004"]
+    )
+    out = resolve(f"image:{IMAGE}@{LIST}", "s390x", registry=reg, tag_family="nightly-supply-chain",
+                  tags=["ci-cd-tech-preview-v3", ("rc1", "release")])  # fmt: skip
+    assert (out["tag"], out["tag_family"]) == (
+        "nightly-supply-chain-2026-10-04",
+        "nightly-supply-chain",
+    )
+    assert out["tags"] == [
+        ["nightly-supply-chain-2026-10-04", "nightly-supply-chain"],
+        ["ci-cd-tech-preview-v3", "ci-cd-tech-preview"],
+        ["rc1", "release"],
+    ]
 
 
 def test_a_weekly_tag_takes_the_iso_year_of_the_image_build():
@@ -242,7 +297,8 @@ def test_a_weekly_tag_takes_the_iso_year_of_the_image_build():
         "sha256:cfg": ("", {"created": "2026-10-01T08:00:00Z"}),
     }
     out = resolve(f"image:{IMAGE}@{LIST}", "s390x",
-                  registry=FakeRegistry(served, ["weekly-W39", "weekly-W40"]), channel="weekly")  # fmt: skip
+                  registry=FakeRegistry(served, ["weekly-W39", "weekly-W40"]),
+                  tag_family="weekly-supply-chain")  # fmt: skip
     assert out["tag"] == "weekly-supply-chain-2026-w40"
 
 
@@ -411,7 +467,7 @@ def test_ensure_records_an_artifact_its_ref_and_tags_once():
     )
     for _ in range(2):
         identity = ensure_artifact(client, "db", f"image:{IMAGE}@{LIST}", "s390x", origin="promoted",
-                                   tags=[("rc1", "release")], channel="nightly", registry=reg)  # fmt: skip
+                                   tags=[("rc1", "release")], tag_family="nightly-supply-chain", registry=reg)  # fmt: skip
     assert (
         identity.artifact_id
         == ArtifactIdentity.from_image(f"{IMAGE}@{LEAF}", "s390x").artifact_id
@@ -452,15 +508,24 @@ def test_the_cli_prints_the_resolution_as_json(monkeypatch, capsys):
         )
 
 
-def test_the_cli_dates_a_channel_tag_today_unless_given_a_date(monkeypatch, capsys):
+def test_the_cli_dates_a_family_tag_today_unless_given_a_tag_date(monkeypatch, capsys):
     monkeypatch.setattr(artifacts, "Registry", lambda **kw: FakeRegistry(LISTED))
     base = ["resolve", "--image", f"{IMAGE}@{LIST}", "--arch", "s390x", "--no-lookup"]
-    artifacts.main([*base, "--channel", "nightly"])
+    artifacts.main([*base, "--tag-family", "nightly-supply-chain"])
     today = datetime.now(timezone.utc).date().isoformat()
     assert json.loads(capsys.readouterr().out)["tag"] == f"nightly-supply-chain-{today}"
-    artifacts.main([*base, "--channel", "nightly", "--date", "2026-09-26"])
+    artifacts.main(
+        [*base, "--tag-family", "nightly-supply-chain", "--tag-date", "2026-09-26"]
+    )
     assert (
         json.loads(capsys.readouterr().out)["tag"] == "nightly-supply-chain-2026-09-26"
     )
     artifacts.main(base)
     assert json.loads(capsys.readouterr().out)["tag"] == ""
+    artifacts.main([*base, "--tag", "ci-cd-tech-preview-v3"])
+    out = json.loads(capsys.readouterr().out)
+    assert (out["tag"], out["tag_family"]) == (
+        "ci-cd-tech-preview-v3",
+        "ci-cd-tech-preview",
+    )
+    assert "channel" not in out

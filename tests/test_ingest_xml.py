@@ -937,9 +937,7 @@ def test_a_rerun_count_rides_on_the_final_attempt(ingest, tmp_path):
     assert run["total_tests"] == 2
 
 
-def test_the_artifact_date_defaults_to_the_runs_start_day(
-    ingest, monkeypatch, tmp_path
-):
+def test_the_tag_date_defaults_to_the_runs_start_day(ingest, monkeypatch, tmp_path):
     xml = tmp_path / "report.xml"
     xml.write_text(
         "<testsuites><testsuite name='pytest' timestamp='2026-10-04T23:50:00+00:00'>"
@@ -953,5 +951,5 @@ def test_the_artifact_date_defaults_to_the_runs_start_day(
     )
     _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)))
     _run_main(ingest, monkeypatch, xml, FakeClient(dict(FULL_RUN_SCHEMA)),
-              ["--artifact-date", "2026-09-26"])  # fmt: skip
-    assert [str(a.artifact_date) for a in seen] == ["2026-10-04", "2026-09-26"]
+              ["--tag-date", "2026-09-26"])  # fmt: skip
+    assert [str(a.tag_date) for a in seen] == ["2026-10-04", "2026-09-26"]
