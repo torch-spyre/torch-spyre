@@ -1088,8 +1088,18 @@ def test_the_tag_date_defaults_to_the_runs_start_day(ingest, monkeypatch, tmp_pa
 def test_the_deprecated_script_path_forwards_to_the_package():
     shim = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
     env = {**os.environ, "PYTHONPATH": str(_CHLIB)}
+    # Run as `python <shim>`, with the driver stubbed as the in-process fixture does: the test
+    # images carry no clickhouse_connect, and --help never connects.
+    run = (
+        "import runpy, sys, types; "
+        "sys.modules.setdefault('clickhouse_connect', types.ModuleType('clickhouse_connect')); "
+        "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
     out = subprocess.run(
-        [sys.executable, str(shim), "--help"], env=env, capture_output=True, text=True
+        [sys.executable, "-c", run, str(shim), "--help"],
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert out.returncode == 0, out.stderr
     assert "spyre_clickhouse_ingest results" in out.stdout
