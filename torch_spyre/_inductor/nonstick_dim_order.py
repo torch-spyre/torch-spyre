@@ -98,8 +98,12 @@ logger = get_inductor_logger("nonstick_dim_order")
 def _buf_stl(buf) -> SpyreTensorLayout | None:
     """Return the committed STL for any buffer type.
 
-    For ComputedBuffer: buf.committed_stl (set by optimize_restickify_locations).
-    For graph inputs and other buffers: read from the FixedTiledLayout directly.
+    For ComputedBuffer: buf.committed_stl (set by optimize_restickify_locations,
+    deleted by insert_restickify — only valid between those two passes).
+    For InputBuffer (graph inputs): buf.committed_stl (set by
+    optimize_restickify_locations, retained through insert_restickify).
+    For other buffers without committed_stl: read from the FixedTiledLayout
+    directly (e.g. restickify nodes inserted by insert_restickify).
     Returns None if no STL is available.
     """
     if hasattr(buf, "committed_stl"):
