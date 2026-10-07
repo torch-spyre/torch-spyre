@@ -39,6 +39,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
@@ -48,6 +49,7 @@ from ..wsr.coarse_tile import (
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
+from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
 
@@ -160,6 +162,45 @@ def _get_red_var(
     return loop_var, None
 
 
+def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
+    """Why ``op`` takes no coarse tiling for carrying a symbolic extent, or
+    ``None``.
+
+    Not a lowering limit but an applier one. The applier reads every output
+    range, reduction range and layout size of a tiled op as an ``int``
+    (``_raw_to_squeezed_pos``, ``_divide_ranges``), whichever axis the tiling
+    falls on. So an op with a symbolic extent anywhere -- a dim a recompile for
+    a second shape left symbolic -- cannot be tiled even on its static dims.
+
+    The same holds for the rest of a tiled layout's metadata
+    (``_layout_has_static_span_metadata``): the host strides can be symbolic
+    over static sizes -- a mutation op inherits its target view's strides --
+    and ``compute_tile_stride`` orders them by value.
+    """
+    for what, extents in (
+        ("output range", getattr(op.data, "ranges", None)),
+        ("reduction range", getattr(op.data, "reduction_ranges", None)),
+        ("layout size", getattr(getattr(op, "layout", None), "size", None)),
+    ):
+        for extent in extents or ():
+            if not (isinstance(extent, int) or getattr(extent, "is_Integer", False)):
+                return (
+                    f"coarse tiling: {op.get_name()} has symbolic {what} "
+                    f"{extent}; the applier reads every extent of a tiled op "
+                    "as an integer, so the op cannot be tiled."
+                )
+    layout = getattr(op, "layout", None)
+    if isinstance(layout, FixedTiledLayout) and not _layout_has_static_span_metadata(
+        layout
+    ):
+        return (
+            f"coarse tiling: {op.get_name()} has symbolic layout metadata "
+            f"(stride {list(layout.stride)}); the applier reads a tiled op's "
+            "layout as integers, so the op cannot be tiled."
+        )
+    return None
+
+
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, spec: TileSpec
 ) -> tuple[list[sympy.Symbol] | None, str | None]:
@@ -176,7 +217,14 @@ def try_resolve_tile_axis_loop_vars(
     ``is_reduction``: ``op_out_coords(op)`` for an output axis
     (:func:`_get_out_var`), the squeezed reduction loop variables for a
     reduction axis (:func:`_get_red_var`).
+
+    A non-empty ``spec`` on an op with a symbolic extent is rejected whatever
+    its axes (:func:`_symbolic_extent_reason`).
     """
+    if spec.axes:
+        reason = _symbolic_extent_reason(op)
+        if reason is not None:
+            return None, reason
     out_coords = op_out_coords(op)
     iter_space = iteration_space_from_op(op)
     loop_vars: list[sympy.Symbol] = []

@@ -125,7 +125,16 @@ SELECT
     -- 'running' is advisory only (a crashed run keeps this row until the 90-day TTL); shown
     -- here for the drill-down, but aggregating callers must exclude it (see v_tier_trend).
     CAST(r.state = 'running' AS UInt8) AS is_advisory
-FROM artifact_results AS r
+FROM
+(
+    -- One row per verdict, the latest: a leg writes a 'running' seed before its final state and a
+    -- re-push repeats it, so raw rows count a run's counters twice. A run can hold a functional
+    -- and a capability verdict for one artifact, hence result_kind/test_type in the key.
+    SELECT *
+    FROM artifact_results
+    ORDER BY ts DESC, audit_timestamp DESC
+    LIMIT 1 BY artifact_id, run_id, result_kind, test_type
+) AS r
 LEFT JOIN v_artifacts AS a ON a.artifact_id = r.artifact_id
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
