@@ -70,8 +70,28 @@ inputs:
     description: Fail the job when the artifact cannot be resolved or recorded.
     required: false
     default: 'false'
+  clickhouse-v2-host:
+    description: The v2 connection (secrets CLICKHOUSE_V2_HOST/PORT/USER/PASS/DB). Empty falls back to clickhouse-*.
+    required: false
+    default: ''
+  clickhouse-v2-port:
+    description: v2 ClickHouse port.
+    required: false
+    default: ''
+  clickhouse-v2-user:
+    description: v2 ClickHouse user.
+    required: false
+    default: ''
+  clickhouse-v2-pass:
+    description: v2 ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-v2-db:
+    description: The spyre_v2 database on the v2 connection.
+    required: false
+    default: ''
   clickhouse-host:
-    description: ClickHouse host. Empty = no lookup and no write (dry-run and lookup off still resolve).
+    description: Shared ClickHouse host, the fallback while clickhouse-v2-host is empty.
     required: false
     default: ''
   clickhouse-port:
@@ -87,7 +107,7 @@ inputs:
     required: false
     default: ''
   clickhouse-db-v2:
-    description: The spyre_v2 database.
+    description: The spyre_v2 database on the shared connection (fallback).
     required: false
     default: ''
   registry-username:
@@ -171,11 +191,12 @@ runs:
         RUN_URL: ${{ inputs.run-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
         DRY_RUN: ${{ inputs.dry-run }}
         STRICT: ${{ inputs.strict }}
-        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
-        CLICKHOUSE_PORT: ${{ inputs.clickhouse-port }}
-        CLICKHOUSE_USER: ${{ inputs.clickhouse-user }}
-        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
-        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-db-v2 }}
+        V2_HOST: ${{ inputs.clickhouse-v2-host }}
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-v2-host || inputs.clickhouse-host }}
+        CLICKHOUSE_PORT: ${{ inputs.clickhouse-v2-host && inputs.clickhouse-v2-port || inputs.clickhouse-port }}
+        CLICKHOUSE_USER: ${{ inputs.clickhouse-v2-host && inputs.clickhouse-v2-user || inputs.clickhouse-user }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-v2-host && inputs.clickhouse-v2-pass || inputs.clickhouse-pass }}
+        CLICKHOUSE_DB_V2: ${{ inputs.clickhouse-v2-host && inputs.clickhouse-v2-db || inputs.clickhouse-db-v2 }}
         ICR_USERNAME: ${{ inputs.registry-username }}
         ICR_PASSWORD: ${{ inputs.registry-password }}
         ARTIFACTORY_USER: ${{ inputs.artifactory-user }}
@@ -183,9 +204,15 @@ runs:
       run: |
         set -uo pipefail
         if [ -z "${CLICKHOUSE_HOST}" ] && [ "${DRY_RUN}" != "true" ]; then
-          echo "::notice title=v2 artifact::no clickhouse-host; ${ARTIFACT} not recorded."
+          echo "::notice title=v2 artifact::no clickhouse-v2-host; ${ARTIFACT} not recorded."
           exit 0
         fi
+        if [ -z "${V2_HOST}" ] && [ -n "${CLICKHOUSE_HOST}" ]; then
+          # v2 fallback onto the shared connection: remove once every repo has CLICKHOUSE_V2_*.
+          echo "::notice title=v2 ClickHouse::v2 written over the shared CLICKHOUSE_* secrets;" \
+               "add CLICKHOUSE_V2_HOST/PORT/USER/PASS/DB to give v2 its own."
+        fi
+        export CLICKHOUSE_DB="${CLICKHOUSE_DB_V2}"
         args=(--artifact "${ARTIFACT}" --lookup "${LOOKUP}" --registry "${REGISTRY}"
               --origin "${ORIGIN}" --run-url "${RUN_URL}")
         [ -n "${ARCH}" ] && args+=(--arch "${ARCH}")
