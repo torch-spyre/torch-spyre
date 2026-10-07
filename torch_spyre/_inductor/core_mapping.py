@@ -23,6 +23,7 @@ from itertools import permutations
 from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
@@ -75,24 +76,27 @@ def owner_slots(
 
     if num_cores <= 0:
         raise ValueError(f"physical core count must be positive, got {num_cores}")
-    if splits.keys() != slots.keys():
+    try:
+        formulas = {dim: sympify(slots[dim]) for dim in splits}
+    except KeyError:
         raise ValueError(
             "ownership split and owner-slot dimensions differ: "
             f"{sorted(map(str, splits))} != {sorted(map(str, slots))}"
         )
-    formulas = {dim: sympify(slots[dim]) for dim in splits}
     rows = []
     for core in range(num_cores):
         row = {}
         for dim, split in splits.items():
             value = _owner_at_core(formulas[dim], core)
-            if value.free_symbols or value.is_integer is not True:
+            try:
+                int_value = as_int(value, strict=True)
+            except ValueError:
                 raise ValueError(f"non-integral owner slot {value} on core {core}")
-            if not 0 <= int(value) < int(split):
+            if not 0 <= int_value < split:
                 raise ValueError(
-                    f"owner slot {int(value)} outside split {split} on core {core}"
+                    f"owner slot {int_value} outside split {split} on core {core}"
                 )
-            row[dim] = int(value)
+            row[dim] = int_value
         rows.append(row)
     return tuple(rows)
 
@@ -111,20 +115,21 @@ def transfer_edges(
 
     Both partitions must describe the same coordinate domain.
     """
-    return {
-        (s_core, d_core)
-        for s_core, s_slice in source_map.items()
-        for d_core, d_slice in destination_map.items()
-        if all(
-            _overlap(
-                s_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                d_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in source_splits.keys() | destination_splits.keys()
-        )
-    }
+    all_splits = source_splits.keys() | destination_splits.keys()
+    result = set()
+    for s_core, s_slice in source_map.items():
+        for d_core, d_slice in destination_map.items():
+            for dim in all_splits:
+                if not _overlap(
+                    s_slice.get(dim, 0),
+                    source_splits.get(dim, 1),
+                    d_slice.get(dim, 0),
+                    destination_splits.get(dim, 1),
+                ):
+                    break
+            else:
+                result.add((s_core, d_core))
+    return result
 
 
 def same_owner_maps(
@@ -140,13 +145,16 @@ def same_owner_maps(
     Unsplit dimensions describe no ownership and are ignored. Equivalent SymPy
     spellings compare equal; a missing owner formula is a mismatch.
     """
-
-    left = {dim: int(split) for dim, split in left_splits.items() if int(split) > 1}
-    right = {dim: int(split) for dim, split in right_splits.items() if int(split) > 1}
-    if left != right or left_cores != right_cores:
+    if left_cores <= 0:
         return False
-    if not left:
+    if left_cores != right_cores:
+        return False
+    left = {dim: split for dim, split in left_splits.items() if split > 1}
+    right = {dim: split for dim, split in right_splits.items() if split > 1}
+    if not left and not right:
         return True
+    if left != right:
+        return False
     try:
         return core_mappings_equal(
             {dim: left_slots[dim] for dim in left},
@@ -396,7 +404,6 @@ def decompose_fused_split_view(
             fused_split,
             rectangles=True,
         )
-        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         shapes = {tuple(high - low + 1 for low, high in bounds) for bounds in regions}
         if len(shapes) != 1:
             reject(
@@ -420,6 +427,7 @@ def decompose_fused_split_view(
             return None
 
         synthetic = {axis: Symbol(f"physical_dim_{axis}") for axis in driven}
+        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         expected = tuple(
             {
                 synthetic[axis]: lo // width
@@ -951,6 +959,10 @@ def partition_lx_size_bytes(
     return get_device_size_in_bytes(per_core_size, device_dtype)
 
 
+def _comparable(expr):
+    return expr if not isinstance(expr, Expr) else str(expr)
+
+
 def core_mappings_equal(
     left: Mapping[Any, Expr],
     right: Mapping[Any, Expr],
@@ -965,19 +977,22 @@ def core_mappings_equal(
     on a 304-op graph this was 5 million ``sympify`` calls.
     """
 
-    if left.keys() != right.keys():
-        return False
     if num_cores <= 0:
         return False
+    if left.keys() != right.keys():
+        return False
+
     try:
         key_left = tuple(
             sorted(
-                ((str(d), sympify(e)) for d, e in left.items()), key=lambda kv: kv[0]
+                ((_comparable(d), sympify(e)) for d, e in left.items()),
+                key=lambda kv: kv[0],
             )
         )
         key_right = tuple(
             sorted(
-                ((str(d), sympify(e)) for d, e in right.items()), key=lambda kv: kv[0]
+                ((_comparable(d), sympify(e)) for d, e in right.items()),
+                key=lambda kv: kv[0],
             )
         )
     except (TypeError, ValueError):
@@ -987,20 +1002,19 @@ def core_mappings_equal(
 
 @lru_cache(maxsize=65536)
 def _core_mappings_equal_cached(
-    left: tuple[tuple[str, Expr], ...],
-    right: tuple[tuple[str, Expr], ...],
+    left: tuple[tuple[Any, Expr], ...],
+    right: tuple[tuple[Any, Expr], ...],
     num_cores: int,
 ) -> bool:
     try:
         for (_, lf), (_, rf) in zip(left, right):
             for core in range(num_cores):
-                values = [_owner_at_core(f, core) for f in (lf, rf)]
-                if any(
-                    value.free_symbols or value.is_integer is not True
-                    for value in values
-                ):
-                    return False
-                if values[0] != values[1]:
+                try:
+                    l_val = as_int(_owner_at_core(lf, core))
+                    r_val = as_int(_owner_at_core(rf, core))
+                    if l_val != r_val:
+                        return False
+                except ValueError:
                     return False
         return True
     except (TypeError, ValueError):
