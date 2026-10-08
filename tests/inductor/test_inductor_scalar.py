@@ -33,7 +33,8 @@ class TestTensorScalarCoreArithmetic:
     def test_complex64_add_mul_div_python_complex_scalars(self, execution_mode):
         """
         ``complex64`` tensor with Python ``complex`` scalars: ``+ (1+2j)``, ``* (3-4j)``, ``/ (0.5+0.5j)``.
-        The complex dtype is rejected.
+        The complex dtype is rejected. Both modes fail when the tensor is moved to the
+        device, before ``torch.compile`` runs, so they pin the same check.
         """
 
         def complex_ops(x):

@@ -699,7 +699,7 @@ class TestModelScalarOperations:
             execution_mode, moe_loss, main_loss, aux_loss, atol=4e-3, rtol=4e-3
         )
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1387
+    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4720 (clip on IEEE_FP32)
     def test_quantization_scale_int8(self, execution_mode):
         """INT8 quantization with scale factor: the fp32 clamp is rejected."""
 

@@ -522,6 +522,13 @@ class ParameterizedTestMeta(type):
             # or raises for another reason, fails.
             expect_raise = cases.get("expect_raise", {})
             used_expect_raise = set()
+            # The fragment is what separates "rejected for the documented reason" from
+            # "failed some other way": "" matches any exception, None is a bare raise.
+            for key, fragment in expect_raise.items():
+                assert isinstance(fragment, str) and fragment.strip(), (
+                    f"{test_name_prefix}: expect_raise[{key!r}] needs a non-empty "
+                    "message fragment"
+                )
             for overlap, other in (
                 (expect_fail, "expect_fail"),
                 (skip_list, "skip"),
@@ -566,6 +573,16 @@ class ParameterizedTestMeta(type):
                             )(namespace[test_name])
                         elif test_case in expect_raise or op_case in expect_raise:
                             marked = op_case if op_case in expect_raise else test_case
+                            # A bare key covers every op, so compare per test, not just
+                            # the raw keys: expect_raise={"c"} and expect_fail=["a_c"]
+                            # would otherwise lose the xfail silently.
+                            assert (
+                                test_case not in expect_fail
+                                and op_case not in expect_fail
+                            ), (
+                                f"{test_name_prefix}: {test_name} is in both "
+                                "expect_raise and expect_fail"
+                            )
                             used_expect_raise.add(marked)
                             namespace[test_name] = _expect_raise_test(
                                 namespace[test_name], expect_raise[marked]

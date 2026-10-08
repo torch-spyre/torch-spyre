@@ -84,7 +84,8 @@ class TestTransposeEdge:
     # --- Dtypes ---
 
     def test_transpose_complex_dtype(self, execution_mode):
-        # Issue #1545: the complex dtype is rejected.
+        # Issue #1545: the complex dtype is rejected. Both modes fail when the tensor
+        # is moved to the device, before torch.compile runs.
         x = torch.randn((64, 128), dtype=torch.complex64)
         with pytest.raises(Exception, match="does not support dtype ComplexFloat"):
             _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)

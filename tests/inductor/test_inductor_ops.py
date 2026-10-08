@@ -7838,6 +7838,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_count_nonzero_float_dim0_rejected(self):
         # The compiled backend has no int32 sum, which count_nonzero needs.
+        # TODO: a missing feature, not a design limit. When int32 sum is
+        # implemented this stops raising, and the test has to become a positive one.
         x = cached_randn((67, 256))
         with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
             self.compare_with_cpu(
@@ -7848,6 +7850,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_count_nonzero_bool_dim0_rejected(self):
         # The compiled backend has no int32 sum, which count_nonzero needs.
+        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
                 [True, False, True, False, True, False, True],
@@ -7875,6 +7878,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_nanmean_all_dims_rejected(self):
         # nanmean sums the non-NaN values, and the backend has no int32 sum.
+        # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -9789,15 +9793,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
     def test_restickify_fp32_unsupported(self):
-        """Verify RESTICKIFY_OP correctly rejects FP32 dtype.
+        """An op that needs a restickify has no feasible layout for FP32.
 
-        Operations that would trigger restickify (like transpose + pointwise)
-        are rejected when using FP32 tensors.
+        ``x.t() + y`` needs a restickify, which only exists for the DL16 format
+        (fp16 and bf16; both compile and match the CPU). With FP32 operands the
+        layout optimizer finds no feasible layout. That is its generic "no
+        mechanism to resolve stick incompatibility" error, which also fires for
+        other causes (unaligned re-offsets, #1377), so the fragment pins the FP32
+        device dtype that the message lists for each input.
         """
         x = torch.randn((128, 128), dtype=torch.float32)
         y = torch.randn((128, 128), dtype=torch.float32)
         # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(Exception, match="no mechanism to resolve stick incompat"):
+        with pytest.raises(
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+        ):
             self.compare_with_cpu(
                 lambda x, y: x.t() + y,
                 x,
@@ -9806,15 +9816,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_restickify_int64_unsupported(self):
-        """Verify RESTICKIFY_OP correctly rejects INT64 dtype.
+        """The same, for INT64: there is no feasible layout without a restickify.
 
-        Operations that would trigger restickify (like transpose + pointwise)
-        are rejected when using INT64 tensors.
+        The device computes the int64 add in IEEE_FP32 (the message lists IEEE_FP32
+        for the converted operands), so the fragment pins that dtype, as above.
         """
         x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(Exception, match="no mechanism to resolve stick incompat"):
+        with pytest.raises(
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+        ):
             self.compare_with_cpu(
                 lambda x, y: x.t() + y,
                 x,

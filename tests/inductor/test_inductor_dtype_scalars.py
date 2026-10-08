@@ -268,7 +268,11 @@ class TestDatatypeScalarOperations:
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
     def test_mixed_dtype_chain_fp64_fp32_fp16(self, execution_mode):
-        """FP64 → FP32 → FP16 chain: the FP64 input is rejected."""
+        """FP64 → FP32 → FP16 chain: the FP64 input is rejected.
+
+        Both modes fail when the FP64 tensor is moved to the device, before
+        ``torch.compile`` runs, so they pin the same check.
+        """
 
         def mixed_chain(x):
             x_fp32 = x.to(torch.float32)

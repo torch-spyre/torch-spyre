@@ -108,6 +108,30 @@ class TestExpectRaise(unittest.TestCase):
                 _base,
             )
 
+    def test_empty_or_missing_fragment_is_rejected(self):
+        # "" matches any exception and None would be a bare must-raise.
+        for bad in ("", None, "  "):
+            with self.subTest(fragment=bad):
+                with pytest.raises(AssertionError, match="non-empty"):
+                    _make(
+                        {"param_sets": {"c": ("reject",)}, "expect_raise": {"c": bad}},
+                        _base,
+                    )
+
+    def test_bare_expect_raise_and_op_specific_expect_fail_are_rejected(self):
+        # expect_raise={"c"} also covers op "a"'s case, so expect_fail=["a_c"] would
+        # be silently replaced by the raise wrapper.
+        with pytest.raises(AssertionError, match="expect_fail"):
+            _make(
+                {
+                    "ops_dict": {"a": "a", "b": "b"},
+                    "param_sets": {"c": ("reject",)},
+                    "expect_raise": {"c": "mixed EA"},
+                    "expect_fail": ["a_c"],
+                },
+                lambda self, op, mode: None,
+            )
+
     def test_entry_that_matches_no_case_is_rejected(self):
         with pytest.raises(AssertionError, match="matches no"):
             _make(

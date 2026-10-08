@@ -66,8 +66,8 @@ def _expect_raise(match):
 
 
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-# Scalar eager add is rejected for SEN143_FP8 today; when #1474 lands this fails
-# and the case has to go back to a normal one.
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
 _SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
