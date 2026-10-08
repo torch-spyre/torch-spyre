@@ -64,6 +64,8 @@ from spyre_clickhouse_ingest import (
     tables_present,
 )
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
+from spyre_clickhouse_ingest.offline import add_offline_options
+from spyre_clickhouse_ingest.offline import main as offline_main
 from spyre_clickhouse_ingest.options import (
     pair,
     add_artifact_options,
@@ -1413,7 +1415,8 @@ def _gha_run_url(args) -> str:
     return f"{server}/{repo}/actions/runs/{rid}"
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
+    """`results`' flags, the offline bundle ones included (offline.add_offline_options)."""
     parser = argparse.ArgumentParser(prog="spyre_clickhouse_ingest results")
     parser.add_argument("--xml-dir", default=None)
     parser.add_argument("--xml-file", default=None)
@@ -1497,7 +1500,18 @@ def main(argv=None):
         "replacement tables only), or both (the migration window). Also settable via "
         "INGEST_SCHEMA so a workflow can set it once for every leg.",
     )
-    args = parser.parse_args(argv)
+    add_offline_options(parser)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.offline or args.validate_only or args.upload:
+        return offline_main(argv)
+    if args.from_bundle:
+        from spyre_clickhouse_ingest.bundle import ingest
+
+        return ingest(args)
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot

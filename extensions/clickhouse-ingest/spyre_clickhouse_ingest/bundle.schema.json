@@ -2,55 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/torch-spyre/torch-spyre/tree/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/bundle.schema.json",
   "title": "spyre_v2 results bundle: bundle.json, schema_version 1",
-  "description": "A sealed bundle is a directory (or .tgz of it) holding this file and every file it lists. `bundle seal` fills files, started_at and ended_at. A blank artifact_id/image/artifact counts as absent.",
+  "description": "bundle.json, minimal: an artifact (artifact_id, or image with arch) and test_type (implied perf for kind vllm), beside at least one results file. Every other key is optional and derived at ingest when absent: component and arch from the artifact, run_key as manual:<uploader>:<bundle sha256>, files[] (checked when present). A blank artifact field counts as absent.",
   "type": "object",
-  "required": [
-    "schema_version",
-    "component",
-    "arch",
-    "test_type",
-    "started_at",
-    "files"
-  ],
-  "allOf": [
-    {
-      "anyOf": [
-        {
-          "required": [
-            "artifact_id"
-          ]
-        },
-        {
-          "required": [
-            "image"
-          ]
-        },
-        {
-          "required": [
-            "artifact"
-          ]
-        }
-      ]
-    },
-    {
-      "anyOf": [
-        {
-          "required": [
-            "run_key"
-          ]
-        },
-        {
-          "required": [
-            "jenkins_run_key"
-          ]
-        }
-      ]
-    }
-  ],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": 1
+      "description": "Default 1; a newer version is refused.",
+      "type": "integer",
+      "enum": [
+        1
+      ]
     },
     "kind": {
       "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg.",
@@ -74,12 +35,12 @@
       "type": "string"
     },
     "component": {
-      "description": "The suite's owner, a test_case_id hash input (torch-spyre, spyre-inference, spyre-backend, ...).",
+      "description": "The suite's owner, a test_case_id hash input. Default: the artifact's component.",
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]*$"
     },
     "arch": {
-      "description": "Where the tests ran.",
+      "description": "Where the tests ran. Default: the artifact's arch. Needed with an image alone.",
       "enum": [
         "x86_64",
         "s390x",
@@ -107,9 +68,9 @@
       ]
     },
     "run_key": {
-      "description": "Unique per run and tier source: `manual:<who>:<uuid4>`, or a Jenkins `<JOB_NAME>#<BUILD_NUMBER>` (then the run_id equals a connected v2Results run's).",
+      "description": "Unique per run: manual:<who>:<token>, or a Jenkins <JOB_NAME>#<BUILD_NUMBER> (then the run_id equals a connected v2Results run's). Default: manual:<uploader>:<bundle sha256>.",
       "type": "string",
-      "pattern": "^(manual:[A-Za-z0-9._@+-]+:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[^#\\s]+#[0-9]+)$"
+      "pattern": "^(manual:[A-Za-z0-9._@+-]+:[A-Za-z0-9-]+|[^#\\s]+#[0-9]+)$"
     },
     "jenkins_run_key": {
       "description": "Alias of a Jenkins run_key; when both are set they must be equal.",

@@ -12,41 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`bundle init|seal|validate|ingest`: offline results, recorded later under their own run."""
+"""`results --offline | --upload | --from-bundle`: results recorded offline, ingested later."""
 
 import io
 import json
 import shutil
+import subprocess
+import sys
 import tarfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from spyre_clickhouse_ingest import bundle, results, schema
+from spyre_clickhouse_ingest import bundle, offline, results, schema
+from spyre_clickhouse_ingest.__main__ import main as cli
 from spyre_clickhouse_ingest.identity import RunId
 from spyre_clickhouse_ingest.junit import RunCoordinates
 
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
+OTHER = "0" * 8 + AID[8:]
+IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
 JUNIT = """<?xml version="1.0"?><testsuites><testsuite name="s" tests="2"
  timestamp="2026-10-08T10:00:00+00:00"><testcase classname="a.b" name="test_x" time="1"/>
  <testcase classname="a.b" name="test_y" time="1"><failure message="boom"/></testcase>
  </testsuite></testsuites>"""
+VLLM_DATA = Path(__file__).parent / "data" / "vllm_bundle"
 
 
-def _init(tmp_path, *extra, name="b"):
-    out = tmp_path / name
-    argv = ["init", "--artifact", f"id:{AID}", "--component", "spyre-inference"]
-    argv += ["--arch", "s390x", "--test-type", "fvt", "--out", str(out), *extra]
-    assert bundle.main(argv) == 0
-    return out
+def _xml(tmp_path, text=JUNIT):
+    d = tmp_path / "xml"
+    d.mkdir(exist_ok=True)
+    (d / "junit.xml").write_text(text)
+    return d
 
 
-def _sealed(tmp_path, *extra, xml=JUNIT, name="b"):
-    out = _init(tmp_path, *extra, name=name)
-    (out / "results" / "junit.xml").write_text(xml)
-    assert bundle.main(["seal", str(out)]) == 0
-    return out
+def _offline(tmp_path, *extra, out="b", artifact=f"id:{AID}", capsys=None):
+    """`results --offline --out` with the usual flags; returns the bundle path."""
+    path = tmp_path / out
+    argv = ["results", "--offline", "--out", str(path), "--xml-dir", str(_xml(tmp_path)),
+            "--artifact", artifact, "--arch", "s390x", "--trigger-type", "fvt", *extra]  # fmt: skip
+    assert cli(argv) == 0
+    if capsys:
+        capsys.readouterr()
+    return path
 
 
 def _meta(path):
@@ -60,144 +71,205 @@ def _edit(path, **fields):
     )
 
 
-def _rejected(path, code=bundle.REJECTED):
-    with pytest.raises(bundle.BundleError) as err:
-        bundle.check(path)
+def _minimal(tmp_path, meta=None, name="m"):
+    root = tmp_path / name
+    (root / "results").mkdir(parents=True)
+    (root / "results" / "junit.xml").write_text(JUNIT)
+    (root / "bundle.json").write_text(
+        json.dumps(meta or {"artifact_id": AID, "test_type": "fvt"})
+    )
+    return root
+
+
+def _rejected(path, code=offline.REJECTED):
+    with pytest.raises(offline.BundleError) as err:
+        offline.check(path)
     assert err.value.code == code
     return str(err.value)
 
 
+# --- the format, offline ------------------------------------------------------------------
+
+
 def test_schema_tiers_are_the_ddl_check_set():
     assert (
-        set(bundle.schema()["properties"]["test_type"]["enum"])
+        set(offline.schema()["properties"]["test_type"]["enum"])
         == schema.TEST_TYPE_VALUES
     )
 
 
-def test_init_writes_a_manual_skeleton_that_seal_completes(tmp_path):
-    out = _init(tmp_path, "--runner", "image=icr.io/x@sha256:" + "a" * 64)
-    meta = _meta(out)
-    assert meta["artifact_id"] == AID and "artifact" not in meta
-    assert meta["run_key"].startswith("manual:") and meta["files"] == []
-    assert meta["runner"]["image"].startswith("icr.io/x")
-    _rejected(out)
-    (out / "results" / "junit.xml").write_text(JUNIT)
-    assert bundle.main(["seal", str(out)]) == 0
-    meta = bundle.check(out)
+def test_offline_writes_a_bundle_from_the_usual_flags(tmp_path, capsys):
+    path = _offline(tmp_path, "--component", "spyre-inference", "--jenkins-run-key",
+                    "Spyre-Test/testing/Jenkinsfile.x#7", "--run-url", "https://j/7/")  # fmt: skip
+    report = json.loads(capsys.readouterr().out)
+    meta = _meta(path)
+    assert (meta["artifact_id"], meta["test_type"], meta["arch"]) == (
+        AID,
+        "fvt",
+        "s390x",
+    )
+    assert meta["run_key"] == "Spyre-Test/testing/Jenkinsfile.x#7" == report["run_key"]
     assert [f["path"] for f in meta["files"]] == ["results/junit.xml"]
-    assert meta["started_at"] == "2026-10-08T10:00:00Z" and meta["ended_at"]
+    assert meta["started_at"] == "2026-10-08T10:00:00Z"
+    assert report["run_id"] == RunId.derive("jenkins", meta["run_key"], "s390x", "fvt")
+    assert report["upload_path"].startswith(
+        f"zsp/next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
+    )
 
 
-def test_validate_reads_a_tgz(tmp_path, capsys):
-    out = _sealed(tmp_path)
-    tgz = tmp_path / "b.tgz"
-    with tarfile.open(tgz, "w:gz") as tar:
-        tar.add(out, arcname="b")
-    assert bundle.main(["validate", str(tgz)]) == 0
-    report = json.loads(capsys.readouterr().out.splitlines()[-1])
-    assert report["status"] == "valid" and report["run_id"] == bundle.run_id(_meta(out))
+def test_offline_tgz_and_validate_only(tmp_path, capsys):
+    tgz = _offline(tmp_path, out="b.tgz", artifact=f"image:{IMAGE}", capsys=capsys)
+    assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "valid"
+    assert report["upload_path"].split("/")[5] == "sha256-" + "b6" * 32
+    assert report["run_key"].startswith("manual:<uploader>:")
 
 
-def test_a_tgz_escaping_its_directory_is_rejected(tmp_path):
+def test_the_minimal_bundle_is_an_artifact_a_tier_and_a_result(tmp_path):
+    assert offline.check(_minimal(tmp_path))["test_type"] == "fvt"
+    image_only = _minimal(tmp_path, {"image": IMAGE, "test_type": "fvt"}, name="i")
+    assert "only with arch" in _rejected(image_only)
+    _edit(image_only, arch="s390x")
+    assert offline.check(image_only)["image"] == IMAGE
+    vllm_only = tmp_path / "v"
+    shutil.copytree(VLLM_DATA, vllm_only)
+    (vllm_only / "bundle.json").write_text(
+        json.dumps({"kind": "vllm", "artifact_id": AID})
+    )
+    assert offline.check(vllm_only)["test_type"] == "perf"
+
+
+@pytest.mark.parametrize(
+    "meta, why",
+    [
+        ({"artifact_id": AID}, "test_type is required"),
+        ({"test_type": "fvt"}, "needs artifact_id or image"),
+        (
+            {"artifact_id": "", "image": "", "test_type": "fvt"},
+            "needs artifact_id or image",
+        ),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "schema_version": 2},
+            "newer than this ingest",
+        ),
+        ({"artifact_id": AID, "test_type": "nightly"}, "is not one of"),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "colour": "red"},
+            "unknown key 'colour'",
+        ),
+        ({"artifact_id": AID, "test_type": "fvt", "tag_family": "x"}, "verdicts only"),
+        ({"artifact": f"id:{OTHER}", "artifact_id": AID, "test_type": "fvt"}, "differ"),
+        (
+            {
+                "artifact_id": AID,
+                "test_type": "fvt",
+                "run_key": "J#1",
+                "jenkins_run_key": "J#2",
+            },
+            "differ",
+        ),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "started_at": "2026-10-08 10:00"},
+            "with a zone",
+        ),
+    ],
+)
+def test_bad_bundle_json_is_rejected(tmp_path, meta, why):
+    assert why in _rejected(_minimal(tmp_path, meta))
+
+
+def test_files_are_checked_only_when_listed(tmp_path):
+    path = _offline(tmp_path)
+    (path / "results" / "extra.xml").write_text(JUNIT)
+    assert "not in files[]" in _rejected(path)
+    (path / "results" / "extra.xml").unlink()
+    (path / "results" / "junit.xml").write_text(JUNIT.replace("boom", "bang"))
+    assert "sha256 mismatch" in _rejected(path)
+    (path / "results" / "junit.xml").unlink()
+    assert "missing" in _rejected(path, offline.INCOMPLETE)
+    _edit(path, files=None)
+    (path / "results" / "other.xml").write_text(JUNIT)
+    assert offline.check(path)
+
+
+def test_files_outside_results_and_attachments_are_rejected(tmp_path):
+    root = _minimal(tmp_path)
+    (root / "notes.txt").write_text("x")
+    assert "belong in results/" in _rejected(root)
+
+
+def test_a_bundle_with_no_cases_records_nothing(tmp_path):
+    root = _minimal(tmp_path)
+    (root / "results" / "junit.xml").write_text(
+        "<testsuites><testsuite name='s'/></testsuites>"
+    )
+    assert "no <testcase>" in _rejected(root)
+
+
+def test_a_tgz_escaping_its_directory_is_rejected(tmp_path, capsys):
     tgz = tmp_path / "evil.tgz"
     with tarfile.open(tgz, "w:gz") as tar:
         info = tarfile.TarInfo("../bundle.json")
         info.size = 2
         tar.addfile(info, io.BytesIO(b"{}"))
-    assert bundle.main(["validate", str(tgz)]) == bundle.REJECTED
-
-
-@pytest.mark.parametrize(
-    "change, why",
-    [
-        ({"colour": "red"}, "unknown key 'colour'"),
-        ({"test_type": "nightly"}, "is not one of"),
-        ({"run_key": "manual:me:not-a-uuid"}, "does not match"),
-        ({"started_at": "2026-10-08 10:00"}, "with a zone"),
-        ({"tag_family": "nightly-supply-chain"}, "manual bundle records verdicts only"),
-        ({"artifact": "id:" + "0" * 8 + AID[8:]}, "differ"),
-        ({"artifact_id": None}, None),
-    ],
-)
-def test_bad_bundle_json_is_rejected(tmp_path, change, why):
-    out = _sealed(tmp_path)
-    _edit(out, **change)
-    if (
-        why is None
-    ):  # artifact_id dropped and no artifact spec: neither names the artifact
-        assert "needs artifact_id or image or artifact" in _rejected(out)
-    else:
-        assert why in _rejected(out)
-
-
-def test_files_must_match_the_directory(tmp_path):
-    out = _sealed(tmp_path)
-    (out / "results" / "extra.xml").write_text(JUNIT)
-    assert "not in files[]" in _rejected(out)
-    (out / "results" / "extra.xml").unlink()
-    (out / "results" / "junit.xml").write_text(JUNIT.replace("boom", "bang"))
-    assert "sha256 mismatch" in _rejected(out)
-    (out / "results" / "junit.xml").unlink()
-    assert "missing" in _rejected(out, bundle.INCOMPLETE)
-
-
-def test_a_bundle_with_no_cases_records_nothing_and_is_rejected(tmp_path):
-    out = _init(tmp_path)
-    (out / "results" / "empty.xml").write_text(
-        "<testsuites><testsuite name='s'/></testsuites>"
-    )
-    assert bundle.main(["seal", str(out)]) == bundle.REJECTED
-    assert "no <testcase>" in _rejected(out)
-
-
-def test_stf_isolated_bundle_fits_with_schema_version_and_files(tmp_path):
-    """spyre-test-framework's ISOLATED upload, plus the two fields v1 requires."""
-    out = tmp_path / "fvt"
-    (out / "results").mkdir(parents=True)
-    (out / "results" / "z1-junit.xml").write_text(JUNIT)
-    stf = {
-        "artifact": f"id:{AID}",
-        "artifact_id": AID,
-        "tag_family": "",
-        "jenkins_run_key": "Spyre-Test/testing/Jenkinsfile.spyreinference#131",
-        "run_url": "https://jenkins/job/Spyre-Test/job/testing/job/Jenkinsfile.spyreinference/131/",
-        "arch": "s390x",
-        "component": "spyre-inference",
-        "test_type": "fvt",
-        "started_at": "2026-10-08T09:00:00Z",
-    }
-    (out / "bundle.json").write_text(json.dumps(stf))
-    assert "missing 'schema_version'" in _rejected(out)
-    files = [
-        {
-            "path": "results/z1-junit.xml",
-            "sha256": bundle.sha256(out / "results/z1-junit.xml"),
-        }
-    ]
-    _edit(out, schema_version=1, files=files)
-    meta = bundle.check(out)
     assert (
-        bundle.bundle_name(meta)
-        == "Spyre-Test_testing_Jenkinsfile.spyreinference_131-fvt"
+        cli(["results", "--from-bundle", str(tgz), "--validate-only"])
+        == offline.REJECTED
     )
 
 
-def test_a_jenkins_key_hashes_as_the_connected_run_and_a_manual_one_as_a_bundle(
-    tmp_path,
-):
+def test_the_digest_covers_content_not_the_bundle_json_alone(tmp_path):
+    root = _minimal(tmp_path)
+    before = offline.digest(root)
+    (root / "results" / "junit.xml").write_text(JUNIT.replace("boom", "bang"))
+    assert offline.digest(root) != before
+
+
+def test_the_offline_path_needs_only_the_standard_library(tmp_path):
+    """No clickhouse-connect, regex or yaml: an air-gapped host has only a --no-deps wheel."""
+    xml = _xml(tmp_path)
+    code = (
+        "import sys\n"
+        "for m in ('clickhouse_connect', 'regex', 'yaml'): sys.modules[m] = None\n"
+        "from spyre_clickhouse_ingest.__main__ import main\n"
+        f"assert main(['results', '--offline', '--out', {str(tmp_path / 'b.tgz')!r}, '--xml-dir', {str(xml)!r},"
+        f" '--artifact', 'id:{AID}', '--arch', 's390x', '--trigger-type', 'fvt']) == 0\n"
+        f"assert main(['results', '--from-bundle', {str(tmp_path / 'b.tgz')!r}, '--validate-only']) == 0\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+
+
+def test_offline_flags_are_results_flags():
+    """Each flag the offline parser reads means the same in `results`."""
+    online = {
+        a.option_strings[0]: a.dest
+        for a in results.build_parser()._actions
+        if a.option_strings
+    }
+    for a in offline.parser()._actions:
+        if a.option_strings and a.dest != "help":
+            assert online.get(a.option_strings[0]) == a.dest, a.option_strings
+
+
+def test_a_jenkins_key_hashes_as_the_connected_run_and_a_manual_one_as_a_bundle():
     key = "Spyre-Test/testing/Jenkinsfile.spyreinference#131"
     meta = {"run_key": key, "arch": "s390x", "test_type": "svt"}
     connected = SimpleNamespace(run_id="", gha_run_id="", jenkins_run_key=key)
     assert bundle.run_id(meta) == RunId.for_args(connected, "", "s390x", "svt")
-    manual = {**meta, "run_key": "manual:me:7d8121d7-e19f-4844-897b-f9b1fe876278"}
-    assert bundle.run_id(manual) == RunId.derive(
-        "bundle", manual["run_key"], "s390x", "svt"
-    )
     assert RunCoordinates.source_and_external(connected, "") == ("jenkins", key)
+    manual = {**meta, "run_key": "manual:me:abc"}
+    assert bundle.run_id(manual) == RunId.derive(
+        "bundle", "manual:me:abc", "s390x", "svt"
+    )
+
+
+# --- results --from-bundle, against a fake spyre_v2 ----------------------------------------
 
 
 class FakeClient:
-    """Answers the two existence reads ingest makes, and counts the verdict check."""
+    """Answers ingest's existence reads, and the verdict check."""
 
     def __init__(self, verdicts=(), files=(), landed=True):
         self.verdicts, self.files, self.landed = verdicts, files, landed
@@ -216,55 +288,69 @@ class FakeClient:
         return SimpleNamespace(result_rows=rows)
 
 
+def _resolution(aid, arch="s390x", component="torch-spyre"):
+    return SimpleNamespace(artifact_id=aid, arch=arch, component=component)
+
+
 @pytest.fixture
 def online(monkeypatch):
-    """ingest against a fake spyre_v2: `calls` holds each `results` argv."""
+    """--from-bundle against a fake spyre_v2: `calls` holds each `results` argv."""
     state = SimpleNamespace(client=FakeClient(), calls=[], resolved=AID, by_spec={})
     from spyre_clickhouse_ingest import client, resolver
 
+    def resolve(spec, arch, **kw):
+        aid = state.by_spec.get(spec, state.resolved)
+        return _resolution(aid) if aid else None
+
     monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: state.client)
+    monkeypatch.setattr(resolver, "resolve", resolve)
     monkeypatch.setattr(
-        resolver, "resolve",
-        lambda spec, arch, **kw: (
-            SimpleNamespace(artifact_id=state.by_spec.get(spec, state.resolved))
-            if state.by_spec.get(spec, state.resolved)
-            else None
+        bundle, "write_junit",
+        lambda db, root, meta, aid, rid, props, strict: state.calls.append(
+            bundle.results_argv(meta, root, aid, rid, props, strict)
         ),
     )  # fmt: skip
-    monkeypatch.setattr(results, "main", lambda argv: state.calls.append(argv))
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
     return state
 
 
 def _ingest(path, capsys, *extra):
-    code = bundle.main(["ingest", str(path), "--strict", *extra])
+    capsys.readouterr()
+    code = cli(["results", "--from-bundle", str(path), "--strict", *extra])
     return code, json.loads(capsys.readouterr().out.splitlines()[-1])
 
 
-def test_ingest_records_through_results_by_id_lookup_only(tmp_path, online, capsys):
-    out = _sealed(tmp_path)
+def _flags(argv):
+    return dict(zip(argv[::2], argv[1::2]))
+
+
+def test_a_minimal_bundle_takes_arch_component_and_run_key_from_artifact_and_content(
+    tmp_path, online, capsys
+):
+    root = _minimal(tmp_path)
     code, report = _ingest(
-        out, capsys, "--uploader", "jdoe", "--bundle-url", "https://art/b/"
+        root, capsys, "--uploader", "jdoe", "--bundle-url", "https://art/b/"
     )
     assert (code, report["status"]) == (0, "ingested")
+    sha = offline.digest(root)
+    assert report["run_key"] == f"manual:jdoe:{sha}" and report["bundle_sha256"] == sha
     argv = online.calls[0]
-    pairs = dict(zip(argv[::2], argv[1::2]))
-    assert pairs["--artifact"] == f"id:{AID}" and pairs["--lookup"] == "only"
-    assert pairs["--run-id"] == bundle.run_id(_meta(out)) == report["run_id"]
-    assert pairs["--run-url"] == "https://art/b/" and "--jenkins-run-key" not in argv
-    props = [argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"]
-    assert {
-        "source=bundle",
-        "uploader=jdoe",
-        f"bundle_sha256={bundle.digest(out)}",
-    } <= set(props)
+    flags = _flags(argv)
+    assert (flags["--arch"], flags["--component"]) == ("s390x", "torch-spyre")
+    assert flags["--artifact"] == f"id:{AID}" and flags["--lookup"] == "only"
+    assert flags["--run-id"] == RunId.derive(
+        "bundle", f"manual:jdoe:{sha}", "s390x", "fvt"
+    )
+    assert flags["--run-url"] == "https://art/b/" and "--jenkins-run-key" not in argv
+    props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
+    assert {"source=bundle", "uploader=jdoe", f"bundle_sha256={sha}"} <= props
     assert argv[-1] == "--strict" and "--dry-run" not in argv
 
 
-def test_a_re_ingest_of_the_same_bundle_is_a_duplicate(tmp_path, online, capsys):
-    out = _sealed(tmp_path)
-    online.client.verdicts = [bundle.digest(out)]
-    code, report = _ingest(out, capsys)
+def test_a_re_upload_of_the_same_content_is_a_duplicate(tmp_path, online, capsys):
+    root = _minimal(tmp_path)
+    online.client.verdicts = [offline.digest(root)]
+    code, report = _ingest(root, capsys, "--uploader", "jdoe")
     assert (code, report["status"]) == (0, "duplicate") and online.calls == []
 
 
@@ -279,45 +365,81 @@ def test_a_re_ingest_of_the_same_bundle_is_a_duplicate(tmp_path, online, capsys)
 def test_a_run_key_taken_by_other_results_is_rejected(
     tmp_path, online, capsys, verdicts, files, why
 ):
-    out = _sealed(tmp_path)
+    root = _minimal(
+        tmp_path, {"artifact_id": AID, "test_type": "fvt", "run_key": "manual:me:r1"}
+    )
     online.client.verdicts, online.client.files = verdicts, files
-    code, report = _ingest(out, capsys)
-    assert (code, report["status"]) == (bundle.REJECTED, "rejected") and why in report[
+    code, report = _ingest(root, capsys)
+    assert (code, report["status"]) == (offline.REJECTED, "rejected") and why in report[
         "reason"
     ]
-    assert online.calls == []
 
 
 def test_a_partly_ingested_bundle_is_completed(tmp_path, online, capsys):
-    out = _sealed(tmp_path)
     online.client.files = ["junit.xml"]
-    assert _ingest(out, capsys)[1]["status"] == "ingested"
+    assert _ingest(_minimal(tmp_path), capsys)[1]["status"] == "ingested"
 
 
 def test_an_unrecorded_artifact_is_rejected(tmp_path, online, capsys):
     online.resolved = ""
-    code, report = _ingest(_sealed(tmp_path), capsys)
-    assert code == bundle.REJECTED and "artifact not recorded" in report["reason"]
+    code, report = _ingest(_minimal(tmp_path), capsys)
+    assert code == offline.REJECTED and "artifact not recorded" in report["reason"]
+
+
+def test_the_image_is_the_fallback_for_an_unrecorded_id(tmp_path, online, capsys):
+    root = _minimal(
+        tmp_path,
+        {"artifact_id": AID, "image": IMAGE, "arch": "s390x", "test_type": "fvt"},
+    )
+    online.by_spec = {f"id:{AID}": "", f"image:{IMAGE}": OTHER}
+    code, report = _ingest(root, capsys)
+    assert (code, report["artifact_id"], report["artifact_from"]) == (0, OTHER, "image")
+    assert _flags(online.calls[0])["--artifact"] == f"id:{OTHER}"
+
+
+def test_an_id_and_an_image_naming_different_artifacts_are_rejected(
+    tmp_path, online, capsys
+):
+    root = _minimal(
+        tmp_path,
+        {"artifact_id": AID, "image": IMAGE, "arch": "s390x", "test_type": "fvt"},
+    )
+    online.by_spec = {f"image:{IMAGE}": OTHER}
+    code, report = _ingest(root, capsys)
+    assert code == offline.REJECTED and "different artifacts" in report["reason"]
+
+
+def test_the_inbox_folder_must_be_the_id_or_the_image_digest(tmp_path, online, capsys):
+    root = _minimal(
+        tmp_path,
+        {"artifact_id": AID, "image": IMAGE, "arch": "s390x", "test_type": "fvt"},
+    )
+    assert _ingest(root, capsys, "--expect-key", "sha256-" + "b6" * 32)[0] == 0
+    code, report = _ingest(root, capsys, "--expect-key", OTHER)
+    assert code == offline.REJECTED and "is not its artifact_id" in report["reason"]
 
 
 def test_an_untrusted_jenkins_key_is_rejected(tmp_path, online, capsys):
-    out = _sealed(tmp_path, "--run-key", "Spyre/orchestrator#12")
-    code, report = _ingest(out, capsys, "--trusted-job-prefix", "Spyre-Test/testing/")
-    assert code == bundle.REJECTED and "not from a trusted job" in report["reason"]
-    code, report = _ingest(out, capsys, "--trusted-job-prefix", "Spyre/")
-    assert code == 0 and "--jenkins-run-key" in online.calls[0]
+    root = _minimal(
+        tmp_path,
+        {"artifact_id": AID, "test_type": "fvt", "run_key": "Spyre/orchestrator#12"},
+    )
+    code, report = _ingest(root, capsys, "--trusted-job-prefix", "Spyre-Test/testing/")
+    assert code == offline.REJECTED and "not from a trusted job" in report["reason"]
+    assert _ingest(root, capsys, "--trusted-job-prefix", "Spyre/")[0] == 0
+    assert "--jenkins-run-key" in online.calls[0]
 
 
 def test_a_verdict_that_did_not_land_is_a_retry(tmp_path, online, capsys):
     online.client.landed = False
-    code, report = _ingest(_sealed(tmp_path), capsys)
-    assert (code, report["status"]) == (bundle.FAILED, "failed")
+    code, report = _ingest(_minimal(tmp_path), capsys)
+    assert (code, report["status"]) == (offline.FAILED, "failed")
 
 
 def test_dry_run_reads_on_a_readonly_connection_and_writes_nothing(
     tmp_path, online, capsys
 ):
-    code, report = _ingest(_sealed(tmp_path), capsys, "--dry-run")
+    code, report = _ingest(_minimal(tmp_path), capsys, "--dry-run")
     assert (code, report["status"]) == (0, "would-ingest")
     assert online.calls == [] and online.client.settings == {"readonly": "2"}
 
@@ -353,77 +475,8 @@ def test_result_props_reach_the_verdict_and_replace_its_source(monkeypatch):
     }
 
 
-IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
-OTHER = "0" * 8 + AID[8:]
+# --- vLLM bench bundles ---------------------------------------------------------------------
 
-
-def test_init_takes_an_image_and_files_it_under_its_digest(tmp_path, capsys):
-    out = _init(tmp_path, name="i")  # an id bundle first, for the contrast
-    assert bundle.upload_path(_meta(out)).split("/")[5] == AID
-    out = tmp_path / "img"
-    argv = [
-        "init",
-        "--image",
-        IMAGE,
-        "--component",
-        "spyre-inference",
-        "--arch",
-        "s390x",
-    ]
-    assert bundle.main([*argv, "--test-type", "fvt", "--out", str(out)]) == 0
-    meta = _meta(out)
-    assert meta["image"] == IMAGE and "artifact_id" not in meta
-    assert bundle.upload_path(meta).split("/")[5] == "sha256-" + "b6" * 32
-
-
-def test_blank_and_spec_artifact_fields_normalize(tmp_path):
-    out = _sealed(tmp_path)
-    _edit(out, artifact_id="", image=IMAGE)
-    assert "artifact_id" not in bundle.check(out)
-    _edit(out, image=None, artifact="image:" + IMAGE)
-    assert bundle.check(out)["image"] == IMAGE
-    _edit(out, image="", artifact="")
-    assert "needs artifact_id or image" in _rejected(out)
-
-
-def test_ingest_falls_back_to_the_image_when_the_id_is_unrecorded(
-    tmp_path, online, capsys
-):
-    out = _sealed(tmp_path)
-    _edit(out, image=IMAGE)
-    bundle.main(["seal", str(out)])
-    online.by_spec = {f"id:{AID}": "", f"image:{IMAGE}": OTHER}
-    code, report = _ingest(out, capsys)
-    assert (code, report["artifact_id"], report["artifact_from"]) == (0, OTHER, "image")
-    assert (
-        dict(zip(online.calls[0][::2], online.calls[0][1::2]))["--artifact"]
-        == f"id:{OTHER}"
-    )
-
-
-def test_an_id_and_an_image_naming_different_artifacts_are_rejected(
-    tmp_path, online, capsys
-):
-    out = _sealed(tmp_path)
-    _edit(out, image=IMAGE)
-    bundle.main(["seal", str(out)])
-    online.by_spec = {f"image:{IMAGE}": OTHER}
-    code, report = _ingest(out, capsys)
-    assert code == bundle.REJECTED and "different artifacts" in report["reason"]
-
-
-def test_the_inbox_folder_must_be_the_id_or_the_image_digest(tmp_path, online, capsys):
-    out = _sealed(tmp_path)
-    _edit(out, image=IMAGE)
-    bundle.main(["seal", str(out)])
-    assert _ingest(out, capsys, "--expect-key", "sha256-" + "b6" * 32)[0] == 0
-    code, report = _ingest(out, capsys, "--expect-key", OTHER)
-    assert code == bundle.REJECTED and "is not its artifact_id" in report["reason"]
-
-
-# --- vllm bundles -------------------------------------------------------------------------
-
-VLLM_DATA = Path(__file__).parent / "data" / "vllm_bundle"
 # What prod spyre_v2.benchmarks holds for the live spyre-inference leg's two benchmarks.
 PROD_IDS = {
     "latency_granite8B_tp1_in64_out64": "9d066729-8f4e-5e55-9871-2f226a441285",
@@ -433,12 +486,14 @@ MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 
 
 def _vllm(tmp_path, *extra):
+    src = tmp_path / "vllm-out"
+    shutil.copytree(VLLM_DATA / "results", src)
+    shutil.copy(VLLM_DATA / "attachments" / "latency_granite8B_tp1_in64_out64.cmd", src)
     out = tmp_path / "perf"
-    shutil.copytree(VLLM_DATA, out)
-    argv = ["init", "--artifact", f"id:{AID}", "--arch", "x86_64", "--kind", "vllm", "--out", str(out),
-            "--perf", "head_sha=881a59d2", "--perf", "head_branch=main", *extra]  # fmt: skip
-    assert bundle.main(argv) == 0
-    assert bundle.main(["seal", str(out)]) == 0
+    argv = ["results", "--offline", "--out", str(out), "--vllm-results-dir", str(src),
+            "--artifact", f"id:{AID}", "--arch", "x86_64", "--perf", "head_sha=881a59d2",
+            "--perf", "head_branch=main", *extra]  # fmt: skip
+    assert cli(argv) == 0
     return out
 
 
@@ -465,15 +520,15 @@ class CapturingClient:
         )
 
 
-def test_init_kind_vllm_defaults_the_perf_leg(tmp_path):
+def test_offline_vllm_bundles_the_bench_json_and_its_commands(tmp_path):
     meta = _meta(_vllm(tmp_path))
-    assert (meta["kind"], meta["component"], meta["test_type"]) == (
-        "vllm",
-        "spyre-inference",
-        "perf",
-    )
-    assert {f["path"] for f in meta["files"]} >= {
+    assert (meta["kind"], meta["perf"]["head_sha"]) == ("vllm", "881a59d2")
+    assert "test_type" not in meta and "component" not in meta
+    assert {f["path"] for f in meta["files"]} == {
+        "results/latency_granite8B_tp1_in64_out64.json",
         "results/latency_granite8B_tp1_in64_out64.pytorch.json",
+        "results/throughput_granite8B_tp1_in64_out64.json",
+        "results/throughput_granite8B_tp1_in64_out64.pytorch.json",
         "attachments/latency_granite8B_tp1_in64_out64.cmd",
     }
 
@@ -500,11 +555,7 @@ def test_init_kind_vllm_defaults_the_perf_leg(tmp_path):
 def test_a_bad_vllm_bundle_is_rejected(tmp_path, setup, why):
     out = _vllm(tmp_path)
     setup(out)
-    meta = _meta(out)
-    meta["files"] = [
-        {"path": p, "sha256": bundle.sha256(out / p)} for p in bundle.bundle_files(out)
-    ]
-    (out / "bundle.json").write_text(json.dumps(meta))
+    _edit(out, files=None)
     assert why in _rejected(out)
 
 
@@ -518,7 +569,9 @@ def test_a_vllm_bundle_writes_the_live_legs_rows(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
     monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
     monkeypatch.setattr(
-        resolver, "resolve", lambda *a, **kw: SimpleNamespace(artifact_id=AID)
+        resolver,
+        "resolve",
+        lambda *a, **kw: _resolution(AID, "x86_64", "spyre-inference"),
     )
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
     code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
@@ -527,10 +580,8 @@ def test_a_vllm_bundle_writes_the_live_legs_rows(tmp_path, monkeypatch, capsys):
     ids = {r["name"]: r["benchmark_id"] for r in ch.inserted["benchmarks"]}
     assert ids == PROD_IDS
     runs = {r["benchmark_id"]: r for r in ch.inserted["benchmark_runs"]}
-    lat, thr = (
-        runs[PROD_IDS["latency_granite8B_tp1_in64_out64"]],
-        runs[PROD_IDS["throughput_granite8B_tp1_in64_out64"]],
-    )
+    lat = runs[PROD_IDS["latency_granite8B_tp1_in64_out64"]]
+    thr = runs[PROD_IDS["throughput_granite8B_tp1_in64_out64"]]
     assert sorted(lat["measurements"]) == [
         "avg_latency",
         "latency",
@@ -579,5 +630,143 @@ def test_a_native_file_alone_takes_its_model_from_perf(tmp_path):
     out = _vllm(tmp_path, "--perf", f"model={MODEL}")
     for f in (out / "results").glob("*.pytorch.json"):
         f.unlink()
-    rows = bundle.vllm_rows(out, _meta(out))
+    _edit(out, files=None)
+    rows = bundle.vllm_rows(out, offline.check(out) | {"arch": "x86_64"})
     assert {json.loads(r["extra"])["model"] for r in rows} == {MODEL}
+
+
+# --- results --upload, against a local Artifactory stand-in ----------------------------------
+
+
+class FakeArtifactory(BaseHTTPRequestHandler):
+    """PUT stores; GET serves stored files and api/storage folder listings; `fail` 503s N PUTs."""
+
+    store: dict = {}
+    seen: list = []
+    fail = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        type(self).seen.append(
+            ("PUT", self.path, self.headers.get("Authorization", ""))
+        )
+        if type(self).fail:
+            type(self).fail -= 1
+            self.send_response(503)
+            self.end_headers()
+            return
+        type(self).store[self.path] = body
+        self.send_response(201)
+        self.end_headers()
+
+    def do_GET(self):
+        prefix = "/artifactory/api/storage/repo/"
+        if self.path.startswith(prefix):
+            folder = "/artifactory/repo/" + self.path[len(prefix) :] + "/"
+            kids = {
+                p[len(folder) :].split("/")[0]
+                for p in type(self).store
+                if p.startswith(folder)
+            }
+            body = json.dumps(
+                {"children": [{"uri": "/" + k} for k in sorted(kids)]}
+            ).encode()
+            code = 200 if kids else 404
+        else:
+            body, code = (
+                type(self).store.get(self.path, b""),
+                200 if self.path in type(self).store else 404,
+            )
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def art(monkeypatch):
+    FakeArtifactory.store, FakeArtifactory.seen, FakeArtifactory.fail = {}, [], 0
+    server = HTTPServer(("127.0.0.1", 0), FakeArtifactory)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(offline.time, "sleep", lambda s: None)
+    monkeypatch.delenv("ARTIFACTORY_USER", raising=False)
+    monkeypatch.setenv("ARTIFACTORY_TOKEN", "tok")
+    yield SimpleNamespace(
+        base=f"http://127.0.0.1:{server.server_port}/artifactory", cls=FakeArtifactory
+    )
+    server.shutdown()
+
+
+def _upload(art, *argv, capsys):
+    capsys.readouterr()
+    code = cli(["results", *argv, "--base-url", art.base, "--repo", "repo"])
+    return code, json.loads(capsys.readouterr().out.splitlines()[-1])
+
+
+def test_offline_upload_puts_one_tgz_in_the_inbox(tmp_path, art, capsys):
+    argv = ["--offline", "--upload", "--xml-dir", str(_xml(tmp_path)), "--artifact", f"id:{AID}",
+            "--arch", "s390x", "--trigger-type", "fvt"]  # fmt: skip
+    code, report = _upload(art, *argv, capsys=capsys)
+    assert (code, report["status"]) == (0, "uploaded")
+    ((method, path, auth),) = art.cls.seen
+    assert path.startswith(
+        f"/artifactory/repo/zsp/next/s390x/v2-results/inbox/{AID}/manual_"
+    )
+    assert path.endswith("-fvt.tgz") and auth == "Bearer tok"
+    tgz = tmp_path / "got.tgz"
+    tgz.write_bytes(art.cls.store[path])
+    with offline.opened(tgz) as root:
+        assert offline.check(root)["artifact_id"] == AID
+
+
+def test_a_folder_upload_puts_bundle_json_last_and_retries_a_503(tmp_path, art, capsys):
+    path = _offline(tmp_path, capsys=capsys)
+    art.cls.fail = 1
+    code, _ = _upload(art, "--upload", str(path), "--as-folder", capsys=capsys)
+    puts = [p for m, p, _ in art.cls.seen]
+    assert code == 0 and puts[0] == puts[1] and puts[-1].endswith("/bundle.json")
+    assert puts[1].endswith("/results/junit.xml")
+
+
+def test_upload_without_a_token_fails_clearly(tmp_path, art, capsys, monkeypatch):
+    monkeypatch.delenv("ARTIFACTORY_TOKEN")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code, report = _upload(
+        art, "--upload", str(_offline(tmp_path, capsys=capsys)), capsys=capsys
+    )
+    assert code == offline.FAILED and "no Artifactory token" in report["reason"]
+
+
+def test_the_token_can_come_from_netrc(tmp_path, art, capsys, monkeypatch):
+    monkeypatch.delenv("ARTIFACTORY_TOKEN")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".netrc").write_text("machine 127.0.0.1 login me password pw\n")
+    (tmp_path / ".netrc").chmod(0o600)
+    assert (
+        _upload(art, "--upload", str(_offline(tmp_path, capsys=capsys)), capsys=capsys)[
+            0
+        ]
+        == 0
+    )
+    assert art.cls.seen[-1][2] == "Basic bWU6cHc="
+
+
+@pytest.mark.parametrize(
+    "where, status", [("processed", "ingested"), ("rejected", "rejected")]
+)
+def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
+    path = _offline(tmp_path, capsys=capsys)
+    with offline.opened(path) as root:
+        meta, dig = offline.check(root), offline.digest(root)
+    done = f"/artifactory/repo/zsp/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
+    art.cls.store[done] = b"x"
+    art.cls.store[done + ".REJECTED.json"] = json.dumps(
+        {"reason": "sha256 mismatch"}
+    ).encode()
+    code, report = _upload(art, "--upload", str(path), "--wait", "1", capsys=capsys)
+    assert (code, report["status"]) == (0, status)
+    assert report.get("reason", "") == (
+        "sha256 mismatch" if where == "rejected" else ""
+    )
