@@ -44,6 +44,10 @@ def _has_xfail(fn):
     return any(m.name == "xfail" for m in getattr(fn, "pytestmark", []))
 
 
+def _expects_raise(fn):
+    return getattr(fn, "_expects_raise", False)
+
+
 class TestLxPlanningSuiteGeneration(unittest.TestCase):
     def test_lx_classes_have_no_xfail_marked_tests(self):
         for cls in _LX_CLASSES:
@@ -60,8 +64,20 @@ class TestLxPlanningSuiteGeneration(unittest.TestCase):
                 copied = {re.sub(r"_lx_planning_\w+$", "", n) for n in _tests(cls)}
                 self.assertEqual(sorted(xfail_names & copied), [])
 
+    def test_expect_raise_testops_tests_are_not_copied(self):
+        raise_names = {n for n, v in _tests(ops.TestOps).items() if _expects_raise(v)}
+        self.assertTrue(raise_names, "TestOps has no expect_raise tests to check")
+        for cls in _LX_CLASSES:
+            with self.subTest(cls=cls.__name__):
+                copied = {re.sub(r"_lx_planning_\w+$", "", n) for n in _tests(cls)}
+                self.assertEqual(sorted(raise_names & copied), [])
+
     def test_passing_testops_tests_are_still_copied(self):
-        ok_names = {n for n, v in _tests(ops.TestOps).items() if not _has_xfail(v)}
+        ok_names = {
+            n
+            for n, v in _tests(ops.TestOps).items()
+            if not _has_xfail(v) and not _expects_raise(v)
+        }
         if not lx.tests_lx_planning_full:
             # Only the canonical subset is copied.
             ok_names &= lx._canonical_test_names(ops.TestOps)
