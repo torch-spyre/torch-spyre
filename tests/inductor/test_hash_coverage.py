@@ -422,7 +422,7 @@ class TestFrontendPoolAllocationHashed(unittest.TestCase):
         op = _make_op_spec()
         with (
             patch(
-                "torch_spyre.execution.kernel_cache._get_dxp_version",
+                "torch_spyre.execution.kernel_cache._get_backend_compiler_version",
                 return_value="test-dxp-1.0",
             ),
             patch(

@@ -302,12 +302,12 @@ def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
 # pair of FP32 sticks. Padding the conversions is enough while work division
 # leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
 # is a whole number of pairs; (68,) is the unsplit case.
-_PARTIAL_STICK_UPCAST_PASS = [(68,), (232,), (1000,), (4, 100), (4, 104)]
+_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
 # Here work division splits the stick dim and the round-up ends in the middle of
 # a pair, so the pair's second stick is left to no core.
 # TODO: make work division handle staggered FP32, splitting the stick dim by
 # whole stick pairs.
-_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(196,), (4100,), (4, 68), (4, 196)]
+_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
 
 
 @pytest.mark.parametrize(

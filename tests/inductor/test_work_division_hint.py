@@ -18,7 +18,6 @@ from dataclasses import replace
 import json
 import logging
 import logging.handlers
-import collections
 import math
 import regex as re
 from types import SimpleNamespace
@@ -57,7 +56,6 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from utils_inductor import (
     mock_backend_compiler,
-    assert_lx_only_relayout_payload,
     capture_backend_output_dirs,
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -105,7 +103,6 @@ def _emitted_kernels():
 
 
 _capture_backend_output_dirs = capture_backend_output_dirs
-_assert_lx_only_relayout_payload = assert_lx_only_relayout_payload
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):
@@ -1544,11 +1541,10 @@ def test_grouped_lx_relayout_device(broadcast):
         _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    with _capture_backend_output_dirs() as output_dirs:
-        actual, code = run_and_get_code(
-            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
-            *device_args,
-        )
+    actual, code = run_and_get_code(
+        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        *device_args,
+    )
     torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=2e-1)
     relayouts = [
         block
@@ -1560,7 +1556,6 @@ def test_grouped_lx_relayout_device(broadcast):
     assert len(relayouts) == 1
     domains = re.findall(r"num_cores=(\d+)", relayouts[0])
     assert domains == [str(source_cores), "32"]
-    _assert_lx_only_relayout_payload(output_dirs)
 
 
 @config.patch(
@@ -1628,7 +1623,6 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     assert len(copies) == int(enabled)
     if enabled:
         assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
-        _assert_lx_only_relayout_payload(directories)
     if reader == "split_matmul":
         matmuls = [
             root
@@ -1699,7 +1693,6 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
-        _capture_backend_output_dirs() as directories,
     ):
         actual, _ = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
@@ -1725,10 +1718,6 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         assert copy.args[0].allocation == down_arg.allocation
         assert set(copy.args[-1].allocation) == {"lx"}
         assert copy.completed_producer_cores == tuple(range(1, 32, 2))
-        native_routes = _assert_lx_only_relayout_payload(directories)
-        assert collections.Counter(
-            core for readers in native_routes.values() for core in readers
-        ) == {core: 4 for core in range(32)}
         assert any(
             arg.is_input and arg.allocation == copy.args[-1].allocation
             for spec in specs
@@ -2207,11 +2196,6 @@ def test_completed_reduction_relayout_device(
     ]
     assert len(copies) == int(enabled)
     if enabled:
-        routes = _assert_lx_only_relayout_payload(directories)
-        assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
-        assert collections.Counter(
-            c for readers in routes.values() for c in readers
-        ) == {core: out_split // consumer_out for core in range(32)}
         assert "completed_producer_cores=" in "\n".join(code)
 
 

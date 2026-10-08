@@ -61,6 +61,7 @@ from .identity import (
     split_case_tags,
     tags_for_case,
 )
+from .resolver import Resolution, ensure, ensure_artifact, resolve, resolve_artifact
 from .junit import (
     JUnitXml,
     RunCoordinates,
@@ -136,6 +137,8 @@ __all__ = [
     "client_summary",
     "component_of",
     "drop_older_case_attempts",
+    "ensure",
+    "ensure_artifact",
     "extract_properties",
     "filter_suite_records",
     "get_client",
@@ -153,6 +156,9 @@ __all__ = [
     "installed_digest",
     "load_records",
     "promote_xpass",
+    "Resolution",
+    "resolve",
+    "resolve_artifact",
     "run_id_for",
     "run_id_of",
     "schema",

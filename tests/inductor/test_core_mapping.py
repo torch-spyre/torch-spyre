@@ -1056,6 +1056,24 @@ def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
         )
 
 
+def test_tile_ownership_view_runs_the_innermost_level_fastest():
+    # Tile ids count the way the loop nest runs: the outer level's slice holds
+    # while the inner level steps through its tiles.
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    view = pass_utils_module.tile_ownership_view(prep, ((head, 2), (flat, 4)))
+    assert view.same_partition(
+        PerCoreView(
+            ((2, 4), (3, 2)),
+            ((2, sympy.Mod(_CORE_ID, 4)), (3, sympy.floor(_CORE_ID / 4))),
+            num_cores=8,
+        )
+    )
+    # The same two levels nested the other way walk the buffer differently.
+    swapped = pass_utils_module.tile_ownership_view(prep, ((flat, 4), (head, 2)))
+    assert not view.same_partition(swapped)
+
+
 def test_direct_axis_proof_budget_boundary():
     prove = core_mapping_module.direct_axis_ownership_failure
     point = core_mapping_module._LOOP_POINT

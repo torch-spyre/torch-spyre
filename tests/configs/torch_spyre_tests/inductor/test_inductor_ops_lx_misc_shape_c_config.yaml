@@ -57,8 +57,6 @@ test_suite_config:
             - LxPlanning.*::test_transpose_patterns.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_add_constant.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_repeat.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_restickify_fp32_unsupported_xfail.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_restickify_int64_unsupported_xfail.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_multiops_split.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success
           tags:
