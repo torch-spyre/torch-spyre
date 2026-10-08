@@ -2050,7 +2050,9 @@ def _fused_layout_group_ops(
     per-core division. The joint solver, free to divide each op independently,
     can hand the group's members incompatible divisions and corrupt the shared
     per-core addressing/scheduling, so the caller pins the whole group to its
-    fixed (work-division) division. Two op kinds need this identical treatment:
+    fixed (work-division) division (except an fp8 consumer that
+    :meth:`CoOptimizingAllocator._seed_aligned_division` aligns to its matmul).
+    Two op kinds need this identical treatment:
 
     * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
       input restickifies and output clones carry too; an output clone splitting
@@ -2095,6 +2097,45 @@ def _fused_layout_group_ops(
                 group.setdefault(op.name, reason_of_seed[dep.name])
                 break
     return group
+
+
+def _fp8_matmul_consumer_seeds(graph: GraphLowering) -> dict[str, list[Operation]]:
+    """Map each op that reads a ``batchmatmulfp8`` output to the seeds it reads.
+
+    These are the one-hop consumers of :func:`_fused_layout_group_ops`'s fp8
+    groups, minus any op whose own output an fp8 seed reads: that op is also an
+    operand producer of that seed, and operand producers keep their pin.
+    """
+    seeds = {
+        op.get_name(): op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    }
+    if not seeds:
+        return {}
+    seed_inputs = {
+        dep.name
+        for seed in seeds.values()
+        for dep in op_read_writes(seed).reads
+        if isinstance(dep, MemoryDep)
+    }
+    result: dict[str, list[Operation]] = {}
+    for op in graph.operations:
+        if (
+            not isinstance(op, ComputedBuffer)
+            or op.get_name() in seeds
+            or op.get_name() in seed_inputs
+        ):
+            continue
+        read: dict[str, Operation] = {}
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in seeds:
+                read.setdefault(dep.name, seeds[dep.name])
+        if read:
+            result[op.get_name()] = list(read.values())
+    return result
 
 
 def _view_for_div(
@@ -3060,13 +3101,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # loop-invariant, so build them once here rather than rescanning
         # graph.operations for every op.
         offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        fp8_group_reason = "fp8 matmul layout group"
         layout_group_reason = _fused_layout_group_ops(
             graph,
             {
                 KEEP_BY_INDEX_OP: "keep_by_index layout group",
-                BATCH_MATMUL_FP8_OP: "fp8 matmul layout group",
+                BATCH_MATMUL_FP8_OP: fp8_group_reason,
             },
         )
+        fp8_consumer_seeds = _fp8_matmul_consumer_seeds(graph)
+        prep_cache: dict = {}
         result = {}
         for op in graph.operations:
             reason: Optional[str] = None
@@ -3103,7 +3147,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ):
                 reason = "user work_div hint"
 
-            if reason is not None:
+            # An fp8 matmul consumer whose fixed division can never share the
+            # matmul output's residency takes a matching one instead (#4752).
+            aligned: Optional[CoreDivision] = None
+            if reason == fp8_group_reason and op.name in fp8_consumer_seeds:
+                aligned = self._seed_aligned_division(
+                    op,
+                    fp8_consumer_seeds[op.name],
+                    profiles,
+                    matmul_roles,
+                    max_cores,
+                    prep_cache,
+                )
+            if aligned is not None:
+                divs = [aligned]
+            elif reason is not None:
                 divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
@@ -3137,6 +3195,70 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             result[op.name] = divs
 
         return result
+
+    def _seed_aligned_division(
+        self,
+        op: Operation,
+        seeds: list[Operation],
+        profiles: tuple[dict[int, int], ...],
+        matmul_roles: tuple[dict[str, int], ...],
+        max_cores: int,
+        prep_cache: dict,
+    ) -> Optional[CoreDivision]:
+        """A division for an fp8 matmul consumer that slices the matmul output
+        the way the matmul does, or ``None`` to keep the consumer's fixed one.
+
+        Work division sizes the matmul on its FP8 sticks and the consumer on its
+        fp16 sticks, so the two fixed divisions can differ (M=1, N=14336: 28 vs
+        32 cores). The fp8 layout group pins both, and when no relayout can
+        bridge the two core domains the matmul output can never be LX-resident.
+        In that case only, the consumer takes the most-cores candidate of its
+        ordinary menu whose view of the output matches the matmul's. The matmul
+        and its operand producers keep their pins. A consumer of several fp8
+        matmuls keeps its fixed division.
+        """
+        if len(seeds) != 1:
+            return None
+        seed = seeds[0]
+        edge = build_residency_edge(
+            seed.name, seed, op, op_read_writes(op).reads, None, prep_cache
+        )
+        if edge is None:
+            return None
+        seed_div = _fixed_core_division(seed)
+        fixed = _fixed_core_division(op)
+        if edge.match_pairs([seed_div.splits], [fixed.splits]):
+            return None
+        src, dst = seed_div.cores_used, fixed.cores_used
+        if core_domain_rejection(src, dst) is None and dst % src == 0:
+            return None
+        if self.prune:
+            menu = [
+                _core_division(op, splits)
+                for splits in _legal_split_options(
+                    op, _enum_split_options(op, profiles, matmul_roles)
+                )
+            ]
+        else:
+            menu = self._enumerate_core_divisions(op, max_cores)
+        menu = [
+            d
+            for d in menu
+            if d.cores_used <= max_cores and _split_option_is_legal(op, d.splits)
+        ]
+        pairs = edge.match_pairs([seed_div.splits], [d.splits for d in menu])
+        matched = sorted({j for _, j in pairs})
+        if not matched:
+            return None
+        aligned = max((menu[j] for j in matched), key=lambda d: d.cores_used)
+        logger.debug(
+            "align %s to fp8 matmul %s: %s -> %s",
+            op.name,
+            seed.name,
+            fixed.label,
+            aligned.label,
+        )
+        return aligned
 
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int

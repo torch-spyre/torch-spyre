@@ -52,6 +52,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import lx_relayout
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -2991,6 +2992,275 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
         ):
             allocator._division_map(graph)
+
+
+class TestFp8MatmulConsumerAlignment(unittest.TestCase):
+    """#4752: an fp8 matmul's one-hop consumer takes a division whose view of
+    the matmul output matches the matmul's, when no relayout can bridge them."""
+
+    _ALLOC = "torch_spyre._inductor.scratchpad.allocator"
+
+    def test_consumer_seeds_are_one_hop_readers_that_feed_no_fp8_seed(self):
+        n = _isym("n")
+
+        def dep(name):
+            return MemoryDep(name, n, (n,), (256,))
+
+        def op(name, reduction_type=None):
+            return _computed_buffer(
+                (1, 256),
+                name=name,
+                reduction_type=reduction_type,
+                reduction_ranges=(128,) if reduction_type else (),
+            )
+
+        ops = [
+            op("q"),
+            op("mm", BATCH_MATMUL_FP8_OP),
+            op("mul"),  # one hop after mm: a consumer
+            op("mul2"),  # two hops after mm
+            op("feeds"),  # reads mm, and mm2 reads it: an operand producer
+            op("mm2", BATCH_MATMUL_FP8_OP),
+            op("out"),  # one hop after mm2
+            op("total", "sum"),  # a reduction that is not an fp8 seed
+            op("after_total"),
+        ]
+        reads = {
+            "q": [],
+            "mm": ["q"],
+            "mul": ["mm"],
+            "mul2": ["mul"],
+            "feeds": ["mm"],
+            "mm2": ["feeds"],
+            "out": ["mm2"],
+            "total": ["q"],
+            "after_total": ["total"],
+        }
+        rw = {
+            name: MagicMock(writes=[dep(name)], reads=[dep(r) for r in names])
+            for name, names in reads.items()
+        }
+        with patch(
+            f"{self._ALLOC}.op_read_writes", side_effect=lambda o: rw[o.get_name()]
+        ):
+            seeds = allocator_module._fp8_matmul_consumer_seeds(
+                MagicMock(operations=ops)
+            )
+
+        self.assertEqual(
+            {name: [s.get_name() for s in found] for name, found in seeds.items()},
+            {"mul": ["mm"], "out": ["mm2"]},
+        )
+
+    def _align(self, seed_splits, fixed_splits, menu, legal=lambda splits: True):
+        """Run ``_seed_aligned_division`` for a consumer of one fp8 matmul whose
+        committed splits are ``seed_splits``; each side's view of the matmul
+        output is a real ``PerCoreView`` slicing device dim 0 by ``m`` and dim
+        1 by ``n``."""
+        m, n = self.m, self.n
+        seed = _computed_buffer(
+            (4, 4096),
+            name="mm",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(128,),
+        )
+        consumer = _computed_buffer((4, 4096), name="mul")
+        fixed = {
+            "mm": CoreDivision(splits=seed_splits),
+            "mul": CoreDivision(splits=fixed_splits),
+        }
+        out = MemoryDep("mm", 4096 * m + n, (m, n), (4, 4096))
+        rw = {
+            "mm": MagicMock(writes=[out], reads=[]),
+            "mul": MagicMock(writes=[], reads=[out]),
+        }
+
+        def view_for_div(op, dep, buf_name, splits, prep_cache):
+            dims = [(0, splits.get(m, 1)), (1, splits.get(n, 1))]
+            return (_physical_view(*[d for d in dims if d[1] > 1]), False, True)
+
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with (
+            patch.object(allocator_module.config, "sencores", 32),
+            patch(f"{self._ALLOC}._view_for_div", side_effect=view_for_div),
+            patch(
+                f"{self._ALLOC}.op_read_writes",
+                side_effect=lambda o: rw[o.get_name()],
+            ),
+            patch(
+                f"{self._ALLOC}._fixed_core_division",
+                side_effect=lambda o: fixed[o.get_name()],
+            ),
+            patch(
+                f"{self._ALLOC}._split_option_is_legal",
+                side_effect=lambda _op, splits: legal(splits),
+            ),
+            patch.object(
+                allocator,
+                "_enumerate_core_divisions",
+                return_value=[CoreDivision(splits=s) for s in menu],
+            ),
+        ):
+            return allocator._seed_aligned_division(consumer, [seed], (), (), 32, {})
+
+    def test_seed_aligned_division_only_when_no_relayout_bridges(self):
+        self.m, self.n = m, n = _isym("m"), _isym("n")
+        menu = [{n: 32}, {n: 28}, {n: 16}, {n: 14}, {n: 7}, {}]
+        cases = [
+            # (seed, consumer fixed, expected) -- None keeps the fixed division.
+            # 14 -> 28: a larger domain that is not every core cannot be
+            # bridged, so the consumer moves onto the matmul's 14 cores.
+            ({n: 14}, {n: 28}, CoreDivision(splits={n: 14})),
+            # 28 -> 32: every core, but 32 % 28 != 0 -- no even fan-out.
+            ({n: 28}, {n: 32}, CoreDivision(splits={n: 28})),
+            # A single-core matmul: the consumer becomes single-core too.
+            ({}, {n: 2}, CoreDivision(splits={})),
+            # Views already match: nothing to do.
+            ({n: 14}, {n: 14}, None),
+            # 16 -> 32 is an even broadcast onto every core: a relayout can
+            # bridge it, so the solver keeps that choice.
+            ({n: 16}, {n: 32}, None),
+            # Equal core counts, different views (M>1): relayout-bridgeable.
+            ({m: 4, n: 8}, {n: 32}, None),
+        ]
+        for seed_splits, fixed_splits, expected in cases:
+            with self.subTest(seed=seed_splits, fixed=fixed_splits):
+                self.assertEqual(self._align(seed_splits, fixed_splits, menu), expected)
+        with self.subTest("no matching candidate keeps the fixed division"):
+            self.assertIsNone(self._align({n: 14}, {n: 28}, [{n: 28}, {n: 7}]))
+        with self.subTest("an illegal matching candidate is never chosen"):
+            self.assertIsNone(
+                self._align({n: 14}, {n: 28}, menu, legal=lambda s: s != {n: 14})
+            )
+
+    def test_division_map_aligns_only_fp8_group_consumers(self):
+        n = _isym("n")
+        ops = {
+            name: _computed_buffer((1, 4096), name=name)
+            for name in ("mm", "mul", "kbi_out", "operand")
+        }
+        graph = MagicMock(operations=list(ops.values()))
+        fixed = CoreDivision(splits={n: 32})
+        aligned = CoreDivision(splits={n: 28})
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        group = {
+            "mm": "fp8 matmul layout group",
+            "mul": "fp8 matmul layout group",
+            "operand": "fp8 matmul layout group",
+            "kbi_out": "keep_by_index layout group",
+        }
+
+        def run(align_result):
+            with (
+                patch(
+                    f"{self._ALLOC}.ops_in_offset_mutation_component",
+                    return_value=set(),
+                ),
+                patch(
+                    f"{self._ALLOC}._find_distinct_matmul_splits",
+                    return_value=((), ()),
+                ),
+                patch(f"{self._ALLOC}._fused_layout_group_ops", return_value=group),
+                patch(
+                    f"{self._ALLOC}._fp8_matmul_consumer_seeds",
+                    return_value={"mul": [ops["mm"]], "kbi_out": [ops["mm"]]},
+                ),
+                patch(f"{self._ALLOC}._fixed_core_division", return_value=fixed),
+                patch(f"{self._ALLOC}._split_option_is_legal", return_value=True),
+                patch.object(
+                    allocator, "_seed_aligned_division", return_value=align_result
+                ) as align,
+            ):
+                return allocator._division_map(graph), align
+
+        divisions, align = run(aligned)
+        self.assertEqual(divisions["mul"], [aligned])
+        for name in ("mm", "operand", "kbi_out"):
+            self.assertEqual(divisions[name], [fixed], name)
+        # Only the fp8 group's consumer is offered alignment: not the matmul,
+        # not its operand producer, and not a keep_by_index group member.
+        self.assertEqual([c.args[0].get_name() for c in align.call_args_list], ["mul"])
+
+        divisions, _ = run(None)
+        self.assertEqual(divisions["mul"], [fixed])
+
+
+class TestFp8MatmulConsumerAlignmentOnDevice(unittest.TestCase):
+    """#4752 on device: M=1, K=128, N=1792. Work division splits the matmul's
+    14 FP8 sticks over 14 cores and its fp16 consumer's 28 sticks over 28, and
+    no relayout bridges 14 -> 28, so the matmul output used to spill. The
+    consumer now takes the matmul's 14-core view, and the matmul output must
+    stay in LX through ``prepare_spyre_kernels`` (no demotion)."""
+
+    def test_small_m1_matmul_output_stays_in_lx(self):
+        m, k, n = 1, 128, 1792
+        torch.manual_seed(0)
+        a = (torch.randn(m, k) * 0.5).to(torch.float16)
+        b = (torch.randn(k, n) * 0.5).to(torch.float16)
+        sa = torch.tensor([0.1], dtype=torch.float16)
+        sb = torch.tensor([0.1], dtype=torch.float16)
+        bias = (torch.randn(n) * 0.1).to(torch.float16)
+        dev = torch.device("spyre")
+
+        def scaled_mm(qa, qb, sa, sb, bias):
+            return torch.ops.aten._scaled_mm(
+                qa, qb, scale_a=sa, scale_b=sb, bias=bias, out_dtype=torch.float16
+            )
+
+        real_align = CoOptimizingAllocator._seed_aligned_division
+        aligned = []
+
+        def spy_align(self_, op, *args):
+            result = real_align(self_, op, *args)
+            aligned.append((op.get_name(), result))
+            return result
+
+        torch._dynamo.reset()
+        with (
+            fresh_cache(),
+            allocator_module.config.patch(
+                {
+                    "sencores": 32,
+                    "lx_planning": True,
+                    "co_optimizing_lx_planning": True,
+                    "layout_solver": "cpsat",
+                }
+            ),
+        ):
+            qa = torch.compile(
+                lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s)
+            )(a.to(dev), sa.to(dev))
+            qb = torch.compile(
+                lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s)
+            )(b.to(dev), sb.to(dev))
+            with (
+                patch.object(
+                    CoOptimizingAllocator, "_seed_aligned_division", spy_align
+                ),
+                patch(
+                    "torch_spyre._inductor.scheduler.demote_lx_relayout_group",
+                    wraps=lx_relayout.demote_lx_relayout_group,
+                ) as demote,
+                self.assertLogs("spyre.inductor.scratchpad.allocator", "DEBUG") as logs,
+            ):
+                out = torch.compile(scaled_mm)(
+                    qa, qb, sa.to(dev), sb.to(dev), bias.to(dev)
+                ).cpu()
+
+        self.assertTrue(
+            any(r is not None and r.cores_used == 14 for _, r in aligned), aligned
+        )
+        self.assertTrue(
+            any("(scaled_mm) → lx" in line for line in logs.output),
+            [line for line in logs.output if "lx_pinning" in line],
+        )
+        demote.assert_not_called()
+
+        def q(x, s):
+            return (x / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+
+        ref = (q(a, sa) @ q(b, sb)) * (sa.float() * sb.float()) + bias.float()
+        torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.1)
 
 
 class TestTopKConstraints(unittest.TestCase):
