@@ -494,7 +494,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                             )
 
     # Phase 2: performance transforms (matmul perf reorder).
-    seen_p2: set[str] = set()
+    # For each matmul op, reorder both its non-graph-input input buffers and
+    # its own output buffer: inputs benefit from reading a wider contiguous
+    # region; the output benefits from the same largest-dim-between-sticks
+    # layout for downstream consumers.
+    already_reordered: set[str] = set()
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -505,18 +509,18 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             and op.data.reduction_type in MATMUL_REDUCTION_OPS
         ):
             continue
-        for dep in op.get_read_writes().reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            if dep.name in graph_inputs:
-                continue
-            buf = V.graph.get_buffer(dep.name)
-            if not isinstance(buf, ComputedBuffer):
-                continue
+        input_bufs = [
+            V.graph.get_buffer(dep.name)
+            for dep in op.get_read_writes().reads
+            if isinstance(dep, MemoryDep)
+            and dep.name not in graph_inputs
+            and isinstance(V.graph.get_buffer(dep.name), ComputedBuffer)
+        ]
+        for buf in [*input_bufs, op]:
             name = buf.get_name()
-            if name in seen_p2:
+            if name in already_reordered:
                 continue
-            seen_p2.add(name)
+            already_reordered.add(name)
             pinned = pinned_dims.get(name, set())
             reordered_stl = _try_matmul_perf_reorder(buf, pinned)
             if reordered_stl is not None:
