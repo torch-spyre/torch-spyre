@@ -46,7 +46,23 @@ struct PendingWork {
   std::vector<at::Tensor> rank_outputs;
   int64_t chunk_size = 0;
   std::vector<at::Tensor> hold_tensors;
+  // Opaque handle keeping borrowed tensor storage alive for the lifetime of
+  // the WorkSchedule.  Passed to spyre_comms::relinquish_work_schedule() when
+  // the wait is skipped so spyre-comms can release it only after the schedule
+  // is fully retired.
+  std::shared_ptr<void> keep_alive;
 };
+
+// Build a keep_alive payload that owns a vector of tensors via shared_ptr.
+// The returned shared_ptr<void> keeps every tensor in `tensors` alive until it
+// is released, without exposing the PyTorch type to spyre-comms.
+static std::shared_ptr<void> make_tensor_keep_alive(
+    std::vector<at::Tensor> tensors) {
+  // Allocate the vector on the heap and wrap it as opaque void.
+  auto* holder = new std::vector<at::Tensor>(std::move(tensors));
+  return std::shared_ptr<void>(
+      holder, [](void* p) { delete static_cast<std::vector<at::Tensor>*>(p); });
+}
 
 // Global map to track pending async operations.
 // Key: SharedOwnerCtx* (stable per-allocation identity). PendingWork holds
@@ -348,6 +364,10 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
 
   work_schedule->start();
 
+  // Build keep_alive to hold the output tensor storage for the duration of
+  // the WorkSchedule.  broadcast borrows the buffer address of `output`.
+  auto ka = make_tensor_keep_alive({output});
+
   // Store pending work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
@@ -356,7 +376,10 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
                 "intervening wait_work");
     pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::Broadcast,
                                                std::move(work_schedule),
-                                               {output}});
+                                               {output},
+                                               0,
+                                               {output},
+                                               std::move(ka)});
   }
 
   return output;
@@ -397,15 +420,22 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
 
   work_schedule->start();
 
+  // Build keep_alive to hold the input tensor storage for the duration of
+  // the WorkSchedule.  allreduce borrows the buffer address of `input`.
+  auto ka = make_tensor_keep_alive({input});
+
   // Store pending work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
     TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
                 "allreduce_run called twice on the same allocation without "
                 "intervening wait_work");
-    pending_work_map_.emplace(
-        ctx, PendingWork{
-                 CollectiveKind::AllReduce, std::move(work_schedule), {input}});
+    pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::AllReduce,
+                                               std::move(work_schedule),
+                                               {input},
+                                               0,
+                                               {input},
+                                               std::move(ka)});
   }
 
   return input;
@@ -469,6 +499,10 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   TORCH_CHECK(output_ctx != nullptr,
               "SharedOwnerCtx is null for output tensor");
 
+  // Build keep_alive from rank_outputs before moving them into PendingWork.
+  // allgather borrows the buffer addresses of every per-rank output tensor.
+  auto ka = make_tensor_keep_alive(rank_outputs);
+
   // Store pending work with rank_outputs for assembly in wait_work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
@@ -479,7 +513,8 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
                                                       std::move(work_schedule),
                                                       std::move(rank_outputs),
                                                       input.size(0),
-                                                      {output}});
+                                                      {output},
+                                                      std::move(ka)});
   }
 
   return output;
@@ -532,9 +567,12 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
       // If we are skipping the wait, relinquish ownership to spyre-comms so
       // the WorkSchedule stays alive until finalize_library() drains it.
       // This prevents ~WorkSchedule() from firing inline here and forcing an
-      // unwanted synchronous wait().
+      // unwanted synchronous wait().  Pass the keep_alive bundle so that the
+      // borrowed tensor buffers remain valid until spyre-comms retires the
+      // schedule.
       check_collective_errors(*pending.work);
-      spyre_comms::relinquish_work_schedule(std::move(pending.work));
+      spyre_comms::relinquish_work_schedule(std::move(pending.work),
+                                            std::move(pending.keep_alive));
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
     }
   }
