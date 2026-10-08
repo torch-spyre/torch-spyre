@@ -217,6 +217,71 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 "mutation target",
             )
 
+    def test_mutated_graph_output_clears_only_with_validated_drain_plan(self):
+        """The graph-output-mutation refusal is lifted only by a validated plan.
+
+        This is the exact guard that pins a returned ``for_each_tile``
+        accumulator to HBM today (refusal reason "graph output mutated
+        after production").  A ``drain_plans`` entry clears it; the plan is
+        never produced on the fixed-division (placement) path, and the
+        pre-existing mutation-target refusal above it is untouched.
+        """
+        graph = SimpleNamespace(operations=[])
+        common = dict(
+            graph=graph,
+            name="carry",
+            uses=[0, 1],
+            mutated_buffers={"carry"},
+            graph_output_names={"carry"},
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            division_is_fixed=False,
+            buf_user_deps={},
+        )
+        carry = self._tagged_carry()
+        with (
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+        ):
+            # No plan: today's refusal stands.
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(op=carry, **common),
+                "graph output mutated after production",
+            )
+            # A validated plan clears exactly this branch.
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(
+                    op=carry, drain_plans={"carry"}, **common
+                )
+            )
+            # The placement path never receives plans, but even if one leaked,
+            # the earlier mutation-target refusal still fires first.
+            common["division_is_fixed"] = True
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(
+                    op=carry, drain_plans={"carry"}, **common
+                ),
+                "mutation target",
+            )
+
 
 class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
     """Issue #4655: the restickify barrier tests one committed division
@@ -2358,6 +2423,189 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(
                 allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
             )
+
+    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
+        """A drained carry under the carry-read gate: resident only if readers agree.
+
+        ``plain`` is a ``for_each_tile`` carry: filled before the loop, updated
+        in place by ``update`` and returned from the graph. Inside the loop,
+        ``consumer`` reads the update's name, so it reads the storage's bytes.
+        The post-loop drain plan makes this mutated graph output eligible for
+        LX, which is exactly when the read edge above starts to matter. The
+        real drain validator, buffer build, CP-SAT solve and push run on one
+        small graph (fill, update, reader, then an op after the loop):
+
+        * the reader can slice the storage the way the storage is owned: the
+          storage is resident, stays live to the graph exit, and the push emits
+          one drain clone after the loop's last member;
+        * every reader division slices it another way (same core count, other
+          axes, as in #4990): the edge admits no pair, the solver keeps the
+          storage in HBM, and the push emits nothing.
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+        from torch.utils._ordered_set import OrderedSet
+
+        x = _isym("x")
+
+        def dep(name):
+            return MemoryDep(name, x, (x,), (8,))
+
+        def rw(reads, writes):
+            return SimpleNamespace(
+                reads=OrderedSet(dep(n) for n in reads),
+                writes=OrderedSet(dep(n) for n in writes),
+            )
+
+        storage_op = self.op_by_name["plain"]
+        update_op = self._carry_update()
+        reader_op = self.consumer_op
+        tail_op = self._op("tail")
+        ops = [storage_op, update_op, reader_op, tail_op]
+        for op in ops:
+            op.name = op.get_name()
+            op.layout = _fixed_tiled_layout((8, 64))
+        op_by_name = {op.name: op for op in ops}
+        graph = MagicMock()
+        graph.operations = ops
+        graph.graph_input_names = []
+        graph.graph_outputs = [storage_op]
+        graph.get_output_names.return_value = ["plain"]
+        graph.get_buffer.side_effect = op_by_name.get
+        # The drain's FX clone reads the storage's own FX node.
+        graph.graph = torch.fx.Graph()
+        storage_op.origins = OrderedSet([graph.graph.placeholder("plain")])
+
+        # One counted loop holds the update and the reader; the fill and the
+        # tail run outside it. The update writes through the storage.
+        loop = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
+        )
+        update_op.loop_info = loop
+        reader_op.loop_info = loop
+        record = LoopCarryRecord(
+            storage_name="plain",
+            update_name="update",
+            loop_origin=SimpleNamespace(graph=graph.graph),
+        )
+        storage_op._loop_carry_record = record
+        update_op._loop_carry_record = record
+        update_op.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        update_op.layout.target = storage_op
+        self.rw.update(
+            {
+                storage_op: rw([], ["plain"]),
+                update_op: rw(["plain"], ["update"]),
+                reader_op: rw(["update"], ["consumer"]),
+                tail_op: rw([], ["tail"]),
+            }
+        )
+        mem_usage = {
+            "plain": {"size": 256, "op_inputs": []},
+            # A mutation alias is unsized, as mem_usage_by_buf reports it.
+            "update": {"size": -1, "op_inputs": ["plain"]},
+            "consumer": {"size": 256, "op_inputs": ["update"]},
+            "tail": {"size": 256, "op_inputs": []},
+        }
+
+        def residency(*_args, **_kwargs):
+            # The verdicts _residency_by_buf gives these ops: the plan clears
+            # the storage's "graph output mutated after production" refusal
+            # (TestLoopCarryLxEligibility covers that branch); the update is a
+            # mutation alias, never an LX buffer itself.
+            return {
+                "plain": None,
+                "update": "op not allowed",
+                "consumer": None,
+                "tail": None,
+            }
+
+        def run(reader_divs):
+            allocator = CoOptimizingAllocator(
+                allocator_module._make_cpsat_solver, size=4096
+            )
+            divisions = {
+                "plain": self.parent_divs,
+                "update": self.parent_divs,
+                "consumer": reader_divs,
+                "tail": self.parent_divs[:1],
+            }
+            with ExitStack() as stack:
+                stack.enter_context(self._patches())
+                for target, kwargs in (
+                    ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
+                    ("allocator.clone_at_graph_boundaries", {"return_value": True}),
+                    ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
+                    ("allocator.materialize_lx_relayouts", {}),
+                ):
+                    stack.enter_context(
+                        patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
+                    )
+                stack.enter_context(
+                    patch.object(allocator, "_residency_by_buf", side_effect=residency)
+                )
+                stack.enter_context(
+                    patch.object(
+                        allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
+                    )
+                )
+                stack.enter_context(patch.object(allocator, "_set_one_allocation"))
+                editor_cls = stack.enter_context(
+                    patch.object(allocator_module, "GraphEditor")
+                )
+
+                plans = allocator_module.validated_drain_plans(
+                    graph, division_is_fixed=False
+                )
+                self.assertEqual(set(plans), {"plain"})
+                self.assertIs(plans["plain"].anchor_op, reader_op)
+                allocator._validated_drain_plans = plans
+                built = allocator._build_cd_bound_buffers(graph, {}, divisions)
+                solver = allocator.layout_planning(built, allocator.size)
+                solved = {b.name: b for b in solver.plan_layout()}
+                # _commit_divisions would record the committed ownership here.
+                for op in ops:
+                    op.iteration_space_ownership = object()
+                allocator._push_allocation(graph, list(solved.values()), [])
+            return plans["plain"], {b.name: b for b in built}, solved, editor_cls
+
+        with self.subTest("reader splits like the storage"):
+            plan, built, solved, editor_cls = run(self.consumer_divs[:2])
+            storage = solved["plain"]
+            self.assertIsNotNone(storage.address)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_called_once_with(
+                storage_op,
+                [],
+                input=False,
+                private=True,
+                after_fx=plan.loop_origin,
+                lower_anchor=plan.anchor_op,
+            )
+            drain = editor.push_allocation_with_clone.return_value
+            editor.change_graph_output.assert_called_once_with(storage_op, drain)
+            # Why: the reader's edge on the storage admits the identical
+            # slicings, and the solver committed one of them.
+            matches = built["consumer"].cd_parent_matches.get("plain")
+            self.assertEqual(matches, [(0, 0), (1, 1)])
+            self.assertIn(
+                (storage.chosen_division, solved["consumer"].chosen_division), matches
+            )
+            # The drain plan keeps the storage live to the graph exit (4 ops),
+            # past the loop's end (3) that the counted-loop rule alone gives.
+            self.assertEqual(built["plain"].end_time, len(ops))
+
+        with self.subTest("reader splits the storage differently"):
+            plan, built, solved, editor_cls = run([self.consumer_divs[3]])
+            self.assertIsNone(solved["plain"].address)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_not_called()
+            editor.change_graph_output.assert_not_called()
+            # Why: the reader's edge on the storage exists but admits no pair.
+            self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):

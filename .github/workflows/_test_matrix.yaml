@@ -1495,11 +1495,20 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
+      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
+      - name: Download the first attempt's JUnit XML report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ runner.temp }}/replaced-report
+
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         id: run_tests
         uses: ./.github/actions/run-test-suite
         with:
           retried: pod
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
           config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
@@ -1604,10 +1613,19 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
+      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
+      - name: Download the first attempt's JUnit XML report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ runner.temp }}/replaced-report
+
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         uses: ./.github/actions/run-test-suite
         with:
           retried: pod
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}

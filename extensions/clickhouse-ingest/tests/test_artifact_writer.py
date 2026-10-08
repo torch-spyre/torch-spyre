@@ -49,6 +49,12 @@ class FakeClient:
 
     def query(self, sql, parameters=None):
         self.queries.append((sql, parameters or {}))
+        if "count()" not in sql:
+            # A record lookup (resolver.Lookup) finds nothing.
+            class Empty:
+                result_rows: list = []
+
+            return Empty()
         n = self.counts.pop(0) if self.counts else 0
 
         class R:

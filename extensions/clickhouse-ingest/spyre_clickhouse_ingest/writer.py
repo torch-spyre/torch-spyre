@@ -19,6 +19,7 @@ from collections import Counter
 import sys
 
 from . import schema
+from .mark_retried import PRIOR_MESSAGE, PRIOR_MESSAGE_MAX, PRIOR_STATUS
 from .identity import (
     ArtifactIdentity,
     BenchmarkId,
@@ -201,6 +202,20 @@ class TestResultWriter(RunWriter):
                 parameters=params,
             )
 
+    # run_case_counters_mv's columns; `recovered` exists only once migration 010 has run, and the
+    # writer is installed from main at run time, ahead of the schema.
+    _COUNTERS = {
+        "total_tests": "count()",
+        "passed": "countIf(status = 'passed')",
+        "failed": "countIf(status = 'failed')",
+        "errors": "countIf(status = 'error')",
+        "skipped": "countIf(status = 'skipped')",
+        "xfail": "countIf(status = 'xfail')",
+        "xpass": "countIf(status = 'xpass')",
+        "recovered": "countIf(status = 'passed' AND (props['result.prior_status'] IN "
+        "('failed', 'error') OR toUInt32OrZero(props['result.reruns']) > 0))",
+    }
+
     @classmethod
     def _rebuild_counters(cls, client, db: str, run_id: str, component: str) -> None:
         """Recount this run's run_case_counters from test_case_runs.
@@ -211,12 +226,18 @@ class TestResultWriter(RunWriter):
         counters = f"{db}.run_case_counters" if db else "run_case_counters"
         params = {"component": component, "run_id": run_id}
         where = "component = {component:String} AND run_id = {run_id:UUID}"
+        has_recovered = client.query(
+            "SELECT count() FROM system.columns WHERE table = 'run_case_counters' "
+            "AND name = 'recovered' AND database = "
+            + ("{db:String}" if db else "currentDatabase()"),
+            parameters={"db": db},
+        ).result_rows
+        recovered = bool(has_recovered and has_recovered[0][0])
+        cols = [c for c in cls._COUNTERS if c != "recovered" or recovered]
         client.command(f"DELETE FROM {counters} WHERE {where}", parameters=params)
         client.command(
-            f"INSERT INTO {counters} SELECT run_id, component, count(), "
-            "countIf(status = 'passed'), countIf(status = 'failed'), "
-            "countIf(status = 'error'), countIf(status = 'skipped'), "
-            "countIf(status = 'xfail'), countIf(status = 'xpass') "
+            f"INSERT INTO {counters} (run_id, component, {', '.join(cols)}) "
+            f"SELECT run_id, component, {', '.join(cls._COUNTERS[c] for c in cols)} "
             f"FROM {cls.fact_table.qualified(db)} WHERE {where} "
             "GROUP BY run_id, component",
             parameters=params,
@@ -418,9 +439,10 @@ class TestResultWriter(RunWriter):
         ids = list(batch)
         held: dict = {}
         for i in range(0, len(ids), schema.IDENTITY_LOOKUP_CHUNK):
-            for tcid, uuid, status, dur, msg, ran_in, attempt, sf in client.query(
+            found = client.query(
                 "SELECT test_case_id, audit_uuid, status, duration_s, fail_message, "
-                "props['ran_in'], props['run_attempt'], props['source_file'] "
+                "props['ran_in'], props['run_attempt'], props['source_file'], "
+                f"props['{PRIOR_STATUS}'], props['{PRIOR_MESSAGE}'] "
                 f"FROM {cls.fact_table.qualified(db)} "
                 "WHERE component = {component:String} AND run_id = {run_id:UUID} "
                 "AND test_case_id IN {ids:Array(UUID)}",
@@ -429,7 +451,8 @@ class TestResultWriter(RunWriter):
                     "run_id": run_id,
                     "ids": ids[i : i + schema.IDENTITY_LOOKUP_CHUNK],
                 },
-            ).result_rows:
+            ).result_rows
+            for tcid, uuid, status, dur, msg, ran_in, attempt, sf, *prior in found:
                 held.setdefault(str(tcid), []).append(
                     {
                         "audit_uuid": str(uuid),
@@ -439,6 +462,7 @@ class TestResultWriter(RunWriter):
                         "ran_in": ran_in,
                         "attempt": int(attempt or 0),
                         "source_file": sf,
+                        "prior": tuple(prior),
                     }
                 )
         keep, superseded = [], set()
@@ -449,10 +473,35 @@ class TestResultWriter(RunWriter):
                 if any(cls._restates(run_id, h, f) for h in rows_held):
                     continue
                 keep.append(r)
-                superseded |= {
-                    h["audit_uuid"] for h in rows_held if cls._restates(run_id, f, h)
-                }
+                replaced = [h for h in rows_held if cls._restates(run_id, f, h)]
+                superseded |= {h["audit_uuid"] for h in replaced}
+                cls._keep_prior(run_id, r, f, replaced)
         return keep, sorted(superseded)
+
+    @staticmethod
+    def _keep_prior(run_id: str, row: dict, f: dict, replaced: list) -> None:
+        """Stamp on `row` the newest failure of an older attempt it replaces, else it is lost."""
+        if row["props"].get(PRIOR_STATUS):
+            return
+        older = [
+            h
+            for h in replaced
+            if h["attempt"] < f["attempt"]
+            and h["source_file"] == f["source_file"]
+            and h["ran_in"] in ("", str(run_id))
+        ]
+        for h in sorted(older, key=lambda h: h["attempt"], reverse=True):
+            # A rerun attempt also re-ingests the reports it did not re-run: an unchanged outcome
+            # is the same execution, so only a prior mark it already carried moves forward.
+            rerun = any(h[k] != f[k] for k in ("status", "duration_s", "fail_message"))
+            if rerun and h["status"] in ("failed", "error"):
+                prior = (h["status"], h["fail_message"][:PRIOR_MESSAGE_MAX])
+            elif h["prior"] and h["prior"][0]:
+                prior = h["prior"]
+            else:
+                continue
+            row["props"][PRIOR_STATUS], row["props"][PRIOR_MESSAGE] = prior
+            return
 
     @staticmethod
     def _recorded(case: dict) -> tuple:
@@ -526,7 +575,7 @@ class BenchmarkWriter(RunWriter):
         ident_rows: dict[str, schema.BenchmarkRow] = {}
         facts: dict[tuple[str, str], schema.BenchmarkRunRow] = {}
         skipped = 0
-        for b in benchmarks:
+        for b in BenchmarkId.rank_kernels(component, benchmarks):
             name, tags = b.get("name", ""), b.get("tags") or []
             disc = b.get("disc") or {}
             bid = BenchmarkId.derive(
@@ -722,6 +771,19 @@ class ArtifactWriter:
         )
 
     @classmethod
+    def ref_recorded(cls, client, db: str, artifact_id: str, ref: str) -> bool:
+        """Does `artifact_refs` already hold this ref for this artifact?"""
+        return bool(ref) and (
+            cls.ref_table.count_rows(
+                client,
+                db,
+                "artifact_id = {artifact_id:UUID} AND ref = {ref:String}",
+                {"artifact_id": artifact_id, "ref": ref},
+            )
+            > 0
+        )
+
+    @classmethod
     def tag_recorded(cls, client, db: str, tag: str, artifact_id: str) -> bool:
         """Does this tag already point at this artifact? (Also a plain MergeTree.)"""
         return (
@@ -820,8 +882,8 @@ class ArtifactWriter:
             }
             cls.artifact_table.insert(client, [row], db=db)
         method, ref_kind = cls.ref_shape(identity.kind)
-        if identity.ref:
-            # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
+        # Checked, not left to the ReplacingMergeTree: unmerged repeats are read as duplicates.
+        if identity.ref and not cls.ref_recorded(client, db, aid, identity.ref):
             ref_row: schema.ArtifactRefRow = {
                 "artifact_id": aid,
                 "method": method,
@@ -975,41 +1037,11 @@ class ArtifactWriter:
         base = DerivedId.norm(base_artifact_id)
         # aid == base means the leg ran the image UNCHANGED, so the artifact is the
         # one the orchestrator already recorded, and our own row would be a duplicate.
-        if aid != base and not cls.artifact_recorded(client, db, aid):
-            identity = ArtifactIdentity.from_gha(comp, base, installed, a)
-            # Keyed on the caller's id: the record it came from is the authority.
-            cls.artifact_table.insert(
-                client,
-                [
-                    {
-                        "artifact_id": aid,
-                        "component": comp,
-                        "arch": a,
-                        "kind": "image",
-                        # The hashed name, not a display string.
-                        "artifact_name": base,
-                        # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
-                        "origin": "built",
-                        "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"]
-                        if base
-                        else [],
-                        "context_deps": [],
-                        "sources": [(repo, git_ref, git_sha)]
-                        if (repo or git_ref or git_sha)
-                        else [],
-                        "props": cls._props(
-                            {
-                                # The digest GhaArtifactId put in the id12 slot.
-                                "id12": identity.id12,
-                                **dict(identity.inputs),
-                                "run_url": run_url,
-                                "source": "gha",
-                            }
-                        ),
-                    }
-                ],
-                db=db,
-            )
+        if aid != base:
+            cls.insert_gha_artifact(
+                client, db, aid, comp, base, installed, a,
+                sources=[(repo, git_ref, git_sha)], run_url=run_url,
+            )  # fmt: skip
         return cls.insert_result(
             client,
             db,
@@ -1023,6 +1055,41 @@ class ArtifactWriter:
             props={"run_url": run_url, "source": "gha"},
             attempt=attempt,
         )
+
+    @classmethod
+    def insert_gha_artifact(
+        cls, client, db: str, aid: str, component: str, base: str, installed: str, arch: str,
+        *, sources=(), run_url: str = "",
+    ) -> bool:  # fmt: skip
+        """Record a GHA leg's delta on `base` once, keyed on the caller's id (the record it came
+        from is the authority); True when a row was written."""
+        if cls.artifact_recorded(client, db, aid):
+            return False
+        identity = ArtifactIdentity.from_gha(component, base, installed, arch)
+        row: schema.ArtifactRow = {
+            "artifact_id": aid,
+            "component": DerivedId.norm(component),
+            "arch": DerivedId.arch(arch),
+            "kind": "image",
+            # The hashed name, not a display string.
+            "artifact_name": base,
+            # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
+            "origin": "built",
+            "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"] if base else [],
+            "context_deps": [],
+            "sources": [tuple(s) for s in sources if any(s)],
+            "props": cls._props(
+                {
+                    # The digest GhaArtifactId put in the id12 slot.
+                    "id12": identity.id12,
+                    **dict(identity.inputs),
+                    "run_url": run_url,
+                    "source": "gha",
+                }
+            ),
+        }
+        cls.artifact_table.insert(client, [row], db=db)
+        return True
 
     @staticmethod
     def _props(values: dict) -> dict:

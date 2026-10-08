@@ -247,6 +247,104 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+    (1, 1, 1, 1),
+]
+
+
+@pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)
+@pytest.mark.parametrize("start_dtype", [torch.float32, torch.float16])
+def test_roundtrip_stick_only_shape(shape, start_dtype):
+    """A conversion round trip works when the tensor is a scalar or all size-1 dims.
+
+    A type conversion needs one spatial dim beyond the stick, which these shapes
+    do not have; codegen supplies a virtual one. Both directions are exercised
+    because a single fp16->fp32 output is staggered and not comparable to CPU.
+    Random values make a lane read from the wrong place show up as a mismatch.
+    """
+    other_dtype = torch.float16 if start_dtype == torch.float32 else torch.float32
+
+    def fn(t):
+        return t.to(other_dtype).to(start_dtype)
+
+    x = torch.randn(shape, dtype=start_dtype)
+    result = torch.compile(fn, backend="inductor")(x.to("spyre"))
+
+    ea = get_spyre_tensor_layout(result).element_arrangement
+    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-3, atol=1e-3)
+
+
+def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
+    """A conversion of a 1-D tensor that ends inside a stick pads it to whole sticks.
+
+    The only loop variable is the stick, so codegen adds a virtual row before it;
+    the stick must still be padded. int32 and fp32 share a stick width, so this
+    covers the padding without a width change.
+    """
+
+    def fn(x):
+        return torch.rsqrt(x.to(torch.float32))
+
+    x = torch.randint(1, 1000, (44,), dtype=torch.int32)
+    result = torch.compile(fn, dynamic=False)(x.to("spyre"))
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=1e-2, atol=1e-2)
+
+
+# An op consuming an upcast FP32 value before the downcast back, on stick lengths
+# that end inside a stick. The upcast value is staggered: each FP16 stick spans a
+# pair of FP32 sticks. Padding the conversions is enough while work division
+# leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
+# is a whole number of pairs; (68,) is the unsplit case.
+_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
+# Here work division splits the stick dim and the round-up ends in the middle of
+# a pair, so the pair's second stick is left to no core.
+# TODO: make work division handle staggered FP32, splitting the stick dim by
+# whole stick pairs.
+_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        *_PARTIAL_STICK_UPCAST_PASS,
+        *[
+            pytest.param(
+                shape,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="TODO: size work division for an upcast value by whole "
+                    "stick pairs, so the last pair's second stick is processed",
+                ),
+            )
+            for shape in _PARTIAL_STICK_UPCAST_NEEDS_PAIRS
+        ],
+    ],
+    ids=str,
+)
+def test_upcast_consumed_on_partial_stick(shape):
+    """An op between an FP16 -> FP32 -> FP16 round trip keeps every element.
+
+    The values are exact in DLFloat16, so any element the device moves or drops
+    shows up as a mismatch.
+    """
+    torch._dynamo.reset()
+
+    def fn(x):
+        y = x.to(torch.float32)
+        return (y + y).to(torch.float16)
+
+    x = (torch.randint(-64, 64, shape) / 8).to(torch.float16)
+    result = torch.compile(fn)(x.to("spyre"))
+    torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
+
+
 def _stagger_fn(x, fp16):
     """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
     return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))

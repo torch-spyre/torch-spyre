@@ -1,0 +1,69 @@
+# The tag families spyre_v2 records (artifact_tags.tag_family), keyed by the stored value.
+# Override the whole file with SPYRE_TAG_FAMILIES=<path to another YAML file>.
+#
+# Per family, every key optional:
+#   registry_tag  a regex for the container-registry tag that names an image in
+#                 this family; its named groups become template fields
+#   tag           the v2 tag built from a registry_tag match
+#   fallback      the v2 tag built from --tag-date when no registry tag names the image; empty
+#                 means the family has none and needs an explicit --tag
+#   dated         whether the family's tag needs a date: the CLI then defaults --tag-date to
+#                 today (UTC)
+#   nearest       search registry tags nearest --tag-date first, a tag with more groups (a snap
+#                 build's own timed tag) before one with fewer (its day's aggregate)
+#   prefix        a full --tag starting with "<family>-" belongs to this family
+#
+# `misc` (required) holds a --tag whose prefix names no family and that was given none; it is
+# warned about, and `results --strict` fails on it. Give such tags a real family instead.
+#
+# Template fields (str.format; text inside [...] is dropped when any field in it is empty):
+#   family        the family key
+#   date          a date: the registry tag's `date` group (YYYYMMDD), else --tag-date
+#   time          the registry tag's `time` group, verbatim
+#   build         the registry tag's `build` group, verbatim
+#   iso_year      the ISO year: of `date`; for a week-only tag, of the image's build date
+#   iso_week      the ISO week (int): the registry tag's `iso_week` group, else of `date`
+#   registry_tag  the matched registry tag, verbatim
+
+snap-supply-chain:
+  registry_tag: ^snap-(?P<date>\d{8})(?:T(?P<time>\d{6})_(?P<build>\d+))?$
+  tag: '{family}-{date:%Y-%m-%d}[T{time}]'
+  fallback: '{family}-{date:%Y-%m-%d}'
+  dated: true
+  nearest: true
+  prefix: true
+
+nightly-supply-chain:
+  registry_tag: ^nightly-(?P<date>\d{8})$
+  tag: '{family}-{date:%Y-%m-%d}'
+  fallback: '{family}-{date:%Y-%m-%d}'
+  dated: true
+  nearest: true
+  prefix: true
+
+weekly-supply-chain:
+  registry_tag: ^weekly-W(?P<iso_week>\d{2})$
+  tag: '{family}-{iso_year}-w{iso_week:02}'
+  fallback: '{family}-{iso_year}-w{iso_week:02}'
+  dated: true
+  prefix: true
+
+# Its streams are promoted as ci-cd-tech-preview-vN and, by orch-spyre-delivery, cicd-tech-preview-vN.
+ci-cd-tech-preview:
+  registry_tag: ^(ci-cd|cicd)-tech-preview-v\d+$
+  tag: '{registry_tag}'
+  prefix: true
+
+# Families with no registry tag of their own: every tag in them is given in full.
+release:
+  prefix: true
+
+# Named only by an explicit --tag (<repo>#<pr>, <repo>#<pr>@<sha12>[+mq], <component>@<sha12>).
+pr: {}
+main: {}
+nightly: {}
+weekly: {}
+snap: {}
+
+# Explicit tags only: never matched by prefix, never dated (see the header).
+misc: {}
