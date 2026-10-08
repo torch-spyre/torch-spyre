@@ -61,6 +61,7 @@ from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
     work_division_from_view,
 )
+from .scratchpad.utils import frontend_lx_high_water
 from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
@@ -76,6 +77,7 @@ from .pass_utils import (
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .op_spec import (
+    FRONTEND_LX_BYTES_INFO_KEY,
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
     LoopSpec,
@@ -1071,6 +1073,14 @@ class SpyreKernel(Kernel[CSEVariable]):
             raise RuntimeError("LX relayout marker has no matching registered plan")
         if relayout_plans:
             op_info = {**op_info, LX_RELAYOUT_INFO_KEY: True}
+
+        # The frontend LX reservation for this operation, from this call's
+        # allocation and lifetimes. Looked up per operation, never carried from
+        # a cached program: two calls of equal code can own different LX, and a
+        # missing value means the backend keeps its full default reservation.
+        lx_bytes = frontend_lx_high_water(V.graph).get(ir_node.get_operation_name())
+        if lx_bytes is not None:
+            op_info = {**op_info, FRONTEND_LX_BYTES_INFO_KEY: lx_bytes}
 
         op_spec = OpSpec(
             op,

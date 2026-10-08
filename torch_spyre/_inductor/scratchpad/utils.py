@@ -222,6 +222,134 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
     return counted_loop_lifetime_overrides(graph)[1]
 
 
+_FRONTEND_LX_FOOTPRINTS_ATTR = "_spyre_frontend_lx_footprints"
+_FRONTEND_LX_HIGH_WATER_ATTR = "_spyre_frontend_lx_high_water"
+
+
+def publish_frontend_lx_footprints(
+    graph: GraphLowering, footprints: dict[str, int]
+) -> None:
+    """Record the allocator's final packed per-core LX footprint per placed buffer.
+
+    Called once per planning run, after LX placement is committed and the graph
+    mutations are materialized (input clones, LX relayout copies), so the keys
+    are the buffer names the final graph uses. This is the single source of the
+    per-core footprint: ``frontend_lx_high_water`` never re-derives one from a
+    tensor size.
+    """
+    setattr(graph, _FRONTEND_LX_FOOTPRINTS_ATTR, dict(footprints))
+    invalidate_frontend_lx_high_water(graph)
+
+
+def invalidate_frontend_lx_high_water(graph: GraphLowering) -> None:
+    """Drop the cached per-op high-water; call whenever LX ownership changes."""
+
+    if hasattr(graph, _FRONTEND_LX_HIGH_WATER_ATTR):
+        delattr(graph, _FRONTEND_LX_HIGH_WATER_ATTR)
+
+
+def frontend_lx_high_water(graph: GraphLowering) -> dict[str, int]:
+    """Highest occupied LX end address per operation, in bytes per core.
+
+    Returns ``{operation_name: bytes}`` for every operation of ``graph``: the
+    maximum over LX-resident buffers live at that operation of
+    ``address + packed per-core footprint``, rounded up to the allocation
+    granularity, or 0 when no frontend buffer is live there. A buffer is live at
+    operation ``t`` when ``start_time <= t < end_time`` in the solvers'
+    convention: ``start_time = min(uses[0], lifetime_start_override)`` and
+    ``end_time = max(uses[-1] + 1, lifetime_end_override)``, so the writing and
+    last-reading operations are included and a value carried around a counted
+    loop's backedge stays live for the loop's whole textual interval.
+
+    An empty dict means no safe bound was established -- the allocator never
+    published footprints, an LX-resident buffer has no footprint record, or a
+    bound would exceed the configured planning size. Callers must then emit no
+    ``frontend_lx_bytes`` attribute and the backend keeps its full default
+    reservation. Unsized or missing records are never read as zero occupancy.
+    """
+    cached = getattr(graph, _FRONTEND_LX_HIGH_WATER_ATTR, None)
+    if cached is not None:
+        return cached
+
+    footprints = getattr(graph, _FRONTEND_LX_FOOTPRINTS_ATTR, None)
+    if footprints is None:
+        result: dict[str, int] = {}
+    else:
+        result = _compute_frontend_lx_high_water(graph, footprints)
+    setattr(graph, _FRONTEND_LX_HIGH_WATER_ATTR, result)
+    return result
+
+
+def _lx_resident_layout(graph: GraphLowering, name: str) -> Optional[FixedTiledLayout]:
+    buffer = graph.try_get_buffer(name)
+    layout = getattr(buffer, "layout", None)
+    if not isinstance(layout, FixedTiledLayout) or "lx" not in layout.allocation:
+        return None
+    return layout
+
+
+def _compute_frontend_lx_high_water(
+    graph: GraphLowering, footprints: dict[str, int]
+) -> dict[str, int]:
+    # Local import: the allocator imports this module, so the bound it owns can
+    # only be read lazily, at a point long after both modules are loaded.
+    from torch_spyre._inductor.scratchpad.allocator import (
+        _LX_ALLOCATION_GRANULARITY_BYTES,
+        _lx_planning_size,
+    )
+
+    limit = _lx_planning_size()
+    lifetimes = calculate_liveness(graph)
+    start_overrides, end_overrides = counted_loop_lifetime_overrides(graph)
+
+    # Every LX-resident buffer the graph still touches must have a published
+    # footprint, or no op's bound can be proven safe.
+    for op in graph.operations:
+        rw = op_read_writes(op)
+        for dep in (*rw.reads, *rw.writes):
+            if (
+                _lx_resident_layout(graph, dep.name) is not None
+                and dep.name not in footprints
+            ):
+                return {}
+
+    intervals: list[tuple[int, int, int]] = []
+    for name, size in footprints.items():
+        layout = _lx_resident_layout(graph, name)
+        if layout is None:
+            # Demoted before emission: the buffer no longer owns LX.
+            continue
+        if not isinstance(size, int) or size <= 0:
+            return {}
+        uses = lifetimes.get(name, [])
+        if not uses:
+            continue
+        interval = LifetimeBoundBuffer(
+            name,
+            size,
+            uses,
+            first_use_is_read=False,
+            lifetime_start_override=start_overrides.get(name),
+            lifetime_end_override=end_overrides.get(name),
+        )
+        end_address = layout.allocation["lx"] + size
+        intervals.append((interval.start_time, interval.end_time, end_address))
+
+    values: dict[str, int] = {}
+    for index, op in enumerate(graph.operations):
+        top = 0
+        for start, end, end_address in intervals:
+            if start <= index < end and end_address > top:
+                top = end_address
+        top = round_up_to_alignment(top, _LX_ALLOCATION_GRANULARITY_BYTES)
+        if top > limit:
+            # Placement never exceeds the planning size; anything above it means
+            # the records cannot be trusted, so keep the backend's default.
+            return {}
+        values[op.get_operation_name()] = top
+    return values
+
+
 def mem_usage_by_buf(
     graph: GraphLowering,
     cache: Optional[dict] = None,

@@ -25,7 +25,12 @@ from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    format_op_spec_list,
+    frontend_lx_bytes_attr_value,
+)
 from torch_spyre._inductor.op_spec_validation import validate_op_specs
 
 
@@ -140,6 +145,9 @@ def generate_bundle(
     sdsc_cache_counts: list[int] | None = None
     if _spyre_config.sdsc_cache:
         sdsc_cache_counts = [0, 0]  # [hits, misses]
+    # The frontend_lx_bytes each sdsc file's calls state, folded per file while
+    # the calls are assigned to files (_record_frontend_lx_bytes).
+    file_lx_bytes: dict[str, int | None] = {}
     _compile_specs(
         specs_list,
         symbols,
@@ -149,6 +157,7 @@ def generate_bundle(
         output_dir,
         sdsc_cache={} if _spyre_config.sdsc_cache else None,
         _sdsc_cache_counts=sdsc_cache_counts,
+        file_lx_bytes=file_lx_bytes,
     )
     if sdsc_cache_counts is not None:
         hits, misses = sdsc_cache_counts
@@ -467,6 +476,7 @@ def generate_bundle(
             indent=2,
             kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
+            file_lx_bytes=file_lx_bytes,
         )
 
         f.write("\t\treturn\n")
@@ -495,12 +505,16 @@ def _compile_specs(
     output_dir: str,
     sdsc_cache: dict | None = None,
     _sdsc_cache_counts: list | None = None,
+    file_lx_bytes: dict | None = None,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first.
 
     Identical op specs (same canonical SDSC at counter 0) reuse the previously
     compiled entry — same sdsc file and same symbol registrations.
     Pass sdsc_cache={} to enable caching; None disables it.
+
+    ``file_lx_bytes``, when given, receives the ``frontend_lx_bytes`` every call
+    of each sdsc file states (``_record_frontend_lx_bytes``).
     """
     for entry in specs:
         if isinstance(entry, LoopSpec):
@@ -513,6 +527,7 @@ def _compile_specs(
                 output_dir,
                 sdsc_cache,
                 _sdsc_cache_counts,
+                file_lx_bytes,
             )
         elif isinstance(entry, OpSpec):
             cached = None
@@ -551,6 +566,8 @@ def _compile_specs(
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
             file_name = f"sdsc_{idx}.json"
+            if file_lx_bytes is not None:
+                _record_frontend_lx_bytes(file_lx_bytes, file_name, entry.op_info)
             if cached is None:
                 cached_json = sdsc_json
                 if sdsc_cache is not None:
@@ -680,6 +697,34 @@ def _dim_input_arg_type(dim_sk: SymbolKind) -> str:
     )
 
 
+def _record_frontend_lx_bytes(
+    file_lx_bytes: dict[str, int | None], file_name: str, op_info: dict | None
+) -> None:
+    """Fold one call's ``frontend_lx_bytes`` into the value its sdsc file states:
+    the largest bound over the file's calls, or ``None`` (no attribute) once any
+    call has none.
+
+    The SDSC cache makes equal programs share one sdsc file, and the backend
+    schedules one plan per file -- its LX staging addresses are fixed once and
+    reused by every call. The backend reserves ``[0, bound)`` per call (per
+    phase), but a plan made in the phase of one call must also hold in the
+    phases of the others: a staging buffer placed just above a small bound would
+    land inside front-end LX that another call of the same program still holds.
+    So every call of a shared file states the largest of their bounds; a call
+    without a bound keeps the backend's full default reservation, which is
+    larger than any bound, so then no call of that file carries one. A file
+    with one call keeps its own bound unchanged.
+    """
+    bound = frontend_lx_bytes_attr_value(op_info)
+    if file_name not in file_lx_bytes:
+        file_lx_bytes[file_name] = bound
+        return
+    stated = file_lx_bytes[file_name]
+    file_lx_bytes[file_name] = (
+        None if stated is None or bound is None else max(stated, bound)
+    )
+
+
 def _emit_specs(
     specs: list,
     compiled_iter,
@@ -693,8 +738,14 @@ def _emit_specs(
     indent: int,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
+    file_lx_bytes: dict | None = None,
 ) -> None:
-    """Recursively emit MLIR ops for specs into file f."""
+    """Recursively emit MLIR ops for specs into file f.
+
+    ``file_lx_bytes`` maps each sdsc file to the ``frontend_lx_bytes`` its calls
+    state (``_record_frontend_lx_bytes``); a call whose file has no entry
+    states none, so the backend keeps its full default reservation.
+    """
     if kernel_sym_to_arg_idx is None:
         kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
@@ -738,6 +789,7 @@ def _emit_specs(
                 indent + 1,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
+                file_lx_bytes=file_lx_bytes,
             )
             f.write(f"{tab}}}\n")
 
@@ -803,10 +855,20 @@ def _emit_specs(
 
             operand_str = ", ".join(operands)
             symbol_ids_str = ", ".join(str(i) for i in cached_symbol_ids)
+            # The reservation of the program this call runs: the cached JSON above
+            # supplies the filename and symbol IDs, never ownership, and every call
+            # of a shared file states the largest bound of its calls (one backend
+            # plan serves them all; see _record_frontend_lx_bytes).
+            lx_bytes = (file_lx_bytes or {}).get(sdsc_filename)
+            lx_bytes_attr = (
+                f", frontend_lx_bytes = {lx_bytes} : i64"
+                if lx_bytes is not None
+                else ""
+            )
             f.write(
                 f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
                 f'{{sdsc_filename="{sdsc_filename}", '
-                f'"symbol_ids"=[{symbol_ids_str}]}}\n'
+                f'"symbol_ids"=[{symbol_ids_str}]{lx_bytes_attr}}}\n'
             )
 
 

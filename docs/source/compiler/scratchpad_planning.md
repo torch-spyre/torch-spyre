@@ -34,6 +34,7 @@ An op with no legal candidate raises `Unsupported`.
 - [Implementation](#implementation)
 - [Solvers](#solvers)
 - [Co-optimization with work-distribution](#co-optimization-with-work-distribution)
+- [Per-program frontend reservation](#per-program-frontend-reservation)
 - [LX context switching](#lx-context-switching)
 - [Current limitations](#current-limitations)
 - [Target patterns](#target-patterns)
@@ -662,6 +663,42 @@ and `LxContextSwitchingPass` is registered as a `post_optimization_pass` instead
 guard runs exactly as PR3683 shipped it and the new pass is never registered. It is a real
 either/or, not a partial toggle, so old and new behavior stay directly comparable while the new
 mechanism earns trust in production; removing the guard entirely is a follow-up once it does.
+
+## Per-program frontend reservation
+
+The frontend may emit `frontend_lx_bytes = N : i64` on a program call. `N`
+reserves the prefix `[0, N)` in bytes **per core**, in that program's phase;
+it is not a device-wide tensor size. The planner derives it from the final
+packed offsets and per-core footprints of every frontend LX buffer live
+in that phase, rounded up to 128 bytes. Lifetimes include the write and
+last read, and a counted-loop carry stays live across its backedge.
+
+If any footprint is unknown or inconsistent with the final placement,
+the frontend omits all such attributes for that graph. Calls sharing a
+cached SDSC program use their largest bound. If any of those calls has
+no certified bound, all calls sharing that program omit the attribute.
+The kernel cache key includes each op's own bound, so a changed emitted
+reservation cannot reuse a stale bundle.
+
+The Python metadata accepts only nonnegative integers representable as
+signed i64; booleans and out-of-range integers are omitted. The backend
+also checks the signless i64 type, nonnegative value, 128-byte alignment,
+and configured default frontend capacity. An absent or invalid attribute
+keeps that default reservation. A valid zero explicitly certifies that
+the frontend owns no LX prefix in that phase.
+
+This contract requires backend support for `frontend_lx_bytes`. The
+frontend and backend must agree on architecture capacity and
+`DXP_LX_FRAC_AVAIL`; no new user flag changes that fraction. Reclaimed
+space may grow backend M/N chunks, while the reduction chunk remains
+the one selected under the default frontend share. The backend must
+stop compilation if that default-share room or a reused schedule's
+staging range is unavailable in a call's phase.
+
+Long-lived placement units are packed low first to keep later programs'
+bounds tight. If that packing does not fit, the solver's stacking order
+is tried; if neither fits, its original legal offsets are retained.
+Repacking preserves residency and never clamps an offset into capacity.
 
 ## Current limitations
 
