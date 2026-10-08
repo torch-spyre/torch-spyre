@@ -41,6 +41,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
     DEVICE_NAME,
+    DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -1116,25 +1117,26 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
-    # SEN169 intermediates can exceed IEEE fp16's finite range. A missing
-    # bound must not impose that range, or go through infinity encoding.
     if min is None and max is None:
         raise Unsupported("clamp requires at least one bound")
+    # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
+    # encoding is finite. FP32 has IEEE infinities, so preserve those too.
+    dtype = x.get_dtype()
+    limit = float("inf") if dtype == torch.float32 else DLFLOAT16_MAX
     if min is None:
-        pw = lowering.minimum(x, max)
-    elif max is None:
-        pw = lowering.maximum(x, min)
-    else:
-        pw = Pointwise.create(
-            device=x.get_device(),
-            dtype=x.get_dtype(),
-            inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
-                x.make_loader()(index), min, max
-            ),
-            ranges=x.get_size(),
-            origin_node=x.get_origin_node(),
-            traceback=x.get_traceback(),
-        )
+        min = -limit
+    if max is None:
+        max = limit
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=dtype,
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
+            x.make_loader()(index), min, max
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
     pw.realize()
     return pw
 
