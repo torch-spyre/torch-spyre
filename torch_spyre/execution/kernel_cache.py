@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from functools import lru_cache
 from typing import Optional
 
+import sympy
 import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
@@ -233,6 +234,21 @@ def _strip_debug_handles(obj):
     return obj
 
 
+def _normalized_expr_str(expr) -> str:
+    """``str(expr)`` in the spelling the reload path will produce.
+
+    Hashing a raw ``str`` makes the cache key depend on which side of a reload
+    the expression was last on. Normalising means both sides agree. Falls back
+    to the raw string if the expression does not survive a parse, which keeps a
+    key computable rather than failing a compile over a hash input.
+    """
+    raw = str(expr)
+    try:
+        return str(sympy.sympify(raw))
+    except Exception:  # noqa: BLE001 - a key we cannot normalise is still a key
+        return raw
+
+
 def compute_specs_hash(
     specs: Sequence, kernel_name: str = "", pool_size: int = 0
 ) -> str:
@@ -278,10 +294,49 @@ def compute_specs_hash(
                 # Include the trip count so loops with different iteration
                 # counts never collide, even when their body OpSpecs produce
                 # identical SDSC JSON.
-                loop_count_str = str(entry.count)
+                # Normalised through one sympify, because str() is NOT stable
+                # across the reload. The serializer writes sympify('<str>') and
+                # str(FloorDiv(s0, 64)) is "(s0//64)", which re-parses as
+                # floor(s0/64) and prints as "floor(s0/64)". Hashing the raw
+                # string would give a reloaded kernel a different key from the
+                # one that produced it, so it misses its own entry and
+                # recompiles, in the one feature whose point is not recompiling.
+                # The round trip is idempotent: both spellings normalise to the
+                # same string, and a concrete count is unaffected.
+                loop_count_str = _normalized_expr_str(entry.count)
                 content_parts.append(f"loop_count:{loop_count_str}".encode())
                 _debug_loop_counts.append(loop_count_str)
                 logger.debug("  [hash] LoopSpec  count=%s", loop_count_str)
+                # The per-symbol max and tile size are NOT recoverable from the
+                # count string: two kernels can share "FloorDiv(s0, 64)" while
+                # declaring different maxima, and the max reaches the bundle's
+                # input_arg rather than the SDSC JSON hashed below. Without this
+                # they collide and the second is served a binary built for the
+                # first one's range.
+                if entry.count_symbol_bounds:
+                    bounds = json.dumps(
+                        {
+                            name: list(bound)
+                            for name, bound in entry.count_symbol_bounds.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_bounds:{bounds}".encode())
+                    logger.debug("  [hash] LoopSpec  bounds=%s", bounds)
+                # Which argument and dim the runtime reads each symbol from is
+                # baked into the bundle's parameter list, so two otherwise
+                # identical kernels reading the same dimension off different
+                # arguments are different binaries.
+                if entry.count_symbol_sources:
+                    sources = json.dumps(
+                        {
+                            name: list(source)
+                            for name, source in entry.count_symbol_sources.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_sources:{sources}".encode())
+                    logger.debug("  [hash] LoopSpec  sources=%s", sources)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (

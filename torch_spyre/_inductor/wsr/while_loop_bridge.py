@@ -1363,10 +1363,52 @@ def splice_while_loop(
         name_map[placeholder_name] = read_target.get_name()
         ref_map[placeholder_name] = read_target
 
+    # ``.inputs`` stays the default: it is what the rest of this pass patches.
+    # It is not always positionally aligned with the body's placeholders, though,
+    # because ``ExternKernel.__init__`` repacks ``[*carried, *additional]``
+    # through ``_split_by_sym_type`` into a tensor-only ``.inputs``, so a SymInt
+    # operand -- how a varying dimension arrives -- drops out of it while the
+    # body graph still lists its placeholder.
+    #
+    # Fall back only when the lengths say an operand went missing:
+    # ``.carried_inputs``/``.additional_inputs`` hold different objects, so
+    # swapping unconditionally changes which buffer a concrete operand resolves
+    # to. _trace_while_loop traced the body as fn(*carried, *additional), so that
+    # concatenation is the placeholder order.
+    operands = while_op.inputs
+    if len(operands) < len(body_graph_input_names):
+        operands = [
+            *(while_op.carried_inputs or ()),
+            *(while_op.additional_inputs or ()),
+        ]
+        if len(operands) < len(body_graph_input_names):
+            raise AssertionError(
+                f"while_loop body has {len(body_graph_input_names)} placeholders "
+                f"but only {len(operands)} operands "
+                f"(inputs={len(while_op.inputs)}, "
+                f"carried={len(while_op.carried_inputs or ())}, "
+                f"additional={len(while_op.additional_inputs or ())}). The body "
+                f"graph and the operand list disagree, which this pass cannot "
+                f"reconcile."
+            )
+
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
-        real_input = while_op.inputs[i]
-        real_name = real_input.get_name()
+        real_input = operands[i]
+
+        # A SymInt operand is a shape expression, not a buffer, so there is
+        # nothing for the read redirection to point at.
+        #
+        # Keyed on get_name() raising, because that is exactly the condition:
+        # ShapeAsConstantBuffer subclasses IRNode rather than Buffer and inherits
+        # a raising get_name(). Not hasattr, which is True for an attribute that
+        # raises only when called, and not _storage_name, which insists on
+        # reaching an ir.Buffer and so skips operands this pass needs.
+        try:
+            real_name = real_input.get_name()
+        except NotImplementedError:
+            continue
+
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
 

@@ -64,6 +64,8 @@ from .scratchpad.lx_relayout import (
 from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
+    max_trip_count,
+    symbolic_count_bounds,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -79,6 +81,7 @@ from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
     LoopSpec,
+    walk_loop_specs,
     OpSpec,
     TensorArg,
     TensorWorkDivision,
@@ -999,7 +1002,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    # Not int(): a symbolic count has no single value and int()
+                    # on one raises. What the SDSC needs here is the dimension's
+                    # largest extent. See max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1370,9 +1376,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
-        """Replace the current op_specs list with a single LoopSpec of the given count."""
+        """Replace the current op_specs list with a single LoopSpec of the given count.
+
+        The count's per-symbol bounds are resolved here rather than at codegen
+        because this is the last point the ShapeEnv is available.
+        """
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        self.op_specs = [
+            LoopSpec(
+                count=count,
+                body=body,
+                count_symbol_bounds=symbolic_count_bounds(count),
+            )
+        ]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1385,6 +1401,79 @@ class SpyreKernel(Kernel[CSEVariable]):
                 format_op_spec_list(self.op_specs),
             )
 
+    def _logical_size_for(self, name: str) -> "list | None":
+        """The LOGICAL, PyTorch-visible size of a launch argument, or None.
+
+        Not the device geometry. Under a max-strided reservation the two differ
+        deliberately, and it is the logical size that varies per call, which is
+        what a loop bound has to track. Reading the device size here would make
+        every launch run the maximum number of trips while appearing to work.
+        """
+        node = getattr(V.graph, "graph_inputs", {}).get(name)
+        if node is None:
+            try:
+                node = V.graph.get_buffer(name)
+            except Exception:  # noqa: BLE001 - may not name a buffer at all
+                return None
+        try:
+            return list(node.get_size())
+        except NotImplementedError:
+            # A nameless IRNode, e.g. a shape expression rather than a buffer.
+            return None
+
+    def _resolve_loop_dimension_sources(self, actuals: list[str]) -> None:
+        """Record which launch argument and dim each symbolic count reads from.
+
+        The bundle declares one ``input_arg`` per varying dimension and the
+        runtime fills it from ``inputs_outputs[arg_index].size(dim_index)`` on
+        every launch. Nothing downstream can work that mapping out: ``TensorArg``
+        carries device geometry rather than logical sizes, and by bundle
+        generation the FX graph is gone. Here both the argument ordering and the
+        buffer layouts are still live, and ``actuals`` is the same list
+        ``arg_index`` is assigned from just above, so the indices agree by
+        construction.
+
+        A symbol that cannot be placed is LEFT OUT rather than guessed, and
+        bundle generation then refuses to declare a parameter for it. That is the
+        right failure: a wrong ``(arg_index, dim_index)`` would bind the wrong
+        number and be silently wrong on every launch rather than once.
+
+        Matched by symbol NAME, because that is what survives the reload. See
+        pass_utils.decompose_tiled_count.
+        """
+        loops = [
+            loop for loop in walk_loop_specs(self.op_specs) if loop.count_symbol_bounds
+        ]
+        if not loops:
+            return
+
+        sizes = {name: self._logical_size_for(name) for name in actuals}
+        for loop in loops:
+            sources: dict[str, tuple[int, int]] = {}
+            for sym_name in loop.count_symbol_bounds:
+                placed = _place_symbol(sym_name, actuals, sizes)
+                if placed is None:
+                    logger.warning(
+                        "[symbolic-loop] could not place symbol %s on any launch "
+                        "argument, so the runtime has nothing to bind and the "
+                        "bundle will refuse to declare a parameter for it. "
+                        "Looked at %s",
+                        sym_name,
+                        {
+                            name: [str(e) for e in (size or [])]
+                            for name, size in sizes.items()
+                        },
+                    )
+                    continue
+                sources[sym_name] = placed
+            loop.count_symbol_sources = sources
+            if sources:
+                logger.info(
+                    "[symbolic-loop] count=%s reads its dimension(s) from %s",
+                    loop.count,
+                    {name: f"args[{a}].size({d})" for name, (a, d) in sources.items()},
+                )
+
     def codegen_kernel(self):
         """Bind the argument list and HBM addresses, then print the finalized OpSpecs.
 
@@ -1392,12 +1481,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         afterwards is bound here.
         """
 
-        def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, IndirectAccess):
-                name_sym = x.args[0]
-                return f"IndirectAccess('{name_sym}')"
-            return "sympify('" + str(x) + "')"
-
+        sympy_str = _sympy_literal
         self.remove_kernel_local_buffers()
         # Compute live, deduped call-arg list from names in spyre_kernel_args.
         # python_argdefs() includes all registered names from load()/store(),
@@ -1431,6 +1515,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                     if has_pool_allocations
                     else tensor_arg.arg_index
                 ]
+
+        self._resolve_loop_dimension_sources(actuals)
 
         buf = IndentedBuffer()
         buf.writeline("[")
@@ -1569,6 +1655,36 @@ def uses_hbm_pool(specs) -> bool:
     )
 
 
+def _place_symbol(sym_name: str, actuals: list[str], sizes: dict) -> "tuple | None":
+    """The first ``(arg_index, dim_index)`` whose extent is this symbol.
+
+    First rather than only: a dimension tied across two arguments is one symbol
+    and either position binds the same value, so the first is as good as any.
+    ``actuals`` order is what ``arg_index`` means, so it is iterated rather than
+    the dict.
+    """
+    for arg_index, name in enumerate(actuals):
+        for dim_index, extent in enumerate(sizes.get(name) or ()):
+            if str(extent) == sym_name:
+                return arg_index, dim_index
+    return None
+
+
+def _sympy_literal(x: sympy.Expr) -> str:
+    """One expression as a line of the generated kernel source.
+
+    Module level rather than a closure so a round-trip test can serialize
+    through the same function the real codegen uses. Note what this costs on the
+    way back: ``sympify`` re-parses ``//`` into ``floor`` and drops the symbol's
+    assumptions, so anything reading these back accepts both spellings and keys
+    by name. See pass_utils.decompose_tiled_count.
+    """
+    if isinstance(x, IndirectAccess):
+        name_sym = x.args[0]
+        return f"IndirectAccess('{name_sym}')"
+    return "sympify('" + str(x) + "')"
+
+
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     """Emit Python source for a list of OpSpec / UnimplementedOp / LoopSpec entries."""
     for op_spec in specs:
@@ -1578,6 +1694,18 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                # Plain ints keyed by name, so this survives the round trip that
+                # the count expression itself does not.
+                if op_spec.count_symbol_bounds:
+                    buf.writeline(
+                        "count_symbol_bounds="
+                        f"{_serialize_value(op_spec.count_symbol_bounds)},"
+                    )
+                if op_spec.count_symbol_sources:
+                    buf.writeline(
+                        "count_symbol_sources="
+                        f"{_serialize_value(op_spec.count_symbol_sources)},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

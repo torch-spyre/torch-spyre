@@ -143,10 +143,37 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         TORCH_CHECK(sym.tensor_id >= 0 && static_cast<size_t>(sym.tensor_id) <
                                               ctx.inputs_outputs.size(),
                     "symbolic_args tensor_id out of range");
-        TORCH_CHECK(sym.kind == SymbolicArgKind::kAddress,
-                    "SymbolicArgKind::kDimension is not yet implemented");
-        args.push_back(
-            get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
+        switch (sym.kind) {
+          case SymbolicArgKind::kAddress:
+            args.push_back(
+                get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
+            break;
+          case SymbolicArgKind::kDimension: {
+            // A varying dimension behind a symbolic loop bound. The bundle
+            // declares it as
+            //   !sdscbundle.input_arg<index, granularity=G, max_value=M>
+            // and the device derives the trip count from it as
+            // (ub - lb) / step, so the value bound here is the ONLY place the
+            // runtime size enters the program. Nothing in the program body is
+            // rewritten for it, which is the whole point: an address or stride
+            // derived from this size would instead have to be recomputed on
+            // every dispatch.
+            //
+            // size(), i.e. the LOGICAL size. Under a max-strided reservation
+            // the allocation is deliberately larger, and it is the logical
+            // size that varies per call and that the trip count must track.
+            const at::Tensor& tensor = ctx.inputs_outputs[sym.tensor_id];
+            TORCH_CHECK(sym.dim_index >= 0 && sym.dim_index < tensor.dim(),
+                        "symbolic_args dim_index ", sym.dim_index,
+                        " is out of range for the rank-", tensor.dim(),
+                        " tensor at inputs_outputs[", sym.tensor_id, "]");
+            args.push_back(static_cast<int64_t>(tensor.size(sym.dim_index)));
+            break;
+          }
+          default:
+            TORCH_CHECK(false, "unhandled SymbolicArgKind ",
+                        static_cast<int32_t>(sym.kind));
+        }
       }
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.

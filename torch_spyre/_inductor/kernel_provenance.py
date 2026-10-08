@@ -94,6 +94,8 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    "count_symbol_bounds": "dict[str, tuple[int, int]]",
+    "count_symbol_sources": "dict[str, tuple[int, int]]",
 }
 
 
@@ -285,11 +287,23 @@ def _canonical_spec(spec: object) -> object:
             )
         return result
     if isinstance(spec, LoopSpec):
-        return {
+        result = {
             "kind": "loop",
             "count": _canonical_value(spec.count),
             "body": [_canonical_spec(child) for child in spec.body],
         }
+        # Present only when there is something to carry, the same way
+        # completed_producer_cores is handled above. A concrete loop has no
+        # bounds, so its bundle key is unchanged by this field existing, which
+        # matters because that key names every profiler event and a symbolic
+        # feature should not rename them for kernels that are not symbolic. Two
+        # loops that differ by having bounds still get different keys, so the
+        # discriminating power is the same.
+        if spec.count_symbol_bounds:
+            result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
+        if spec.count_symbol_sources:
+            result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
+        return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
 

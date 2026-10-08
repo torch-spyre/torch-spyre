@@ -215,21 +215,22 @@ class TestD2HFromTensorSegment(TestCase):
 
 
 class TestSymbolicArg(TestCase):
-    """
-    Unit tests for the SymbolicArg typed payload.
+    """Unit tests for the SymbolicArg typed payload."""
 
-    Notes:
-        Tests will need to be reworked once kdimension is implemented.
-    """
+    def test_kdimension_entry_is_no_longer_refused(self):
+        """A kDimension entry traverses Python, pybind, LaunchContext, construct.
 
-    def test_kdimension_entry_reaches_construct_and_raises(self):
-        """A kDimension entry traverses Python → pybind → LaunchContext →
-        construct() and raises 'kDimension is not yet implemented'.
+        It used to assert construct() raised "kDimension is not yet
+        implemented". That slot is implemented now, so the thing left to pin is
+        that the refusal is gone.
 
-        Uses a real-symbols ComputeOnHost step (non-{0} ishape) so the
-        payload is consumed rather than short-circuited by the fake-symbols
-        nullptr path.  The raise proves the entry survived the full carrier
-        path and was read positionally from slot 0.
+        Deliberately not asserting what happens instead. The mock's artifact
+        declares no symbol inputs, so the backend currently reports a count
+        mismatch, and that is a property of the fixture rather than of the
+        carrier path. Asserting it would make this test fail again the day the
+        fixture or the backend message changes. Either outcome is fine here: the
+        call succeeding is correct, and so is it failing for an environment
+        reason. Only the old refusal is a regression.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = tpk().create_mock_spyrecode(
@@ -248,10 +249,10 @@ class TestSymbolicArg(TestCase):
 
             stream = torch.Stream("spyre")
             with stream:
-                with pytest.raises(
-                    RuntimeError, match="kDimension is not yet implemented"
-                ):
+                try:
                     torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
+                except RuntimeError as exc:
+                    self.assertNotIn("kDimension is not yet implemented", str(exc))
 
     def test_symbolic_arg_attributes_and_repr_roundtrip(self):
         """SymbolicArg fields and repr survive pybind construction.

@@ -190,10 +190,12 @@ def _compile_to_dir(
         symbol in the compiled bundle.
 
     Raises:
-        NotImplementedError: if any dimension symbol is present, because the
-            runtime kDimension payload is not yet implemented and submitting
-            such a bundle to the backend compiler would produce a mismatched
-            inputSym_ slot count.
+        NotImplementedError: if any SDSC dimension symbol is present. The
+            kDimension launch slot is implemented, but that only serves a loop
+            bound: the SDSC route additionally needs the symbol to reach an
+            SDSC's own symbol table, which nothing does, so submitting such a
+            bundle would produce a mismatched inputSym_ slot count. A
+            loop_dimension is not a dimension and passes.
     """
     with timing_recorder.stage(
         "stage:SpyreAsyncCompile:generate_bundle",

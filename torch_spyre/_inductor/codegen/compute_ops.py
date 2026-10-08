@@ -33,7 +33,7 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
-    Five variants (constructed via class methods):
+    Six variants (constructed via class methods):
       - ``kernel(arg_index)``:               raw HBM base address of a kernel tensor arg;
                                              emitted as a ``!sdscbundle.input_arg`` param
                                              named ``%arg_{arg_index}``.  Value =
@@ -92,6 +92,10 @@ class SymbolKind:
                                              ``dimToSymbolMapping_`` entry.  Registered
                                              before address symbols so their negative IDs
                                              never collide with address symbol IDs.
+      - ``loop_dimension(...)``:             a bundle loop bound, read from a launch
+                                             tensor's shape.  Never reaches an SDSC.
+                                             Distinct from ``dimension`` on purpose, see
+                                             its own docstring.
     """
 
     kind: str
@@ -104,6 +108,9 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Only meaningful for the loop_dimension variant: which dim of which launch
+    # tensor the runtime reads this symbol's value from.
+    dim_index: int = -1
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -164,6 +171,40 @@ class SymbolKind:
             pytorch_sym=pytorch_sym,
         )
 
+    @classmethod
+    def loop_dimension(
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        arg_index: int,
+        dim_index: int,
+    ) -> "SymbolKind":
+        """A bundle-level loop bound, read from a launch tensor's shape.
+
+        Deliberately a different variant from ``dimension``. That one lives in an
+        SDSC's ``dimToSymbolMapping_``, the symbolic-SDSC route where the symbol
+        stays inside one op's iteration space. This one never reaches an SDSC at
+        all: the loop is explicit, the body is a static tile, and the dimension
+        exists only as a bundle parameter whose value the runtime reads from
+        ``inputs_outputs[arg_index].size(dim_index)`` on every launch, via
+        ``SymbolicArgKind::kDimension``.
+
+        ``is_dimension`` stays False for this variant on purpose. The guard in
+        ``execution/async_compile`` refuses SDSC dimension symbols because that
+        route's runtime payload was never built, and a bundle carrying one would
+        reach the backend with a mismatched ``inputSym_`` slot count. That guard
+        should keep refusing the old route, and should not refuse this one.
+        """
+        return cls(
+            kind="loop_dimension",
+            granularity=granularity,
+            max_value=max_value,
+            pytorch_sym=pytorch_sym,
+            arg_index=arg_index,
+            dim_index=dim_index,
+        )
+
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
@@ -178,7 +219,13 @@ class SymbolKind:
 
     @property
     def is_dimension(self) -> bool:
+        # The old symbolic-SDSC route only. See loop_dimension for why this must
+        # not also answer True for a loop bound.
         return self.kind == "dimension"
+
+    @property
+    def is_loop_dimension(self) -> bool:
+        return self.kind == "loop_dimension"
 
 
 def core_idx_to_slice_offset(

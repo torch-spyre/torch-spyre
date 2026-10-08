@@ -313,6 +313,36 @@ def test_compile_to_dir_rejects_dimension_symbols(tmp_path: Path):
         async_compile_mod._compile_to_dir("test_kernel", str(tmp_path), [], 0)
 
 
+def test_compile_to_dir_allows_loop_dimension_symbols(tmp_path: Path):
+    """A loop bound must pass the gate the test above pins shut.
+
+    The two halves belong together. That gate exists because the SDSC dimension
+    route's runtime payload was never built, so a bundle carrying one reaches
+    the backend with a mismatched inputSym_ slot count. A loop bound never
+    enters an SDSC: the loop is explicit, the body is a static tile, and the
+    runtime reads the value from the launch tensor's shape. So it has to get
+    through, and `is_dimension` is False for it on purpose.
+
+    Without this test, "simplifying" is_dimension to cover both kinds would pass
+    the suite while refusing the whole feature at the compile boundary.
+    """
+    fake_symbol_kinds = [
+        SymbolKind.loop_dimension(
+            granularity=64, max_value=512, pytorch_sym="s0", arg_index=0, dim_index=0
+        ),
+        SymbolKind.kernel(0),
+    ]
+
+    with patch.object(
+        async_compile_mod, "generate_bundle", return_value=fake_symbol_kinds
+    ):
+        # Returns the kinds it was given rather than raising. Anything beyond
+        # that is the backend compiler's job, which this helper does not reach.
+        got = async_compile_mod._compile_to_dir("test_kernel", str(tmp_path), [], 0)
+
+    assert got == fake_symbol_kinds
+
+
 def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
     """Two backend compiles must overlap, not run serially in the parent.
 

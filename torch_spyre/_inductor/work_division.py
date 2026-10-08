@@ -111,6 +111,11 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
 
     Concrete dims (no free symbols) are also omitted, so callers can use
     ``v in meta`` to detect both cases.
+
+    Deprecated. Serves the symbolic-SDSC route, which the explicit-loop route
+    supersedes. On the loop route this returns EMPTY, because there the body op's
+    iteration space is a static tile, so callers must treat empty as normal.
+    TODO(vivekmankar): remove with the rest of the symbolic-SDSC route.
     """
     meta: SymbolMeta = {}
     for sym, expr in it_space.items():
@@ -436,6 +441,9 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         if stick_var in symbol_meta:
+            # Deprecated with _collect_symbol_metadata: reachable only when
+            # symbol_meta is non-empty, so never on the explicit-loop route.
+            # TODO(vivekmankar): remove with the symbolic-SDSC route.
             logger.info(
                 f"[work_division/symbolic] stick-dim guard raised: "
                 f"stick_var={stick_var} on tensor {td.dep.name} is symbolic"

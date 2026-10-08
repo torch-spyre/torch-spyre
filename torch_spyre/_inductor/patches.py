@@ -28,6 +28,9 @@ from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
 from .constants import DEVICE_NAME
+from .logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("patches")
 
 
 @contextmanager
@@ -97,6 +100,57 @@ def _preserve_spyre_input_storage_offsets():
         yield
     finally:
         GraphLowering.placeholder = old_placeholder  # type: ignore[method-assign]
+
+
+@contextmanager
+def _resolve_scan_shapes_by_expression():
+    """Let upstream rebuild a scan output shape whose extent is an expression.
+
+    ``decompose_scan_to_while_loop`` rebuilds the scan output's shape through
+    ``resolve_shape_to_proxy``, against an env keyed ``{arg.node.expr: arg}``
+    over the scan's SymInt args plus the scan length. ``sympy_interp`` only
+    consults that env for a bare ``sympy.Symbol`` leaf, so an expression key
+    such as ``FloorDiv(s97, 64)`` sits in the dict unread: it recurses into
+    ``s97`` and raises ``KeyError(s97)``.
+
+    That fires exactly when the body is fully static and only the trip count is
+    derived from a dynamic dim, which is the shape a symbolic loop bound has.
+    The proxy for the whole expression is already in the dict as the scan
+    length, so matching the expression before upstream's symbol walk is enough.
+
+    An upstream gap, not a Spyre one. Remove it once that is fixed. Everything
+    else takes the original path, one element at a time so upstream keeps its
+    own type checking and error messages.
+    """
+    from torch._inductor.fx_passes import post_grad as _post_grad
+
+    original = getattr(_post_grad, "resolve_shape_to_proxy", None)
+    if original is None:
+        # Renamed or removed upstream. Say so once rather than failing here: if
+        # the gap is fixed we want to know, and if it moved we want to look.
+        logger.info(
+            "[symbolic-loop] resolve_shape_to_proxy is absent, so its "
+            "expression-key gap is not patched. Check whether upstream fixed it"
+        )
+        yield
+        return
+
+    @wraps(original)
+    def resolve_shape_to_proxy(shape, bound_symbols):
+        resolved = []
+        for size in shape:
+            expr = getattr(getattr(size, "node", None), "expr", None)
+            if expr is not None and expr in bound_symbols:
+                resolved.append(bound_symbols[expr])
+            else:
+                resolved.append(original([size], bound_symbols)[0])
+        return resolved
+
+    _post_grad.resolve_shape_to_proxy = resolve_shape_to_proxy
+    try:
+        yield
+    finally:
+        _post_grad.resolve_shape_to_proxy = original
 
 
 @contextmanager
@@ -231,6 +285,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
+        _resolve_scan_shapes_by_expression(),
         enable_spyre_lowerings(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
