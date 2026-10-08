@@ -16,7 +16,9 @@
 
 import io
 import json
+import shutil
 import tarfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -113,7 +115,7 @@ def test_a_tgz_escaping_its_directory_is_rejected(tmp_path):
         ({"run_key": "manual:me:not-a-uuid"}, "does not match"),
         ({"started_at": "2026-10-08 10:00"}, "with a zone"),
         ({"tag_family": "nightly-supply-chain"}, "manual bundle records verdicts only"),
-        ({"artifact": "id:" + "0" * 8 + AID[8:]}, "different ids"),
+        ({"artifact": "id:" + "0" * 8 + AID[8:]}, "differ"),
         ({"artifact_id": None}, None),
     ],
 )
@@ -123,7 +125,7 @@ def test_bad_bundle_json_is_rejected(tmp_path, change, why):
     if (
         why is None
     ):  # artifact_id dropped and no artifact spec: neither names the artifact
-        assert "needs artifact_id or artifact" in _rejected(out)
+        assert "needs artifact_id or image or artifact" in _rejected(out)
     else:
         assert why in _rejected(out)
 
@@ -217,13 +219,17 @@ class FakeClient:
 @pytest.fixture
 def online(monkeypatch):
     """ingest against a fake spyre_v2: `calls` holds each `results` argv."""
-    state = SimpleNamespace(client=FakeClient(), calls=[], resolved=AID)
+    state = SimpleNamespace(client=FakeClient(), calls=[], resolved=AID, by_spec={})
     from spyre_clickhouse_ingest import client, resolver
 
     monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: state.client)
     monkeypatch.setattr(
         resolver, "resolve",
-        lambda spec, arch, **kw: SimpleNamespace(artifact_id=state.resolved) if state.resolved else None,
+        lambda spec, arch, **kw: (
+            SimpleNamespace(artifact_id=state.by_spec.get(spec, state.resolved))
+            if state.by_spec.get(spec, state.resolved)
+            else None
+        ),
     )  # fmt: skip
     monkeypatch.setattr(results, "main", lambda argv: state.calls.append(argv))
     monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
@@ -291,7 +297,7 @@ def test_a_partly_ingested_bundle_is_completed(tmp_path, online, capsys):
 def test_an_unrecorded_artifact_is_rejected(tmp_path, online, capsys):
     online.resolved = ""
     code, report = _ingest(_sealed(tmp_path), capsys)
-    assert code == bundle.REJECTED and "is not recorded" in report["reason"]
+    assert code == bundle.REJECTED and "artifact not recorded" in report["reason"]
 
 
 def test_an_untrusted_jenkins_key_is_rejected(tmp_path, online, capsys):
@@ -345,3 +351,233 @@ def test_result_props_reach_the_verdict_and_replace_its_source(monkeypatch):
         "source": "bundle",
         "uploader": "jdoe",
     }
+
+
+IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
+OTHER = "0" * 8 + AID[8:]
+
+
+def test_init_takes_an_image_and_files_it_under_its_digest(tmp_path, capsys):
+    out = _init(tmp_path, name="i")  # an id bundle first, for the contrast
+    assert bundle.upload_path(_meta(out)).split("/")[5] == AID
+    out = tmp_path / "img"
+    argv = [
+        "init",
+        "--image",
+        IMAGE,
+        "--component",
+        "spyre-inference",
+        "--arch",
+        "s390x",
+    ]
+    assert bundle.main([*argv, "--test-type", "fvt", "--out", str(out)]) == 0
+    meta = _meta(out)
+    assert meta["image"] == IMAGE and "artifact_id" not in meta
+    assert bundle.upload_path(meta).split("/")[5] == "sha256-" + "b6" * 32
+
+
+def test_blank_and_spec_artifact_fields_normalize(tmp_path):
+    out = _sealed(tmp_path)
+    _edit(out, artifact_id="", image=IMAGE)
+    assert "artifact_id" not in bundle.check(out)
+    _edit(out, image=None, artifact="image:" + IMAGE)
+    assert bundle.check(out)["image"] == IMAGE
+    _edit(out, image="", artifact="")
+    assert "needs artifact_id or image" in _rejected(out)
+
+
+def test_ingest_falls_back_to_the_image_when_the_id_is_unrecorded(
+    tmp_path, online, capsys
+):
+    out = _sealed(tmp_path)
+    _edit(out, image=IMAGE)
+    bundle.main(["seal", str(out)])
+    online.by_spec = {f"id:{AID}": "", f"image:{IMAGE}": OTHER}
+    code, report = _ingest(out, capsys)
+    assert (code, report["artifact_id"], report["artifact_from"]) == (0, OTHER, "image")
+    assert (
+        dict(zip(online.calls[0][::2], online.calls[0][1::2]))["--artifact"]
+        == f"id:{OTHER}"
+    )
+
+
+def test_an_id_and_an_image_naming_different_artifacts_are_rejected(
+    tmp_path, online, capsys
+):
+    out = _sealed(tmp_path)
+    _edit(out, image=IMAGE)
+    bundle.main(["seal", str(out)])
+    online.by_spec = {f"image:{IMAGE}": OTHER}
+    code, report = _ingest(out, capsys)
+    assert code == bundle.REJECTED and "different artifacts" in report["reason"]
+
+
+def test_the_inbox_folder_must_be_the_id_or_the_image_digest(tmp_path, online, capsys):
+    out = _sealed(tmp_path)
+    _edit(out, image=IMAGE)
+    bundle.main(["seal", str(out)])
+    assert _ingest(out, capsys, "--expect-key", "sha256-" + "b6" * 32)[0] == 0
+    code, report = _ingest(out, capsys, "--expect-key", OTHER)
+    assert code == bundle.REJECTED and "is not its artifact_id" in report["reason"]
+
+
+# --- vllm bundles -------------------------------------------------------------------------
+
+VLLM_DATA = Path(__file__).parent / "data" / "vllm_bundle"
+# What prod spyre_v2.benchmarks holds for the live spyre-inference leg's two benchmarks.
+PROD_IDS = {
+    "latency_granite8B_tp1_in64_out64": "9d066729-8f4e-5e55-9871-2f226a441285",
+    "throughput_granite8B_tp1_in64_out64": "f00e5306-f7fb-53ff-802e-470084835bd4",
+}
+MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+
+
+def _vllm(tmp_path, *extra):
+    out = tmp_path / "perf"
+    shutil.copytree(VLLM_DATA, out)
+    argv = ["init", "--artifact", f"id:{AID}", "--arch", "x86_64", "--kind", "vllm", "--out", str(out),
+            "--perf", "head_sha=881a59d2", "--perf", "head_branch=main", *extra]  # fmt: skip
+    assert bundle.main(argv) == 0
+    assert bundle.main(["seal", str(out)]) == 0
+    return out
+
+
+class CapturingClient:
+    """Captures inserts; a count is of the rows inserted so far, every other probe is empty."""
+
+    def __init__(self):
+        self.inserted = {}
+
+    def set_client_setting(self, k, v):
+        pass
+
+    def query(self, sql, parameters=None):
+        if "count()" in sql:
+            table = (
+                "artifact_results" if "artifact_results" in sql else "benchmark_runs"
+            )
+            return SimpleNamespace(result_rows=[[len(self.inserted.get(table, []))]])
+        return SimpleNamespace(result_rows=[])
+
+    def insert(self, table, rows, column_names=None, database=None, **_):
+        self.inserted.setdefault(table, []).extend(
+            dict(zip(column_names, r)) for r in rows
+        )
+
+
+def test_init_kind_vllm_defaults_the_perf_leg(tmp_path):
+    meta = _meta(_vllm(tmp_path))
+    assert (meta["kind"], meta["component"], meta["test_type"]) == (
+        "vllm",
+        "spyre-inference",
+        "perf",
+    )
+    assert {f["path"] for f in meta["files"]} >= {
+        "results/latency_granite8B_tp1_in64_out64.pytorch.json",
+        "attachments/latency_granite8B_tp1_in64_out64.cmd",
+    }
+
+
+@pytest.mark.parametrize(
+    "setup, why",
+    [
+        (
+            lambda out: (out / "results" / "x.xml").write_text(JUNIT),
+            "results/*.json only",
+        ),
+        (
+            lambda out: (out / "results" / "decode_tp1.json").write_text("{}"),
+            "must start with one of",
+        ),
+        (
+            lambda out: (out / "results" / "latency_x.json").write_text('{"x": 1}'),
+            "no vLLM",
+        ),
+        (lambda out: _edit(out, perf={"tensor_parallel": "4"}), "differ from perf"),
+        (lambda out: _edit(out, test_type="regression"), "test_type perf"),
+    ],
+)
+def test_a_bad_vllm_bundle_is_rejected(tmp_path, setup, why):
+    out = _vllm(tmp_path)
+    setup(out)
+    meta = _meta(out)
+    meta["files"] = [
+        {"path": p, "sha256": bundle.sha256(out / p)} for p in bundle.bundle_files(out)
+    ]
+    (out / "bundle.json").write_text(json.dumps(meta))
+    assert why in _rejected(out)
+
+
+def test_a_vllm_bundle_writes_the_live_legs_rows(tmp_path, monkeypatch, capsys):
+    """Same benchmark ids prod holds, same measurement and prop shapes; only source differs."""
+    from spyre_clickhouse_ingest import client, resolver, vllm
+
+    out = _vllm(tmp_path)
+    ch = CapturingClient()
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(vllm, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver, "resolve", lambda *a, **kw: SimpleNamespace(artifact_id=AID)
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    code, report = _ingest(out, capsys, "--bundle-url", "https://art/p/")
+    assert (code, report["status"], report["benchmark_runs"]) == (0, "ingested", 2)
+
+    ids = {r["name"]: r["benchmark_id"] for r in ch.inserted["benchmarks"]}
+    assert ids == PROD_IDS
+    runs = {r["benchmark_id"]: r for r in ch.inserted["benchmark_runs"]}
+    lat, thr = (
+        runs[PROD_IDS["latency_granite8B_tp1_in64_out64"]],
+        runs[PROD_IDS["throughput_granite8B_tp1_in64_out64"]],
+    )
+    assert sorted(lat["measurements"]) == [
+        "avg_latency",
+        "latency",
+        "p10_latency",
+        "p25_latency",
+        "p50_latency",
+        "p75_latency",
+        "p90_latency",
+        "p99_latency",
+    ]
+    assert lat["measurements"]["latency"] == [0.7093, 0.7155] and lat["iterations"] == 2
+    assert sorted(thr["measurements"]) == [
+        "elapsed_time",
+        "requests_per_second",
+        "tokens_per_second",
+    ]
+    assert (
+        thr["iterations"] == 1
+        and lat["backend"] == "spyre"
+        and lat["run_id"] == report["run_id"]
+    )
+    assert {k: v for k, v in lat["props"].items() if not k.startswith("unit.")} == {
+        "report_kind": "vllm", "repo": "spyre-inference", "head_branch": "main", "workflow_id": "0",
+        "run_attempt": "1", "job_id": "0", "head_sha": "881a59d2", "arch": "x86_64",
+        "hardware_type": "IBM_Spyre",
+    }  # fmt: skip
+    (bench,) = [b for b in ch.inserted["benchmarks"] if b["name"].startswith("latency")]
+    assert bench["props"] == {"record_type": "model", "run_mode": "latency", "tensor_parallel": "1",
+                              "input_len": "64", "output_len": "64", "model": MODEL}  # fmt: skip
+
+    (verdict,) = ch.inserted["artifact_results"]
+    assert (verdict["artifact_id"], verdict["run_id"]) == (AID, report["run_id"])
+    assert (verdict["result_kind"], verdict["test_type"], verdict["state"]) == (
+        "performance",
+        "perf",
+        "passed",
+    )
+    assert verdict["duration_s"] == pytest.approx(3.162)
+    assert (
+        verdict["props"]["source"] == "bundle"
+        and verdict["props"]["run_url"] == "https://art/p/"
+    )
+
+
+def test_a_native_file_alone_takes_its_model_from_perf(tmp_path):
+    out = _vllm(tmp_path, "--perf", f"model={MODEL}")
+    for f in (out / "results").glob("*.pytorch.json"):
+        f.unlink()
+    rows = bundle.vllm_rows(out, _meta(out))
+    assert {json.loads(r["extra"])["model"] for r in rows} == {MODEL}

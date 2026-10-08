@@ -14,15 +14,17 @@
 
 """Results bundles: test results recorded where spyre_v2 is unreachable, ingested later.
 
-    python -m spyre_clickhouse_ingest bundle init --artifact id:<uuid> --component C --arch A \
-        --test-type T [--out DIR]                       # offline: bundle.json skeleton
+    python -m spyre_clickhouse_ingest bundle init (--artifact id:<uuid> | --image <repo>@sha256:<d>) \
+        --arch A [--kind vllm | --component C --test-type T] [--out DIR]   # offline skeleton
     python -m spyre_clickhouse_ingest bundle seal DIR   # offline: files[] checksums, validate
     python -m spyre_clickhouse_ingest bundle validate DIR|TGZ        # offline
     python -m spyre_clickhouse_ingest bundle ingest DIR|TGZ --strict # online
 
-A bundle is DIR/bundle.json (bundle.schema.json) + DIR/results/*.xml (+ DIR/attachments/).
-`ingest` records it through `results`, so its rows link exactly as a connected run's do, under
-the run_id of its run_key. It writes no artifact: the artifact must already be recorded.
+A bundle is DIR/bundle.json (bundle.schema.json) + DIR/results/ (+ DIR/attachments/): JUnit XML
+(kind junit), or vLLM bench JSON (kind vllm). `ingest` records it through the path a connected
+run takes -- `results` for JUnit, vllm.py for vLLM -- so its rows link exactly as that run's do,
+under the run_id of its run_key. It writes no artifact: the artifact must already be recorded,
+found by artifact_id, else by image digest.
 Exit codes: 0 ingested or already ingested, 1 failed (retry), 2 rejected, 3 incomplete.
 """
 
@@ -44,6 +46,7 @@ from pathlib import Path
 
 import regex as re
 
+from . import vllm
 from .identity import DerivedId, RunId
 from .options import pair
 
@@ -55,6 +58,8 @@ STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
 # as `bundle`.
 MANUAL_PREFIX = "manual:"
 SOURCE = "bundle"
+# kind -> the extension of its results/ files.
+KINDS = {"junit": ".xml", "vllm": ".json"}
 
 
 class BundleError(Exception):
@@ -141,8 +146,43 @@ def run_id(meta: dict) -> str:
     return RunId.derive(source, key, meta["arch"], meta["test_type"])
 
 
-def spec(meta: dict) -> str:
-    return meta.get("artifact") or f"id:{meta['artifact_id']}"
+def normalized(meta: dict) -> dict:
+    """bundle.json with blank artifact fields dropped, and an `artifact` id:/image: spec moved
+    to artifact_id / image (refused when it disagrees with them)."""
+    meta = {k: v for k, v in meta.items() if not (k in ARTIFACT_KEYS and v == "")}
+    named = meta.get("artifact", "")
+    for prefix, key in (("id:", "artifact_id"), ("image:", "image")):
+        if isinstance(named, str) and named.startswith(prefix):
+            value = named[len(prefix) :].strip()
+            if meta.setdefault(key, value) != value:
+                raise BundleError(f"artifact {named!r} and {key} {meta[key]!r} differ")
+            del meta["artifact"]
+    return meta
+
+
+ARTIFACT_KEYS = ("artifact_id", "image", "artifact")
+
+
+def specs(meta: dict) -> list:
+    """(field, spec) for each way the bundle names its artifact, the id first."""
+    out = (
+        [("artifact_id", f"id:{meta['artifact_id']}")]
+        if meta.get("artifact_id")
+        else []
+    )
+    if meta.get("image"):
+        out.append(("image", f"image:{meta['image']}"))
+    if meta.get("artifact"):
+        out.append(("artifact", meta["artifact"]))
+    return out
+
+
+def inbox_keys(meta: dict) -> set:
+    """The folder names an inbox may file this bundle under: its id, or its image digest."""
+    keys = {meta["artifact_id"]} if meta.get("artifact_id") else set()
+    if meta.get("image"):
+        keys.add("sha256-" + meta["image"].rpartition("@sha256:")[2])
+    return keys
 
 
 def bundle_name(meta: dict) -> str:
@@ -152,8 +192,8 @@ def bundle_name(meta: dict) -> str:
 
 def upload_path(meta: dict) -> str:
     """Its inbox folder under the generic repo (see README); a .tgz goes at this path + .tgz."""
-    aid = meta.get("artifact_id") or "<artifact_id>"
-    return f"zsp/next/{meta['arch']}/v2-results/inbox/{aid}/{bundle_name(meta)}"
+    key = meta.get("artifact_id") or min(inbox_keys(meta), default="<artifact_id>")
+    return f"zsp/next/{meta['arch']}/v2-results/inbox/{key}/{bundle_name(meta)}"
 
 
 def sha256(path: Path) -> str:
@@ -200,15 +240,24 @@ def check(root: Path) -> dict:
     errors = schema_errors(meta, schema())
     if errors:
         raise BundleError("; ".join(errors))
+    meta = normalized(meta)
+    if not specs(meta):
+        raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
     key = run_key(meta)
     if meta.get("run_key") and meta.get("jenkins_run_key", key) != key:
         errors.append("run_key and jenkins_run_key differ")
     if is_manual(key) and (meta.get("tag_family") or meta.get("tags")):
         errors.append("a manual bundle records verdicts only; drop tag_family/tags")
-    named = meta.get("artifact", "")
-    if meta.get("artifact_id") and named.startswith("id:"):
-        if named[3:].strip() != meta["artifact_id"]:
-            errors.append("artifact and artifact_id name different ids")
+    kind = meta.get("kind", "junit")
+    if kind == "vllm" and (meta["test_type"], meta["component"]) != (
+        "perf",
+        vllm.BENCH_COMPONENT,
+    ):
+        errors.append(
+            f"a vllm bundle is test_type perf, component {vllm.BENCH_COMPONENT}"
+        )
+    if kind != "vllm" and meta.get("perf"):
+        errors.append("perf context is for a vllm bundle")
     if meta.get("ended_at") and _ts(meta["ended_at"]) < _ts(meta["started_at"]):
         errors.append("ended_at is before started_at")
     listed = [f["path"] for f in meta["files"]]
@@ -227,14 +276,54 @@ def check(root: Path) -> dict:
     bad = [f["path"] for f in meta["files"] if sha256(root / f["path"]) != f["sha256"]]
     if bad:
         raise BundleError(f"sha256 mismatch: {bad}")
-    xmls = [p for p in listed if p.startswith("results/")]
-    if not xmls:
-        raise BundleError("no results/*.xml: the bundle records nothing")
-    if sum(count_cases(root / p) for p in xmls) == 0:
+    results = [p for p in listed if p.startswith("results/")]
+    ext = KINDS[kind]
+    wrong = [p for p in results if not p.endswith(ext)]
+    if wrong:
+        raise BundleError(f"a {kind} bundle holds results/*{ext} only: {wrong}")
+    if not results:
+        raise BundleError(f"no results/*{ext}: the bundle records nothing")
+    if kind == "vllm":
+        check_vllm(root, meta, results)
+    elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
         )
     return meta
+
+
+def check_vllm(root: Path, meta: dict, results: list) -> None:
+    """Every results/*.json is a vLLM bench file the live ingest reads, consistent with `perf`."""
+    perf = meta.get("perf", {})
+    for p in results:
+        name = vllm.bench_name(Path(p).name)
+        if name.split("_")[0] not in vllm.RUN_MODES:
+            raise BundleError(f"{p}: the name must start with one of {vllm.RUN_MODES}_")
+        try:
+            records = vllm.read_benchmark_results(str(root / p))
+        except (OSError, UnicodeDecodeError) as err:
+            raise BundleError(f"{p}: unreadable ({err})") from None
+        if not any(
+            isinstance(r, dict)
+            and (vllm.extract_vllm_metrics(r) or vllm.extract_pytorch_metrics(r))
+            for r in records
+        ):
+            raise BundleError(f"{p}: no vLLM latency/throughput/serve metric in it")
+        shapes = vllm.parse_input_shapes(name)
+        clash = [k for k in shapes if perf.get(k, shapes[k]) != shapes[k]]
+        if clash:
+            raise BundleError(f"{p}: its name's {clash} differ from perf {clash}")
+
+
+def vllm_rows(root: Path, meta: dict) -> list:
+    """The bundle's flat vLLM rows, exactly as the live ingest extracts them."""
+    perf = meta.get("perf", {})
+    with contextlib.redirect_stdout(sys.stderr):
+        return vllm.extract_rows(
+            str(root / "results"), perf.get("head_branch", ""), perf.get("head_sha", ""),
+            "", "0", meta.get("workflow") or "vLLM Benchmark", 0, arch=meta["arch"],
+            model=perf.get("model", ""),
+        )  # fmt: skip
 
 
 def _ts(value: str) -> datetime:
@@ -289,17 +378,21 @@ def init(args) -> int:
     path = out / BUNDLE_FILE
     if path.exists() and not args.force:
         sys.exit(f"[error] {path} exists; pass --force to replace it")
-    named = args.artifact.strip()
-    aid = args.artifact_id.strip() or (
-        named[3:].strip() if named.startswith("id:") else ""
-    )
+    vllm_kind = args.kind == "vllm"
+    try:
+        named = normalized(
+            {"artifact_id": args.artifact_id.strip(), "image": args.image.strip(),
+             "artifact": args.artifact.strip()}
+        )  # fmt: skip
+    except BundleError as err:
+        sys.exit(f"[error] {err}")
     meta = {
         "schema_version": SCHEMA_VERSION,
-        **({"artifact_id": aid} if aid else {}),
-        **({"artifact": named} if named and not named.startswith("id:") else {}),
-        "component": args.component,
+        **({"kind": args.kind} if vllm_kind else {}),
+        **named,
+        "component": args.component or (vllm.BENCH_COMPONENT if vllm_kind else ""),
         "arch": DerivedId.arch(args.arch),
-        "test_type": args.test_type,
+        "test_type": args.test_type or ("perf" if vllm_kind else ""),
         "run_key": args.run_key or f"{MANUAL_PREFIX}{getpass.getuser()}:{uuid.uuid4()}",
         "started_at": args.started_at,
         "runner": {
@@ -309,6 +402,8 @@ def init(args) -> int:
         },
         "files": [],
     }
+    if args.perf:
+        meta["perf"] = dict(args.perf)
     for key in ("run_url", "workflow", "notes", "tag_family"):
         if getattr(args, key):
             meta[key] = getattr(args, key)
@@ -318,8 +413,13 @@ def init(args) -> int:
         meta["env"] = dict(args.env)
     (out / "results").mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(meta, indent=2) + "\n")
+    what = (
+        "the vLLM bench *.json (and *.pytorch.json); .cmd/.log files go in attachments/"
+        if vllm_kind
+        else "the JUnit XML"
+    )
     print(
-        f"[info] wrote {path}; put the JUnit XML in {out / 'results'}/, then: bundle seal {out}"
+        f"[info] wrote {path}; put {what} in {out / 'results'}/, then: bundle seal {out}"
     )
     print(f"[info] upload path: {upload_path(meta)}")
     return 0
@@ -333,7 +433,7 @@ def seal(args) -> int:
         {"path": p, "sha256": sha256(root / p)} for p in bundle_files(root)
     ]
     if not meta.get("started_at"):
-        meta["started_at"] = _earliest_suite(root) or _now()
+        meta["started_at"] = _earliest_suite(root) or _earliest_file(root) or _now()
     meta["ended_at"] = args.ended_at or meta.get("ended_at") or _now()
     meta["sealed_at"] = _now()
     path.write_text(json.dumps(meta, indent=2) + "\n")
@@ -362,12 +462,23 @@ def _earliest_suite(root: Path) -> str:
     return min(stamps).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if stamps else ""
 
 
+def _earliest_file(root: Path) -> str:
+    """The oldest results/ file's mtime: a vLLM result carries no start time of its own."""
+    times = [p.stat().st_mtime for p in (root / "results").glob("*") if p.is_file()]
+    return (
+        datetime.fromtimestamp(min(times), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if times
+        else ""
+    )
+
+
 def validate(args) -> int:
     try:
         with opened(Path(args.bundle)) as root:
             meta = check(root)
-            report = {"status": "valid", "run_key": run_key(meta), "run_id": run_id(meta),
-                      "bundle_sha256": digest(root), "upload_path": upload_path(meta)}  # fmt: skip
+            report = {"status": "valid", "kind": meta.get("kind", "junit"), "run_key": run_key(meta),
+                      "run_id": run_id(meta), "bundle_sha256": digest(root),
+                      "upload_path": upload_path(meta)}  # fmt: skip
     except BundleError as err:
         print(json.dumps({"status": "invalid", "reason": str(err)}))
         return err.code
@@ -439,6 +550,34 @@ def ingest(args) -> int:
     return 0
 
 
+def resolve_artifact(client, db: str, meta: dict) -> tuple:
+    """(artifact_id, the field that named it): the id first, else the image, lookup only.
+
+    Each named field must resolve to the same artifact; one that names none (an unknown id)
+    is passed over when another resolves.
+    """
+    from .resolver import resolve
+
+    found, missed = {}, []
+    for field, sp in specs(meta):
+        try:
+            r = resolve(sp, meta["arch"], client=client, db=db, lookup="only")
+        except ValueError as err:
+            missed.append(f"{field} {sp!r}: {err}")
+            continue
+        if r is None:
+            missed.append(f"{field} {sp!r}: not recorded in {db} on {meta['arch']}")
+        else:
+            found.setdefault(r.artifact_id, field)
+    if len(found) > 1:
+        raise BundleError(
+            f"the bundle's artifact fields name different artifacts: {found}"
+        )
+    if not found:
+        raise BundleError("artifact not recorded: " + "; ".join(missed))
+    return next(iter(found.items()))
+
+
 def _ingest(root: Path, args) -> dict:
     meta = check(root)
     key = run_key(meta)
@@ -448,15 +587,12 @@ def _ingest(root: Path, args) -> dict:
                 f"run key {key!r} is not from a trusted job ({args.trusted_job_prefix}); "
                 f"a hand-made bundle uses {MANUAL_PREFIX}<who>:<uuid4>"
             )
-    if (
-        args.expect_artifact_id
-        and meta.get("artifact_id", args.expect_artifact_id) != args.expect_artifact_id
-    ):
+    if args.expect_key and args.expect_key not in inbox_keys(meta):
         raise BundleError(
-            f"bundle.json names {meta['artifact_id']}, its path {args.expect_artifact_id}"
+            f"its folder {args.expect_key!r} is not its artifact_id or sha256-<image digest> "
+            f"({sorted(inbox_keys(meta))})"
         )
     from .client import ClickHouse, ClickHouseEnv
-    from .resolver import resolve
 
     db = args.database or ClickHouseEnv.target_database()
     if not db:
@@ -469,21 +605,9 @@ def _ingest(root: Path, args) -> dict:
             client.set_client_setting("readonly", "2")
     except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
         raise BundleError(f"spyre_v2 unreachable: {err}", FAILED) from None
-    try:
-        r = resolve(spec(meta), meta["arch"], client=client, db=db, lookup="only")
-    except ValueError as err:
-        raise BundleError(f"artifact {spec(meta)!r}: {err}") from None
-    if r is None:
-        raise BundleError(
-            f"artifact {spec(meta)!r} is not recorded in {db} on {meta['arch']}"
-        )
-    aid = r.artifact_id
-    if meta.get("artifact_id", aid) != aid:
-        raise BundleError(
-            f"artifact {meta['artifact']!r} is {aid}, not {meta['artifact_id']}"
-        )
+    aid, via = resolve_artifact(client, db, meta)
     rid, sha = run_id(meta), digest(root)
-    report = {"run_key": key, "run_id": rid, "artifact_id": aid,
+    report = {"run_key": key, "run_id": rid, "artifact_id": aid, "artifact_from": via,
               "test_type": meta["test_type"], "bundle_sha256": sha}  # fmt: skip
     seen, files = existing_run(client, db, rid, meta["component"])
     if seen == {sha}:
@@ -503,21 +627,53 @@ def _ingest(root: Path, args) -> dict:
         return {**report, "status": "would-ingest"}
     props = {"source": SOURCE, "uploader": args.uploader or meta.get("uploader", ""),
              "bundle_sha256": sha, "bundle_url": args.bundle_url}  # fmt: skip
+    if meta.get("kind") == "vllm":
+        report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
+    else:
+        write_junit(db, root, meta, aid, rid, props, args.strict)
+    if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
+        raise BundleError(
+            f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
+        )
+    return {**report, "status": "ingested"}
+
+
+def write_junit(db, root, meta, aid, rid, props, strict) -> None:
     from .results import main as results
 
     os.environ["CLICKHOUSE_DB_V2"] = db
     # stdout carries only this command's one-line JSON report.
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            results(results_argv(meta, root, aid, rid, props, args.strict))
+            results(results_argv(meta, root, aid, rid, props, strict))
     except SystemExit as exit_:
         if exit_.code not in (0, None):
             raise BundleError(f"results exited {exit_.code}", FAILED) from None
-    if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
-        raise BundleError(
-            f"no {meta['test_type']} verdict landed for {aid} under {rid}", FAILED
-        )
-    return {**report, "status": "ingested"}
+
+
+def write_vllm(client, db, root, meta, aid, rid, props) -> int:
+    """The live vLLM leg's v2 rows: benchmarks + benchmark_runs, then its performance verdict."""
+    from .client import tables_present
+    from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
+    from .writer import insert_artifact_result
+
+    if not tables_present(
+        client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
+    ):
+        raise BundleError(f"{db} lacks the benchmark tables", FAILED)
+    rows = vllm_rows(root, meta)
+    try:
+        n = vllm.write_benchmarks(client, db, rows, rid)
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
+            state=meta.get("perf", {}).get("state", "passed"), arch=meta["arch"],
+            result_kind="performance", duration_s=vllm.duration_s(rows),
+            props={**{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"vLLM write failed: {err!r}", FAILED) from None
+    return n
 
 
 def main(argv=None) -> int:
@@ -528,12 +684,21 @@ def main(argv=None) -> int:
 
     ini = sub.add_parser("init", help="write a bundle.json skeleton (offline)")
     ini.add_argument(
-        "--artifact", default="", help="id:<uuid>, or any `artifacts resolve` spec"
+        "--artifact", default="", help="id:<uuid> or image:<repo>@sha256:<digest>"
     )
     ini.add_argument("--artifact-id", default="")
-    ini.add_argument("--component", required=True)
+    ini.add_argument("--image", default="", help="<repo>@sha256:<digest>: the fallback")
+    ini.add_argument("--kind", choices=tuple(KINDS), default="junit")
+    ini.add_argument("--component", default="", help="required for junit")
     ini.add_argument("--arch", required=True)
-    ini.add_argument("--test-type", required=True)
+    ini.add_argument("--test-type", default="", help="required for junit; vllm: perf")
+    ini.add_argument(
+        "--perf",
+        action="append",
+        type=pair,
+        default=[],
+        help="vllm context k=v: model, head_sha, head_branch, state, tensor_parallel, ...",
+    )
     ini.add_argument("--run-key", default="", help="default: manual:<user>:<uuid4>")
     ini.add_argument("--started-at", default="", help="default: set by seal")
     ini.add_argument("--run-url", default="")
@@ -578,15 +743,20 @@ def main(argv=None) -> int:
     ing.add_argument("--trusted-job-prefix", action="append", default=[],
                      help="accept a Jenkins run key only from these jobs (repeatable)")  # fmt: skip
     ing.add_argument(
-        "--expect-artifact-id", default="", help="the artifact_id its path names"
+        "--expect-key",
+        default="",
+        help="its inbox folder: <artifact_id> or sha256-<digest>",
     )
     ing.add_argument(
         "--dry-run", action="store_true", help="check everything, write nothing"
     )
 
     args = parser.parse_args(argv)
-    if args.cmd == "init" and not (args.artifact or args.artifact_id):
-        parser.error("--artifact or --artifact-id is required")
+    if args.cmd == "init":
+        if not (args.artifact or args.artifact_id or args.image):
+            parser.error("--artifact, --artifact-id or --image is required")
+        if args.kind == "junit" and not (args.component and args.test_type):
+            parser.error("a junit bundle needs --component and --test-type")
     return {"init": init, "seal": seal, "validate": validate, "ingest": ingest}[
         args.cmd
     ](args)

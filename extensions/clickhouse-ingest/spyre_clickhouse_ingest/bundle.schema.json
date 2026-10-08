@@ -2,38 +2,108 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/torch-spyre/torch-spyre/tree/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/bundle.schema.json",
   "title": "spyre_v2 results bundle: bundle.json, schema_version 1",
-  "description": "A sealed bundle is a directory (or .tgz of it) holding this file and every file it lists. `bundle seal` fills files, started_at and ended_at.",
+  "description": "A sealed bundle is a directory (or .tgz of it) holding this file and every file it lists. `bundle seal` fills files, started_at and ended_at. A blank artifact_id/image/artifact counts as absent.",
   "type": "object",
-  "required": ["schema_version", "component", "arch", "test_type", "started_at", "files"],
+  "required": [
+    "schema_version",
+    "component",
+    "arch",
+    "test_type",
+    "started_at",
+    "files"
+  ],
   "allOf": [
-    {"anyOf": [{"required": ["artifact_id"]}, {"required": ["artifact"]}]},
-    {"anyOf": [{"required": ["run_key"]}, {"required": ["jenkins_run_key"]}]}
+    {
+      "anyOf": [
+        {
+          "required": [
+            "artifact_id"
+          ]
+        },
+        {
+          "required": [
+            "image"
+          ]
+        },
+        {
+          "required": [
+            "artifact"
+          ]
+        }
+      ]
+    },
+    {
+      "anyOf": [
+        {
+          "required": [
+            "run_key"
+          ]
+        },
+        {
+          "required": [
+            "jenkins_run_key"
+          ]
+        }
+      ]
+    }
   ],
   "additionalProperties": false,
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg.",
+      "enum": [
+        "junit",
+        "vllm"
+      ]
+    },
     "artifact_id": {
-      "description": "The tested artifact's spyre_v2 artifact_id; it must already be recorded.",
+      "description": "The tested artifact's spyre_v2 artifact_id, tried first; it must already be recorded.",
       "type": "string",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      "pattern": "^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$"
+    },
+    "image": {
+      "description": "The pulled image by digest, <repo>@sha256:<digest>, with arch: the fallback when artifact_id is absent or unrecorded. With both, they must name the same artifact.",
+      "type": "string",
+      "pattern": "^([^\\s@]+@sha256:[0-9a-f]{64})?$"
     },
     "artifact": {
-      "description": "Any `artifacts resolve` spec (id:<uuid>, image:<ref>@sha256:<digest>, ...); with artifact_id, both must name the same artifact.",
-      "type": "string",
-      "minLength": 1
+      "description": "Compatibility: any `artifacts resolve` spec; id: and image: specs are read as artifact_id / image.",
+      "type": "string"
     },
     "component": {
       "description": "The suite's owner, a test_case_id hash input (torch-spyre, spyre-inference, spyre-backend, ...).",
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9._-]*$"
     },
-    "arch": {"description": "Where the tests ran.", "enum": ["x86_64", "s390x", "ppc64le"]},
+    "arch": {
+      "description": "Where the tests ran.",
+      "enum": [
+        "x86_64",
+        "s390x",
+        "ppc64le"
+      ]
+    },
     "test_type": {
       "description": "The tier; artifact_results.test_type's CHECK set.",
       "enum": [
-        "smoke", "unit", "integration", "regression", "trunk", "perf",
-        "fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic",
-        "model_ops", "model_modules", "model_support"
+        "smoke",
+        "unit",
+        "integration",
+        "regression",
+        "trunk",
+        "perf",
+        "fvt",
+        "fvt-static",
+        "fvt-dynamic",
+        "svt",
+        "svt-static",
+        "svt-dynamic",
+        "model_ops",
+        "model_modules",
+        "model_support"
       ]
     },
     "run_key": {
@@ -46,32 +116,115 @@
       "type": "string",
       "pattern": "^[^#\\s]+#[0-9]+$"
     },
-    "run_url": {"description": "The run's own page, if it has one; default: the processed bundle's URL.", "type": "string"},
-    "workflow": {"type": "string"},
-    "started_at": {"description": "ISO-8601 with a zone, e.g. 2026-10-09T08:00:00Z.", "type": "string", "format": "date-time"},
-    "ended_at": {"type": "string", "format": "date-time"},
-    "tag_family": {"description": "Jenkins run keys only: a manual bundle records verdicts, never tags.", "type": "string"},
-    "tags": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "run_url": {
+      "description": "The run's own page, if it has one; default: the processed bundle's URL.",
+      "type": "string"
+    },
+    "workflow": {
+      "type": "string"
+    },
+    "started_at": {
+      "description": "ISO-8601 with a zone, e.g. 2026-10-09T08:00:00Z.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tag_family": {
+      "description": "Jenkins run keys only: a manual bundle records verdicts, never tags.",
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "runner": {
       "description": "Where it ran: host, user, image (the pulled ref@digest), cards, ...",
       "type": "object",
-      "additionalProperties": {"type": "string"}
+      "additionalProperties": {
+        "type": "string"
+      }
     },
-    "env": {"description": "Free-form environment notes, kept with the bundle.", "type": "object", "additionalProperties": {"type": "string"}},
-    "notes": {"type": "string"},
-    "uploader": {"description": "Who built the bundle; the relay records the Artifactory uploader instead.", "type": "string"},
-    "sealed_at": {"type": "string", "format": "date-time"},
+    "env": {
+      "description": "Free-form environment notes, kept with the bundle.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "string"
+    },
+    "uploader": {
+      "description": "Who built the bundle; the relay records the Artifactory uploader instead.",
+      "type": "string"
+    },
+    "sealed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
     "files": {
-      "description": "Every file of the bundle but bundle.json. results/*.xml are ingested (JUnit or benchmark XML); attachments/ are kept, not ingested.",
+      "description": "Every file of the bundle but bundle.json. results/*.xml (junit) or results/*.json (vllm) are ingested; attachments/ are kept, not ingested.",
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["path", "sha256"],
+        "required": [
+          "path",
+          "sha256"
+        ],
         "additionalProperties": false,
         "properties": {
-          "path": {"type": "string", "pattern": "^(results/[^/]+\\.xml|attachments/[^\\s]+)$"},
-          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          "path": {
+            "type": "string",
+            "pattern": "^(results/[^/]+\\.(xml|json)|attachments/[^\\s]+)$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "perf": {
+      "description": "vllm bundles: run context. tensor_parallel/input_len/output_len must agree with each file's <mode>_<model>_tp<N>_in<N>_out<N> name; model names a benchmark whose records name none; state is the verdict (default passed).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "tensor_parallel": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "input_len": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "output_len": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "cards": {
+          "type": "string"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "head_branch": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
         }
       }
     }
