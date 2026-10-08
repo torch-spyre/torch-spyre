@@ -58,10 +58,24 @@ locations (`~/dt-inductor`, `~/torch-spyre`).
 
 Before making changes, verify:
 
-1. **Target version is valid** — `release/$NEW` branch exists:
+1. **Target version is valid** — the `v$NEW.0` tag (or `release/$NEW`
+   branch) exists upstream. Check the remote, not just local refs, since
+   a local clone may not have fetched it yet:
    ```bash
-   cd $PYTORCH_DIR && git branch -r | grep "release/$NEW"
+   cd $PYTORCH_DIR && git ls-remote origin "refs/tags/v$NEW.0" "refs/heads/release/$NEW"
    ```
+   To move an existing checkout, fetch the tag and update submodules:
+   ```bash
+   git fetch origin tag v$NEW.0 --no-tags
+   git checkout v$NEW.0 && git submodule update --init --recursive
+   ```
+   **Pitfall:** if a submodule directory holds its own embedded `.git`
+   (e.g. a local fork checked out in place), `git checkout` with
+   `submodule.recurse=true` can abort halfway ("could not migrate git
+   directory ... File exists"), leaving HEAD at the old tag and the work
+   tree half-updated. Move that directory out of the tree first (it may
+   hold unpushed branches — never delete it), then re-run the checkout and
+   `git submodule update`.
 
 2. **PyTorch source is at target version:**
    ```bash
@@ -197,7 +211,9 @@ version examples. Update them:
 ```
 
 Note: Search broadly for the OLD version — if a version was previously
-skipped, some comments may still reference an even older version.
+skipped, some comments may still reference an even older version. As of
+the 2.14 upgrade these example comments no longer exist; if the grep in
+Step 10 finds nothing here, there is nothing to do.
 
 ---
 
@@ -222,6 +238,21 @@ The requirements table has a PyTorch row:
 →
 | PyTorch | ~= $NEW.0 |
 ```
+
+### `.github/actions/build-torch-spyre-local-pytorch/action.yml`
+
+**File:** `$TORCH_SPYRE_DIR/.github/actions/build-torch-spyre-local-pytorch/action.yml`
+
+This CI action carries its own copy of the LOCAL_PYTORCH `sed` patterns
+(forward substitution **and** the trap/revert), matching Step 6's
+`build-torch-spyre.sh`. Update every `torch~=$OLD.0` and `torch>=$OLD.0`
+to `$NEW.0`. If missed, the patterns silently stop matching and CI's
+local-PyTorch build keeps the pinned wheel instead of the source build.
+
+### `.github/workflows/push-pytorch-dispatch-to-clickhouse.yaml`
+
+Comment-only examples (`"release/$OLD"`, `"$OLD"`, `"torch~=$OLD.0"`);
+the logic reads `pyproject.toml`. Update the examples to `$NEW`.
 
 ### `.github/workflows/upstream_tests_beta.yaml` (if present)
 
@@ -465,8 +496,23 @@ After all changes:
 5. **Run tests:**
    ```bash
    cd $TORCH_SPYRE_DIR
-   python -m pytest tests/_inductor/test_inductor_ops.py -v
+   python -m pytest tests/inductor/test_inductor_ops.py -q -rf
    ```
+   - The full file takes longer than a typical tool timeout; run it in the
+     background. `pytest-timeout` is not installed, so don't pass
+     `--timeout`.
+   - A test that faults the device leaves it in an error state
+     (`StreamError`) and `conftest.py` then **skips** every later test in
+     that process. A sudden run of skips is not a pass: rerun the affected
+     tests one per process to get real results.
+   - CI runs tests through the OOT runner (`tests/run_test.sh <config>.yaml`),
+     which can differ from plain pytest (test order within a process,
+     generated wrapper classes). Reproduce CI failures with the same
+     config.
+
+6. **Run the full CI.** Local runs cover only a slice, and the local lower
+   stack may differ from CI's. The fastest full signal is a draft PR.
+   Before calling a failure local-only, confirm it passes in CI.
 
 ---
 
@@ -483,6 +529,7 @@ After completing all steps, report:
    - docs/source/getting_started/installation.md: version table updated
    - checkout-pytorch-src.sh: comment + branch updated
    - build-torch-spyre.sh: sed patterns updated (both forward + trap)
+   - build-torch-spyre-local-pytorch/action.yml: sed patterns updated (both forward + trap)
    - dev_install.md: version references updated
    - profiling_tools.md: stale kineto-spyre wheel section removed (not needed since PyTorch 2.13)
    - libgomp shim symlinks created under $PYTORCH_DIR/torch/lib/
@@ -558,6 +605,34 @@ After upgrading, watch for:
    across minor versions. Any extension linked against `libtorch` /
    `libc10` (vllm `_C.abi3.so`, torchvision, torchaudio, custom kernels)
    must be rebuilt against the new PyTorch. See dedicated section below.
+9. **Inductor IR shape changes** — torch-spyre's passes pattern-match
+   upstream IR. Example (2.14, pytorch#184279): single-output
+   `FallbackKernel`s stopped producing a `MultiOutputLayout` + `MultiOutput`
+   and now carry a `FixedLayout` themselves. `propagate_layouts` skipped
+   `FallbackKernel`, so the output never got a device layout and every
+   consumer raised `<buf> does not have FixedTiledLayout`. When many
+   unrelated ops fail with the same pass error, `git log` the upstream
+   `torch/_inductor/ir.py` between the two tags for the node type involved.
+10. **Test framework validation** — upstream `torch.testing` tightens
+    checks. Example (2.14, pytorch#192648): generated test names may not
+    contain `.`, which aborted collection of whole files (every OOT wrapper
+    job failed at collection). Fixed centrally in `ParameterizedTestMeta`
+    (`_safe_test_name`).
+11. **Tests that depend on Dynamo/Inductor internals** — placeholder
+    numbering (`arg0_1`, `arg1_1`) followed Dynamo's input order, which
+    changed in 2.14; tests hard-coding generated buffer names broke (and
+    one inverted assertion passed vacuously). Identify buffers by
+    shape/role, not by number. Likewise `pytest.warns` records *every*
+    warning raised in its block, so count by category.
+12. **Upstream tests newly running on device** — the upstream-test configs
+    (`tests/configs/upstream_tests/*.yaml`) list tests by name. When
+    upstream drops `@onlyCPU` / `@onlyNativeDeviceTypes` or adds
+    `device=` params, a test that "passed" trivially on CPU now runs on
+    spyre. Diff the upstream test file between tags
+    (`git diff v$OLD.0 v$NEW.0 -- test/<file>.py | grep -E "^[-+] +(@|def test_)"`)
+    and move newly device-bound failures to `xfail` (or `skip` if they
+    crash the process, since a crash kills the xdist worker and every
+    remaining test in the file).
 
 ---
 

@@ -5,12 +5,8 @@ test_suite_config:
       unlisted_test_mode: mandatory_success
       tests:
         - names: # Tests that pass with no special config needed
-            - TestViewOps::test_as_strided_gradients
             - TestViewOps::test_contiguous_self
-            - TestViewOps::test_unbind
-            - TestOldViewOps::test_atleast_gradient
             - TestOldViewOps::test_contiguous
-            - TestOldViewOps::test_resize_as_preserves_strides
             - TestViewOps::test_view_dtype_upsize_errors
             - TestViewOps::test_view_tensor_split
             - TestOldViewOps::test_broadcast_to
@@ -43,7 +39,6 @@ test_suite_config:
         - names:
             - TestViewOps::test_imag_noncomplex
             - TestViewOps::test_as_strided_overflow_storage_offset
-            - TestOldViewOps::test_resize_overflow
             - TestOldViewOps::test_tensor_split_errors
           mode: mandatory_success
 
@@ -53,6 +48,32 @@ test_suite_config:
         #######################################################################
         - names:
             - TestViewOps::test_maybe_view_chunk_cat
+          mode: xfail
+        #######################################################################
+        #### Tests device-parametrized in pytorch 2.14 (were CPU-only) ####
+        #######################################################################
+        - names:
+            # unbind backward copies a slice at storage_offset 100, not a multiple
+            # of the fp32 stick (32 elems): spyre::copy_from_d2d rejects it
+            - TestViewOps::test_unbind
+            # gradcheck runs in float64, which Spyre does not support
+            - TestViewOps::test_as_strided_gradients
+            # @onlyCPU / @onlyNativeDeviceTypes dropped (or device= added) in 2.14:
+            # assertEqual compares on device and needs aten::isnan
+            - TestOldViewOps::test_chunk
+            - TestOldViewOps::test_split
+            - TestOldViewOps::test_t
+            - TestOldViewOps::test_unsqueeze
+            # float64 is not supported on Spyre
+            - TestOldViewOps::test_atleast_gradient
+            - TestOldViewOps::test_resize_overflow
+            # torch.bool result from IEEE operands is not supported
+            - TestOldViewOps::test_narrow
+            - TestOldViewOps::test_narrow_tensor
+            # aten::_validate_compressed_sparse_indices is not implemented
+            - TestOldViewOps::test_crow_col_indices
+            # resize_as_ on a transposed device tensor does not keep its strides
+            - TestOldViewOps::test_resize_as_preserves_strides
           mode: xfail
         #######################################################################
         - names: # Tests that pass with extra dtypes allowed

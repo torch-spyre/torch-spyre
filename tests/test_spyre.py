@@ -922,6 +922,19 @@ class TestSpyre(TestCase):
         )
         torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
 
+    def test_d2d_conversion_to_unsupported_dtype_raises(self):
+        """Casting a device tensor to float64 raises instead of crashing.
+
+        The unsupported dtype used to reach SpyreTensorLayout::init, which
+        divided by its zero elems_per_stick and killed the process (SIGFPE).
+        """
+        source = torch.arange(64, dtype=torch.float32).to("spyre")
+
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
+            source.to(torch.float64)
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype Double"):
+            torch.compile(lambda t: t.to(torch.float64))(source)
+
     @parametrize(
         "sizes",
         [

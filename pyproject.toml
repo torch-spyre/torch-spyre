@@ -12,8 +12,8 @@ requires = [
     "regex",
     "setuptools>=77.0.3",  # match upstream torch dependency range
     "setuptools_scm>=10",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "wheel"
 ]
 build-backend = "build_backend"
@@ -28,8 +28,8 @@ description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy",
     "regex",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "psutil",
     # CP-SAT LX layout solver. `layout_solver` defaults to "cpsat" (see config.py),
     # so a base install needs ortools to actually get it -- without this, every
@@ -75,8 +75,8 @@ build = [ # no-isolation build
     # this extra, and in uv.lock, or the version falls back to 0.0.0 and
     # version_file is silently never written.
     "setuptools_scm>=10",
-    "torch~=2.13.0",
-#    "torch>=2.13.0",
+    "torch~=2.14.0",
+#    "torch>=2.14.0",
     "wheel"
 ]
 test = [

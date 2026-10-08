@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "logging.h"
+#include "module.h"
 #include "types_mapping.h"
 
 namespace spyre {
@@ -85,6 +86,10 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                   (((host_size.size() + 1) == dim_order.size()) &&
                    dim_order.back() == -1),
               "Incompatible host_size and dim_order");
+  // An unsupported dtype maps to a zero elems_per_stick, which the tiling
+  // below divides by (SIGFPE) -- reject it up front instead.
+  TORCH_CHECK(spyre::is_supported_dtype(dtype),
+              "Spyre backend does not support dtype ", dtype);
 
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =

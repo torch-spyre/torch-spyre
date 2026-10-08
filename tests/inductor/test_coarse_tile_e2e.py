@@ -77,6 +77,22 @@ _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 _EXPECT_RAISES = True
 
 
+def _graph_input_name(source_code, size):
+    """Name of the compiled graph's input with ``size`` (e.g. ``"arg0_1"``).
+
+    Placeholder numbering follows Dynamo's input order, which is not stable
+    across PyTorch versions, so tests identify inputs by shape instead.
+    """
+    shape = (
+        "(" + ", ".join(str(s) for s in size) + ("," if len(size) == 1 else "") + ")"
+    )
+    names = re.findall(
+        r"assert_size_stride\((arg\d+_\d+), " + re.escape(shape), source_code
+    )
+    assert len(names) == 1, f"expected one graph input of size {size}, got {names}"
+    return names[0]
+
+
 def _run_coarse_tile_test_raises(fn, inputs, match):
     """Run a test that currently raises; skip the raise check when _EXPECT_RAISES=False."""
     if _EXPECT_RAISES:
@@ -5970,7 +5986,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
         # per stick is one H*F = 4096-element expert slab.
         self.assertEqual(int(weight_step.group(1)) * 64, H * F)
-        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+        w_name = _graph_input_name(source_codes[0], (E, H, F))
+        self.assertNotIn(f"coarse_tile_read_copy_0_{w_name}", source_codes[0])
 
     def test_unsqueeze_broadcast_matmul_keeps_copy_when_proof_declines(self):
         """A failed proof leaves the original staging copy authoritative."""
@@ -6002,7 +6019,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
         src = source_codes[0]
-        self.assertIn("coarse_tile_read_copy_0_arg1_1", src)
+        w_name = _graph_input_name(src, (E, H, F))
+        self.assertIn(f"coarse_tile_read_copy_0_{w_name}", src)
 
     def test_unsqueeze_broadcast_matmul_allows_physical_view_permutation(self):
         """Logical ownership can match when staging permutes physical axes."""
@@ -6046,7 +6064,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
-        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+        w_name = _graph_input_name(source_codes[0], (E, H, F))
+        self.assertNotIn(f"coarse_tile_read_copy_0_{w_name}", source_codes[0])
 
     def test_unsqueeze_broadcast_matmul_distinguishes_experts_exactly(self):
         """Each trip reads its own weight slab, not expert zero or stale HBM."""

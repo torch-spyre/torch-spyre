@@ -3035,13 +3035,18 @@ def propagate_spyre_tensor_layouts(
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
             # FallbackKernel.create in PyTorch produces three cases:
-            #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
+            #   Case 1 (single tensor)  -> FixedLayout on the FallbackKernel itself
+            #                              (PT >= 2.14, pytorch#184279; older
+            #                              versions used MultiOutputLayout + 1
+            #                              MultiOutput)
             #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
             #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
-            # The FallbackKernel itself never carries a real tensor layout
-            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
-            # The trailing MultiOutputs are handled in their own branch below.
-            pass
+            # Case 1 is laid out like a MultiOutput; in cases 2 and 3 the
+            # FallbackKernel carries no real tensor layout and the trailing
+            # MultiOutputs are handled in their own branch below.
+            if isinstance(op.layout, FixedLayout):
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, MultiOutput):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
