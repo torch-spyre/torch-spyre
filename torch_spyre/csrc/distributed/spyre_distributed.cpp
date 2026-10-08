@@ -62,8 +62,11 @@ static void check_collective_errors(spyre_comms::WorkSchedule& work) {
   TORCH_CHECK(
       work.getState() != spyre_comms::WorkScheduleState::State::DONE_ERROR,
       "[SpyreCCL]: collective failed");
-  auto* runtime = spyre::GlobalRuntime::get();
-  TORCH_CHECK(runtime == nullptr || !runtime->hasStreamError(),
+  // Check only the default stream that spyre-comms submits onto.
+  // RuntimeContext::hasStreamError() aggregates all registered streams, so a
+  // fault on an unrelated non-default stream would incorrectly reject a
+  // successful collective.
+  TORCH_CHECK(!spyre::getDefaultStreamRuntimeHandle()->needsShutdown(),
               "[SpyreCCL]: device stream error during collective");
 }
 
