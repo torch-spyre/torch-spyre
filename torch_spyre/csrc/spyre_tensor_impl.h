@@ -92,6 +92,11 @@ class SpyreTensorLayout {
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
+  // Empty means unknown. Otherwise physical elements outside this
+  // origin-anchored rectangle are zero. Runtime getters expose this only
+  // while the allocation's load-time certificate remains valid.
+  std::vector<int64_t> zero_padding_valid_size;
+
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
@@ -176,7 +181,21 @@ class SpyreTensorLayout {
    */
   SpyreTensorLayout with_element_arrangement(ElementArrangement ea) const {
     SpyreTensorLayout copy = *this;
+    if (ea != element_arrangement) copy.zero_padding_valid_size.clear();
     copy.element_arrangement = ea;
+    return copy;
+  }
+
+  SpyreTensorLayout with_zero_padding(
+      const std::vector<int64_t>& valid_size) const {
+    TORCH_CHECK(valid_size.empty() || valid_size.size() == device_size.size(),
+                "Zero-padding valid region must have device-layout rank");
+    for (size_t i = 0; i < valid_size.size(); ++i) {
+      TORCH_CHECK(valid_size[i] >= 0 && valid_size[i] <= device_size[i],
+                  "Zero-padding valid region exceeds the allocation");
+    }
+    SpyreTensorLayout copy = *this;
+    copy.zero_padding_valid_size = valid_size;
     return copy;
   }
 
@@ -195,7 +214,8 @@ class SpyreTensorLayout {
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement;
+           this->element_arrangement == other.element_arrangement &&
+           this->zero_padding_valid_size == other.zero_padding_valid_size;
   }
 };
 
@@ -246,6 +266,9 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
+bool certify_zero_padding(const at::Tensor& tensor,
+                          const std::vector<int64_t>& valid_size);
+void invalidate_zero_padding(const at::Tensor& tensor);
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
 std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
 
@@ -260,6 +283,8 @@ struct hash<spyre::SpyreTensorLayout> {
     for (int64_t v : layout.device_size)
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
     for (int64_t v : layout.stride_map)
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
+    for (int64_t v : layout.zero_padding_valid_size)
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
     seed = c10::hash_combine(
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));

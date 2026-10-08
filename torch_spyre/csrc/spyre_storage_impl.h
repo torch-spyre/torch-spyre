@@ -18,6 +18,11 @@
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/SymInt.h>
+#include <c10/core/TensorImpl.h>
+
+#include <mutex>
+#include <optional>
+#include <vector>
 
 namespace spyre {
 
@@ -31,6 +36,20 @@ namespace spyre {
  */
 class SpyreStorageImpl : public c10::StorageImpl {
  public:
+  // Shared by aliases. The version handle detects ordinary PyTorch writes;
+  // raw DMA/fill entry points explicitly invalidate before writing.
+  struct ZeroPaddingCertificate {
+    std::vector<int64_t> device_size;
+    std::vector<int64_t> stride_map;
+    std::vector<int64_t> valid_size;
+    std::vector<int64_t> host_size;
+    std::vector<int64_t> host_stride;
+    c10::VariableVersion version;
+    uint32_t recorded_version;
+  };
+  mutable std::mutex zero_padding_mutex;
+  std::optional<ZeroPaddingCertificate> zero_padding;
+
   SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
                    c10::DeviceAllocator* allocator, bool resizable);
 };

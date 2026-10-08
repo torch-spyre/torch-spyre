@@ -69,6 +69,7 @@ from .pass_utils import (
     indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
+    logical_iteration_space_from_op,
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
@@ -319,14 +320,28 @@ def aligned_ownership_split_domains(
     accesses = [
         AlignmentAccess(td.layout.device_layout, td.dep.index) for td in tensor_deps
     ]
+    from .dense_padding import has_dense_padding, physical_iteration_space
+
+    padded = has_dense_padding(ctx.op)
     try:
+        logical_space = (
+            logical_iteration_space_from_op(ctx.op) if padded else ctx.it_space
+        )
+        if (
+            padded
+            and physical_iteration_space(ctx.op, op_read_writes(ctx.op), logical_space)
+            != ctx.it_space
+        ):
+            raise Unsupported("dense padding ownership context has changed")
         alignment_inputs = build_operation_alignment_inputs(
-            ctx.it_space,
+            logical_space,
             accesses,
             {symbol: (extent, 1) for symbol, extent in ctx.it_space.items()},
         )
         _, aligned_tensors, segments = align_tensors_pure(alignment_inputs)
-    except Exception:
+    except Exception as error:
+        if padded:
+            raise Unsupported("cannot prove dense padding ownership") from error
         # The alignment input is rebuilt ahead of codegen. Codegen reports its
         # own alignment failures; this rule only narrows splits it can prove bad.
         return ConstraintResult()
@@ -422,7 +437,7 @@ def carried_reduction_pinned_row(
 
 
 def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Block reduction stick vars that cannot be split across cores.
+    """Keep coordinate-masked axes within one core partition.
 
     The backend cannot coordinate-mask a dim spread over cores (mirrors
     ``_get_coordinate_mask`` in codegen/superdsc.py). ``ctx.it_space`` must be
@@ -435,6 +450,12 @@ def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRes
         if v in ctx.stick_vars
         and concretize_expr(ctx.it_space[v]) % ctx.stick_vars[v] != 0
     }
+    if ctx.op.__dict__.get("dense_padding_zero_mask") is True:
+        logical = logical_iteration_space_from_op(ctx.op)
+        changed = {v for v, extent in ctx.it_space.items() if extent != logical[v]}
+        if len(changed) != 1 or changed.intersection(ctx.reduction_vars):
+            raise Unsupported("dense zero mask must have one physical output axis")
+        blocked.update(changed)
     return ConstraintResult(blocked=blocked)
 
 

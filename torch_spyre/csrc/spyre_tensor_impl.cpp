@@ -174,6 +174,14 @@ std::string SpyreTensorLayout::toString() const {
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
   ss << ")";
+  if (!zero_padding_valid_size.empty()) {
+    ss << ".with_zero_padding([";
+    for (size_t i = 0; i < zero_padding_valid_size.size(); ++i) {
+      if (i) ss << ", ";
+      ss << zero_padding_valid_size[i];
+    }
+    ss << "])";
+  }
   return ss.str();
 }
 
@@ -285,7 +293,23 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   SpyreTensorLayout stl;
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    stl = impl->spyre_layout;
+    stl = impl->spyre_layout.with_zero_padding({});
+    auto* storage = dynamic_cast<SpyreStorageImpl*>(
+        tensor.storage().unsafeGetStorageImpl());
+    if (storage) {
+      std::lock_guard<std::mutex> lock(storage->zero_padding_mutex);
+      const auto& cert = storage->zero_padding;
+      if (cert && cert->version.enabled() &&
+          cert->version.current_version() == cert->recorded_version &&
+          tensor.storage_offset() == 0 &&
+          tensor.sizes().vec() == cert->host_size &&
+          tensor.strides().vec() == cert->host_stride &&
+          stl.device_size == cert->device_size &&
+          stl.stride_map == cert->stride_map &&
+          stl.element_arrangement == ElementArrangement::STANDARD) {
+        stl = stl.with_zero_padding(cert->valid_size);
+      }
+    }
   } else {
     TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorLayout");
   }
@@ -295,6 +319,7 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl) {
   TORCH_CHECK(tensor.is_privateuseone());
+  invalidate_zero_padding(tensor);
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
     impl->spyre_layout = stl;
@@ -303,6 +328,40 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
                 "Error: Attempting to set a STL for a device tensor that does "
                 "not have SpyreTensorImpl");
   }
+}
+
+void invalidate_zero_padding(const at::Tensor& tensor) {
+  if (!tensor.is_privateuseone()) return;
+  auto* storage =
+      dynamic_cast<SpyreStorageImpl*>(tensor.storage().unsafeGetStorageImpl());
+  if (storage) {
+    std::lock_guard<std::mutex> lock(storage->zero_padding_mutex);
+    storage->zero_padding.reset();
+  }
+}
+
+bool certify_zero_padding(const at::Tensor& tensor,
+                          const std::vector<int64_t>& valid_size) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  auto* impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  auto* storage =
+      dynamic_cast<SpyreStorageImpl*>(tensor.storage().unsafeGetStorageImpl());
+  TORCH_CHECK(impl && storage, "Zero-padding certificate needs Spyre storage");
+  const auto& stl = impl->spyre_layout;
+  stl.with_zero_padding(valid_size);  // Validate the rectangle.
+  TORCH_CHECK(tensor.storage_offset() == 0 && tensor.is_contiguous() &&
+                  stl.element_arrangement == ElementArrangement::STANDARD,
+              "Zero-padding certification requires a dense base tensor");
+  std::lock_guard<std::mutex> lock(storage->zero_padding_mutex);
+  storage->zero_padding.reset();
+  // No certificate without a mutation counter: a later compiled mutation
+  // of an inference tensor could otherwise leave the fact stale.
+  if (!impl->version_counter().enabled() || valid_size.empty()) return false;
+  storage->zero_padding.emplace(SpyreStorageImpl::ZeroPaddingCertificate{
+      stl.device_size, stl.stride_map, valid_size, tensor.sizes().vec(),
+      tensor.strides().vec(), impl->version_counter(),
+      impl->version_counter().current_version()});
+  return true;
 }
 
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {

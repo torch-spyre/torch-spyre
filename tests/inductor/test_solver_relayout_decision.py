@@ -392,6 +392,33 @@ def test_relayout_fires_when_cheaper_than_the_spill():
     assert _disjoint(copy.address, p.address), "copy overlaps its source"
 
 
+def _solve_with_matmuls(buffers, matmul_ticks):
+    """``_solve`` with the allocator's matmul indices set on the solver."""
+    solver = CpSatLayoutSolver(buffers, 64, alignment=1)
+    solver.matmul_ticks = frozenset(matmul_ticks)
+    result = solver.plan_layout_and_core_divisions(_objective(buffers))
+    return {b.name: b for b in result}
+
+
+@pytest.mark.parametrize(
+    "matmuls,copy_below",
+    [({1}, True), (set(), False), ({0}, False), ({0, 1}, False)],
+)
+def test_a_copy_goes_below_its_dying_source_only_for_a_matmul(matmuls, copy_below):
+    """P dies at its copy: the copy op the commit path inserts before C is P's
+    last reader. When C (tick 1) is a matmul, the copy is packed first, so C's
+    program states the copy alone instead of P's dead slot plus the copy. When
+    P's writer (tick 0) is a matmul too, that would cost the writer its room,
+    so P stays below."""
+    r = _solve_with_matmuls(_pc(5000.0), matmuls)
+    p, copy = r["P"], _copy(r)
+    assert p.address is not None and copy.address is not None
+    assert _disjoint(copy.address, p.address)
+    low, high = (copy, p) if copy_below else (p, copy)
+    assert (low.address, high.address) == (0, _PER_CORE)
+    assert r["C"].chosen_relayouts["P"].destination_address == copy.address
+
+
 def test_relayout_declines_when_dearer_than_the_spill():
     r = _solve(_pc(50000.0))
     assert r["P"].address is None, "spilling is cheaper: P must not reside"

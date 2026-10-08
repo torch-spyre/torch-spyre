@@ -14,3 +14,5 @@ test_suite_config:
       unlisted_test_mode: mandatory_success
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_solver_relayout_e2e.py
       unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_lx_handoff_packing.py
+      unlisted_test_mode: mandatory_success

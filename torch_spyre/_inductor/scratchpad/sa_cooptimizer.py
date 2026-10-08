@@ -59,7 +59,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
-    ceil_div,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
@@ -342,15 +341,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _per_core_size(self, idx: int, div_idx: int) -> int:
         """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
-        ``ceil_div(total_size, output_partition)``, using the substrate's integer
-        helper so this rounds identically to every other footprint-division site.
+        :meth:`CoreDivisionBuffer.per_core_size`, so this rounds identically to
+        every other engine.
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
         *placeable* at zero footprint is
         :meth:`_assert_unsized_buffers_are_pinned`."""
-        part = self._bufs[idx].core_divisions[div_idx].output_partition
-        return max(0, ceil_div(self._bufs[idx].size, part))
+        return max(0, self._bufs[idx].per_core_size(div_idx))
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``

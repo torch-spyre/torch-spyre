@@ -683,6 +683,9 @@ def _matmul_features(
     """
     data = getattr(op, "data", None)
     k_size = _prod_ints(getattr(data, "reduction_ranges", None) or [])
+    dense_padding = getattr(op, "dense_reduction_padding", None)
+    if dense_padding is not None:
+        k_size = dense_padding[1]
     # One pass over the output buffer, times the passes over the whole loop nest.
     macs = out_elems * k_size * out_factor
     rows_per_core = cols_per_core = 0.0

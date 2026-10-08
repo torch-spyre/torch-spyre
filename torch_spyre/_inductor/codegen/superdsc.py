@@ -2353,6 +2353,31 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     coordinate_masking = _get_coordinate_mask(
         sdsc_iteration_space, args[-1], padding, op_spec.op
     )
+    from ..dense_padding import ZERO_MASK_INFO_KEY, ZERO_PRESERVING_POINTWISE
+
+    dense_mask = (op_spec.op_info or {}).get(ZERO_MASK_INFO_KEY)
+    if dense_mask is not None:
+        if (
+            op_spec.is_reduction
+            or op_spec.op not in ZERO_PRESERVING_POINTWISE
+            or args[-1].data_format == DataFormats.IEEE_FP32
+        ):
+            raise ValueError("unsupported operation carrying a dense zero-tail mask")
+        _, tail_dim = _get_device_dim_order(op_spec.args[-1], symbol_mapping)
+        logical, physical = dense_mask["logical"], dense_mask["physical"]
+        if (
+            tail_dim is None
+            or sdsc_iteration_space.get(tail_dim) != physical
+            or not 0 < logical < physical
+            or coordinate_masking
+        ):
+            raise ValueError("dense zero-tail mask lost its physical output axis")
+        if dim_splits[tail_dim] != 1:
+            raise ValueError("dense zero-tail mask axis cannot be split across cores")
+        # SAMV replaces each operand's tail with zero before the pointwise
+        # operation. Every admitted operation maps all-zero operands to zero;
+        # projection tails therefore need no assumed value.
+        coordinate_masking = {tail_dim: [[logical, physical - logical]]}
     masking_const_id = -1
     if coordinate_masking:
         # Constant ids follow insertion order, so capture the index here rather

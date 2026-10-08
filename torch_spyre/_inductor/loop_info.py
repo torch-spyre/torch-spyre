@@ -455,6 +455,8 @@ _SPYRE_METADATA_ATTRS = (
     # added to this tuple, because copy_op_metadata only copies attrs
     # listed here.
     "tile_marker_dim",
+    "dense_reduction_padding",
+    "dense_padding_zero_mask",
 )
 
 

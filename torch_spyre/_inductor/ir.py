@@ -104,6 +104,9 @@ class FixedTiledLayout(FixedLayout):
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
         self.lx_view: Optional["PerCoreView"] = None
+        # Compiler-only physical iteration, independent of logical size/stride.
+        # (logical innermost extent, selected physical extent), or None.
+        self.dense_padding: tuple[int, int] | None = None
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"

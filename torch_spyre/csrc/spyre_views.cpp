@@ -34,6 +34,19 @@
 
 namespace spyre {
 
+// The low-level compiler view helpers bypass Autograd's ordinary view setup.
+// Their mutations must still invalidate allocation-scoped padding proofs.
+static void share_padding_version(const at::Tensor& source,
+                                  const at::Tensor& alias) {
+  const auto& version = source.unsafeGetTensorImpl()->version_counter();
+  if (!alias.is_inference()) {
+    alias.unsafeGetTensorImpl()->set_version_counter(version);
+  } else if (version.enabled()) {
+    // PyTorch forbids attaching an enabled counter to an inference tensor.
+    invalidate_zero_padding(source);
+  }
+}
+
 //
 // templated for ArrayRef<int64_t> and SmallVector<int64_t> use cases
 //
@@ -57,6 +70,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  share_padding_version(self, self_);
   return self_;
 }
 
@@ -83,6 +97,7 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   spyre_tensor_impl_->spyre_layout = stl;
   spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
   spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
+  share_padding_version(self, self_);
   return self_;
 }
 
@@ -141,6 +156,7 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
     spyre_impl->dma_strides = stride.vec();
   }
 
+  share_padding_version(self, result);
   return result;
 }
 
@@ -190,6 +206,7 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
     spyre_tensor_impl_->dma_sizes = size.vec();
     spyre_tensor_impl_->dma_strides = stride.vec();
   }
+  share_padding_version(self, self_);
   return self_;
 }
 
@@ -236,6 +253,7 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
   result_impl->spyre_layout = orig_impl->spyre_layout;
   result_impl->dma_sizes = orig_impl->dma_sizes;
   result_impl->dma_strides = orig_impl->dma_strides;
+  share_padding_version(self, result);
 
   return result;
 }

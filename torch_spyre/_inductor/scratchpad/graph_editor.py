@@ -215,6 +215,9 @@ class GraphEditor:
             layout.device_layout,
             offset=layout.offset,
         )
+        from ..dense_padding import copy_padding_layout
+
+        copy_padding_layout(layout, clone_layout)
         # Input buffers have no loop metadata, so input clones inherit it from
         # their consumer. Output clones inherit it from their producer.
         metadata_source = buffer_users[0] if input else buffer
@@ -229,6 +232,8 @@ class GraphEditor:
         new_com_buf.origins.add(new_fx_node)
         new_com_buf.origin_node = new_fx_node
         copy_op_metadata(metadata_source, new_com_buf)
+        new_com_buf.dense_reduction_padding = None
+        new_com_buf.dense_padding_zero_mask = False
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
         register_operation_after_graph_edit(self.lowering, new_com_buf)
         new_buf_name = new_com_buf.get_name()

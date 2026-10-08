@@ -180,10 +180,29 @@ def _dma_to_spyre_dim_order_swapped(
         dev_dtype,
         [1, 0],  # dim_order: stick on dim-0 = out_features
     )
+    from torch_spyre._inductor import config
+    from torch_spyre._inductor.dense_padding import padded_linear_layout
+
+    valid_size = None
+    if config.compiler_dense_padding and not torch.is_inference_mode_enabled():
+        padded = padded_linear_layout(layout, tuple(weight.shape), dev_dtype)
+        if padded is not None:
+            valid_size = list(layout.device_size)
+            layout = padded
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
     )
+    if valid_size is not None:
+        from torch_spyre._C import fill_tensor
+
+        # DMA-in writes only logical elements. Establish every gap first on
+        # the same device stream; the blocking copy below completes both.
+        fill_tensor(dst, 0.0)
     copy_tensor(weight, dst, non_blocking=False)
+    if valid_size is not None:
+        from torch_spyre._C import _certify_zero_padding
+
+        _certify_zero_padding(dst, valid_size)
     return dst
 
 

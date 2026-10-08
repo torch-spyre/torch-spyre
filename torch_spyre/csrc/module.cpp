@@ -66,7 +66,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 3;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -291,6 +291,10 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
                     &spyre::SpyreTensorLayout::element_arrangement)
+      .def_readonly("zero_padding_valid_size",
+                    &spyre::SpyreTensorLayout::zero_padding_valid_size)
+      .def("with_zero_padding", &spyre::SpyreTensorLayout::with_zero_padding,
+           py::arg("valid_size"))
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
            py::arg("element_arrangement"))
@@ -325,7 +329,8 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement);
+                                  p.element_arrangement,
+                                  p.zero_padding_valid_size);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -359,6 +364,17 @@ PYBIND11_MODULE(_C, m) {
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[4].cast<spyre::ElementArrangement>());
+            } else if (version == 4) {
+              if (t.size() != 6) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(
+                         t[1].cast<std::vector<int64_t>>(),
+                         t[2].cast<std::vector<int64_t>>(),
+                         t[3].cast<DataFormats>(),
+                         t[4].cast<spyre::ElementArrangement>())
+                  .with_zero_padding(t[5].cast<std::vector<int64_t>>());
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
@@ -410,6 +426,9 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device_size"), py::arg("device_dtype"),
         "Return whole-stick storage bytes; reject undefined format geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
+  // Only the load path calls this, after zero fill plus logical DMA.
+  m.def("_certify_zero_padding", &spyre::certify_zero_padding);
+  m.def("_invalidate_zero_padding", &spyre::invalidate_zero_padding);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,

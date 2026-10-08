@@ -19,6 +19,11 @@ from typing import Literal
 from torch.utils._config_module import install_config_module
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
+# Local opt-in until the native valid-region contract and device gates pass.
+# This is one compiler policy for all eligible static dense inference graphs.
+compiler_dense_padding: bool = (
+    os.environ.get("SPYRE_COMPILER_DENSE_PADDING", "0") == "1"
+)
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )

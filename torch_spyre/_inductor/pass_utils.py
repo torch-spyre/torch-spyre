@@ -1863,7 +1863,7 @@ def iter_var_id(stick_expr) -> int:
     return int(name[i + 1 :])
 
 
-def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
+def logical_iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
@@ -1886,7 +1886,9 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         raise Unsupported("Unexpected node type")
 
 
-def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+def logical_iteration_space_from_op(
+    op: ComputedBuffer,
+) -> dict[sympy.Symbol, sympy.Expr]:
     """Pre-scheduler version of iteration_space: uses op.get_read_writes() instead
     of SchedulerNode.read_writes."""
     rw = op_read_writes(op)
@@ -1908,6 +1910,20 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         return result
     else:
         raise Unsupported("Unexpected node type")
+
+
+def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
+    from .dense_padding import physical_iteration_space
+
+    return physical_iteration_space(n.node, n.read_writes, logical_iteration_space(n))
+
+
+def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+    from .dense_padding import physical_iteration_space
+
+    return physical_iteration_space(
+        op, op_read_writes(op), logical_iteration_space_from_op(op)
+    )
 
 
 _V = TypeVar("_V")

@@ -224,6 +224,9 @@ def _dump_buffers(
         )  # allocation dict starts empty: invisible to LX planning (already
         # run by this point) and picked up later by ordinary HBM/hbm_pool
         # buffer addressing, same as any other un-pinned intermediate.
+        from ..dense_padding import copy_padding_layout
+
+        copy_padding_layout(layout, dump_layout)
         clone_tb = clone_lowering(buf)
         dump_buf = ComputedBuffer(
             name=None,
@@ -234,6 +237,8 @@ def _dump_buffers(
         dump_buf.origins.add(dump_fx)
         dump_buf.origin_node = dump_fx
         copy_op_metadata(buf, dump_buf)  # keep it in buf's coarse-tile/loop-group
+        dump_buf.dense_reduction_padding = None
+        dump_buf.dense_padding_zero_mask = False
         dump_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         dump_buf.name = graph.register_buffer(dump_buf)
         register_operation_after_graph_edit(graph, dump_buf)
@@ -294,6 +299,8 @@ def _restore_buffers(
         restore_buf.origins.add(restore_fx)
         restore_buf.origin_node = restore_fx
         copy_op_metadata(buf, restore_buf)
+        restore_buf.dense_reduction_padding = None
+        restore_buf.dense_padding_zero_mask = False
         # Without this, restore_buf defaults to an untiled single-core view,
         # which disagrees with buf's own 32-core split as seen by buf's other
         # users. Since this write aliases buf's own layout object (via

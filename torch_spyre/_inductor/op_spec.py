@@ -31,6 +31,35 @@ from .constants import IDENTITY_OP
 
 LX_RELAYOUT_INFO_KEY = "lx_relayout_certified"
 
+# Optional per-program frontend LX reservation, in bytes per core, reserving
+# [0, value) in the owning program's phase. Absent means the backend keeps its
+# configured default reservation.
+FRONTEND_LX_BYTES_INFO_KEY = "frontend_lx_bytes"
+
+
+def frontend_lx_bytes_attr_value(op_info: dict | None) -> int | None:
+    """One op's own reservation, as bundle emission and the cache key read it.
+
+    Returns the op's reservation in bytes per core, or ``None`` when the op has
+    none (absent key, a boolean, or an integer outside nonnegative signed i64).
+    Bundle emission writes ``frontend_lx_bytes = N : i64`` on a call: the
+    largest over the calls that share the call's sdsc file, or none when any of
+    them has none (``codegen.bundle._record_frontend_lx_bytes``). The kernel
+    cache key hashes every op's own value, so it changes whenever an emitted
+    attribute can change; it may also change when none does (a smaller bound
+    on a shared file), which only costs a recompile.
+    """
+    if not op_info:
+        return None
+    value = op_info.get(FRONTEND_LX_BYTES_INFO_KEY)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value < (1 << 63)
+    ):
+        return int(value)
+    return None
+
 
 class IndirectAccess(Function):
     """Sympy function: IndirectAccess(tensor_name) — runtime index read from that tensor at the current iteration point.

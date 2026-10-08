@@ -204,7 +204,47 @@ def test_a_pooled_mutation_destination_leaves_the_external_argument_list():
         assert kernel._live_call_arg_names == ["result"]
         assert result_arg.arg_index == 0
         kernel.call_kernel("prepared")
-        assert emitted == ["prepared.run(result)"]
+        assert emitted == [
+            "_invalidate_zero_padding(result)",
+            "prepared.run(result)",
+        ]
+
+
+def test_compiled_writes_invalidate_live_destinations_before_launch():
+    """Mutation aliases and reused outputs lose proof; input-only tensors do not."""
+    names = ("weight", "destination", "reused", "alias", "dead_output")
+    layouts = {name: _layout(False) for name in names}
+    emitted = []
+    graph = SimpleNamespace(
+        get_buffer={
+            name: SimpleNamespace(get_layout=lambda layout=layout: layout)
+            for name, layout in layouts.items()
+        }.get,
+        removed_buffers=OrderedSet(),
+        unaligned_buffers=OrderedSet(),
+        scheduler=SimpleNamespace(mutation_real_name={"alias": "destination"}),
+        wrapper_code=SimpleNamespace(writeline=emitted.append),
+        get_dtype=lambda name: None,
+    )
+    with V.set_graph_handler(graph):
+        kernel = SpyreKernel()
+        kernel.args.input("weight")
+        kernel.args.input("destination")
+        kernel.args.output("alias")
+        kernel.args.output("alias")
+        kernel.args.output("dead_output")
+        kernel.args.make_inplace("scratch", "reused")
+        kernel.spyre_kernel_args = [
+            (name, Mock(allocation={"hbm": 0}))
+            for name in ("weight", "destination", "reused")
+        ]
+        kernel.codegen_kernel()
+        kernel.call_kernel("prepared")
+    assert emitted == [
+        "_invalidate_zero_padding(reused)",
+        "_invalidate_zero_padding(destination)",
+        "prepared.run(reused, weight, destination)",
+    ]
 
 
 # --- the real compile -------------------------------------------------------

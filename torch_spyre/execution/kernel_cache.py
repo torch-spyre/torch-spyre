@@ -241,9 +241,11 @@ def compute_specs_hash(
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
     (op structure, iteration space, tiling, shapes, dtypes), the trip count of
     every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, the versions of torch, torch_spyre and
-    the deeptools/flex toolchain, the backend compiler in use, and the active
-    compile config.
+    the total pool allocation size, each op's own frontend LX reservation
+    (``op_info["frontend_lx_bytes"]``, from which ``generate_bundle`` derives
+    each call's attribute), the versions of
+    torch, torch_spyre and the deeptools/flex toolchain, the backend compiler
+    in use, and the active compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -254,7 +256,11 @@ def compute_specs_hash(
                      their pool size get different cache keys.
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
-    from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+    from torch_spyre._inductor.op_spec import (
+        LoopSpec,
+        OpSpec,
+        frontend_lx_bytes_attr_value,
+    )
     from torch_spyre._inductor import config as _spyre_config
 
     use_symbols = _spyre_config.bundle_symbolic_args
@@ -319,6 +325,20 @@ def compute_specs_hash(
                             sort_keys=True,
                         ).encode()
                     )
+                # Include the op's own frontend LX reservation: bundle emission
+                # derives each call's frontend_lx_bytes from these values (the
+                # largest over the calls of one sdsc file), so two compilations
+                # whose OpSpec trees differ only in op_info["frontend_lx_bytes"]
+                # must not share a cache entry -- a hit would replay the other
+                # compilation's attribute and could under-reserve a phase. The
+                # helper is the one emission reads, so the key changes whenever
+                # the emitted bundle.mlir can change (absent / zero / value
+                # distinct; malformed values emission drops hash like absent);
+                # a smaller bound on a shared file changes the key alone.
+                lx_bytes = frontend_lx_bytes_attr_value(entry.op_info)
+                content_parts.append(
+                    f"frontend_lx:{'absent' if lx_bytes is None else lx_bytes}".encode()
+                )
                 _debug_ops.append(entry.op)
                 logger.debug(
                     "  [hash] OpSpec[%d] op=%s  iter_space=%s  n_args=%d",

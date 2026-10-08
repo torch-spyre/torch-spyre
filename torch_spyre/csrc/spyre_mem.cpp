@@ -992,6 +992,7 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
+  invalidate_zero_padding(dst);
   SpyreStream stream;
   at::Tensor alloc_view;
   at::Tensor cpu_alloc;
@@ -1192,6 +1193,7 @@ const at::Tensor& spyre_resize_(
   if (self.sizes() == size_int && self.is_contiguous()) {
     return self;
   }
+  invalidate_zero_padding(self);
   TORCH_CHECK(memory_format_opt != c10::MemoryFormat::Preserve,
               "aten::resize_ does not support MemoryFormat::Preserve");
   TORCH_CHECK(!memory_format_opt.has_value() ||
@@ -1246,6 +1248,7 @@ const at::Tensor& spyre_resize_(
 }
 
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
+  invalidate_zero_padding(self);
   TORCH_CHECK(self.is_privateuseone(),
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
@@ -1255,7 +1258,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
   // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
-  SpyreStream stream;
+  auto stream = getCurrentStream(self.device());
   stream.fillAsync(get_composite_address(self), value, dtype,
                    /*use_dmai=*/true);
 

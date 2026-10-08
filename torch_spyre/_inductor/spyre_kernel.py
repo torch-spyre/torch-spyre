@@ -61,11 +61,13 @@ from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
     work_division_from_view,
 )
+from .scratchpad.utils import frontend_lx_high_water
 from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
+    logical_iteration_space,
     iteration_space_with_splits,
     indirect_access_subs_from_kernel,
     input_layout_for_operation,
@@ -76,6 +78,7 @@ from .pass_utils import (
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .op_spec import (
+    FRONTEND_LX_BYTES_INFO_KEY,
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
     LoopSpec,
@@ -829,10 +832,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
+        from .dense_padding import has_dense_padding
+
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
             base_index,
-            it_space,
+            logical_iteration_space(current_node)
+            if has_dense_padding(operation)
+            else it_space,
             self.indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
@@ -1071,6 +1078,24 @@ class SpyreKernel(Kernel[CSEVariable]):
             raise RuntimeError("LX relayout marker has no matching registered plan")
         if relayout_plans:
             op_info = {**op_info, LX_RELAYOUT_INFO_KEY: True}
+
+        # The frontend LX reservation for this operation, from this call's
+        # allocation and lifetimes. Looked up per operation, never carried from
+        # a cached program: two calls of equal code can own different LX, and a
+        # missing value means the backend keeps its full default reservation.
+        lx_bytes = frontend_lx_high_water(V.graph).get(ir_node.get_operation_name())
+        if lx_bytes is not None:
+            op_info = {**op_info, FRONTEND_LX_BYTES_INFO_KEY: lx_bytes}
+
+        from .dense_padding import ZERO_MASK_INFO_KEY, zero_mask_for_op
+
+        zero_mask = zero_mask_for_op(
+            ir_node,
+            self.current_node.read_writes,
+            logical_iteration_space(self.current_node),
+        )
+        if zero_mask:
+            op_info = {**op_info, ZERO_MASK_INFO_KEY: zero_mask}
 
         op_spec = OpSpec(
             op,
@@ -1485,6 +1510,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             "call_kernel() requires codegen_kernel() to have run first"
         )
         call_args.extend(self._live_call_arg_names)
+
+        # Compiled stores bypass the native copy/fill invalidators. Clear the
+        # allocation's proof even when a .data alias has an independent version
+        # counter. Intersect with finalized arguments to exclude pooled/dead
+        # destinations; live_output_buffers also includes in-place reuse.
+        outputs = self.args.live_output_buffers()
+        for arg in self._live_call_arg_names:
+            if arg in outputs:
+                wrapper.writeline(f"_invalidate_zero_padding({arg})")
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")

@@ -11375,7 +11375,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         graph.get_output_names.return_value = ["buf2"]
         graph.graph_input_names = []
         graph.get_buffer.return_value = storage_op
-        buffer = SimpleNamespace(name="buf2", address=address, lx_view=object())
+        buffer = SimpleNamespace(
+            name="buf2", size=128, address=address, lx_view=object()
+        )
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -11481,11 +11483,13 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             "buf2": storage_op,
             "outA": other_op,
         }.get
-        buffer = SimpleNamespace(name="buf2", address=0x4000, lx_view=object())
+        buffer = SimpleNamespace(
+            name="buf2", size=128, address=0x4000, lx_view=object()
+        )
         # Ordinary output clone first, then the drain: the drain's anchor is
         # the same object, whatever the ordinary push did to the list.
         buffers = [
-            SimpleNamespace(name="outA", address=0x2000, lx_view=object()),
+            SimpleNamespace(name="outA", size=128, address=0x2000, lx_view=object()),
             buffer,
         ]
         clone = SimpleNamespace(
@@ -11719,8 +11723,9 @@ class TestHoistedInputClone(unittest.TestCase):
         source = _SentinelOp("x")
         graph.get_buffer.return_value = source
         lx_view = object()
-        buffer = SimpleNamespace(name="x", address=0x4000, lx_view=lx_view)
+        buffer = SimpleNamespace(name="x", size=128, address=0x4000, lx_view=lx_view)
         clone = SimpleNamespace(
+            get_name=lambda: "x_lx",
             loop_info=object(),
             _loop_carry_record=object(),
             _carried_reduction_record=object(),
