@@ -53,6 +53,7 @@ from .registry import (
     ICR_HOST,
     MISC,
     Registry,
+    canonical,
     dated_tag,
     family_of,
     split_image,
@@ -119,6 +120,8 @@ class Resolution:
     leaf: str = ""
     manifest_list: str = ""
     registry_tag: str = ""
+    # canonical tag -> the raw spelling it was given or found as (recorded as tag prop registry_tag)
+    spellings: dict = dataclasses.field(default_factory=dict, repr=False, compare=False)
     # used | off | unreachable: <why>; '' when the spec needed no registry.
     registry: str = ""
     # A dry run's would-be rows, table -> [row]; only printed for a dry run.
@@ -131,7 +134,8 @@ class Resolution:
         return {
             f.name: getattr(self, f.name)
             for f in dataclasses.fields(self)
-            if f.name != "identity" and (f.name != "rows" or self.dry_run)
+            if f.name not in ("identity", "spellings")
+            and (f.name != "rows" or self.dry_run)
         }
 
     def __getitem__(self, key):
@@ -325,6 +329,7 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
     the given family, else `tag_family`, else misc (with a warning); an unknown family raises
     ValueError. One in `tag_family` replaces
     `resolved_tag`, the tag the registry or the date gave that family; the rest are added.
+    A tag in another spelling of its family's prefix is returned under the family's own.
     """
     given = []
     known = tag_families()
@@ -332,6 +337,7 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
         tag, family = (t, "") if isinstance(t, str) else t
         if not tag:
             continue
+        tag = canonical(tag)
         family = family_of(tag) or family or tag_family
         if not family:
             print(misc_warning(tag), file=sys.stderr)
@@ -340,7 +346,7 @@ def named(resolved_tag: str, tag_family: str, tags=()) -> list:
             raise ValueError(f"tag {tag!r}: unknown tag_family {family!r}")
         given.append((tag, family))
     if tag_family and resolved_tag and not any(f == tag_family for _, f in given):
-        given.insert(0, (resolved_tag, tag_family))
+        given.insert(0, (canonical(resolved_tag), tag_family))
     return list(dict.fromkeys(given))
 
 
@@ -386,6 +392,8 @@ class _Resolver:
     def result(self, identity, source, spec, resolved_tag="", **extra) -> Resolution:
         method, ref_kind = ArtifactWriter.ref_shape(identity.kind)
         pairs = named(resolved_tag, self.tag_family, self.tags)
+        given = [resolved_tag] + [t if isinstance(t, str) else t[0] for t in self.tags]
+        spellings = {canonical(t): t for t in given if t and canonical(t) != t}
         primary = next(
             (p for p in pairs if p[1] == self.tag_family),
             pairs[0] if pairs else ("", ""),
@@ -404,6 +412,7 @@ class _Resolver:
             tag=primary[0],
             tag_family=primary[1],
             tags=[list(p) for p in pairs],
+            spellings=spellings,
             identity=identity,
             **extra,
         )
@@ -815,6 +824,11 @@ def ensure(
 def _write(client, db, r, identity, ref, new_tags, origin, sources, identity_deps, context_deps,
            props, tag_props, run_url) -> None:  # fmt: skip
     """ensure's writes, existence-checked row by row."""
+
+    def props_of(tag: str) -> dict:
+        raw = r.spellings.get(tag)
+        return {**tag_props, **({"registry_tag": raw} if raw else {})}
+
     base = dict(identity.inputs).get("base_artifact_id", "")
     if base:
         # A GHA delta is recorded as insert_gha_result records it, keyed on the record's id.
@@ -823,7 +837,7 @@ def _write(client, db, r, identity, ref, new_tags, origin, sources, identity_dep
             dict(identity.inputs).get("installed", ""), identity.arch, sources=sources, run_url=run_url,
         )  # fmt: skip
         for t, f in new_tags:
-            ArtifactWriter.insert_tag(client, db, identity, t, f, props=tag_props)
+            ArtifactWriter.insert_tag(client, db, identity, t, f, props=props_of(t))
         return
     identity = dataclasses.replace(
         identity, ref=ref, content_digest=r.leaf or identity.content_digest
@@ -837,7 +851,7 @@ def _write(client, db, r, identity, ref, new_tags, origin, sources, identity_dep
         identity_deps=identity_deps,
         context_deps=context_deps,
         props={**({"run_url": run_url} if run_url else {}), **(props or {})},
-        tags=[(t, f, tag_props) for t, f in new_tags],
+        tags=[(t, f, props_of(t)) for t, f in new_tags],
     )
 
 
