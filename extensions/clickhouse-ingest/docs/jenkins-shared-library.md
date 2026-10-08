@@ -64,8 +64,8 @@ $UV <ingestScriptPath> ...
 ```
 
 where `ingestScriptPath = "/home/senuser/${a.product}/${a.ingestScript ?:
-'.github/scripts/ingest_xml.py'}"`. In other words: **the same
-`ingest_xml.py` CLI the GHA composite actions call, run inside the product's
+'.github/scripts/ingest_xml.py'}"` (the deprecated forwarder to `python -m spyre_clickhouse_ingest results`). In other words: **the same
+`python -m spyre_clickhouse_ingest results` CLI the GHA composite actions call, run inside the product's
 own container image**, with `extensions/clickhouse-ingest` attached via
 `uv run --with <local-path>` (a local editable install) rather than the
 `git+https://...#subdirectory=...` form the GHA actions use — because the
@@ -125,7 +125,7 @@ flowchart LR
   B --> C["build job: 'product-test'"]
   C --> D["Jenkinsfile.product-test<br/>runs on the s390x/ppc64le agent"]
   D --> E["pushToClickhouse.pushJUnitXml(...)"]
-  E --> F["ingest_xml.py inside the product container<br/>(same script GHA calls)"]
+  E --> F["spyre_clickhouse_ingest results inside the product container<br/>(same ingest GHA calls)"]
   F --> G[("test_cases / test_case_runs")]
 ```
 
@@ -144,14 +144,14 @@ pushToClickhouse.pushJUnitXml([
 ```
 
 `NODE_LABEL`/`platform` is the **only** arch-specific field — it becomes
-`benchmark_runs.platform` / `ingest_xml.py`'s `--platform` flag. A comment at
+`benchmark_runs.platform` / the ingest's `--arch` flag (`--platform` is its deprecated alias). A comment at
 the call site notes that a missing value here made Power rows invisible to
 the results tab entirely: `platform` isn't cosmetic, it's what a dashboard
 filters on.
 
 There is **no separate Python path** in `pipelines/lib/` for JUnit ingestion
 — `pipelines/lib/*.py` never touches XML at all. Power and s390x go through
-literally the same `ingest_xml.py` CLI, and therefore the same
+literally the same `python -m spyre_clickhouse_ingest results` CLI, and therefore the same
 `TestResultWriter`/`identity.py` code, as x86_64 GHA legs.
 
 ### How `jenkins_run_key` (`"folder/job#123"`) gets built
@@ -209,7 +209,7 @@ This is the single most important thing to understand before touching either
 side of this pipeline. `pipelines/lib/run_identity.py`'s own docstring states
 it plainly:
 
-> Four writers (this orchestrator, and the `ingest_xml*.py` in torch-spyre,
+> Four writers (this orchestrator, and the XML ingests in torch-spyre,
 > hf-adapters and spyre-inference) each independently compute `run_id` and
 > `test_case_id`. Nothing threads them... **byte-exactness is the contract.**
 
@@ -224,7 +224,7 @@ And `pipelines/lib/test_v2_row_contract.py`:
 The four independently-maintained copies of the uuid5 formula:
 
 1. **`extensions/clickhouse-ingest/identity.py`** (this package) — used by
-   every `ingest_xml*.py` in torch-spyre, hf-adapters and spyre-inference, on
+   `python -m spyre_clickhouse_ingest results` and the `ingest_xml*.py` in hf-adapters and spyre-inference, on
    the GHA/x86_64 side.
 2. **`spyre-frameworks/pipelines/lib/run_identity.py`** — Python, "the
    canonical reference implementation" per its own docstring, used by the
@@ -361,7 +361,7 @@ pushToClickhouse.pushArtifactResult([
   write silently no-ops — v1-only, never an error.
 - For `pushJUnitXml` specifically: the calling image must bake the ingest
   script at `/home/senuser/<product>/<ingestScriptRel>` (default
-  `.github/scripts/ingest_xml.py`), and — to get schema-v2 writes — a
+  `.github/scripts/ingest_xml.py`, the deprecated forwarder to `python -m spyre_clickhouse_ingest results`), and — to get schema-v2 writes — a
   checkout of `extensions/clickhouse-ingest` at
   `/home/senuser/<product>/extensions/clickhouse-ingest`, which
   `pushJUnitXml` auto-attaches via `uv run --with`.

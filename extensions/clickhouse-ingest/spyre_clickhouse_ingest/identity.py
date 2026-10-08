@@ -31,6 +31,16 @@ def _is_hex(s: str, n: int) -> bool:
     return len(s) == n and all(c in "0123456789abcdef" for c in s)
 
 
+def _hex_token(text: str) -> str:
+    """The last 12-hex token of `text` delimited by `.`, `-`, `_` or `+`; '' when none."""
+    # str ops, not regex: derive-artifact-id imports this module with no third-party packages.
+    parts = (text or "").translate(str.maketrans("-_+", "...")).split(".")
+    for part in reversed(parts):
+        if _is_hex(part, 12):
+            return part
+    return ""
+
+
 def _strip_dev_suffix(name: str) -> str:
     for suffix in ("-devel", "-dev"):
         if name.endswith(suffix):
@@ -355,6 +365,53 @@ class ArtifactIdentity:
         )
 
     @classmethod
+    def from_rpm(
+        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+    ) -> "ArtifactIdentity":
+        """An RPM by file name, URL, NEVRA or dnf glob; id12 is the 12-hex identity token the
+        producer puts in its release (`<name>-*.<id12>.*.<arch>`)."""
+        base = (ref or "").strip().rsplit("/", 1)[-1].removesuffix(".rpm")
+        rpm_name = name or (
+            base.split("-*", 1)[0] if "-*" in base else base.rsplit("-", 2)[0]
+        )
+        token = id12 or _hex_token(base)
+        if not (rpm_name and _is_hex(token, 12)):
+            raise ValueError(f"rpm needs a name and a 12-hex identity token: {ref!r}")
+        return cls(
+            component=component or rpm_name,
+            artifact_name=rpm_name,
+            id12=token,
+            arch=DerivedId.arch(arch),
+            kind="rpm",
+            ref=(ref or "").strip(),
+        )
+
+    @classmethod
+    def from_wheel(
+        cls, ref: str, arch: str, component: str = "", name: str = "", id12: str = ""
+    ) -> "ArtifactIdentity":
+        """A wheel by `name==version`, file name or URL; id12 is the 12-hex identity token
+        ending its local version (`+<id12>`, `+cpu.<id12>`)."""
+        raw = (ref or "").strip()
+        if "==" in raw:
+            dist, _, version = raw.partition("==")
+        else:
+            # PEP 427: `{distribution}-{version}-...whl`, `-` in the name escaped as `_`.
+            dist, version = (raw.rsplit("/", 1)[-1].split("-") + [""])[:2]
+        token = id12 or _hex_token(version.rpartition("+")[2])
+        dist = name or dist
+        if not (dist and version and _is_hex(token, 12)):
+            raise ValueError(f"wheel needs name==version+<12-hex id>: {ref!r}")
+        return cls(
+            component=component or dist,
+            artifact_name=dist,
+            id12=token,
+            arch=DerivedId.arch(arch),
+            kind="wheel",
+            ref=f"{dist}=={version}",
+        )
+
+    @classmethod
     def from_gha(
         cls, component: str, base_artifact_id: str, installed: str, arch: str
     ) -> "ArtifactIdentity":
@@ -440,6 +497,87 @@ class CapabilityId(DerivedId):
 
 class BenchmarkId(DerivedId):
     """Content identity of a benchmark; `backend` is unhashed -- the comparison axis."""
+
+    # A compiled kernel's name ends in a per-compile token, `_` + 16 of [a-z0-9], before an
+    # optional `#<n>`. migrations/012 matches the same names in SQL; a test pins both.
+    KERNEL_PREFIX = "spyre_kernel_"
+    KERNEL_TOKEN = 16
+
+    @classmethod
+    def kernel_stem(cls, kernel_name) -> str:
+        """A compiled kernel's name without its per-compile token; '' for any other name."""
+        name = "" if kernel_name is None else str(kernel_name)
+        head, sep, n = name.rpartition("#")
+        if not (sep and n and all(c in "0123456789" for c in n)):
+            head, sep, n = name, "", ""
+        token = head[-cls.KERNEL_TOKEN - 1 :]
+        if not (
+            name.startswith(cls.KERNEL_PREFIX)
+            and len(token) == cls.KERNEL_TOKEN + 1
+            and token[0] == "_"
+            and all(c in "abcdefghijklmnopqrstuvwxyz0123456789" for c in token[1:])
+        ):
+            return ""
+        return head[: -len(token)] + sep + n
+
+    @classmethod
+    def rank_kernels(cls, component: str, entries: list) -> list:
+        """`entries` with each compiled kernel's hashed kernel_name as `<stem>@<rank>`.
+
+        One op compiles several kernels with the same stem (two `fused_add`s at 0.27 and
+        0.003 ms), so the stem alone would merge them: rank 1 is the slowest by duration_ms
+        among the kernels sharing every other identity input, ties broken by raw name. The
+        key is also kept as props['kernel_key'], the stable label; the raw name, which changes
+        on every compile, goes to run_props.
+        """
+        keyed = []
+        samples: dict[str, dict[str, dict[str, list]]] = {}
+        for e in entries:
+            disc = e.get("disc") or {}
+            keys = e.get("disc_keys") or ()
+            stem = cls.kernel_stem(disc.get("kernel_name"))
+            if not (stem and e.get("measurements") and "kernel_name" in keys):
+                keyed.append(None)
+                continue
+            raw = str(disc["kernel_name"])
+            group = cls.derive(
+                component,
+                e.get("name", ""),
+                e.get("tags"),
+                {**disc, "kernel_name": stem},
+                keys,
+            )
+            by_backend = samples.setdefault(group, {}).setdefault(raw, {})
+            by_backend.setdefault(e.get("backend", ""), []).extend(
+                e["measurements"].get("duration_ms") or []
+            )
+            keyed.append((group, stem, raw))
+        # A kernel's duration is its slowest backend's mean, as one benchmark_runs row holds it.
+        dur = {
+            (g, raw): max(sum(d) / len(d) if d else 0.0 for d in by_backend.values())
+            for g, kernels in samples.items()
+            for raw, by_backend in kernels.items()
+        }
+        rank = {
+            (g, raw): n
+            for g, kernels in samples.items()
+            for n, raw in enumerate(sorted(kernels, key=lambda r: (-dur[g, r], r)), 1)
+        }
+        out = []
+        for e, k in zip(entries, keyed):
+            if k is None:
+                out.append(e)
+                continue
+            key = f"{k[1]}@{rank[k[0], k[2]]}"
+            out.append(
+                {
+                    **e,
+                    "disc": {**e["disc"], "kernel_name": key},
+                    "props": {**(e.get("props") or {}), "kernel_key": key},
+                    "run_props": {**(e.get("run_props") or {}), "kernel_name": k[2]},
+                }
+            )
+        return out
 
     @classmethod
     def derive(cls, component: str, name: str, tags, disc=None, disc_keys=()) -> str:

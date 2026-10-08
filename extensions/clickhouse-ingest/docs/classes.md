@@ -250,7 +250,7 @@ TestResultWriter.already_ingested(client, db, run_id, component, source_file="")
 TestResultWriter.insert(client, db, component, run_id, cases, source_file="")
 ```
 
-**Use case.** `ingest_xml.py`, `ingest_xml_si.py` and
+**Use case.** `python -m spyre_clickhouse_ingest results`, `ingest_xml_si.py` and
 `ingest_xml_hf_adapters.py` all call this for the same reason: turn a parsed
 JUnit case list into `test_cases`/`test_case_runs` rows. A case whose identity
 can't be derived (no name) is skipped with a warning rather than colliding
@@ -264,7 +264,7 @@ BenchmarkWriter.insert(client, db, component, run_id, benchmarks, report_kind=""
 ```
 
 **Use case.** `ingest_vllm_benchmarks.py` (spyre-inference) and the perf leg
-of torch-spyre's own `ingest_xml.py` both call this — one row per (benchmark,
+of `python -m spyre_clickhouse_ingest results` both call this — one row per (benchmark,
 backend), samples extended across repeated entries, and any run row with zero
 measurements dropped (the DDL's `CHECK` would otherwise fail the *whole*
 insert for one bad benchmark).
@@ -292,7 +292,7 @@ ArtifactWriter.result_recorded(client, db, artifact_id, run_id, result_kind, tes
 ArtifactWriter.insert_gha_result(client, db, *, artifact_id, component, arch, run_id, test_type, state, ...)
 ```
 
-**Use case.** `ingest_xml.py`, given a non-empty `--artifact-id` from
+**Use case.** `python -m spyre_clickhouse_ingest results`, given a non-empty `--artifact-id` from
 `derive-gha-artifact-id`, records both the artifact a GHA leg ran *and* its
 verdict as one call — refusing on a partial id (missing component/arch/etc.)
 rather than writing a half-identified row that a dashboard join would never
