@@ -34,7 +34,7 @@ test_suite_config:
             - LxPlanning.*::test_linalg_norm_keepdim.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_argmin_keepdim0.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_min_tuple_output_keepdim0.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_logsumexp_keepdim0_known_xfail.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_logsumexp_keepdim0.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_mean_3d_dim0_keepdim.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_index_copy_.*_lx_planning_(pointwise|reduction)
             # Regression guard for LX producer/consumer core->slice agreement

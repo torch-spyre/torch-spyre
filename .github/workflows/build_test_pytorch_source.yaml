@@ -103,6 +103,7 @@ jobs:
         uses: ./.github/actions/checkout-pytorch
         with:
           sha: ${{ inputs.pytorch_sha }}
+          submodules: 'true'
 
       - uses: ./.github/actions/gather-runner-info
         with:

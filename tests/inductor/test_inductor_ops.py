@@ -399,17 +399,19 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
+# fp32 and int32 share a stick width, so their conversions have no stick pairs to
+# keep together and are exempt from the shapes above.
+_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
     if (
-        shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
+        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
         or (
             DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst)
-            not in [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+            and (src, dst) not in _SAME_WIDTH_PAIRS
         )
         # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
         # so there's no width change to trip the fp16-stick boundary.
@@ -419,6 +421,26 @@ TO_DTYPE_OP_EXPECT_FAIL = [
             and (src, dst) != (torch.float32, torch.int32)
         )
     )
+]
+
+# Cases the predicate above flags that now pass on every config (base and both LX
+# planning classes). Listing them here, rather than loosening the predicate, keeps
+# the still-failing cases generated from the same rule.
+_TO_DTYPE_OP_NOW_PASSING = {
+    "bfloat16_to_bool_4x68",
+    "bfloat16_to_bool_68",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "float16_to_bfloat16_4x68",
+    "float16_to_bfloat16_68",
+    "float16_to_bool_4x68",
+    "float16_to_bool_68",
+    "float32_to_bool_4x16",
+    "float32_to_bool_4x68",
+    "float32_to_bool_68",
+}
+TO_DTYPE_OP_EXPECT_FAIL = [
+    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -432,12 +454,61 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
-TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+]
+
+# Explicit round trips that pass on a stick ending inside a stick; the rest of the
+# unaligned shapes need the consumer of the upcast value padded to whole stick
+# pairs (see test_upcast_consumed_on_partial_stick). The implicit round
+# trip still hits an unsupported op on these shapes.
+_ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
+_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
+    case
+    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+    if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
+]
+
+# Further round-trip cases that now pass on every config. They differ between the
+# add and copy variants, so each variant gets its own expect_fail list. The implicit
+# variant is the same as the shared implicit list minus its own passing cases.
+_ROUND_TRIP_ADD_NOW_PASSING = {
+    "bfloat16_to_float16_4x16",
+    "bfloat16_to_float16_4x32",
+    "bfloat16_to_float16_4x63",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "bfloat16_to_float32_4x63",
+    "float16_to_float32_4x63",
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
+    "bfloat16_to_float32_4x16",
+    "float16_to_float32_4x16",
+}
+_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_ADD_NOW_PASSING
+]
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_COPY_NOW_PASSING
+]
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
+    case
+    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1878,8 +1949,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "large_dim_0_1",
                 "large_dim_0_1_nopad",
-                "large_dim_0_2",
-                "large_dim_0_2_nopad",
                 "large_dim_1_2",
                 "large_dim_1_2_nopad",
             ],
@@ -2269,7 +2338,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44_scalar32"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_256_scalar128": (
@@ -2315,7 +2383,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_64": (
@@ -3262,7 +3329,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "tuple": (((64, 64)), 1024.0),
                 "size": (torch.Size([64, 128]), 1024.0),
             },
-            "expect_fail": ["value_2"],
         },
         (
             "test_dropout_functional",
@@ -4044,7 +4110,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int_true": (torch.tensor([1], dtype=torch.int64),),
                 "int_false": (torch.tensor([0], dtype=torch.int64),),
             },
-            "expect_fail": ["float32_true", "float32_false", "negative_true"],
         },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
@@ -5042,10 +5107,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "fp16_3d_dim_2",
                 "fp16_3d_dim_neg1",
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
@@ -5578,6 +5639,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (67, 71, 256),
                     ),
                 ),
+                # Stick dims shorter than one stick; size 1 has no loop variable.
+                "67x1": (cached_randn((67, 1)),),
+                "67x2": (cached_randn((67, 2)),),
+                "1": (cached_randn((1,)),),
                 "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
                 "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
                 # Only exp(23) overflows DLFloat16 itself. The LX pointwise
@@ -5811,7 +5876,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6028,7 +6093,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -6036,7 +6101,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",
@@ -7834,15 +7899,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.logsumexp (stable error signature: InductorError: "
-            "IndexError: list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_logsumexp_keepdim0_known_xfail(self):
+    def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(
             lambda x: torch.logsumexp(x, dim=0, keepdim=False),
@@ -8399,7 +8456,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+        # -65504 is the fp16 limit: the pointwise lx wrap's (x + x) / 2 overflows
+        # fp16 on the CPU but not in DLFloat16, so give the lx wraps an fp64
+        # reference to transform.
+        self.compare_with_cpu(
+            fn,
+            needs_device=True,
+            cpu_compile=False,
+            dlfloat16_reference=torch.full(*args, dtype=torch.float64),
+        )
 
     def test_full_bfloat16_cpu(self):
         """Compiled BF16 ``full`` stays in native Spyre lowering."""

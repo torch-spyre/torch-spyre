@@ -18,7 +18,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Callable, cast, Optional
 
@@ -26,6 +26,7 @@ import sympy
 import torch
 from torch._inductor.ir import (
     TensorBox,
+    Buffer,
     ComputedBuffer,
     ExternKernel,
     FallbackKernel,
@@ -46,6 +47,7 @@ from torch_spyre._inductor.pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
+    origin_in_graph,
     _prepare_per_core_view,
     _per_core_view_from_prep,
     _per_core_view_on_buf,
@@ -101,6 +103,8 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
+    counted_loop_entry,
+    counted_loop_group_path,
     counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
@@ -269,6 +273,372 @@ def _is_persistent_accumulator_storage(op: Any) -> bool:
     return _is_carried_reduction_storage(op) or _is_loop_carry_storage(op)
 
 
+@dataclass(frozen=True)
+class DrainPlan:
+    """Validated post-loop materialization plan for one resident loop carry.
+
+    A ``for_each_tile`` accumulator returned from the graph is both a carry
+    storage and a graph output.  The ordinary output clone runs after the
+    storage's pre-loop initializer, so it would copy the initial value; the
+    plan instead anchors one output clone after the whole counted loop.
+    Computed once, pre-solve, by :func:`validated_drain_plans` and consumed by
+    the residency gate, the lifetime extension and the post-solve push -- never
+    re-derived from graph state that later passes mutate.
+
+    Attributes
+    ----------
+    storage_name:
+        The carry's initial storage (also the single graph-output entry).
+    update_name:
+        Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
+    loop_group:
+        The update's ``loop_info.loop_group_id`` -- exactly one level.
+    anchor_op:
+        The last operation of the loop's group subtree, as an ``Operation``
+        object (identity survives other clones; a saved index would not).
+        The drain is inserted immediately after it.
+    loop_origin:
+        The exact FX ``while_loop`` HOP node retained by the splice; the drain
+        clone's FX node is inserted after it.
+    """
+
+    storage_name: str
+    update_name: str
+    loop_group: tuple[int, ...]
+    anchor_op: Operation
+    loop_origin: Any
+
+
+def _access_group_path(op: Operation) -> tuple[int, ...]:
+    """The op's counted-loop group path, mirroring utils.group_path exactly."""
+
+    if isinstance(op, ExternKernel):
+        return ()
+    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+
+def _graph_output_buffer_name(entry: Any) -> Optional[str]:
+    """The buffer name a ``graph_outputs`` entry names, or None if unwrappable."""
+
+    node = entry
+    while not isinstance(node, Buffer):
+        node = getattr(node, "data", None)
+        if node is None:
+            return None
+    return node.get_name()
+
+
+def _is_reinterpret_output_entry(entry: Any) -> bool:
+    """Whether a ReinterpretView sits anywhere between the entry and its buffer.
+
+    ``GraphEditor.change_graph_output`` keeps such a view and repoints its
+    ``.data`` in place.  The splice may have handed that same view object to the
+    carry update as its mutation target (an init that is a view, e.g.
+    ``zeros_like`` of a transposed tensor, reaches the output as
+    ``TensorBox(StorageBox(view))``), so repointing it would make the in-loop
+    update write the drain clone instead of the carry.
+    """
+
+    node = entry
+    while not isinstance(node, Buffer):
+        if isinstance(node, ReinterpretView):
+            return True
+        node = getattr(node, "data", None)
+        if node is None:
+            return False
+    return False
+
+
+def validated_drain_plans(
+    graph: GraphLowering, *, division_is_fixed: bool
+) -> dict[str, DrainPlan]:
+    """The validated post-loop materialization plan for every eligible carry.
+
+    Returns ``{}`` unless boundary cloning is on and the joint path (which can
+    choose the update's division) is running; the placement path keeps today's
+    refusal.  A storage is planned only if every predicate holds, and any
+    failure means that storage is simply absent from the plan -- every consumer
+    then keeps today's behavior (the carry stays in HBM and no clone is ever
+    created):
+
+    P1  boundary cloning is enabled;
+    P2  exactly one ``graph.graph_outputs`` entry names the storage, and no
+        ReinterpretView sits anywhere on its wrapper chain
+        (``change_graph_output`` replaces the first match, so an aliased entry
+        declines, and it repoints a view in place);
+    P3  the storage op carries a ``LoopCarryRecord`` whose ``storage_name`` is
+        its own name and whose ``update_name`` resolves to exactly one op;
+    P4  that update is the only op mutating the storage;
+    P5  the update's group path is exactly one level, every in-loop access of
+        the storage is that update, and the storage itself (the initializer)
+        has no loop membership;
+    P6  the retained FX ``while_loop`` origin lives in this graph;
+    P7  the loop's group subtree is non-empty, so its last member -- the
+        lowered insertion anchor -- exists;
+    P8  the storage has an FX origin in this graph: the drain's FX clone reads
+        that node.  The pre-loop ownership copy of a caller's init is built
+        without origins by design (``while_loop_bridge._make_copying_buffer``),
+        so such a carry declines.
+
+    Intentional false negatives (safe declines, not bugs): a carry whose
+    initializer is a view (the mutation target names the view, not the backing
+    buffer), a carry with any second in-loop access, and a loop whose group is
+    nested in another.  Every one of them keeps today's HBM behavior.
+
+    The plan is data, not a decision: the existing solver still chooses
+    residency and ownership, and an HBM selection emits no copy at all.
+    """
+
+    if division_is_fixed or not clone_at_graph_boundaries():
+        return {}
+    fx_graph = getattr(graph, "graph", None)
+    if fx_graph is None:
+        return {}
+    op_by_name: dict[str, Operation] = {op.name: op for op in graph.operations}
+    mutators: dict[str, list[Operation]] = defaultdict(list)
+    for op in graph.operations:
+        layout = getattr(op, "layout", None)
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            mutators[layout.target.get_name()].append(op)
+
+    plans: dict[str, DrainPlan] = {}
+    for name, storage_op in op_by_name.items():
+        record = getattr(storage_op, "_loop_carry_record", None)
+        if not isinstance(record, LoopCarryRecord):
+            continue
+        if record.storage_name != name:
+            continue
+        loop_origin = record.loop_origin
+        if loop_origin is None or getattr(loop_origin, "graph", None) is not fx_graph:
+            continue
+        if origin_in_graph(getattr(storage_op, "origins", ()), fx_graph) is None:
+            continue
+        update_op = op_by_name.get(record.update_name)
+        if update_op is None:
+            continue
+        update_group = _access_group_path(update_op)
+        if len(update_group) != 1:
+            continue
+        if _access_group_path(storage_op):
+            continue
+        storage_mutators = mutators.get(name, [])
+        if len(storage_mutators) != 1 or storage_mutators[0] is not update_op:
+            continue
+        in_loop_access_elsewhere = any(
+            op is not update_op
+            and _access_group_path(op)
+            and any(
+                dep.name == name
+                for dep in op_read_writes(op).reads | op_read_writes(op).writes
+            )
+            for op in graph.operations
+        )
+        if in_loop_access_elsewhere:
+            continue
+        output_entries = [
+            index
+            for index, entry in enumerate(graph.graph_outputs)
+            if _graph_output_buffer_name(entry) == name
+        ]
+        if len(output_entries) != 1:
+            continue
+        if _is_reinterpret_output_entry(graph.graph_outputs[output_entries[0]]):
+            continue
+        anchor_op = None
+        for op in graph.operations:
+            op_group = _access_group_path(op)
+            if op_group and op_group[0] == update_group[0]:
+                anchor_op = op
+        if anchor_op is None:
+            continue
+        plans[name] = DrainPlan(
+            storage_name=name,
+            update_name=record.update_name,
+            loop_group=update_group,
+            anchor_op=anchor_op,
+            loop_origin=loop_origin,
+        )
+    return plans
+
+
+def _drain_lifetime_end_overrides(
+    lifetime_end_overrides: dict[str, int],
+    drain_plans: Mapping[str, DrainPlan],
+    graph_end: int,
+) -> None:
+    """Extend every planned drain storage's lifetime to the graph exit, in place.
+
+    All solver intervals are pre-insertion indices and ``graph_end =
+    len(graph.operations)`` is the exclusive end every pre-insertion op lies
+    before.  Extending a storage's end to ``graph_end`` means no solver buffer
+    can share its address after its birth (a sharer would have to be dead
+    strictly before the fill), which is what makes the post-solve drain read
+    safe regardless of where the scheduler eventually places it.  This only
+    removes reuse; it adds no unpriced occupancy and no cost term.
+    """
+
+    for planned_name in drain_plans:
+        lifetime_end_overrides[planned_name] = max(
+            lifetime_end_overrides.get(planned_name, 0), graph_end
+        )
+
+
+def _clear_loop_membership_metadata(op: Operation) -> None:
+    """Drop loop/carry metadata from a clone placed outside its counted loop.
+
+    ``copy_op_metadata`` copies the storage's (drain) or the first consumer's
+    (input clone) attributes onto the clone, but a post-loop drain and a
+    hoisted pre-loop input clone are neither loop members nor carries: a
+    surviving ``loop_info`` would re-group the clone into the counted loop at
+    scheduling time (``_loop_group_id``) and give it another op's per-read tile
+    advance in codegen (``_general_tile_advance``), and the records would
+    misclassify it in ``_build_cd_bound_buffers``.  Only the drain branch and
+    the hoisted-input branch of ``_push_allocation`` call this; every other
+    clone keeps today's metadata-copy behavior.
+    """
+
+    for attr in ("loop_info", "_loop_carry_record", "_carried_reduction_record"):
+        if hasattr(op, attr):
+            delattr(op, attr)
+
+
+def _hoisted_input_clone_entry(
+    graph: GraphLowering, name: str, users: Sequence[Operation]
+) -> Optional[Operation]:
+    """Where an LX clone of graph input ``name`` may run once, before its loop.
+
+    An input clone copies the whole input (``clone_lowering`` over the input's
+    full ranges), never a per-trip window: each consumer keeps its own index,
+    tile advance included, and only the buffer it names changes.  So when the
+    first consumer runs inside a counted loop, re-running the clone on every
+    trip rewrites the same LX bytes with the same values; it can run once
+    before the loop.  ``counted_loop_lifetime_overrides`` already reserves the
+    input's LX address from that loop's entry to its end, so the move changes
+    no address, no lifetime and no capacity -- only how often the HBM read
+    happens.
+
+    Returns the loop's entry operation, or ``None`` (clone stays where it is
+    today) when the first consumer is not a counted-loop member, when any
+    operation mutates the input (a per-trip clone would then observe the
+    writes), or when an opaque extern kernel runs between the loop entry and
+    the first consumer (the clone's LX bytes would be live across it, which
+    the residency gate only checked from the first use on), or when the
+    input's last reader is its outermost loop's last member: no lifetime end
+    override widens the clone then, so the reverse-parent in-place edge
+    (``_handoff_parent_end``) may hand its slot to that reader, and the next
+    trip would read the overwritten bytes that a per-trip clone re-copies.
+    A multi-output fallback anywhere in the outer loop's span also prevents
+    hoisting: it can run before the loop and overwrite the clone's LX bytes,
+    and context switching does not bracket it.
+    """
+    if not users:
+        return None
+    entry = counted_loop_entry(graph.operations, users[0])
+    if entry is None:
+        return None
+    for op in graph.operations:
+        try:
+            if name in op.get_mutation_names():
+                return None
+        except NotImplementedError:
+            return None
+    start = graph.operations.index(entry)
+    first_use = graph.operations.index(users[0])
+    if _extern_kernel_in_live_range(graph, list(range(start, first_use + 1))):
+        return None
+    outer = counted_loop_group_path(entry)[:1]
+    end = max(
+        i
+        for i, op in enumerate(graph.operations)
+        if counted_loop_group_path(op)[:1] == outer
+    )
+    if _multi_output_extern_kernel_in_live_range(graph, [start, end]):
+        return None
+    last_outer = counted_loop_group_path(users[-1])[:1]
+    if last_outer and not any(
+        counted_loop_group_path(op)[:1] == last_outer
+        for op in graph.operations[graph.operations.index(users[-1]) + 1 :]
+    ):
+        return None
+    return entry
+
+
+def _assert_drain_plan_committed(
+    graph: GraphLowering,
+    storage_buffer: LifetimeBoundBuffer,
+    buffers_by_name: Mapping[str, LifetimeBoundBuffer],
+    op_by_name: dict[str, Operation],
+    plan: DrainPlan,
+) -> None:
+    """Fail-fast checks for a planned drain the solver committed to LX.
+
+    Reaching this function means the pre-solve plan was accepted and the
+    solver chose the storage resident, so every fact below must hold; a
+    failure is an internal error, not a decline (all refusal happens before
+    the solve, in :func:`validated_drain_plans`, and the HBM fallback simply
+    never gets here).  The ownership check recomputes the carry edge's
+    admitted ``(storage, update)`` division pairs from the chosen divisions --
+    the same geometry ``constrain_residency`` gated on -- so a resident
+    storage whose update does not actually match its slicing can never emit a
+    drain.
+    """
+
+    if plan.anchor_op not in graph.operations:
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: lowered anchor "
+            f"{plan.anchor_op.get_name()} is no longer in graph.operations; "
+            "the plan was validated pre-solve, so this is an internal error"
+        )
+    if getattr(plan.loop_origin, "graph", None) is not graph.graph:
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: retained FX loop origin "
+            f"{plan.loop_origin} is not in the current lowering graph"
+        )
+    storage_op = graph.get_buffer(plan.storage_name)
+    update_op = op_by_name.get(plan.update_name)
+    if update_op is None:
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: tagged update "
+            f"{plan.update_name} is missing from graph.operations"
+        )
+    if (
+        getattr(storage_op, "iteration_space_ownership", None) is None
+        or getattr(update_op, "iteration_space_ownership", None) is None
+    ):
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: committed physical "
+            "ownership is missing on the storage or its update"
+        )
+    update_buffer = buffers_by_name.get(plan.update_name)
+    if not isinstance(storage_buffer, CoreDivisionBuffer) or not isinstance(
+        update_buffer, CoreDivisionBuffer
+    ):
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: storage or update is not a "
+            "core-division solver buffer"
+        )
+    if storage_buffer.chosen_division is None or update_buffer.chosen_division is None:
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: solver left the storage or "
+            "update division unchosen"
+        )
+    edge = CoOptimizingAllocator._loop_carry_update_edge(update_op, op_by_name, {})
+    pairs = (
+        edge.match_pairs(
+            [cd.splits for cd in storage_buffer.core_divisions],
+            [cd.splits for cd in update_buffer.core_divisions],
+        )
+        if edge is not None
+        else []
+    )
+    if (storage_buffer.chosen_division, update_buffer.chosen_division) not in pairs:
+        raise AssertionError(
+            f"drain plan for {plan.storage_name}: committed divisions "
+            f"({storage_buffer.chosen_division}, "
+            f"{update_buffer.chosen_division}) are not an admitted carry pair"
+        )
+
+
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
 # set -- rather than a live instance, and build a fresh one per solve.
@@ -339,6 +709,11 @@ class ScratchpadAllocator:
         self.post_optimization_passes = post_optimization_passes
         self.layout_planning: Optional[LayoutSolverFactory] = layout_planning
         self.size = size
+        # Validated post-loop materialization plans, computed once per solve by
+        # the joint allocator's _prepare_buffers and retained through the
+        # residency gate, the lifetime extension and the post-solve push.  The
+        # placement path leaves this empty, which is its pre-change behavior.
+        self._validated_drain_plans: dict[str, DrainPlan] = {}
 
     @staticmethod
     def _planned_lx_buffer_names(
@@ -578,6 +953,7 @@ class ScratchpadAllocator:
         buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]],
         planned_lx_buffers: frozenset[str] = frozenset(),
         lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
+        drain_plans: Collection[str] = (),
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -684,10 +1060,12 @@ class ScratchpadAllocator:
                 return "graph output (no clone)"
             if name in reinterpret_output_names:
                 return "graph output is a ReinterpretView"
-            if name in mutated_buffers:
+            if name in mutated_buffers and name not in drain_plans:
                 # The output clone is inserted after the producer, so it would
                 # copy the value from before a later in-place update (e.g. a
-                # loop carry returned from the graph).
+                # loop carry returned from the graph).  A validated drain plan
+                # re-anchors that clone after the whole counted loop instead, so
+                # only the plan clears this refusal.
                 return "graph output mutated after production"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
@@ -772,6 +1150,7 @@ class ScratchpadAllocator:
         ncores_reasons: Optional[dict[str, str]] = None,
         planned_lx_buffers: frozenset[str] = frozenset(),
         lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
+        drain_plans: Collection[str] = (),
     ) -> dict[str, Optional[str]]:
         """:meth:`_buffer_residency_reason` over ``names``, as ``name -> reason``.
 
@@ -818,6 +1197,7 @@ class ScratchpadAllocator:
                 buf_user_deps=buf_user_deps,
                 planned_lx_buffers=planned_lx_buffers,
                 lx_relayout_plans=lx_relayout_plans,
+                drain_plans=drain_plans,
             )
             for name in names
         }
@@ -1465,6 +1845,9 @@ class ScratchpadAllocator:
 
         buffer_users = get_buffer_users(graph)
         graph_editor = GraphEditor(graph)
+        drain_plans = self._validated_drain_plans
+        op_by_name = {op.name: op for op in graph.operations} if drain_plans else {}
+        buffers_by_name = {buf.name: buf for buf in buffers} if drain_plans else {}
 
         for b in buffers:
             if b.address is None or b.name.startswith("__spyre_lx_relayout__:"):
@@ -1472,18 +1855,52 @@ class ScratchpadAllocator:
 
             buf = graph.get_buffer(b.name)
             if b.name in inputs:
+                # A loop-invariant input clone runs once, before the counted
+                # loop its consumers run in, instead of on every trip.
+                hoist_before = _hoisted_input_clone_entry(
+                    graph, b.name, buffer_users[b.name]
+                )
                 new_buffer = graph_editor.push_allocation_with_clone(
                     buf,
                     buffer_users[b.name],
                     input=True,
                     lx_view=b.lx_view,
+                    lower_before=hoist_before,
                 )
+                if hoist_before is not None:
+                    _clear_loop_membership_metadata(new_buffer)
                 self._set_one_allocation(new_buffer, b.address, b.lx_view)
 
             elif b.name in outputs:
-                new_buffer = graph_editor.push_allocation_with_clone(
-                    buf, buffer_users[b.name], input=False
-                )
+                drain_plan = drain_plans.get(b.name)
+                if drain_plan is not None:
+                    # Post-loop materialization of a resident carry that is
+                    # also the graph output.  The plan was validated before the
+                    # solve and the solver committed this buffer to LX, so
+                    # every fact it relies on must still hold here: a missing
+                    # anchor or ownership is an internal error, never a late
+                    # fallback that would return the pre-loop value.
+                    _assert_drain_plan_committed(
+                        graph, b, buffers_by_name, op_by_name, drain_plan
+                    )
+                    new_buffer = graph_editor.push_allocation_with_clone(
+                        buf,
+                        [],
+                        input=False,
+                        private=True,
+                        after_fx=drain_plan.loop_origin,
+                        lower_anchor=drain_plan.anchor_op,
+                    )
+                    # Drain-only metadata hygiene: the clone copied the
+                    # storage's attributes, but it is neither a loop member nor
+                    # a carry.  The scheduler-level
+                    # ``_loop_group_id(drain_node) is None`` is asserted by the
+                    # captured-order test; here the op-level absence is exact.
+                    _clear_loop_membership_metadata(new_buffer)
+                else:
+                    new_buffer = graph_editor.push_allocation_with_clone(
+                        buf, buffer_users[b.name], input=False
+                    )
                 self._set_one_allocation(buf, b.address, b.lx_view)
                 graph_editor.change_graph_output(buf, new_buffer)
 
@@ -2255,6 +2672,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         lx_relayout_plans: list[LXRelayoutPlan] | None = None,
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
+        # Validate the post-loop drain plans exactly once, here, before the
+        # solver runs: the residency gate, the lifetime extension and the push
+        # must all consume this same object.  Re-deriving it after the solve
+        # could disagree with what residency actually admitted.
+        self._validated_drain_plans = validated_drain_plans(
+            graph, division_is_fixed=False
+        )
         in_place = self._determine_in_place_division_invariant(graph)
         divisions = self._division_map(graph, allow_deferred_read_candidates=True)
         pending = {
@@ -2846,6 +3270,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         mem_usage: dict,
         lifetimes: dict[str, list[int]],
+        drain_plans: Collection[str] = (),
     ) -> dict[str, Optional[str]]:
         """Per-buffer residency verdict: ``None`` if the buffer may be pinned in
         LX, else the reason it may not.
@@ -2860,7 +3285,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         therefore not needed here.
         """
         return self._residency_reasons(
-            graph, list(mem_usage), division_is_fixed=False, lifetimes=lifetimes
+            graph,
+            list(mem_usage),
+            division_is_fixed=False,
+            lifetimes=lifetimes,
+            drain_plans=drain_plans,
         )
 
     def _build_cd_bound_buffers(
@@ -2884,6 +3313,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         lifetime_start_overrides, lifetime_end_overrides = (
             counted_loop_lifetime_overrides(graph)
         )
+        # A planned drain is a new post-solve op that reads the carry storage
+        # after the loop, so the storage must stay live to the graph exit.  This
+        # is inside the solve, so the extension only removes reuse and stays
+        # priced -- it adds no cost term and no capacity.
+        drain_plans = self._validated_drain_plans
+        if drain_plans:
+            _drain_lifetime_end_overrides(
+                lifetime_end_overrides, drain_plans, len(graph.operations)
+            )
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -2891,7 +3329,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
-        residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
+        residency_by_buf = self._residency_by_buf(
+            graph, mem_usage, lifetimes, drain_plans
+        )
 
         # Resolve every compiler-tagged carry before constructing any buffer.
         # If its aliased update cannot be represented as a physical-ownership
@@ -2971,7 +3411,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             residency_reason = residency_by_buf[output_name]
 
             buf_divisions = divisions[output_name]
-            parents = list(in_place.get(output_name, []))
+            # Drain plans can extend a parent's lifetime after the in-place
+            # candidates were computed. Recheck adjacency with the same final
+            # bounds handed to the solver so stale handoffs cannot reach it.
+            parents = [
+                parent
+                for parent in in_place.get(output_name, [])
+                if _handoff_parent_end(parent, lifetimes, lifetime_end_overrides)
+                == _handoff_child_start(
+                    output_name, lifetimes, lifetime_start_overrides
+                )
+            ]
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
             cd_parent_matches = self._cd_parent_matches(
@@ -3658,6 +4108,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         is not None
                     ):
                         continue
+                    source_span, destination_span = _span(pv), _span(cv)
+                    if (
+                        source_span is None
+                        or destination_span is None
+                        or destination_span > self.size
+                    ):
+                        continue
                     key = (
                         pv,
                         cv,
@@ -3679,13 +4136,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         )
                     cost = pair_cost[key]
                     if cost is None:
-                        continue
-                    source_span, destination_span = _span(pv), _span(cv)
-                    if (
-                        source_span is None
-                        or destination_span is None
-                        or destination_span > self.size
-                    ):
                         continue
                     candidates.append(
                         RelayoutCandidate(

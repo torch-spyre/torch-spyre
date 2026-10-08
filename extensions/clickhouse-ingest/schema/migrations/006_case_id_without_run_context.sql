@@ -134,7 +134,7 @@ WHERE test_case_id IN (SELECT old_id FROM case_id_rekey)
 -- recount is counted twice, so run a pass while no ingest is writing.
 DELETE FROM run_case_counters WHERE run_id IN (SELECT run_id FROM case_id_rekey_runs);
 
-INSERT INTO run_case_counters
+INSERT INTO run_case_counters (run_id, component, total_tests, passed, failed, errors, skipped, xfail, xpass)
 SELECT
     run_id,
     component,
