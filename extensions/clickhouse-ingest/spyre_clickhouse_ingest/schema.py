@@ -61,6 +61,10 @@ TIMING_STATE_VALUES = {
 TIMING_EXECUTOR_VALUES = frozenset(
     {"gha-ephemeral", "gha-standing", "jenkins-local", "jenkins-job", ""}
 )
+TARGET_TYPE_VALUES = frozenset({"jenkins", "gha_dispatch", "webhook"})
+DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
+REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
@@ -630,6 +634,89 @@ class CiRunTimings(Table):
         return ordered
 
 
+class ArtifactSubscriptions(Table):
+    """Who an artifact triggers; one row per version, the newest updated_at wins."""
+
+    name = "artifact_subscriptions"
+    columns = (
+        "subscription_id",
+        "updated_at",
+        "enabled",
+        "tag_family",
+        "tag_pattern",
+        "tag_props",
+        "component",
+        "arch",
+        "kind",
+        "artifact_name",
+        "not_before",
+        "target_type",
+        "target",
+        "params",
+        "credential_id",
+        "owner",
+        "notes",
+        "props",
+    )
+    required = ("subscription_id", "target")
+    enums = (("target_type", TARGET_TYPE_VALUES),)
+
+
+class DispatchRequests(Table):
+    """A person's or pipeline's "run this subscription against this artifact"."""
+
+    name = "dispatch_requests"
+    columns = (
+        "request_id",
+        "requested_at",
+        "subscription_id",
+        "artifact_id",
+        "tag",
+        "requested_by",
+        "requester",
+        "params",
+        "reason",
+        "props",
+    )
+    required = ("request_id", "subscription_id", "artifact_id")
+    enums = (("requested_by", REQUESTED_BY_VALUES),)
+
+
+class ArtifactDispatches(Table):
+    """One dispatch, upserted on every state change; written only by the dispatcher."""
+
+    name = "artifact_dispatches"
+    columns = (
+        "dispatch_id",
+        "updated_at",
+        "subscription_id",
+        "artifact_id",
+        "tag",
+        "tag_ts",
+        "requested_by",
+        "requester",
+        "request_id",
+        "requested_at",
+        "state",
+        "target_type",
+        "target",
+        "params",
+        "target_url",
+        "build_url",
+        "error",
+        "attempts",
+        "next_attempt_at",
+        "dispatcher_url",
+        "props",
+    )
+    required = ("dispatch_id", "subscription_id", "artifact_id")
+    enums = (
+        ("requested_by", DISPATCHED_BY_VALUES),
+        ("state", DISPATCH_STATE_VALUES),
+        ("target_type", TARGET_TYPE_VALUES | {""}),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -643,6 +730,9 @@ ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
 PIPELINE_RUNS = PipelineRuns
 CI_RUN_TIMINGS = CiRunTimings
+ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+DISPATCH_REQUESTS = DispatchRequests
+ARTIFACT_DISPATCHES = ArtifactDispatches
 
 TABLES = {
     t.name: t
@@ -659,6 +749,9 @@ TABLES = {
         CapabilityRuns,
         PipelineRuns,
         CiRunTimings,
+        ArtifactSubscriptions,
+        DispatchRequests,
+        ArtifactDispatches,
     )
 }
 
