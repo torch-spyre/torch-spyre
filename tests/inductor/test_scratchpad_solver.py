@@ -1672,6 +1672,55 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(result["mm_out"].chosen_division)
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "division gate tests need ortools")
+class TestCpSatDivisionGate(TestCase):
+    def test_gate_preserves_exact_allowed_assignments(self):
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _gate_divisions
+
+        class Solutions(cp_model.CpSolverSolutionCallback):
+            def __init__(self, variables):
+                super().__init__()
+                self.variables = variables
+                self.values = set()
+
+            def on_solution_callback(self):
+                self.values.add(tuple(self.value(v) for v in self.variables))
+
+        pairs = [(0, 0), (0, 2), (1, 1), (1, 1)]
+        for compatible, shared, fixed, negated in (
+            ([], False, False, False),
+            (pairs, False, False, False),
+            (pairs, False, False, True),
+            (pairs, True, False, False),
+            (pairs, False, True, False),
+            ([(0, 0)], True, True, False),
+        ):
+            with self.subTest(
+                compatible=compatible, shared=shared, fixed=fixed, negated=negated
+            ):
+                model = cp_model.CpModel()
+                source = model.new_int_var(0, 0 if fixed else 1, "source")
+                dest = source if shared else model.new_int_var(0, 2, "dest")
+                enabled = model.new_bool_var("enabled")
+                gate = enabled.Not() if negated else enabled
+                _gate_divisions(model, compatible, source, dest, gate)
+                self.assertEqual(len(model.proto.variables), 2 if shared else 3)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                solver.parameters.enumerate_all_solutions = True
+                solutions = Solutions([source, dest, enabled])
+                self.assertEqual(solver.solve(model, solutions), cp_model.OPTIMAL)
+                expected = {
+                    (i, j, flag)
+                    for i, j, flag in itertools.product(
+                        range(1 if fixed else 2), range(3), range(2)
+                    )
+                    if (not shared or i == j)
+                    and ((not flag if not negated else flag) or (i, j) in compatible)
+                }
+                self.assertEqual(solutions.values, expected)
+
+
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat printer tests need ortools")
 class TestSympyExprToCpSatPrinter(TestCase):
     """Direct unit tests for ``_SympyExprToCpSat``'s Piecewise/relational-
@@ -1743,6 +1792,59 @@ class TestSympyExprToCpSatPrinter(TestCase):
             solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
             expected = 1 + 2 * value if value >= 3 else 5
             self.assertEqual(solver.ObjectiveValue(), expected)
+
+    def test_repeated_piecewise_guards_preserve_every_assignment(self):
+        # Different prices share overlapping guards. The first matching branch
+        # must win, and repeated terms must not duplicate the guard encoding.
+        x, y = sympy.symbols("x y", integer=True)
+        expressions = [
+            sympy.Piecewise(
+                (k * x + y, sympy.And(x >= 1, y <= 1)),
+                (x - k * y, sympy.Or(x >= 2, y <= 0)),
+                (k + x * y, True),
+            )
+            for k in range(1, 17)
+        ]
+        model = cp_model.CpModel()
+        variables = {name: model.new_int_var(-1, 3, name) for name in ("x", "y")}
+        printer = _SympyExprToCpSat(model, variables, {})
+        costs = [printer.convert(expr) for expr in expressions]
+        guards = [
+            v
+            for v in model.proto.variables
+            if v.name.startswith(("cond_", "and_", "or_"))
+        ]
+        self.assertLessEqual(len(guards), 12)
+        model.minimize(sum(costs))
+        for a, b in itertools.product(range(-1, 4), repeat=2):
+            with self.subTest(x=a, y=b):
+                fixed = model.clone()
+                fixed.add(variables["x"] == a)
+                fixed.add(variables["y"] == b)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                expected = sum(expr.subs({x: a, y: b}) for expr in expressions)
+                self.assertAlmostEqual(solver.objective_value, float(expected))
+
+    def test_repeated_constant_conditions_do_not_create_decisions(self):
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        variable = model.new_int_var(-2, 2, "y")
+        printer = _SympyExprToCpSat(model, {"x": 2, "y": variable}, {})
+        expressions = [
+            sympy.Piecewise((k * y, x < k), (y - k, True)) for k in range(1, 17)
+        ]
+        model.minimize(sum(printer.convert(expr) for expr in expressions))
+        self.assertFalse(any(v.name.startswith("cond_") for v in model.proto.variables))
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 1
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+        expected = min(
+            sum(expr.subs({x: 2, y: value}) for expr in expressions)
+            for value in range(-2, 3)
+        )
+        self.assertAlmostEqual(solver.objective_value, float(expected))
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty

@@ -180,13 +180,11 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     if not compatible:
         model.Add(enforce_lit == 0)
         return
-    pair_lits = []
-    for i, j in compatible:
-        lit = model.NewBoolVar("")
-        model.Add(src_div == i).OnlyEnforceIf(lit)
-        model.Add(dst_div == j).OnlyEnforceIf(lit)
-        pair_lits.append(lit)
-    model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
+    # Let CP-SAT encode the relation as a table, instead of introducing a
+    # Boolean and two implications for every compatible pair on every edge.
+    model.add_allowed_assignments([src_div, dst_div], compatible).only_enforce_if(
+        enforce_lit
+    )
 
 
 def _eq_fact(rel):
@@ -645,7 +643,17 @@ class _SympyExprToCpSat(Printer):
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
+        # These caches belong to one converter/model. A class-level @cache
+        # would retain every converter and its CP model across compilations.
+        self._expr_cache: dict = {}
+        self._condition_cache: dict = {}
+        self._conjunction_cache: dict = {}
         super().__init__()
+
+    def _print(self, expr, **kwargs):
+        if expr not in self._expr_cache:
+            self._expr_cache[expr] = super()._print(expr, **kwargs)
+        return self._expr_cache[expr]
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
@@ -1119,24 +1127,42 @@ class _SympyExprToCpSat(Printer):
 
     @memoize_method
     def _print_condition(self, cond):
+        if cond in self._condition_cache:
+            return self._condition_cache[cond]
         if not isinstance(cond, sympy.core.relational.Relational):
             return self._print(cond)
         cond_expr = self._print(cond)
+        if isinstance(cond_expr, bool):
+            # Fixed divisions turn many symbolic predicates into constants.
+            var = self._model.new_constant(int(cond_expr))
+            self._condition_cache[cond] = var
+            return var
         not_cond_expr = self._print(sympy.Not(cond))
         var = self._model.new_bool_var(f"cond_{self._count}")
         self._count += 1
         self._model.Add(cond_expr).OnlyEnforceIf(var)
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
+        self._condition_cache[cond] = var
         return var
+
+    def _conjunction(self, lits):
+        # Expanded cost terms often have different values under exactly the
+        # same branch guard. Share the guard even when the Piecewise differs.
+        key = tuple(sorted({lit.index for lit in lits}))
+        if key not in self._conjunction_cache:
+            var = self._model.new_bool_var(f"and_{self._count}")
+            self._count += 1
+            self._model.add_bool_and(lits).only_enforce_if(var)
+            self._model.add_bool_or([lit.Not() for lit in lits]).only_enforce_if(
+                var.Not()
+            )
+            self._conjunction_cache[key] = var
+        return self._conjunction_cache[key]
 
     @memoize_method
     def _print_And(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
-        and_var = self._model.new_bool_var(f"and_{self._count}")
-        self._count += 1
-        self._model.AddBoolAnd(lits).OnlyEnforceIf(and_var)
-        self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
-        return and_var
+        return self._conjunction(lits)
 
     @memoize_method
     def _print_Or(self, expr):
