@@ -79,6 +79,15 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
+    def generate_arange_tensor_fallback(self, node):
+        length, column = node.constant_args
+        dtype = node.layout.dtype
+        device = node.layout.device
+        self.writeline(
+            f"{node.get_name()} = spyre_arange_tensor({length}, "
+            f'torch.device("{device}"), {dtype}, column={column})'
+        )
+
     def _generate_extern_kernel_alloc_helper(self, extern_kernel, args):
         """Mark calls whose eager result is consumed inside this graph.
 
@@ -199,7 +208,7 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
         self.imports.splice(
             """
                 from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, spyre_arange_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
                 import subprocess

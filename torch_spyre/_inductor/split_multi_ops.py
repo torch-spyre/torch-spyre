@@ -372,6 +372,11 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
     return tuple(args), clean_kw, out_dtype
 
 
+def _index_syms(n: int) -> tuple[sympy.Symbol, ...]:
+    """The index symbols _trace_inner_fn passes to a traced inner_fn."""
+    return tuple(sympy.Symbol(f"_i{k}") for k in range(n))
+
+
 def _trace_inner_fn(op):
     """Trace the inner_fn of an operation to extract its structure.
 
@@ -384,7 +389,7 @@ def _trace_inner_fn(op):
         List of traced operations or None if tracing failed
     """
     ranges = op.data.ranges
-    syms = tuple(sympy.Symbol(f"_i{k}") for k in range(len(ranges)))
+    syms = _index_syms(len(ranges))
     tracer = _TracingHandler(V.ops)
     try:
         with tracer:
@@ -458,10 +463,14 @@ def _lower_fx_node(node, gl, ops, idx):
         The created buffer
     """
     tb = gl.run_node(node)
+    gl.env[node] = tb  # run_node does not record it in the env
     buf = tb.data.data
     gl.operations.remove(buf)
     ops.insert(idx, buf)
     gl.name_to_buffer[buf.get_name()] = buf
+    # A later split child resolves an input name through gl.env alone, and
+    # neither node nor buffer existed when the env was seeded, so register here.
+    gl.env[node] = tb
     return buf
 
 
@@ -541,6 +550,7 @@ def _make_intermediate_bufs(
             # For ExternKernel like SpyreConstantFallback, extract the raw buffer
             # only for positioning — don't replace it with raw buffer in operations.
             tb = gl.run_node(new_node)
+            gl.env[new_node] = tb  # run_node does not record it in the env
             # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
             # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
@@ -558,6 +568,9 @@ def _make_intermediate_bufs(
             operations.insert(insert_idx, new_buf)
             buf_name = new_buf.get_name()
             vid_to_bufname[vid] = buf_name
+            # Reachable as an input to a later split child, which resolves an
+            # input name through gl.env alone.
+            gl.env[new_node] = tb
             # Track this materialized constant for the handler's constant_map.
             constant_map[(fill_value, out_dtype)] = buf_name
             insert_idx += 1
@@ -785,6 +798,53 @@ def validate_ops(graph: GraphLowering) -> None:
             )
 
 
+def _validate_split_supported(op, trace, intermediate_ops) -> None:
+    """Refuse to split ``op`` when an intermediate would combine view loads.
+
+    An intermediate is materialized as an FX op over the base buffers, which
+    reproduces a load only at its buffer's canonical position: the buffer's
+    strides on the trailing output index symbols, aligned as for broadcasting.
+    A load at an offset or through a view (e.g. one select() row) is elsewhere.
+    A single such operand is still reloaded at its own index on replay, but two
+    tensor operands are combined over the base buffers and pair the wrong
+    elements.
+    """
+    # A reduction's loads also index the reduction symbols, which the canonical
+    # position does not model, so only pointwise bodies are checked.
+    if not isinstance(op.data, Pointwise):
+        return
+    syms = _index_syms(len(op.data.ranges))
+    tensors: set[int] = set()  # values derived from any load
+    from_view: set[int] = set()  # values derived from a view load
+    for name, vid, inputs, kwargs in trace:
+        if name == "load":
+            tensors.add(vid)
+            layout = V.graph.get_buffer(kwargs["_name"]).get_layout()
+            lead = len(syms) - len(layout.size)
+            # A buffer of higher rank than the output is read through a view.
+            is_view = lead < 0
+            if not is_view:
+                canonical = layout.offset + sum(
+                    st * syms[lead + k]
+                    for k, (sz, st) in enumerate(zip(layout.size, layout.stride))
+                    if sz != 1
+                )
+                is_view = sympy.expand(kwargs["_index"] - canonical) != 0
+            if is_view:
+                from_view.add(vid)
+        elif any(v in tensors for v in inputs):
+            tensors.add(vid)
+            if any(v in from_view for v in inputs):
+                from_view.add(vid)
+    for name, _, inputs, _ in intermediate_ops:
+        operands = [v for v in inputs if v in tensors]
+        if len(operands) > 1 and any(v in from_view for v in operands):
+            raise Unsupported(
+                f"split_multi_ops: {op.get_name()}: intermediate '{name}' combines "
+                "loads through a view, which split_multi_ops does not support"
+            )
+
+
 def split_multi_ops(graph: GraphLowering):
     """Split multi-ops in a single loop body into separate buffers.
 
@@ -856,6 +916,13 @@ def split_multi_ops(graph: GraphLowering):
 
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
+
+        # Views in a fused intermediate are not supported yet.
+        # TODO: support views. A view load needs its own buffer, and building one
+        # means reconstructing inner_fn from traced index expressions. That
+        # contradicts the rule that a pass wraps inner_fn and never reconstructs
+        # it (#2797), so supporting views means revisiting that rule.
+        _validate_split_supported(op, trace, intermediate_ops)
 
         if _is_reduction_with_to_dtype(op, compute_ops):
             intermediate_ops = compute_ops

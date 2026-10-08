@@ -30,6 +30,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
+from torch_spyre._inductor.decompositions import get_spyre_decomp_table
 from torch_spyre.ops.fallbacks import fallback_ops
 
 from . import config
@@ -53,6 +54,7 @@ from .ir import (
     BroadcastAsyncFallback,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
     SpyreReduction,
     WaitWorkFallback,
 )
@@ -149,17 +151,23 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    The assertion compares against the table ``get_decomp_fn`` supplies, which
+    for Spyre is ``get_spyre_decomp_table``, so both tables are consulted: an op
+    carrying only a Spyre decomposition is just as exposed. ``cumsum`` is in the
+    Spyre table alone.
+
+    Only overloads that lack a lowering are touched, so this composes with
+    ``unregister_lowerings`` (which runs first) and does not clobber Spyre's own
+    lowerings.
     """
+    spyre_decompositions = get_spyre_decomp_table()
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
-            if (
-                overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+            carries_decomp = (
+                overload in lowering.decompositions or overload in spyre_decompositions
+            )
+            if carries_decomp and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -310,7 +318,9 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
     layout passes (which key off ``op.data.origins[].target``) recognize it even
     when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    if a ``target`` origin already exists. The node is registered in the graph
+    env, so split_multi_ops can resolve the buffer by name when a fused body
+    downstream loads it.
     """
 
     def _realized_buffer(node):
@@ -333,6 +343,11 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # Passes that read the node expect what an FX-lowered node carries: an
+    # example value and an env entry.
+    fx_node.meta["val"] = ir.ir_node_to_tensor(result)
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1554,6 +1569,16 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     )
 
 
+@register_spyre_lowering(torch.ops.spyre.arange.default, type_promotion_kind=None)
+def lower_arange(length, dtype, device, column=False):
+    op_overload = getattr(
+        torch.ops.spyre.arange, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreArangeFallback(op_overload, length, dtype, device, column)
+    )
+
+
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
 def lower_constant(value, dtype, device):
     op_overload = getattr(
@@ -1811,6 +1836,9 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
 
+    # Do not realize the result or stamp an origin on it here. split_multi_ops
+    # materializes a fused conversion over its source buffer; realizing it here
+    # would size the conversion of an expanded view at the broadcast extent.
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
     )
@@ -1838,15 +1866,25 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
-    converted_args = []
-    for x in args:
+    def convert(x):
         if isinstance(x, (int, float)):
-            converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            return x
+        converted = to_dtype(x, torch.float32)
 
-    output = fn(*converted_args)
+        # split_multi_ops currently does not support views in a fused
+        # intermediate: it rebuilds the op over the base buffers, so two
+        # conversions of one buffer at different offsets (e.g. two select()
+        # rows) would read the same elements. Work around it by giving each
+        # conversion a buffer of its own.
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        return converted
+
+    output = fn(*[convert(x) for x in args])
 
     if convert_output:
         return to_dtype(output, torch.int64)
