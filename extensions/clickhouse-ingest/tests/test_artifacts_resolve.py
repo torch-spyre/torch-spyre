@@ -96,6 +96,9 @@ class FakeLookup(Lookup):
     def by_digest(self, arch, digest):
         return self._hit("digest", arch, digest)
 
+    def digest_arches(self, digest):
+        return set(self.by.get("arches", {}).get(digest, ()))
+
     def by_rpm_file(self, arch, filename, rpm_name):
         return self._hit("rpm_file", arch, filename, rpm_name)
 
@@ -1135,3 +1138,31 @@ def test_a_recorded_digest_still_takes_its_family_tag_from_the_registry():
         recorded[0],
         "nightly-supply-chain-2026-10-04",
     )
+
+
+def test_a_leaf_named_with_the_wrong_arch_is_refused():
+    served = {
+        LEAF: (LEAF, {"config": {"digest": "sha256:cfg"}}),
+        "sha256:cfg": ("", {"architecture": "ppc64le"}),
+    }
+    assert (
+        resolve(
+            f"image:{IMAGE}@{LEAF}",
+            "ppc64le",
+            registry=FakeRegistry(served),
+            lookup=FakeLookup(),
+        )["arch"]
+        == "ppc64le"
+    )
+    with pytest.raises(ValueError, match="is a ppc64le image"):
+        resolve(
+            f"image:{IMAGE}@{LEAF}",
+            "s390x",
+            registry=FakeRegistry(served),
+            lookup=FakeLookup(),
+        )
+    # No registry answer: the arch the digest is recorded under decides.
+    for registry in ("off", Unauthorized()):
+        with pytest.raises(ValueError, match="recorded as"):
+            resolve(f"image:{IMAGE}@{LEAF}", "s390x", registry=registry,
+                    lookup=FakeLookup(arches={LEAF: {"ppc64le"}}))  # fmt: skip

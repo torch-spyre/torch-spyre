@@ -225,6 +225,18 @@ class Lookup:
             {"d": digest, "at": "@" + digest},
         )
 
+    def digest_arches(self, digest: str) -> set:
+        """Every arch an image digest is recorded under (any arch), folded."""
+        if self.client is None or not digest:
+            return set()
+        rows = self.client.query(
+            f"SELECT DISTINCT arch FROM {self.db}.artifacts WHERE kind = 'image' AND artifact_id IN "
+            f"(SELECT artifact_id FROM {self.db}.artifact_refs WHERE content_digest = {{d:String}} "
+            f"OR endsWith(ref, {{at:String}}))",
+            parameters={"d": digest, "at": "@" + digest},
+        ).result_rows
+        return {DerivedId.arch(a) for (a,) in rows}
+
     def by_tag(self, arch: str, pullspec: str):
         """The one image recorded under a content-addressed `pullspec` (its tag ends in the
         record's id12); a tag with no id12 moves, and one held by several records moved."""
@@ -504,6 +516,16 @@ class _Resolver:
         # A recorded digest needs no registry for its id (the record keeps the id it was filed
         # under); the registry, when it answers, still names its tag in tag_family.
         row = digest and self.lookup.by_digest(self.arch, digest)
+        if not row and digest:
+            # Recorded under another arch: a per-arch leaf named with the wrong --arch.
+            other = self.lookup.digest_arches(digest) - {
+                "multi",
+                DerivedId.arch(self.arch),
+            }
+            if other:
+                raise ValueError(
+                    f"{spec!r} is recorded as {sorted(other)}, not {self.arch!r}"
+                )
         if row:
             resolved, registry_tag = self.tagged(path, digest)
             return self.result(
@@ -518,10 +540,18 @@ class _Resolver:
                 registry.leaf(path, digest, self.arch) if digest else ("", "")
             )
             labels = registry.labels(path, leaf) if leaf else {}
+            # A single-arch manifest is its own leaf: its platform must be the one asked for.
+            platform = (
+                registry.config(path, leaf).get("architecture", "")
+                if leaf and not listed
+                else ""
+            )
         except (NeedsRegistry, OSError) as err:
             return self.offline(host, path, tag, digest, over, body, spec, err)
         if not leaf:
             return None
+        if platform and DerivedId.arch(platform) != DerivedId.arch(self.arch):
+            raise ValueError(f"{spec!r} is a {platform} image, not {self.arch!r}")
         pinned = f"{host}/{path}@{leaf}"
         labelled = _labelled(labels, path, self.arch, over)
         row = (
