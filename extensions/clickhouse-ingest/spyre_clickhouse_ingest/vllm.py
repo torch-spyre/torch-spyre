@@ -197,6 +197,17 @@ def model_from_record(record: dict[str, Any], filename: str) -> str:
     )
 
 
+def branch_or_blank(branch: str) -> str:
+    """The branch, or '' when a caller passed a commit sha in its place: a 7-40 hex string
+    would chart as a branch of its own."""
+    b = (branch or "").strip()
+    return (
+        ""
+        if 7 <= len(b) <= 40 and all(c in "0123456789abcdef" for c in b.lower())
+        else b
+    )
+
+
 def extract_rows(
     results_dir: str,
     branch: str,
@@ -251,7 +262,7 @@ def extract_rows(
                 "actual": float(value),
                 "target": 0.0,
                 "repo": "spyre-inference",
-                "head_branch": branch,
+                "head_branch": branch_or_blank(branch),
                 "workflow_id": int(run_id) if run_id.isdigit() else 0,
                 "job_id": int(job_id) if job_id.isdigit() else 0,
                 "run_attempt": 1,

@@ -770,3 +770,17 @@ def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
     assert report.get("reason", "") == (
         "sha256 mismatch" if where == "rejected" else ""
     )
+
+
+@pytest.mark.parametrize(
+    "branch, recorded",
+    [("main", "main"), ("881a59d", ""), ("881a59d284dd6c225d09c416545766a1718a2f09", ""),
+     ("release-1.2", "release-1.2"), ("cafe", "cafe")],
+)  # fmt: skip
+def test_a_sha_is_never_recorded_as_the_vllm_branch(tmp_path, branch, recorded):
+    from spyre_clickhouse_ingest import vllm
+
+    rows = vllm.extract_rows(
+        str(VLLM_DATA / "results"), branch, "881a59d2", "", "0", "wf", 0
+    )
+    assert {r["head_branch"] for r in rows} == {recorded}
