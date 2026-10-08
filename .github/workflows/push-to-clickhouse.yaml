@@ -203,18 +203,13 @@ jobs:
           which python3
           python3 --version
 
-      # Check out the local composite action (and the ingest script it runs).
-      # The uv/venv/deps/ingest steps that used to live here inline now live in
-      # .github/actions/ingest-xml-to-clickhouse, shared with the perf job's
-      # inline push so there is one ingest implementation. `uses: ./...`
-      # resolves against the workspace, so the action tree must be present.
-      - name: Checkout (for the composite action and ingest script)
+      # The local composite action and the ingest library it runs: `uses: ./...` resolves
+      # against the workspace, so both must be present.
+      - name: Checkout (for the composite action and ingest library)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
             .github/actions
-            .github/scripts/ingest_xml.py
-            # Imported by the script above; omitting it fails the import at startup.
             extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
@@ -344,13 +339,13 @@ jobs:
 
       # ---------------------------------------------------------------------------
       # Parse each XML file and insert rows into ClickHouse.
-      # The Python script is in .github/scripts/ingest_xml.py (see below).
+      # `python -m spyre_clickhouse_ingest results`, via ingest-xml-to-clickhouse.
       # ---------------------------------------------------------------------------
       - name: Extract suite tier from display title
         id: extract-tier
         run: |
           # display_title is "integration-tests (regression)" / "integration-tests (integration)" / etc.
-          # Fall back to empty (ingest_xml.py defaults it to 'unknown') for manual workflow_dispatch
+          # Fall back to empty (the ingest defaults it to 'unknown') for manual workflow_dispatch
           # re-ingests or older runs whose display_title predates this convention.
           TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
           echo "Resolved tier: ${TIER:-<none>}"
@@ -395,7 +390,7 @@ jobs:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           run-attempt: ${{ env.TRIGGERING_RUN_ATTEMPT }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
-          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          artifact: ${{ steps.leg-artifact-id.outputs.value && format('gha:{0}', steps.leg-artifact-id.outputs.value) || '' }}
           # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.
           repository: ${{ env.TRIGGERING_REPO }}
           component: ${{ inputs.component || 'torch-spyre' }}
