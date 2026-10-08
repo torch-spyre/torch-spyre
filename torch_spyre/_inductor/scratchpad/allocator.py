@@ -47,7 +47,6 @@ from torch_spyre._inductor.pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
-    origin_in_graph,
     _prepare_per_core_view,
     _per_core_view_from_prep,
     _per_core_view_on_buf,
@@ -108,6 +107,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.split_multi_ops import _origin_in_graph as origin_in_graph
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
