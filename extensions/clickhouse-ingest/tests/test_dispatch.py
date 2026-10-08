@@ -174,3 +174,19 @@ def test_a_dry_run_request_writes_nothing():
         is False
     )
     assert client.inserts == []
+
+
+def test_store_reads_return_utc_aware_datetimes():
+    """A naive value re-inserted would be read as the agent's local time (IST: 5:30 off)."""
+    from datetime import datetime, timezone
+
+    class Client:
+        def query(self, sql, parameters=None):
+            class R:
+                column_names = ("tag_ts", "tag")
+                result_rows = [(datetime(2026, 9, 29, 14, 26, 32), "t")]
+
+            return R()
+
+    [row] = dispatch.DispatchStore(Client(), "db").matches(datetime.now(timezone.utc))
+    assert row["tag_ts"] == datetime(2026, 9, 29, 14, 26, 32, tzinfo=timezone.utc)

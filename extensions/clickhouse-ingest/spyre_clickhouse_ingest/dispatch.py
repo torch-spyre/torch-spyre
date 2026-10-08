@@ -119,8 +119,15 @@ class DispatchStore:
         self.client, self.db = client, db
 
     def _rows(self, sql: str, **params) -> list[dict]:
+        # The server runs in UTC but returns naive datetimes, which an insert would read as local time.
         res = self.client.query(sql, parameters=params)
-        return [dict(zip(res.column_names, r)) for r in res.result_rows]
+        return [
+            {
+                k: _utc(v) if isinstance(v, datetime) else v
+                for k, v in zip(res.column_names, r)
+            }
+            for r in res.result_rows
+        ]
 
     def watermark(self) -> datetime | None:
         """tag_ts of the newest tag match already dispatched, or None before the first."""
