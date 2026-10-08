@@ -105,6 +105,8 @@ writes nothing; with `--lookup off` it needs no database.
 a run tested; `--platform` is a deprecated alias of `--arch`, and `--tag-date` defaults to the
 run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-id's record
 (= `--artifact gha:<record>`); a bare `--artifact-id` that is not recorded writes no verdict.
+`--ci-event push|pull_request` also tags that artifact as Jenkins tags its builds:
+`<repo>@<sha12>` (`main`) for a push to main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`).
 
 **SDK**:
 

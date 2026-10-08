@@ -816,6 +816,37 @@ def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
     assert (res["test_type"], res["result_kind"]) == ("model_ops", "capability")
 
 
+@pytest.mark.parametrize(
+    ("event", "branch", "pr", "tags"),
+    [
+        ("push", "main", "0", [("torch-spyre@07379f50aaaa", "main")]),
+        (
+            "pull_request",
+            "fix",
+            "5200",
+            [("torch-spyre#5200", "pr"), ("torch-spyre#5200@07379f50aaaa", "pr")],
+        ),
+        ("push", "release-0.5", "0", []),
+        ("workflow_dispatch", "main", "0", []),
+        ("schedule", "main", "0", []),
+    ],
+)
+def test_a_gha_delta_is_tagged_as_its_ci_event_built_it(
+    ingest, event, branch, pr, tags
+):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    args = _args(
+        ci_event=event, branch=branch, pr_number=pr, sha="07379f50aaaa" + "0" * 28
+    )
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = [(t, dict(zip(cols, r))) for t, rs, cols in c.inserts for r in rs]
+    got = [(r["tag"], r["tag_family"]) for t, r in rows if t == "artifact_tags"]
+    assert got == tags
+    assert {r["artifact_id"] for t, r in rows if t == "artifact_tags"} <= {_AID}
+    assert sum(t == "artifact_results" for t, _ in rows) == 1
+
+
 def test_a_named_image_is_registered_tagged_and_judged(ingest):
     # --artifact names what a Jenkins leg ran; the verdict lands on that image, tagged.
     c = _ArtifactClient()
