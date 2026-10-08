@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|bundle|results|ci-run-timings} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = ("artifacts", "results", "ci-run-timings")
+    commands = ("artifacts", "bundle", "results", "ci-run-timings")
     if not argv or argv[0] not in commands:
         sys.exit(
             f"usage: python -m spyre_clickhouse_ingest {{{'|'.join(commands)}}} ..."
@@ -27,6 +27,8 @@ def main(argv=None):
     command, rest = argv[0], argv[1:]
     if command == "artifacts":
         from .artifacts import main as run
+    elif command == "bundle":
+        from .bundle import main as run
     elif command == "ci-run-timings":
         from .ci_run_timings import main as run
     else:

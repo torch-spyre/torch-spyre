@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/torch-spyre/torch-spyre/tree/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/bundle.schema.json",
+  "title": "spyre_v2 results bundle: bundle.json, schema_version 1",
+  "description": "A sealed bundle is a directory (or .tgz of it) holding this file and every file it lists. `bundle seal` fills files, started_at and ended_at.",
+  "type": "object",
+  "required": ["schema_version", "component", "arch", "test_type", "started_at", "files"],
+  "allOf": [
+    {"anyOf": [{"required": ["artifact_id"]}, {"required": ["artifact"]}]},
+    {"anyOf": [{"required": ["run_key"]}, {"required": ["jenkins_run_key"]}]}
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "artifact_id": {
+      "description": "The tested artifact's spyre_v2 artifact_id; it must already be recorded.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "artifact": {
+      "description": "Any `artifacts resolve` spec (id:<uuid>, image:<ref>@sha256:<digest>, ...); with artifact_id, both must name the same artifact.",
+      "type": "string",
+      "minLength": 1
+    },
+    "component": {
+      "description": "The suite's owner, a test_case_id hash input (torch-spyre, spyre-inference, spyre-backend, ...).",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "arch": {"description": "Where the tests ran.", "enum": ["x86_64", "s390x", "ppc64le"]},
+    "test_type": {
+      "description": "The tier; artifact_results.test_type's CHECK set.",
+      "enum": [
+        "smoke", "unit", "integration", "regression", "trunk", "perf",
+        "fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic",
+        "model_ops", "model_modules", "model_support"
+      ]
+    },
+    "run_key": {
+      "description": "Unique per run and tier source: `manual:<who>:<uuid4>`, or a Jenkins `<JOB_NAME>#<BUILD_NUMBER>` (then the run_id equals a connected v2Results run's).",
+      "type": "string",
+      "pattern": "^(manual:[A-Za-z0-9._@+-]+:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[^#\\s]+#[0-9]+)$"
+    },
+    "jenkins_run_key": {
+      "description": "Alias of a Jenkins run_key; when both are set they must be equal.",
+      "type": "string",
+      "pattern": "^[^#\\s]+#[0-9]+$"
+    },
+    "run_url": {"description": "The run's own page, if it has one; default: the processed bundle's URL.", "type": "string"},
+    "workflow": {"type": "string"},
+    "started_at": {"description": "ISO-8601 with a zone, e.g. 2026-10-09T08:00:00Z.", "type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "tag_family": {"description": "Jenkins run keys only: a manual bundle records verdicts, never tags.", "type": "string"},
+    "tags": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "runner": {
+      "description": "Where it ran: host, user, image (the pulled ref@digest), cards, ...",
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "env": {"description": "Free-form environment notes, kept with the bundle.", "type": "object", "additionalProperties": {"type": "string"}},
+    "notes": {"type": "string"},
+    "uploader": {"description": "Who built the bundle; the relay records the Artifactory uploader instead.", "type": "string"},
+    "sealed_at": {"type": "string", "format": "date-time"},
+    "files": {
+      "description": "Every file of the bundle but bundle.json. results/*.xml are ingested (JUnit or benchmark XML); attachments/ are kept, not ingested.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string", "pattern": "^(results/[^/]+\\.xml|attachments/[^\\s]+)$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

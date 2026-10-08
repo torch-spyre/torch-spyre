@@ -65,6 +65,7 @@ from spyre_clickhouse_ingest import (
 )
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 from spyre_clickhouse_ingest.options import (
+    pair,
     add_artifact_options,
     artifact_options,
     artifact_spec,
@@ -1323,7 +1324,10 @@ def _admitted_legs(legs: dict):
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
-    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    result_props = dict(_opt(args, "result_props") or [])
+    source = result_props.pop("source", "") or (
+        "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    )
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
     if not (admitted or _opt(args, "artifact")):
@@ -1389,7 +1393,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
             state=state,
             arch=args.arch,
             duration_s=acc["duration_s"],
-            props={"run_url": run_url, "source": source},
+            props={**result_props, "run_url": run_url, "source": source},
             attempt=getattr(args, "run_attempt", 0),
         ):
             print(
@@ -1461,6 +1465,14 @@ def main(argv=None):
         tag_date_help="default: the run's start day (its earliest suite timestamp), else today (UTC)",
         platform_alias=True,
         arch_required=False,
+    )
+    parser.add_argument(
+        "--result-prop",
+        dest="result_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
     )
     parser.add_argument(
         "--strict",

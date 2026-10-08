@@ -59,6 +59,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `registry.py` | read-only registry access: an image's per-arch leaf, labels and its tag in a tag family |
 | `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
+| `bundle.py`, `bundle.schema.json` | offline results bundles: `bundle init`/`seal`/`validate`/`ingest` ([below](#offline-results-bundles)) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 
@@ -192,6 +193,92 @@ consumer sees none of the producing run's inputs or outputs.
 
 Every step degrades to empty rather than failing: a pre-#1782 image carries no id, and a test
 run must never go red over telemetry.
+
+## Offline results bundles
+
+For a run that cannot reach ClickHouse (an isolated lab, an air-gapped host, a person testing by
+hand): record the results as a bundle, carry it to a connected host, and upload it to the
+Artifactory inbox. The `v2-results-relay` job (spyre-frameworks, every 15 minutes) ingests it
+with `bundle ingest`. That goes through `results`, so the verdict and cases link to the artifact
+exactly as a connected run's do. A bundle records results only: its artifact must already be in
+spyre_v2, and a manual bundle adds no tags.
+
+A bundle is a directory, or a `.tgz` of one:
+
+```
+bundle.json        # bundle.schema.json, schema_version 1
+results/*.xml      # JUnit (or benchmark) XML, ingested
+attachments/...    # optional: logs, notes; kept with the bundle, not ingested
+```
+
+| `bundle.json` key | |
+|---|---|
+| `schema_version` | `1` |
+| `artifact_id` / `artifact` | the tested artifact's id, or any `artifacts resolve` spec (at least one) |
+| `component`, `arch`, `test_type` | the suite's owner, where it ran, the tier (`artifact_results.test_type`) |
+| `run_key` | `manual:<who>:<uuid4>`, or a Jenkins `<JOB_NAME>#<BUILD_NUMBER>` (alias `jenkins_run_key`) |
+| `started_at`, `ended_at` | ISO-8601 with a zone; `seal` fills them |
+| `files` | `[{path, sha256}]` for every other file; `seal` fills it |
+| optional | `run_url`, `workflow`, `runner` {host, user, image, ...}, `env` {...}, `notes`, `uploader`, `sealed_at`; `tag_family`/`tags` for Jenkins keys only |
+
+The run is `RunId(source, run_key, arch, test_type)`, with source `bundle` for a manual key and
+`jenkins` for a Jenkins key. A Jenkins-keyed bundle therefore gets the run_id a connected
+`v2Results` run of that build would get. The relay accepts a Jenkins key only from trusted jobs
+(`Spyre-Test/testing/`). Re-ingesting the same bundle is a no-op. A different bundle or run under
+the same run_key is rejected. The verdict's `props` carry `source=bundle`, `uploader` (the
+Artifactory account that uploaded it), `bundle_sha256` (of bundle.json) and `bundle_url`, which
+is also the `run_url` when the bundle names none.
+
+### Air-gapped flow
+
+1. **While connected**, from the artifact's dashboard page: pull the image **by digest**, and
+   copy the pre-filled `bundle.json` (or the `bundle init` command). The ids are filled in, so
+   nothing after this step needs the network.
+2. **Offline**, run the tests with JUnit output into `results/`, then seal **on the test host**.
+   pytest writes suite timestamps in local time, so `seal` reads them there.
+3. **Connected**, `bundle validate` it, then upload it under its inbox path (`seal` and
+   `validate` print it).
+
+```
+python -m spyre_clickhouse_ingest bundle init --artifact id:<artifact_id> \
+    --component <component> --arch <arch> --test-type <tier> --out mybundle \
+    --runner image=<ref>@sha256:<digest>          # skip if you copied bundle.json
+pytest ... --junitxml=mybundle/results/junit.xml
+python -m spyre_clickhouse_ingest bundle seal mybundle
+COPYFILE_DISABLE=1 tar -C mybundle -czf mybundle.tgz .
+python -m spyre_clickhouse_ingest bundle validate mybundle.tgz    # on the connected host
+```
+
+With no package on the test host, write `bundle.json` by hand and fill `files` from
+`sha256sum results/*.xml`.
+
+### Uploading
+
+The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/zsp/next/<arch>/v2-results/inbox/<artifact_id>/`
+on `https://na.artifactory.swg-devops.com/artifactory`. Upload the bundle there as
+`<bundle-name>.tgz`, or as a folder `<bundle-name>/`. `<bundle-name>` is the run key with every
+character outside `A-Za-z0-9._-` replaced by `_`, then `-<test_type>`. Uploading needs deploy
+permission on that repository.
+
+```
+ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
+INBOX=zsp/next/<arch>/v2-results/inbox/<artifact_id>
+# One file:
+curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<bundle-name>.tgz"
+# Or a folder, bundle.json last:
+for f in results/*.xml bundle.json; do
+  curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T "mybundle/$f" "$ART/$INBOX/<bundle-name>/$f"
+done
+# Or the JFrog CLI:
+jf rt upload mybundle.tgz "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<bundle-name>.tgz"
+```
+
+Within 15 minutes the relay moves it to `v2-results/processed/<artifact_id>/...`, or to
+`v2-results/rejected/<artifact_id>/...` with a `REJECTED.json` giving the reason. A folder whose
+listed files have not all arrived is left in the inbox, and is rejected after 24 hours.
+`bundle ingest` exits `0` ingested or duplicate, `1` failed (retried), `2` rejected,
+`3` incomplete, and prints one JSON line on stdout. `--dry-run` runs every check on a read-only
+connection and writes nothing.
 
 ## What is deliberately NOT here
 
