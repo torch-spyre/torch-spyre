@@ -267,9 +267,8 @@ class TestDatatypeScalarOperations:
         _compare_modes(execution_mode, type_promo_op, x, atol=atol, rtol=rtol)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-    @pytest.mark.xfail(reason="Spyre backend does not support dtype Double(FP64)")
     def test_mixed_dtype_chain_fp64_fp32_fp16(self, execution_mode):
-        """Test mixed dtype chain: FP64 → FP32 → FP16."""
+        """FP64 → FP32 → FP16 chain: the FP64 input is rejected."""
 
         def mixed_chain(x):
             x_fp32 = x.to(torch.float32)
@@ -277,7 +276,8 @@ class TestDatatypeScalarOperations:
             return x_scaled.to(torch.float16)
 
         x = cached_randn((128, 64), dtype=torch.float64)
-        _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
+        with pytest.raises(Exception, match="does not support dtype Double"):
+            _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize(
         "dtype,scalar_value,atol,rtol",
