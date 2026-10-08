@@ -1809,7 +1809,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((1, 1),),
                 ]
             ),
-            "expect_fail": ["49159x4096"],
+            # Same per-core span limit as the large transposes above.
+            "expect_raise": {"49159x4096": "per-core tensor span"},
         },
         # Reversal along a non-stick dim works; the stick (last) dim needs a
         # gather along the stick dimension, which the backend cannot do, and
@@ -1946,12 +1947,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((769, 4096, 64), abs=True),
                 ),
             },
-            "expect_fail": [
-                "large_dim_0_1",
-                "large_dim_0_1_nopad",
-                "large_dim_1_2",
-                "large_dim_1_2_nopad",
-            ],
+            # The per-core span of the 384.5 MB result exceeds the 256 MB hardware
+            # limit; the lowering rejects it (raise_if_per_core_overflow).
+            "expect_raise": {
+                "large_dim_0_1": "per-core tensor span",
+                "large_dim_0_1_nopad": "per-core tensor span",
+                "large_dim_1_2": "per-core tensor span",
+                "large_dim_1_2_nopad": "per-core tensor span",
+            },
         },
         ("test_transpose_3d", "test_transpose_3d_cpu"): {
             "param_sets": {
@@ -2537,12 +2540,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": [
-                "fp16_fp32_1d256",
-                "fp32_fp16_1d256",
-                "fp16_fp32_2d4x64",
-                "fp32_fp16_2d4x64",
-            ],
+            # A STANDARD operand mixed with a staggered one is rejected at compile
+            # time unless the STANDARD operand broadcasts at the stick dim (see
+            # test_round_trip_to_dtype_implicit_invalid, which asserts the same).
+            "expect_raise": {
+                "fp16_fp32_1d256": "Multi-arg pointwise with mixed EA",
+                "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
+                "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
+                "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
+            },
             "skip": [
                 "fp16_fp32_bcast_stick",
                 "fp16_fp32_bcast_0dim",
@@ -6218,20 +6224,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # bmm-decomposed path (see the test_conv2d param sets, e.g.
             # 1x3x64_ksize3_pad1).  8x64_ksize3_pad1 was a passing test_conv2d
             # case before depthwise gained its own lowering, so it is kept here
-            # as an xfail to record the capability change rather than letting it
-            # vanish from the suite.  It is strict (see ParameterizedTestMeta and
-            # the XPASS rewrite in tests/conftest.py), so if padding support
-            # lands this flips to a CI failure instead of the gap staying
-            # invisible.
-            #
-            # Caveat, measured: xfail asserts only *that* the case fails, not
-            # that padding is the reason.  Removing just the lowering guard does
-            # not make it XPASS -- the compile then reaches the backend and
-            # aborts (SIGABRT), which is the runtime support the
-            # guard's own message refers to.  So this entry tracks "depthwise +
-            # padding does not work end to end"; a message-asserting negative
-            # test would additionally pin *where* it is rejected.
-            "expect_fail": ["8x64_ksize3_pad1"],
+            # to record the capability change rather than letting it vanish from
+            # the suite.  It asserts the rejection and its reason, so if padding
+            # support lands this fails and has to be turned back into a positive
+            # case.  (As an xfail it would also have passed for the SIGABRT you get
+            # by removing just the guard.)
+            "expect_raise": {
+                "8x64_ksize3_pad1": "Depthwise conv2d currently only supports zero padding"
+            },
             "param_sets": {
                 "1x64_ksize3": (
                     cached_randn((1, 64, 32, 32)),
@@ -7836,32 +7836,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.count_nonzero on "
-            "floating inputs yet (stable error signature: Unsupported: "
-            "unexpected argument Constant(value=0.0, dtype=torch.float16) to "
-            "notequal)"
-        ),
-        strict=True,
-    )
-    def test_count_nonzero_float_dim0_known_xfail(self):
+    def test_count_nonzero_float_dim0_rejected(self):
+        # The compiled backend has no int32 sum, which count_nonzero needs.
         x = cached_randn((67, 256))
-        self.compare_with_cpu(
-            lambda x: torch.count_nonzero(x, dim=0),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(
+                lambda x: torch.count_nonzero(x, dim=0),
+                x,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.count_nonzero on "
-            "bool inputs yet (stable error signature: Unsupported: unexpected "
-            "argument PointwiseOp(op='to_dtype', ...) to reduction lowering)"
-        ),
-        strict=True,
-    )
-    def test_count_nonzero_bool_dim0_known_xfail(self):
+    def test_count_nonzero_bool_dim0_rejected(self):
+        # The compiled backend has no int32 sum, which count_nonzero needs.
         x = torch.tensor(
             [
                 [True, False, True, False, True, False, True],
@@ -7872,11 +7858,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.bool,
         )
-        self.compare_with_cpu(
-            lambda x: torch.count_nonzero(x, dim=0),
-            x,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(
+                lambda x: torch.count_nonzero(x, dim=0),
+                x,
+                run_eager=False,
+            )
 
     def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
@@ -7886,15 +7873,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.nanmean (stable error signature: InductorError: IndexError: "
-            "list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_nanmean_all_dims_known_xfail(self):
+    def test_nanmean_all_dims_rejected(self):
+        # nanmean sums the non-NaN values, and the backend has no int32 sum.
         x = torch.tensor(
             [
                 [float("nan"), 1.0, -2.0, 3.0],
@@ -7903,7 +7883,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
+        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+            self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
     @pytest.mark.xfail(
         reason=(
@@ -9807,51 +9788,39 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
-    @pytest.mark.xfail(
-        reason=(
-            "RESTICKIFY_OP does not support FP32 dtype "
-            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.IEEE_FP32)"
-        ),
-        strict=True,
-    )
-    def test_restickify_fp32_unsupported_xfail(self):
+    def test_restickify_fp32_unsupported(self):
         """Verify RESTICKIFY_OP correctly rejects FP32 dtype.
 
         Operations that would trigger restickify (like transpose + pointwise)
-        should fail with Unsupported error when using FP32 tensors.
+        are rejected when using FP32 tensors.
         """
         x = torch.randn((128, 128), dtype=torch.float32)
         y = torch.randn((128, 128), dtype=torch.float32)
         # Transpose creates layout incompatibility that triggers restickify
-        self.compare_with_cpu(
-            lambda x, y: x.t() + y,
-            x,
-            y,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match="no mechanism to resolve stick incompat"):
+            self.compare_with_cpu(
+                lambda x, y: x.t() + y,
+                x,
+                y,
+                run_eager=False,
+            )
 
-    @pytest.mark.xfail(
-        reason=(
-            "RESTICKIFY_OP does not support INT64 dtype "
-            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.INT32)"
-        ),
-        strict=True,
-    )
-    def test_restickify_int64_unsupported_xfail(self):
+    def test_restickify_int64_unsupported(self):
         """Verify RESTICKIFY_OP correctly rejects INT64 dtype.
 
         Operations that would trigger restickify (like transpose + pointwise)
-        should fail with Unsupported error when using INT64 tensors.
+        are rejected when using INT64 tensors.
         """
         x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         # Transpose creates layout incompatibility that triggers restickify
-        self.compare_with_cpu(
-            lambda x, y: x.t() + y,
-            x,
-            y,
-            run_eager=False,
-        )
+        with pytest.raises(Exception, match="no mechanism to resolve stick incompat"):
+            self.compare_with_cpu(
+                lambda x, y: x.t() + y,
+                x,
+                y,
+                run_eager=False,
+            )
 
     def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""

@@ -1020,7 +1020,7 @@ class TestFindAltTargetStlBoolStickSize(TestCase):
     or the hardware compiler. That matters because an actual compiled
     mutation into an IEEE_FP32-backed bool currently fails end-to-end on two
     unrelated, lower-level gaps (ReStickifyOpHBM rejects IEEE_FP32 outright --
-    see test_restickify_fp32_unsupported_xfail in test_inductor_ops.py -- and
+    see test_restickify_fp32_unsupported in test_inductor_ops.py -- and
     separately the DL op scheduler finds no candidate for a fused copy/slice
     into IEEE_FP32). Neither gap is specific to this stick-size computation,
     so this test isolates the one thing this fix actually changes.
