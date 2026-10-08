@@ -254,6 +254,34 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsBenchAllreduce";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
       return "aiuSubmitToHardware";
+    // flex host-side spans: ResponseWorker (79-82), per-chunk DMA (83), P2P
+    // RDMA (84-91).
+    case AIUPTI_RUNTIME_TRACE_CBID_FETCH_RESPONSE_BLOCKS:
+      return "aiuFetchResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_RESPONSE_COMPLETION_THREAD:
+      return "aiuResponseCompletionThread";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE_BLOCKS:
+      return "aiuParseResponseBlocks";
+    case AIUPTI_RUNTIME_TRACE_CBID_ITERATION_DURATION:
+      return "aiuIterationDuration";
+    case AIUPTI_RUNTIME_TRACE_CBID_PROCESS_SINGLE_CHUNK_DMA:
+      return "aiuProcessSingleChunkDma";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_SEND:
+      return "aiuP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_MULTICAST:
+      return "aiuP2PRdmaMulticast";
+    case AIUPTI_RUNTIME_TRACE_CBID_P2P_RDMA_WAIT:
+      return "aiuP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_SEND:
+      return "aiuScheduleP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_SCHEDULE_P2P_RDMA_WAIT:
+      return "aiuScheduleP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_SEND:
+      return "aiuLaunchP2PRdmaSend";
+    case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_P2P_RDMA_WAIT:
+      return "aiuLaunchP2PRdmaWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
+      return "aiuInitializeP2P";
     default:
       break;
   }
