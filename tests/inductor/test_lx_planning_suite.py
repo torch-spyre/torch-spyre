@@ -23,6 +23,7 @@ change that failure, so the lx classes must not contain copies of such tests.
 import os
 import sys
 import unittest
+from unittest import mock
 
 import regex as re
 
@@ -70,6 +71,37 @@ class TestLxPlanningSuiteGeneration(unittest.TestCase):
                 # _DELEGATOR_TESTS are deliberately not wrapped.
                 missing = ok_names - copied - lx._DELEGATOR_TESTS
                 self.assertEqual(sorted(missing), [])
+
+    def test_expect_raise_tests_are_not_copied(self):
+        # A test that asserts a rejection of the base op says nothing about LX planning.
+        class Src:
+            def test_ok(self):
+                pass
+
+            def test_rejected(self):
+                pass
+
+            test_rejected._expects_raise = True
+
+        class Dst:
+            pass
+
+        with mock.patch.object(lx, "tests_lx_planning_full", True):
+            lx._copy_canonical_tests(Src, Dst, "sfx", None, [])
+        self.assertEqual(
+            sorted(n for n in vars(Dst) if n.startswith("test_")), ["test_ok_sfx"]
+        )
+
+    def test_canonical_subset_skips_expect_raise_cases(self):
+        class Fake:
+            PARAMS = {
+                ("test_a", "base"): {
+                    "param_sets": {"rejected": (), "good": ()},
+                    "expect_raise": {"rejected": "boom"},
+                },
+            }
+
+        self.assertEqual(lx._canonical_test_names(Fake), {"test_a_good"})
 
     def test_canonical_subset_skips_xfail_cases(self):
         class Fake:
