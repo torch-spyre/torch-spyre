@@ -24,6 +24,7 @@ test_suite_config:
             - LxPlanning.*::test_max_sub_broadcast.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_sub_alpha.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_sub_broadcast.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_expand_size1_pointwise.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_sub_scalar.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_scalar_cpu.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success
