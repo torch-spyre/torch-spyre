@@ -54,7 +54,96 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
 | `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |
 | `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
+| `resolver.py` | any artifact spec -> its one spyre_v2 artifact, existing or derived (`resolve` / `ensure`) |
+| `options.py` | the artifact flags every surface shares (`add_artifact_options`) |
+| `registry.py` | read-only registry access: an image's per-arch leaf, labels and its tag in a tag family |
+| `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
+| `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
+
+## Naming an artifact (simple -> advanced)
+
+One option group (`options.add_artifact_options`) is shared by every surface, so a flag means the
+same thing everywhere; all of them go through `resolver.resolve` (read-only) or `resolver.ensure`
+(records it). The spec forms are listed in `resolver.py`'s docstring.
+
+**CLI** (`python -m spyre_clickhouse_ingest artifacts ...`, or the `spyre-clickhouse-ingest`
+script):
+
+```bash
+# 1. What does this image name? Read-only, prints the resolution as JSON.
+python -m spyre_clickhouse_ingest artifacts resolve --artifact image:icr.io/<repo>@sha256:<list> --arch s390x
+
+# 2. Record it, tagged by its supply-chain family (the registry's tag, else --tag-date).
+python -m spyre_clickhouse_ingest artifacts ensure --artifact image:icr.io/<repo>@sha256:<list> \
+  --arch s390x --tag-family nightly-supply-chain
+
+# 3. An identity the caller already knows: no registry call, never rebound to another id.
+python -m spyre_clickhouse_ingest artifacts ensure \
+  --artifact 'rpm:ibm-flex-*.<id12>.*.x86_64;component=flex;name=ibm-flex;id12=<id12>' --arch x86_64 \
+  --source ai-chip-toolchain/flex@main@<sha> --identity-dep base=<sha256> --prop k=v \
+  --tag rc1 --tag-prop k=v --run-url "$BUILD_URL" --lookup off --registry off --dry-run
+```
+
+`--lookup auto|off|only`: an existing record wins / derive only, read no database / it must be
+recorded. `--registry auto|off`: called only when the spec needs it / never. A recorded image
+digest is answered from the database with no registry call. With no registry answer (off, or
+unreachable: no `ICR_*` credentials) an unrecorded image is found by a tag ending in its id12
+(`s390x-dev-<id12>`) held by one record, else derived from its digest; an image named only by
+any other tag then fails. The output's `registry` says which happened.
+
+In `results` a tag it cannot file (an unknown `--tag-family`) is dropped with a warning; the
+other tags and the verdicts are recorded regardless. `--strict` makes `results` exit 1 when a
+named artifact's verdicts were not all recorded, or when a tag fell back to `misc`.
+Only immutable refs are looked up -- a digest, `name==version`, an rpm NEVRA or glob, a generic
+URL with its sha -- never a moving tag or a bare name. `--arch multi` keeps a manifest list's own
+digest. `--dry-run` prints what would be written (`"written": true` and the would-be `rows`) and
+writes nothing; with `--lookup off` it needs no database.
+
+**Ingest** (`python -m spyre_clickhouse_ingest results ...`): the same flags name the artifact
+a run tested; `--platform` is a deprecated alias of `--arch`, and `--tag-date` defaults to the
+run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-id's record
+(= `--artifact gha:<record>`); a bare `--artifact-id` that is not recorded writes no verdict.
+
+**SDK**:
+
+```python
+from spyre_clickhouse_ingest import ensure, resolve
+
+r = resolve("wheel:torch-spyre==0.1+<id12>", "x86_64", client=client, db="spyre_v2")
+r = ensure(client, "spyre_v2", "image:icr.io/<repo>@sha256:<list>", "s390x",
+           tag_family="nightly-supply-chain", tag_date=day, sources=[(repo, ref, sha)])
+r.artifact_id, r.source, r.written  # source: given | existing | label | derived
+```
+
+`resolve` returns a `Resolution` (or None when the spec names nothing); `ensure` raises
+ValueError instead. An `ArtifactIdentity` passed as the spec is authoritative. `artifacts write`
+batch entries take either `artifact` (the hash inputs) or `spec` (plus any resolve option), and go
+through `ensure` too.
+
+### Tag families
+
+`tag_families.yaml` (its header documents every key and template field) maps a family to the
+registry tag that names an image in it and the v2 tag it is recorded as. `SPYRE_TAG_FAMILIES=<path>`
+replaces the whole file; a bad regex, an unknown key or template field, or a duplicate family
+fails at load, as does a file with no `misc` family. A `--tag` whose prefix names no family and
+is given no `--tag-family` is filed under `misc`, with a warning naming the tag -- never under
+`release`, which takes only `release-*` tags. `misc` is never matched by prefix or dated; pass the
+real family (`pr`, `main`, `nightly`, ...) instead, or `--tag-family misc` to mean it.
+A family's `spellings` are other prefixes a registry uses for it: `cicd-tech-preview-vN` is stored
+as `ci-cd-tech-preview-vN`, with the raw spelling in the tag prop `registry_tag`, so one tech
+preview is one tag.
+
+## Moving off ingest_xml.py
+
+`.github/scripts/ingest_xml.py` only forwards to `python -m spyre_clickhouse_ingest results`
+(same arguments). Delete it once this finds no caller:
+
+```bash
+grep -rn 'scripts/ingest_xml\.py' --include='*.y*ml' --include='Jenkinsfile*' --include='*.groovy' \
+  --include='*.sh' --include='*.py' --include=Makefile \
+  torch-spyre hf-adapters spyre-inference spyre-frameworks spyre-test-framework
+```
 
 ## Tables modelled
 

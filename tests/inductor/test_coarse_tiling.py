@@ -10939,7 +10939,7 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
-    """derive_tiling_groups — consecutive runs of ops sharing a TileSpec."""
+    """derive_tiling_groups — consecutive runs of ops running one loop nest."""
 
     def _graph_of(self, names):
         return _graph([_make_op(_make_pointwise([Integer(64)]), n) for n in names])
@@ -10956,13 +10956,24 @@ class TestDeriveTilingGroups(unittest.TestCase):
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
 
-    def test_spec_change_breaks_the_run(self):
+    def test_nest_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
         s1 = TileSpec((TileAxis(0, 4),))
         s2 = TileSpec((TileAxis(0, 2),))
         groups = derive_tiling_groups(g, {"op0": s1, "op1": s2})
         self.assertEqual([len(ops) for ops, _ in groups], [1, 1])
-        self.assertEqual([spec for _, spec in groups], [s1, s2])
+        self.assertEqual([nest for _, nest in groups], [(4,), (2,)])
+
+    def test_equal_nests_on_different_dims_share_a_run(self):
+        # host_dim is positional in each op's own output, so the run keys on the
+        # loop nest alone; which dims line up is checked per edge at apply.
+        g = self._graph_of(["op0", "op1"])
+        groups = derive_tiling_groups(
+            g,
+            {"op0": TileSpec((TileAxis(0, 4),)), "op1": TileSpec((TileAxis(1, 4),))},
+        )
+        self.assertEqual(self._names(groups), [["op0", "op1"]])
+        self.assertEqual([nest for _, nest in groups], [(4,)])
 
     def test_empty_and_all_untiled_produce_no_groups(self):
         g = self._graph_of(["op0", "op1"])
@@ -11085,13 +11096,14 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         groups_specs = derive_tiling_groups(g, {"op0": spec, "op1": spec})
         self.assertEqual(len(groups_specs), 1)
-        group_ops, group_spec = groups_specs[0]
+        group_ops, nest = groups_specs[0]
         self.assertEqual([o.get_operation_name() for o in group_ops], ["op0", "op1"])
+        self.assertEqual(nest, (4,))
         # One group, base 0 -> hint_ids [0], every op in the group shares it.
         base = _derive_hint_id_base(g)
         self.assertEqual(base, 0)
-        hints0 = tile_spec_to_dim_hints(got0, group_spec, [base])
-        hints1 = tile_spec_to_dim_hints(got1, group_spec, [base])
+        hints0 = tile_spec_to_dim_hints(got0, spec, [base])
+        hints1 = tile_spec_to_dim_hints(got1, spec, [base])
         self.assertEqual(hints0[0].hint_id, hints1[0].hint_id)
         self.assertEqual(hints0[0].split_count, 4)
 
@@ -11197,6 +11209,672 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))
         self.assertEqual(self._state(ops[:1]), loop_before)
+
+
+class _SentinelOp:
+    """Identity-only stand-in for an ``ir.Operation`` in push-branch tests."""
+
+    def __init__(self, name):
+        self.name = name
+        self.operation_name = name
+
+    def get_name(self):
+        return self.name
+
+    def __repr__(self):
+        return f"_SentinelOp({self.name!r})"
+
+
+class TestDrainPlanPushAndLifetime(unittest.TestCase):
+    """Post-loop drain plan: lifetime extension and the push branch.
+
+    The drain-map validator itself is exercised on a real captured
+    ``for_each_tile`` graph in ``test_for_each_tile_lowering.py``; here the
+    plan is an input, and the tests pin the lifetime extension arithmetic, the
+    no-late-decline assertion, and the exact push call shape (drain vs
+    ordinary output clone vs HBM fallback) with mocked graph-editor
+    machinery, following this module's existing mock conventions.
+    """
+
+    def test_drain_lifetime_extension_reaches_graph_exit(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _drain_lifetime_end_overrides,
+        )
+
+        plan = SimpleNamespace(storage_name="buf2")
+        overrides = {"buf2": 3, "other": 9}
+        _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 7)
+        self.assertEqual(overrides, {"buf2": 7, "other": 9})
+        # max(): a later shorter measurement never shrinks a longer end.
+        _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 5)
+        self.assertEqual(overrides["buf2"], 7)
+
+    def test_drain_lifetime_extension_rejects_stale_in_place_handoff(self):
+        """A post-loop reader cannot reuse a carry kept live for its drain."""
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad import utils as utils_module
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivision,
+            _check_in_place_relationships,
+        )
+
+        ops = [
+            _LoopOp("carry"),
+            _LoopOp("update", (0,)),
+            _LoopOp("reader"),
+            _LoopOp("tail"),
+        ]
+        inputs = {
+            "carry": [],
+            "update": ["carry"],
+            "reader": ["carry"],
+            "tail": ["reader"],
+        }
+        layout = SimpleNamespace(device_layout=object())
+        for op in ops:
+            op.layout = layout
+        by_name = {op.name: op for op in ops}
+        graph = SimpleNamespace(
+            operations=ops,
+            graph_input_names=[],
+            get_buffer=by_name.get,
+            get_output_names=lambda: ["carry", "tail"],
+        )
+        dep = namedtuple("dep", ["name"])
+
+        def read_writes(op):
+            return SimpleNamespace(
+                reads={dep(name) for name in inputs[op.name]},
+                writes={dep(op.name)},
+            )
+
+        allocator = CoOptimizingAllocator(MagicMock(), size=4096)
+        allocator._validated_drain_plans = {
+            "carry": SimpleNamespace(storage_name="carry")
+        }
+        divisions = {op.name: [CoreDivision(splits={})] for op in ops}
+        with (
+            patch.object(utils_module, "op_read_writes", side_effect=read_writes),
+            patch.object(allocator_module, "op_read_writes", side_effect=read_writes),
+            patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "mem_usage_by_buf",
+                return_value={
+                    name: {"size": 128, "op_inputs": reads}
+                    for name, reads in inputs.items()
+                },
+            ),
+            patch.object(
+                allocator,
+                "_op_inputs_good_for_lx_inplace",
+                side_effect=lambda op: inputs[op.name],
+            ),
+            patch.object(
+                allocator, "_residency_by_buf", return_value=dict.fromkeys(by_name)
+            ),
+            patch.object(allocator, "_cd_parent_matches", return_value={}),
+            patch.object(allocator, "_cd_parent_relayouts", return_value={}),
+        ):
+            in_place = allocator._determine_in_place_division_invariant(graph)
+            self.assertEqual(in_place["reader"], ["carry"])
+            built = allocator._build_cd_bound_buffers(graph, in_place, divisions)
+
+        # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
+        _check_in_place_relationships(built)
+        buffers = {b.name: b for b in built}
+        self.assertEqual(buffers["carry"].end_time, len(ops))
+        self.assertEqual(buffers["reader"].in_place_parents, [])
+        self.assertEqual(buffers["tail"].in_place_parents, ["reader"])
+
+    def test_missing_drain_anchor_raises_instead_of_falling_back(self):
+        """After LX is committed there is no late decline."""
+        from torch_spyre._inductor.scratchpad.allocator import (
+            DrainPlan,
+            _assert_drain_plan_committed,
+        )
+
+        plan = DrainPlan(
+            storage_name="buf2",
+            update_name="buf2_update",
+            loop_group=(0,),
+            anchor_op=_SentinelOp("no_longer_present"),
+            loop_origin=_SentinelOp("while_loop_hop"),
+        )
+        graph = SimpleNamespace(operations=[], graph=object())
+        with self.assertRaisesRegex(AssertionError, "no longer in graph.operations"):
+            _assert_drain_plan_committed(graph, None, {}, {}, plan)
+
+    def _isolation_plan(self):
+        from torch_spyre._inductor.scratchpad.allocator import DrainPlan
+
+        return DrainPlan(
+            storage_name="buf2",
+            update_name="buf2_update",
+            loop_group=(0,),
+            anchor_op=_SentinelOp("loop_last_member"),
+            loop_origin=_SentinelOp("while_loop_hop"),
+        )
+
+    def _run_push(self, *, with_plan, address=0x4000):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        storage_op = _SentinelOp("buf2")
+        update_op = _SentinelOp("buf2_update")
+        plan = self._isolation_plan()
+        graph = MagicMock()
+        graph.operations = [storage_op, update_op, plan.anchor_op]
+        graph.get_output_names.return_value = ["buf2"]
+        graph.graph_input_names = []
+        graph.get_buffer.return_value = storage_op
+        buffer = SimpleNamespace(name="buf2", address=address, lx_view=object())
+        clone = SimpleNamespace(
+            loop_info=object(),
+            _loop_carry_record=object(),
+            _carried_reduction_record=object(),
+        )
+        if with_plan:
+            allocator._validated_drain_plans = {"buf2": plan}
+        with (
+            patch.object(
+                allocator_module, "get_buffer_users", return_value={"buf2": [update_op]}
+            ),
+            patch.object(allocator_module, "GraphEditor") as graph_editor_cls,
+            patch.object(allocator_module, "materialize_lx_relayouts"),
+            patch.object(
+                allocator_module, "_assert_drain_plan_committed"
+            ) as check_committed,
+            patch.object(allocator, "_set_one_allocation"),
+        ):
+            editor = graph_editor_cls.return_value
+            editor.push_allocation_with_clone.return_value = clone
+            allocator._push_allocation(graph, [buffer], [])
+        return SimpleNamespace(
+            editor=editor,
+            clone=clone,
+            check_committed=check_committed,
+            storage_op=storage_op,
+            update_op=update_op,
+            plan=plan,
+            with_plan=with_plan,
+        )
+
+    def test_push_emits_post_loop_drain_only_with_plan(self):
+        """Drain branch: output-only clone after the loop's last member."""
+        result = self._run_push(with_plan=True)
+        result.check_committed.assert_called_once()
+        result.editor.push_allocation_with_clone.assert_called_once_with(
+            result.storage_op,
+            [],
+            input=False,
+            private=True,
+            after_fx=result.plan.loop_origin,
+            lower_anchor=result.plan.anchor_op,
+        )
+        # The real clearing helper ran; the clone loses exactly the
+        # loop/carry metadata.
+        self.assertFalse(hasattr(result.clone, "loop_info"))
+        self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
+        self.assertFalse(hasattr(result.clone, "_carried_reduction_record"))
+        result.editor.change_graph_output.assert_called_once_with(
+            result.storage_op, result.clone
+        )
+
+    def test_push_ordinary_output_clone_is_unchanged_without_plan(self):
+        """Default-call differential: no plan -> today's exact call."""
+        result = self._run_push(with_plan=False)
+        result.check_committed.assert_not_called()
+        result.editor.push_allocation_with_clone.assert_called_once_with(
+            result.storage_op, [result.update_op], input=False
+        )
+        # The ordinary clone path is not touched by the drain-only clearing.
+        self.assertTrue(hasattr(result.clone, "loop_info"))
+        self.assertTrue(hasattr(result.clone, "_loop_carry_record"))
+        self.assertTrue(hasattr(result.clone, "_carried_reduction_record"))
+
+    def test_push_emits_no_copy_when_solver_chose_hbm(self):
+        result = self._run_push(with_plan=True, address=None)
+        result.editor.push_allocation_with_clone.assert_not_called()
+        result.editor.change_graph_output.assert_not_called()
+        # Nothing touched the clone: the HBM fallback emits no copy and no
+        # metadata rewrite.
+        self.assertTrue(hasattr(result.clone, "loop_info"))
+        self.assertTrue(hasattr(result.clone, "_loop_carry_record"))
+
+    def test_second_output_clone_in_same_push_keeps_the_drain_anchor(self):
+        """Anchors are Operation objects, not indices.
+
+        An earlier ordinary output clone in the same ``_push_allocation``
+        call only inserts ops around existing ones, so the drain's anchor
+        identity must still resolve.  The editor is mocked here; the real
+        insertion (``operations.index(lower_anchor) + 1``) is exercised on a
+        real captured graph in ``test_for_each_tile_lowering.py``.
+        """
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
+        from torch_spyre._inductor.scratchpad.greedy_solver import (
+            GreedyLayoutSolver,
+        )
+
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        plan = self._isolation_plan()
+        allocator._validated_drain_plans = {"buf2": plan}
+        storage_op = _SentinelOp("buf2")
+        update_op = _SentinelOp("buf2_update")
+        other_op = _SentinelOp("outA")
+        other_consumer = _SentinelOp("outA_consumer")
+        graph = MagicMock()
+        graph.operations = [other_op, storage_op, update_op, plan.anchor_op]
+        graph.get_output_names.return_value = ["buf2", "outA"]
+        graph.graph_input_names = []
+        graph.get_buffer.side_effect = {
+            "buf2": storage_op,
+            "outA": other_op,
+        }.get
+        buffer = SimpleNamespace(name="buf2", address=0x4000, lx_view=object())
+        # Ordinary output clone first, then the drain: the drain's anchor is
+        # the same object, whatever the ordinary push did to the list.
+        buffers = [
+            SimpleNamespace(name="outA", address=0x2000, lx_view=object()),
+            buffer,
+        ]
+        clone = SimpleNamespace(
+            loop_info=object(),
+            _loop_carry_record=object(),
+            _carried_reduction_record=object(),
+        )
+        with (
+            patch.object(
+                allocator_module,
+                "get_buffer_users",
+                return_value={"buf2": [update_op], "outA": [other_consumer]},
+            ),
+            patch.object(allocator_module, "GraphEditor") as graph_editor_cls,
+            patch.object(allocator_module, "materialize_lx_relayouts"),
+            patch.object(allocator_module, "_assert_drain_plan_committed"),
+            patch.object(allocator, "_set_one_allocation"),
+        ):
+            editor = graph_editor_cls.return_value
+            editor.push_allocation_with_clone.return_value = clone
+            allocator._push_allocation(graph, buffers, [])
+        calls = editor.push_allocation_with_clone.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args, (other_op, [other_consumer]))
+        self.assertEqual(calls[1].args, (storage_op, []))
+        self.assertEqual(calls[1].kwargs["lower_anchor"], plan.anchor_op)
+        self.assertIs(plan.anchor_op, graph.operations[-1])
+
+
+class _LoopOp:
+    """Operation stand-in with an optional counted-loop path and mutations."""
+
+    def __init__(self, name, path=None, mutates=()):
+        self.name = name
+        self.operation_name = name
+        if path is not None:
+            self.loop_info = SimpleNamespace(loop_group_id=path)
+        self._mutates = list(mutates)
+
+    def get_name(self):
+        return self.name
+
+    def get_mutation_names(self):
+        return list(self._mutates)
+
+    def __repr__(self):
+        return f"_LoopOp({self.name!r})"
+
+
+def _extern_op(name, path=None):
+    """A real ``ExternKernel`` instance (isinstance is what the guards test)."""
+    from torch._inductor.ir import ExternKernel
+
+    class _Extern(ExternKernel):
+        def __init__(self):  # bypass IR construction; identity only
+            pass
+
+        def get_mutation_names(self):
+            return []
+
+    op = _Extern()
+    object.__setattr__(op, "name", name)
+    if path is not None:
+        object.__setattr__(op, "loop_info", SimpleNamespace(loop_group_id=path))
+    return op
+
+
+class TestHoistedInputClone(unittest.TestCase):
+    """An LX clone of a graph input read inside a counted loop runs once, before it.
+
+    The clone copies the whole input, so re-running it every trip rewrites the
+    same LX bytes; ``counted_loop_lifetime_overrides`` already reserves the
+    input's address from the loop's entry.  These tests pin the entry choice,
+    the decline cases and the push call shape.
+    """
+
+    def _graph(self, ops):
+        return SimpleNamespace(operations=list(ops))
+
+    def test_entry_is_the_outermost_loop_start(self):
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_entry,
+            counted_loop_group_path,
+        )
+
+        pre = _LoopOp("pre")
+        first = _LoopOp("first", (0,))
+        inner = _LoopOp("inner", (0, 1))
+        later = _LoopOp("later", (0,))
+        other_loop = _LoopOp("other", (1,))
+        ops = [pre, first, inner, later, other_loop]
+        self.assertEqual(counted_loop_group_path(inner), (0, 1))
+        self.assertIs(counted_loop_entry(ops, inner), first)
+        self.assertIs(counted_loop_entry(ops, later), first)
+        self.assertIs(counted_loop_entry(ops, other_loop), other_loop)
+        self.assertIsNone(counted_loop_entry(ops, pre))
+
+    def test_extern_kernel_with_loop_info_is_not_a_member(self):
+        # Same rule as counted_loop_lifetime_overrides / scheduler._loop_group_id.
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_entry,
+            counted_loop_group_path,
+        )
+
+        hoisted_const = _extern_op("const", (0,))
+        member = _LoopOp("member", (0,))
+        self.assertEqual(counted_loop_group_path(hoisted_const), ())
+        self.assertIs(counted_loop_entry([hoisted_const, member], member), member)
+
+    def test_entry_is_the_loop_start_the_lifetime_overrides_reserve_from(self):
+        """The hoist position and the reserved interval are the same index."""
+        from torch_spyre._inductor.scratchpad import utils as utils_module
+        from torch_spyre._inductor.scratchpad.utils import counted_loop_entry
+
+        x_dep = SimpleNamespace(name="x")
+        pre = _LoopOp("pre")
+        head = _LoopOp("head", (0,))
+        reader = _LoopOp("reader", (0,))
+        tail = _LoopOp("tail", (0,))
+        ops = [pre, head, reader, tail]
+        rw = {
+            "pre": SimpleNamespace(reads=[], writes=[SimpleNamespace(name="pre")]),
+            "head": SimpleNamespace(reads=[], writes=[SimpleNamespace(name="head")]),
+            "reader": SimpleNamespace(
+                reads=[x_dep], writes=[SimpleNamespace(name="reader")]
+            ),
+            "tail": SimpleNamespace(reads=[], writes=[SimpleNamespace(name="tail")]),
+        }
+        graph = SimpleNamespace(operations=ops, graph_input_names=["x"])
+        with patch.object(
+            utils_module, "op_read_writes", side_effect=lambda op: rw[op.name]
+        ):
+            starts, ends = utils_module.counted_loop_lifetime_overrides(graph)
+        entry = counted_loop_entry(ops, reader)
+        self.assertEqual(starts["x"], ops.index(entry))
+        self.assertEqual(ends["x"], len(ops))
+
+    def test_hoist_entry_for_an_in_loop_first_consumer(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _hoisted_input_clone_entry,
+        )
+
+        pre = _LoopOp("pre")
+        head = _LoopOp("head", (0,))
+        consumer = _LoopOp("bmm", (0,))
+        tail = _LoopOp("add", (0,))  # loop ends with an op that does not read x
+        graph = self._graph([pre, head, consumer, tail])
+        self.assertIs(_hoisted_input_clone_entry(graph, "x", [consumer]), head)
+
+    def test_no_hoist_when_the_first_consumer_is_outside_any_loop(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _hoisted_input_clone_entry,
+        )
+
+        consumer = _LoopOp("add")
+        in_loop = _LoopOp("bmm", (0,))
+        graph = self._graph([consumer, in_loop])
+        self.assertIsNone(_hoisted_input_clone_entry(graph, "x", [consumer, in_loop]))
+        self.assertIsNone(_hoisted_input_clone_entry(graph, "x", []))
+
+    def test_no_hoist_when_any_op_mutates_the_input(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _hoisted_input_clone_entry,
+        )
+
+        consumer = _LoopOp("bmm", (0,))
+        writer = _LoopOp("copy_", (0,), mutates=["x"])
+        graph = self._graph([consumer, writer, _LoopOp("add", (0,))])
+        self.assertIsNone(_hoisted_input_clone_entry(graph, "x", [consumer, writer]))
+
+    def test_no_hoist_across_an_extern_kernel_before_the_first_use(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _hoisted_input_clone_entry,
+        )
+
+        head = _LoopOp("head", (0,))
+        extern = _extern_op("fallback")
+        consumer = _LoopOp("bmm", (0,))
+        graph = self._graph([head, extern, consumer, _LoopOp("add", (0,))])
+        self.assertIsNone(_hoisted_input_clone_entry(graph, "x", [consumer]))
+
+    def test_no_hoist_across_multi_output_fallback_after_the_last_use(self):
+        from torch._inductor.ir import FallbackKernel
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _hoisted_input_clone_entry,
+        )
+
+        class _Fallback(FallbackKernel):
+            def __init__(self):
+                self.name = "fallback"
+                self.outputs = [_SentinelOp("out0"), _SentinelOp("out1")]
+
+            def get_mutation_names(self):
+                return []
+
+        head = _LoopOp("head", (0,))
+        reader = _LoopOp("reader", (0,))
+        fallback = _Fallback()
+        # The fallback is after x's last read, but the whole loop must wait
+        # for its output. A hoisted clone could run before this unbracketed
+        # fallback; the per-trip clone remains inside that waiting loop.
+        tail = _make_inside_consumer_op("tail", "out0", (0,))
+        tail.get_mutation_names.return_value = []
+        ops = [head, reader, fallback, tail]
+        with config.patch({"enable_lx_context_switching": True}):
+            self.assertIsNone(
+                _hoisted_input_clone_entry(self._graph(ops), "x", [reader])
+            )
+            result = self._run_input_push(ops, [reader])
+        result.editor.push_allocation_with_clone.assert_called_once_with(
+            result.source,
+            [reader],
+            input=True,
+            lx_view=result.lx_view,
+            lower_before=None,
+        )
+        for attr in ("loop_info", "_loop_carry_record", "_carried_reduction_record"):
+            self.assertTrue(hasattr(result.clone, attr), attr)
+        result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
+
+    def _run_input_push(self, ops, users):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        graph = MagicMock()
+        graph.operations = list(ops)
+        graph.get_output_names.return_value = []
+        graph.graph_input_names = ["x"]
+        source = _SentinelOp("x")
+        graph.get_buffer.return_value = source
+        lx_view = object()
+        buffer = SimpleNamespace(name="x", address=0x4000, lx_view=lx_view)
+        clone = SimpleNamespace(
+            loop_info=object(),
+            _loop_carry_record=object(),
+            _carried_reduction_record=object(),
+        )
+        with (
+            patch.object(
+                allocator_module, "get_buffer_users", return_value={"x": list(users)}
+            ),
+            patch.object(allocator_module, "GraphEditor") as graph_editor_cls,
+            patch.object(allocator_module, "materialize_lx_relayouts"),
+            patch.object(allocator, "_set_one_allocation") as set_alloc,
+        ):
+            editor = graph_editor_cls.return_value
+            editor.push_allocation_with_clone.return_value = clone
+            allocator._push_allocation(graph, [buffer], [])
+        return SimpleNamespace(
+            editor=editor,
+            clone=clone,
+            source=source,
+            lx_view=lx_view,
+            set_alloc=set_alloc,
+        )
+
+    def test_push_hoists_an_in_loop_input_clone_and_clears_membership(self):
+        head = _LoopOp("head", (0,))
+        consumer = _LoopOp("bmm", (0,))
+        tail = _LoopOp("add", (0,))
+        result = self._run_input_push(
+            [_LoopOp("pre"), head, consumer, tail], [consumer]
+        )
+        result.editor.push_allocation_with_clone.assert_called_once_with(
+            result.source,
+            [consumer],
+            input=True,
+            lx_view=result.lx_view,
+            lower_before=head,
+        )
+        self.assertFalse(hasattr(result.clone, "loop_info"))
+        self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
+        self.assertFalse(hasattr(result.clone, "_carried_reduction_record"))
+        result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
+
+    def test_push_keeps_todays_input_clone_outside_loops(self):
+        consumer = _LoopOp("add")
+        result = self._run_input_push([consumer], [consumer])
+        result.editor.push_allocation_with_clone.assert_called_once_with(
+            result.source,
+            [consumer],
+            input=True,
+            lx_view=result.lx_view,
+            lower_before=None,
+        )
+        # No hoist, no metadata change: the clone keeps whatever it copied.
+        self.assertTrue(hasattr(result.clone, "loop_info"))
+
+    def test_no_hoist_when_the_last_reader_can_take_the_slot_in_place(self):
+        """A hoisted clone's LX slot is never handed off in place.
+
+        When x's last reader is the loop's last member, no end override widens
+        x's lifetime, so the reverse-parent edge (#3212) is legal: that reader
+        may write its output over x on trip 1 and trip 2 would read the
+        overwritten bytes.  A per-trip clone re-copies x after it; a hoisted one
+        would not, so the hoist declines.  The MoE shape (the loop ends with
+        the accumulator add, which does not read x) keeps the hoist, and there
+        the edge is illegal.  Real lifetime, handoff and edge helpers.
+        """
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad import utils as utils_module
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+            _handoff_child_start,
+            _handoff_parent_end,
+            _hoisted_input_clone_entry,
+        )
+
+        dep = namedtuple("dep", ["name"])
+
+        def ns(*names):  # dep sets, unioned by calculate_liveness
+            return {dep(n) for n in names}
+
+        layout = object()
+        for shape, tail_reads_x in (
+            ("x read by the loop's last op", True),
+            ("MoE F1: loop ends with the acc add", False),
+        ):
+            with self.subTest(shape):
+                pre = _LoopOp("pre")
+                head = _LoopOp("head", (0,))
+                gate = _LoopOp("gate", (0,))
+                tail = _LoopOp("tail", (0,))
+                ops = [pre, head, gate, tail]
+                rw = {
+                    "pre": SimpleNamespace(reads=ns(), writes=ns("pre")),
+                    "head": SimpleNamespace(reads=ns(), writes=ns("head")),
+                    "gate": SimpleNamespace(reads=ns("x"), writes=ns("gate")),
+                    "tail": SimpleNamespace(
+                        reads=ns("x", "gate") if tail_reads_x else ns("acc", "gate"),
+                        writes=ns("tail"),
+                    ),
+                }
+                graph = SimpleNamespace(operations=ops, graph_input_names=["x"])
+                with patch.object(
+                    utils_module, "op_read_writes", side_effect=lambda op: rw[op.name]
+                ):
+                    lifetimes = utils_module.calculate_liveness(graph)
+                    starts, ends = utils_module.counted_loop_lifetime_overrides(graph)
+                last_reader = ops[lifetimes["x"][-1]]
+                edge = ScratchpadAllocator._inplace_edge_ok(
+                    child_pointwise_inputs=["x"],
+                    parent_name="x",
+                    child_device_layout=layout,
+                    parent_device_layout=layout,
+                    child_start=_handoff_child_start(
+                        last_reader.name, lifetimes, starts
+                    ),
+                    parent_end=_handoff_parent_end("x", lifetimes, ends),
+                    child_size_per_core=2048,
+                    parent_size_per_core=2048,
+                )
+                users = [gate, tail] if tail_reads_x else [gate]
+                entry = _hoisted_input_clone_entry(graph, "x", users)
+                self.assertEqual(edge, tail_reads_x)
+                if tail_reads_x:
+                    self.assertNotIn("x", ends)
+                    self.assertIsNone(entry)
+                    pushed = self._run_input_push(ops, users)
+                    self.assertIsNone(
+                        pushed.editor.push_allocation_with_clone.call_args.kwargs[
+                            "lower_before"
+                        ]
+                    )
+                else:
+                    self.assertEqual(ends["x"], len(ops))
+                    self.assertIs(entry, head)
+                # Invariant: whenever the clone is hoisted, its slot cannot be
+                # handed to the last reader in place.
+                self.assertFalse(entry is not None and edge)
+
+    def test_graph_editor_rejects_two_positions(self):
+        """A clone is either a post-loop drain or a hoisted input clone."""
+        from torch_spyre._inductor.scratchpad import graph_editor as ge
+
+        editor = ge.GraphEditor.__new__(ge.GraphEditor)
+        head = _LoopOp("head", (0,))
+        with self.assertRaisesRegex(AssertionError, "exclude each other"):
+            editor.push_allocation_with_clone(
+                MagicMock(),
+                [_LoopOp("bmm", (0,))],
+                input=True,
+                lx_view=object(),
+                lower_anchor=head,
+                lower_before=head,
+            )
 
 
 if __name__ == "__main__":

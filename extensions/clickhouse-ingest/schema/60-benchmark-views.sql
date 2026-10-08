@@ -13,7 +13,10 @@ SELECT
     b.props['config_name']  AS config_name,
     b.props['input_shapes'] AS input_shapes,
     b.props['run_mode']     AS run_mode,
-    b.props['kernel_name']  AS kernel_name,
+    -- The stable label of a compiled kernel (props['kernel_key']); raw_kernel_name is this run's
+    -- compile, whose token changes on every recompile.
+    if(b.props['kernel_key'] != '', b.props['kernel_key'], b.props['kernel_name']) AS kernel_name,
+    if(r.props['kernel_name'] != '', r.props['kernel_name'], b.props['kernel_name']) AS raw_kernel_name,
     -- measurements is Map(String, Array(Float64)) on the table (every sample); reduced to one
     -- value per metric here, under the same name, so every view below addresses scalars.
     -- arrayAvg, not samples[1], which would depend on harness ordering.

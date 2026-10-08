@@ -52,7 +52,7 @@ Output: `root` — the directory holding both trees for this call.
 
 ### `ingest-xml-to-clickhouse`
 
-JUnit + benchmark XML to ClickHouse, via `ingest_xml.py`. The only ingest
+JUnit + benchmark XML to ClickHouse, via `python -m spyre_clickhouse_ingest results`. The only ingest
 implementation for the schema-v2 functional/benchmark tables; every repo's
 XML pipeline ends here.
 
