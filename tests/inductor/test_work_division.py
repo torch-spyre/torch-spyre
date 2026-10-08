@@ -1820,7 +1820,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         w = torch.randn(self._W_SHAPE, dtype=torch.float16)
         x_dev = x.to(
             device_layout=SpyreTensorLayout(
-                [32, 32, 1, 1, 64], [1, 32, -1, 65536, 1024], fp16
+                [32, 32, 1, 1, 64], [32, 1, -1, 65536, 1024], fp16
             )
         )
         w_dev = w.to(
