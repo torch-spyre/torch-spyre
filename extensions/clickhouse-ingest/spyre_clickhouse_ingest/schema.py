@@ -62,6 +62,9 @@ TIMING_EXECUTOR_VALUES = frozenset(
     {"gha-ephemeral", "gha-standing", "jenkins-local", "jenkins-job", ""}
 )
 TARGET_TYPE_VALUES = frozenset({"jenkins", "gha_dispatch", "webhook"})
+EVENT_TYPE_VALUES = frozenset(
+    {"artifact.tagged", "artifact.recorded", "artifact.promoted", "results.recorded"}
+)
 DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
 REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
@@ -642,17 +645,28 @@ class ArtifactSubscriptions(Table):
         "subscription_id",
         "updated_at",
         "enabled",
+        "event_types",
         "tag_family",
         "tag_pattern",
         "tag_props",
+        "exclude_families",
+        "exclude_tag_patterns",
+        "result_test_types",
+        "result_states",
         "component",
         "arch",
         "kind",
         "artifact_name",
         "not_before",
+        "require",
+        "unless_exists",
+        "max_per_hour",
+        "max_per_day",
+        "coalesce_minutes",
         "target_type",
         "target",
         "params",
+        "payload_fields",
         "credential_id",
         "owner",
         "notes",
@@ -691,8 +705,10 @@ class ArtifactDispatches(Table):
         "updated_at",
         "subscription_id",
         "artifact_id",
+        "event_type",
+        "event_key",
         "tag",
-        "tag_ts",
+        "event_ts",
         "requested_by",
         "requester",
         "request_id",
@@ -701,6 +717,7 @@ class ArtifactDispatches(Table):
         "target_type",
         "target",
         "params",
+        "payload",
         "target_url",
         "build_url",
         "error",

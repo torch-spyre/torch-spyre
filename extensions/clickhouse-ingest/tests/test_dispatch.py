@@ -54,15 +54,23 @@ def test_model_columns_are_the_ddl_minus_audit(model):
     ]
 
 
-def test_auto_id_is_stable_and_keyed_on_subscription_artifact_and_tag():
-    a = DispatchId.auto("stf-torchspyre", AID, "ci-cd-tech-preview-v1")
-    assert a == DispatchId.auto("stf-torchspyre", AID, "ci-cd-tech-preview-v1")
-    assert a != DispatchId.auto("stf-torchspyre", AID, "ci-cd-tech-preview-v2")
-    assert a != DispatchId.auto("stf-spyrebackend", AID, "ci-cd-tech-preview-v1")
+TAGGED = "artifact.tagged"
+
+
+def test_auto_id_is_stable_and_keyed_on_subscription_artifact_and_event():
+    a = DispatchId.auto("stf-torchspyre", AID, TAGGED, "ci-cd-tech-preview-v1")
+    assert a == DispatchId.auto("stf-torchspyre", AID, TAGGED, "ci-cd-tech-preview-v1")
+    assert a != DispatchId.auto("stf-torchspyre", AID, TAGGED, "ci-cd-tech-preview-v2")
+    assert a != DispatchId.auto(
+        "stf-spyrebackend", AID, TAGGED, "ci-cd-tech-preview-v1"
+    )
+    assert a != DispatchId.auto(
+        "stf-torchspyre", AID, "results.recorded", "ci-cd-tech-preview-v1"
+    )
 
 
 def test_request_id_never_collides_with_an_auto_id():
-    assert DispatchId.request(AID) != DispatchId.auto("", AID, "")
+    assert DispatchId.request(AID) != DispatchId.auto("", AID, "", "")
 
 
 def test_render_fills_the_artifact_fields():
@@ -104,7 +112,7 @@ def test_an_unknown_or_empty_placeholder_refuses_the_render(template):
 
 def test_dispatch_row_fills_defaults_and_passes_the_model():
     row = dispatch.dispatch_row(
-        dispatch_id=DispatchId.auto("s", AID, "t"),
+        dispatch_id=DispatchId.auto("s", AID, TAGGED, "t"),
         subscription_id="s",
         artifact_id=AID,
         requested_by="auto",
@@ -188,5 +196,116 @@ def test_store_reads_return_utc_aware_datetimes():
 
             return R()
 
-    [row] = dispatch.DispatchStore(Client(), "db").matches(datetime.now(timezone.utc))
+    [row] = dispatch.DispatchStore(Client(), "db").events(datetime.now(timezone.utc))
     assert row["tag_ts"] == datetime(2026, 9, 29, 14, 26, 32, tzinfo=timezone.utc)
+
+
+NOW = __import__("datetime").datetime(
+    2026, 10, 9, 12, 0, tzinfo=__import__("datetime").timezone.utc
+)
+
+
+def event(minutes_ago, **over):
+    from datetime import timedelta
+
+    r = {
+        "subscription_id": "s",
+        "component": "hf-adapters",
+        "arch": "s390x",
+        "artifact_id": f"a{minutes_ago}",
+        "event_type": TAGGED,
+        "event_key": f"t{minutes_ago}",
+        "event_ts": NOW - timedelta(minutes=minutes_ago),
+        "coalesce_minutes": 0,
+        "max_per_hour": 0,
+        "max_per_day": 0,
+    }
+    return {**r, **over}
+
+
+def decisions(rows, counts=None):
+    return [
+        (r["artifact_id"], d) for r, d, _ in dispatch.decide(rows, counts or {}, NOW)
+    ]
+
+
+def test_without_limits_everything_fires():
+    assert decisions([event(5), event(3)]) == [("a5", "fire"), ("a3", "fire")]
+
+
+def test_coalescing_fires_only_the_newest_once_its_window_closes():
+    rows = [event(m, coalesce_minutes=30) for m in (90, 75, 50, 10)]
+    # 90 is superseded by 75, 75 by 50 (25 min later); 50's window closed with nothing newer
+    # inside it; 10's window is still open.
+    assert decisions(rows) == [
+        ("a90", "coalesced"),
+        ("a75", "coalesced"),
+        ("a50", "fire"),
+        ("a10", "coalescing"),
+    ]
+
+
+def test_coalescing_is_per_component_and_arch():
+    rows = [
+        event(60, coalesce_minutes=30),
+        event(55, coalesce_minutes=30, arch="x86_64"),
+    ]
+    assert decisions(rows) == [("a60", "fire"), ("a55", "fire")]
+
+
+def test_rate_limits_defer_the_excess_counting_what_was_already_sent():
+    rows = [event(m, max_per_hour=2) for m in (30, 20, 10)]
+    assert decisions(rows, {"s": (1, 1)}) == [
+        ("a30", "fire"),
+        ("a20", "throttled"),
+        ("a10", "throttled"),
+    ]
+    assert decisions([event(5, max_per_day=3)], {"s": (0, 3)}) == [("a5", "throttled")]
+
+
+def test_payload_is_the_chosen_subset_and_refuses_unknown_fields():
+    ctx = {
+        "artifact_id": AID,
+        "tag": "t",
+        "digest": DIGEST,
+        "verdicts": [{"test_type": "trunk"}],
+    }
+    assert dispatch.payload([], ctx) == {"artifact_id": AID, "tag": "t"}
+    assert dispatch.payload(["digest", "verdicts"], ctx) == {
+        "digest": DIGEST,
+        "verdicts": [{"test_type": "trunk"}],
+    }
+    with pytest.raises(ValueError, match="secret"):
+        dispatch.payload(["secret"], ctx)
+
+
+class PreviewStore:
+    def __init__(self, rows, counts=None):
+        self.rows, self._counts = rows, counts or {}
+
+    def events(self, since, **kw):
+        return self.rows
+
+    def counts(self, now):
+        return self._counts
+
+
+def test_preview_explains_every_event_and_writes_nothing():
+    rows = [
+        {**event(90), "reason": "", "dispatch_state": "triggered"},
+        {**event(80), "reason": "excluded", "dispatch_state": ""},
+        {**event(70), "reason": "waiting: trunk=passed", "dispatch_state": ""},
+        {**event(60, max_per_day=1), "reason": "", "dispatch_state": ""},
+        {**event(50, max_per_day=1), "reason": "", "dispatch_state": ""},
+    ]
+    out = [
+        (r["outcome"], r["why"])
+        for r in dispatch.preview(PreviewStore(rows), NOW, subscription_id="s")
+    ]
+    assert out == [
+        ("dispatched (triggered)", ""),
+        ("not dispatched", "excluded"),
+        ("not dispatched", "waiting: trunk=passed"),
+        ("would fire", ""),
+        ("throttled", "1/h, 1/day sent"),
+    ]

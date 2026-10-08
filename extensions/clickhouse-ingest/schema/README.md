@@ -21,7 +21,7 @@ Applying them in filename order works from an empty database.
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
 | `53-pipeline-views.sql` | `v_pipeline_runs`, `v_pipeline_run_outcomes`, `v_pipeline_gate_daily` | 47 |
-| `54-dispatch-views.sql` | `v_subscription_artifacts`, `v_artifact_subscribers` | 20, 25, 50 |
+| `54-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers` | 20, 25, 50 |
 | `60-benchmark-views.sql` | 4 `v_benchmark_*` views | 20, 30 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata` + their MVs | 30 |
