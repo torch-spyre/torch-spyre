@@ -234,6 +234,60 @@ def _pinned(ops):
 class OffsetMutationPinTest(TestCase):
     """Which ops ``ops_in_offset_mutation_component`` pins around an offset write."""
 
+    def test_reader_chain_has_no_hop_limit(self):
+        for depth in (3, 32):
+            with self.subTest(depth=depth):
+                ops = [
+                    _pin_op("producer", reads=["arg0"]),
+                    _pin_op("clone", reads=["arg1"]),
+                    _pin_op(
+                        "write", reads=["producer"], target="clone", write_offset=32
+                    ),
+                ]
+                parent = "clone"
+                for i in range(depth):
+                    name = f"hop{i}"
+                    ops.append(_pin_op(name, reads=[parent]))
+                    parent = name
+                expected = {"clone", "write"} | {f"hop{i}" for i in range(depth)}
+                self.assertEqual(_pinned(ops), expected)
+                self.assertEqual(_pinned(list(reversed(ops))), expected)
+
+    def test_transitive_zero_offset_writer_reaches_target_and_readers(self):
+        ops = [
+            _pin_op("clone", reads=["src"]),
+            _pin_op("write", reads=["value"], target="clone", write_offset=32),
+            _pin_op("hop1", reads=["clone"]),
+            _pin_op("hop2", reads=["hop1"]),
+            _pin_op("hop3", reads=["hop2"]),
+            _pin_op("copy_back", reads=["hop3"], target="arg0"),
+            _pin_op("reader", reads=["arg0"]),
+            _pin_op("second_copy", reads=["reader"], target="arg1"),
+            _pin_op("tail", reads=["arg1"]),
+            _pin_op("unrelated", reads=["value"]),
+        ]
+        expected = {op.name for op in ops} - {"unrelated"}
+        self.assertEqual(_pinned(ops), expected)
+        self.assertEqual(_pinned(list(reversed(ops))), expected)
+
+    def test_alias_cycle_terminates(self):
+        ops = [
+            _pin_op("write", reads=["arg0"], target="clone", write_offset=32),
+            _pin_op("clone", reads=["write"]),
+            _pin_op("copy_back", reads=["clone"], target="arg0"),
+            _pin_op("reader", reads=["arg0"]),
+        ]
+        self.assertEqual(_pinned(ops), {op.name for op in ops})
+
+    def test_symbolic_tile_offset_does_not_seed_pin(self):
+        tile = sympy.Symbol("tile", integer=True, nonnegative=True)
+        ops = [
+            _pin_op("storage"),
+            _pin_op("write", target="storage", write_offset=64 * tile),
+            _pin_op("reader", reads=["storage"]),
+        ]
+        self.assertEqual(_pinned(ops), set())
+
     def test_no_offset_write_pins_nothing(self):
         ops = [_pin_op("a", reads=["arg0"]), _pin_op("b", reads=["a"])]
         self.assertEqual(_pinned(ops), set())
@@ -255,7 +309,15 @@ class OffsetMutationPinTest(TestCase):
         ]
         self.assertEqual(
             _pinned(ops),
-            {"pad_fill", "pad_rows", "pad_zeros", "gate_up", "silu"},
+            {
+                "pad_fill",
+                "pad_rows",
+                "pad_zeros",
+                "gate_up",
+                "silu",
+                "down",
+                "residual",
+            },
         )
 
     def test_copy_back_into_graph_input_pins_its_readers(self):

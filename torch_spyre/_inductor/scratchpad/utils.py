@@ -484,86 +484,52 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 def ops_in_offset_mutation_component(
     graph: GraphLowering,
 ) -> set[str]:
-    """Names of ops around a sliced in-place mutation that writes at a constant
-    non-zero offset (e.g. ``x[:, 32:96] = ...``).
+    """Pin the forward dependency closure of constant-offset mutation storage.
 
-    The offset write's codegen assumes the target buffer keeps the slicing the
-    eager path chose. If the co-optimizing allocator re-slices the ops around it
-    (a different core division), the deeptools scheduler can no longer place
-    the offset write and aborts the compile (``DtException: "There must be at
-    least one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``), or the
-    compiled result is wrong. This is the root cause of the
-    ``slice_stick_mutation_*`` co-optimizing-allocator failures -- the division
-    change, *not* LX residency (the abort reproduces with pinning fully
-    disabled).
+    Re-slicing an offset write or its downstream users can make its address
+    arithmetic unschedulable or produce wrong results, including when all
+    involved buffers are in HBM. ``cd_parent_matches`` only constrains LX
+    residency, so adding mutation edges there cannot replace this guard.
 
-    The caller pins every op in this set to its upstream (fixed) division, the
-    slicing the greedy / placement-only path uses. The set is the ops that touch
-    the mutated storage, plus their direct consumers:
+    Follow reads from buffer to consumer, and MutationLayout links in both
+    directions: an update and its target share storage. This also follows
+    copy-backs and zero-offset writes reached through arbitrarily long reader
+    chains. There is no hop limit. A reached writer brings its target and all
+    of that target's readers into the closure, regardless of graph order.
 
-    * the storage's aliases: the offset write, its target, every other
-      ``MutationLayout`` write into an alias, and copy-back chains (a mutation
-      that reads an alias, such as the write back into a mutated graph input,
-      makes its own target an alias too);
-    * every op that reads an alias;
-    * every op that reads one of those readers' outputs.
+    Do not follow ordinary reads backwards to their producers: the solver's
+    residency gate already protects reads from independently re-sliced
+    producers. In particular, padding an FFN input must not pin the upstream
+    attention block (issue #4990). Downstream ops are conservatively pinned;
+    this is a dependency boundary, not an exact address-dependence analysis.
 
-    Producers of the written value are deliberately not followed, and neither is
-    anything further away. An earlier version pinned the whole undirected
-    data-dependency component of the write, which in a transformer block is
-    every op: one ``constant_pad_nd`` in front of an FFN matmul pinned the
-    attention that precedes it (issue #4990).
-
-    Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
-    offsets (coarse tiling) are not offset writes, so nothing is seeded and
-    coarse tiling is not constrained.
+    Symbolic coarse-tile offsets do not seed the walk; see
+    :func:`_writes_at_constant_offset`.
     """
     seeds = [op.name for op in graph.operations if _writes_at_constant_offset(op)]
     if not seeds:
         return set()
 
-    # Undirected MutationLayout op <-> target links (op.name == its output
-    # buffer, Inductor convention); these name one storage.
-    mutation_targets: dict[str, str] = {}
-    alias_links: dict[str, set[str]] = {}
+    successors: dict[str, set[str]] = {}
+    op_names = {op.name for op in graph.operations}
     for op in graph.operations:
+        for dep in op_read_writes(op).reads:
+            successors.setdefault(dep.name, set()).add(op.name)
         layout = getattr(op, "layout", None)
-        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
-            continue
-        try:
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
             target = layout.target.get_name()
-        except (AttributeError, TypeError):
-            continue
-        mutation_targets[op.name] = target
-        alias_links.setdefault(op.name, set()).add(target)
-        alias_links.setdefault(target, set()).add(op.name)
+            successors.setdefault(op.name, set()).add(target)
+            successors.setdefault(target, set()).add(op.name)
 
-    reads_by_op = {
-        op.name: {
-            name
-            for dep in op_read_writes(op).reads
-            if (name := getattr(dep, "name", None))
-        }
-        for op in graph.operations
-    }
-
-    aliases: set[str] = set()
+    reached: set[str] = set()
     stack = list(seeds)
     while stack:
-        while stack:
-            node = stack.pop()
-            if node not in aliases:
-                aliases.add(node)
-                stack.extend(alias_links.get(node, ()))
-        # A copy-back reads an alias and writes a new target; it and the
-        # storage it writes join the alias set.
-        for writer, target in mutation_targets.items():
-            if writer not in aliases and reads_by_op[writer] & aliases:
-                stack.extend((writer, target))
-
-    readers = {name for name, reads in reads_by_op.items() if reads & aliases}
-    consumers = {name for name, reads in reads_by_op.items() if reads & readers}
-    return (aliases | readers | consumers) & reads_by_op.keys()
+        name = stack.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        stack.extend(successors.get(name, ()))
+    return reached & op_names
 
 
 def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
