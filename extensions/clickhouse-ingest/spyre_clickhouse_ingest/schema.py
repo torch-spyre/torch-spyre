@@ -571,6 +571,7 @@ class CiRunTimings(Table):
         "repo",
         "pr_number",
         "sha",
+        "base_ref",
         "is_pr_component",
         "build_url",
         "verdict",

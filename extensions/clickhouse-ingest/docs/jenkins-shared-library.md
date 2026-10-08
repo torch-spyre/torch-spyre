@@ -214,6 +214,7 @@ same spans. The batch's sources:
 |---|---|
 | `run.comment_at`, `picked_up_at`, `pickup_path` | the `/spyre-test` poller, passed to the orchestrator as `TRIGGER_COMMENT_AT` / `TRIGGER_PICKED_UP_MS` / `TRIGGER_PICKUP_PATH` |
 | `run.pr_queued_at`, `pr_running_at` | `postPrStatusUpdate`, the first time the PR comment shows each state |
+| `run.base_ref` | the trigger PR's `base.ref`, read by `resolve_target.py` when it resolves the PR (`''` for a non-PR run) |
 | `run.pr_components` | the run's Test-With companion PRs, so their components read `is_pr_component` |
 | `builds[]` | `buildOneNode`, from the component-build's start, its agent-and-lock acquisition (`CB_BUILD_NODE_MS`) and its test-stage start (`CB_TEST_START_MS`); `dropped` nodes from the plan's dropped set, `reused` ones from `NODE_ALREADY_BUILT` |
 | `tests[]` | the test-leg join, from the dispatch, the leg's test-stage start and the leg job's end, with the leg's `gating`, `runner_died`, `failure_reason` and `failed_stage` |

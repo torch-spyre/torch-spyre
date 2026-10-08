@@ -54,6 +54,7 @@ def _batch(**over):
             "trigger_pr": "github.ibm.com/ai-chip-toolchain/deeptools#4500",
             "pr_components": ["github.com/torch-spyre/torch-spyre#3372"],
             "sha": "0123456789abcdef",
+            "base_ref": "main",
             "build_url": "https://jenkins/job/orchestrator/4242/",
             "verdict": "green",
             "result": "SUCCESS",
@@ -244,7 +245,7 @@ def test_run_fields_repeat_on_every_row():
         assert r["run_key"] == "Spyre/orchestrator#4242"
         assert (r["repo"], r["pr_number"]) == ("deeptools", 4500)
         assert (r["trigger_kind"], r["build_mode"]) == ("upstream", "pr")
-        assert r["sha"] == "0123456789abcdef"
+        assert (r["sha"], r["base_ref"]) == ("0123456789abcdef", "main")
         assert r["superseded"] is False
         assert r["run_started_at"] == _at("2026-10-08T10:00:10")
         assert r["pr_queued_at"] == _at("2026-10-08T10:00:30")
@@ -311,12 +312,17 @@ def test_pr_components_may_be_bare_component_names():
 def test_a_non_pr_run_is_written_with_an_empty_trigger_pr():
     batch = _batch()
     batch["run"].update(
-        trigger_pr="", pr_components=[], comment_at="", trigger_source="main-push"
+        trigger_pr="",
+        pr_components=[],
+        comment_at="",
+        trigger_source="main-push",
+        base_ref="",
     )
     rows = _rows(batch)
     assert len(rows) == 4
     for r in rows:
         assert (r["trigger_pr"], r["repo"], r["pr_number"]) == ("", "", 0)
+        assert r["base_ref"] == ""
         assert r["is_pr_component"] is False
         assert r["comment_at"] is None
         CiRunTimings.row(r)

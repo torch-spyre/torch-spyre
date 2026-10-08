@@ -54,6 +54,7 @@ BATCH_KEYS = {
         "trigger_pr",
         "pr_components",
         "sha",
+        "base_ref",
         "build_url",
         "verdict",
         "result",
@@ -94,6 +95,7 @@ RUN_TEXT = (
     "preset",
     "build_mode",
     "sha",
+    "base_ref",
     "build_url",
     "pickup_path",
 )

@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS ci_run_timings
     -- A retried build or re-dispatched leg is its own row, so a flaky first attempt stays visible.
     attempt                UInt16 DEFAULT 1,                                              -- e.g. 1 (2 for a retry)
 
-    -- The run, as on its pipeline_runs row; trigger_pr is '' for a non-PR run.
+    -- The run, as on its pipeline_runs row; trigger_pr is '' for a non-PR run, base_ref is
+    -- the branch the trigger PR targets.
     trigger_kind           LowCardinality(String) DEFAULT '',                             -- e.g. 'upstream' (also 'manual', 'timer')
     trigger_source         LowCardinality(String) DEFAULT '',                             -- e.g. 'spyre-test' (also 'main-push', 'merge-queue')
     preset                 LowCardinality(String) DEFAULT '',                             -- e.g. 'trigger-pr-validation'
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS ci_run_timings
     repo                   LowCardinality(String) DEFAULT '',                             -- e.g. 'deeptools'
     pr_number              UInt32 DEFAULT 0,                                              -- e.g. 4500
     sha                    String DEFAULT '',                                             -- e.g. '0123456789abcdef0123456789abcdef01234567'
+    base_ref               LowCardinality(String) DEFAULT '',                             -- e.g. 'main' (also 'release/2.x'; '' for a non-PR run)
     -- The component is one of the run's PRs (trigger or Test-With companion), not a dependency.
     is_pr_component        Bool DEFAULT false,                                            -- e.g. true (deeptools, or a Test-With companion) | false (a dependency)
     build_url              String DEFAULT '',                                             -- e.g. 'https://jenkins/job/orchestrator/4242/'
