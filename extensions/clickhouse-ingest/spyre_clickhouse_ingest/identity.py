@@ -441,6 +441,87 @@ class CapabilityId(DerivedId):
 class BenchmarkId(DerivedId):
     """Content identity of a benchmark; `backend` is unhashed -- the comparison axis."""
 
+    # A compiled kernel's name ends in a per-compile token, `_` + 16 of [a-z0-9], before an
+    # optional `#<n>`. migrations/012 matches the same names in SQL; a test pins both.
+    KERNEL_PREFIX = "spyre_kernel_"
+    KERNEL_TOKEN = 16
+
+    @classmethod
+    def kernel_stem(cls, kernel_name) -> str:
+        """A compiled kernel's name without its per-compile token; '' for any other name."""
+        name = "" if kernel_name is None else str(kernel_name)
+        head, sep, n = name.rpartition("#")
+        if not (sep and n and all(c in "0123456789" for c in n)):
+            head, sep, n = name, "", ""
+        token = head[-cls.KERNEL_TOKEN - 1 :]
+        if not (
+            name.startswith(cls.KERNEL_PREFIX)
+            and len(token) == cls.KERNEL_TOKEN + 1
+            and token[0] == "_"
+            and all(c in "abcdefghijklmnopqrstuvwxyz0123456789" for c in token[1:])
+        ):
+            return ""
+        return head[: -len(token)] + sep + n
+
+    @classmethod
+    def rank_kernels(cls, component: str, entries: list) -> list:
+        """`entries` with each compiled kernel's hashed kernel_name as `<stem>@<rank>`.
+
+        One op compiles several kernels with the same stem (two `fused_add`s at 0.27 and
+        0.003 ms), so the stem alone would merge them: rank 1 is the slowest by duration_ms
+        among the kernels sharing every other identity input, ties broken by raw name. The
+        key is also kept as props['kernel_key'], the stable label; the raw name, which changes
+        on every compile, goes to run_props.
+        """
+        keyed = []
+        samples: dict[str, dict[str, dict[str, list]]] = {}
+        for e in entries:
+            disc = e.get("disc") or {}
+            keys = e.get("disc_keys") or ()
+            stem = cls.kernel_stem(disc.get("kernel_name"))
+            if not (stem and e.get("measurements") and "kernel_name" in keys):
+                keyed.append(None)
+                continue
+            raw = str(disc["kernel_name"])
+            group = cls.derive(
+                component,
+                e.get("name", ""),
+                e.get("tags"),
+                {**disc, "kernel_name": stem},
+                keys,
+            )
+            by_backend = samples.setdefault(group, {}).setdefault(raw, {})
+            by_backend.setdefault(e.get("backend", ""), []).extend(
+                e["measurements"].get("duration_ms") or []
+            )
+            keyed.append((group, stem, raw))
+        # A kernel's duration is its slowest backend's mean, as one benchmark_runs row holds it.
+        dur = {
+            (g, raw): max(sum(d) / len(d) if d else 0.0 for d in by_backend.values())
+            for g, kernels in samples.items()
+            for raw, by_backend in kernels.items()
+        }
+        rank = {
+            (g, raw): n
+            for g, kernels in samples.items()
+            for n, raw in enumerate(sorted(kernels, key=lambda r: (-dur[g, r], r)), 1)
+        }
+        out = []
+        for e, k in zip(entries, keyed):
+            if k is None:
+                out.append(e)
+                continue
+            key = f"{k[1]}@{rank[k[0], k[2]]}"
+            out.append(
+                {
+                    **e,
+                    "disc": {**e["disc"], "kernel_name": key},
+                    "props": {**(e.get("props") or {}), "kernel_key": key},
+                    "run_props": {**(e.get("run_props") or {}), "kernel_name": k[2]},
+                }
+            )
+        return out
+
     @classmethod
     def derive(cls, component: str, name: str, tags, disc=None, disc_keys=()) -> str:
         """The benchmark's uuid, or '' without a component and a name."""

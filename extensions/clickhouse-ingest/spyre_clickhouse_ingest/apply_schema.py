@@ -55,6 +55,11 @@ class SchemaApplier:
     EXPLICIT = re.compile(r"^--\s*APPLY:\s*explicit\b", re.IGNORECASE | re.MULTILINE)
     # A migration written to be repeated, e.g. to re-key rows that stale writers keep producing.
     RERUNNABLE = re.compile(r"^--\s*RERUNNABLE\b", re.IGNORECASE | re.MULTILINE)
+    # A migration statement after `-- IF TABLE EXISTS: <name>` runs only when that table exists,
+    # so a migration can fix a table another schema file may not have created yet.
+    IF_TABLE = re.compile(
+        r"^--\s*IF TABLE EXISTS:\s*(\w+)\s*$", re.IGNORECASE | re.MULTILINE
+    )
     CREATE = re.compile(
         r"^CREATE\s+(MATERIALIZED\s+VIEW|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
         re.IGNORECASE,
@@ -110,6 +115,17 @@ class SchemaApplier:
         """The executable statements in one file, comments removed."""
         stripped = cls.LINE_COMMENT.sub("", cls.BLOCK_COMMENT.sub("", text))
         return [s.strip() for s in stripped.split(";") if s.strip()]
+
+    @classmethod
+    def run_migration(cls, client, text: str) -> None:
+        """Run a migration's statements, skipping each one whose IF_TABLE is absent."""
+        marked = cls.IF_TABLE.sub(lambda m: f"\0{m.group(1)}\0", text)
+        for stmt in cls.statements(marked):
+            table, _, sql = stmt.rpartition("\0")
+            table = table.strip("\0")
+            if table and not client.command(f"EXISTS TABLE {table}"):
+                continue
+            client.command(sql.strip())
 
     @classmethod
     def required_version(cls, text: str) -> tuple:
@@ -316,8 +332,7 @@ class SchemaApplier:
                 if done[path.name] != cls.checksum(text):
                     print(f"  [warn] {path.name} changed after it was applied")
                 continue
-            for stmt in cls.statements(text):
-                client.command(stmt)
+            cls.run_migration(client, text)
             client.insert(
                 cls.LEDGER,
                 [[path.name, cls.checksum(text)]],
@@ -361,8 +376,7 @@ class SchemaApplier:
         text = path.read_text()
         if not cls.RERUNNABLE.search(text):
             raise ValueError(f"{path.name} is not marked -- RERUNNABLE")
-        for stmt in cls.statements(text):
-            client.command(stmt)
+        cls.run_migration(client, text)
 
 
 SCHEMA_DIR = SchemaApplier.schema_dir()
