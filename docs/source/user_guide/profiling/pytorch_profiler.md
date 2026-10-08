@@ -152,7 +152,7 @@ wrong attribution rather than an explicit missing join.
 
 ## Advanced features
 
-Full reference lives in the upstream
+The full reference is in the upstream
 [PyTorch profiler documentation][torch-profiler-docs]:
 
 - `record_function` — annotate named spans
@@ -160,9 +160,12 @@ Full reference lives in the upstream
 - `on_trace_ready` — stream to TensorBoard-compatible JSON
 - `with_stack` — include file and line for Python ops
 
-## Known issues (from torch-spyre-docs)
+## Communication events
 
-- **Multi-AIU communication profiling is not supported yet.**
+Host-side communication spans emitted by spyre-comms appear in the trace
+under `aiuComms*` names. Collectives such as allreduce, allgather, and
+broadcast, together with the send, receive, and transfer operations beneath
+them, are recorded alongside compute kernels on multi-AIU runs.
 
 ## See also
 

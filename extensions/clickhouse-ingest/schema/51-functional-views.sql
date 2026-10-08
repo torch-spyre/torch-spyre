@@ -12,7 +12,7 @@ SELECT
     cr.component    AS component,
     c.classname     AS classname,
     c.name          AS name,
-    c.tags          AS tags,
+    arrayConcat(c.tags, cr.tags) AS tags,
     cr.status       AS status,
     cr.duration_s   AS duration_s,
     cr.fail_message AS fail_message,
@@ -34,6 +34,9 @@ SELECT
     countIf(cr.status = 'passed') AS passed,
     countIf(cr.status IN ('failed', 'error')) AS failed,
     countIf(cr.status = 'skipped') AS skipped,
+    -- Of passed, as in run_case_counters.recovered.
+    countIf(cr.status = 'passed' AND (cr.props['result.prior_status'] IN ('failed', 'error')
+            OR toUInt32OrZero(cr.props['result.reruns']) > 0)) AS recovered,
     passed / runs AS pass_rate,
     avg(cr.duration_s) AS mean_duration_s,
     anyIf(cr.fail_message, cr.fail_message != '') AS sample_fail_message
@@ -75,6 +78,7 @@ GROUP BY run_id, component, tier;
 
 -- Completeness of a run against its leg's tier: of the cases tagged for that tier, how many
 -- this run executed (the tiers do not nest, so a run need not cover its tier's population).
+-- Tier tags live on test_case_runs, so a tier's population is every case any run tagged for it.
 -- not_covered > 0 means PARTIAL. Grain is (run_id, component, tier); filter by run_id.
 CREATE VIEW IF NOT EXISTS v_tier_report_completeness AS
 SELECT
@@ -88,7 +92,7 @@ SELECT
 FROM
 (
     SELECT cr.run_id AS run_id, cr.component AS component, leg.tier AS tier,
-           uniqExactIf(cr.test_case_id, has(c.tags, concat('testtype__', leg.tier))) AS ran_total
+           uniqExactIf(cr.test_case_id, has(cr.tags, concat('testtype__', leg.tier))) AS ran_total
     FROM test_case_runs AS cr
     INNER JOIN
     (
@@ -97,14 +101,14 @@ FROM
         WHERE result_kind = 'functional'
         GROUP BY run_id
     ) AS leg ON leg.run_id = cr.run_id
-    LEFT JOIN test_cases AS c
-           ON c.test_case_id = cr.test_case_id AND c.component = cr.component
     GROUP BY run_id, component, tier
 ) AS ran
 INNER JOIN
 (
+    -- Scans all of test_case_runs' history per query; a small per-(component, tier) aggregate
+    -- is the follow-up once retention makes that slow.
     SELECT component, substring(tag, 11) AS tier, uniqExact(test_case_id) AS want_total
-    FROM test_cases
+    FROM test_case_runs
     ARRAY JOIN tags AS tag
     WHERE startsWith(tag, 'testtype__')
     GROUP BY component, tier

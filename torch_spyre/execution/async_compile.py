@@ -19,7 +19,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch._inductor.async_compile import AsyncCompile, get_compile_threads
@@ -27,6 +27,7 @@ from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.compile_worker.subproc_pool import SubprocException
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor import timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -39,7 +40,11 @@ from torch_spyre._inductor.kernel_provenance import (
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
-from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from .kernel_runner import (
+    SpyreFrontendOnlyRunner,
+    SpyreSDSCKernelRunner,
+    SpyreUnimplementedRunner,
+)
 from .kernel_cache import (
     allocate_compile_dir,
     commit_compile_dir,
@@ -47,9 +52,13 @@ from .kernel_cache import (
     get_cached_kernel_dir,
     get_kernel_registry,
     load_symbol_kinds,
+    record_kernel_name,
     save_symbol_kinds,
     _move_to_failed_dir,
 )
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -80,6 +89,40 @@ def _check_ktir_device_prerequisites() -> None:
             "OpSpec->KTIR: cannot compile for the device:\n"
             + "\n".join(f"  - {m}" for m in missing)
         )
+
+
+# One event name for every backend invocation, whichever emitter selected it, so
+# a frontend total stays a single subtraction as emitters come and go. The tool
+# is in the event's meta.
+_BACKEND_STAGE = "stage:SpyreAsyncCompile:backend_compile"
+
+# The frontend-only warning is per process, not per kernel: a large model emits
+# hundreds of kernels and the record already names each skipped one.
+_warned_frontend_only = False
+
+
+def _skip_backend(kernel_name: str, output_dir: str, tool: str):
+    """Frontend-only boundary: record the skip and hand back a raising stub.
+
+    Shared by every emitter so the mode means one thing, and so a new backend
+    cannot quietly bypass it -- the marker region times nothing, it only fixes
+    where the boundary fell in the timeline.
+    """
+    global _warned_frontend_only
+    if not _warned_frontend_only:
+        logger.warning(
+            "TORCH_SPYRE_FRONTEND_ONLY=1: skipping %s for every kernel; this "
+            "process produces no runnable kernels. Skipped kernels are named in "
+            "the timing record.",
+            tool,
+        )
+        _warned_frontend_only = True
+    with timing_recorder.stage(
+        "stage:SpyreAsyncCompile:backend_skipped", kernel=kernel_name, tool=tool
+    ):
+        pass
+    timing_recorder.append_run_meta("backend_skipped_kernels", kernel_name)
+    return SpyreFrontendOnlyRunner(kernel_name, output_dir)
 
 
 # Linux caps a single path component at NAME_MAX bytes (255 on ext4/xfs/tmpfs).
@@ -152,7 +195,14 @@ def _compile_to_dir(
             such a bundle to the backend compiler would produce a mismatched
             inputSym_ slot count.
     """
-    symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
+    with timing_recorder.stage(
+        "stage:SpyreAsyncCompile:generate_bundle",
+        kernel=kernel_name,
+        specs=len(specs),
+    ):
+        symbol_kinds = generate_bundle(
+            kernel_name, compile_dir, specs, pool_size=pool_size
+        )
     if any(sk.is_dimension for sk in symbol_kinds):
         raise NotImplementedError(
             "SDSC bundle dimension symbols require runtime kDimension support"
@@ -257,6 +307,23 @@ def _run_backend_compiler(
     return compile_dir
 
 
+def _prepare_kernel(
+    kernel_name: str,
+    output_dir: str,
+    kernel_provenance: "KernelProvenanceDescriptor | None",
+    symbol_kinds: Any = None,
+) -> SpyreSDSCKernelRunner:
+    with timing_recorder.stage(
+        "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
+    ):
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            kernel_provenance=kernel_provenance,
+            symbol_kinds=symbol_kinds,
+        )
+
+
 class _SpyreCompileFuture(CodeCacheFuture):
     """Resolve one backend compile task and build its runner in the parent."""
 
@@ -298,11 +365,11 @@ class _SpyreCompileFuture(CodeCacheFuture):
         code_dir = self._compile_dir
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
-        self._runner = SpyreSDSCKernelRunner(
+        self._runner = _prepare_kernel(
             self._kernel_name,
             code_dir,
-            kernel_provenance=self._kernel_provenance,
-            symbol_kinds=self._symbol_kinds,
+            self._kernel_provenance,
+            self._symbol_kinds,
         )
         return self._runner
 
@@ -344,6 +411,13 @@ class SpyreAsyncCompile(AsyncCompile):
         self, kernel_name: str, compile_dir: str
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
+        # Everything before this call is frontend work and _run_backend_compiler
+        # is the whole of the backend, so every backend compile passes through
+        # here. The frontend-only boundary is taken by the caller; a path that
+        # reaches this point with the mode on has routed around it.
+        assert not _spyre_config.frontend_only, (
+            "frontend-only must stop before the backend is submitted"
+        )
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -357,7 +431,8 @@ class SpyreAsyncCompile(AsyncCompile):
                     dict(os.environ),
                 )
 
-        _run_backend_compiler(kernel_name, compile_dir, dict(os.environ))
+        with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
+            _run_backend_compiler(kernel_name, compile_dir, dict(os.environ))
         return None
 
     def _compile_future(
@@ -400,7 +475,10 @@ class SpyreAsyncCompile(AsyncCompile):
             # sdsc(). Derive the transport-neutral identity here without changing
             # the generated wrapper call ABI.
             finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
-            kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
+            with timing_recorder.stage(
+                "stage:SpyreAsyncCompile:kernel_provenance", kernel=kernel_name
+            ):
+                kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
         except Exception:  # noqa: BLE001 - provenance must never fail the build
             # Keep canonicalization strict rather than issuing an ambiguous
             # fallback key. Log the first traceback, then report the complete
@@ -419,11 +497,18 @@ class SpyreAsyncCompile(AsyncCompile):
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
+            # A cache hit runs neither generate_bundle nor the backend compiler,
+            # so a frontend-only process would measure no frontend work and still
+            # hand back a runnable kernel. Committing a bundle-only dir is worse:
+            # commit_compile_dir treats an existing dir as a lost race, so that
+            # key would discard every later complete compile.
+            and not _spyre_config.frontend_only
         )
 
         if use_cache:
-            # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
-            # neither generate_bundle nor the backend compiler runs at all.
+            # Hash the specs in-memory before compiling.  On a cache hit
+            # neither generate_bundle nor the backend compiler runs at all
+            # (only the kernel_name.txt marker is touched).
             try:
                 cache_key = compute_specs_hash(
                     specs, kernel_name=kernel_name, pool_size=pool_size
@@ -442,11 +527,12 @@ class SpyreAsyncCompile(AsyncCompile):
                 if cached_dir is not None:
                     logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
                     get_kernel_registry().record_hit(cache_key)
-                    return SpyreSDSCKernelRunner(
+                    record_kernel_name(cached_dir, kernel_name)
+                    return _prepare_kernel(
                         kernel_name,
                         cached_dir,
-                        kernel_provenance=kernel_provenance,
-                        symbol_kinds=load_symbol_kinds(cached_dir),
+                        kernel_provenance,
+                        load_symbol_kinds(cached_dir),
                     )
 
                 logger.debug("Cache MISS: Compiling kernel")
@@ -454,7 +540,9 @@ class SpyreAsyncCompile(AsyncCompile):
 
                 # Allocate a temp dir INSIDE the cache root (same filesystem)
                 # so the rename in commit_compile_dir is atomic on POSIX.
-                compile_dir: str = allocate_compile_dir(cache_key)
+                compile_dir: str = allocate_compile_dir(
+                    cache_key, kernel_name=kernel_name
+                )
                 try:
                     symbol_kinds = _compile_to_dir(
                         kernel_name, compile_dir, specs, pool_size
@@ -472,11 +560,8 @@ class SpyreAsyncCompile(AsyncCompile):
                         )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
-                    return SpyreSDSCKernelRunner(
-                        kernel_name,
-                        cached_dir,
-                        kernel_provenance=kernel_provenance,
-                        symbol_kinds=symbol_kinds,
+                    return _prepare_kernel(
+                        kernel_name, cached_dir, kernel_provenance, symbol_kinds
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -484,10 +569,13 @@ class SpyreAsyncCompile(AsyncCompile):
                     _move_to_failed_dir(compile_dir)
                     raise
 
-        # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
-        # Compile into a throw-away temp dir that lives for this process only.
+        # Caching disabled (SPYRE_KERNEL_CACHE=0, force_disable_caches, or
+        # frontend-only). Compile into a throw-away temp dir that lives for this
+        # process only.
         output_dir = get_output_dir(kernel_name)
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
+        if _spyre_config.frontend_only:
+            return _skip_backend(kernel_name, output_dir, "dbo-opt")
         task = self._submit_backend_compile(kernel_name, output_dir)
         if task is not None:
             return self._compile_future(
@@ -497,12 +585,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 kernel_provenance,
                 symbol_kinds,
             )
-        return SpyreSDSCKernelRunner(
-            kernel_name,
-            output_dir,
-            kernel_provenance=kernel_provenance,
-            symbol_kinds=symbol_kinds,
-        )
+        return _prepare_kernel(kernel_name, output_dir, kernel_provenance, symbol_kinds)
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -516,8 +599,11 @@ class SpyreAsyncCompile(AsyncCompile):
         ``SpyreSDSCKernelRunner``.
         """
         # Upfront, before anything is emitted: what device execution needs is a
-        # matter of configuration, so there is no reason to emit first.
-        _check_ktir_device_prerequisites()
+        # matter of configuration, so there is no reason to emit first. Skipped
+        # under frontend_only: these are the backend's prerequisites, and a
+        # frontend measurement must not require a toolchain it never invokes.
+        if not _spyre_config.frontend_only:
+            _check_ktir_device_prerequisites()
 
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -539,12 +625,17 @@ class SpyreAsyncCompile(AsyncCompile):
         # The same predicate ``call_kernel`` passes a pool tensor by, so the
         # signature opens with a matching slot.  Read from config here: the
         # emitter reads no config.
-        ktir_text = generate_ktir(
-            kernel_name,
-            specs,
-            bake_addresses=not _spyre_config.bundle_symbolic_args,
-            frontend_pool_allocation=_spyre_config.pool_allocated_by_frontend(),
-        )
+        with timing_recorder.stage(
+            "stage:SpyreAsyncCompile:generate_ktir",
+            kernel=kernel_name,
+            specs=len(specs),
+        ):
+            ktir_text = generate_ktir(
+                kernel_name,
+                specs,
+                bake_addresses=not _spyre_config.bundle_symbolic_args,
+                frontend_pool_allocation=_spyre_config.pool_allocated_by_frontend(),
+            )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.
@@ -563,6 +654,13 @@ class SpyreAsyncCompile(AsyncCompile):
         writes ``spyreCodeDir/{spyrecode.json, init_binary.bin}`` -- exactly the
         layout ``prepare_kernel`` loads, so no new runner is needed.
         """
+        # dbo-opt is this emitter's backend, so the boundary is here -- ahead of
+        # its prerequisites, which only the invocation needs. Both emitters are
+        # guarded rather than rejecting the combination at config read, so the
+        # mode means the same thing whichever one is selected.
+        if _spyre_config.frontend_only:
+            return _skip_backend(kernel_name, output_dir, "dbo-opt")
+
         # Re-checked here, not only in ``ktir``: this is also reached directly
         # (tests, callers compiling a .ktir off disk), and the check is a cheap
         # idempotent read of config plus one PATH lookup.
@@ -585,13 +683,16 @@ class SpyreAsyncCompile(AsyncCompile):
         # to one backend for its lifetime via ``ktir_emitter``.
         with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=_COMPILE_TIMEOUT_S,
-                )
+                with timing_recorder.stage(
+                    _BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"
+                ):
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=_COMPILE_TIMEOUT_S,
+                    )
                 # dbo-opt can exit 0 having written nothing, so the artifact
                 # itself -- not the return code -- is the success condition.
                 spyrecode = os.path.join(output_dir, "spyreCodeDir", "spyrecode.json")

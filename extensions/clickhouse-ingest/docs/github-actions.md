@@ -52,7 +52,7 @@ Output: `root` — the directory holding both trees for this call.
 
 ### `ingest-xml-to-clickhouse`
 
-JUnit + benchmark XML to ClickHouse, via `ingest_xml.py`. The only ingest
+JUnit + benchmark XML to ClickHouse, via `python -m spyre_clickhouse_ingest results`. The only ingest
 implementation for the schema-v2 functional/benchmark tables; every repo's
 XML pipeline ends here.
 
@@ -88,16 +88,16 @@ Currently called by torch-spyre and spyre-inference only — see
 ### `ingest-model-ops-to-clickhouse`
 
 Downloads model-ops job logs, parses them for operation-support variants
-(`parse_model_ops_logs.py`), and inserts them (`ingest_model_ops.py`) as
-`capabilities`/`capability_runs` rows with `test_type="model_ops"`. Filters
-strictly on the job-name prefix `model-ops /`, not a `Spyre` substring match
-— a regression-matrix job also carries that word and would otherwise land as
-a fake model-ops suite.
+(`parse_model_ops_logs.py`), and inserts them (`ingest_model_ops.py`) into the
+v1 `model_ops_*` tables only. Filters strictly on the job-name prefix
+`model-ops /`, not a `Spyre` substring match — a regression-matrix job also
+carries that word and would otherwise land as a fake model-ops suite. The v2
+`capabilities`/`capability_runs` verdicts come from the suites' JUnit
+`capability.*` properties instead, through `ingest-xml-to-clickhouse`.
 
 | Key input | Purpose |
 |---|---|
 | `gha-run-id` (required) | Nightly run to analyse. |
-| `schema` | `v1` / `v2` / `both`. |
 
 Outputs: `json-file`, `log-file`, `has-variant-data` — the ingest step is
 skipped whenever parsing found zero variants, so an in-progress or
@@ -179,9 +179,9 @@ action (it isn't log-driven), but it dual-writes through the exact same
 
 | Workflow | Triggers | Calls |
 |---|---|---|
-| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `model-ops-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
+| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
 | `push-hw-diagnostics-to-clickhouse.yaml` | same `workflow_run` set | `ingest-hw-diagnostics-to-clickhouse` |
-| `push-model-ops-logs-to-clickhouse.yaml` | model-ops nightly run completion | `ingest-model-ops-to-clickhouse` |
+| `push-model-ops-logs-to-clickhouse.yaml` | model-ops nightly run completion | `ingest-model-ops-to-clickhouse` (v1 only) |
 | `push-pytorch-dispatch-to-clickhouse.yaml` | `repository_dispatch` from pytorch/pytorch's CRCR relay | `ingest-pytorch-dispatch-to-clickhouse` |
 
 `derive-gha-artifact-id` runs earlier, inside the test-execution workflow

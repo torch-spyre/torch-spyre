@@ -115,6 +115,7 @@ class AiuptiActivityProfilerSession
   bool hasDeviceResource(uint32_t device, uint32_t id);
   void recordStream(uint32_t device, uint32_t id);
   void recordMemoryStream(uint32_t device, uint32_t id, std::string kind);
+  void recordThreadStream(uint32_t device, uint32_t id);
 
   int64_t totalAllocatedBytes_{0};
 };

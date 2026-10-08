@@ -16,9 +16,7 @@ from contextlib import contextmanager
 import copy
 import functools
 import hashlib
-import json
 from pathlib import Path
-import shutil
 import subprocess
 from unittest.mock import patch as mock_patch
 import torch
@@ -503,6 +501,9 @@ class ParameterizedTestMeta(type):
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
             expect_fail = cases.get("expect_fail", [])
+            skip_list = cases.get("skip", [])
+            # {case: reason}: an xfail still runs on the card, so a case that faults it is skipped.
+            device_fault = cases.get("device_fault", {})
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -529,18 +530,25 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
-                        # An expect_fail entry may target either the bare param
-                        # key (xfails every op for that shape) or the specific
-                        # ``{op_name}_{test_case}`` combination (xfails just that
-                        # op), so a single op can be marked without affecting the
-                        # others sharing the shape.
                         op_case = f"{op_name}_{test_case}"
-                        op_case_match = op_case in expect_fail
-                        if test_case in expect_fail or op_case_match:
-                            marked = op_case if op_case_match else test_case
-                            namespace[test_name] = pytest.mark.xfail(
-                                reason=f"Expected fail for {marked}", strict=True
+                        op_case_skip = op_case in skip_list
+                        if test_case in skip_list or op_case_skip:
+                            marked = op_case if op_case_skip else test_case
+                            namespace[test_name] = pytest.mark.skip(
+                                reason=f"Skipped for {marked}"
                             )(namespace[test_name])
+                        else:
+                            # An expect_fail entry may target either the bare param
+                            # key (xfails every op for that shape) or the specific
+                            # ``{op_name}_{test_case}`` combination (xfails just that
+                            # op), so a single op can be marked without affecting the
+                            # others sharing the shape.
+                            op_case_match = op_case in expect_fail
+                            if test_case in expect_fail or op_case_match:
+                                marked = op_case if op_case_match else test_case
+                                namespace[test_name] = pytest.mark.xfail(
+                                    reason=f"Expected fail for {marked}", strict=True
+                                )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -562,7 +570,15 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
-                    if test_case in expect_fail:
+                    if test_case in skip_list:
+                        namespace[test_name] = pytest.mark.skip(
+                            reason=f"Skipped for {test_case}"
+                        )(namespace[test_name])
+                    elif test_case in device_fault:
+                        namespace[test_name] = pytest.mark.skip(
+                            reason=f"Faults the device: {device_fault[test_case]}"
+                        )(namespace[test_name])
+                    elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
                             reason=f"Expected fail for {test_case}", strict=True
                         )(namespace[test_name])
@@ -864,69 +880,3 @@ def capture_backend_output_dirs():
 
     with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
         yield output_dirs
-
-
-def requires_dxp_standalone():
-    """Skip the calling test unless ``dxp_standalone`` is on PATH.
-
-    Bundles are compiled by dbo-opt, so dxp_standalone is no longer needed to
-    build or run a kernel.  The debug re-lowering below is the one thing that
-    still requires it: ``--use-dxp`` with ``DXP_DEBUG=1`` writes the
-    ``debug/sdsc_*/*.out.out.out.json`` payloads these assertions read, and
-    dbo-opt has no equivalent.  So the payload check is only meaningful where
-    that binary exists, and a missing one is an environment fact rather than a
-    product failure -- skip rather than fail.
-    """
-    if shutil.which("dxp_standalone") is None:
-        pytest.skip(
-            "dxp_standalone not on PATH: the --use-dxp/DXP_DEBUG debug payload "
-            "this assertion reads has no dbo-opt equivalent"
-        )
-
-
-def assert_lx_only_relayout_payload(output_dirs):
-    """The compiled bundle's SDSC payload carries exactly one LX relayout op and
-    no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
-    HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
-    re-lowering of the same bundle, not a second device execution.
-
-    Skips when dxp_standalone is unavailable -- see requires_dxp_standalone.
-    """
-    requires_dxp_standalone()
-
-    for output_dir in output_dirs:
-        subprocess.run(
-            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
-            check=True,
-            env={**os.environ, "DXP_DEBUG": "1"},
-        )
-    payloads = [
-        json.loads(path.read_text())
-        for output_dir in output_dirs
-        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
-    ]
-    assert payloads, "DeepTools emitted no debug SDSC payloads"
-    nodes = []
-    pending = list(payloads)
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            nodes.append(value)
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    lx_ops = [
-        node
-        for node in nodes
-        if isinstance(node.get("op"), dict) and node["op"].get("name") == "STCDPOpLx"
-    ]
-    assert len(lx_ops) == 1
-    op_names = [node["name"] for node in nodes if isinstance(node.get("name"), str)]
-    assert not any(
-        token in name.lower()
-        for name in op_names
-        for token in ("dma", "restickify", "stcdpophbm")
-    )
-    labeled_ds = lx_ops[0]["labeledDs_"]
-    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
-    return lx_ops[0]["op"]["prodConsList"]

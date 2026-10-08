@@ -66,17 +66,18 @@ FROM
 (
     -- ifNull: an unjoined row is NULL under a reader's join_use_nulls=1, and a NULL slot key
     -- would pool every unjoined row into one slot.
+    -- arch is canonicalized here too, matching v_tag_resolution, so amd64/x86_64 share one slot.
     SELECT at.tag AS tag, at.tag_family AS tag_family, at.artifact_id AS artifact_id,
            at.ts AS ts,
            ifNull(a.component, '') AS component,
-           ifNull(a.arch, '')      AS arch,
+           if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')) AS arch,
            uniqExact(at.artifact_id) OVER (
                PARTITION BY at.tag,
                             -- (component, arch, artifact_name) when joined, else the artifact itself.
                             if(ifNull(a.component, '') = '',
                                toString(at.artifact_id),
                                ifNull(a.component, '')),
-                            ifNull(a.arch, ''),
+                            if(ifNull(a.arch, '') IN ('amd64', 'x86', 'x86-64'), 'x86_64', ifNull(a.arch, '')),
                             ifNull(a.artifact_name, ''))
                AS slot_artifacts
     FROM artifact_tags AS at
@@ -114,6 +115,8 @@ SELECT
     -- Previously omitted, leaving pass_rate at 92.11% instead of 97.88% (72,887 prod rows).
     coalesce(c.xfail, 0)       AS xfail,
     coalesce(c.xpass, 0)       AS xpass,
+    -- Of passed: an earlier attempt of the case failed.
+    coalesce(c.recovered, 0)   AS recovered,
     r.duration_s     AS duration_s,
     -- Denominator excludes xfail/xpass: of the cases whose outcome was in question, how many passed.
     if(total_tests - xfail - xpass > 0,
@@ -122,7 +125,16 @@ SELECT
     -- 'running' is advisory only (a crashed run keeps this row until the 90-day TTL); shown
     -- here for the drill-down, but aggregating callers must exclude it (see v_tier_trend).
     CAST(r.state = 'running' AS UInt8) AS is_advisory
-FROM artifact_results AS r
+FROM
+(
+    -- One row per verdict, the latest: a leg writes a 'running' seed before its final state and a
+    -- re-push repeats it, so raw rows count a run's counters twice. A run can hold a functional
+    -- and a capability verdict for one artifact, hence result_kind/test_type in the key.
+    SELECT *
+    FROM artifact_results
+    ORDER BY ts DESC, audit_timestamp DESC
+    LIMIT 1 BY artifact_id, run_id, result_kind, test_type
+) AS r
 LEFT JOIN v_artifacts AS a ON a.artifact_id = r.artifact_id
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
@@ -136,7 +148,8 @@ LEFT JOIN (
         sum(errors)      AS errors,
         sum(skipped)     AS skipped,
         sum(xfail)       AS xfail,
-        sum(xpass)       AS xpass
+        sum(xpass)       AS xpass,
+        sum(recovered)   AS recovered
     FROM run_case_counters
     GROUP BY run_id
 ) AS c ON c.run_id = r.run_id;
@@ -162,6 +175,8 @@ SELECT
     e.failed       AS failed,
     e.errors       AS errors,
     e.skipped      AS skipped,
+    e.xfail        AS xfail,
+    e.xpass        AS xpass,
     e.duration_s   AS duration_s,
     e.pass_rate    AS pass_rate,
     e.suite_ran    AS suite_ran,
@@ -220,7 +235,12 @@ SELECT
     sum(e.failed)           AS failed,
     sum(e.errors)           AS errors,
     sum(e.skipped)          AS skipped,
-    if(sum(e.total_tests) > 0, sum(e.passed) / sum(e.total_tests), NULL) AS pass_rate,
+    sum(e.xfail)            AS xfail,
+    sum(e.xpass)            AS xpass,
+    sum(e.recovered)        AS recovered,
+    -- Same denominator as v_artifact_results_enriched: xfail/xpass excluded.
+    if(sum(e.total_tests) - sum(e.xfail) - sum(e.xpass) > 0,
+       sum(e.passed) / (sum(e.total_tests) - sum(e.xfail) - sum(e.xpass)), NULL) AS pass_rate,
     avg(e.duration_s)       AS mean_duration_s
 FROM
 (

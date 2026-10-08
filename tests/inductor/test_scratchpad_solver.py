@@ -31,11 +31,14 @@ from unittest import TestCase
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType,
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    TileAxis,
+    TileSpec,
     solved_bindings,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -163,6 +166,48 @@ class TestLxPlanningContract(TestCase):
                         ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
                     ):
                         _lx_planning_size()
+
+
+class TestDrainLifetimeBoundary(TestCase):
+    """The post-loop drain storage must stay live to the graph exit.
+
+    All solver intervals are on pre-insertion operation indices with a
+    half-open ``[start, end)`` convention.  The drain reads the storage after
+    the whole counted loop, so the storage's end is extended to
+    ``N = len(graph.operations)``; the failing boundary case is exactly a
+    buffer whose start equals the loop's textual end (``s_B = loop_end + 1``):
+    against the un-extended ``end = uses[-1] + 1`` it does not overlap and
+    could legally take the same address, clobbering the value.  These tests
+    pin the half-open arithmetic and the extension's effect.
+    """
+
+    def test_extended_end_excludes_the_loop_end_boundary_sharer(self):
+        # Storage fill at tick 0, tagged update read/write at tick 5
+        # (loop_end = 5, so N = 7 with the post-loop drain op's slot).
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5], lifetime_end_override=7)
+        self.assertEqual(storage.end_time, 7)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertTrue(
+            storage.overlaps_in_time(sharer),
+            "end=7 must overlap a buffer born at the loop's textual end",
+        )
+
+    def test_unextended_end_would_allow_the_boundary_sharer(self):
+        """Un-extended, the same pair shares: this is the bug the plan fix closes."""
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5])
+        self.assertEqual(storage.end_time, 6)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertFalse(storage.overlaps_in_time(sharer))
+
+    def test_override_extending_beyond_nominal_end_is_kept(self):
+        storage = LifetimeBoundBuffer("carry", 100, [0, 9], lifetime_end_override=12)
+        self.assertEqual(storage.end_time, 12)
+
+    def test_override_below_nominal_end_is_rejected(self):
+        # The extension helper takes a max(), so it can never build this; the
+        # constructor is the backstop for any other caller.
+        with self.assertRaises(AssertionError):
+            LifetimeBoundBuffer("bad", 100, [0, 9], lifetime_end_override=9)
 
 
 def _two_gap_buffers():
@@ -1364,6 +1409,200 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
                 balanced.output_splits,
                 f"{name}: balance step should pick the balanced two-axis division",
             )
+
+    def _chosen_tiling(self, buffers, name):
+        result = {
+            buf.name: buf
+            for buf in self.solver_class(
+                buffers, size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        return result[name].core_divisions[result[name].chosen_division].tiling
+
+    def test_cut_stage_joins_the_op_between_producer_and_consumer(self):
+        # Op order a, b, c; c reads a and b. a and c can only be tiled, b may
+        # go either way. Loop groups are consecutive runs, so an untiled b
+        # splits a from c and copies a out: two cuts (a, and c before the
+        # sink) against one when b joins the run. Nothing else separates the
+        # two plans -- all resident, one core each -- and the tile-count stage
+        # alone would pick the untiled b.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled, untiled = CoreDivision(tiling=spec), CoreDivision()
+        a = CoreDivisionBuffer("a", 128, [0, 2], core_divisions=[tiled])
+        b = CoreDivisionBuffer("b", 128, [1, 2], core_divisions=[untiled, tiled])
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[tiled],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)], "b": [(0, 0), (1, 0)]},
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), spec)
+
+    def test_cut_stage_counts_a_tiled_graph_output(self):
+        # A graph output is copied out of its loop even when its only consumer
+        # shares the nest, so tiling it costs a cut. Here that tiling is also
+        # the more parallel division, which the parallelism stage would take
+        # if the cut went uncounted.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        parallel = CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec)
+        out = CoreDivisionBuffer(
+            "out",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(), parallel],
+            boundary=BufferType.Output,
+        )
+        consumer = CoreDivisionBuffer(
+            "consumer",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["out"],
+            cd_parent_matches={"out": [(0, 0), (1, 0)]},
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [2],
+            core_divisions=_whole(),
+            parents=["consumer"],
+            cd_parent_matches={"consumer": [(0, 0)]},
+        )
+        self.assertTrue(
+            self._chosen_tiling([out, consumer, sink], "out").is_untiled,
+        )
+
+    def test_cut_stage_splits_a_pair_the_table_does_not_match(self):
+        # b reads a, and both tilings run the same nest (d0:2), so adjacent
+        # they would share it -- but the table has no (tiled a, tiled b) pair:
+        # b walks a different dim of a's buffer. Sharing the nest would read
+        # the wrong tile, so b must stay untiled even though tiling it is the
+        # more parallel division. Every buffer is barred from LX so residency
+        # cannot make the choice instead.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(tiling=spec)],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec),
+            ],
+            parents=["a"],
+            cd_parent_matches={"a": [(0, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [2],
+            core_divisions=_whole(),
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0), (1, 0)]},
+        )
+        self.assertTrue(self._chosen_tiling([a, b, sink], "b").is_untiled)
+
+    def test_cut_stage_splits_a_pair_an_untileable_op_sits_between(self):
+        # Op order a, b, c; c reads a, and the table matches their tilings.
+        # But b can only be untiled, and loop groups are consecutive runs, so
+        # b splits a from c whatever they choose: a tiled is copied out for c
+        # to read. That is two cuts (a, and c before the sink) against one for
+        # an untiled a. a's tiled candidate also carries a two-core split,
+        # which the parallelism stage would take if a and c counted as one nest.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 2],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec),
+            ],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b", 128, [1, 2], core_divisions=_whole(), residency_reason=barred
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0), (1, 0)], "b": [(0, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertTrue(self._chosen_tiling([a, b, c, sink], "a").is_untiled)
+
+    def test_cut_stage_joins_a_matched_pair_with_different_specs(self):
+        # a -> b -> c, all running a two-tile nest. b's d1:2 is the tiling the
+        # table matches with a's d0:2 and c's d0:2 (b reads a transposed), so
+        # the three share one nest with a single cut, at c. Keying the nest on
+        # spec equality instead would split b off and cost a cut at a as well.
+        d0 = TileSpec((TileAxis(host_dim=0, count=2),))
+        d1 = TileSpec((TileAxis(host_dim=1, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(tiling=d0)],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision(), CoreDivision(tiling=d1)],
+            parents=["a"],
+            cd_parent_matches={"a": [(0, 1)]},
+            residency_reason=barred,
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=d0)],
+            parents=["b"],
+            cd_parent_matches={"b": [(1, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
 
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the

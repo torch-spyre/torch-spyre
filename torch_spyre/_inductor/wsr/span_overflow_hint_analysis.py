@@ -33,6 +33,7 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import (
+    concretize_expr,
     device_coordinates,
     _fixed_read_layout,
     host_coordinates,
@@ -40,6 +41,7 @@ from ..pass_utils import (
     op_out_coords,
 )
 from ..work_division import MAX_SPAN_BYTES
+from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
 
 
 logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
@@ -337,6 +339,38 @@ def _post_tile_stick_alignment_error(
         f"tile size {tile_size}, which is not aligned to Spyre stick size "
         f"{stick_elems}; coarse-tile boundaries would cut through physical sticks"
     )
+
+
+def _post_tile_resize_error(
+    op: ComputedBuffer, host_dim: int, split_count: int, stick_host_dim: int | None
+) -> str | None:
+    """Why the apply could not lay out ``op``'s tile for ``host_dim`` split
+    ``split_count`` ways, or ``None``. Makes ``_divide_ranges``'s
+    ``_resize_device_layout`` call, which raises on e.g. a device dim folding
+    two host dims. The full buffer the tiles are gathered into needs no check:
+    it is not grown back from the tile, it takes the layout planning recorded
+    (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). A symbolic
+    size is read at its compile-time value, which the device layout was built
+    from."""
+    layout = op.layout
+    if (
+        split_count <= 1
+        or not isinstance(layout, FixedTiledLayout)
+        or len(layout.size) != len(op.data.ranges)
+        or host_dim in _loop_var_hinted_ranges(op)
+    ):
+        return None
+    full_size = [concretize_expr(s) for s in layout.size]
+    tile_size = list(full_size)
+    tile_size[host_dim] //= split_count
+    try:
+        _resize_device_layout(
+            layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    return None
 
 
 def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
@@ -1605,7 +1639,9 @@ def _split_candidates_for_host_dim(
     because coarse tiling emits equal-sized loop tiles.  Then the candidates are
     filtered for output and input stick alignment: a split is legal only if the
     resulting tile boundary does not cut through physical sticks in the output
-    layout or any direct input layout controlled by the same output symbol.
+    layout or any direct input layout controlled by the same output symbol,
+    and only if the apply can resize the output's device layout to the tile
+    (:func:`_post_tile_resize_error`).
     """
     ranges = list(op.data.ranges)
     if host_dim >= len(ranges):
@@ -1633,6 +1669,11 @@ def _split_candidates_for_host_dim(
             for d in (i, full_size // i)
         }
     )
+    stick_host_dim = (
+        _stick_host_dim(op, op.layout.device_layout)
+        if isinstance(op.layout, FixedTiledLayout)
+        else None
+    )
     legal_candidates = [
         split
         for split in candidates
@@ -1650,6 +1691,7 @@ def _split_candidates_for_host_dim(
             and split <= _MAX_AUTO_TILE_SPLIT_COUNT
             and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
             and _input_stick_alignment_error(op, host_dim, split) is None
+            and _post_tile_resize_error(op, host_dim, split, stick_host_dim) is None
         )
     ]
     capped_candidates = _cap_split_candidates(legal_candidates, required_count)

@@ -62,6 +62,7 @@ from for_each_tile_fixtures import (
     split_k_fn,
     split_k_private_transposed_init_fn,
     split_k_transposed_caller_init_fn,
+    split_k_transposed_caller_init_two_carries_fn,
     split_m_elementwise_fn,
     split_m_fn,
     two_loops_shared_init_fn,
@@ -628,6 +629,75 @@ def _find_while_loop_ir_op(fn, args):
     graph = GraphLowering(gm, example_inputs=list(args), shape_env=fake_mode.shape_env)
     with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
         graph.run(*args)
+    while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+    assert len(while_ops) == 1, f"expected exactly one WhileLoop, got {len(while_ops)}"
+    return while_ops[0]
+
+
+def _find_while_loop_ir_op_with_spyre_cmp_lowerings(fn, args):
+    """Like _find_while_loop_ir_op, but patches only the Spyre comparison
+    lowerings into lowering.lowerings for the duration of graph.run().
+
+    Only cmp overloads (eq/ne/lt/le/gt/ge) are injected -- NOT the full
+    enable_spyre_lowerings() CM -- because that CM also activates Spyre's
+    batchmatmul lowering, which the CPU GraphLowering codegen cannot handle.
+    The body subgraph contains a matmul and would fail with
+    ``unknown reduction_type=batchmatmul`` if any matmul lowering were live.
+    """
+    import contextlib
+    from torch._inductor.graph import GraphLowering
+    from torch._inductor import ir
+    import torch._inductor.lowering as ind_lowering
+    from torch_spyre._inductor.lowering import spyre_lowerings
+
+    _out, gm = capture_post_grad_while_loop(fn, args)
+
+    fake_mode = None
+    for node in gm.graph.nodes:
+        val = node.meta.get("val") if hasattr(node, "meta") else None
+        candidate = getattr(val, "fake_mode", None)
+        if candidate is not None:
+            fake_mode = candidate
+            break
+    assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
+
+    # Identify the cmp overloads registered in spyre_lowerings.
+    _CMP_OPS = {
+        torch.ops.aten.eq,
+        torch.ops.aten.ne,
+        torch.ops.aten.lt,
+        torch.ops.aten.le,
+        torch.ops.aten.gt,
+        torch.ops.aten.ge,
+    }
+    cmp_patch = {}
+    for overload, fn_impl in spyre_lowerings.items():
+        try:
+            packet = overload.overloadpacket
+        except AttributeError:
+            continue
+        if packet in _CMP_OPS:
+            cmp_patch[overload] = fn_impl
+
+    @contextlib.contextmanager
+    def _patch_cmp():
+        saved = {}
+        for ov, fn_impl in cmp_patch.items():
+            saved[ov] = ind_lowering.lowerings.get(ov)
+            ind_lowering.lowerings[ov] = fn_impl
+        try:
+            yield
+        finally:
+            for ov, prev in saved.items():
+                if prev is None:
+                    ind_lowering.lowerings.pop(ov, None)
+                else:
+                    ind_lowering.lowerings[ov] = prev
+
+    graph = GraphLowering(gm, example_inputs=list(args), shape_env=fake_mode.shape_env)
+    with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
+        with _patch_cmp():
+            graph.run(*args)
     while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
     assert len(while_ops) == 1, f"expected exactly one WhileLoop, got {len(while_ops)}"
     return while_ops[0]
@@ -1952,6 +2022,510 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
 
 
+class TestDrainMaterialization(unittest.TestCase):
+    """Post-loop drain: FX-origin capture, plan validation, scheduler order.
+
+    Everything here runs on real captured ``split_k_fn`` graphs lowered through
+    ``GraphLowering`` and spliced by the production ``splice_while_loops``
+    entry point.  ``capture_post_grad_while_loop`` is torch.compile on CPU
+    input tensors, and ``GraphLowering.run`` only builds IR: no Spyre tensor is
+    allocated and no kernel is executed by these tests.
+    """
+
+    _run_graph = TestSpliceWhileLoops._run_graph
+
+    @staticmethod
+    def _validate(graph):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        # The validator reads op read/writes, which need an active graph
+        # handler (op.get_read_writes -> V.graph.sizevars), exactly as in the
+        # production call site inside _prepare_buffers.
+        with V.set_graph_handler(graph):
+            return allocator_module.validated_drain_plans(
+                graph, division_is_fixed=False
+            )
+
+    @staticmethod
+    def _carry_parts(graph):
+        """The (storage, update, record) of the carry that is the graph output.
+
+        ``split_k_fn`` carries three accumulators through its loop (all three
+        records are captured); only the returned one is a graph-output carry
+        and therefore the only one the drain plan can apply to.
+        """
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+        output_names = set(graph.get_output_names())
+        storages = []
+        for op in graph.operations:
+            record = getattr(op, "_loop_carry_record", None)
+            if (
+                isinstance(record, LoopCarryRecord)
+                and record.storage_name == op.get_name()
+                and op.get_name() in output_names
+            ):
+                storages.append((op, record))
+        if len(storages) != 1:
+            raise AssertionError(
+                f"expected exactly one graph-output carry storage, got {len(storages)}"
+            )
+        storage, record = storages[0]
+        update = next(
+            op for op in graph.operations if op.get_name() == record.update_name
+        )
+        return storage, update, record
+
+    @staticmethod
+    def _all_carry_records(graph):
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
+
+        records = []
+        for op in graph.operations:
+            record = getattr(op, "_loop_carry_record", None)
+            if (
+                isinstance(record, LoopCarryRecord)
+                and record.storage_name == op.get_name()
+            ):
+                records.append(record)
+        return records
+
+    def _spliced_graph(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        return graph
+
+    # ------------------------------------------------------------------
+    # Capture validator
+    # ------------------------------------------------------------------
+
+    def test_validated_loop_origin_accepts_only_the_exact_first_hop(self):
+        import torch.fx as fx
+
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _validated_loop_origin,
+        )
+
+        class _FakeWhileOp:
+            def __init__(self, origins):
+                self.origins = origins
+
+        class _FakeGraph:
+            def __init__(self, fx_graph):
+                self.graph = fx_graph
+
+        hop = getattr(torch.ops.higher_order, "while_loop", None)
+        if hop is None:  # pragma: no cover - fork-only HOP
+            self.skipTest("torch fork does not register higher_order.while_loop")
+        fx_graph = fx.Graph()
+        accepted = fx_graph.create_node("call_function", hop, ())
+        wrong_target = fx_graph.create_node(
+            "call_function", torch.ops.aten.add.Tensor, ()
+        )
+        foreign_graph = fx.Graph()
+        foreign_hop = foreign_graph.create_node("call_function", hop, ())
+        graph = _FakeGraph(fx_graph)
+
+        self.assertIsNone(_validated_loop_origin(graph, _FakeWhileOp([])))
+        # Wrong target.
+        self.assertIsNone(_validated_loop_origin(graph, _FakeWhileOp([wrong_target])))
+        # First origin is foreign, even if a graph-local HOP follows.
+        self.assertIsNone(
+            _validated_loop_origin(graph, _FakeWhileOp([foreign_hop, accepted]))
+        )
+        # First origin is the graph-local HOP but the target is foreign.
+        self.assertIsNone(
+            _validated_loop_origin(graph, _FakeWhileOp([wrong_target, accepted]))
+        )
+        # Chained-loop false negative: two graph-local while_loop origins.
+        accepted_two = fx_graph.create_node("call_function", hop, ())
+        self.assertIsNone(
+            _validated_loop_origin(graph, _FakeWhileOp([accepted, accepted_two]))
+        )
+        # The exact single first origin is accepted by identity.
+        self.assertIs(_validated_loop_origin(graph, _FakeWhileOp([accepted])), accepted)
+        # A foreign origin alone declines.
+        self.assertIsNone(_validated_loop_origin(graph, _FakeWhileOp([foreign_hop])))
+
+    def test_real_splice_captures_the_hop_origin_on_the_record(self):
+        graph = self._spliced_graph()
+        _storage, _update, record = self._carry_parts(graph)
+        origin = record.loop_origin
+        self.assertIsNotNone(
+            origin, "the production splice must retain a validated loop origin"
+        )
+        self.assertIs(origin.graph, graph.graph)
+        hops = tuple(
+            target
+            for name in ("while_loop", "while_loop_stack_output")
+            if (target := getattr(torch.ops.higher_order, name, None)) is not None
+        )
+        self.assertIn(origin.target, hops)
+        # Every accumulator carry of this loop captured the same HOP node.
+        records = self._all_carry_records(graph)
+        self.assertGreaterEqual(len(records), 1)
+        self.assertTrue(all(r.loop_origin is not None for r in records))
+        self.assertEqual({id(r.loop_origin) for r in records}, {id(origin)})
+
+    # ------------------------------------------------------------------
+    # Plan validation matrix on the real graph
+    # ------------------------------------------------------------------
+
+    def test_plan_accepts_the_real_carry_graph(self):
+        from torch_spyre._inductor.scratchpad.allocator import DrainPlan
+
+        graph = self._spliced_graph()
+        storage, update, record = self._carry_parts(graph)
+        plans = self._validate(graph)
+        self.assertEqual(len(plans), 1, "the split_k carry must validate")
+        plan = plans[storage.get_name()]
+        self.assertIsInstance(plan, DrainPlan)
+        self.assertEqual(plan.update_name, update.get_name())
+        self.assertEqual(plan.loop_group, (0,))
+        self.assertIs(plan.loop_origin, record.loop_origin)
+        # The anchor is the last operation of the loop's group subtree.
+        expected_anchor = None
+        for op in graph.operations:
+            loop_info = getattr(op, "loop_info", None)
+            if loop_info is not None and loop_info.loop_group_id[:1] == (0,):
+                expected_anchor = op
+        self.assertIsNotNone(expected_anchor)
+        self.assertIs(plan.anchor_op, expected_anchor)
+
+    def test_plan_declines_every_unproven_variant(self):
+        import dataclasses
+
+        import sympy
+        import torch.fx as fx
+
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep, ReadWrites
+        from torch.utils._ordered_set import OrderedSet
+
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        graph = self._spliced_graph()
+        storage, update, record = self._carry_parts(graph)
+        self.assertTrue(self._validate(graph), "baseline graph must validate")
+
+        with self.subTest("no record"):
+            with mock.patch.object(storage, "_loop_carry_record", None):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("loop_origin missing"):
+            broken = dataclasses.replace(record, loop_origin=None)
+            with mock.patch.object(storage, "_loop_carry_record", broken):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("loop_origin foreign graph"):
+            foreign = fx.Graph().create_node(
+                "call_function", torch.ops.aten.add.Tensor, ()
+            )
+            broken = dataclasses.replace(record, loop_origin=foreign)
+            with mock.patch.object(storage, "_loop_carry_record", broken):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("update unresolvable"):
+            broken = dataclasses.replace(record, update_name="not_an_op")
+            with mock.patch.object(storage, "_loop_carry_record", broken):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("storage name mismatch"):
+            broken = dataclasses.replace(record, storage_name="not_the_storage")
+            with mock.patch.object(storage, "_loop_carry_record", broken):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("nested loop level"):
+            from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+            nested = CoarseTileInfo(
+                loop_group_id=(0, 0),
+                loop_count=[sympy.Integer(4), sympy.Integer(4)],
+                loop_tiled_dims=[[], []],
+            )
+            with mock.patch.object(update, "loop_info", nested):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("storage is itself a loop member"):
+            from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+            tagged = CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[sympy.Integer(4)],
+                loop_tiled_dims=[[]],
+            )
+            with mock.patch.object(storage, "loop_info", tagged, create=True):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("second writer into the storage"):
+            other = next(
+                op for op in graph.operations if op is not storage and op is not update
+            )
+            original_layout = other.layout
+            with V.set_graph_handler(graph):
+                other.layout = ir.MutationLayoutSHOULDREMOVE(storage)
+            try:
+                self.assertEqual(self._validate(graph), {})
+            finally:
+                other.layout = original_layout
+        with self.subTest("multiple graph output slots"):
+            extra = ir.TensorBox(ir.StorageBox(storage))
+            graph.graph_outputs.append(extra)
+            try:
+                self.assertEqual(self._validate(graph), {})
+            finally:
+                graph.graph_outputs.pop()
+        with self.subTest("reinterpret output entry"):
+            with mock.patch.object(
+                allocator_module, "_is_reinterpret_output_entry", return_value=True
+            ):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("boundary cloning off"):
+            with mock.patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=False
+            ):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("fixed division"):
+            self.assertEqual(
+                allocator_module.validated_drain_plans(graph, division_is_fixed=True),
+                {},
+            )
+        with self.subTest("extra in-loop reader of the storage"):
+            victim = next(
+                op
+                for op in graph.operations
+                if op is not storage
+                and op is not update
+                and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
+            )
+            real_read_writes = allocator_module.op_read_writes
+            injected = MemoryDep(storage.get_name(), sympy.Integer(0), (), ())
+
+            def _forged(op):
+                rw = real_read_writes(op)
+                if op is victim:
+                    return ReadWrites(
+                        reads=rw.reads | OrderedSet([injected]),
+                        writes=rw.writes,
+                        index_exprs=rw.index_exprs,
+                    )
+                return rw
+
+            with mock.patch.object(
+                allocator_module, "op_read_writes", side_effect=_forged
+            ):
+                self.assertEqual(self._validate(graph), {})
+        with self.subTest("storage has no FX origin in this graph"):
+            with mock.patch.object(storage, "origins", OrderedSet()):
+                self.assertEqual(self._validate(graph), {})
+
+    def test_plan_declines_a_caller_init_carry(self):
+        """A caller-owned init is copied before the loop into an origin-less buffer.
+
+        That copy is the carry's storage, so the drain's FX clone would have no
+        node to read: the plan must decline and the carry keep today's HBM
+        behavior, instead of failing in the push.
+        """
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        graph = self._run_graph(split_k_caller_init_fn, (X, Y, torch.zeros_like(ref)))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        storage, _update, record = self._carry_parts(graph)
+        self.assertIn("while_loop_carry_copy_", storage.get_name())
+        self.assertIsNotNone(record.loop_origin)
+        self.assertEqual(len(storage.origins), 0)
+        self.assertEqual(self._validate(graph), {})
+
+    def test_plan_declines_a_carry_whose_output_is_a_view(self):
+        """An init that is a view reaches the output wrapped around that view.
+
+        ``b``'s init is ``zeros_like`` of a transposed tensor, so its graph
+        output is ``TensorBox(StorageBox(view))`` and the same view is its
+        update's mutation target. Repointing that view to a drain clone would
+        redirect the in-loop update, so the plan must decline.
+        """
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        acc0 = torch.zeros_like(ref).t().contiguous()
+        graph = self._run_graph(
+            split_k_transposed_caller_init_two_carries_fn, (X, Y, acc0)
+        )
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+        def nested_view(entry):
+            node = entry.data if isinstance(entry, ir.TensorBox) else None
+            return isinstance(node, ir.StorageBox) and isinstance(
+                node.data, ir.ReinterpretView
+            )
+
+        self.assertTrue(any(nested_view(e) for e in graph.graph_outputs))
+        self.assertEqual(self._validate(graph), {})
+
+    # ------------------------------------------------------------------
+    # Real captured scheduler nodes and loop ordering
+    # ------------------------------------------------------------------
+
+    def test_drain_is_scheduled_after_the_whole_loop(self):
+        from types import SimpleNamespace
+
+        from torch._inductor.scheduler import Scheduler, SchedulerNode
+        from torch_spyre._inductor.scheduler import (
+            CountedLoopSchedulerNode,
+            _build_loop_group,
+            _loop_group_id,
+            _regroup_by_outer_loop_key,
+        )
+
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+
+        graph = self._spliced_graph()
+        plans = self._validate(graph)
+        self.assertEqual(len(plans), 1)
+        storage_name, plan = next(iter(plans.items()))
+        storage = graph.get_buffer(storage_name)
+
+        # The CPU-captured fixture lowers the carry to a host ``FixedLayout``;
+        # the real push path requires a device layout.  Replace it with a
+        # Spyre FixedTiledLayout over the same logical shape (fp16 because the
+        # fixture's fp32 row of 64 elements exceeds one 128-byte stick) --
+        # buffer names and dependencies, the only inputs to the ordering
+        # claim, are unchanged.
+        from torch._inductor.ir import FlexibleLayout
+        from torch_spyre._C import SpyreTensorLayout
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        host_layout = storage.get_layout()
+        size = list(host_layout.size)
+        dtype = torch.float16
+        stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+        stick_dim = len(size) - 1
+        dim_order = [i for i in range(len(size)) if i != stick_dim] + [stick_dim]
+        storage.layout = FixedTiledLayout(
+            torch.device("spyre:0"),
+            dtype,
+            size,
+            stride,
+            SpyreTensorLayout(size, stride, dtype, dim_order),
+        )
+
+        with V.set_graph_handler(graph):
+            drain = GraphEditor(graph).push_allocation_with_clone(
+                storage,
+                [],
+                input=False,
+                private=True,
+                after_fx=plan.loop_origin,
+                lower_anchor=plan.anchor_op,
+            )
+        allocator_module._clear_loop_membership_metadata(drain)
+
+        # Lowered order: immediately after the loop's last member.
+        anchor_index = graph.operations.index(plan.anchor_op)
+        self.assertIs(graph.operations[anchor_index + 1], drain)
+        # FX structure: after the retained loop node, and the loop's carried
+        # input was not rewired (the fill's FX users are unchanged).
+        self.assertIn(drain.origin_node, graph.graph.nodes)
+        self.assertIn(plan.loop_origin, graph.graph.nodes)
+
+        # Real scheduler nodes, built by the real dispatch on the real ops.
+        # The dispatch, the node constructor and the grouping all query
+        # ``V.graph`` (sizevars / groups), so the graph handler stays active
+        # for this whole block, exactly as it is during a real schedule.
+        stub = SimpleNamespace(
+            available_buffer_names=set(),
+            name_to_fused_node={},
+            removed_ops=set(),
+            get_backend=lambda device: SimpleNamespace(
+                group_fn=lambda sizes: tuple(sizes)
+            ),
+        )
+        with V.set_graph_handler(graph):
+            snodes = [
+                Scheduler.create_scheduler_node(stub, op) for op in graph.operations
+            ]
+            # The real Scheduler assigns these over its node list at the end of
+            # compute_dependencies; FusedSchedulerNode reads them.
+            for order, snode in enumerate(snodes):
+                snode.min_order = order
+                snode.max_order = order
+
+            # Mutation-rename propagation, mirroring Scheduler.__init__'s own
+            # loop (torch/_inductor/scheduler.py, frozen serving venv): each
+            # node renames its reads of a mutated buffer to the latest
+            # in-place writer before dependencies are consumed.
+            mutation_renames: dict[str, str] = {}
+
+            def resolve(name):
+                seen = set()
+                while name in mutation_renames and name not in seen:
+                    seen.add(name)
+                    name = mutation_renames[name]
+                return name
+
+            for snode in snodes:
+                snode.update_mutated_names(mutation_renames)
+                for buf in snode.get_outputs():
+                    for alt_name in buf.get_mutations():
+                        mutation_renames[resolve(alt_name)] = buf.get_name()
+                        mutation_renames[alt_name] = buf.get_name()
+
+            ordered = _regroup_by_outer_loop_key(snodes)
+            wrapped = _build_loop_group(ordered, 0)
+
+        drain_node = next(n for n in snodes if getattr(n, "node", None) is drain)
+        # The drain carries no loop membership.
+        self.assertIsNone(_loop_group_id(drain_node))
+
+        # Its unresolved dependency names the loop's tagged update, not
+        # the pre-loop initializer.  Compared by node identity because
+        # SchedulerNode.get_name() returns the operation name, which is a
+        # different field from the buffer name the dependencies carry.
+        update_op = graph.get_buffer(plan.update_name)
+        update_node = next(n for n in snodes if getattr(n, "node", None) is update_op)
+        name_to_node = {
+            buffer_name: snode
+            for snode in snodes
+            for buffer_name in snode.get_buffer_names()
+        }
+        producers = {
+            name_to_node[dep.name]
+            for dep in drain_node.unmet_dependencies
+            if dep.name in name_to_node
+        }
+        self.assertIn(
+            update_node,
+            producers,
+            "the drain must depend on the in-loop mutator; a missing "
+            "dependency means the scheduler rewrite would be required",
+        )
+
+        drain_index = next(i for i, n in enumerate(ordered) if n is drain_node)
+        last_loop_member_index = max(
+            i
+            for i, n in enumerate(ordered)
+            if isinstance(n, SchedulerNode)
+            and getattr(n.node, "loop_info", None) is not None
+        )
+        self.assertLess(last_loop_member_index, drain_index)
+
+        counted_loops = [n for n in wrapped if isinstance(n, CountedLoopSchedulerNode)]
+        self.assertEqual(len(counted_loops), 1)
+        self.assertNotIn(drain_node, counted_loops[0].get_nodes())
+        wrapped_drain_index = next(i for i, n in enumerate(wrapped) if n is drain_node)
+        self.assertLess(wrapped.index(counted_loops[0]), wrapped_drain_index)
+
+
 class TestTryProveForEachTile(unittest.TestCase):
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
@@ -1980,6 +2554,32 @@ class TestTryProveForEachTile(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertTrue(result.reason)
+
+    def test_map_mode_trip_count_survives_spyre_cmp_lowerings(self):
+        # Regression: the int-compare lowering (_lower_cmp_impl) must not
+        # insert a to_dtype cast for 0-dim integer predicates compared against
+        # an int.  If it does, the cond graph grows a second op (n_ops == 2)
+        # and the bound becomes float(N) instead of int(N), both of which make
+        # _extract_trip_count return None, causing silently wrong loop counts.
+        while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
+            split_m_fn, matmul_inputs()[0]
+        )
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertIsNotNone(result.trip_count)
+
+    def test_carry_mode_trip_count_survives_spyre_cmp_lowerings(self):
+        # Same regression check for the carry / split-K variant.
+        while_op = _find_while_loop_ir_op_with_spyre_cmp_lowerings(
+            split_k_fn, matmul_inputs()[0]
+        )
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertIsNotNone(result.trip_count)
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
@@ -4247,6 +4847,172 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             "no op in split_m_elementwise_fn's body has a loop_var-advancing "
             "read -- test would pass vacuously",
         )
+
+
+class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
+    """An LX input clone read inside a counted loop is placed before the loop.
+
+    Real captured ``split_m_fn`` graph (``Y`` invariant, ``X`` sliced), lowered
+    through ``GraphLowering`` and spliced by the production
+    ``splice_while_loops``; the real ``GraphEditor`` inserts the clone and real
+    scheduler nodes are grouped by the real counted-loop regrouping.  No Spyre
+    tensor is allocated and no kernel runs.
+    """
+
+    _run_graph = TestSpliceWhileLoops._run_graph
+
+    def _spliced_graph(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_m_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        return graph
+
+    @staticmethod
+    def _tile_input(graph, name):
+        """Give a CPU-captured input the Spyre layout the real push requires."""
+        from torch._inductor.ir import FlexibleLayout
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        box = graph.get_buffer(name)  # TensorBox(StorageBox(InputBuffer))
+        inner = box.data.data
+        size = [int(s) for s in inner.get_layout().size]
+        dtype = torch.float16
+        stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+        stick_dim = len(size) - 1
+        dim_order = [i for i in range(len(size)) if i != stick_dim] + [stick_dim]
+        object.__setattr__(
+            inner,
+            "layout",
+            FixedTiledLayout(
+                torch.device("spyre:0"),
+                dtype,
+                size,
+                stride,
+                SpyreTensorLayout(size, stride, dtype, dim_order),
+            ),
+        )
+        return box
+
+    def test_invariant_input_clone_runs_once_before_the_loop(self):
+        from types import SimpleNamespace
+
+        from torch._inductor.scheduler import Scheduler
+        from torch_spyre._inductor.pass_utils import PerCoreView, op_read_writes
+        from torch_spyre._inductor.scheduler import (
+            CountedLoopSchedulerNode,
+            _build_loop_group,
+            _loop_group_id,
+            _regroup_by_outer_loop_key,
+        )
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_entry,
+            counted_loop_group_path,
+            get_buffer_users,
+        )
+
+        graph = self._spliced_graph()
+        with V.set_graph_handler(graph):
+            users = get_buffer_users(graph)
+            in_loop_inputs = [
+                name
+                for name in graph.graph_input_names
+                if users.get(name) and counted_loop_group_path(users[name][0])
+            ]
+            self.assertTrue(in_loop_inputs, "fixture must read an input in its loop")
+            name = in_loop_inputs[0]
+            entry = counted_loop_entry(graph.operations, users[name][0])
+            # The gate declines exactly when the input's last reader is its
+            # outermost loop's last member (that reader could take the clone's
+            # slot in place); otherwise it returns the loop entry.  The
+            # placement below is checked at the loop entry either way.
+            last = users[name][-1]
+            last_outer = counted_loop_group_path(last)[:1]
+            ends_loop = bool(last_outer) and not any(
+                counted_loop_group_path(op)[:1] == last_outer
+                for op in graph.operations[graph.operations.index(last) + 1 :]
+            )
+            self.assertIs(
+                allocator_module._hoisted_input_clone_entry(graph, name, users[name]),
+                None if ends_loop else entry,
+            )
+            box = self._tile_input(graph, name)
+            user_names = {u.get_name() for u in users[name]}
+            reads_before = sorted(
+                str(d.index)
+                for op in users[name]
+                for d in op_read_writes(op).reads
+                if d.name == name
+            )
+            clone = GraphEditor(graph).push_allocation_with_clone(
+                box,
+                users[name],
+                input=True,
+                lx_view=PerCoreView((), (), num_cores=1),
+                lower_before=entry,
+            )
+            allocator_module._clear_loop_membership_metadata(clone)
+
+            # Lowered order: immediately before the loop entry, outside it.
+            self.assertIs(graph.operations[graph.operations.index(entry) - 1], clone)
+            self.assertEqual(counted_loop_group_path(clone), ())
+            # The clone reads only the input.
+            self.assertEqual({d.name for d in op_read_writes(clone).reads}, {name})
+            # Consumers read the clone with exactly the indices they used for
+            # the input (a tile-advancing read keeps advancing; only the name
+            # changed), and nothing reads the input directly any more.
+            clone_name = clone.get_name()
+            consumers = [op for op in graph.operations if op.get_name() in user_names]
+            reads_after = sorted(
+                str(d.index)
+                for op in consumers
+                for d in op_read_writes(op).reads
+                if d.name == clone_name
+            )
+            self.assertEqual(reads_after, reads_before)
+            self.assertFalse(
+                any(
+                    d.name == name for op in consumers for d in op_read_writes(op).reads
+                )
+            )
+
+            stub = SimpleNamespace(
+                available_buffer_names=set(),
+                name_to_fused_node={},
+                removed_ops=set(),
+                get_backend=lambda device: SimpleNamespace(
+                    group_fn=lambda sizes: tuple(sizes)
+                ),
+            )
+            snodes = [
+                Scheduler.create_scheduler_node(stub, op) for op in graph.operations
+            ]
+            for order, snode in enumerate(snodes):
+                snode.min_order = order
+                snode.max_order = order
+            ordered = _regroup_by_outer_loop_key(snodes)
+            wrapped = _build_loop_group(ordered, 0)
+
+        clone_node = next(n for n in snodes if getattr(n, "node", None) is clone)
+        self.assertIsNone(_loop_group_id(clone_node))
+        counted_loops = [n for n in wrapped if isinstance(n, CountedLoopSchedulerNode)]
+        self.assertEqual(len(counted_loops), 1)
+        self.assertNotIn(clone_node, counted_loops[0].get_nodes())
+        self.assertLess(wrapped.index(clone_node), wrapped.index(counted_loops[0]))
+        # Some loop member depends on the clone, so the scheduler cannot sink it.
+        readers = [
+            n
+            for n in counted_loops[0].get_nodes()
+            if any(dep.name == clone_name for dep in n.unmet_dependencies)
+        ]
+        self.assertTrue(readers)
 
 
 if __name__ == "__main__":

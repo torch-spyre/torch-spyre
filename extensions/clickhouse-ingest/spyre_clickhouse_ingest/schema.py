@@ -24,16 +24,31 @@ KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
-RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "capability"})
+# Which capability analysis produced a capability_runs row; also the test_type of a
+# result_kind='capability' verdict.
+CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_modules", "model_support"})
+# spyre-test-framework's stages, each its own leg.
+SUITE_STAGE_VALUES = frozenset(
+    {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
 )
-# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
-# TEST_TYPE_VALUES, not a subset of it.
-CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
+TEST_TYPE_VALUES = (
+    frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+    | SUITE_STAGE_VALUES
+    | CAPABILITY_TYPE_VALUES
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
-# capability_runs.status: not_implemented is unsupported, not a skipped test.
-CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
+# capability_runs.status: not_implemented is unsupported, not a skipped test; undetermined is a
+# test that broke before giving a verdict.
+CAPABILITY_STATUS_VALUES = frozenset(
+    {"passed", "failed", "not_implemented", "undetermined"}
+)
+
+RUN_SOURCE_VALUES = frozenset({"jenkins", "gha"})
+PIPELINE_TYPE_VALUES = frozenset(
+    {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
+)
+RUN_STATE_VALUES = frozenset({"running", "finished"})
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
@@ -41,6 +56,7 @@ CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 # since id12 is a hash INPUT to artifact_id. A reader resolves it via props['id12'].
 DEP_ENTRY_SEP = "@"
 DEP_BASE_PREFIX = "base="
+IDENTITY_LOOKUP_CHUNK = 2000
 
 
 class SchemaError(ValueError):
@@ -137,12 +153,15 @@ class Table:
         if not cls.identity:
             raise SchemaError(f"{cls.name} has no identity column")
         ids = [str(k) for k in rows]
+        # Chunked: the ids travel as one HTTP form field, and ClickHouse rejects a field over
+        # http_max_field_value_size (128 KiB) -- a 12k-case merged junit is ~470 KiB.
         known = {
             str(r[0])
+            for i in range(0, len(ids), IDENTITY_LOOKUP_CHUNK)
             for r in client.query(
                 f"SELECT {cls.identity} FROM {cls.qualified(db)} "
                 f"WHERE {cls.identity} IN {{ids:Array(UUID)}}",
-                parameters={"ids": ids},
+                parameters={"ids": ids[i : i + IDENTITY_LOOKUP_CHUNK]},
             ).result_rows
         }
         fresh = [v for k, v in rows.items() if str(k) not in known]
@@ -184,7 +203,7 @@ class TestCaseRow(TypedDict):
 
 
 class TestCases(Table):
-    """Test identity: one row per (component, classname, name, tags)."""
+    """Test identity: one row per (component, classname, name, identity tags)."""
 
     name = "test_cases"
     columns = ("test_case_id", "component", "classname", "name", "tags")
@@ -201,10 +220,12 @@ class TestCaseRunRow(TypedDict):
     duration_s: float
     fail_message: str
     props: dict[str, str]
+    tags: list[str]
+    measurements: dict[str, float]
 
 
 class TestCaseRuns(Table):
-    """One test's outcome in one run; props carries the source_file discriminator."""
+    """One test's outcome in one run: run-context tags, recorded measurements and results."""
 
     name = "test_case_runs"
     columns = (
@@ -215,6 +236,8 @@ class TestCaseRuns(Table):
         "duration_s",
         "fail_message",
         "props",
+        "tags",
+        "measurements",
     )
     required = ("component",)
     enums = (("status", STATUS_VALUES),)
@@ -447,6 +470,67 @@ class ArtifactResults(Table):
     Row = ArtifactResultRow
 
 
+class PipelineRuns(Table):
+    """One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.
+
+    Jenkins rows arrive as JSONEachRow from vars/pushToClickhouse.groovy; this model is the
+    shape the gha_runs poller writes through.
+    """
+
+    name = "pipeline_runs"
+    columns = (
+        "run_key",
+        "updated_at",
+        "source",
+        "pipeline_type",
+        "state",
+        "job_name",
+        "build_number",
+        "attempt",
+        "build_url",
+        "agent",
+        "parent_run_key",
+        "started_at",
+        "ended_at",
+        "queue_ms",
+        "duration_ms",
+        "build_ms",
+        "test_ms",
+        "trigger_kind",
+        "trigger_source",
+        "preset",
+        "build_mode",
+        "repo",
+        "pr_number",
+        "sha",
+        "component",
+        "arches",
+        "result",
+        "verdict",
+        "superseded",
+        "reached_normal_completion",
+        "lane_results",
+        "nodes_built",
+        "nodes_reused",
+        "nodes_dropped",
+        "tests_total",
+        "tests_failed",
+        "ch_write_failures",
+        "failure_reason",
+        "failure_is_infra",
+        "failure_evidence",
+        "failed_stage",
+        "fail_log_tail",
+        "props",
+    )
+    required = ("run_key", "job_name")
+    enums = (
+        ("source", RUN_SOURCE_VALUES),
+        ("pipeline_type", PIPELINE_TYPE_VALUES),
+        ("state", RUN_STATE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -458,6 +542,7 @@ ARTIFACTS = Artifacts
 ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
+PIPELINE_RUNS = PipelineRuns
 
 TABLES = {
     t.name: t
@@ -472,6 +557,7 @@ TABLES = {
         ArtifactResults,
         Capabilities,
         CapabilityRuns,
+        PipelineRuns,
     )
 }
 

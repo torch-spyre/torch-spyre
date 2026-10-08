@@ -468,6 +468,11 @@ def _patch_tensor_for_spyre():
     # inside the HOP body — not just in the top-level graph.
     # ──────────────────────────────────────────────────────────────────────────
     _patch_invoke_subgraph_decompositions()
+    # ─────────────── scan input-to-input aliasing (#4893) ───────────────
+    # Lets scan's body read loop inputs that share a storage, e.g. K and V split
+    # from one fused QKV projection and captured whole by an outer for_each_tile.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_scan_input_aliasing()
 
     # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────
     # Monkey-patches the three public Python entry points to support
@@ -551,6 +556,155 @@ def _patch_invoke_subgraph_decompositions():
 
     _spyre_extract_nested_region_config._spyre_decomp_patched = True
     mod._extract_nested_region_config = _spyre_extract_nested_region_config
+
+
+def _patch_scan_input_aliasing() -> bool:
+    """Let ``scan`` read loop inputs that share a storage (torch-spyre#4893).
+
+    The SDPA decomposition's outer ``for_each_tile`` levels (query, GQA group) capture
+    K and V whole, and with a fused QKV projection those are two views of one
+    storage. torch 2.13's ``scan`` rejects two inputs on one storage, in Dynamo's HOP
+    check and again in its functionalization, although it also rejects every input
+    mutation, so such inputs are read-only. Both checks now accept input-input
+    aliasing for ``scan``; Dynamo's still rejects it when an aliased input requires
+    grad, and input-output and output-output aliasing stay rejected.
+
+    Carries need no extra check: neither stock Inductor nor torch-spyre's loop
+    lowering (``_carry_real_input_is_private``) writes a carry's storage in place
+    while anything else can read it.
+
+    Applied process-wide, so CPU and CUDA scans in the same process are relaxed
+    too. Only on torch 2.13 and 2.14, whose patched functions are identical; other
+    versions are skipped with a warning. Returns whether the patch is active.
+    Idempotent.
+
+    TODO(#4893): remove with the first torch release that carries the upstream fix.
+    """
+    import contextvars
+    import functools
+    import sys
+
+    import torch
+    from torch.utils import _pytree as pytree
+
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release not in ((2, 13), (2, 14)):
+        import warnings
+
+        warnings.warn(
+            f"scan input-aliasing patch not applied on torch {torch.__version__}; "
+            "fused-QKV attention may fail to compile (torch-spyre#4893)."
+        )
+        return False
+
+    import torch._dynamo.output_graph as output_graph
+    import torch._dynamo.variables.higher_order_ops as hop_vars
+    import torch._higher_order_ops.scan  # noqa: F401
+    import torch._higher_order_ops.utils as hop_utils
+
+    scan_op = sys.modules["torch._higher_order_ops.scan"].scan_op
+    tracer_cls = output_graph.SubgraphTracer
+    if getattr(tracer_cls.has_aliasing, "_spyre_scan_aliasing_patched", False):
+        return True
+
+    relaxed = contextvars.ContextVar("spyre_scan_input_aliasing", default=False)
+    original_has_aliasing = tracer_cls.has_aliasing
+    original_check = hop_vars.check_aliasing_and_input_mutation
+    original_functionalize_check = hop_utils._check_alias_and_mutation
+
+    def has_aliasing(self):
+        """Torch's own check, or for scan a copy of it that skips input pairs."""
+        if not relaxed.get():
+            return original_has_aliasing(self)
+        storages = hop_vars.get_tensor_storages
+        example = hop_utils._collect_fake_inputs
+
+        input_storages = {}
+        for node in self.graph.nodes:
+            if node.op != "placeholder":
+                break
+            value = example([node])[0]
+            if not isinstance(value, torch.Tensor):
+                continue
+            for storage in storages(value):
+                if storage in input_storages:
+                    first = input_storages[storage]
+                    if not (value.requires_grad or example([first])[0].requires_grad):
+                        continue
+                    msg = (
+                        f"Input-to-input aliasing detected at nodes {first} and {node}"
+                    )
+                    return output_graph.AliasingInfo(True, msg)
+                input_storages[storage] = node
+
+        output_storages = {}
+        out_nodes = self.graph.find_nodes(op="output")[0]
+        for out_node in pytree.tree_leaves(out_nodes.args[0]):
+            if not out_node:
+                continue
+            value = example([out_node])[0]
+            if isinstance(value, list):
+                raise AssertionError("example_value must not be a list")
+            if not isinstance(value, torch.Tensor):
+                continue
+            for storage in storages(value):
+                if storage in output_storages:
+                    msg = (
+                        "Output-to-output aliasing detected at nodes "
+                        f"{output_storages[storage]} and {out_node}"
+                    )
+                    return output_graph.AliasingInfo(True, msg)
+                output_storages[storage] = out_node
+
+        shared = input_storages.keys() & output_storages.keys()
+        if shared:
+            aliased = ", ".join(
+                f"{input_storages[s]} and {output_storages[s]}" for s in shared
+            )
+            msg = f"Input-to-output aliasing detected at nodes {aliased}"
+            return output_graph.AliasingInfo(True, msg)
+        return output_graph.AliasingInfo(False, "")
+
+    @functools.wraps(original_check)
+    def check_aliasing_and_input_mutation(
+        subtracer, graph, supports_input_mutation, supports_aliasing, source_target
+    ):
+        token = relaxed.set(source_target is scan_op)
+        try:
+            return original_check(
+                subtracer,
+                graph,
+                supports_input_mutation,
+                supports_aliasing,
+                source_target,
+            )
+        finally:
+            relaxed.reset(token)
+
+    @functools.wraps(original_functionalize_check)
+    def _check_alias_and_mutation(graph_module, inputs_fake, name, pre_dispatch):
+        # scan_functionalize is the only caller passing "scan".
+        if name != "scan":
+            return original_functionalize_check(
+                graph_module, inputs_fake, name, pre_dispatch
+            )
+        result = hop_utils.potential_input_alias_or_mutation(
+            graph_module, inputs_fake, pre_dispatch
+        )
+        # True: the analysis could not run (UnsupportedAliasMutationException).
+        if result is True:
+            raise RuntimeError(f"{name} might be aliasing the input or the output!")
+        (_input_input, input_output, output_output), mutation = result
+        if input_output or output_output:
+            raise RuntimeError(f"{name} might be aliasing the input or the output!")
+        if mutation:
+            raise RuntimeError(f"{name} might be modifying the input!")
+
+    has_aliasing._spyre_scan_aliasing_patched = True  # type: ignore[attr-defined]
+    tracer_cls.has_aliasing = has_aliasing
+    hop_vars.check_aliasing_and_input_mutation = check_aliasing_and_input_mutation
+    hop_utils._check_alias_and_mutation = _check_alias_and_mutation
+    return True
 
 
 # ── Safetensors hook + monkey-patch ──────────────────────────────────────────

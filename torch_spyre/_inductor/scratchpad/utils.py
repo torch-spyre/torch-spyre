@@ -107,6 +107,38 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
+    """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
+
+    Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
+    An extern kernel keeps its loop_info (e.g. a loop-body constant that
+    dedup_and_promote_constants hoisted to the graph head) but runs once,
+    outside the loop.
+    """
+    if isinstance(op, ExternKernel):
+        return ()
+    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+
+def counted_loop_entry(
+    operations: list[Operation], op: Operation
+) -> Optional[Operation]:
+    """First operation of the outermost counted loop that ``op`` runs in.
+
+    ``None`` when ``op`` is not a counted-loop member.  "First" is the same
+    textual position :func:`counted_loop_lifetime_overrides` uses as that loop's
+    start, so a value placed immediately before the returned operation is
+    inside the interval those overrides already reserve for a value born
+    outside the loop and read inside it.
+    """
+    outer = counted_loop_group_path(op)[:1]
+    if not outer:
+        return None
+    return next(
+        (o for o in operations if counted_loop_group_path(o)[:1] == outer), None
+    )
+
+
 def counted_loop_lifetime_overrides(
     graph: GraphLowering,
 ) -> tuple[dict[str, int], dict[str, int]]:
@@ -123,8 +155,7 @@ def counted_loop_lifetime_overrides(
     their ordinary per-iteration lifetimes.
     """
 
-    def group_path(op: Operation) -> tuple[int, ...]:
-        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    group_path = counted_loop_group_path
 
     loop_start: dict[tuple[int, ...], int] = {}
     loop_end: dict[tuple[int, ...], int] = {}

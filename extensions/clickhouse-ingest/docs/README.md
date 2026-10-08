@@ -34,6 +34,10 @@ entirely separate mechanism worth understanding on its own terms.
 4. **[Getting started](getting-started.md)** — install from source, reuse
    from a new GitHub Actions workflow, reuse from a new Jenkins pipeline,
    and how to run the test suite.
+5. **[Sandboxes and the sandbox MCP server](sandbox.md)** — personal
+   `spyre_v2` copies on the dev server, seeded from prod: how to sign up,
+   connect an MCP client, change schema safely, and prove a branch with
+   `verify_schema` before its PR.
 
 ## The shape of the whole system
 
@@ -74,3 +78,4 @@ carrying out of this whole reference.
 | Understand why Power/s390x results differ from x86_64's path | [Jenkins § Test results on power and s390x](jenkins-shared-library.md#test-results-on-power-and-s390x) |
 | Change an identity-derivation function safely | [Jenkins § Identity: one formula, four implementations](jenkins-shared-library.md#identity-one-formula-four-implementations) |
 | Install and run the tests locally | [Getting started § Install](getting-started.md#install-from-source) |
+| Try a schema change or query on real data without touching prod | [Sandboxes](sandbox.md) |

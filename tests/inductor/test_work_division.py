@@ -46,6 +46,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
+    BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
@@ -67,6 +68,9 @@ from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
     _default_split,
+    _HBM_BW_GBS,
+    _matmul_split_cost,
+    adjust_it_space_for_sticks,
     enumerate_work_division_candidates,
     work_division_context_for_op,
     work_division_splits_are_legal,
@@ -112,9 +116,11 @@ def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
     return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
 
 
-def _tensor_dep(name, shape, symbols, element_arrangement=None):
+def _tensor_dep(name, shape, symbols, element_arrangement=None, dtype=torch.float16):
     """Build a real TensorDep for a contiguous access over ``symbols``."""
-    layout = _fixed_tiled_layout(shape, element_arrangement=element_arrangement)
+    layout = _fixed_tiled_layout(
+        shape, dtype=dtype, element_arrangement=element_arrangement
+    )
     index = sympy.Integer(0)
     for sym, stride in zip(symbols, layout.stride):
         index += sym * int(stride)
@@ -208,6 +214,71 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             common["division_is_fixed"] = True
             self.assertEqual(
                 self.allocator._buffer_residency_reason(op=carry, **common),
+                "mutation target",
+            )
+
+    def test_mutated_graph_output_clears_only_with_validated_drain_plan(self):
+        """The graph-output-mutation refusal is lifted only by a validated plan.
+
+        This is the exact guard that pins a returned ``for_each_tile``
+        accumulator to HBM today (refusal reason "graph output mutated
+        after production").  A ``drain_plans`` entry clears it; the plan is
+        never produced on the fixed-division (placement) path, and the
+        pre-existing mutation-target refusal above it is untouched.
+        """
+        graph = SimpleNamespace(operations=[])
+        common = dict(
+            graph=graph,
+            name="carry",
+            uses=[0, 1],
+            mutated_buffers={"carry"},
+            graph_output_names={"carry"},
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            division_is_fixed=False,
+            buf_user_deps={},
+        )
+        carry = self._tagged_carry()
+        with (
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+        ):
+            # No plan: today's refusal stands.
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(op=carry, **common),
+                "graph output mutated after production",
+            )
+            # A validated plan clears exactly this branch.
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(
+                    op=carry, drain_plans={"carry"}, **common
+                )
+            )
+            # The placement path never receives plans, but even if one leaked,
+            # the earlier mutation-target refusal still fires first.
+            common["division_is_fixed"] = True
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(
+                    op=carry, drain_plans={"carry"}, **common
+                ),
                 "mutation target",
             )
 
@@ -1296,6 +1367,207 @@ class TestCostModelConstraints(unittest.TestCase):
         self.assertGreater(unrestricted[batch], 1)
         self.assertEqual(restricted[batch], 1)
 
+    def test_fp8_cost_model_uses_correct_elems_per_stick(self):
+        """#4466: N_e/K_e must come from the FP8 operand's stick (128
+        elems/stick), not the FP16 output's (64) -- else they're halved."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep(
+                "act",
+                (8, 4096),
+                (m, k),
+                element_arrangement=ElementArrangement.QFP8CH,
+                dtype=torch.float8_e4m3fn,
+            ),
+            _tensor_dep(
+                "weight",
+                (4096, 12800),
+                (k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+                dtype=torch.float8_e4m3fn,
+            ),
+        ]
+        it_space = {m: 8, n: 12800, k: 4096}
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            it_space, input_tds + [output_td]
+        )
+
+        captured = {}
+
+        def capture_axes(_b_axis, _m_axis, n_axis, k_axis, *_args, **_kwargs):
+            captured["N_e"] = n_axis[0]
+            captured["K_e"] = k_axis[0]
+            return 1.0
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=capture_axes,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                stick_vars,
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+
+        self.assertEqual(captured["N_e"], 12800)
+        self.assertEqual(captured["K_e"], 4096)
+
+    def test_fp8_matmul_split_cost_uses_correct_byte_width(self):
+        """#4465: activation/weight bytes must come from their own FP8
+        elems_per_stick (1 byte/elem), not the flat fp16 _DTYPE_BYTES (2)."""
+        m, n, k = (_isym(name) for name in ("m", "n", "k"))
+        op = _computed_buffer(
+            (8, 12800),
+            name="scaled_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(4096,),
+        )
+        output_td = _tensor_dep("scaled_mm_out", (8, 12800), (m, n))
+        input_tds = [
+            _tensor_dep(
+                "act",
+                (8, 4096),
+                (m, k),
+                element_arrangement=ElementArrangement.QFP8CH,
+                dtype=torch.float8_e4m3fn,
+            ),
+            _tensor_dep(
+                "weight",
+                (4096, 12800),
+                (k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+                dtype=torch.float8_e4m3fn,
+            ),
+        ]
+        it_space_adjusted = {m: 8, n: 100, k: 32}
+
+        captured = {}
+
+        def capture_bytes(_b_axis, _m_axis, _n_axis, _k_axis, *_args, **kwargs):
+            captured["operand_bytes"] = kwargs.get("operand_bytes")
+            captured["output_bytes"] = kwargs.get("output_bytes")
+            return 1.0
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=capture_bytes,
+        ):
+            _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space_adjusted},
+                it_space_adjusted,
+                output_td,
+                {n: 128},
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+
+        # Layer 1: planner must derive+pass these; reverted -> None != 1.0/2.0.
+        self.assertEqual(captured["operand_bytes"], 1.0)
+        self.assertEqual(captured["output_bytes"], 2.0)
+
+        # Layer 2: old no-kwargs callers (e.g. cost_model.py) keep the flat default.
+        B, M, K, N = 1, 8, 4096, 12800
+        sm, sn, sk = 4, 8, 1  # fanout_split=max(sm,sn)=8 keeps cohort_penalty == 1.0
+        legacy_cost_with_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+        )
+        legacy_cost_without_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            include_hbm=False,
+        )
+        legacy_bytes_total = (
+            (legacy_cost_with_hbm - legacy_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        self.assertAlmostEqual(legacy_bytes_total, 105_127_936, delta=1.0)
+
+        # Layer 3: the real (unmocked) function, given correct fp8 byte widths,
+        # must itself compute the correct bytes_total.
+        shared_cost_with_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        shared_cost_without_hbm = _matmul_split_cost(
+            (B, 1),
+            (M, sm),
+            (N, sn),
+            (K, sk),
+            32,
+            shared_weight=True,
+            include_hbm=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        shared_bytes_total = (
+            (shared_cost_with_hbm - shared_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        self.assertAlmostEqual(shared_bytes_total, 52_666_368, delta=1.0)
+
+        # Separate-batched-weight branch (weight_batches=B, not 1): B=2,
+        # M=8, K=4096, N=12800. fanout_split = n (shared_weight=False), so
+        # n=8 again keeps cohort_penalty == 1.0.
+        B2, M2, K2, N2 = 2, 8, 4096, 12800
+        m2, n2, k2 = 1, 8, 1
+        separate_cost_with_hbm = _matmul_split_cost(
+            (B2, 1),
+            (M2, m2),
+            (N2, n2),
+            (K2, k2),
+            32,
+            shared_weight=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        separate_cost_without_hbm = _matmul_split_cost(
+            (B2, 1),
+            (M2, m2),
+            (N2, n2),
+            (K2, k2),
+            32,
+            shared_weight=False,
+            include_hbm=False,
+            operand_bytes=1.0,
+            output_bytes=2.0,
+        )
+        separate_bytes_total = (
+            (separate_cost_with_hbm - separate_cost_without_hbm) * _HBM_BW_GBS * 1000
+        )
+        # weight_batches=B2=2 (not shared): (B2*M2*K2 + B2*K2*N2)*1 + B2*M2*N2*2
+        self.assertAlmostEqual(separate_bytes_total, 105_332_736, delta=1.0)
+
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):
     """coordinate_mask_blocked_vars only reads reduction_vars/stick_vars/it_space,
@@ -1997,15 +2269,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         op.get_name.return_value = name
         return op
 
-    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
+    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
         name = op.get_name()
         if name == "consumer":
-            index = [cd.splits for cd in self.consumer_divs].index(splits)
+            index = [cd.splits for cd in self.consumer_divs].index(division.splits)
             return (self.consumer_views[index], False, True)
         views, partial, repr_ok, _matmul = self.parents.get(
             name, ([self.view_a, self.view_b], [False, False], [True, True], False)
         )
-        index = [cd.splits for cd in self.divisions[name]].index(splits)
+        index = [cd.splits for cd in self.divisions[name]].index(division.splits)
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
@@ -2077,6 +2349,34 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 with self._patches():
                     self.assertEqual(self._table(allocator)["matmul"], [(1, 1)])
 
+    def test_a_producer_read_twice_pairs_only_where_both_reads_match(self):
+        # The consumer reads "plain" a second time through another index, and
+        # that read slices it differently: under consumer index 0 it owns the
+        # buffer on two device dims, and under index 3 the way the first read
+        # does under index 0. A pair has to be true of both reads, which
+        # leaves (1, 1): (0, 0) holds for the first read alone and (0, 3) for
+        # the second alone.
+        y = _isym("y")
+        second = MemoryDep("plain", y, (y,), (8,))
+        self.rw[self.consumer_op].reads.append(second)
+        second_views = [self.view_wide, self.view_b, self.view_a, self.view_a]
+
+        def view_for_div(op, dep, buf_name, division, prep_cache):
+            if dep == second:
+                index = [cd.splits for cd in self.consumer_divs].index(division.splits)
+                return (second_views[index], False, True)
+            return self._view_for_div(op, dep, buf_name, division, prep_cache)
+
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with (
+            self._patches(),
+            patch.object(allocator_module, "_view_for_div", side_effect=view_for_div),
+        ):
+            pairs = self._table(allocator).get("plain", [])
+        self.assertLessEqual(
+            set(pairs), {(1, 1)}, "a pair must hold for every read of the producer"
+        )
+
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         storage_op = self.op_by_name["plain"]
@@ -2095,25 +2395,252 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             self.assertIsNotNone(edge)
             self.assertEqual(edge.buf_name, storage_op.get_name())
-            self.assertEqual(edge.read_dep.name, storage_op.get_name())
             self.assertEqual(
-                edge.match_pairs(
-                    [cd.splits for cd in self.parent_divs],
-                    [cd.splits for cd in self.consumer_divs],
-                ),
+                [dep.name for dep in edge.read_deps], [storage_op.get_name()]
+            )
+            self.assertEqual(
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
             )
+
+    def _carry_update(self):
+        """Make ``plain`` a loop carry updated by a new op ``update``."""
+        x = _isym("x")
+        storage_op = self.op_by_name["plain"]
+        update_op = self._op("update")
+        record = LoopCarryRecord(storage_name="plain", update_name="update")
+        storage_op._loop_carry_record = record
+        update_op._loop_carry_record = record
+        self.op_by_name["update"] = update_op
+        self.divisions["update"] = self.parent_divs
+        self.rw[update_op] = MagicMock(
+            writes=[MemoryDep("update", x, (x,), (8,))],
+            reads=[MemoryDep("plain", x, (x,), (8,))],
+        )
+        return update_op
+
+    def test_reading_a_loop_carry_update_is_an_edge_on_its_storage(self):
+        # The update writes through the carry's storage, so a later read of the
+        # update's name reads the storage's LX bytes: it needs the storage's
+        # ownership, although the update itself is never an LX buffer.
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        update_op = self._carry_update()
+        x = _isym("x")
+        self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))
+
+        with self._patches():
+            carry_edges = {
+                "update": allocator._loop_carry_update_edge(
+                    update_op, self.op_by_name, {}
+                )
+            }
+            edges = allocator._loop_carry_read_edges(self.consumer_op, carry_edges, {})
+            self.assertEqual(set(edges), {"plain"})
+            edge = edges["plain"]
+            self.assertIs(edge.consumer_op, self.consumer_op)
+            self.assertEqual([dep.name for dep in edge.read_deps], ["plain"])
+            self.assertEqual(
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
+                [(0, 0), (1, 1)],
+            )
+            # The update's own write is the carry edge, not a read edge.
+            self.assertEqual(
+                allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
+            )
+
+    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
+        """A drained carry under the carry-read gate: resident only if readers agree.
+
+        ``plain`` is a ``for_each_tile`` carry: filled before the loop, updated
+        in place by ``update`` and returned from the graph. Inside the loop,
+        ``consumer`` reads the update's name, so it reads the storage's bytes.
+        The post-loop drain plan makes this mutated graph output eligible for
+        LX, which is exactly when the read edge above starts to matter. The
+        real drain validator, buffer build, CP-SAT solve and push run on one
+        small graph (fill, update, reader, then an op after the loop):
+
+        * the reader can slice the storage the way the storage is owned: the
+          storage is resident, stays live to the graph exit, and the push emits
+          one drain clone after the loop's last member;
+        * every reader division slices it another way (same core count, other
+          axes, as in #4990): the edge admits no pair, the solver keeps the
+          storage in HBM, and the push emits nothing.
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+        from torch.utils._ordered_set import OrderedSet
+
+        x = _isym("x")
+
+        def dep(name):
+            return MemoryDep(name, x, (x,), (8,))
+
+        def rw(reads, writes):
+            return SimpleNamespace(
+                reads=OrderedSet(dep(n) for n in reads),
+                writes=OrderedSet(dep(n) for n in writes),
+            )
+
+        storage_op = self.op_by_name["plain"]
+        update_op = self._carry_update()
+        reader_op = self.consumer_op
+        tail_op = self._op("tail")
+        ops = [storage_op, update_op, reader_op, tail_op]
+        for op in ops:
+            op.name = op.get_name()
+            op.layout = _fixed_tiled_layout((8, 64))
+        op_by_name = {op.name: op for op in ops}
+        graph = MagicMock()
+        graph.operations = ops
+        graph.graph_input_names = []
+        graph.graph_outputs = [storage_op]
+        graph.get_output_names.return_value = ["plain"]
+        graph.get_buffer.side_effect = op_by_name.get
+        # The drain's FX clone reads the storage's own FX node.
+        graph.graph = torch.fx.Graph()
+        storage_op.origins = OrderedSet([graph.graph.placeholder("plain")])
+
+        # One counted loop holds the update and the reader; the fill and the
+        # tail run outside it. The update writes through the storage.
+        loop = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
+        )
+        update_op.loop_info = loop
+        reader_op.loop_info = loop
+        record = LoopCarryRecord(
+            storage_name="plain",
+            update_name="update",
+            loop_origin=SimpleNamespace(graph=graph.graph),
+        )
+        storage_op._loop_carry_record = record
+        update_op._loop_carry_record = record
+        update_op.layout = MagicMock(spec=MutationLayoutSHOULDREMOVE)
+        update_op.layout.target = storage_op
+        self.rw.update(
+            {
+                storage_op: rw([], ["plain"]),
+                update_op: rw(["plain"], ["update"]),
+                reader_op: rw(["update"], ["consumer"]),
+                tail_op: rw([], ["tail"]),
+            }
+        )
+        mem_usage = {
+            "plain": {"size": 256, "op_inputs": []},
+            # A mutation alias is unsized, as mem_usage_by_buf reports it.
+            "update": {"size": -1, "op_inputs": ["plain"]},
+            "consumer": {"size": 256, "op_inputs": ["update"]},
+            "tail": {"size": 256, "op_inputs": []},
+        }
+
+        def residency(*_args, **_kwargs):
+            # The verdicts _residency_by_buf gives these ops: the plan clears
+            # the storage's "graph output mutated after production" refusal
+            # (TestLoopCarryLxEligibility covers that branch); the update is a
+            # mutation alias, never an LX buffer itself.
+            return {
+                "plain": None,
+                "update": "op not allowed",
+                "consumer": None,
+                "tail": None,
+            }
+
+        def run(reader_divs):
+            allocator = CoOptimizingAllocator(
+                allocator_module._make_cpsat_solver, size=4096
+            )
+            divisions = {
+                "plain": self.parent_divs,
+                "update": self.parent_divs,
+                "consumer": reader_divs,
+                "tail": self.parent_divs[:1],
+            }
+            with ExitStack() as stack:
+                stack.enter_context(self._patches())
+                for target, kwargs in (
+                    ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
+                    ("allocator.clone_at_graph_boundaries", {"return_value": True}),
+                    ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
+                    ("allocator.materialize_lx_relayouts", {}),
+                ):
+                    stack.enter_context(
+                        patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
+                    )
+                stack.enter_context(
+                    patch.object(allocator, "_residency_by_buf", side_effect=residency)
+                )
+                stack.enter_context(
+                    patch.object(
+                        allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
+                    )
+                )
+                stack.enter_context(patch.object(allocator, "_set_one_allocation"))
+                editor_cls = stack.enter_context(
+                    patch.object(allocator_module, "GraphEditor")
+                )
+
+                plans = allocator_module.validated_drain_plans(
+                    graph, division_is_fixed=False
+                )
+                self.assertEqual(set(plans), {"plain"})
+                self.assertIs(plans["plain"].anchor_op, reader_op)
+                allocator._validated_drain_plans = plans
+                built = allocator._build_cd_bound_buffers(graph, {}, divisions)
+                solver = allocator.layout_planning(built, allocator.size)
+                solved = {b.name: b for b in solver.plan_layout()}
+                # _commit_divisions would record the committed ownership here.
+                for op in ops:
+                    op.iteration_space_ownership = object()
+                allocator._push_allocation(graph, list(solved.values()), [])
+            return plans["plain"], {b.name: b for b in built}, solved, editor_cls
+
+        with self.subTest("reader splits like the storage"):
+            plan, built, solved, editor_cls = run(self.consumer_divs[:2])
+            storage = solved["plain"]
+            self.assertIsNotNone(storage.address)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_called_once_with(
+                storage_op,
+                [],
+                input=False,
+                private=True,
+                after_fx=plan.loop_origin,
+                lower_anchor=plan.anchor_op,
+            )
+            drain = editor.push_allocation_with_clone.return_value
+            editor.change_graph_output.assert_called_once_with(storage_op, drain)
+            # Why: the reader's edge on the storage admits the identical
+            # slicings, and the solver committed one of them.
+            matches = built["consumer"].cd_parent_matches.get("plain")
+            self.assertEqual(matches, [(0, 0), (1, 1)])
+            self.assertIn(
+                (storage.chosen_division, solved["consumer"].chosen_division), matches
+            )
+            # The drain plan keeps the storage live to the graph exit (4 ops),
+            # past the loop's end (3) that the counted-loop rule alone gives.
+            self.assertEqual(built["plain"].end_time, len(ops))
+
+        with self.subTest("reader splits the storage differently"):
+            plan, built, solved, editor_cls = run([self.consumer_divs[3]])
+            self.assertIsNone(solved["plain"].address)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_not_called()
+            editor.change_graph_output.assert_not_called()
+            # Why: the reader's edge on the storage exists but admits no pair.
+            self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
         """Per-pair reimplementation of what ``match_pairs`` computes in
         batch, exercised against the same splits-dict API."""
-        if edge._cores_used(parent_div.splits) != edge._cores_used(consumer_div.splits):
+        if edge._cores_used(parent_div) != edge._cores_used(consumer_div):
             return False
-        parent_view = edge.parent_view(parent_div.splits)
+        parent_view = edge.parent_view(parent_div)
         if parent_view is None:
             return False
-        consumer_view = edge.consumer_view(consumer_div.splits)
+        consumer_view = edge.consumer_view(consumer_div)
         return consumer_view is not None and parent_view.same_partition(consumer_view)
 
     def test_compatible_agrees_with_the_table(self):
@@ -2149,9 +2676,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIsNotNone(edge)
             # Four owners cannot directly serve eight consumer cores.
             self.assertEqual(
-                edge.match_pairs(
-                    [self.parent_divs[0].splits], [self.consumer_divs[2].splits]
-                ),
+                edge.match_pairs([self.parent_divs[0]], [self.consumer_divs[2]]),
                 [],
             )
 
@@ -2187,7 +2712,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                                 "plain", producer, self.consumer_op, reads, None, {}
                             )
                         if memory in reads and memory in writes:
-                            self.assertIs(edge.read_dep, memory)
+                            self.assertEqual(edge.read_deps, (memory,))
                             self.assertIs(edge.write_dep, memory)
                         else:
                             self.assertIsNone(edge)
@@ -2233,8 +2758,8 @@ class TestCloneDivisionMatching(unittest.TestCase):
             writes=[MemoryDep("consumer", x, (x,), (8,))],
         )
 
-    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
-        index = [cd.splits for cd in self.consumer_divs].index(splits)
+    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
+        index = [cd.splits for cd in self.consumer_divs].index(division.splits)
         return (self.views[index], False, True)
 
     def _menu(self):

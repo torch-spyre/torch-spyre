@@ -54,10 +54,11 @@
 # Segfault resilience
 # -------------------
 # If a file-level pytest run exits with any signal (exit >= 128, e.g. SIGSEGV/139
-# or C-level abort/255), the file is automatically retried with "-n1" via
-# pytest-xdist.  xdist spawns each test in a worker subprocess; when a worker
-# crashes the xdist controller catches the worker death, records that test as
-# ERROR, and continues with the remaining tests.
+# or C-level abort/255), the file is automatically retried with one
+# pytest-xdist worker (_XDIST_ISOLATION_ARGS).  xdist spawns each test in a
+# worker subprocess; when a worker crashes the xdist controller catches the
+# worker death, records that test as ERROR, and continues with the remaining
+# tests.
 #
 # --collect-only is NOT used as the fallback strategy: the process that crashes
 # during test execution often also crashes during collection, yielding zero IDs.
@@ -1021,6 +1022,21 @@ _cleanup_wrappers() {
 }
 trap _cleanup_wrappers EXIT
 
+# _is_upstream_pytorch_test <test_file>
+# True when the nearest checkout enclosing the file is PyTorch rather than
+# torch-spyre (same sentinels used to resolve TORCH_ROOT / TORCH_DEVICE_ROOT),
+# so it holds however the two checkouts are nested.
+_is_upstream_pytorch_test() {
+    local dir
+    dir="$(realpath "$(dirname "$1")")"
+    while [[ "$dir" != "/" ]]; do
+        [[ -e "$dir/tests/oot_framework/oot_test_base_common.py" ]] && return 1
+        [[ -e "$dir/test/test_binary_ufuncs.py" ]] && return 0
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
 # generate_wrapper_if_needed <test_file>
 # Sets global _RUN_FILE to the path pytest should actually run.
 # generate_wrapper_if_needed <test_file>
@@ -1119,7 +1135,7 @@ if _cls_${cls} is None:
     raise RuntimeError('Could not find original class ${cls} in pre-import of module ${module_name}')
 globals().setdefault('${cls}', _cls_${cls})
 _flatten_same_named_bases(_cls_${cls})
-_instantiate(_cls_${cls}, globals())
+_instantiate_with_stable_names(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
     done
@@ -1373,6 +1389,43 @@ def _flatten_same_named_bases(cls):
             delattr(base, name)
 
 # ---------------------------------------------------------------------------
+# Class-level device_type on the generic class
+#
+# Some upstream classes pin a device on the class itself, e.g.
+#   class TestFxGraphCache(TestCase):
+#       device_type = GPU_TYPE
+# instantiate_device_type_tests() walks set(generic_test_class.__dict__) and
+# copies non-test members onto the generated <Class>SPYRE class as it goes.
+# Set order follows the per-process string hash seed, so device_type ("cuda")
+# is copied part-way through the walk: tests instantiated before it get the
+# "_spyre" suffix, tests after it "_cuda", and the split differs in every
+# process. --parallel collects node IDs in one process and runs them in
+# another, so pytest rejects the run ("ERROR: not found", exit 4) and that
+# card's whole slice of the file never runs.
+#
+# Fix: hide the attribute while instantiating so every name uses the device
+# base's suffix, then restore it and set it on each generated class -- the
+# value the upstream copy always ends up leaving there, so runtime behaviour
+# is unchanged and only the names become deterministic.
+# ---------------------------------------------------------------------------
+_NO_DEVICE_TYPE = object()
+
+def _instantiate_with_stable_names(cls, scope):
+    own = cls.__dict__.get('device_type', _NO_DEVICE_TYPE)
+    if own is _NO_DEVICE_TYPE:
+        _instantiate(cls, scope)
+        return
+    before = dict(scope)
+    delattr(cls, 'device_type')
+    try:
+        _instantiate(cls, scope)
+    finally:
+        cls.device_type = own
+    for name, obj in scope.items():
+        if obj is not before.get(name) and isinstance(obj, type) and issubclass(obj, cls):
+            obj.device_type = own
+
+# ---------------------------------------------------------------------------
 # Inject instantiate_device_type_tests for all classes needing injection,
 # using pre-captured class objects from _pre_import_classes.
 #
@@ -1401,6 +1454,36 @@ ${cleanup_block}
 
 WRAPPER_EOF
 
+    # Upstream PyTorch tests never mean their subprocesses to use Spyre (e.g.
+    # test_codecache's "python -c" CPU compile steps), but torch-spyre's own
+    # tests do (spyreccl_backend.py checks LOCAL_RANK validation in a child that
+    # starts the runtime), so only upstream files get this hook.
+    local subprocess_hook=""
+    if _is_upstream_pytorch_test "$test_file"; then
+        subprocess_hook=$(cat <<'HOOK_EOF'
+
+
+import pytest
+
+
+# This pytest process owns its Spyre card and a card serves one process, so a
+# subprocess a test starts must not try to open it -- it fails with "Device or
+# resource busy". torch_spyre treats IS_INDUCTOR_SPAWNED_SUBPROCESS=1 as "not
+# the owner" (no runtime, no device) and reads it once at import, so setting it
+# only while a test runs reaches child processes and never this one.
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    prev = os.environ.get("IS_INDUCTOR_SPAWNED_SUBPROCESS")
+    os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = "1"
+    yield
+    if prev is None:
+        os.environ.pop("IS_INDUCTOR_SPAWNED_SUBPROCESS", None)
+    else:
+        os.environ["IS_INDUCTOR_SPAWNED_SUBPROCESS"] = prev
+HOOK_EOF
+)
+    fi
+
     # Generate a conftest.py that patches DEVICE_LIST_SUPPORT_PROFILING_TEST
     # before pytest collects any tests. This is the only reliable point to
     # patch it: conftest.py runs before module import during collection, so
@@ -1428,6 +1511,7 @@ def _xfail_failure_message(report):
 def pytest_runtest_logreport(report):
     if report.when == "call" and report.skipped and getattr(report, "wasxfail", None) is not None:
         os.write(1, f"  [XFAIL ERROR = {_xfail_failure_message(report)}]\n".encode())
+${subprocess_hook}
 CONFTEST_EOF
 
     WRAPPER_FILES+=("$wrapper_path" "$conftest_path")
@@ -1586,6 +1670,10 @@ print(f"[torch_oot_device_tests_run] Tags injected into XML: {xml_path}", flush=
 '
 
 OVERALL_EXIT=0
+
+# Test IDs the --parallel collect phase found, and results the card runs reported for them.
+_PARALLEL_COLLECTED=0
+_PARALLEL_REPORTED=0
 
 # ---------------------------------------------------------------------------
 # Extract the caller-supplied --junit-xml destination BEFORE the
@@ -1759,8 +1847,27 @@ print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {
 '
 
 # Command prefix _run_pytest_isolated applies to the pytest/torchrun invocation.
-# Empty for normal runs; the signal-retry path sets it to bound its re-run.
+# Empty for normal runs; the signal-retry path sets it to keep the xdist
+# controller off the card and to bound its re-run.
 _OOT_TIMEOUT_PREFIX=()
+
+# ---------------------------------------------------------------------------
+# pytest-xdist arguments for the crash-isolation retries (serial and --parallel).
+#
+# Plain -n1 cannot work on Spyre: the xdist controller also runs the upstream
+# conftest's pytest_configure, whose RNG seeding (torch.manual_seed ->
+# torch.spyre.manual_seed_all) opens the card. The controller then holds the
+# card and its own worker dies with "Failed to open the IBM Spyre VFIO device
+# ... Device or resource busy" before running a single test.
+#
+# The controller never collects or runs tests, so callers start it with
+# _XDIST_CONTROLLER_ENV (device backend autoload off) and the worker turns
+# autoload back on through its --tx spec, which execnet applies before the
+# worker imports torch. -n would overwrite --tx, so the single worker is
+# spelled out with --tx and --dist load instead.
+# ---------------------------------------------------------------------------
+_XDIST_CONTROLLER_ENV=("TORCH_DEVICE_BACKEND_AUTOLOAD=0")
+_XDIST_ISOLATION_ARGS=("--dist" "load" "--tx" "popen//env:TORCH_DEVICE_BACKEND_AUTOLOAD=${TORCH_DEVICE_BACKEND_AUTOLOAD:-1}")
 
 # ---------------------------------------------------------------------------
 # _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> <output_tmp> \
@@ -1910,7 +2017,8 @@ _run_pytest_isolated() {
 # Called when a file-level pytest run exits with a signal (exit >= 128, most
 # commonly SIGSEGV or exit 255 from a C-level abort).
 #
-# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess).
+# Re-runs the same file under pytest-xdist with one worker subprocess
+# (_XDIST_ISOLATION_ARGS -- not -n1, see there).
 # xdist spawns each test in a worker process; when a worker crashes the
 # xdist controller catches the worker death, marks that test as ERROR, and
 # continues with the remaining tests
@@ -1942,7 +2050,7 @@ _run_xdist_fallback() {
     export OOT_TEST_FILE="${_dir}/${_base}"
 
     echo ""
-    echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
+    echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — retrying under xdist (one worker, crash isolation) ***"
     echo "[torch_oot_device_tests_run]     File: $_orig"
     echo "[torch_oot_device_tests_run]     Each test runs in its own worker; crashes are contained."
     echo ""
@@ -1950,7 +2058,7 @@ _run_xdist_fallback() {
     # Check pytest-xdist is available before proceeding.
     if ! python3 -m pytest --co -q --no-header -p xdist /dev/null &>/dev/null 2>&1; then
         if ! python3 -c "import xdist" 2>/dev/null; then
-            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
+            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — cannot use the xdist fallback." >&2
             echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
             echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
             [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
@@ -1961,7 +2069,7 @@ _run_xdist_fallback() {
         fi
     fi
 
-    local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
+    local _xdist_args=("${_XDIST_ISOLATION_ARGS[@]}" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
     # This retry re-runs on the SAME device that just killed pytest with a signal.
@@ -1975,9 +2083,9 @@ _run_xdist_fallback() {
     if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
         echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
         # --foreground: this prefix wraps the calls above, so it needs the same fix or it reintroduces the escape one level up.
-        _OOT_TIMEOUT_PREFIX=("timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
+        _OOT_TIMEOUT_PREFIX=("env" "${_XDIST_CONTROLLER_ENV[@]}" "timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
     else
-        _OOT_TIMEOUT_PREFIX=()
+        _OOT_TIMEOUT_PREFIX=("env" "${_XDIST_CONTROLLER_ENV[@]}")
     fi
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
     _OOT_TIMEOUT_PREFIX=()
@@ -2030,9 +2138,11 @@ _run_xdist_fallback() {
         OVERALL_EXIT=$_xexit
     fi
 
-    # Inject XML tags into the shard produced by the xdist run.
+    # Inject XML tags into the shard produced by the xdist run, and mark it a retry: the
+    # re-run overwrote the first attempt's XML.
     if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+        python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
     fi
 }
 
@@ -2094,6 +2204,22 @@ except Exception as e:
     echo 1
 }
 
+# Sets the caller's _probe_slot to a card slot in [0, $1) not held by a running probe, waiting if all are busy.
+_claim_probe_slot() {
+    local _n="$1" _s _pid _running
+    while :; do
+        _running=" $(jobs -rp | tr '\n' ' ') "
+        for (( _s=0; _s<_n; _s++ )); do
+            _pid="${_probe_slot_pids[$_s]:-}"
+            if [[ -z "$_pid" || "$_running" != *" $_pid "* ]]; then
+                _probe_slot=$_s
+                return
+            fi
+        done
+        wait -n 2>/dev/null || true
+    done
+}
+
 # ---------------------------------------------------------------------------
 # _run_parallel_across_cards
 #
@@ -2112,8 +2238,8 @@ except Exception as e:
 #
 # Collection uses `pytest --collect-only -q` run from the file's directory
 # so conftest.py and SPYRE_TEST_FILE / OOT_TEST_FILE are set up identically
-# to a real run.  Collection is done without SPYRE_DEVICES so the runtime
-# is not loaded.
+# to a real run.
+# Collection opens a card (upstream conftest seeds the RNG), so each concurrent probe gets its own card (#5150).
 #
 # Globals read:   RUN_FILES TEST_FILES _EXTRA_NO_XML _FINAL_XML_PATH
 #                 YAML_CONFIG _XML_INJECT_PY
@@ -2141,6 +2267,31 @@ _run_parallel_across_cards() {
     local _collect_start=$SECONDS
 
     # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    local _k
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
+    # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
     # Output of `pytest --collect-only -q` looks like:
@@ -2152,11 +2303,9 @@ _run_parallel_across_cards() {
     # We keep only lines that contain "::" (node IDs), discarding the
     # summary line and any warnings.
     #
-    # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
-    # framework can identify the config) but without SPYRE_DEVICES / hardware
-    # initialisation so collection is fast even on a login node.
+    # Per-file collection sets SPYRE_TEST_FILE so the OOT framework can identify the config.
     #
-    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # The per-file `--collect-only` probes
     # are fanned out as background jobs (bounded to _n_cards concurrent) and
     # each writes its raw node IDs to a per-file temp file. Running them
     # serially and foreground here was the dominant cost of --parallel (every
@@ -2186,8 +2335,9 @@ _run_parallel_across_cards() {
         done
     fi
 
-    # Fan out collection: one background probe per file, bounded to _n_cards
-    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    # Fan out collection: one background probe per file, each pinned to a free card slot.
+    local -a _probe_slot_pids=()
+    local _probe_slot
     local -a _collect_out_files=()
     # Parallel array to _collect_out_files, indexed the same way, holding each probe's stderr path.
     local -a _collect_err_files=()
@@ -2212,23 +2362,16 @@ _run_parallel_across_cards() {
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
+        # Blocks until a card slot is free -- this is also the concurrency throttle.
+        _claim_probe_slot "$_n_cards"
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
             set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
-            # Give this probe its own Inductor cache dir so concurrent collect-only imports
-            # don't share cache state. Bucketed by the same concurrency bound as the probe
-            # throttle (not by file), so only _n_cards dirs ever exist -- keying by file index
-            # instead was tried and measurably slower (every probe pays a cold-cache setup
-            # cost instead of most reusing an already-warmed slot's dir), without actually
-            # preventing failures: the same handful of heavy-import files still failed on a
-            # contended first attempt even with fully unique dirs, and it was the retry below
-            # (a fresh, less-contended attempt -- not cache-dir isolation) that reliably saved
-            # them. So slot bucketing stays naive here; a same-slot collision, if it ever
-            # happens, is caught by that retry instead of prevented up front.
+            export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
+            # One Inductor cache dir per slot (per-file dirs were measurably slower: cold cache each probe).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
-            _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
@@ -2238,11 +2381,7 @@ _run_parallel_across_cards() {
             echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
-
-        # Throttle to at most _n_cards concurrent probes.
-        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
-            wait -n 2>/dev/null || true
-        done
+        _probe_slot_pids[$_probe_slot]=$!
     done
 
     # Wait for any remaining probes to finish before reading their output.
@@ -2324,10 +2463,13 @@ _run_parallel_across_cards() {
             _retry_out_files[$i]="$_rout"
             _retry_err_files[$i]="$_rerr"
             _retry_exit_files[$i]="$_rexit"
+            # Same card pinning as the first pass, capped at this round's worker limit.
+            _claim_probe_slot "$_retry_workers"
             (
                 set +euo pipefail
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
+                export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
@@ -2337,9 +2479,7 @@ _run_parallel_across_cards() {
                 echo "${PIPESTATUS[0]}" > "$_rexit"
             ) &
             _retry_pids+=($!)
-            while [[ "$(jobs -rp | wc -l)" -ge "$_retry_workers" ]]; do
-                wait -n 2>/dev/null || true
-            done
+            _probe_slot_pids[$_probe_slot]=$!
         done
         for _rpid in "${_retry_pids[@]+"${_retry_pids[@]}"}"; do
             wait "$_rpid" 2>/dev/null || true
@@ -2438,6 +2578,7 @@ _run_parallel_across_cards() {
     fi
 
     echo "[torch_oot_device_tests_run]   total test IDs collected: ${_total}"
+    _PARALLEL_COLLECTED=$_total
     echo ""
 
     # -----------------------------------------------------------------------
@@ -2449,7 +2590,6 @@ _run_parallel_across_cards() {
     # Format per line:  <file_idx>:<node_id>
     # -----------------------------------------------------------------------
     local -a _card_id_files=()
-    local _k
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _f="/tmp/_spyre_card_ids_${$}_${_k}.tmp"
         : > "$_f"
@@ -2461,31 +2601,7 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
-    # -----------------------------------------------------------------------
-    # Card-slot -> physical SPYRE_DEVICES index mapping.
-    #
-    # _n_cards is a count (e.g. 3), not a list of physical device indices.
-    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
-    # "1,5,7"), device_count() already narrows the detected count to match,
-    # but the physical indices are NOT 0..N-1 -- they are exactly the values
-    # listed. Each per-card subshell must export its real index, not its
-    # position in the round-robin loop, or it ends up targeting cards the
-    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
-    # -----------------------------------------------------------------------
-    local -a _CARD_DEVICE_IDS=()
-    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
-        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
-    fi
-    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
-        # No restriction (or a mismatched one) -- fall back to the natural
-        # 0..N-1 physical indexing.
-        _CARD_DEVICE_IDS=()
-        for (( _k=0; _k<_n_cards; _k++ )); do
-            _CARD_DEVICE_IDS+=("$_k")
-        done
-    fi
-
-    # Print the assignment summary.
+    # Print the assignment summary (card -> physical index from _CARD_DEVICE_IDS above).
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
@@ -2627,17 +2743,58 @@ _run_parallel_across_cards() {
                     echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally for $original_file" >&2
                 fi
 
-                # Track per-file results and collect failed test names.
+                # Retry crashes / abnormal exits under xdist. The retry re-runs the
+                # whole slice and overwrites its XML, so its results replace the
+                # first attempt's below instead of being added to them.
+                local _res_out="$_par_out_tmp" _res_exit="$_exit" _retried=0
+                local _xdist_par_out="/tmp/_spyre_par_xdist_out_${$}_card${_subshell_card}_${_fidx}.tmp"
+                case $_exit in
+                    0|1|5|127|130) ;;
+                    4)
+                        # Usage error: pytest ran nothing. An xdist retry would pass the
+                        # same node IDs and fail the same way, so report it instead.
+                        echo "[torch_oot_device_tests_run] ERROR: pytest rejected card ${_subshell_card}'s slice of $(basename "$original_file") (exit 4) -- none of its ${#_node_ids[@]} test(s) ran." >&2
+                        echo "[torch_oot_device_tests_run]        Usually a collected node ID does not exist in this run -- see 'ERROR: not found' above." >&2
+                        ;;
+                    *)
+                        echo "[torch_oot_device_tests_run] WARNING: pytest exited abnormally (code $_exit) on card ${_subshell_card} -- retrying its slice under xdist" >&2
+                        if python3 -c "import xdist" 2>/dev/null; then
+                            local -a _xdist_args=("${_XDIST_ISOLATION_ARGS[@]}" "${_file_args[@]+"${_file_args[@]}"}")
+                            (
+                                set +euo pipefail
+                                cd "$run_dir"
+                                env "${_XDIST_CONTROLLER_ENV[@]}" python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
+                                echo "${PIPESTATUS[0]}" > "$_exit_tmp"
+                            ) || true
+                            _retried=1
+                            _res_out="$_xdist_par_out"
+                            _res_exit=139
+                            if [[ -f "$_exit_tmp" ]]; then
+                                _res_exit=$(< "$_exit_tmp")
+                                rm -f "$_exit_tmp"
+                            fi
+                            if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
+                                python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+                                python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
+                            fi
+                        else
+                            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — skipping xdist fallback for card ${_subshell_card}." >&2
+                            [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        fi
+                        ;;
+                esac
+
+                # Track per-file results and collect failed test names, from the final attempt.
                 _p_file_display="$(basename "$original_file")"
-                if [[ -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
-                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
+                if [[ -f "$_res_out" && $_res_exit -lt 128 ]]; then
+                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_res_out")"
                     # Accumulate per-suite counts (multi-config).
                     if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
                         _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
                         echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
                     fi
                     # Record per-file result for end-of-run summary.
-                    case $_exit in
+                    case $_res_exit in
                         0) _pfstatus="PASS" ;;
                         1) _pfstatus="FAIL" ;;
                         5) _pfstatus="NOTEST" ;;
@@ -2647,19 +2804,19 @@ _run_parallel_across_cards() {
                     # Collect failed test names.
                     while IFS= read -r _pfn; do
                         [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
-                    done < <(_extract_failed_tests "$_par_out_tmp")
-                elif [[ $_exit -ge 128 ]]; then
+                    done < <(_extract_failed_tests "$_res_out")
+                else
                     echo "FILE_RESULT ${_p_file_display} SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                 fi
-                rm -f "$_par_out_tmp"
+                rm -f "$_par_out_tmp" "$_xdist_par_out"
 
-                # XML tag injection for clean runs.
-                if [[ -n "$_shard_xml" && -f "$_shard_xml" && $_exit -lt 128 ]]; then
+                # XML tag injection for runs that were not retried (the retry injected its own).
+                if [[ $_retried -eq 0 && -n "$_shard_xml" && -f "$_shard_xml" && $_exit -lt 128 ]]; then
                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                 fi
 
-                # Exit-code handling.
-                case $_exit in
+                # Exit-code handling, from the final attempt.
+                case $_res_exit in
                     0) ;;
                     1)
                         # Test failure — masked in --mode=validate (see serial
@@ -2671,49 +2828,12 @@ _run_parallel_across_cards() {
                     5)  echo "[torch_oot_device_tests_run] WARNING: no tests collected for card ${_subshell_card} slice of $(basename "$original_file")" >&2 ;;
                     127)
                         echo "[torch_oot_device_tests_run_err] FATAL: python3/pytest not found for $original_file" >&2
-                        _card_overall=$_exit ;;
+                        _card_overall=$_res_exit ;;
                     130)
                         echo "[torch_oot_device_tests_run_err] FATAL: interrupted (card ${_subshell_card}) -- aborting." >&2
-                        _card_overall=$_exit
+                        _card_overall=$_res_exit
                         break ;;
-                    *)
-                        # Signal exit — retry the card's slice with -n1 xdist.
-                        echo "[torch_oot_device_tests_run] WARNING: pytest exited with signal (code $_exit) on card ${_subshell_card}" >&2
-                        if python3 -c "import xdist" 2>/dev/null; then
-                            local -a _xdist_args=("-n1" "${_file_args[@]+"${_file_args[@]}"}")
-                            local _xdist_par_out="/tmp/_spyre_par_xdist_out_${$}_card${_subshell_card}_${_fidx}.tmp"
-                            (
-                                set +euo pipefail
-                                cd "$run_dir"
-                                python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
-                                echo "${PIPESTATUS[0]}" > "$_exit_tmp"
-                            ) || true
-                            if [[ -f "$_exit_tmp" ]]; then
-                                local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
-                                if [[ $_xexit -eq 1 ]]; then
-                                    # Test failure on retry — masked in --mode=validate.
-                                    if [[ "$_MODE" != "validate" ]]; then
-                                        [[ $_card_overall -eq 0 ]] && _card_overall=1
-                                    fi
-                                elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
-                                    [[ $_card_overall -eq 0 ]] && _card_overall=$_xexit
-                                fi
-                                if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
-                                    python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
-                                fi
-                                # Accumulate counts from xdist retry output.
-                                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
-                                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
-                                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
-                                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
-                                fi
-                            fi
-                            rm -f "$_xdist_par_out"
-                        else
-                            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — skipping xdist fallback for card ${_subshell_card}." >&2
-                            [[ $_card_overall -eq 0 ]] && _card_overall=1
-                        fi
-                        ;;
+                    *)  [[ $_card_overall -eq 0 ]] && _card_overall=$_res_exit ;;
                 esac
             done
 
@@ -2842,6 +2962,7 @@ _run_parallel_across_cards() {
         _FILE_SUMMARY_LABELS+=("$_slbl")
         _FILE_SUMMARY_STATUS+=("${_par_agg_status[$_slbl]}")
         _FILE_SUMMARY_COUNTS+=("${_par_agg_p[$_slbl]} ${_par_agg_f[$_slbl]} ${_par_agg_e[$_slbl]} ${_par_agg_s[$_slbl]} ${_par_agg_xf[$_slbl]} ${_par_agg_xp[$_slbl]} ${_par_agg_t[$_slbl]}")
+        _PARALLEL_REPORTED=$(( _PARALLEL_REPORTED + ${_par_agg_p[$_slbl]} + ${_par_agg_f[$_slbl]} + ${_par_agg_e[$_slbl]} + ${_par_agg_s[$_slbl]} + ${_par_agg_xf[$_slbl]} + ${_par_agg_xp[$_slbl]} ))
     done
 }
 
@@ -3010,7 +3131,7 @@ for i in "${_SERIAL_FILE_IDX[@]+"${_SERIAL_FILE_IDX[@]}"}"; do
     #   1   = tests ran, some failed/errored  (propagated → OVERALL_EXIT=1)
     #   5   = no tests collected              (warning only; does not fail run)
     #   127 = command not found (python3/pytest missing) — fatal
-    #   128+= signal/abnormal termination    — retry with -n1 (xdist fallback)
+    #   128+= signal/abnormal termination    — retry under xdist (one worker)
     #         Common: 139 (SIGSEGV), 255 (C abort).  130 (Ctrl-C) breaks loop.
     # -----------------------------------------------------------------------
     case $_exit in
@@ -3043,7 +3164,7 @@ for i in "${_SERIAL_FILE_IDX[@]+"${_SERIAL_FILE_IDX[@]}"}"; do
             ;;
         *)
             # Exit >= 128 (excluding 130): signal termination — most likely SIGSEGV
-            # (139) or a C-level abort (255).  Re-run the same file with -n1 so
+            # (139) or a C-level abort (255).  Re-run the same file under xdist so
             # pytest-xdist spawns each test in a worker subprocess; a crashing
             # worker is caught by the xdist controller and the remaining tests
             # continue.  --collect-only is not used: the same process that crashes
@@ -3200,6 +3321,13 @@ fi
 echo "========================================================================"
 if [[ ${#_FILE_SUMMARY_LABELS[@]} -gt 0 ]]; then
     echo "[torch_oot_device_tests_run] Totals: ${_tot_all} tests (${_tot_passed} passed, ${_tot_failed} failed, ${_tot_error} error, ${_tot_skipped} skipped, ${_tot_xpassed} xpassed, ${_tot_xfailed} xfailed)"
+fi
+# Every test ID --parallel collected should come back with a result.
+if [[ $_PARALLEL_COLLECTED -gt 0 ]]; then
+    echo "[torch_oot_device_tests_run] --parallel: ${_PARALLEL_COLLECTED} test ID(s) collected, ${_PARALLEL_REPORTED} result(s) reported."
+    if [[ $_PARALLEL_REPORTED -lt $_PARALLEL_COLLECTED ]]; then
+        echo "[torch_oot_device_tests_run] WARNING: $(( _PARALLEL_COLLECTED - _PARALLEL_REPORTED )) collected test(s) have no result -- deselected (e.g. -k), or lost; see the per-card errors above." >&2
+    fi
 fi
 
 # ---------------------------------------------------------------------------
