@@ -29,7 +29,29 @@ logger = get_inductor_logger("scratchpad.greedy_solver")
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
-    supports_paired_buffers = True
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return True
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return False
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
 
     def __init__(
         self, buffers: Sequence[LifetimeBoundBuffer], size: int, alignment: int = 128

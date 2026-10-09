@@ -1181,10 +1181,28 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     (residency, then parallelism, then division balance).
     """
 
-    decides_lx_relayouts = True
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return True
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return True
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return True
 
     @classmethod
     def replans_after_tiling(cls) -> bool:
+        return True
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
         return True
 
     def __init__(

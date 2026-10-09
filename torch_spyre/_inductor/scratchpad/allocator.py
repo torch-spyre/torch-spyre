@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import logging
 import math
 import time
@@ -20,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Callable, cast, NamedTuple, Optional
+from typing import Any, cast, NamedTuple, Optional
 
 import sympy
 import torch
@@ -136,7 +135,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     FiredRelayoutGroup,
     core_domain_rejection,
     grouped_gather_rejection,
-    lx_solver_relayout,
     LXRelayoutPlan,
     materialize_lx_relayouts,
     partition_footprint,
@@ -644,18 +642,6 @@ def _assert_drain_plan_committed(
         )
 
 
-# A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
-# so the allocators hold a factory -- how to build a solver for a given buffer
-# set -- rather than a live instance, and build a fresh one per solve.
-LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanSolver]
-# Same argument type as ``LayoutSolverFactory`` (``Callable`` parameters are
-# contravariant, and every ``CoreDivisionBuffer`` sequence is already a
-# ``Sequence[LifetimeBoundBuffer]``); only the narrower return type differs.
-CoreDivisionSolverFactory = Callable[
-    [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
-]
-
-
 class ScratchpadOptimizationPass(ABC):
     """
     Abstract class for optimization passes which are implemented to improve
@@ -682,17 +668,17 @@ class ScratchpadAllocator:
 
     def __init__(
         self,
-        layout_planning: LayoutSolverFactory,
+        layout_planning: type[MemoryPlanSolver],
         size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
-        """Configure the allocator with a solver factory and graph passes.
+        """Configure the allocator with a solver class and graph passes.
 
         Args:
-            layout_planning: Factory that builds a solver (already bound to a
-                given buffer set) that assigns LX addresses to lifetime-bound
-                buffers. A solver is single-use -- buffers are required at its
+            layout_planning: Class of the solver that assigns LX addresses to
+                lifetime-bound buffers, asked for its capabilities before any
+                solve. A solver is single-use -- buffers are required at its
                 construction -- so the allocator builds a fresh one per solve
                 (see :meth:`_build_solver`) rather than holding a live instance.
             size: LX size
@@ -712,7 +698,7 @@ class ScratchpadAllocator:
         # (for the solver decision). Reset at the start of each plan_allocation.
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
-        self.layout_planning: Optional[LayoutSolverFactory] = layout_planning
+        self.layout_planning: Optional[type[MemoryPlanSolver]] = layout_planning
         self.size = size
         # Validated post-loop materialization plans, computed once per solve by
         # the joint allocator's _prepare_buffers and retained through the
@@ -791,16 +777,11 @@ class ScratchpadAllocator:
     ) -> Sequence[Any]:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
         assert self.layout_planning is not None
-        if not getattr(self.layout_planning, "supports_paired_buffers", False):
+        if not self.layout_planning.supports_paired_buffers():
             if config.lx_planner_relayout:
-                solver_name = getattr(
-                    self.layout_planning,
-                    "__name__",
-                    type(self.layout_planning).__name__,
-                )
                 logger.debug(
                     "LX relayout is not supported by %s; continuing without relayout",
-                    solver_name,
+                    self.layout_planning.__name__,
                 )
             return self._generate_buffers(graph)
         if lx_relayout_plans is None:
@@ -2476,16 +2457,6 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
-def _solver_picks_tilings() -> bool:
-    """Whether the joint solve chooses a coarse tiling for each op.
-
-    Only the CP-SAT joint solve prices tiled candidates and ranks cuts, so
-    ``auto_coarse_tiling`` is inert on any other solver -- including dropping
-    the cost expression, which the annealing co-optimizer still scores by.
-    """
-    return config.auto_coarse_tiling and config.layout_solver == "cpsat"
-
-
 def _op_read_span_is_evaluable(op: Operation) -> bool:
     """True when the read-distance filter can compute concrete post-tile spans.
 
@@ -2629,7 +2600,7 @@ class _DivisionMap(NamedTuple):
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
-        layout_planning: CoreDivisionSolverFactory,
+        layout_planning: type[CoreDivisionLayoutSolver],
         size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
@@ -2638,10 +2609,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """Joint core-division + LX-placement allocator.
 
         Args:
-            layout_planning: Factory for a core-division-aware solver — either
-                the OR-Tools ``CpSatLayoutSolver`` (ILP) or an
-                ``ExhaustiveSearchSolver`` (DFS) wrapping a placement-only
-                factory. This allocator drives the *joint* entry point, so it
+            layout_planning: Class of a core-division-aware solver -- the
+                OR-Tools ``CpSatLayoutSolver`` (ILP), ``SaCoOptimizingSolver``,
+                or ``ExhaustiveSearchSolver.wrapping`` a placement-only solver
+                (DFS). This allocator drives the *joint* entry point, so it
                 needs the ``CoreDivisionLayoutSolver`` interface rather than a
                 plain ``MemoryPlanSolver``. The ortools-missing fallback to
                 greedy placement lives in :func:`select_allocator`, which
@@ -2656,19 +2627,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             pre_optimization_passes=pre_optimization_passes,
             post_optimization_passes=post_optimization_passes,
         )
-        # Narrow the base's ``LayoutSolverFactory`` annotation: the joint entry
-        # point requires the core-division interface.
-        self.layout_planning: Optional[CoreDivisionSolverFactory] = layout_planning
+        # Narrow the base's ``type[MemoryPlanSolver]`` annotation: the joint
+        # entry point requires the core-division interface.
+        self.layout_planning: Optional[type[CoreDivisionLayoutSolver]] = layout_planning
         self.prune = prune
-        # Whether the engine can decide LX relayouts (place a RelayoutCopyBuffer
-        # under the coupling its docstring lists). Probed on an empty solver the
-        # way select_allocator probes joint-ness, because the factory may be a
-        # function rather than a class. Engines that cannot are never handed a
-        # copy, and their objective never carries a relayout term.
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
-        self._decides_lx_relayouts: bool = bool(
-            getattr(layout_planning([], size), "decides_lx_relayouts", False)
-        )
+        self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
+        self._tilings_from_menu = layout_planning.tilings_from_menu()
+        if config.lx_planner_relayout and not self._decides_lx_relayouts:
+            logger.debug(
+                "%s does not decide LX relayouts; continuing without relayout",
+                layout_planning.__name__,
+            )
 
     def _prepare_buffers(
         self,
@@ -2825,7 +2795,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
-        if _solver_picks_tilings():
+        if (
+            config.auto_coarse_tiling
+            and solver.chooses_tilings()
+            and solver.linear_cost_only()
+        ):
             # The cost model is flat in both axes the tiling search moves along:
             # it has no term for tile size and none for cut count, so every
             # candidate tiling scores identically and the choice falls to
@@ -3211,7 +3185,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
         self._readers_by_name: dict[str, list[Operation]] = {}
-        if _solver_picks_tilings():
+        if config.auto_coarse_tiling and self._tilings_from_menu:
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
             )
@@ -3396,9 +3370,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
-        Unless the solve picks tilings (:func:`_solver_picks_tilings`) the only
-        option is the untiled ``TileSpec``, so enumeration and every downstream
-        plan stay bit-identical to today. When it does, the op is offered the
+        Unless ``auto_coarse_tiling`` is on and the solver takes its tilings off
+        this menu (``tilings_from_menu()``) the only option is the untiled
+        ``TileSpec``, so enumeration and every downstream plan stay
+        bit-identical to today. When it does, the op is offered the
         output-axis tilings it could take, minus any whose per-core read span
         would still exceed the read-distance limit (``MAX_SPAN_BYTES``); the
         untiled option is dropped too when the op's own full-size read
@@ -3436,7 +3411,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
             return untiled
-        if not _solver_picks_tilings():
+        if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
@@ -4324,12 +4299,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         write, activation source, pointwise-or-matmul consumer, ...) mirror
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
-        split range) live in ``solver_relayout_pair_cost``. Gated on
-        ``lx_solver_relayout()`` (the solver kind decides relayouts).
+        split range) live in ``solver_relayout_pair_cost``. Gated on the
+        solver's ``decides_lx_relayouts``.
         """
-        if not lx_solver_relayout() or config.ktir_emitter:
+        if not self._decides_lx_relayouts or config.ktir_emitter:
             return {}
-        if not self._decides_lx_relayouts or consumer_op is None:
+        if consumer_op is None:
             return {}
         relayouts: dict[str, list[RelayoutCandidate]] = {}
         for parent in parent_names:
@@ -4564,38 +4539,31 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ]
 
 
-def _make_cpsat_solver(
-    buffers: Sequence[LifetimeBoundBuffer], size: int
-) -> MemoryPlanSolver:
-    """Build the CP-SAT layout solver, or ``GreedyLayoutSolver`` when ortools
-    is unavailable.
+def _cpsat_solver_class() -> type[MemoryPlanSolver]:
+    """``CpSatLayoutSolver``, or ``GreedyLayoutSolver`` when ortools is
+    unavailable.
 
-    Imported lazily so this module (and every non-cpsat path) loads without
-    ortools installed; ``CpSatLayoutSolver.__init__`` raises ``ImportError``
-    when ortools (``cp_model``) is missing, which we translate to a
-    placement-only greedy fallback so callers never see an unusable factory.
+    Resolved to a class once, when the allocator is selected, so the
+    capabilities the allocator asks of it are the chosen solver's.
+    ``ilp_solver_ortools`` imports without ortools and leaves ``cp_model``
+    ``None``; it is imported lazily so every non-cpsat path skips it.
     """
-    try:
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
+    from torch_spyre._inductor.scratchpad import ilp_solver_ortools
 
-        return CpSatLayoutSolver(buffers, size)
-    except ImportError as exc:
-        logger.warning(
-            "cpsat layout solver unavailable (%s); falling back to the "
-            "default greedy allocator.",
-            exc,
-        )
-        return GreedyLayoutSolver(buffers, size)
+    if ilp_solver_ortools.cp_model is not None:
+        return ilp_solver_ortools.CpSatLayoutSolver
+    logger.warning(
+        "cpsat layout solver unavailable (ortools is not installed); falling "
+        "back to the default greedy allocator."
+    )
+    return GreedyLayoutSolver
 
 
-_PLACEMENT_SOLVERS: dict[str, LayoutSolverFactory] = {
+_PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {
     "greedy": GreedyLayoutSolver,
     "bestfit": BestFitLayoutSolver,
     "firstfit": FirstFitLayoutSolver,
     "simulated_annealing": SimulatedAnnealingLayoutSolver,
-    "cpsat": _make_cpsat_solver,
 }
 
 
@@ -4628,12 +4596,15 @@ def select_allocator() -> ScratchpadAllocator:
     """
     size = _lx_planning_size()
 
-    try:
-        solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
-    except KeyError:
-        raise ValueError(
-            f"Invalid layout_solver config option '{config.layout_solver}'."
-        )
+    if config.layout_solver == "cpsat":
+        solver_cls = _cpsat_solver_class()
+    else:
+        try:
+            solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
+        except KeyError:
+            raise ValueError(
+                f"Invalid layout_solver config option '{config.layout_solver}'."
+            )
 
     # LxContextSwitchingPass replaces PR3683's blanket "never pin a buffer to
     # LX across an extern kernel" guard with a real fix (bracket the risky
@@ -4651,21 +4622,11 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
     if config.co_optimizing_lx_planning:
-        if config.lx_planner_relayout and not lx_solver_relayout():
-            logger.debug(
-                "layout_solver=%s does not decide LX relayouts; continuing "
-                "without relayout",
-                config.layout_solver,
-            )
         if config.layout_solver == "simulated_annealing":
             return CoOptimizingAllocator(
                 layout_planning=SaCoOptimizingSolver, size=size
             )
-        # Throwaway empty-buffer probe: cheap (no real solving happens in
-        # __init__) and the only way to know whether this factory's solver is
-        # core-division-capable when the factory may be a plain function (the
-        # ortools-availability-aware cpsat factory) rather than a solver class.
-        if not isinstance(solver_cls([], size), CoreDivisionLayoutSolver):
+        if not solver_cls.chooses_core_divisions():
             if not config.allow_exhaustive_search:
                 raise ValueError(
                     f"co_optimizing_lx_planning=True with layout_solver="
@@ -4681,17 +4642,15 @@ def select_allocator() -> ScratchpadAllocator:
                     "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
                 )
             return CoOptimizingAllocator(
-                layout_planning=functools.partial(
-                    ExhaustiveSearchSolver, inner_factory=solver_cls
-                ),
+                layout_planning=ExhaustiveSearchSolver.wrapping(solver_cls),
                 size=size,
                 prune=True,
                 post_optimization_passes=post_optimization_passes,
             )
-        # The isinstance check above just proved this factory's solver is a
-        # CoreDivisionLayoutSolver at runtime; narrow the static type to match.
+        # chooses_core_divisions() holds exactly for CoreDivisionLayoutSolver
+        # subclasses (MemoryPlanSolver.__init_subclass__ checks it).
         return CoOptimizingAllocator(
-            layout_planning=cast(CoreDivisionSolverFactory, solver_cls),
+            layout_planning=cast(type[CoreDivisionLayoutSolver], solver_cls),
             size=size,
             post_optimization_passes=post_optimization_passes,
         )

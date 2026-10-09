@@ -339,7 +339,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # consumer's slicing: the two views differ but are relayout-compatible (a
     # permutation), priced by the fitted relayout law. Sibling of
     # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
-    # only when ``lx_relayout.lx_solver_relayout()`` holds, for the CP-SAT solver's
+    # only for a solver whose ``decides_lx_relayouts()`` holds, for its
     # relayout decision variables. The record carries the views, core count,
     # group and price, so the solver and the commit path never re-derive them.
     cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
@@ -889,7 +889,96 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
-    supports_paired_buffers = False
+    # What a solver can do, asked of its class before any instance exists. Every
+    # concrete solver answers each abstract one itself; __init_subclass__ fails
+    # the class definition otherwise, or on a combination that makes no sense.
+
+    @classmethod
+    def chooses_core_divisions(cls) -> bool:
+        """Chooses each buffer's core division jointly with its placement:
+        exactly the :class:`CoreDivisionLayoutSolver` subclasses."""
+        return False
+
+    @classmethod
+    @abstractmethod
+    def supports_paired_buffers(cls) -> bool:
+        """Places a committed LX relayout's source and destination as a pair
+        (``LifetimeBoundBuffer.paired_with``). The allocator collects committed
+        relayout plans only for such a solver."""
+
+    @classmethod
+    @abstractmethod
+    def decides_lx_relayouts(cls) -> bool:
+        """Places a :class:`RelayoutCopyBuffer` under the coupling its
+        docstring lists and writes ``chosen_relayouts`` back on the consumers it
+        serves. The allocator enumerates relayout candidates only for such a
+        solver; the others never see a copy and their objective carries no
+        relayout term."""
+
+    @classmethod
+    @abstractmethod
+    def chooses_tilings(cls) -> bool:
+        """Chooses each op's coarse tiling jointly with its core division. With
+        ``linear_cost_only`` too, the allocator hands it no cost expression
+        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
+        size or cut count."""
+
+    @classmethod
+    @abstractmethod
+    def tilings_from_menu(cls) -> bool:
+        """Takes each op's tiling candidates off the menu the allocator
+        enumerates, rather than generating its own. The allocator enumerates
+        tiled candidates only for such a solver."""
+
+    @classmethod
+    @abstractmethod
+    def replans_after_tiling(cls) -> bool:
+        """Needs a second, placement-only solve over the graph once the tilings
+        it chose are applied, rather than its own placement standing
+        (``CoOptimizingAllocator._materialize_selection``)."""
+
+    @classmethod
+    @abstractmethod
+    def linear_cost_only(cls) -> bool:
+        """Can only minimize a cost expression that lowers to linear terms, so
+        the objective must avoid the cost model's fractional powers."""
+
+    _CAPABILITIES = (
+        "supports_paired_buffers",
+        "decides_lx_relayouts",
+        "chooses_tilings",
+        "tilings_from_menu",
+        "replans_after_tiling",
+        "linear_cost_only",
+    )
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        abstract = {
+            name
+            for name in dir(cls)
+            if getattr(getattr(cls, name, None), "__isabstractmethod__", False)
+        }
+        if abstract - set(MemoryPlanSolver._CAPABILITIES):
+            return  # still abstract in its solve methods: not a concrete solver
+        if abstract:
+            raise TypeError(f"{cls.__name__} must answer {', '.join(sorted(abstract))}")
+        chooses = cls.chooses_core_divisions()
+        if chooses != issubclass(cls, CoreDivisionLayoutSolver):
+            raise TypeError(
+                f"{cls.__name__}.chooses_core_divisions() must be "
+                f"{not chooses}: it is exactly the CoreDivisionLayoutSolver "
+                "subclasses"
+            )
+        for implied, prerequisite in (
+            ("decides_lx_relayouts", "chooses_core_divisions"),
+            ("chooses_tilings", "chooses_core_divisions"),
+            ("linear_cost_only", "chooses_core_divisions"),
+            ("tilings_from_menu", "chooses_tilings"),
+            ("replans_after_tiling", "chooses_tilings"),
+        ):
+            if getattr(cls, implied)() and not getattr(cls, prerequisite)():
+                raise TypeError(f"{cls.__name__}.{implied}() requires {prerequisite}()")
 
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
@@ -914,7 +1003,7 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
-        assert self.supports_paired_buffers or not any(
+        assert self.supports_paired_buffers() or not any(
             buffer.paired_with for buffer in self.buffers
         ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
@@ -986,20 +1075,9 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     special case where there is nothing to choose.
     """
 
-    # Whether this engine decides LX relayouts: places a
-    # :class:`RelayoutCopyBuffer` under the coupling its docstring lists and
-    # writes ``chosen_relayouts`` back on the consumers it serves. The allocator
-    # enumerates candidates and builds copies only for engines that say so; the
-    # others never see a copy and their objective carries no relayout term.
-    decides_lx_relayouts: bool = False
-
     @classmethod
-    def replans_after_tiling(cls) -> bool:
-        """Whether the allocator should apply the coarse tilings this engine's
-        solve chose and then solve again over the tiled graph
-        (``CoOptimizingAllocator._materialize_selection``). Otherwise its first
-        placement stands, and any tiling it chose is its own to apply."""
-        return False
+    def chooses_core_divisions(cls) -> bool:
+        return True
 
     @abstractmethod
     def plan_layout_and_core_divisions(

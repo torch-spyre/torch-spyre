@@ -132,11 +132,8 @@ class TestExhaustiveSearchResidency(TestCase):
             residency_reason="no consumer reads it from LX",
         )
 
-        solver = ExhaustiveSearchSolver(
-            [producer, consumer, sink],
-            size=512,
-            inner_factory=GreedyLayoutSolver,
-            alignment=1,
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            [producer, consumer, sink], size=512, alignment=1
         )
         result = {
             buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()

@@ -11291,7 +11291,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 writes={dep(op.name)},
             )
 
-        allocator = CoOptimizingAllocator(MagicMock(), size=4096)
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
+        allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=4096)
         allocator._validated_drain_plans = {
             "carry": SimpleNamespace(storage_name="carry")
         }

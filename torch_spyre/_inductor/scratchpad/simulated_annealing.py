@@ -112,6 +112,30 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
     cleanup swaps) -- so the live layout is never churned through a full sweep.
     """
 
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return False
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
+
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
