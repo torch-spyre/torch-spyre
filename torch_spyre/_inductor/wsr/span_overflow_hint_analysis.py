@@ -1061,13 +1061,14 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       ``_best_case_inner_span``, which is more aggressive than any
       output-range coarse tile or any N-way work-division core split, so if
       even that leaves the span over the limit, no output mechanism can close
-      it -- only a reduction-range split or a K-split.
+      it -- only a reduction-range split, which this op cannot do.
 
-    Single-dim plain reductions (``_sole_real_reduction_range_pos`` returns
-    non-None) are excluded from the abort: ``multi_reduction_k_split_blocked``
-    only pins reduction vars when there are 2+ reduction dims, so
-    ``work_distribution_pass`` can legally K-split a single-dim plain
-    reduction and bring its span under the limit.
+    Note: ``multi_reduction_k_split_blocked`` only pins reduction vars for 2+
+    reduction dims; single-dim plain reductions can now K-split.  This abort
+    remains correct: the K-splittable types (``sum``, ``prod``, float
+    ``max``/``min``) exit via ``_supports_reduction_range_tiling`` at the top
+    of this function and never reach here.  The types that do reach here
+    (``mean``, integer ``max``/``min``) have no K-split recovery path.
 
     ``max_cores`` is therefore not consulted: the best case already bounds
     every core-split outcome.
@@ -1127,11 +1128,6 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
                 # not assume untileable from it.
                 continue
             if span_elems * best_inner * itemsize > MAX_SPAN_BYTES:
-                if _sole_real_reduction_range_pos(op) is not None:
-                    # Single-dim plain reductions can K-split (see
-                    # multi_reduction_k_split_blocked); let
-                    # work_distribution_pass handle the overflow.
-                    continue
                 return True
     return False
 
@@ -2340,10 +2336,11 @@ def plan_span_overflow_tile(
             # The BMM exemption is not arbitrary: work division cross-core
             # splits a matmul's K range, so a BMM K-only rejection here is
             # genuinely recoverable downstream and keeps its historical None.
-            # Multi-dim plain sum/prod/max/min are pinned to split=1 by
-            # multi_reduction_k_split_blocked and have no such recovery, so
-            # dropping their overflow just defers the failure to the backend.
-            # Single-dim plain reductions are handled by the caller.
+            # Plain sum/prod/max/min that support reduction-range tiling are
+            # handled by _has_untileable_reduction_span returning False early.
+            # The types that reach here (mean, integer max/min) have no K-split
+            # recovery, so dropping their overflow just defers the failure to
+            # the backend.
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: the reduced axis overflows "
                 "and no legal, stick-aligned reduction-range split within "
