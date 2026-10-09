@@ -79,6 +79,7 @@ from .insert_restickify import (
     RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
+from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
@@ -494,10 +495,9 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                             )
 
     # Phase 2: performance transforms (matmul perf reorder).
-    # For each matmul op, reorder both its non-graph-input input buffers and
-    # its own output buffer: inputs benefit from reading a wider contiguous
-    # region; the output benefits from the same largest-dim-between-sticks
-    # layout for downstream consumers.
+    # For each matmul op, reorder its non-graph-input input buffers so they
+    # read a wider contiguous region.  Optionally (SPYRE_NDO_MATMUL_OUTPUT_REORDER)
+    # also reorder the matmul's own output buffer with the same heuristic.
     already_reordered: set[str] = set()
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
@@ -516,7 +516,10 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             and dep.name not in graph_inputs
             and isinstance(V.graph.get_buffer(dep.name), ComputedBuffer)
         ]
-        for buf in [*input_bufs, op]:
+        bufs_to_reorder = list(input_bufs)
+        if config.ndo_matmul_output_reorder:
+            bufs_to_reorder.append(op)
+        for buf in bufs_to_reorder:
             name = buf.get_name()
             if name in already_reordered:
                 continue
