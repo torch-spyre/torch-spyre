@@ -6750,7 +6750,7 @@ def _propagate_tiled_reduction_op(
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
     )
-    # SpyreTensorLayout([], dtype) yields device_size=[1, 64], stride_map=[-1, -1]
+    # SpyreTensorLayout([], dtype) yields device_size=[1, 64], stride_map=[0, 0]
     # — a 0-d broadcast scalar in Spyre's device coordinate system.
     scalar_stl = SpyreTensorLayout([], dtype)
     scalar_op.layout = FixedTiledLayout(device, dtype, [], [], scalar_stl)

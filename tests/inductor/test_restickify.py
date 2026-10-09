@@ -2540,17 +2540,17 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 #
 # A restickify whose old stick has host size 1 collapses one operand's
 # within-stick coordinate to a constant, so that operand's STL carries the old
-# stick as a size-1 ``stride_map == -1`` singleton dim, while the restore
+# stick as a size-1 ``stride_map == 0`` singleton dim, while the restore
 # (_restickify_restore_elided_dim) rebuilds the descriptor to sweep a full
 # 64-plane stick.  The grow is two coupled halves: padding._pad_elided_dim
-# prepends an outermost size-64 ``-1`` gap dim to the (intact) operand's STL so
+# prepends an outermost size-64 ``0`` gap dim to the (intact) operand's STL so
 # the allocation covers the sweep, and the restore REUSES that dim (binds the
 # shared iteration symbol to it) rather than inserting its own, keeping the
 # descriptor total equal to the grown allocation.  These tests pin each half
 # against the real STL / OpSpec APIs, without a device (the functional
 # lane-displacement checks are the *_stick_crossing_* tests above).
 _SIZE1_COLLAPSED_DEVICE_SIZE = [67, 1, 1, 64]
-_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, -1, 1]
+_SIZE1_COLLAPSED_STRIDE_MAP = [7, 64, 0, 1]
 _SIZE1_HOST_SIZE = [1, 67, 7]
 _SIZE1_HOST_STRIDE = [469, 7, 1]
 _SIZE1_STICK = 64  # SEN169_FP16 elems_per_stick
@@ -2588,10 +2588,10 @@ def test_size1_grow_prepends_size64_gap_dim():
     _pad_elided_dim(buf)
 
     dl = buf.layout.device_layout
-    # An outermost size-64 gap dim (stride_map -1) is prepended; the original
+    # An outermost size-64 gap dim (stride_map 0) is prepended; the original
     # device dims follow unchanged.
     assert list(dl.device_size) == [_SIZE1_STICK, *_SIZE1_COLLAPSED_DEVICE_SIZE]
-    assert list(dl.stride_map) == [-1, *_SIZE1_COLLAPSED_STRIDE_MAP]
+    assert list(dl.stride_map) == [0, *_SIZE1_COLLAPSED_STRIDE_MAP]
     # Allocation is 128B/stick * prod(device_size[:-1]) (get_device_size_in_bytes
     # in spyre_tensor_impl.cpp); the prepended dim grows it exactly 64x.
     alloc_bytes = 128 * math.prod(list(dl.device_size)[:-1])

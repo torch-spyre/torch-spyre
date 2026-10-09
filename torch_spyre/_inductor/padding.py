@@ -521,7 +521,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     The transposed dim is a non-stick dim here -- the new stick on the input side,
     the old stick on the output side -- that pairs with the stick on the other
     operand.  When it has host size 1, Inductor elides it, so the STL carries it as
-    a size-1 dim with ``stride_map == -1``, and its allocation holds one plane, but
+    a size-1 dim with ``stride_map == 0``, and its allocation holds one plane, but
     the paired stick needs 64.
 
     Prepending a size-64 gap dim makes the allocation cover all 64 planes.  This
@@ -535,7 +535,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     stick = stl.elems_per_stick()
     grown_stl = SpyreTensorLayout(
         [stick, *stl.device_size],
-        [-1, *stl.stride_map],
+        [0, *stl.stride_map],
         stl.device_dtype,
         stl.element_arrangement,
     )

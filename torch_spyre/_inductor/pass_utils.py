@@ -2354,7 +2354,7 @@ def is_sparse_stl(stl) -> bool:
 
     A sparse layout is produced by a reduction along the stick dimension:
     the stick dim (device_size[-1] == elems_per_stick) is synthetic with
-    stride_map[-1] == -1 (no corresponding host stride).
+    stride_map[-1] == 0 (no corresponding host stride).
 
     A device tensor has a device_size and stride_map. Remove the dimensions of
     size one from both lists. The stride of a dimension is the prod of the
@@ -2552,7 +2552,7 @@ def compute_restickify_needed(
             y_sm = list(sm)
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
-            y_sm[-1] = -1
+            y_sm[-1] = 0
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "

@@ -93,7 +93,7 @@ class TestSpyreTensorLayout(TestCase):
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)
         self.assertEqual(stl.device_size, [1, 64])
-        self.assertEqual(stl.stride_map, [-1, -1])
+        self.assertEqual(stl.stride_map, [0, 0])
 
         stl = SpyreTensorLayout([120], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
@@ -155,7 +155,7 @@ class TestSpyreTensorLayout(TestCase):
     def test_sparse_dim_order(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1, -1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(stl.stride_map, [1, 0, 256, 0])
 
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
@@ -582,7 +582,7 @@ class TestSpyreTensorLayout(TestCase):
         # without being loose enough to mask a genuine regression.
         self.assertEqual(x, x_dev.cpu(), atol=1e-3, rtol=1e-3)
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(x_stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(x_stl.stride_map, [1, 0, 256, 0])
 
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
@@ -811,11 +811,32 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(get_device_size_in_bytes(empty), 0)
         with self.assertRaisesRegex(RuntimeError, "stride_map has 2 entries for 3"):
             SpyreTensorLayout([1, 4, 64], [64, 1], fp16, ElementArrangement.STANDARD)
-        # -1 (size-1 / sparse) and 0 (broadcast) stride entries stay legal.
+        # -1 (legacy broadcast marker) is normalized to 0; values below -1 are
+        # rejected.
         ok = SpyreTensorLayout(
             [1, 4, 64], [-1, 0, 1], fp16, ElementArrangement.STANDARD
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
+        self.assertEqual(list(ok.stride_map), [0, 0, 1])
+        with self.assertRaisesRegex(RuntimeError, "not a valid stride"):
+            SpyreTensorLayout([1, 4, 64], [-2, 0, 1], fp16, ElementArrangement.STANDARD)
+
+    def test_explicit_stl_minus_one_normalized_to_zero(self):
+        """stride_map -1 (legacy broadcast marker) is normalized to 0 in the
+        explicit (device_size, stride_map) constructor."""
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, -1, 1], fp16)
+        self.assertEqual(list(stl.stride_map), [32, 0, 1])
+        self.assertEqual(list(stl.device_size), [2, 1, 32])
+
+    def test_stl_v3_pickle_minus_one_loads_as_zero(self):
+        """An STL constructed with a legacy -1 in stride_map round-trips
+        through pickle with 0 in its place."""
+        fp16_df = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([2, 1, 32], [32, -1, 1], fp16_df)
+        self.assertEqual(list(stl.stride_map), [32, 0, 1])
+        restored = pickle.loads(pickle.dumps(stl))
+        self.assertEqual(list(restored.stride_map), [32, 0, 1])
 
 
 if __name__ == "__main__":

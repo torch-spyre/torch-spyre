@@ -97,8 +97,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->device_size[0] = 1;
     this->device_size[1] = this->elems_per_stick();
     this->stride_map.resize(2);
-    this->stride_map[0] = -1;
-    this->stride_map[1] = -1;
+    this->stride_map[0] = 0;
+    this->stride_map[1] = 0;
     return;
   }
 
@@ -126,7 +126,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->device_size[host_rank - 1] = compute_extent(dim_order[0]);
   this->device_size[host_rank] = this->elems_per_stick();
 
-  this->stride_map.assign(dev_rank, -1);
+  this->stride_map.assign(dev_rank, 0);
   std::vector<int64_t> last_stride(host_size.size(), -1);
 
   auto update_stride = [&](int32_t host_dim, int dev_idx) {

@@ -133,6 +133,12 @@ class SpyreTensorLayout {
         stride_map(stride_map),
         device_dtype(device_dtype),
         element_arrangement(element_arrangement) {
+    // Normalize legacy -1 to 0.
+    for (auto& s : this->stride_map) {
+      TORCH_CHECK(s >= -1, "Invalid SpyreTensorLayout: stride_map entry ", s,
+                  " is not a valid stride (must be >= -1)");
+      if (s == -1) s = 0;
+    }
     validate_shape();
   }
 
@@ -151,10 +157,11 @@ class SpyreTensorLayout {
    * rescale_stl_for_dtype now rejects that upstream of the constructor, and
    * get_device_stride_infos checks every divisor before use.
    *
-   * stride_map entries are deliberately not range-checked here: -1 marks a
-   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
-   * Consistency between stride_map and the host strides is only knowable at
-   * use time and is checked in get_device_stride_infos.
+   * stride_map entries are range-checked in the constructor: -1
+   * is normalized to 0, and any value below -1 is rejected.
+   * After normalization, 0 marks a broadcast or size-1 dimension — both
+   * legitimate.  Consistency between stride_map and the host strides is only
+   * knowable at use time and is checked in get_device_stride_infos.
    */
   void validate_shape() const {
     TORCH_CHECK(!device_size.empty(),

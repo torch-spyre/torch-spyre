@@ -2115,7 +2115,7 @@ class TestDivideRanges(unittest.TestCase):
 
     def test_resize_device_layout_grow_from_singleton(self):
         """_allocate_full_buffer grow path: a device dim tiled to size 1
-        (stride_map != -1) must be grown back on the full-buffer allocation.
+        (stride_map != 0) must be grown back on the full-buffer allocation.
 
         [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
         update to device_size=4, not remain frozen at 1."""
@@ -2123,7 +2123,7 @@ class TestDivideRanges(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
-        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
+        # device_size=[2, 1, 64], stride_map=[64, 0, 1].
         stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
         result = _resize_device_layout(stl, [1, 128], [4, 128])
 
@@ -2156,8 +2156,8 @@ class TestDivideRanges(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
-        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
-        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        # device_size=[1, 128, 64], stride_map=[0, 1, 0] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at 0.
         stl = SpyreTensorLayout([128], [1], torch.float16, [0])
         # Tile the non-stick dim: [128] -> [64].
         result = _resize_device_layout(stl, [128], [64])
@@ -2173,7 +2173,7 @@ class TestDivideRanges(unittest.TestCase):
         Flash-attention QK^T output: logical [B, H, Sq, Skv] with Sq == Skv,
         stored transposed.  The device layout is byte-identical whether Sq or
         Skv is the stick dim (device_size=[32,512,8,1,64],
-        stride_map=[512,16384,64,-1,1]), so size-based elimination cannot tell
+        stride_map=[512,16384,64,0,1]), so size-based elimination cannot tell
         the two size-512 host dims apart.
 
         Without identity (``stick_host_dim=None``) this is genuinely ambiguous
@@ -2200,7 +2200,7 @@ class TestDivideRanges(unittest.TestCase):
             stl, host_size, [1, 32, 256, 512], stick_host_dim=3
         )
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
-        self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+        self.assertEqual(list(result.stride_map), [512, 16384, 64, 0, 1])
 
 
 def _mock_op_out_coords(op):
@@ -9587,9 +9587,9 @@ class TestPredictFrame(unittest.TestCase):
         size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
         one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
         level 2 re-matches the one-stick tile-count dim onto it and collapses
-        its stride to the ``-1`` sentinel.  A single resize never sees that
-        intermediate state and leaves the real stride there, predicting
-        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
+        its stride to ``0``.  A single resize never sees that intermediate
+        state and leaves the real stride there, predicting stride_map
+        [64, 64, 0, 1] against an applied [64, 0, 0, 1].
 
         Needs all three: a dim tiled to extent 1, at a non-final level, with a
         stick host dim of exactly one stick (64 elems at fp16) so a second

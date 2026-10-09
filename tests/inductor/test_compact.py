@@ -91,16 +91,16 @@ def test_compact_3d_layouts():
     assert list(buf0_stl.device_size) == [48, 1, 1, 4, 64], (
         f"Unexpected sparse device_size: {list(buf0_stl.device_size)}"
     )
-    assert list(buf0_stl.stride_map) == [1, -1, -1, 48, -1], (
+    assert list(buf0_stl.stride_map) == [1, 0, 0, 48, 0], (
         f"Unexpected sparse stride_map: {list(buf0_stl.stride_map)}"
     )
 
-    # Dense: one dim fewer, stick dim is now real (stride_map[-1] != -1 except
+    # Dense: one dim fewer, stick dim is now real (stride_map[-1] != 0 except
     # stick synthetic marker; verify it's the standard dense (4,48,1) layout)
     assert list(buf1_stl.device_size) == [48, 1, 4, 64], (
         f"Unexpected dense device_size: {list(buf1_stl.device_size)}"
     )
-    assert list(buf1_stl.stride_map) == [1, -1, 48, -1], (
+    assert list(buf1_stl.stride_map) == [1, 0, 48, 0], (
         f"Unexpected dense stride_map: {list(buf1_stl.stride_map)}"
     )
 
