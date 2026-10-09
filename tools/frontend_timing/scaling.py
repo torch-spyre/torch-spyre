@@ -18,16 +18,11 @@
     python3 tools/frontend_timing/scaling.py rows.json
     python3 tools/frontend_timing/scaling.py rows.json --extrapolate layers=40
 
-A series is a set of points that agree on everything except one parameter. This finds
-them, fits ``log(metric) = a * log(axis) + b`` by least squares, and reports the
-exponent with its R-squared. An exponent quoted without a fit quality beside it is the
-failure this tool exists to prevent: a slope through three noisy points will always
-produce a number, and such numbers have been the basis of complexity claims before.
-
-Extrapolation is the reason it exists at all. Granite 3.3 8B is 40 decoder layers and
-nothing here compiles 40 layers in one graph, so the 40-layer figure is a projection
-from a measured depth series -- reported as a projection, with the fit it rests on,
-never as a measurement.
+A series is the set of points that agree on everything except one parameter. Each is
+fitted as ``log(metric) = a * log(axis) + b`` and reported with its R-squared, because
+a slope through a few noisy points always produces a number. ``--extrapolate`` projects
+a reliable fit, e.g. Granite's depth series to its 40 layers, which no single graph
+compiles.
 """
 
 from __future__ import annotations
@@ -93,29 +88,16 @@ def loglog_fit(pairs: list[tuple[float, float]]) -> Fit | None:
     ``S=1`` survives (log 1 is 0); a metric that measured 0 ms does not.
     """
     usable = [(x, y) for x, y in pairs if x > 0 and y > 0]
-    if len(usable) < 2:
-        return None
     xs = [math.log(x) for x, _ in usable]
     ys = [math.log(y) for _, y in usable]
     if len(set(xs)) < 2:
-        # Every point at the same axis value: a slope is not defined.
+        # Fewer than two distinct axis values: a slope is not defined.
         return None
-
-    mean_x = statistics.fmean(xs)
-    mean_y = statistics.fmean(ys)
-    sxx = sum((x - mean_x) ** 2 for x in xs)
-    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    slope = sxy / sxx
-    intercept = mean_y - slope * mean_x
-
-    total = sum((y - mean_y) ** 2 for y in ys)
-    residual = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
-    r_squared = 1.0 if total == 0 else max(0.0, 1.0 - residual / total)
+    slope, intercept = statistics.linear_regression(xs, ys)
+    # correlation() rejects a constant input; a flat series is fitted exactly.
+    r_squared = statistics.correlation(xs, ys) ** 2 if len(set(ys)) > 1 else 1.0
     return Fit(
-        exponent=slope,
-        intercept=intercept,
-        r_squared=r_squared,
-        points=len(usable),
+        exponent=slope, intercept=intercept, r_squared=r_squared, points=len(usable)
     )
 
 

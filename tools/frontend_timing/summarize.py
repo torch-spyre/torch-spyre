@@ -19,13 +19,8 @@
     python3 tools/frontend_timing/summarize.py /tmp/records
     python3 tools/frontend_timing/summarize.py /tmp/records --passes --csv out.csv
 
-Median across samples, never mean: pod wall time has a long tail, and one contended
-sample should not move the number. Frontend time is a subtraction -- the compile region
-minus the backend invocations inside it -- because the backend runs per kernel from
-within codegen rather than after it.
-
-Records that never reached a compile are reported and excluded rather than averaged in:
-a process that died before compiling looks like a fast one otherwise.
+Medians across samples. Frontend time is the compile region minus the backend
+invocations inside it. Records that did not finish a compile are reported and excluded.
 """
 
 from __future__ import annotations
@@ -46,40 +41,16 @@ GRAPH_PIPELINE = "pipeline:CustomPreSchedulingPasses"
 
 #: Metadata keys that describe the run rather than the point being measured.
 _NON_PARAM_KEYS = frozenset(
-    {
-        "sample",
-        "cold",
-        "cache_dir",
-        "spyre_config",
-        "workload",
-        "recorder_version",
-        "clock",
-        "pid",
-        "git_sha",
-        "torch_spyre_path",
-        "torch_spyre_version",
-        "torch_version",
-        "python_version",
-        "frontend_only",
-        "backend_skipped_kernels",
-        "env_arm",
-        "compile_wall_ms",
-        "peak_rss_kb",
-        "kernels_skipped",
-    }
+    "sample cold cache_dir spyre_config workload recorder_version clock pid git_sha"
+    " torch_spyre_path torch_spyre_version torch_version python_version frontend_only"
+    " backend_skipped_kernels env_arm compile_wall_ms peak_rss_kb"
+    " kernels_skipped".split()
 )
 
-#: Event ``meta`` keys that describe the graph rather than count analysis work. Anything
-#: else numeric on a pass or pipeline event is treated as a counter, so a counter added
-#: to the compiler shows up here without this file being edited.
+#: Event ``meta`` keys that describe the graph. Any other number on a pass event is a
+#: counter, so a counter added to the compiler shows up here with no edit.
 _GRAPH_META_KEYS = frozenset(
-    {
-        "input_operations",
-        "output_operations",
-        "input_nodes",
-        "output_nodes",
-        "passes",
-    }
+    "input_operations output_operations input_nodes output_nodes passes".split()
 )
 
 
@@ -113,12 +84,7 @@ class Record:
         )
 
     def graph_operations(self) -> int | None:
-        """Largest pre-scheduling graph this process compiled, or None if it had none.
-
-        None rather than 0: a record that never reached the pre-scheduling pipeline did
-        not compile a zero-operation graph, and a zero here would read as a graph that
-        shrank to nothing.
-        """
+        """Largest pre-scheduling graph compiled; None, not 0, if there was none."""
         sizes = [
             e.get("meta", {}).get("input_operations", 0)
             for e in self.events
@@ -127,7 +93,7 @@ class Record:
         return max(sizes) if sizes else None
 
     def graph_nodes(self) -> int | None:
-        """Largest FX graph this process compiled, or None if none reported one."""
+        """Largest FX graph compiled, or None if no pipeline reported one."""
         sizes = [
             (e.get("meta") or {})["input_nodes"]
             for e in self.events
@@ -137,20 +103,14 @@ class Record:
         return max(sizes) if sizes else None
 
     def counters(self) -> dict[str, int]:
-        """Analysis-call counts for the whole compile, summed over every pass.
+        """Analysis-call counts summed over every pass.
 
-        Summed rather than kept per pass on purpose: per-pass counters are in the raw
-        record for attribution work, but as dashboard metrics they would multiply every
-        counter by every pass, and a metric name set that grows like that stops being
-        low-cardinality.
+        Only pass events: a pipeline repeats its own passes' totals. Summed per compile
+        rather than kept per pass, so the metric name set stays small.
         """
         totals: dict[str, int] = {}
         for event in self.events:
-            if not event["name"].startswith(("pass:", "pipeline:")):
-                continue
-            # Pipelines carry the inclusive total of their own passes, so counting both
-            # would double everything; passes alone sum to the compile.
-            if event["name"].startswith("pipeline:"):
+            if not event["name"].startswith("pass:"):
                 continue
             for key, value in (event.get("meta") or {}).items():
                 if key in _GRAPH_META_KEYS or not isinstance(value, (int, float)):
@@ -179,18 +139,12 @@ class Record:
         return totals
 
 
-#: Version of the rows file. A consumer that does not know this string should refuse the
-#: file rather than guess, the way the recorder's own RECORDER_VERSION works.
+#: Rows-file version; a consumer that does not know it should refuse the file.
 ROWS_SCHEMA = "frontend-timing-rows/1"
 
 
 def metric_key(event_name: str) -> str:
-    """``stage:Owner:what`` -> ``stage.Owner.what_ms``.
-
-    One grammar for every metric name, because these become warehouse Map keys: dots
-    rather than colons so the names survive tools that treat a colon as a separator, and
-    a unit suffix so a reader never has to guess milliseconds from nanoseconds.
-    """
+    """``stage:Owner:what`` -> ``stage.Owner.what_ms``, safe as a warehouse Map key."""
     return event_name.replace(":", ".") + "_ms"
 
 
@@ -223,9 +177,8 @@ class PointSummary:
 
     @property
     def frontend_ms(self) -> float:
-        # The median of the per-sample differences, not the difference of the two
-        # medians: the subtraction belongs inside one sample, where both numbers came
-        # from the same process.
+        # The median of per-sample differences, not the difference of medians: both
+        # sides of the subtraction must come from one process.
         return self.median("frontend_ms")
 
     def regions_ms(self, prefix: str) -> dict[str, float]:
@@ -250,8 +203,7 @@ def point_name(workload: str, params: dict[str, Any], arm: str = "") -> str:
 def load_records(directory: str) -> tuple[list[Record], list[str]]:
     """Load every record in ``directory``. Returns (usable, problems).
 
-    Subdirectories are not walked, which is what keeps the driver's discarded warmup --
-    written to ``warmup/`` -- out of the summary.
+    Not recursive, which keeps the driver's discarded ``warmup/`` out of the summary.
     """
     records: list[Record] = []
     problems: list[str] = []
@@ -280,8 +232,7 @@ def load_records(directory: str) -> tuple[list[Record], list[str]]:
             continue
         failed = [e["name"] for e in record.events if e.get("error")]
         if failed:
-            # The recorder dumps at process exit whether or not the compile succeeded,
-            # so a failed sample leaves a record whose times measure a failure.
+            # The recorder writes at exit even when the compile raised.
             problems.append(f"{entry}: compile failed in {failed[0]}, excluded")
             continue
         records.append(record)
@@ -289,14 +240,7 @@ def load_records(directory: str) -> tuple[list[Record], list[str]]:
 
 
 def measurements(group: list[Record]) -> dict[str, list[float]]:
-    """Every metric for one point, as its per-sample values.
-
-    Arrays, not medians: the warehouse column is ``Map(String, Array(Float64))``,
-    deliberately, so variance and percentiles stay recomputable downstream. The medians
-    in the human-facing table are taken from these. A metric only some samples carry
-    yields a shorter array rather than a padded one -- an absent measurement must not
-    read as a zero.
-    """
+    """Every metric for one point, as per-sample values; an absent one is not a zero."""
     series: dict[str, list[float]] = {}
 
     def add(key: str, value: float) -> None:
@@ -315,8 +259,7 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
             if size is not None:
                 add(key, size)
         for name, ns in record.by_prefix("stage:").items():
-            # The compile root is already total_ms; recording it twice would let a
-            # careless sum double the whole compile.
+            # Already total_ms, so a sum over stage.* must not see it again.
             if name == COMPILE_EVENT:
                 continue
             add(metric_key(name), ns / 1e6)
@@ -334,38 +277,24 @@ def summarize(records: list[Record]) -> list[PointSummary]:
     for record in records:
         key = point_name(record.workload, record.params, record.arm)
         grouped.setdefault(key, []).append(record)
-
-    summaries = []
-    for point, group in sorted(grouped.items()):
-        summaries.append(
-            PointSummary(
-                point=point,
-                workload=group[0].workload,
-                params=group[0].params,
-                arm=group[0].arm,
-                samples=len(group),
-                measurements=measurements(group),
-            )
+    return [
+        PointSummary(
+            point=point,
+            workload=group[0].workload,
+            params=group[0].params,
+            arm=group[0].arm,
+            samples=len(group),
+            measurements=measurements(group),
         )
-    return summaries
+        for point, group in sorted(grouped.items())
+    ]
 
 
 def provenance(records: list[Record]) -> dict[str, Any]:
-    """What produced these numbers, so a row can be attributed to a commit.
-
-    Read off the first record rather than from the environment: the sweep may be
-    summarized on a different machine from the one that ran it, and the record is the
-    only thing that knows which checkout compiled.
-    """
+    """Build identity, read off the first record: it may be summarized elsewhere."""
     first = records[0].meta if records else {}
-    keys = (
-        "git_sha",
-        "torch_version",
-        "torch_spyre_version",
-        "python_version",
-        "recorder_version",
-    )
-    return {key: first.get(key) for key in keys if first.get(key) is not None}
+    keys = "git_sha torch_version torch_spyre_version python_version recorder_version"
+    return {key: first.get(key) for key in keys.split() if first.get(key) is not None}
 
 
 def render_markdown(
@@ -391,49 +320,23 @@ def render_markdown(
         for name, ms in ranked[:top]:
             lines.append(f"| {name} | {ms:.1f} |")
         if len(ranked) > top:
-            # Say so rather than let a reader think the list is the whole pipeline; the
-            # rows file and the CSV carry every pass.
             lines.append(f"| ...{len(ranked) - top} more passes (see --csv/--json) | |")
     return "\n".join(lines)
 
 
 def write_csv(summaries: list[PointSummary], path: str) -> None:
-    """One row per metric, carrying the point's graph size.
-
-    Graph size travels with every row so per-region time can be plotted against it
-    without joining back to another table. Region names use the same grammar as the rows
-    file, so the two can be compared without translating between vocabularies.
-    """
+    """One row per metric, each with the point's graph size so plots need no join."""
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "point",
-                "workload",
-                "params",
-                "arm",
-                "graph_operations",
-                "region",
-                "median_ms",
-                "samples",
-            ]
-        )
+        header = "point workload params arm graph_operations region median_ms samples"
+        writer.writerow(header.split())
         for s in summaries:
             params = json.dumps(s.params, sort_keys=True)
             for region in sorted(s.measurements):
                 values = s.measurements[region]
-                writer.writerow(
-                    [
-                        s.point,
-                        s.workload,
-                        params,
-                        s.arm,
-                        s.graph_operations,
-                        region,
-                        f"{statistics.median(values):.3f}",
-                        len(values),
-                    ]
-                )
+                row = [s.point, s.workload, params, s.arm, s.graph_operations, region]
+                median = f"{statistics.median(values):.3f}"
+                writer.writerow(row + [median, len(values)])
 
 
 def write_json(
@@ -442,13 +345,7 @@ def write_json(
     path: str,
     tier: str | None = None,
 ) -> None:
-    """The rows file: one object per point, every metric as its per-sample values.
-
-    This is the shape the warehouse wants -- one ``benchmark_runs`` row per point, with
-    ``measurements`` a metric-name to sample-array map -- so the follow-up ingest is a
-    translation with no arithmetic in it. Keeping the arithmetic here, where it can be
-    tested without a database, is the point.
-    """
+    """The rows file: one object per point, every metric as its per-sample values."""
     payload = {
         "schema": ROWS_SCHEMA,
         "meta": {
