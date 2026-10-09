@@ -2202,6 +2202,55 @@ class TestDivideRanges(unittest.TestCase):
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
         self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
 
+    def test_resize_device_layout_follows_permuted_host_strides(self):
+        """A buffer written in a permuted order: host dim 1 is the outer one,
+        as on the output of ``(x + y).permute(1, 0, 2) * 2``.
+
+        The contiguous strides of its size put the outer stride on host dim 0
+        instead. Standing in for the real ones, they name the wrong host dim
+        for a device dim where two host dims are the same size, and leave the
+        outer dim's stride as it was where an inner dim shrinks under it. With
+        the buffer's own strides, the resized layout is the one the tile would
+        be given if it were laid out directly.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.tile import compute_tile_stride
+
+        cases = [
+            # (size, stride, tile size)
+            (
+                "same size, outer dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [64, 16, 128],
+            ),
+            (
+                "same size, inner dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [16, 64, 128],
+            ),
+            ("inner dim tiled", [32, 64, 128], [128, 4096, 1], [8, 64, 128]),
+        ]
+        for name, size, stride, tile_size in cases:
+            with self.subTest(name):
+                tile_stride = [
+                    int(s) for s in compute_tile_stride(size, stride, tile_size)
+                ]
+                stl = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+                result = _resize_device_layout(
+                    stl,
+                    size,
+                    tile_size,
+                    old_host_stride=stride,
+                    new_host_stride=tile_stride,
+                )
+                expected = SpyreTensorLayout(
+                    tile_size, tile_stride, torch.float16, [0, 1, 2]
+                )
+                self.assertEqual(result, expected)
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
@@ -10936,6 +10985,42 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
             o for o in operations if o.get_name().startswith("coarse_tile_combine_")
         ]
         self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
+
+    def test_full_buffer_grown_back_from_a_permuted_tile(self):
+        # Where no full layout was planned, the full buffer's is grown back
+        # from the tile's. This op writes its output with dim 1 outermost and
+        # is tiled on dim 0, the inner one, so the outer dim's stride shrinks
+        # with the tile and has to grow back with the full buffer.
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _allocate_full_buffer
+
+        size, stride = [64, 64, 128], [128, 8192, 1]
+        op = _make_real_tiled_op("pw_permuted", size)
+        original = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+        op.layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(s) for s in size],
+            [Integer(s) for s in stride],
+            original,
+        )
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(
+            op.layout.device_layout,
+            SpyreTensorLayout([16, 64, 128], [128, 2048, 1], torch.float16, [0, 1, 2]),
+        )
+
+        operations = V.graph.operations
+        operations.append(op)
+        full = _allocate_full_buffer(
+            op,
+            [Integer(s) for s in size],
+            tuple(Integer(s) for s in stride),
+            operations,
+            0,
+        )
+        self.assertEqual(full.layout.device_layout, original)
 
 
 class TestDeriveTilingGroups(unittest.TestCase):

@@ -2964,7 +2964,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        return extract_op_features(
+            op,
+            ws,
+            is_lx=is_lx,
+            candidate_work_slices=[
+                _work_slices(op, candidate) for candidate in buffer.core_divisions
+            ],
+        )
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -4287,6 +4294,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
         is_lx[consumer_op.get_name()] = False
         is_lx[parent] = True
+        candidate_work_slices = [
+            _work_slices(consumer_op, division) for division in consumer_divs
+        ]
         return {
             j: float(
                 predict_ops(
@@ -4295,6 +4305,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             consumer_op,
                             _work_slices(consumer_op, consumer_divs[j]),
                             is_lx=is_lx,
+                            candidate_work_slices=candidate_work_slices,
                         )
                     ],
                     params=_COST_PARAMS,

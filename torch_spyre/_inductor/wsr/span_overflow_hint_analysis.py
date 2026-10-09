@@ -42,6 +42,7 @@ from ..pass_utils import (
 )
 from ..work_division import MAX_SPAN_BYTES
 from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
+from .tile import compute_tile_stride
 
 
 logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
@@ -362,11 +363,18 @@ def _post_tile_resize_error(
     ):
         return None
     full_size = [concretize_expr(s) for s in layout.size]
+    full_stride = [concretize_expr(s) for s in layout.stride]
     tile_size = list(full_size)
     tile_size[host_dim] //= split_count
     try:
+        tile_stride = compute_tile_stride(full_size, full_stride, tile_size)
         _resize_device_layout(
-            layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
+            layout.device_layout,
+            full_size,
+            tile_size,
+            stick_host_dim=stick_host_dim,
+            old_host_stride=full_stride,
+            new_host_stride=[int(s) for s in tile_stride],
         )
     except RuntimeError as exc:
         return str(exc)
