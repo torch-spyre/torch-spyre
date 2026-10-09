@@ -39,6 +39,7 @@ Feature source per record (in priority order):
     python tools/cost_model/eval_model.py --params bw_peak_gbps=155
     python tools/cost_model/eval_model.py --verify                # feature-fidelity vs stored pred_us
     python tools/cost_model/eval_model.py --update                # write recomputed pred_us/err back
+    python tools/cost_model/eval_model.py --plot /tmp/scatter.png # predicted-vs-measured PNG + MSE
 """
 
 import argparse
@@ -443,6 +444,66 @@ def _select_build(rows, spec):
     return kept
 
 
+def plot_scatter(evaluated, out_path):
+    """Scatter plot of predicted vs. measured ``kernel_us``, one point per scored row,
+    colored by reporting category, with the 1:1 line and the overall MSE/RMSE (in time
+    units, not RMS% of relative error) annotated.
+
+    This is a diagnostic companion to the RMS%-of-relative-error table ``main()`` prints:
+    RMS% treats a 50% error the same whether the kernel is 10 us or 1 ms, which is right
+    for ranking candidate plans against each other but hides whether a `cost_model.py`
+    tweak's absolute error is concentrated in a few slow kernels or spread evenly. Compare
+    this plot before/after a tweak (e.g. a `--params` override, or editing
+    `torch_spyre/_inductor/cost_model.py` directly) to see which failure mode the tweak
+    moves: points moving toward the 1:1 line is an improvement, points moving away in a
+    specific category is a regression confined to that category, and a cloud that
+    barely shifts is a no-op change. Requires matplotlib, which is NOT a torch-spyre
+    dependency (base or optional) -- ``pip install matplotlib`` separately before using
+    ``--plot``.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        sys.exit("--plot requires matplotlib: pip install matplotlib")
+
+    by_cat = {}
+    for r, pred, meas, _err, _src in evaluated:
+        by_cat.setdefault(category(r["op"]), []).append((pred, meas))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for c in sorted(by_cat):
+        pts = by_cat[c]
+        ax.scatter(
+            [p[0] for p in pts],
+            [p[1] for p in pts],
+            label=f"{c} (n={len(pts)})",
+            alpha=0.6,
+            s=20,
+        )
+
+    all_meas = [meas for _r, _pred, meas, _err, _src in evaluated]
+    all_pred = [pred for _r, pred, _meas, _err, _src in evaluated]
+    lo = min(all_meas + all_pred)
+    hi = max(all_meas + all_pred)
+    ax.plot([lo, hi], [lo, hi], "k--", linewidth=1, label="pred = meas (1:1)")
+
+    mse = sum((p - m) ** 2 for m, p in zip(all_meas, all_pred)) / len(all_meas)
+    rmse = math.sqrt(mse)
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("predicted kernel_us")
+    ax.set_ylabel("measured kernel_us")
+    ax.set_title(
+        f"measured vs. predicted ({len(evaluated)} rows)\nMSE={mse:,.0f} us^2  RMSE={rmse:,.1f} us"
+    )
+    ax.legend(fontsize=7, loc="upper left")
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    print(f"\nwrote {out_path}  (MSE={mse:,.0f} us^2, RMSE={rmse:,.1f} us)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--records", default="")
@@ -464,6 +525,13 @@ def main():
     )
     ap.add_argument(
         "--list-worst", type=int, default=0, help="print the N worst |err| rows"
+    )
+    ap.add_argument(
+        "--plot",
+        default="",
+        metavar="PATH",
+        help="write a predicted-vs-measured scatter plot (PNG) to PATH and print "
+        "its MSE/RMSE in time units, alongside the RMS%% table. Requires matplotlib.",
     )
     ap.add_argument(
         "--build",
@@ -560,6 +628,9 @@ def main():
             f"{sum(allerr) / len(allerr):>+7.1f}  "
             f"[{min(allerr):+.0f}..{max(allerr):+.0f}]"
         )
+
+    if args.plot:
+        plot_scatter(evaluated, args.plot)
 
     if args.list_worst:
         print(f"\nworst {args.list_worst} |err|:")

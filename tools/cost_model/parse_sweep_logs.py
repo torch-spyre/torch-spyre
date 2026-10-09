@@ -73,6 +73,22 @@ _LBL_FA = re.compile(  # flash_attn hint knobs from the label
     r"qtiles=(\d+)\s+ktiles=(\d+)\s+wd=(\S+)"
 )
 
+# A FOURTH label spelling: run_cost_model_sweep.py's own "=== BENCH_... ===" run header
+# (_RUN_HDR), used verbatim as `label` whenever profile_ops.py prints no separate
+# human-readable "-- ..." summary (_LABEL) of its own -- true for every sweep run today,
+# so the patterns above never match current logs and split_forced/split_actual silently
+# stayed None. These mirror profile_ops.py's own env var names (BENCH_N, WD_*, FA_*).
+_ENV_N = re.compile(r"\bBENCH_N=(\d+)")
+# sorted(env.items()) in run_cost_model_sweep.py always writes these alphabetically:
+# WD_K, WD_M, WD_N (no WD_B) for mmwd; WD_B, WD_K, WD_M, WD_N for bmm_wd/bmm_wd_3d2d.
+_ENV_SPLIT_MNK = re.compile(r"\bWD_K=(\d+)\s+WD_M=(\d+)\s+WD_N=(\d+)")
+_ENV_SPLIT_BMNK = re.compile(r"\bWD_B=(\d+)\s+WD_K=(\d+)\s+WD_M=(\d+)\s+WD_N=(\d+)")
+_ENV_LAYOUT = re.compile(r"\bWD_LAYOUT_A=([\d,]+)\s+WD_LAYOUT_B=([\d,]+)")
+_ENV_FA = re.compile(
+    r"\bFA_H=(\d+)\s+FA_LQ=(\d+)\s+FA_LK=(\d+)\s+FA_D=(\d+)\s+"
+    r"FA_H_TILES=(\d+)\s+FA_LQ_TILES=(\d+)\s+FA_LK_TILES=(\d+)\s+FA_WD=(\S+)"
+)
+
 _M_RW = re.compile(r"R=(\d+) B.*?W=(\d+) B.*?loop_trip L=(\d+)")
 _M_BASE = re.compile(r"base =.*?=\s*([\d.]+) us")
 _M_TURN = re.compile(r"turn =.*?=\s*([\d.]+) us")
@@ -161,6 +177,26 @@ def _parse_io(io_lines):
     return ops, total
 
 
+def _split_actual_from_feats(rec):
+    """``split_actual`` from the FEATS matmul record, when present.
+
+    ``op_it_space_splits`` (the other source of ``split_actual``, below) comes from a
+    debug-only text dump that no current run prints, but ``feats`` is populated on every
+    run with ``BENCH_EMIT_RECORDS=1`` -- which the sweep driver always sets -- so this is
+    the reliable actual-side source today. ``matmul_m_split``/``matmul_n_split`` are the
+    on-device M/N split; the K split is folded into ``reduction_cores`` (1 = unsplit).
+    """
+    feats = rec.get("feats") or []
+    for f in feats:
+        if f.get("is_matmul"):
+            return {
+                "m": f.get("matmul_m_split", 1),
+                "n": f.get("matmul_n_split", 1),
+                "k": f.get("reduction_cores", 1),
+            }
+    return None
+
+
 def _derive(rec):
     """Add op-specific derived fields (N, splits, MACs, rows/core) from label."""
     op, label = rec.get("op"), rec.get("label") or ""
@@ -168,10 +204,16 @@ def _derive(rec):
         rec["M"], rec["K"] = rec.get("rows"), rec.get("cols")
         if g := _LBL_MNK.search(label):
             rec["M"], rec["K"], rec["N"] = int(g[1]), int(g[2]), int(g[3])
+        elif g := _ENV_N.search(label):
+            rec["N"] = int(g[1])
         if all(rec.get(d) for d in ("M", "K", "N")):
             rec["macs"] = rec["M"] * rec["N"] * rec["K"]
         if g := _LBL_SPLIT.search(label):
             rec["split_forced"] = {"m": int(g[1]), "n": int(g[2]), "k": int(g[3])}
+        elif g := _ENV_SPLIT_MNK.search(
+            label
+        ):  # WD_K=.. WD_M=.. WD_N=.. (sorted order)
+            rec["split_forced"] = {"m": int(g[2]), "n": int(g[3]), "k": int(g[1])}
         # actual on-device split: d0=M(m), d1=N(n), d2=K(k)
         sp = rec.get("op_it_space_splits") or {}
         if sp:
@@ -180,14 +222,19 @@ def _derive(rec):
                 "n": sp.get("d1", 1),
                 "k": sp.get("d2", 1),
             }
+        else:
+            rec["split_actual"] = _split_actual_from_feats(rec)
     elif op in ("bmm_wd", "bmm_wd_3d2d", "bmm_layout"):
         # Forced-split bmm (bmm_layout also carries a device dim_order per operand). The
         # LABEL is authoritative (we set the split), so read b/m/n/k from it; MACs include
-        # the batch (B*M*N*K). split_actual is left as the raw op_it_space_splits dict --
-        # d0..dN mapping shifts with whether the batch dim collapses (3-dim when B=1, 4-dim
-        # when B>=2), so we do NOT hard-map it here.
+        # the batch (B*M*N*K). split_actual, when derived from op_it_space_splits, is left
+        # as the raw dict -- d0..dN mapping shifts with whether the batch dim collapses
+        # (3-dim when B=1, 4-dim when B>=2) -- so we do NOT hard-map it here; the FEATS
+        # fallback below sidesteps that entirely since it reads named matmul fields.
         if g := _LBL_MNK.search(label):
             rec["M"], rec["K"], rec["N"] = int(g[1]), int(g[2]), int(g[3])
+        elif g := _ENV_N.search(label):
+            rec["N"] = int(g[1])
         if g := _LBL_B.search(label):
             rec["B"] = int(g[1])
         if all(rec.get(d) for d in ("B", "M", "K", "N")):
@@ -199,9 +246,22 @@ def _derive(rec):
                 "n": int(g[3]),
                 "k": int(g[4]),
             }
+        elif g := _ENV_SPLIT_BMNK.search(label):  # WD_B=.. WD_K=.. WD_M=.. WD_N=..
+            rec["split_forced"] = {
+                "b": int(g[1]),
+                "k": int(g[2]),
+                "m": int(g[3]),
+                "n": int(g[4]),
+            }
+        if not rec.get("op_it_space_splits"):
+            rec["split_actual"] = _split_actual_from_feats(rec)
         if g := _LBL_LAYOUT.search(label):  # bmm_layout: the two operand dim_orders
             # groups 1/2 = the `layoutA=`/`layoutB=` form, 3/4 = the newer `A=`/`B=` form
             rec["layout_a"], rec["layout_b"] = (g[1], g[2]) if g[1] else (g[3], g[4])
+        elif g := _ENV_LAYOUT.search(
+            label
+        ):  # current WD_LAYOUT_A=.. WD_LAYOUT_B=.. form
+            rec["layout_a"], rec["layout_b"] = g[1], g[2]
     elif op == "flash_attn":
         # Multi-op coarse-tiled flash attention. The label carries the hint knobs; derive
         # the coarse loop trip count (h_tiles * q_tiles * k_tiles) and the ~2 matmul MACs.
@@ -218,7 +278,22 @@ def _derive(rec):
                 int(g[7]),
             )
             rec["wd"] = g[8]
+        elif g := _ENV_FA.search(label):  # current FA_H=.. FA_LQ=.. ... FA_WD=.. form
+            rec["H"], rec["Lq"], rec["Lk"], rec["D"] = (
+                int(g[1]),
+                int(g[2]),
+                int(g[3]),
+                int(g[4]),
+            )
+            rec["h_tiles"], rec["q_tiles"], rec["k_tiles"] = (
+                int(g[5]),
+                int(g[6]),
+                int(g[7]),
+            )
+            rec["wd"] = g[8]
+        if rec.get("h_tiles") is not None:
             rec["loop_trips"] = rec["h_tiles"] * rec["q_tiles"] * rec["k_tiles"]
+        if all(rec.get(d) for d in ("H", "Lq", "Lk", "D")):
             # ~2 batched matmuls (QK^T reduces D, PV reduces Lk); B assumed 1 (the example)
             rec["macs"] = 2 * rec["H"] * rec["Lq"] * rec["Lk"] * rec["D"]
     elif op == "chain":
@@ -410,6 +485,34 @@ def main():
         f"  current-model sha={cur_sha or '(none)'}: {n_cur} current rows"
         + (f"; dropped ops {sorted(drop)}" if drop else "")
     )
+
+    # A forced work-division hint (WD_*) is a hard constraint on the compiled kernel's
+    # division (allocator.py pins it to a single fixed candidate before the co-optimizer's
+    # search runs), so split_forced should always equal split_actual on their shared keys
+    # (m, n, k -- split_forced may also carry a batch key b that the matmul feature record
+    # has no field for). A mismatch here means either the hint silently did not take, or
+    # these two fields were derived inconsistently -- surface it rather than let a sweep
+    # silently measure a different config than the one requested.
+    mismatches = [
+        r
+        for r in records
+        if r.get("split_forced")
+        and r.get("split_actual")
+        and any(
+            r["split_forced"][k] != r["split_actual"][k]
+            for k in ("m", "n", "k")
+            if k in r["split_forced"] and k in r["split_actual"]
+        )
+    ]
+    if mismatches:
+        print(
+            f"  WARNING: {len(mismatches)} row(s) where split_forced != split_actual:"
+        )
+        for r in mismatches[:10]:
+            print(
+                f"    {r['id']} op={r['op']} forced={r['split_forced']} "
+                f"actual={r['split_actual']}"
+            )
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump({"records": records}, f, indent=2)
