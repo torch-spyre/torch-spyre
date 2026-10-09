@@ -473,7 +473,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
     allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    ordinary = allocator._enumerate_core_divisions(consumer, config.sencores)
+    ordinary, _ = allocator._enumerate_core_divisions(consumer, config.sencores)
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.

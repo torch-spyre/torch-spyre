@@ -17,6 +17,16 @@
     python -m spyre_clickhouse_ingest.artifacts register --artifact image:<ref>@<digest> ...
     python -m spyre_clickhouse_ingest.artifacts release <manifest.json>
     python -m spyre_clickhouse_ingest.artifacts write <batch.json>
+    python -m spyre_clickhouse_ingest.artifacts resolve --artifact <spec> --arch s390x \
+        [--tag-family nightly-supply-chain] [--tag-date YYYY-MM-DD] [--tag <tag> ...]
+    python -m spyre_clickhouse_ingest.artifacts ensure --artifact <spec> --arch s390x ...
+
+`resolve` prints, as JSON, the one artifact a spec (resolver.py's grammar) names: the existing
+spyre_v2 record when there is one (read-only, from CLICKHOUSE_* + CLICKHOUSE_DB_V2; without
+them `lookup` is "none" and the id is derived), for an image its per-arch leaf, and its
+`tag` / `tag_family` (and every pair in `tags`). `ensure` does the same and records it,
+tagged (resolver.ensure_artifact). Registry
+access: ICR_USERNAME / ICR_PASSWORD; Artifactory: ARTIFACTORY_USER / ARTIFACTORY_TOKEN.
 
 A batch is what a pipeline writer (the Jenkins orchestrator) hands over in one call; every
 entry names its artifact by the four hash inputs plus kind and ref:
@@ -43,10 +53,15 @@ manifest list beside its per-arch images: a consumer that pulled by tag holds on
 import argparse
 import json
 import sys
+from datetime import date, datetime, timezone
 from itertools import zip_longest
 from pathlib import Path
 
 from .identity import ArtifactIdentity, DerivedId
+from .options import ENSURE_ONLY, add_artifact_options, artifact_options, artifact_spec
+from .options import source as _source
+from .registry import dated
+from .resolver import ensure, resolve
 from .writer import ArtifactWriter
 
 RELEASE_FAMILY = "release"
@@ -101,22 +116,23 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
     ]
 
 
-def _source(value: str) -> tuple:
-    """`repo@ref@sha` or `repo@sha` -> (repo, git_ref, git_sha)."""
-    parts = value.split("@")
-    if len(parts) == 2:
-        return parts[0], "", parts[1]
-    if len(parts) == 3:
-        return tuple(parts)
-    raise argparse.ArgumentTypeError(f"--source wants repo@[ref@]sha, got {value!r}")
-
-
 # The keys each batch entry may carry. An unknown key is refused: a misspelled one would
 # otherwise leave its column defaulted, and the row would land looking valid.
 BATCH_KEYS = {
     "artifact": {"component", "artifact_name", "id12", "arch", "kind", "ref"},
+    # An entry names its artifact by `artifact` (the hash inputs, authoritative) or by `spec`
+    # (any resolver spec, resolved with the rest of the options).
     "artifacts": {
         "artifact",
+        "spec",
+        "arch",
+        "component",
+        "lookup",
+        "registry",
+        "tag_family",
+        "tags",
+        "tag_date",
+        "tag_props",
         "origin",
         "sources",
         "identity_deps",
@@ -166,26 +182,43 @@ def batch_identity(a: dict) -> ArtifactIdentity:
 
 
 def write_batch(client, db: str, batch: dict) -> dict:
-    """Write every entry of `batch`; returns how many of each landed or already existed."""
+    """Write every entry of `batch`; returns how many of each landed or already existed.
+
+    Each artifact entry goes through resolver.ensure, the one artifact write path.
+    """
     check_batch(batch)
     done = {"artifacts": 0, "tags": 0, "results": 0}
-    for e in batch.get("artifacts", []):
+    for i, e in enumerate(batch.get("artifacts", [])):
         sources = [
             (s.get("repo", ""), s.get("git_ref", ""), s.get("git_sha", ""))
             for s in e.get("sources", [])
         ]
-        done["artifacts"] += bool(
-            ArtifactWriter.insert_artifact(
-                client,
-                db,
-                batch_identity(e["artifact"]),
-                origin=e.get("origin") or "built",
-                sources=sources,
-                identity_deps=e.get("identity_deps", []),
-                context_deps=e.get("context_deps", []),
-                props=e.get("props"),
+        spec = e["spec"] if "spec" in e else batch_identity(e["artifact"])
+        options = {
+            k: e[k]
+            for k in (
+                "lookup",
+                "registry",
+                "tag_family",
+                "tags",
+                "tag_props",
+                "component",
             )
-        )
+            if k in e
+        }
+        if e.get("tag_date"):
+            options["tag_date"] = date.fromisoformat(e["tag_date"])
+        try:
+            ensure(
+                client, db, spec, e.get("arch", ""),
+                origin=e.get("origin") or "built", sources=sources,
+                identity_deps=e.get("identity_deps", []), context_deps=e.get("context_deps", []),
+                props=e.get("props"), **options,
+            )  # fmt: skip
+        except ValueError as err:
+            print(f"  [warn] v2: artifacts[{i}] skipped -- {err}", file=sys.stderr)
+            continue
+        done["artifacts"] += 1
     for e in batch.get("tags", []):
         done["tags"] += ArtifactWriter.insert_tag(
             client,
@@ -247,7 +280,65 @@ def main(argv=None) -> None:
     wr = sub.add_parser("write", help="a batch of artifacts, tags and results (JSON)")
     wr.add_argument("batch", type=Path)
 
+    res = sub.add_parser(
+        "resolve", help="the artifact a spec names (JSON); writes nothing"
+    )
+    ens = sub.add_parser("ensure", help="resolve a spec and record it, tagged (JSON)")
+    for p in (res, ens):
+        add_artifact_options(p)
+        p.add_argument(
+            "--image", default="", help="shorthand for --artifact image:<ref>"
+        )
+    res.add_argument("--no-lookup", action="store_true", help="alias of --lookup off")
+
     args = parser.parse_args(argv)
+    if args.cmd in ("resolve", "ensure"):
+        args.artifact = args.artifact or (
+            args.image and "image:" + args.image.removeprefix("image:")
+        )
+        spec = artifact_spec(args)
+        if not spec:
+            parser.error("--artifact (or --artifact-id / --image) is required")
+        if args.cmd == "resolve" and args.no_lookup:
+            args.lookup = "off"
+        if dated(args.tag_family) and args.tag_date is None:
+            args.tag_date = datetime.now(timezone.utc).date()
+        options = artifact_options(args)
+        from .client import ClickHouse, ClickHouseEnv
+
+        db = args.database or ClickHouseEnv.target_database()
+        if args.cmd == "resolve":
+            client = None
+            if args.lookup != "off" and db and ClickHouseEnv.host():
+                try:
+                    client = ClickHouse.connect(database=db)
+                    client.set_client_setting("readonly", "2")
+                    client.query("SELECT 1")
+                except Exception as err:  # noqa: BLE001 -- derive-only is the documented fallback
+                    if args.lookup == "only":
+                        sys.exit(
+                            f"[error] --lookup only, but spyre_v2 is unreadable: {err}"
+                        )
+                    print(
+                        f"[warn] no spyre_v2 lookup ({err}); deriving only",
+                        file=sys.stderr,
+                    )
+                    client = None
+            for k in ENSURE_ONLY:
+                options.pop(k)
+            r = resolve(spec, args.arch, client=client, db=db, **options)
+            print(json.dumps(r.as_dict() if r else {}, sort_keys=True, default=str))
+            if r is None:
+                sys.exit(1)
+            return
+        # A dry run that reads nothing needs no database: it prints the rows it would write.
+        offline = args.dry_run and args.lookup == "off"
+        if not (db or offline):
+            sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
+        client = None if offline else ClickHouse.connect(database=db)
+        r = ensure(client, db, spec, args.arch, **options)
+        print(json.dumps(r.as_dict(), sort_keys=True, default=str))
+        return
     if args.cmd == "release" and args.dry_run:
         for i in release_identities(json.loads(args.manifest.read_text())):
             print(

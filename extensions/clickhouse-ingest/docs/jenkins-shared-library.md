@@ -64,8 +64,8 @@ $UV <ingestScriptPath> ...
 ```
 
 where `ingestScriptPath = "/home/senuser/${a.product}/${a.ingestScript ?:
-'.github/scripts/ingest_xml.py'}"`. In other words: **the same
-`ingest_xml.py` CLI the GHA composite actions call, run inside the product's
+'.github/scripts/ingest_xml.py'}"` (the deprecated forwarder to `python -m spyre_clickhouse_ingest results`). In other words: **the same
+`python -m spyre_clickhouse_ingest results` CLI the GHA composite actions call, run inside the product's
 own container image**, with `extensions/clickhouse-ingest` attached via
 `uv run --with <local-path>` (a local editable install) rather than the
 `git+https://...#subdirectory=...` form the GHA actions use — because the
@@ -125,7 +125,7 @@ flowchart LR
   B --> C["build job: 'product-test'"]
   C --> D["Jenkinsfile.product-test<br/>runs on the s390x/ppc64le agent"]
   D --> E["pushToClickhouse.pushJUnitXml(...)"]
-  E --> F["ingest_xml.py inside the product container<br/>(same script GHA calls)"]
+  E --> F["spyre_clickhouse_ingest results inside the product container<br/>(same ingest GHA calls)"]
   F --> G[("test_cases / test_case_runs")]
 ```
 
@@ -144,14 +144,14 @@ pushToClickhouse.pushJUnitXml([
 ```
 
 `NODE_LABEL`/`platform` is the **only** arch-specific field — it becomes
-`benchmark_runs.platform` / `ingest_xml.py`'s `--platform` flag. A comment at
+`benchmark_runs.platform` / the ingest's `--arch` flag (`--platform` is its deprecated alias). A comment at
 the call site notes that a missing value here made Power rows invisible to
 the results tab entirely: `platform` isn't cosmetic, it's what a dashboard
 filters on.
 
 There is **no separate Python path** in `pipelines/lib/` for JUnit ingestion
 — `pipelines/lib/*.py` never touches XML at all. Power and s390x go through
-literally the same `ingest_xml.py` CLI, and therefore the same
+literally the same `python -m spyre_clickhouse_ingest results` CLI, and therefore the same
 `TestResultWriter`/`identity.py` code, as x86_64 GHA legs.
 
 ### How `jenkins_run_key` (`"folder/job#123"`) gets built
@@ -197,9 +197,43 @@ row-identity uuid5s, though it hosts its own `v2_artifact_id()` used as a CLI
 helper to stamp an image label, not to write ClickHouse rows.
 
 No `capabilities`/`capability_runs` table exists in
-`pipelines/clickhouse/*.sql` — that table pair is torch-spyre/GHA-side only
-(see [classes.md](classes.md#schemapy)); Jenkins does not currently write
-capability rows.
+`pipelines/clickhouse/*.sql` (see [classes.md](classes.md#schemapy)). A
+Jenkins test leg reaches `capability_runs` only through the product ingest
+that `pushJUnitXml` runs, which routes JUnit `capability.*` properties there.
+
+### The v2 steps: `v2Artifact`, `v2Results`
+
+Pipelines outside the orchestrator (supply chain, tech preview, release,
+SVT/FVT) record in `spyre_v2` through two steps over this package's CLI:
+
+| Step | Runs | Returns |
+|---|---|---|
+| `v2Artifact(spec:, arch:, tagFamily:, ...)` | `artifacts ensure` | the resolution as a Map (`artifact_id`, `source`, `tag`, ...) |
+| `v2Results(xmlDir:, component:, arch:, triggerType:, artifact:, ...)` | `results --schema v2 --strict` | true when the verdicts were recorded |
+
+Both are best-effort by default (a WARN, then `[:]` / false) and fail the
+build with `strict: true`; both skip when the folder sets no v2 database.
+Every option, the hand-off to SVT/FVT and the verification queries are in
+spyre-frameworks' `docs/v2-artifact-recording.md`.
+
+### ci_run_timings
+
+The orchestrator writes where each run's time went once per run, PR-triggered or not, from
+`Jenkinsfile.orchestrator`'s `post{}`: one row per component build and per test leg (a retried
+build or re-dispatched leg is its own `attempt`). It hands one JSON batch to `python -m
+spyre_clickhouse_ingest ci-run-timings write`, which only normalizes timestamps and flattens
+entries; every `*_ms` span is a MATERIALIZED column of the DDL, so a JSONEachRow writer gets the
+same spans. The batch's sources:
+
+| Batch field | Captured by |
+|---|---|
+| `run.comment_at`, `picked_up_at`, `pickup_path` | the `/spyre-test` poller, passed to the orchestrator as `TRIGGER_COMMENT_AT` / `TRIGGER_PICKED_UP_MS` / `TRIGGER_PICKUP_PATH` |
+| `run.pr_queued_at`, `pr_running_at` | `postPrStatusUpdate`, the first time the PR comment shows each state |
+| `run.base_ref` | the trigger PR's `base.ref`, read by `resolve_target.py` when it resolves the PR (`''` for a non-PR run) |
+| `run.pr_components` | the run's Test-With companion PRs, so their components read `is_pr_component` |
+| `builds[]` | `buildOneNode`, from the component-build's start, its agent-and-lock acquisition (`CB_BUILD_NODE_MS`) and its test-stage start (`CB_TEST_START_MS`); `dropped` nodes from the plan's dropped set, `reused` ones from `NODE_ALREADY_BUILT` |
+| `tests[]` | the test-leg join, from the dispatch, the leg's test-stage start and the leg job's end, with the leg's `gating`, `runner_died`, `failure_reason` and `failed_stage` |
+| `tests[].exec` | the executor's phases. `gha-ephemeral` / `gha-standing`: component-build's `GHA_TIMINGS_JSON`, the runner-set deploy (provision) around `run_integration_tests.py`, whose result file carries each GHA run's dispatch, first-job start, last-job completion and `pipeline_runs` key. `jenkins-local` / `jenkins-job`: the `lock(label: SPYRE_CARD_POOL)` request and acquisition (provision), `make test` start and return (exec), and the `SPYRE_CARDS*_CARD_NUMBER` cards |
 
 ---
 
@@ -209,7 +243,7 @@ This is the single most important thing to understand before touching either
 side of this pipeline. `pipelines/lib/run_identity.py`'s own docstring states
 it plainly:
 
-> Four writers (this orchestrator, and the `ingest_xml*.py` in torch-spyre,
+> Four writers (this orchestrator, and the XML ingests in torch-spyre,
 > hf-adapters and spyre-inference) each independently compute `run_id` and
 > `test_case_id`. Nothing threads them... **byte-exactness is the contract.**
 
@@ -224,7 +258,7 @@ And `pipelines/lib/test_v2_row_contract.py`:
 The four independently-maintained copies of the uuid5 formula:
 
 1. **`extensions/clickhouse-ingest/identity.py`** (this package) — used by
-   every `ingest_xml*.py` in torch-spyre, hf-adapters and spyre-inference, on
+   `python -m spyre_clickhouse_ingest results` and the `ingest_xml*.py` in hf-adapters and spyre-inference, on
    the GHA/x86_64 side.
 2. **`spyre-frameworks/pipelines/lib/run_identity.py`** — Python, "the
    canonical reference implementation" per its own docstring, used by the
@@ -361,7 +395,7 @@ pushToClickhouse.pushArtifactResult([
   write silently no-ops — v1-only, never an error.
 - For `pushJUnitXml` specifically: the calling image must bake the ingest
   script at `/home/senuser/<product>/<ingestScriptRel>` (default
-  `.github/scripts/ingest_xml.py`), and — to get schema-v2 writes — a
+  `.github/scripts/ingest_xml.py`, the deprecated forwarder to `python -m spyre_clickhouse_ingest results`), and — to get schema-v2 writes — a
   checkout of `extensions/clickhouse-ingest` at
   `/home/senuser/<product>/extensions/clickhouse-ingest`, which
   `pushJUnitXml` auto-attaches via `uv run --with`.

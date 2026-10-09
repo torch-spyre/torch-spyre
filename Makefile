@@ -49,7 +49,7 @@ TEST_TYPE ?= regression
 TEST_EXCLUDE_TIERS ?=
 
 # Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
-# ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
+# ClickHouse push step (`spyre_clickhouse_ingest results` globs *.xml non-recursively) finds it
 # alongside every other suite's JUnit XML, with no per-suite subdirectory.
 RESULTS_DIR ?= /tmp/results
 

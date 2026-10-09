@@ -1212,6 +1212,40 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
         )
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "the joint solve needs ortools")
+class TestIntermediateReadTwice(BaseTestScratchpadUsage):
+    """An *intermediate* buffer one consumer reads twice is LX-pinned only under
+    a division that owns it the same way through both reads.
+
+    ``a + a.permute(1, 0, 2)`` reads ``a`` once in step and once transposed. A
+    split of the consumer's dim 0 slices ``a`` along dim 0 for the first read
+    and along dim 1 for the second, so no residency of ``a`` serves both. The
+    match table once looked at the first read alone: the solve pinned ``a``
+    under such a split, and the post-solve ownership check could only raise.
+    """
+
+    def test_twice_read_intermediate_is_correct(self):
+        # Small enough that a fits LX, so the solve wants it resident.
+        x = self.rand_device((64, 64, 128))
+        y = self.rand_device((64, 64, 128))
+
+        def fn(x, y):
+            a = x + y
+            return a + a.permute(1, 0, 2)
+
+        cpu_result = fn(x.to("cpu"), y.to("cpu"))
+
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            co_optimizing_lx_planning=True,
+            layout_solver="cpsat",
+            sencores=32,
+        ):
+            result, _ = self.compile_and_collect_mem_usage(fn, (x, y))
+
+        torch.testing.assert_close(result, cpu_result, atol=0.1, rtol=0.1)
+
+
 class TestLivenessIndicesAreDistinct(BaseTestScratchpadUsage):
     """``calculate_liveness`` records one distinct op index per accessing op.
 
@@ -2431,6 +2465,124 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
             "co-opt input clone slot sharing changed the numerical result",
+        )
+
+
+class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
+    """The generation seam on real graphs: the per-candidate machinery the SA
+    co-optimizer asks instead of the enumerated menu and its pair table. The
+    unit tests for these seams (``test_work_division.py``) build their own
+    contexts and preps; what only a real compile can check is that the two
+    answers agree on *live* ops, which is what a generated division rests on."""
+
+    def _captured_buffers(self, fn, x):
+        """The buffer list the co-optimizing allocator built, plus the result.
+
+        The assertions run inside the spy: the split space and the residency
+        edges hold live Inductor IR, which needs the virtualized compile context
+        that ``torch.compile`` tears down on exit."""
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        checked: set[str] = set()
+        orig = CoOptimizingAllocator._build_cd_bound_buffers
+
+        def spy(inner_self, *args, **kwargs):
+            buffers = orig(inner_self, *args, **kwargs)
+            self._check_buffers(buffers, checked)
+            return buffers
+
+        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="simulated_annealing",
+                co_optimizing_lx_planning=True,
+                sencores=32,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+        return checked, result
+
+    def _check_buffers(self, buffers, checked):
+        """Every claim the engine makes about a live buffer, per buffer."""
+        by_name = {b.name: b for b in buffers}
+        for buf in buffers:
+            space = buf.division_space
+            if space is not None:
+                # The menu is exactly what the space admits, which is what makes
+                # a generated division one the enumeration would have carried.
+                for division in buf.core_divisions:
+                    self.assertTrue(
+                        space.admits(space.splits(division)),
+                        f"{buf.name}: menu entry {division.label} not admitted",
+                    )
+                menu = {division.label for division in buf.core_divisions}
+                for neighbour in space.neighbours(buf.core_divisions[0]):
+                    self.assertIn(neighbour.label, menu, buf.name)
+                checked.add("space")
+            # The pair table is a projection of the edges, so the two agree on
+            # every row -- and where both ends generate, so does the inverse
+            # that replaces the row.
+            self.assertEqual(
+                set(buf.residency_edges) - set(buf.cd_parent_matches),
+                set(),
+                buf.name,
+            )
+            for parent, edge in buf.residency_edges.items():
+                pairs = buf.cd_parent_matches[parent]
+                parent_divisions = by_name[parent].core_divisions
+                self.assertEqual(
+                    edge.match_pairs(parent_divisions, buf.core_divisions),
+                    pairs,
+                    f"{buf.name} <- {parent}",
+                )
+                checked.add("edge")
+                parent_space = by_name[parent].division_space
+                if parent_space is None or space is None:
+                    continue
+                for i, parent_division in enumerate(parent_divisions):
+                    constructed = edge.consumer_division_for(parent_division, space)
+                    compatible = [j for ip, j in pairs if ip == i]
+                    if constructed is None:
+                        self.assertFalse(
+                            compatible,
+                            f"{buf.name} <- {parent}: no inverse for candidate "
+                            f"{i}, but the table pairs it with {compatible}",
+                        )
+                        continue
+                    labels = [buf.core_divisions[j].label for j in compatible]
+                    # Identity, not only membership: the two relations may pick
+                    # different compatible entries (see ``_ViewRelation``), but
+                    # a change to which one a flood propagates should be
+                    # deliberate.
+                    self.assertEqual(
+                        constructed.label,
+                        labels[0] if labels else None,
+                        f"{buf.name} <- {parent}: inverse of candidate {i}",
+                    )
+                    checked.add("inverse")
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_generated_divisions_agree_with_the_enumeration_on_a_real_graph(self):
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            a = x + 1.0
+            b = a * 2.0
+            return torch.nn.functional.softmax(b, dim=-1)
+
+        kinds, result = self._captured_buffers(fn, x)
+        # Non-vacuity: all three claims have to have been made on something.
+        self.assertIn("space", kinds, "no buffer got a split space")
+        self.assertIn("edge", kinds, "no buffer got a residency edge")
+        self.assertIn("inverse", kinds, "no edge exercised the view inverse")
+        self.assertTrue(
+            torch.allclose(
+                torch.nn.functional.softmax((x.to("cpu") + 1.0) * 2.0, dim=-1),
+                result,
+                atol=1e-2,
+                rtol=1e-3,
+            ),
+            "generated core divisions changed the numerical result",
         )
 
 
