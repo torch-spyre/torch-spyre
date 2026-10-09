@@ -535,7 +535,7 @@ class TestAlignTensorsStridedTerm(TestCase):
 
     def test_stride_realized_as_gap_keeps_footprint(self):
         (d0, d1, d2), it_space, inp, out = self._tensors(lambda d1: 2 * d1)
-        _, tensors, _ = align_tensors(it_space, [inp, out])
+        new_it_space, tensors, _ = align_tensors(it_space, [inp, out])
         aligned_in = tensors[0]
         # 8 rows x 8 sticks x 64: a stride-2 walk over 4 heads must not inflate
         # the stick-tile dim to 8 iterations *and* add a gap of 2 (it did, and
@@ -545,7 +545,13 @@ class TestAlignTensorsStridedTerm(TestCase):
         gap_idx = sizes.index(2)
         self.assertEqual(sizes[gap_idx - 1], 4, "stick-tile dim counted in iterations")
         self.assertEqual(aligned_in["coordinates"][gap_idx - 1], d1)
-        self.assertEqual(aligned_in["coordinates"][gap_idx], 0)
+        # Even without a residual offset the gap dim hangs off a synthetic size-1
+        # variable: a variable-free gap dim is misaddressed by the backend.
+        gap_coord = aligned_in["coordinates"][gap_idx]
+        self.assertEqual(len(gap_coord.free_symbols), 1)
+        z = next(iter(gap_coord.free_symbols))
+        self.assertEqual(gap_coord, z)
+        self.assertEqual(new_it_space[z][0], 1)
 
     def test_stride_with_residual_offset_selects_gap_position(self):
         """``2*d1 + 1`` (e.g. ``[..., 64:]`` or ``[:, 1::2]``) keeps the +1.

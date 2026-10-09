@@ -229,6 +229,18 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
         out = x[1::2].clone()  # rows 1,3,5,7 ; offset=64, stride[0]=128
         torch.testing.assert_close(out.cpu(), x.cpu()[1::2])
 
+    def test_stepped_slice_from_zero_clone(self):
+        """Stepped slice starting at row 0 of a tiled multi-stick tensor.
+
+        The row coordinate ``2*c0`` has no residual offset, so its gap dim gets a
+        constant zero coordinate; that dim still needs a synthetic variable, as
+        for ``2*c0 + 1``. Rows span two sticks and the tensor is DMA'd from host
+        (``[sticks, rows, 64]``): with one stick per row the misaddressing is
+        invisible."""
+        x = torch.arange(8 * 128, dtype=DTYPE).reshape(8, 128).to(DEVICE)
+        out = x[::2].clone()  # rows 0,2,4,6 ; offset=0, stride[0]=256
+        torch.testing.assert_close(out.cpu(), x.cpu()[::2])
+
     @unittest.expectedFailure
     def test_transpose_varying_offsets_loop(self):
         """Multiple distinct offsets on a transposed view in one process."""
