@@ -276,12 +276,13 @@ def _sdpa_plan_fits_compiler(
     num_q_tiles: int,
     num_kv_blocks: int,
 ) -> bool:
-    """Whether a prefill plan stays within what tracing and DXP can build.
+    """Whether a prefill plan stays within tracing and backend compile limits.
 
-    The backend fully unrolls every loop, so the unrolled tile count bounds a
-    kernel's build: on B1/H16/S3520/D128, 1210 iterations built in 63 s while
-    2420 and 3025 exceeded the 60 s per-kernel dbo-opt timeout. Each nested
+    With backend loop unrolling enabled (the default), the unrolled tile count
+    bounds a kernel's build: on B1/H16/S3520/D128, 1210 iterations built in 63 s,
+    while 2420 and 3025 exceeded the 60 s per-kernel dbo-opt timeout. Each nested
     map adds about 65 Python frames of HOP tracing (issue #4885).
+    These conservative plan limits also apply when backend unrolling is disabled.
     """
     effective_group_tiles = _sdpa_effective_group_tiles(
         num_group_tiles, num_q_tiles, num_kv_blocks
@@ -367,7 +368,8 @@ def _padded_tiling_for_max_extent(
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     """Keep each SDPA backend bundle near the proven 4-by-4 size.
 
-    The backend specializes a counted Lq loop across every unrolled Lk block.
+    With default backend unrolling, a counted Lq loop is specialized across
+    every unrolled Lk block.
     Bundle code size therefore scales with their product, not with the number of
     Lk blocks alone. Cap that product at sixteen when possible, while retaining at
     least one Lk block per group. Once Lq alone needs sixteen or more tiles,

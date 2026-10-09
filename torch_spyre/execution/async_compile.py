@@ -237,6 +237,8 @@ def _run_backend_compiler(
     # than given a bundle-path spelling of its own.
     if _spyre_config.ktir_device_mlir:
         cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    # Always pass the resolved value, including the default, so compilation
+    # matches the cache key instead of depending on dbo-opt's own default.
     cmd.append(f"--enable-loop-unroll={int(backend_loop_unroll)}")
     cmd += [
         f"--export-dir={compile_dir}",
