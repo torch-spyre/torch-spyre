@@ -203,7 +203,7 @@ jobs:
       # pass/fail pair. always() so a timeout or error still signals -- this is
       # the only completion signal when the agent dies before posting a summary.
       - name: React with review outcome
-        if: github.event_name == 'issue_comment'
+        if: always() && github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
