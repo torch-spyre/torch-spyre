@@ -72,6 +72,7 @@ _EXPORTS = {
         "split_case_tags",
         "tags_for_case",
     ),
+    "options": ("ci_tags",),
     "resolver": (
         "Resolution",
         "ensure",
@@ -178,6 +179,7 @@ __all__ = [
     "hw_schema",
     "insert_artifact",
     "insert_artifact_result",
+    "ci_tags",
     "insert_benchmarks",
     "insert_capabilities",
     "insert_gha_artifact_result",

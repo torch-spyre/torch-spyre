@@ -396,6 +396,7 @@ jobs:
           component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          ci-event: ${{ env.TRIGGERING_EVENT }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
           platform: x86_64
           clickhouse-host: ${{ env.CLICKHOUSE_HOST }}

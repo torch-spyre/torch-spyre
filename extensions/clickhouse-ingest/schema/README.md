@@ -20,9 +20,9 @@ Applying them in filename order works from an empty database.
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
 | `53-pipeline-views.sql` | `v_pipeline_runs`, `v_pipeline_run_outcomes`, `v_pipeline_gate_daily` | 47 |
-| `60-benchmark-views.sql` | 4 `v_benchmark_*` views | 20, 30 |
+| `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
-| `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata` + their MVs | 30 |
+| `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between

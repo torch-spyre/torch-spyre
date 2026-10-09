@@ -80,6 +80,49 @@ def capability_declaration(case: dict) -> tuple:
     return decl, ""
 
 
+class DryRunClient:
+    """A dry run's client: reads reach the database (none: nothing recorded), writes are kept."""
+
+    READS = ("SELECT", "WITH", "EXISTS", "SHOW", "DESCRIBE", "DESC", "EXPLAIN")
+
+    def __init__(self, client=None):
+        # rows: table -> would-be rows; counts: database-qualified, as v1 and v2 share names.
+        self.client, self.rows, self.counts, self.statements = client, {}, {}, []
+
+    def _is_read(self, sql: str) -> bool:
+        return sql.lstrip().split(None, 1)[0].upper() in self.READS
+
+    def query(self, sql, *args, **kwargs):
+        if not self._is_read(sql):
+            self.statements.append(sql)
+            return _Rows([])
+        if self.client is not None:
+            return self.client.query(sql, *args, **kwargs)
+        return _Rows([(0,)] if "count()" in sql else [])
+
+    def command(self, sql, *args, **kwargs):
+        if not self._is_read(sql):
+            self.statements.append(sql)
+            return None
+        return self.client.command(sql, *args, **kwargs) if self.client else 0
+
+    def insert(self, table, rows, column_names=None, database=None, **kwargs):
+        self.rows.setdefault(table, []).extend(dict(zip(column_names, r)) for r in rows)
+        name = f"{database}.{table}" if database else table
+        self.counts[name] = self.counts.get(name, 0) + len(rows)
+
+    def report(self) -> str:
+        """What the run would have written: rows per table, then each other write."""
+        lines = [f"    {n:6} row(s) -> {t}" for t, n in sorted(self.counts.items())]
+        lines += ["    " + " ".join(s.split()[:3]) + " ..." for s in self.statements]
+        return "\n".join(lines) or "    nothing"
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.result_rows = rows
+
+
 class RunWriter:
     """Base for a writer over an (identity, fact) table pair."""
 
