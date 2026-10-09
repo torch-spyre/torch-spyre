@@ -19,27 +19,9 @@
     python3 tools/frontend_timing/run_sweep.py --plan .../sweep_plan.json
     python3 tools/frontend_timing/run_sweep.py --workload mlp -p seq_len=128 -p layers=2
 
-ONE PROCESS PER SAMPLE, and that is the whole reason this is a driver rather than a
-loop. ``TORCHINDUCTOR_CACHE_DIR`` is read at import, so no in-process cache reset gives
-a sample a cache directory that never held this graph. A fresh child with a fresh
-directory does.
-
-Each point gets a discarded warmup plus ``--samples`` measured runs, run serially --
-the Spyre device is exclusive per process, and a parallel sweep would measure
-contention. Records land wherever ``--out`` says; this script commits nothing and knows
-no repository path.
-
-Backend compilation is skipped by default (``TORCH_SPYRE_FRONTEND_ONLY=1``) because it
-dominates wall time and is not what this measures. Pass ``--with-backend`` for a point
-where the backend share itself is the question.
-
-A plan point may carry ``tiers`` and ``env``. ``--tier NAME`` runs only the points that
-declare it, which is how one plan serves a per-PR lane, a nightly lane and a weekly lane
-without three files drifting apart; a point with no ``tiers`` runs in every tier.
-``env`` sets environment for that point's children only, which is the A/B facility: the
-only way to measure two configurations against one tree. The CP-SAT evidence behind the
-complexity audit was taken before that optimization became the default, so re-running
-both arms matters.
+Every sample, warmup included, is a fresh process with a fresh Inductor cache, because
+``TORCHINDUCTOR_CACHE_DIR`` is read at import. Samples run serially: the device is
+exclusive per process.
 """
 
 from __future__ import annotations
@@ -58,27 +40,20 @@ from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-#: Where records go when nothing says otherwise. Matches tools/cost_model/records.py:
-#: an explicit path wins, then the environment, then a directory beside this file.
+#: Consulted after --out and before records/ beside this file, as in
+#: tools/cost_model/records.py.
 DEFAULT_RECORDS_ENV = "SPYRE_FRONTEND_TIMING_RECORDS"
 
 
 def resolve_out_dir(explicit: str | None) -> str:
-    if explicit:
-        return explicit
     from_env = os.environ.get(DEFAULT_RECORDS_ENV)
-    if from_env:
-        return from_env
-    return os.path.join(_HERE, "records")
+    return explicit or from_env or os.path.join(_HERE, "records")
 
 
-#: Plan keys that configure the sweep rather than the workload. Everything else in a
-#: point is a builder keyword, so a new key here must also be added to this set or the
-#: child will reject it as an unexpected argument.
+#: Plan keys that configure the sweep; every other key is a builder keyword.
 RESERVED_PLAN_KEYS = frozenset({"workload", "tiers", "env", "comment"})
 
-#: Carries the resolved A/B arm to the child, which records it so a summary can tell two
-#: arms of one point apart instead of averaging them together.
+#: Carries the A/B arm's label to the child, which records it.
 ARM_ENV_VAR = "SPYRE_FTS_ENV_ARM"
 
 
@@ -89,7 +64,6 @@ class Point:
     workload: str
     params: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
-    tiers: tuple[str, ...] = ()
 
     @property
     def arm(self) -> str:
@@ -112,11 +86,7 @@ def parse_params(pairs: list[str]) -> dict[str, Any]:
 
 
 def point_id(workload: str, params: dict[str, Any], arm: str = "") -> str:
-    """A filesystem-safe, order-independent name for one sweep point.
-
-    The arm is part of the name: without it two arms of the same point write to the same
-    record filename and the second silently overwrites the first.
-    """
+    """A filesystem-safe, order-independent name for one point, arm included."""
     name = workload
     if params:
         name += "-" + "_".join(f"{k}{params[k]}" for k in sorted(params))
@@ -134,7 +104,7 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
     import torch
     from torch_spyre._inductor import config, timing_recorder
 
-    # Resolves because main() put the repository root on sys.path before calling here.
+    # main() put the repository root on sys.path.
     from tools.frontend_timing import workloads
 
     built = workloads.build(workload, **params)
@@ -148,23 +118,20 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
         **built.params,
     )
 
-    # fullgraph: a graph break would split one measurement across two compiles and
-    # quietly change what is being timed. The control-flow workload needs it outright --
-    # without it Dynamo leaves the scan HOP and hits a data-dependent scalar.
+    # fullgraph: a graph break would split one measurement across two compiles, and
+    # control_flow's scan HOP fails on a data-dependent scalar without it.
     compiled = torch.compile(built.fn, fullgraph=True)
     started = time.perf_counter()
     try:
         compiled(*built.args)
     except RuntimeError as exc:
-        # Frontend-only mode compiles and then refuses to launch; that is the point
-        # being reached, not a failure. Anything else is real.
+        # Frontend-only mode compiles and then refuses to launch, which is success.
         if not config.frontend_only or "TORCH_SPYRE_FRONTEND_ONLY" not in str(exc):
             raise
     wall_ms = (time.perf_counter() - started) * 1000
 
-    # Recorded after the compile, so they describe it. compile_wall_ms is deliberately
-    # redundant with the recorder's own total: when the two disagree, the recorder is
-    # missing a region, and that is worth knowing from the record itself.
+    # compile_wall_ms duplicates the recorder's total on purpose: a disagreement means
+    # the recorder is missing a region.
     timing_recorder.set_run_meta(
         compile_wall_ms=wall_ms,
         peak_rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -176,12 +143,9 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
 
 
 def _config_snapshot(config: Any) -> dict[str, Any]:
-    """Resolved Spyre config, so a record says what planning produced it.
+    """The whole resolved Spyre config; a curated list of names would go stale.
 
-    Taken whole rather than from a list of names: a curated list goes stale silently,
-    and a record that names the wrong configuration is worse than one that names too
-    much. ``dir()`` does not work here -- install_config_module hides the entries behind
-    a wrapper, and iterating attributes returns nothing.
+    ``dir()`` finds nothing here: install_config_module hides the entries.
     """
     for api in ("get_config_copy", "shallow_copy_dict", "to_dict"):
         getter = getattr(config, api, None)
@@ -210,8 +174,7 @@ def _child_env(
         env["TORCH_SPYRE_FRONTEND_ONLY"] = "1"
     else:
         env.pop("TORCH_SPYRE_FRONTEND_ONLY", None)
-    # The arm goes last so a point can deliberately override anything above it, and its
-    # label travels separately so the child can record which arm produced the record.
+    # Last, so an arm can override anything above it.
     env.update(point.env)
     env[ARM_ENV_VAR] = point.arm
     return env
@@ -281,8 +244,7 @@ def run_point(
 def load_plan(path: str, tier: str | None = None) -> list[Point]:
     """Load a plan, keeping the points that belong to ``tier``.
 
-    A bare list is still accepted, and a point with no ``tiers`` runs in every tier, so
-    a plan written before tiers existed behaves exactly as it did.
+    A point with no ``tiers`` runs in every tier, and a bare list is still a plan.
     """
     with open(path) as handle:
         plan = json.load(handle)
@@ -301,7 +263,6 @@ def load_plan(path: str, tier: str | None = None) -> list[Point]:
                 workload=entry["workload"],
                 params={k: v for k, v in entry.items() if k not in RESERVED_PLAN_KEYS},
                 env=env,
-                tiers=tiers,
             )
         )
     return points
@@ -344,8 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample-index", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    # The worker re-enters this file as a script, so the repository root has to be
-    # importable for `from tools.frontend_timing import workloads` to resolve.
+    # The worker re-enters this file as a script and imports tools.frontend_timing.
     repo_root = os.path.dirname(os.path.dirname(_HERE))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -364,13 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         if cli_env:
             raise SystemExit("--env applies to a single point; a plan carries its own")
     else:
-        points = [
-            Point(
-                workload=args.workload,
-                params=parse_params(args.param),
-                env=cli_env,
-            )
-        ]
+        points = [Point(args.workload, parse_params(args.param), cli_env)]
     if not points:
         raise SystemExit(f"no plan points declare tier {args.tier!r}")
 

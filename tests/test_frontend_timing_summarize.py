@@ -13,14 +13,9 @@
 # limitations under the License.
 
 
-"""Tests for the frontend timing summarizer (tools/frontend_timing/summarize.py).
+"""Tests for tools/frontend_timing/summarize.py, loaded by path since it is a script.
 
-Loaded by path rather than imported: the tool is a script, not a package, and it depends
-on nothing but the standard library.
-
-Deliberately outside tests/inductor/, whose session fixtures touch the Spyre device: the
-summarizer is pure JSON handling, and a tool test that needs no hardware should not
-require any.
+Outside tests/inductor/, whose session fixtures touch the Spyre device.
 """
 
 import csv
@@ -60,6 +55,7 @@ def _record(
     compile_ms=100.0,
     backend_ms=0.0,
     ops=42,
+    pipeline=True,
     passes=None,
     extra_events=None,
     meta=None,
@@ -74,15 +70,18 @@ def _record(
             "inclusive_ns": int(compile_ms * ms),
             "self_ns": int(compile_ms * ms),
         },
-        {
-            "name": summarize_mod.GRAPH_PIPELINE,
-            "ordinal": 1,
-            "parent_ordinal": 0,
-            "inclusive_ns": int(compile_ms * ms * 0.5),
-            "self_ns": 0,
-            "meta": {"input_operations": ops, "output_operations": ops},
-        },
     ]
+    if pipeline:
+        events.append(
+            {
+                "name": summarize_mod.GRAPH_PIPELINE,
+                "ordinal": 1,
+                "parent_ordinal": 0,
+                "inclusive_ns": int(compile_ms * ms * 0.5),
+                "self_ns": 0,
+                "meta": {"input_operations": ops, "output_operations": ops},
+            }
+        )
     if backend_ms:
         events.append(
             {
@@ -120,6 +119,13 @@ def _record(
     path = tmp_path / name
     path.write_text(json.dumps(payload))
     return path
+
+
+def _summary(tmp_path):
+    """The single point summarized from ``tmp_path``."""
+    records, _ = summarize_mod.load_records(str(tmp_path))
+    (summary,) = summarize_mod.summarize(records)
+    return summary
 
 
 class TestLoading:
@@ -200,8 +206,7 @@ class TestSummary:
     def test_medians_across_samples(self, tmp_path):
         for index, ms in enumerate((100.0, 400.0, 200.0)):
             _record(tmp_path, f"s{index}.json", params={"layers": 2}, compile_ms=ms)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Median, not mean: the mean here would be 233.3.
         assert summary.total_ms == pytest.approx(200.0)
@@ -210,8 +215,7 @@ class TestSummary:
 
     def test_frontend_is_total_minus_backend(self, tmp_path):
         _record(tmp_path, "s.json", compile_ms=500.0, backend_ms=200.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.total_ms == pytest.approx(500.0)
         assert summary.backend_ms == pytest.approx(200.0)
@@ -219,8 +223,7 @@ class TestSummary:
 
     def test_frontend_only_records_have_no_backend_share(self, tmp_path):
         _record(tmp_path, "s.json", compile_ms=500.0, meta={"frontend_only": True})
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.backend_ms == 0.0
         assert summary.frontend_ms == pytest.approx(500.0)
 
@@ -243,16 +246,14 @@ class TestSummary:
             params={"layers": 2},
             meta={"git_sha": "abc1234", "pid": 999, "torch_version": "2.13.0"},
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         # Otherwise every sample lands in its own point and nothing has a median.
         assert summary.params == {"layers": 2}
         assert summary.point == "mlp-layers2"
 
     def test_graph_size_comes_from_the_pipeline_event(self, tmp_path):
         _record(tmp_path, "s.json", ops=260)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.graph_operations == 260
 
     def test_passes_and_buckets_are_collected_by_prefix(self, tmp_path):
@@ -262,8 +263,7 @@ class TestSummary:
             passes={"span_reduction": 30.0, "deadcode_elimination": 5.0},
             backend_ms=10.0,
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         span = "pass.CustomPreSchedulingPasses.span_reduction_ms"
         passes_ms = summary.regions_ms("pass.")
@@ -308,8 +308,7 @@ class TestMeasurements:
     def test_metrics_are_arrays_of_samples_not_medians(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0)
         _record(tmp_path, "b.json", compile_ms=300.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Both samples survive: benchmark_runs.measurements is an array per metric so
         # variance stays recomputable, and a median here would throw that away.
@@ -318,8 +317,7 @@ class TestMeasurements:
 
     def test_metric_names_follow_the_grammar(self, tmp_path):
         _record(tmp_path, "a.json", passes={"span_reduction": 30.0}, backend_ms=10.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         keys = summary.measurements
         assert "pass.CustomPreSchedulingPasses.span_reduction_ms" in keys
@@ -329,8 +327,7 @@ class TestMeasurements:
 
     def test_the_compile_root_is_not_also_a_stage_metric(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # It is already total_ms; emitting it twice would let a careless sum over
         # stage.* double the entire compile.
@@ -341,8 +338,7 @@ class TestMeasurements:
     def test_frontend_is_subtracted_inside_each_sample(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0, backend_ms=40.0)
         _record(tmp_path, "b.json", compile_ms=300.0, backend_ms=100.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # 60 and 200, then the median -- not median(total) - median(backend), which
         # would pair numbers from two different processes.
@@ -352,8 +348,7 @@ class TestMeasurements:
     def test_a_metric_only_one_sample_carries_stays_short(self, tmp_path):
         _record(tmp_path, "a.json", passes={"span_reduction": 30.0})
         _record(tmp_path, "b.json")
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Padding the absent sample with a zero would report a 50% improvement that
         # never happened.
@@ -382,8 +377,7 @@ class TestCounters:
             "a.json",
             extra_events=[self._counting_pass(**{"read_writes.extractions": 900})],
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Generic on purpose: a counter added to the compiler must appear here without
         # this file or summarize.py being edited.
@@ -391,8 +385,7 @@ class TestCounters:
 
     def test_graph_sizes_are_not_mistaken_for_counters(self, tmp_path):
         _record(tmp_path, "a.json", extra_events=[self._counting_pass()])
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert not [k for k in summary.measurements if "counter.input_operations" in k]
         assert not [k for k in summary.measurements if "counter.output_operations" in k]
@@ -402,8 +395,7 @@ class TestCounters:
         second = dict(self._counting_pass(**{"read_writes.misses": 7}), ordinal=21)
         second["name"] = "pass:CustomPreSchedulingPasses:span_reduction"
         _record(tmp_path, "a.json", extra_events=[first, second])
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.measurements["counter.read_writes.misses"] == [12.0]
 
@@ -427,8 +419,7 @@ class TestArmsAndRunMetrics:
 
     def test_the_arm_is_not_treated_as_a_workload_parameter(self, tmp_path):
         _record(tmp_path, "a.json", params={"S": 512}, meta={"env_arm": "SENCORES=1"})
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.params == {"S": 512}
 
     def test_run_level_metrics_are_collected(self, tmp_path):
@@ -441,8 +432,7 @@ class TestArmsAndRunMetrics:
                 "kernels_skipped": 17,
             },
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.measurements["peak_rss_kb"] == [2_500_000.0]
         assert summary.measurements["compile_wall_ms"] == [3610.0]
@@ -490,23 +480,7 @@ class TestAbsentIsNotZero:
     ):
         # Only the compile root, so nothing ever reported a graph. A 0 here would read
         # as a graph that shrank to nothing, which on a delta is a total regression.
-        path = tmp_path / "bare.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "meta": {"workload": "mlp", "sample": 1},
-                    "events": [
-                        {
-                            "name": summarize_mod.COMPILE_EVENT,
-                            "ordinal": 0,
-                            "parent_ordinal": None,
-                            "inclusive_ns": 100_000_000,
-                            "self_ns": 100_000_000,
-                        }
-                    ],
-                }
-            )
-        )
+        _record(tmp_path, "bare.json", pipeline=False)
         records, problems = summarize_mod.load_records(str(tmp_path))
         assert problems == []
         (summary,) = summarize_mod.summarize(records)
@@ -530,8 +504,7 @@ class TestAbsentIsNotZero:
                 }
             ],
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.measurements["graph_nodes"] == [77.0]
         # 'passes' is a graph descriptor, not an analysis count.
         assert "counter.passes" not in summary.measurements

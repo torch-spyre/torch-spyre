@@ -13,18 +13,10 @@
 # limitations under the License.
 
 
-"""Tests for the frontend timing sweep driver, its plan, and the scaling fits.
+"""Tests for the sweep driver, its plan and the scaling fits: pure data, no device.
 
-Loaded by path for the same reason as the summarizer tests: these are scripts, not a
-package, and they depend on nothing but the standard library. Nothing here touches the
-Spyre device -- the driver's plan handling, the plan's own consistency, and the fits are
-all pure data.
-
-The plan-consistency tests read ``workloads.py`` with ``ast`` rather than importing it,
-because importing it needs ``torch_spyre._C`` and therefore a built extension. A static
-read still catches the drift that matters: a plan point naming a parameter its builder
-does not accept fails in the child, minutes into a sweep, on a machine you are not
-watching.
+The plan checks read ``workloads.py`` with ``ast``, since importing it needs a built
+``torch_spyre._C``.
 """
 
 import ast
