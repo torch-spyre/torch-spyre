@@ -1030,3 +1030,79 @@ def mock_op_split_space(
     # a domain is the real context's business.
     space._context = lambda tiling: context  # type: ignore[method-assign]
     return space
+
+
+def ir_input_loader(name: str, size: list[int]) -> Callable:
+    """A loader over a float32 CPU ``InputBuffer`` registered with the active
+    graph handler."""
+    from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
+    from torch._inductor.virtualized import V
+
+    inp = InputBuffer(
+        name=name, layout=FixedLayout(torch.device("cpu"), torch.float32, size)
+    )
+    V.graph.name_to_buffer[name] = inp
+    return TensorBox(StorageBox(inp)).make_loader()
+
+
+def ir_computed_buffer(
+    name: str,
+    ranges: list[int],
+    inner_fn: Callable,
+    reduction_ranges: list[int] | None = None,
+) -> tuple[Callable, Any]:
+    """``(loader, op)`` for a ``ComputedBuffer`` -- a ``Pointwise``, or a sum
+    ``Reduction`` over ``reduction_ranges`` -- registered with the active graph
+    handler. It computes on the CPU and is laid out as a row-major fp16 Spyre
+    tensor, so per-core and per-tile views of it can be built."""
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FlexibleLayout,
+        Pointwise,
+        Reduction,
+        StorageBox,
+        TensorBox,
+    )
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    cpu = torch.device("cpu")
+    if reduction_ranges is None:
+        box = Pointwise.create(
+            device=cpu, dtype=torch.float32, inner_fn=inner_fn, ranges=ranges
+        )
+    else:
+        box = Reduction.create(
+            device=cpu,
+            dst_dtype=torch.float32,
+            src_dtype=torch.float32,
+            inner_fn=inner_fn,
+            ranges=ranges,
+            reduction_ranges=reduction_ranges,
+            reduction_type="sum",
+        )
+    stride = [int(st) for st in FlexibleLayout.contiguous_strides(ranges)]
+    device_layout = SpyreTensorLayout(
+        list(ranges), stride, torch.float16, list(range(len(ranges)))
+    )
+    op = ComputedBuffer(
+        name=name,
+        layout=FixedTiledLayout(
+            "spyre:0", torch.float16, ranges, stride, device_layout
+        ),
+        data=box.data.data,
+    )
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return TensorBox(StorageBox(op)).make_loader(), op
+
+
+def patch_row_major_out_coords() -> Any:
+    """Patch ``coarse_tiling.op_out_coords``: the host coords of a row-major
+    layout are the write's own loop vars."""
+    return mock_patch(
+        "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+        side_effect=lambda op: list(next(iter(op.get_read_writes().writes)).var_names),
+    )

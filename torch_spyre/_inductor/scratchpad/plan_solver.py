@@ -26,6 +26,7 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
     from torch_spyre._inductor.work_division import (
         OpSplitSpace,
         ResidencyEdge,
@@ -355,6 +356,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # ``core_divisions`` without materializing it. ``None`` where the allocator
     # built none (see ``allocator._DivisionMap``).
     division_space: Optional["OpSplitSpace"] = None
+    # Index of this buffer's producing operation in ``graph.operations``, which
+    # is what a coarse-tiling *run* is measured over: a group has to occupy one
+    # contiguous stretch of that list, and buffer order is not operation order
+    # (input clones are prepended, and an operation producing no solver buffer
+    # has no index at all). ``None`` where there is no producing operation -- an
+    # input clone -- or where the caller does not supply one, which is what a
+    # solver reads as "operation order is unknown here, so no tiling may span
+    # more than nothing".
+    op_position: Optional[int] = None
+    # Parent name -> whether this buffer's op reads that computed parent tile
+    # by tile under a pair of specs; a pair it does not breaks a run there
+    # (``derive_tiling_groups``). Filled only where the solver chooses tilings.
+    tile_reads: dict[str, "TileReads"] = field(default_factory=dict)
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
