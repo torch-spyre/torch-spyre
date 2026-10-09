@@ -1573,6 +1573,110 @@ class TestCostModelConstraints(unittest.TestCase):
         # weight_batches=B2=2 (not shared): (B2*M2*K2 + B2*K2*N2)*1 + B2*M2*N2*2
         self.assertAlmostEqual(separate_bytes_total, 105_332_736, delta=1.0)
 
+    def _fp8_bmm_planner(self, m_rows, n_sticks, k_sticks, max_cores=32):
+        """Run _cost_model_matmul_planner for a batchmatmulfp8 op.
+
+        ``n_sticks`` and ``k_sticks`` are already in stick units (as the
+        it_space_adjusted values seen by the planner after alignment).
+        """
+        from torch_spyre._inductor.constants import BATCH_MATMUL_FP8_OP
+
+        m, n, k = (_isym(name) for name in ("m_fp8", "n_fp8", "k_fp8"))
+        op = _computed_buffer(
+            (m_rows, n_sticks * 128),
+            name="fp8_mm_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(k_sticks * 128,),
+        )
+        output_td = _tensor_dep("fp8_mm_out", (m_rows, n_sticks * 128), (m, n))
+        input_tds = [
+            _tensor_dep("act_fp8", (m_rows, k_sticks * 128), (m, k)),
+            _tensor_dep(
+                "weight_fp8",
+                (k_sticks * 128, n_sticks * 128),
+                (k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+            ),
+        ]
+        # it_space_adjusted: n and k are in sticks (post-alignment).
+        it_space_adjusted = {m: m_rows, n: n_sticks, k: k_sticks}
+        splits = {m: 1, n: 1, k: 1}
+        return _cost_model_matmul_planner(
+            op,
+            splits,
+            it_space_adjusted,
+            output_td,
+            {n: 128},  # stick_vars: n is the stick dim (128 FP8 elems/stick)
+            {},
+            max_cores,
+            input_tds,
+            set(),
+            {},
+        )
+
+    def test_fp8_bmm_n_split_pinned_to_4_when_enough_sticks(self):
+        """batchmatmulfp8 N-split is pinned to 4 even when cost model would prefer more.
+
+        For n_sticks=16 and large M, _matmul_split_cost prefers n_split=8 because it
+        fills more cores. The _FP8_BMM_N_SPLIT=4 guard must override that choice to
+        satisfy the batchmatmulfp8 hardware contract (core_fold must equal 4).
+        """
+        from torch_spyre._inductor.work_division import _FP8_BMM_N_SPLIT
+
+        m, n, k = (_isym(name) for name in ("m_fp8", "n_fp8", "k_fp8"))
+        # n_sticks=16 (N=2048): without pinning the cost model picks n_split=8.
+        result = self._fp8_bmm_planner(m_rows=128, n_sticks=16, k_sticks=32)
+        self.assertEqual(result[n], _FP8_BMM_N_SPLIT)
+
+    def test_fp8_bmm_n_split_clamped_when_n_sticks_lt_4(self):
+        """batchmatmulfp8 N-split is clamped to n_sticks when n_sticks < 4."""
+        m, n, k = (_isym(name) for name in ("m_fp8", "n_fp8", "k_fp8"))
+        # n_sticks=2: fp8_bmm_n_split = min(4, 2) = 2
+        result_2 = self._fp8_bmm_planner(m_rows=8, n_sticks=2, k_sticks=32)
+        n_sym = [s for s in result_2 if str(s) == "n_fp8"][0]
+        self.assertEqual(result_2[n_sym], 2)
+
+        # n_sticks=3: fp8_bmm_n_split = min(4, 3) = 3
+        result_3 = self._fp8_bmm_planner(m_rows=8, n_sticks=3, k_sticks=32)
+        self.assertEqual(result_3[n_sym], 3)
+
+    def test_fp8_bmm_batch_split_forced_to_1(self):
+        """batchmatmulfp8 batch split is always 1 (hardware does not support batch splits)."""
+        from torch_spyre._inductor.constants import BATCH_MATMUL_FP8_OP
+
+        batch, m, n, k = (_isym(name) for name in ("b_fp8", "m_fp8", "n_fp8", "k_fp8"))
+        op = _computed_buffer(
+            (4, 8, 512),
+            name="fp8_bmm_batch_out",
+            reduction_type=BATCH_MATMUL_FP8_OP,
+            reduction_ranges=(256,),
+        )
+        output_td = _tensor_dep("fp8_bmm_batch_out", (4, 8, 512), (batch, m, n))
+        input_tds = [
+            _tensor_dep("act_b", (4, 8, 256), (batch, m, k)),
+            _tensor_dep(
+                "weight_b",
+                (4, 256, 512),
+                (batch, k, n),
+                element_arrangement=ElementArrangement.QFP8WT,
+            ),
+        ]
+        it_space_adjusted = {batch: 4, m: 8, n: 4, k: 2}
+        splits = {batch: 1, m: 1, n: 1, k: 1}
+        result = _cost_model_matmul_planner(
+            op,
+            splits,
+            it_space_adjusted,
+            output_td,
+            {n: 128},
+            {},
+            32,
+            input_tds,
+            set(),
+            {},
+        )
+        self.assertEqual(result[batch], 1)
+
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):
     """coordinate_mask_blocked_vars only reads reduction_vars/stick_vars/it_space,
