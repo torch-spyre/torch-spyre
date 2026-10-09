@@ -50,8 +50,8 @@ jobs:
     # The static review still runs on the self-hosted fleet (required for model
     # connectivity) but on the card-less pool (spyre_pf_x0), so it never
     # contends for an accelerator.
-    runs-on: ${{ fromJSON(startsWith(github.event.comment.body, '/claude-review-static') && '["x86_64","spyre_pf_x0","linux","image_spyre_backend"]' ||
-      '["x86_64","spyre_pf_x1","linux","image_spyre_backend"]') }}
+    runs-on: ${{ fromJSON(startsWith(github.event.comment.body, '/claude-review-static') && '["x86_64","spyre_pf_x0","linux","image_torch_spyre"]' || '["x86_64","spyre_pf_x1","linux","image_torch_spyre"]')
+      }}
     timeout-minutes: 60
     env:
       REVIEW_MODE: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}
