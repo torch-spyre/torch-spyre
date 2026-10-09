@@ -700,8 +700,6 @@ class TestModelScalarOperations:
             execution_mode, moe_loss, main_loss, aux_loss, atol=4e-3, rtol=4e-3
         )
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1387
-    @pytest.mark.xfail(reason="Clamp (aten::clamp) operation not implemented")
     def test_quantization_scale_int8(self, execution_mode):
         """Test INT8 quantization with scale factor."""
 

@@ -30,12 +30,11 @@ class TestTensorScalarCoreArithmetic:
         torch.manual_seed(0xAFFE)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1545
-    @pytest.mark.xfail(
-        reason="Spyre backend does not support dtype ComplexFloat (torch.complex64)"
-    )
     def test_complex64_add_mul_div_python_complex_scalars(self, execution_mode):
         """
         ``complex64`` tensor with Python ``complex`` scalars: ``+ (1+2j)``, ``* (3-4j)``, ``/ (0.5+0.5j)``.
+        The complex dtype is rejected. Both modes fail when the tensor is moved to the
+        device, before ``torch.compile`` runs, so they pin the same check.
         """
 
         def complex_ops(x):
@@ -48,20 +47,21 @@ class TestTensorScalarCoreArithmetic:
             return y3
 
         x = torch.randn(10, 10, dtype=torch.complex64)
-        compare_with_cpu(
-            complex_ops,
-            x,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        with pytest.raises(Exception, match="does not support dtype ComplexFloat"):
+            compare_with_cpu(
+                complex_ops,
+                x,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-    @pytest.mark.xfail(reason="Spyre backend does not support dtype Double (FP64)")
     def test_fp16_fp32_tensors_fp32_literal_and_fp64_scalar_tensor(
         self, execution_mode
     ):
         """
         ``fp16 * 2.5`` (Python scalar) and ``fp32 + tensor(1.5, float64)``; tuple return.
+        The float64 scalar tensor is rejected.
         """
 
         def mixed_precision_ops(x_fp16, x_fp32):
@@ -73,15 +73,16 @@ class TestTensorScalarCoreArithmetic:
 
         x_fp16 = cached_randn((10, 10), dtype=torch.float16)
         x_fp32 = cached_randn((10, 10), differentiation=1, dtype=torch.float32)
-        compare_with_cpu(
-            mixed_precision_ops,
-            x_fp16,
-            x_fp32,
-            atol=0.01,
-            rtol=0.01,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        with pytest.raises(Exception, match="does not support dtype Double"):
+            compare_with_cpu(
+                mixed_precision_ops,
+                x_fp16,
+                x_fp32,
+                atol=0.01,
+                rtol=0.01,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_scalar_add_mul_sub_zero_one_and_ndim_tensors(self, execution_mode):
         """

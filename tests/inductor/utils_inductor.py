@@ -507,10 +507,23 @@ def _check_expect_fail_unstable(prefix, cases):
         assert key in generated, (
             f"{prefix}: expect_fail_unstable entry {key!r} matches no generated test"
         )
-        for other in ("expect_fail", "skip", "device_fault"):
+        for other in ("expect_fail", "skip", "device_fault", "expect_raise"):
             assert key not in cases.get(other, ()), (
                 f"{prefix}: {key!r} is in both expect_fail_unstable and {other}"
             )
+
+
+def _expect_raise_test(test, fragment):
+    """Wrap a generated test so it passes only if it raises with ``fragment``."""
+
+    @functools.wraps(test)
+    def raising(self):
+        with pytest.raises(Exception, match=fragment):
+            test(self)
+
+    # Marks the test for test_inductor_ops_lx_planning.py, which does not wrap it.
+    raising._expects_raise = True
+    return raising
 
 
 class ParameterizedTestMeta(type):
@@ -534,6 +547,27 @@ class ParameterizedTestMeta(type):
             skip_list = cases.get("skip", [])
             # {case: reason}: an xfail still runs on the card, so a case that faults it is skipped.
             device_fault = cases.get("device_fault", {})
+            # {case or "<op>_<case>": fragment}: a negative test. The body must raise,
+            # and the message must match the fragment, so a case that stops raising,
+            # or raises for another reason, fails.
+            expect_raise = cases.get("expect_raise", {})
+            used_expect_raise = set()
+            # The fragment is what separates "rejected for the documented reason" from
+            # "failed some other way": "" matches any exception, None is a bare raise.
+            for key, fragment in expect_raise.items():
+                assert isinstance(fragment, str) and fragment.strip(), (
+                    f"{test_name_prefix}: expect_raise[{key!r}] needs a non-empty "
+                    "message fragment"
+                )
+            for overlap, other in (
+                (expect_fail, "expect_fail"),
+                (skip_list, "skip"),
+                (device_fault, "device_fault"),
+            ):
+                both = set(expect_raise) & set(overlap)
+                assert not both, (
+                    f"{test_name_prefix}: {sorted(both)} in both expect_raise and {other}"
+                )
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -567,6 +601,29 @@ class ParameterizedTestMeta(type):
                             namespace[test_name] = pytest.mark.skip(
                                 reason=f"Skipped for {marked}"
                             )(namespace[test_name])
+                        elif test_case in expect_raise or op_case in expect_raise:
+                            marked = op_case if op_case in expect_raise else test_case
+                            # A bare key covers every op, so compare per test, not just
+                            # the raw keys: expect_raise={"c"} and expect_fail=["a_c"]
+                            # would otherwise lose the xfail silently.
+                            assert (
+                                test_case not in expect_fail
+                                and op_case not in expect_fail
+                            ), (
+                                f"{test_name_prefix}: {test_name} is in both "
+                                "expect_raise and expect_fail"
+                            )
+                            assert (
+                                test_case not in expect_fail_unstable
+                                and op_case not in expect_fail_unstable
+                            ), (
+                                f"{test_name_prefix}: {test_name} is in both "
+                                "expect_raise and expect_fail_unstable"
+                            )
+                            used_expect_raise.add(marked)
+                            namespace[test_name] = _expect_raise_test(
+                                namespace[test_name], expect_raise[marked]
+                            )
                         else:
                             # An expect_fail entry may target either the bare param
                             # key (xfails every op for that shape) or the specific
@@ -621,6 +678,11 @@ class ParameterizedTestMeta(type):
                         namespace[test_name] = pytest.mark.skip(
                             reason=f"Faults the device: {device_fault[test_case]}"
                         )(namespace[test_name])
+                    elif test_case in expect_raise:
+                        used_expect_raise.add(test_case)
+                        namespace[test_name] = _expect_raise_test(
+                            namespace[test_name], expect_raise[test_case]
+                        )
                     elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
                             reason=f"Expected fail for {test_case}", strict=True
@@ -630,6 +692,12 @@ class ParameterizedTestMeta(type):
                             reason=f"Unstable: {expect_fail_unstable[test_case]}",
                             strict=False,
                         )(namespace[test_name])
+
+            unused = set(expect_raise) - used_expect_raise
+            assert not unused, (
+                f"{test_name_prefix}: expect_raise entry {sorted(unused)} matches no "
+                "generated test (typo, or the case is skipped)"
+            )
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
