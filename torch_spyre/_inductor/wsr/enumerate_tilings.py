@@ -407,6 +407,11 @@ def canonical_tiling(spec: TileSpec) -> TileSpec:
 
 
 def _tileable(op: object) -> bool:
+    """Whether ``op`` may be offered a coarse tiling at all. Not in a loop
+    group already, which ``CoarseTilingPass`` would clobber by stamping
+    ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint and
+    span-overflow passes tiled, ``loop_info`` the members ``coarse_tile`` adds
+    around them (a copy-out, a restickify of a tiled read)."""
     # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
     # and has no device layout of its own to size or stick-check a tile
     # against; prediction refuses to tile it for the same reason.
@@ -414,6 +419,7 @@ def _tileable(op: object) -> bool:
         isinstance(op, ComputedBuffer)
         and isinstance(op.get_layout(), FixedTiledLayout)
         and not getattr(op, "dim_hints", [])
+        and getattr(op, "loop_info", None) is None
     )
 
 
@@ -436,15 +442,9 @@ def build_tiling_space(
     readers: Iterable[Operation] = (),
 ) -> TilingSpace:
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
-    be coarse-tiled at all, which is not an error -- untiled is always legal.
-    An output dim the lowering's resolver refuses (:func:`_lowering_accepts`)
-    has an empty domain.
-
-    An op that already carries ``dim_hints`` is one of those: the hint pass and
-    the span-overflow pass both leave that marker set, and ``CoarseTilingPass``
-    stamps ``op.dim_hints`` wholesale, so offering such an op a tiling here
-    would silently clobber the group it is already part of. So is an op with a
-    symbolic extent (:func:`_static_extents`).
+    be coarse-tiled at all (:func:`_tileable`, :func:`_static_extents`), which
+    is not an error -- untiled is always legal. An output dim the lowering's
+    resolver refuses (:func:`_lowering_accepts`) has an empty domain.
 
     ``readers`` are the ops reading ``op``'s output; a unit tile some reader
     views through another shape is not admitted

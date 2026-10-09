@@ -36,11 +36,13 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest import TestCase
 
 import sympy
 
+from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
@@ -71,7 +73,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     TileSpec,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
-from utils_inductor import mock_op_split_space
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    mock_op_split_space,
+    patch_row_major_out_coords,
+)
 
 
 def _seed_footprint(buffers):
@@ -671,7 +678,7 @@ class RegionRecolorTest(TestCase):
         # After a recolor, every op the flood reached carries the flooded config
         # and the placement the packer holds for it reflects that division's
         # footprint
-        # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
+        # -- i.e. the resize ripple in ``_apply_assignment`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
         for case, gi, buffers in _all_cases():
@@ -680,7 +687,7 @@ class RegionRecolorTest(TestCase):
             for anchor in solver._anchor_candidates:
                 config = solver._sources[anchor].splitting[0]
                 assignment = solver._flood_region(anchor, config)
-                solver._apply_recolor(assignment)
+                solver._apply_assignment(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
                 for op, flooded in assignment.items():
@@ -1818,9 +1825,9 @@ class MoveAlphabetTest(TestCase):
         self.assertEqual(solver.chosen, before)
 
 
-class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
-    """Only the annealer may choose a coarse tiling, and only once something
-    applies it."""
+class TestCoarseTilingIsGatedOnTheFlag(TestCase):
+    """Only the annealer may choose a coarse tiling, and only with
+    ``auto_coarse_tiling`` on."""
 
     @staticmethod
     def _allocator(layout_planning):
@@ -1828,14 +1835,295 @@ class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
             layout_planning=layout_planning, size=1
         )
 
-    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
-        self.assertFalse(self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings)
-        self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
-
-    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+    def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
         """Only a search that generates divisions can carry a ``TileSpec``."""
-        with mock.patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
-            self.assertTrue(
-                self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings
+        for flag in (False, True):
+            with (
+                self.subTest(auto_coarse_tiling=flag),
+                mock.patch.object(ts_config, "auto_coarse_tiling", flag),
+            ):
+                self.assertEqual(
+                    self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings,
+                    flag,
+                )
+                self.assertFalse(
+                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                )
+
+
+def _run_buffer(name, position, space=None):
+    """A two-axis buffer that sits at a stated operation position, so it can be
+    part of a coarse-tiling run."""
+    buf = _cdbuf(name, [], {}, divisions=_TWO_AXIS_MENU)
+    buf.uses = [position, position + 1]
+    buf.op_position = position
+    buf.division_space = space
+    return buf
+
+
+def _run_solver(names, untiled=()):
+    """A primed solver over ``names`` at consecutive operation positions, each
+    with a tiling space unless named in ``untiled``. A ``None`` name leaves its
+    position to an operation with no buffer."""
+    bufs = [
+        _run_buffer(
+            name,
+            position,
+            _two_axis_space(tiling=None if name in untiled else _tiling_space()),
+        )
+        for position, name in enumerate(names)
+        if name is not None
+    ]
+    return _primed(bufs, 1 << 30)
+
+
+def _tiled(solver, idx, tiling=_TILE_4):
+    """Buffer ``idx``'s current splits under ``tiling``."""
+    return solver._sources[idx].retiled(solver.chosen[idx], tiling)
+
+
+class ContiguousTilingRunTest(TestCase):
+    """A tiling group is a contiguous run of the operation list, because that is
+    what ``derive_tiling_groups`` forms and what ``_validate_contiguous``
+    demands. Both structural moves write their tilings as contiguous stretches
+    of runs."""
+
+    def test_a_run_is_the_maximal_stretch_agreeing_on_the_tiling(self):
+        solver = _run_solver("ABC")
+        self.assertEqual(solver._run_bounds(0), (0, 2))  # all untiled: one run
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(1), (1, 1))
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+
+    def test_an_operation_with_no_buffer_breaks_a_run(self):
+        # Position 1 belongs to an operation the solver does not own -- nothing
+        # can carry a tiling to it, so it is untiled and the run stops there.
+        solver = _run_solver(["A", None, "C"])
+        solver.chosen[0] = _tiled(solver, 0)
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+
+    def test_the_trim_strips_a_tiling_the_anchors_run_does_not_reach(self):
+        solver = _run_solver("ABC")
+        # What a flood over the residency relation can produce: A and C tiled,
+        # B (between them) left alone: two groups at apply time.
+        assignment = {0: _tiled(solver, 0), 2: _tiled(solver, 2)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual(trimmed[0].tiling, _TILE_4)
+        self.assertTrue(trimmed[2].tiling.is_untiled)
+        # The splits are the flood's business and are left exactly as they were.
+        self.assertEqual(trimmed[2].splits, assignment[2].splits)
+
+    def test_a_buffer_with_no_operation_position_may_hold_no_tiling(self):
+        # An input clone, or any buffer built without operation order: it is in
+        # no run, so nothing can establish that a group containing it is
+        # contiguous, and declining is the safe direction.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        self.assertIsNone(solver._position_of[0])
+        assignment = {0: _tiled(solver, 0)}
+        self.assertTrue(
+            solver._trim_tilings_to_anchor_run(0, assignment)[0].tiling.is_untiled
+        )
+
+    def test_a_boundary_flip_respecs_one_whole_side_of_the_run(self):
+        solver = _run_solver("ABCD")
+        solver._retile_boundary(1, _tiled(solver, 1))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        # Whichever side was drawn, it is a contiguous stretch containing the
+        # drawn op and reaching one end of its run -- A..H or H..Z.
+        self.assertIn(tiled, ([0, 1], [1, 2, 3]))
+
+    def test_a_boundary_flip_truncates_at_an_op_that_refuses_the_tiling(self):
+        # C has no tiling space, so it can take no tiling at all. The walk stops
+        # there rather than skipping it (which would break contiguity) or
+        # abandoning the move (which would make long runs immovable).
+        solver = _run_solver("ABCD", untiled="C")
+        self.assertIsNone(_tiled(solver, 2))
+        with mock.patch.object(solver._rng, "random", return_value=0.0):  # forward
+            solver._retile_boundary(0, _tiled(solver, 0))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        self.assertEqual(tiled, [0, 1])
+
+    def test_a_search_with_no_tiling_space_never_takes_the_boundary_arm(self):
+        solver = _run_solver("ABCD", untiled="ABCD")
+        with mock.patch.object(solver, "_retile_boundary") as boundary:
+            for _ in range(200):
+                solver._execute_move("flip")
+        boundary.assert_not_called()
+
+
+def _attention_ops():
+    """``KT = K^T``, ``S = Q @ KT``, ``V``, ``O = S @ V`` as IR, in that order,
+    under the caller's graph handler: tiling host dim 0 of all four, ``S``
+    reduces over ``KT``'s tiled dim and ``O`` over ``V``'s."""
+    from torch._inductor.virtualized import ops
+
+    buf, load_input = ir_computed_buffer, ir_input_loader
+    load_q, load_k = load_input("q", [8, 16]), load_input("k", [8, 16])
+    load_kt, kt = buf("KT", [16, 8], lambda i: load_k([i[1], i[0]]))
+    load_s, s = buf(
+        "S",
+        [8, 8],
+        lambda i, r: ops.mul(load_q([i[0], r[0]]), load_kt([r[0], i[1]])),
+        reduction_ranges=[16],
+    )
+    load_v, v = buf("V", [8, 16], load_input("v_in", [8, 16]))
+    _, o = buf(
+        "O",
+        [8, 16],
+        lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+        reduction_ranges=[8],
+    )
+    return [kt, s, v, o]
+
+
+def _permuted_stretch_ops():
+    """``P``, ``C = P`` permuted, ``D = C + P`` permuted, as IR under the
+    caller's graph handler: tiling host dim 0, ``C`` misreads ``P`` and ``D``
+    reads ``C`` as written but misreads ``P``."""
+    from torch._inductor.virtualized import ops
+
+    buf = ir_computed_buffer
+    load_p, p = buf("P", [4, 8, 128], ir_input_loader("in0", [4, 8, 128]))
+    load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+    _, d = buf(
+        "D",
+        [8, 4, 128],
+        lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+    )
+    return [p, c, d]
+
+
+class ApplyGroupAgreementTest(TestCase):
+    """The SA's runs are the groups ``derive_tiling_groups`` forms, including
+    where a reader walks a run member's tiled host dim differently than that
+    member writes it -- the attention chain's ``S = Q @ K^T`` and ``O = S @ V``
+    both reduce over what the positional spec tiles upstream."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self.enterContext(
+            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None)))
+        )
+        self.enterContext(patch_row_major_out_coords())
+
+    def _solver(self, operations):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        from torch._inductor.virtualized import V
+
+        op_by_name = {op.get_name(): op for op in operations}
+        bufs = []
+        for at, op in enumerate(operations):
+            buf = _run_buffer(
+                op.get_name(), at, _two_axis_space(tiling=_tiling_space())
             )
-            self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
+            buf.tile_reads = CoOptimizingAllocator._tile_reads(V.graph, op, op_by_name)
+            buf.parents = sorted(buf.tile_reads)
+            bufs.append(buf)
+        solver = _primed(bufs, 1 << 30)
+        for idx in range(len(bufs)):
+            solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        return solver
+
+    def _assert_runs_are_the_applied_groups(self, operations, expected):
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            derive_tiling_groups,
+        )
+
+        solver = self._solver(operations)
+        from torch._inductor.virtualized import V
+
+        groups = derive_tiling_groups(
+            SimpleNamespace(operations=operations, get_buffer=V.graph.get_buffer),
+            {op.get_name(): _TILE_2 for op in operations},
+        )
+        position = {op.get_name(): at for at, op in enumerate(operations)}
+        applied = {
+            position[op.get_name()]: (
+                position[ops[0].get_name()],
+                position[ops[-1].get_name()],
+            )
+            for ops, _spec in groups
+            for op in ops
+        }
+        self.assertEqual(sorted(set(applied.values())), expected)
+        self.assertEqual(
+            {p: solver._run_bounds(p) for p in range(len(operations))}, applied
+        )
+
+    def test_the_runs_are_the_applied_groups(self):
+        self._assert_runs_are_the_applied_groups(
+            _attention_ops(), [(0, 0), (1, 2), (3, 3)]
+        )
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted.
+        self._assert_runs_are_the_applied_groups(
+            _permuted_stretch_ops(), [(0, 0), (1, 1), (2, 2)]
+        )
+
+    def test_the_trim_strips_a_tiling_carried_across_a_misaligned_read(self):
+        solver = self._solver(_attention_ops())
+        assignment = {i: solver.chosen[i] for i in range(4)}
+        trimmed = solver._trim_tilings_to_anchor_run(1, assignment)
+        self.assertEqual(
+            [trimmed[i].tiling.is_untiled for i in range(4)],
+            [True, False, False, True],
+        )
+
+    def test_a_boundary_flip_stops_at_a_misaligned_read(self):
+        tiled = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        for position, draw, expected in (
+            (1, 0.0, [False, True, True, False]),  # forward: O misreads V
+            (3, 0.9, [False, False, False, True]),  # back: likewise
+        ):
+            solver = self._solver(_attention_ops())
+            for idx in range(4):
+                solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}))
+            with mock.patch.object(solver._rng, "random", return_value=draw):
+                solver._retile_boundary(position, tiled)
+            self.assertEqual(
+                [not solver.chosen[i].tiling.is_untiled for i in range(4)], expected
+            )
+
+    def test_the_view_relation_carries_no_tiling_across_a_misaligned_read(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        edge = mock.MagicMock()
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        relation = _ViewRelation(
+            edge,
+            parent_source,
+            child_source,
+            lambda spec: all(axis.host_dim == 1 for axis in spec.axes),
+        )
+        tiled = parent_source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
+        self.assertTrue(relation.parent_for(tiled).tiling.is_untiled)
+        self.assertEqual(relation.child_for(tiled).division.output_splits, {_AXIS_0: 2})
+
+    def test_the_edge_relation_takes_the_readers_alignment(self):
+        parent = _run_buffer("P", 0, _two_axis_space(tiling=_tiling_space()))
+        child = _run_buffer("C", 1, _two_axis_space(tiling=_tiling_space()))
+        child.parents = ["P"]
+        child.residency_edges = {"P": mock.MagicMock()}
+        reads = mock.MagicMock()
+        reads.aligned.side_effect = lambda parent_spec, child_spec: all(
+            axis.host_dim == 1 for axis in child_spec.axes
+        )
+        child.tile_reads = {"P": reads}
+        relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
+        self.assertFalse(relation.carries(_TILE_2))
+        self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))
