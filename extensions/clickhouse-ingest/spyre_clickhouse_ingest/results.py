@@ -68,6 +68,7 @@ from spyre_clickhouse_ingest.options import (
     add_artifact_options,
     artifact_options,
     artifact_spec,
+    ci_tags,
 )
 from spyre_clickhouse_ingest.registry import MISC, tag_families
 from spyre_clickhouse_ingest.resolver import (
@@ -1320,21 +1321,6 @@ def _admitted_legs(legs: dict):
         yield run_id, tier, acc
 
 
-def ci_tags(event: str, repository: str, branch: str, sha: str, pr_number) -> list:
-    """The (tag, family) pairs a leg built by this CI event carries, spelled as Jenkins tags
-    its own builds: `<repo>@<sha12>` (main) for a push to main, `<repo>#<pr>` and
-    `<repo>#<pr>@<sha12>` (pr) for a pull request; none for any other event."""
-    name, sha12 = (repository or "").rstrip("/").rsplit("/", 1)[-1], (sha or "")[:12]
-    pr = str(pr_number or "").strip()
-    if not (name and len(sha12) == 12):
-        return []
-    if event == "pull_request" and pr not in ("", "0"):
-        return [(f"{name}#{pr}", "pr"), (f"{name}#{pr}@{sha12}", "pr")]
-    if event == "push" and branch == "main":
-        return [(f"{name}@{sha12}", "main")]
-    return []
-
-
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
@@ -1349,7 +1335,8 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         *(
             _opt(args, k)
             for k in ("ci_event", "repository", "branch", "sha", "pr_number")
-        )
+        ),
+        day=_opt(args, "tag_date"),
     )
     # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
     kept, args.misc_tags = [], []
@@ -1465,8 +1452,8 @@ def main(argv=None):
     parser.add_argument(
         "--ci-event",
         default="",
-        help="The CI event that built the leg's artifact (push | pull_request | ...); tags it "
-        "as ci_tags() spells, beside any --tag.",
+        help="The CI event that built the leg's artifact (push | pull_request | schedule | ...); "
+        "tags it as options.ci_tags() spells, beside any --tag.",
     )
     parser.add_argument(
         "--jenkins-run-key",

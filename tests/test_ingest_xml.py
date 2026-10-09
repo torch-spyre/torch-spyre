@@ -828,16 +828,27 @@ def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
         ),
         ("push", "release-0.5", "0", []),
         ("workflow_dispatch", "main", "0", []),
-        ("schedule", "main", "0", []),
+        (
+            "schedule",
+            "main",
+            "0",
+            [("torch-spyre@07379f50aaaa", "main"), ("nightly-2026-10-09", "nightly")],
+        ),
     ],
 )
 def test_a_gha_delta_is_tagged_as_its_ci_event_built_it(
     ingest, event, branch, pr, tags
 ):
+    from datetime import date
+
     c = _ArtifactClient()
     legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
     args = _args(
-        ci_event=event, branch=branch, pr_number=pr, sha="07379f50aaaa" + "0" * 28
+        ci_event=event,
+        branch=branch,
+        pr_number=pr,
+        sha="07379f50aaaa" + "0" * 28,
+        tag_date=date(2026, 10, 9),
     )
     assert ingest._write_artifact_verdicts(c, "db", args, legs)
     rows = [(t, dict(zip(cols, r))) for t, rs, cols in c.inserts for r in rs]

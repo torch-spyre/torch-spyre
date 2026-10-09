@@ -84,9 +84,10 @@ inputs:
     default: ''
   ci-event:
     description: >
-      Event of the run that built the leg's artifact (push | pull_request | ...): a push to
-      main tags it <repo>@<sha12> (main), a pull request <repo>#<pr> and <repo>#<pr>@<sha12>
-      (pr). Empty tags nothing beyond the tag inputs.
+      Event of the run that built the leg's artifact (push | pull_request | schedule | ...): a
+      push to main tags it <repo>@<sha12> (main), a scheduled run of main also nightly-<day>
+      (nightly), a pull request <repo>#<pr> and <repo>#<pr>@<sha12> (pr). Empty tags nothing
+      beyond the tag inputs.
     required: false
     default: ''
   trigger-type:
