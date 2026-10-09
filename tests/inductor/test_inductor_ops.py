@@ -2829,6 +2829,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_pointwise_clamp_preserves_unspecified_bound",
+            "test_clamp_preserves_unspecified_bound",
+        ): {
+            "param_sets": {
+                f"{operation}_{dtype_name}": (operation, dtype)
+                for operation in (
+                    "clamp_min",
+                    "clamp_max",
+                    "lower_only",
+                    "upper_only",
+                    "both",
+                )
+                for dtype_name, dtype in (
+                    ("fp16", torch.float16),
+                    ("bf16", torch.bfloat16),
+                    ("fp32", torch.float32),
+                )
+            },
+        },
+        (
             "test_activation_cls",
             "test_activation_cls",
         ): {
@@ -8249,6 +8269,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_range_op(self, op, input, min, max, err):
         self.compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+
+    def test_clamp_preserves_unspecified_bound(self, operation, dtype):
+        """Missing bounds must preserve the input device format's full range."""
+        scale = 1.0 if dtype == torch.float32 else float(2**18)
+
+        def fn(x):
+            large = x if dtype == torch.float32 else x * scale
+            if operation == "clamp_min":
+                bounded = large.clamp_min(1.0)
+            elif operation == "clamp_max":
+                bounded = large.clamp_max(-1.0)
+            elif operation == "lower_only":
+                bounded = large.clamp(min=1.0)
+            elif operation == "upper_only":
+                bounded = large.clamp(max=-1.0)
+            else:
+                bounded = large.clamp(min=-1.0, max=1.0)
+            return bounded if dtype == torch.float32 else bounded * (1.0 / scale)
+
+        # fp16 reaches DLFloat16's largest finite intermediate (0x7FFE).
+        # bf16 rounds 32704 up, so use its next smaller representable value.
+        largest = {
+            torch.float16: 32704,
+            torch.bfloat16: 32640,
+            torch.float32: torch.finfo(torch.float32).max / scale,
+        }[dtype]
+        values = torch.tensor(
+            [-largest, -24576, -8192, -1, 0, 1, 8192, 24576, largest], dtype=dtype
+        )
+        if dtype == torch.float32:
+            values = torch.cat((values, torch.tensor([-float("inf"), float("inf")])))
+        values = values[:, None].expand(-1, 64).contiguous()
+        # Compute the reference in fp32 so the enlarged intermediate stays finite.
+        expected = fn(values.float()).to(dtype)
+        with fresh_inductor_cache(), torch.inference_mode():
+            actual, source_codes = run_and_get_code(
+                torch.compile(fn, fullgraph=True, dynamic=False), values.to("spyre")
+            )
+        generated = "\n".join(source_codes)
+        self.assertIn("op='clip'", generated)
+        self.assertNotIn("op='minimum'", generated)
+        self.assertNotIn("op='maximum'", generated)
+        actual = actual.cpu()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0.002)
 
     def test_activation_cls(self, op, input, kwargs, err):
         # Spyre activation custom ops (e.g. spyre::gelu) have a pass-through

@@ -16,6 +16,9 @@
 
 import sys
 
+# `results` modes that never reach ClickHouse; they run on the standard library alone.
+OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload")
+
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -29,6 +32,8 @@ def main(argv=None):
         from .artifacts import main as run
     elif command == "ci-run-timings":
         from .ci_run_timings import main as run
+    elif any(a.split("=")[0] in OFFLINE_FLAGS for a in rest):
+        from .offline import main as run
     else:
         from .results import main as run
     return run(rest)
