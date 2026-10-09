@@ -31,8 +31,11 @@ if TYPE_CHECKING:
 
 import torch
 import torch._prims_common as utils
-from torch._higher_order_ops.scan import scan
-from torch.utils._pytree import tree_leaves
+from torch._higher_order_ops.scan import scan, scan_op
+from torch._higher_order_ops.utils import check_input_alias_and_mutation_return_outputs
+from torch._subclasses.fake_tensor import FakeTensor
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
 
 __all__ = ["Gather", "for_each_tile"]
 
@@ -89,6 +92,84 @@ class TileSpec:
 
 
 DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+
+
+def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
+    """Reject a traced ``for_each_tile`` body that ``scan`` cannot run as-is.
+
+    Dynamo checks a ``scan`` body when it traces the call, and functionalization
+    when it dispatches the HOP. A decomposition reaches neither, so
+    ``_scan_in_make_fx`` checks the graph ``scan_op`` has just registered instead,
+    without tracing the body again.
+
+    Inputs may share a storage, such as K and V split from one QKV projection.
+    ``trace_scan`` traces on clones, so the graph shows no input-input aliasing,
+    and since no input may be written, a shared storage is only ever read.
+    """
+    for node in gm.graph.find_nodes(op="get_attr"):
+        if isinstance(getattr(gm, node.target, None), FakeTensor):
+            raise RuntimeError(
+                "for_each_tile() body closes over a traced tensor, which would "
+                f"be baked into {name} as the constant {node.target}; pass it "
+                "as an operand (dims=None) instead"
+            )
+    _, inp_out, out_out, mutated, _ = check_input_alias_and_mutation_return_outputs(gm)
+    if inp_out or out_out:
+        raise RuntimeError(
+            f"for_each_tile() body in {name} returns an input, a view of one, or the "
+            "same tensor twice, which scan does not support; return a clone instead"
+        )
+    if mutated:
+        raise RuntimeError(
+            f"for_each_tile() body in {name} writes to an input in place, which "
+            "scan does not support; write to a new tensor instead"
+        )
+
+
+def _scan_in_make_fx(step, init, xs, lifted, reverse):
+    """Emit the ``scan`` HOP straight into the active make_fx trace.
+
+    ``scan()`` called outside Dynamo re-enters ``torch.compile``. A
+    ``for_each_tile`` reached from an AOT decomposition is exactly that case, and
+    every nested level then costs a full Dynamo inline stack (~180 C-recursion
+    levels each on CPython 3.12), on top of the outer compile's stack. CPython
+    caps the C budget at 800 on s390x, so a GQA SDPA nest raises
+    ``RecursionError`` there. Under make_fx, ``scan_op``'s proxy-mode rule traces
+    ``step`` itself, at ~16 levels per nest level, so skip Dynamo.
+
+    Unlike Dynamo, make_fx does not lift closures: a tensor ``step`` reads from an
+    enclosing trace would be baked into the subgraph as a constant. Every operand
+    read whole each step is therefore passed in ``lifted`` as an
+    ``additional_input``, and ``_check_combine_graph`` rejects a body that still
+    closes over a traced tensor.
+    """
+    leaves_init, spec_init = tree_flatten(init)
+    leaves_xs, spec_xs = tree_flatten(xs)
+    if reverse:
+        leaves_xs = [x.flip(0) for x in leaves_xs]
+    num_init, num_xs = len(leaves_init), len(leaves_xs)
+    y_spec = []
+
+    def flat_step(*args):
+        carry = tree_unflatten(list(args[:num_init]), spec_init)
+        sliced = tree_unflatten(list(args[num_init : num_init + num_xs]), spec_xs)
+        next_carry, y = step(carry, sliced, args[num_init + num_xs :])
+        y_leaves, spec = tree_flatten(y)
+        y_spec[:] = [spec]
+        return [*tree_leaves(next_carry), *y_leaves]
+
+    tracer = get_proxy_mode().tracer
+    flat_out = scan_op(flat_step, leaves_init, leaves_xs, tuple(lifted))
+    # trace_scan has just appended this node; its first argument is the body graph.
+    scan_node = next(n for n in reversed(tracer.graph.nodes) if n.target is scan_op)
+    name = scan_node.args[0].target
+    _check_combine_graph(getattr(tracer.root, name), name)
+
+    final_carry = tree_unflatten(list(flat_out[:num_init]), spec_init)
+    ys = list(flat_out[num_init:])
+    if reverse:
+        ys = [y.flip(0) for y in ys]
+    return final_carry, tree_unflatten(ys, y_spec[0])
 
 
 def _tile_size_vector(shape, dim: int, extent: int) -> tuple[int, ...]:
@@ -340,16 +421,22 @@ def for_each_tile(
         _xs_leaf(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT
     )
 
-    def combine_fn(carry, sliced):
+    # Operands every step reads whole: invariants, and the pools Gather rows index.
+    lifted_idx = [i for i, s in enumerate(specs) if s.kind is not Kind.SLICE]
+
+    def step_fn(carry, sliced, lifted):
         # In map mode, the step counter is the whole carry.
         if count_mode:
             step, carry = carry
         elif map_mode:
             step, carry = carry, None
+        whole = dict(zip(lifted_idx, lifted))
         it = iter(sliced)
         tiles = tuple(
-            o if s.kind is Kind.INVARIANT else _tile(o, s, next(it))
-            for o, s in zip(operands, specs)
+            whole[i]
+            if s.kind is Kind.INVARIANT
+            else _tile(whole.get(i, o), s, next(it))
+            for i, (o, s) in enumerate(zip(operands, specs))
         )
         next_carry, y = body(carry, tiles)
         if map_mode:
@@ -358,18 +445,29 @@ def for_each_tile(
             next_carry = (step + 1, next_carry)
         return next_carry, (() if out_dim is None else y)
 
-    # specialize_float: a Python float closed over by the body
-    # is generalized to a SymFloat and scan_op's validate_subgraph_args_types
-    # currently only accepts Tensor, int, SymInt.
-    # Note: This is currently a shortcoming of `scan`,
-    # but shouldn't be any concern for Spyre.
-    ctx = (
-        contextlib.nullcontext()
-        if torch.compiler.is_dynamo_compiling()
-        else torch._dynamo.config.patch(specialize_float=True)
-    )
-    with ctx:
-        final_carry, ys = scan(combine_fn, scan_init, xs, dim=0, reverse=reverse)
+    lifted = [operands[i] for i in lifted_idx]
+    if not torch.compiler.is_dynamo_compiling() and get_proxy_mode() is not None:
+        # Reached from an AOT decomposition: trace the HOP without Dynamo.
+        final_carry, ys = _scan_in_make_fx(step_fn, scan_init, xs, lifted, reverse)
+    else:
+        # specialize_float: a Python float closed over by the body
+        # is generalized to a SymFloat and scan_op's validate_subgraph_args_types
+        # currently only accepts Tensor, int, SymInt.
+        # Note: This is currently a shortcoming of `scan`,
+        # but shouldn't be any concern for Spyre.
+        ctx = (
+            contextlib.nullcontext()
+            if torch.compiler.is_dynamo_compiling()
+            else torch._dynamo.config.patch(specialize_float=True)
+        )
+        with ctx:
+            final_carry, ys = scan(
+                lambda carry, sliced: step_fn(carry, sliced, lifted),
+                scan_init,
+                xs,
+                dim=0,
+                reverse=reverse,
+            )
 
     if count_mode:
         _, final_carry = final_carry

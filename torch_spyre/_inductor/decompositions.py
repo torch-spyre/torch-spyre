@@ -2188,7 +2188,7 @@ def spyre__sdpa_overrideable(
 
         def sdpa_lk_body(carry, tiles):
             block_maximum, block_denominator, block_output = carry
-            _, k_blk, v_blk, *block_masks = tiles
+            q_blk, k_blk, v_blk, *block_masks = tiles
             if use_gqa:
                 k_blk = k_blk.unsqueeze(2)
                 v_blk = v_blk.unsqueeze(2)
@@ -2201,9 +2201,9 @@ def spyre__sdpa_overrideable(
                 k_blk = k_blk.contiguous()
             keys_T = k_blk.transpose(-1, -2).contiguous()
             scores = (
-                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                torch.ops.spyre.batched_matmul(q_blk, keys_T)
                 if use_gqa
-                else torch.matmul(q_scaled, keys_T)
+                else torch.matmul(q_blk, keys_T)
             )
             for block_mask in block_masks:
                 scores = scores + block_mask
@@ -2225,7 +2225,9 @@ def spyre__sdpa_overrideable(
             new_output = block_output * correction.unsqueeze(-1) + weighted
             return (new_max, new_denominator, new_output), None
 
-        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        # The body reads the scaled Q as an operand: for_each_tile traces it
+        # without Dynamo, so a closed-over tensor would not be lifted.
+        kv_operands = (q_scaled, k_tile, v_tile, *mask_tiles)
         kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
         initial = (running_max, denominator, output_tile)
         # One K/V block already returned through the stable body above.
@@ -2520,15 +2522,15 @@ def _windowed_attention(
 
             def swa_kv_body(carry, tiles):
                 running_max, denominator, output = carry
-                _, k_blk, v_blk, mask_blk = tiles
+                q_blk, k_blk, v_blk, mask_blk = tiles
                 # Match full SDPA: the scan walks K in cache order and
                 # materializes only the bounded, transposed tile required by
                 # the score matmul.
                 keys_t = k_blk.transpose(-1, -2).contiguous()
                 scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                    torch.ops.spyre.batched_matmul(q_blk, keys_t)
                     if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
+                    else torch.matmul(q_blk, keys_t)
                 )
                 scores = scores + mask_blk
 
@@ -2550,7 +2552,9 @@ def _windowed_attention(
                 new_output = output * correction.unsqueeze(-1) + weighted
                 return (new_max, new_denominator, new_output), None
 
-            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+            # The body reads the scaled Q as an operand: for_each_tile traces it
+            # without Dynamo, so a closed-over tensor would not be lifted.
+            kv_operands = (q_scaled, k_tile, v_tile, mask_tile)
             initial = (running_max, denominator, output_tile)
             if tiling.num_kv_blocks == 1:
                 (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
