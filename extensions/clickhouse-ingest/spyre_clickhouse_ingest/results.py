@@ -71,6 +71,7 @@ from spyre_clickhouse_ingest.options import (
     add_artifact_options,
     artifact_options,
     artifact_spec,
+    ci_tags,
 )
 from spyre_clickhouse_ingest.registry import MISC, tag_families
 from spyre_clickhouse_ingest.resolver import (
@@ -1333,10 +1334,27 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     )
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
+    if _opt(args, "capability_legs_only"):
+        # The leg's own tier is another writer's (the orchestrator's) on the same run_id.
+        own = _opt(args, "trigger_type").strip()
+        admitted = [
+            a
+            for a in admitted
+            if a[1] in schema_model.CAPABILITY_TYPE_VALUES and a[1] != own
+        ]
+        if not admitted:
+            return True
     if not (admitted or _opt(args, "artifact")):
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
         return True
     options = artifact_options(args)
+    options["tags"] += ci_tags(
+        *(
+            _opt(args, k)
+            for k in ("ci_event", "repository", "branch", "sha", "pr_number")
+        ),
+        day=_opt(args, "tag_date"),
+    )
     # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
     kept, args.misc_tags = [], []
     for tag in options["tags"]:
@@ -1448,6 +1466,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
+    parser.add_argument(
+        "--capability-legs-only",
+        action="store_true",
+        help="Write only the capability-typed artifact_results legs (model_ops, ...) other than "
+        "--trigger-type's: for a Jenkins leg whose own verdict the orchestrator writes under "
+        "the same run_id.",
+    )
+    parser.add_argument(
+        "--ci-event",
+        default="",
+        help="The CI event that built the leg's artifact (push | pull_request | schedule | ...); "
+        "tags it as options.ci_tags() spells, beside any --tag.",
+    )
     parser.add_argument(
         "--jenkins-run-key",
         default="",

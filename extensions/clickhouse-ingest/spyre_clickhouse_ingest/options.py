@@ -158,6 +158,29 @@ def add_artifact_options(
     return g
 
 
+def ci_tags(
+    event: str, repository: str, branch: str, sha: str, pr_number, day=None
+) -> list:
+    """The (tag, family) pairs an artifact built by this CI event carries, spelled as Jenkins
+    tags its own builds: `<repo>@<sha12>` (main) for a push to main, plus `nightly-<day>`
+    (nightly) for a scheduled run of main; `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (pr) for a
+    pull request; none for any other event."""
+    name, sha12 = (repository or "").rstrip("/").rsplit("/", 1)[-1], (sha or "")[:12]
+    pr = str(pr_number or "").strip()
+    if not (name and len(sha12) == 12):
+        return []
+    if event == "pull_request" and pr not in ("", "0"):
+        return [(f"{name}#{pr}", "pr"), (f"{name}#{pr}@{sha12}", "pr")]
+    if event in ("push", "schedule") and branch == "main":
+        pin = [(f"{name}@{sha12}", "main")]
+        return (
+            pin + [(f"nightly-{day}", "nightly")]
+            if event == "schedule" and day
+            else pin
+        )
+    return []
+
+
 def artifact_spec(args) -> str:
     """--artifact, else --artifact-id as a spec: a `|` record is gha:, a bare id stays one."""
     if getattr(args, "artifact", ""):
