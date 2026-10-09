@@ -671,10 +671,12 @@ def normalize_coordinates(
         #   so divide it by ``num`` -- leaving it inflates the dim, and with it
         #   every outer stride (issue #4050: output row l read input row 2*l).
         #   With several terms the split loop already sized it in iterations.
-        # - a residual constant offset below the stride (``2*d1 + 1``) selects
-        #   the position inside the gap.  Like any other constant offset on a
-        #   non-stick dim it needs a variable to hang off, so mint a synthetic
-        #   size-1 variable the same way the elided-dimension case above does.
+        # - the gap dim is a non-stick dim of size > 1 whose coordinate is the
+        #   constant residual offset below the stride (``1`` for ``2*d1 + 1``,
+        #   ``0`` for ``2*d1``).  Like the elided-dimension case above, it needs
+        #   a synthetic size-1 variable to hang off even when the offset is 0:
+        #   a variable-free gap dim is misaddressed by the backend, which then
+        #   reads a tiled ``[sticks, rows, 64]`` source in row-major order.
         #
         # The stick dim (last coordinate) is left alone: within-stick strides
         # are not representable and are rejected downstream.
@@ -689,21 +691,18 @@ def normalize_coordinates(
                         f"{dim_size} in steps of {stride}, which does not divide it"
                     )
                 inner.dim_size //= stride
-            if residual_offset == 0:
-                terms.append(Term(None, None, None, None, stride))
-            else:
-                var = synthetic_var_fn()
-                var_ranges[var] = 1
-                terms.append(
-                    Term(
-                        sympy.S.One,
-                        sympy.S.One,
-                        var,
-                        sympy.S.One,
-                        stride,
-                        residual_offset,
-                    )
+            var = synthetic_var_fn()
+            var_ranges[var] = 1
+            terms.append(
+                Term(
+                    sympy.S.One,
+                    sympy.S.One,
+                    var,
+                    sympy.S.One,
+                    stride,
+                    residual_offset,
                 )
+            )
         elif residual_offset != 0:
             # Only a within-stick stride can get here (``2*d + 1`` on the stick
             # dim); there is no gap dim to place the residual in.

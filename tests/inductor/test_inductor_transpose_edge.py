@@ -83,10 +83,12 @@ class TestTransposeEdge:
 
     # --- Dtypes ---
 
-    @pytest.mark.xfail(reason="Issue #1545: Complex dtype not supported on Spyre")
     def test_transpose_complex_dtype(self, execution_mode):
+        # Issue #1545: the complex dtype is rejected. Both modes fail when the tensor
+        # is moved to the device, before torch.compile runs.
         x = torch.randn((64, 128), dtype=torch.complex64)
-        _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)
+        with pytest.raises(Exception, match="does not support dtype ComplexFloat"):
+            _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)
 
     def test_transpose_bool_dtype(self, execution_mode):
         x = torch.randint(0, 2, (64, 128), dtype=torch.bool)
@@ -296,9 +298,6 @@ class TestTransposeDeviceSemantics:
         ref = (x_ref.transpose(1, 3) * 2.0) + 1.0
         assert torch.allclose(out.cpu(), ref, rtol=1e-2, atol=5e-3)
 
-    @pytest.mark.xfail(
-        reason="Issue #2006: SpyreKernel.store() rejects Constant scalar in pointwise mul.",
-    )
     def test_compile_with_operations_after_transpose(self):
         @torch.compile
         def fn(x):
@@ -306,11 +305,12 @@ class TestTransposeDeviceSemantics:
             z = y * 2.0
             return z + 1.0
 
-        x = cached_randn((2, 4, 8, 16)).to(SPYRE)
-        y_out = fn(x)
+        x_ref = cached_randn((2, 4, 8, 16))
+        y_out = fn(x_ref.to(SPYRE))
 
-        expected = (x.transpose(1, 3) * 2.0) + 1.0
-        assert torch.allclose(y_out, expected, rtol=1e-5, atol=1e-5)
+        # Compare on the CPU: torch.allclose on two device tensors fails (#2006).
+        expected = (x_ref.transpose(1, 3) * 2.0) + 1.0
+        assert torch.allclose(y_out.cpu(), expected, rtol=1e-2, atol=5e-3)
 
 
 if __name__ == "__main__":

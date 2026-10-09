@@ -162,6 +162,7 @@ SPYRE_FP32_OPS = [
     "to_dtype",
     "maximum",
     "minimum",
+    "clip",
     "greaterthan",
     "greaterequal",
     "lesserthan",
@@ -180,6 +181,9 @@ SPYRE_INT32_OPS = [
     "add",
     "mul",
 ]
+
+# DLFloat16's largest finite value (0x7FFE); 0x7FFF is NaN-Infinity.
+DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)
 
 # FP8 E4M3 numeric limits
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)

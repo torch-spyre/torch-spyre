@@ -2859,6 +2859,11 @@ def _divide_ranges(
     # get_read_writes() result (pass_utils.op_read_writes) is stale
     # regardless of which capture path (if any) runs below -- invalidate
     # unconditionally rather than only inside the symbol-remap branch.
+    # That disagreement is unreachable when coarse tiling runs
+    # pre-stickification (nothing has populated the memo yet), but the
+    # solver-driven path applies tilings *during* scratchpad planning, after
+    # the first solve has memoized every op -- where it surfaced as
+    # ``coarse_tile_local_dim_split_domains``'s extent assertion.
     invalidate_op_read_writes(op)
 
     symbol_remap = None
@@ -2917,8 +2922,15 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
+    # The real strides, not the contiguous ones of the two sizes: this op may
+    # write its output in a permuted order, and its stride_map follows that.
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=[int(s) for s in old_stride],
+        new_host_stride=[int(s) for s in layout.stride],
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
@@ -4270,11 +4282,16 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            # The tile's real strides and the full buffer's, as _divide_ranges
+            # passes them the other way: a tile written in a permuted order
+            # grows back along the dims it was shrunk on.
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(s) for s in orig_layout.stride],
+                new_host_stride=[int(s) for s in strides],
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that

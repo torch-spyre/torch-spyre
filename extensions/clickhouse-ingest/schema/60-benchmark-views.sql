@@ -13,7 +13,10 @@ SELECT
     b.props['config_name']  AS config_name,
     b.props['input_shapes'] AS input_shapes,
     b.props['run_mode']     AS run_mode,
-    b.props['kernel_name']  AS kernel_name,
+    -- The stable label of a compiled kernel (props['kernel_key']); raw_kernel_name is this run's
+    -- compile, whose token changes on every recompile.
+    if(b.props['kernel_key'] != '', b.props['kernel_key'], b.props['kernel_name']) AS kernel_name,
+    if(r.props['kernel_name'] != '', r.props['kernel_name'], b.props['kernel_name']) AS raw_kernel_name,
     -- measurements is Map(String, Array(Float64)) on the table (every sample); reduced to one
     -- value per metric here, under the same name, so every view below addresses scalars.
     -- arrayAvg, not samples[1], which would depend on harness ordering.
@@ -133,3 +136,57 @@ SELECT
 FROM v_benchmark_results_enriched
 ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
 GROUP BY day, benchmark_id, name, component, backend, arch, metric;
+
+-- One row per (benchmark run, tag its artifact holds now): which image a perf number came from,
+-- for filtering and comparing by tag. tag is '' for an untagged artifact; a run with no
+-- performance verdict has no artifact and is absent. Tags resolve as v_tag_resolution does, so a
+-- dated tag moved to a rebuild leaves its old artifact's runs.
+CREATE VIEW IF NOT EXISTS v_benchmark_run_artifacts AS
+SELECT
+    r.run_id                                                             AS run_id,
+    r.component                                                          AS component,
+    if((if(r.arch != '', r.arch, ar.arch) AS raw_arch) IN ('amd64', 'x86', 'x86-64'),
+       'x86_64', raw_arch)                                               AS arch,
+    r.run_ts                                                             AS run_ts,
+    ar.run_url                                                           AS run_url,
+    ar.artifact_id                                                       AS artifact_id,
+    a.component                                                          AS artifact_component,
+    a.artifact_name                                                      AS artifact_name,
+    if(a.props['id12'] != '', a.props['id12'],
+       left(replaceAll(toString(ar.artifact_id), '-', ''), 12))          AS artifact_id12,
+    -- name@digest when a digest was recorded, else the pullspec; '' for a GHA in-run build.
+    multiIf(ifNull(i.digest, '') != '',
+            concat(replaceRegexpOne(i.pullspec, ':[^:/]+$', ''), '@', i.digest),
+            ifNull(i.pullspec, '') != '', i.pullspec,
+            a.props['ref'])                                              AS image,
+    ifNull(i.digest, '')                                                 AS image_digest,
+    ifNull(t.tag, '')                                                    AS tag,
+    ifNull(t.tag_family, '')                                             AS tag_family
+FROM
+(
+    SELECT run_id, any(component) AS component, any(props['arch']) AS arch, min(ts) AS run_ts
+    FROM benchmark_runs
+    GROUP BY run_id
+) AS r
+-- One artifact per run, the latest verdict's, as v_benchmark_results_enriched picks it.
+INNER JOIN
+(
+    SELECT run_id,
+           argMax(artifact_id, (ts, audit_timestamp))      AS artifact_id,
+           argMax(arch, (ts, audit_timestamp))             AS arch,
+           argMax(props['run_url'], (ts, audit_timestamp)) AS run_url
+    FROM artifact_results
+    WHERE result_kind = 'performance'
+    GROUP BY run_id
+) AS ar USING (run_id)
+INNER JOIN v_artifacts AS a ON a.artifact_id = ar.artifact_id
+LEFT JOIN
+(
+    SELECT artifact_id,
+           argMax(ref, ts)                                     AS pullspec,
+           argMaxIf(content_digest, ts, content_digest != '') AS digest
+    FROM artifact_refs
+    WHERE ref_kind = 'pullspec'
+    GROUP BY artifact_id
+) AS i ON i.artifact_id = ar.artifact_id
+LEFT JOIN v_tag_resolution AS t ON t.artifact_id = ar.artifact_id;

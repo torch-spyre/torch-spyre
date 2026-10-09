@@ -56,8 +56,8 @@ the source level.
 ## `for_each_tile`: an explicit, co-indexed tiling loop
 
 `for_each_tile` is `scan` with the tiling made explicit: **one co-indexed loop
-level** that reduces every operand to a per-step tile — a narrow view, a whole
-invariant, or a gathered pool row — threads an optional carry, and optionally
+level** that reduces every operand to a per-step tile (a narrow view, a whole
+invariant, or a gathered pool row), threads an optional carry, and optionally
 lays each step's result tile back into a full-size output along one axis.
 
 ```python
@@ -115,8 +115,30 @@ per the `dims` entry:
 that a purely elementwise tiling doesn't need: `init` threads a **carry**
 (e.g. a running accumulator) from one step to the next, and `out_dim` lays
 each step's output tile back into the correct slice of a full-size result.
-Either can be `None` independently — a pure reduction has no `out_dim`; a
+Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
+loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
+`1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).
+Invalid values raise an error.
+
+Python callers can override the resolved setting during compilation:
+
+```python
+from torch_spyre._inductor import config
+
+with config.patch(backend_loop_unroll=False):
+    result = compiled_model(inputs)  # First call triggers compilation.
+```
+
+The resolved boolean is included in the kernel cache key and passed explicitly
+to each compile worker as `dbo-opt --enable-loop-unroll=0` or `1`. Equivalent
+environment spellings share a cache key; changing the effective setting cannot
+reuse an artifact compiled with the other setting. This controls the SDSC-bundle
+frontend only, not the direct `--from-ktir` path or every loop optimization.
+Preserving device loops requires autopilot; Deeptools rejects disabling unrolling
+with `DT_OPT=autopilot=0`.
 
 For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable
@@ -127,12 +149,12 @@ The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
 a plan only if its resident floor fits in LX: the two co-live score tiles
 (the QK^T output and its exponentials), plus the scaled query, output carry,
 and per-block P@V for a multi-block scan. A spilled score costs far more than
-its HBM bytes, so such plans are rejected rather than priced. It also rejects
-plans the compiler cannot build: more than two nested maps, or more than 1024
-unrolled tile iterations (the backend unrolls every loop). If those limits
-leave no plan whose floor fits, it takes the buildable plan that spills the
-fewest score tiles; coarse tiling remains only for shapes with no buildable
-plan. Overflow above the floor is not charged: across the measured plans it
+its HBM bytes, so such plans are rejected rather than priced. The selector also
+limits compilation to two nested maps and 1024 tile iterations, guarding against
+excessive default loop unrolling. If those limits leave no plan whose floor fits,
+it takes the buildable plan that spills the fewest score tiles; coarse tiling
+remains only for shapes with no buildable plan. Overflow above the floor is not
+charged: across the measured plans it
 had no measurable cost. The admitted plans are ranked by predicted device time
 from four measured terms: a fixed cost per outer map tile, an extra cost per
 tile when the plan splits query rows, the query-shaped carry each K/V scan
@@ -184,7 +206,7 @@ returned `[1024, 4096]` output.
 
 This is the same tiling shape as the
 [Small Example](coarse_tiling_loops.md#small-example) in the companion
-document — a single loop, `y = a + b` then `z = y * c` — and it lowers to the
+document (a single loop, `y = a + b` then `z = y * c`) and it lowers to the
 same downstream mechanism (`loop_info: CoarseTileInfo`, a `CountedLoopSchedulerNode`,
 a `LoopSpec`). `docs/tools/capture_for_each_tile_ir.py` regenerates the real,
 captured IR/OpSpec/`bundle.mlir` for this exact example, which the
@@ -219,7 +241,7 @@ The compiler's lowering pipeline (see [Layer 1's Prove → Splice → Identify �
 Stamp
 sequence](coarse_tiling_loops.md#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info))
 runs to a fixed point over nested `for_each_tile`/`while_loop` structures, so
-this composition is handled uniformly rather than as a special case — see
+this composition is handled uniformly rather than as a special case. See
 that section for how a two-level nest like this ends up with a two-entry
 `loop_group_id` on the innermost ops, analogous to the Small Example's
 `(0, 0)`.
@@ -235,15 +257,15 @@ Inductor as an `ir.WhileLoop` (`scan`'s own lowering), not as a distinct
 "tiling loop" IR node in its own right.
 
 The Spyre backend's job is then to recognize which `ir.WhileLoop`s are
-provably bounded, tile-shaped loops — as opposed to genuinely
-data-dependent `while_loop`s, which stay as `ir.WhileLoop` — and rewrite them
+provably bounded, tile-shaped loops (as opposed to genuinely
+data-dependent `while_loop`s, which stay as `ir.WhileLoop`) and rewrite them
 into a `loop_info`-carrying representation. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1--pre-scheduling-ir-pass),
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
 which covers everything past "a run of ops carries a `loop_info:
-CoarseTileInfo`" — the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
+CoarseTileInfo`": the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
 and the `LoopSpec` codegen tree (Layer 3).
 
 `splice_while_loops` runs in `CustomPreSchedulingPasses`, before dead-code
@@ -277,9 +299,9 @@ and spills to HBM. With WSR, each tile of `y` lives in LX scratchpad for the
 duration of one iteration and is consumed immediately by the next op.
 :::
 
-The full mechanics — how loop identity is carried through Inductor's
+The full mechanics (how loop identity is carried through Inductor's
 flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
-buffers crossing the loop boundary are classified — are documented in
+buffers crossing the loop boundary are classified) are documented in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md).
 
 A buffer that crosses the loop boundary and has a non-empty
@@ -293,20 +315,20 @@ spans every tile the buffer occupies across the loop; sizing it for a single
 tile would let the loop overrun into whatever buffer the allocator packed
 next to it. A buffer whose `output_tiled_dims`/`tiled_dims_per_read` entries
 are empty at every level, by contrast, never advances and is a candidate for
-a fixed-address LX scratchpad slot instead — see
+a fixed-address LX scratchpad slot instead. See
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
 `accum_tile` buffers this distinction matters most for.
 
 ## Related documents
 
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md) — implementation
+- [`coarse_tiling_loops.md`](coarse_tiling_loops.md): implementation
   reference for the transformation stage (Layer 1 IR pass, Layer 2
   scheduler wrapper, Layer 3 codegen tree) that turns `for_each_tile`'s
   `loop_info` into an executable tiled loop nest.
 - [RFC 1358: Coarse-Tiling Loop IR Design
   Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
   which explains the reasoning behind the three-layer design.
-- [`scratchpad_planning.md`](scratchpad_planning.md) — how LX scratchpad
+- [`scratchpad_planning.md`](scratchpad_planning.md): how LX scratchpad
   allocation consumes the per-tile iteration spaces produced by WSR.
-- [`work_division_planning.md`](work_division_planning.md) — how work
+- [`work_division_planning.md`](work_division_planning.md): how work
   distribution across cores runs after WSR on the reduced ranges.

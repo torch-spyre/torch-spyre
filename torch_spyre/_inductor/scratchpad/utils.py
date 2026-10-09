@@ -14,6 +14,7 @@
 
 
 import math
+from collections.abc import Mapping
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -107,6 +108,38 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def counted_loop_group_path(op: Operation) -> tuple[int, ...]:
+    """The counted-loop group path ``op`` runs in, outermost first; ``()`` if none.
+
+    Mirrors scheduler._loop_group_id: only SchedulerNodes join a counted loop.
+    An extern kernel keeps its loop_info (e.g. a loop-body constant that
+    dedup_and_promote_constants hoisted to the graph head) but runs once,
+    outside the loop.
+    """
+    if isinstance(op, ExternKernel):
+        return ()
+    return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+
+def counted_loop_entry(
+    operations: list[Operation], op: Operation
+) -> Optional[Operation]:
+    """First operation of the outermost counted loop that ``op`` runs in.
+
+    ``None`` when ``op`` is not a counted-loop member.  "First" is the same
+    textual position :func:`counted_loop_lifetime_overrides` uses as that loop's
+    start, so a value placed immediately before the returned operation is
+    inside the interval those overrides already reserve for a value born
+    outside the loop and read inside it.
+    """
+    outer = counted_loop_group_path(op)[:1]
+    if not outer:
+        return None
+    return next(
+        (o for o in operations if counted_loop_group_path(o)[:1] == outer), None
+    )
+
+
 def counted_loop_lifetime_overrides(
     graph: GraphLowering,
 ) -> tuple[dict[str, int], dict[str, int]]:
@@ -123,14 +156,7 @@ def counted_loop_lifetime_overrides(
     their ordinary per-iteration lifetimes.
     """
 
-    def group_path(op: Operation) -> tuple[int, ...]:
-        # Mirror scheduler._loop_group_id: only SchedulerNodes join a counted
-        # loop. An extern kernel keeps its loop_info (e.g. a loop-body constant
-        # that dedup_and_promote_constants hoisted to the graph head) but runs
-        # once, outside the loop.
-        if isinstance(op, ExternKernel):
-            return ()
-        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+    group_path = counted_loop_group_path
 
     loop_start: dict[tuple[int, ...], int] = {}
     loop_end: dict[tuple[int, ...], int] = {}
@@ -555,7 +581,9 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering, cache: Optional[dict] = None
+    graph: GraphLowering,
+    cache: Optional[dict] = None,
+    drained_readers: Optional[Mapping[str, str]] = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -570,12 +598,19 @@ def get_ncores_for_buffers(
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
+
+    ``drained_readers`` maps a loop-carry storage to the collective that a
+    validated drain plan will repoint at the post-loop drain.  The judge runs
+    before that rewrite, so that collective's use is not one of the storage's.
     """
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
+        drained_reader = (drained_readers or {}).get(buf_name)
+        if drained_reader is not None:
+            users = [(op, dep) for op, dep in users if op.get_name() != drained_reader]
         layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
         if is_empty_tiled_layout(layout):
             # Reject before the unsplit whole-buffer view shortcut and before

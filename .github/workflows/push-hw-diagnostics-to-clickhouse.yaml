@@ -61,13 +61,28 @@ jobs:
             .github/actions
           sparse-checkout-cone-mode: false
 
-      # tier is a run_id hash input, so it must be push-to-clickhouse.yaml's "Extract suite tier"
+      # tier is a run_id hash input, so it must be push-to-clickhouse.yaml's "Resolve suite tier"
       # rule verbatim or these rows never join that run's cases. Empty there means the case
       # ingest wrote no v2 rows, so the workflow name keeps these rows writable.
-      - name: Extract suite tier from display title
+      - name: Recover suite tier
+        id: test-type
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          artifact-name: test-type
+          label: Suite tier
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve suite tier
         id: extract-tier
+        env:
+          TIER_ARTIFACT: ${{ steps.test-type.outputs.value }}
         run: |
-          TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          TIER=""
+          if [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
+            TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/^[a-z_-]* (\([a-z_-]*\))$/\1/p')
+          fi
+          TIER="${TIER:-${TIER_ARTIFACT}}"
           echo "Resolved tier: ${TIER:-<none>, using ${TRIGGERING_WORKFLOW}}"
           echo "tier=${TIER:-${TRIGGERING_WORKFLOW}}" >> "${GITHUB_OUTPUT}"
 

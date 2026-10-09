@@ -158,6 +158,127 @@ class TestSpyreProfiler(TestCase):
                 msg="Recovered Chrome trace ts doesn't match Json for aten::add",
             )
 
+    @pytest.mark.requires_spyre_profiler
+    @unittest.skipUnless(Test_spyre, "requires spyre device")
+    def test_no_zero_timestamp_or_duration(self) -> None:
+        """Verify no Chrome trace event has ts == 0 or dur == 0 for a large matmul workload."""
+
+        device = torch.device("spyre")
+        M, K, N = 1024, 2048, 1024
+
+        # Keep source tensors on CPU so the profiled region can include explicit
+        # HtoD transfers that must appear in the Chrome trace.
+        a_cpu = torch.randn(M, K, dtype=torch.float16)
+        b_cpu = torch.randn(K, N, dtype=torch.float16)
+
+        # Separate warmup inputs are moved to Spyre before profiling so the
+        # first profiled call measures runtime activity rather than compilation.
+        a_warmup = a_cpu.to(device)
+        b_warmup = b_cpu.to(device)
+
+        def large_matmul(a, b):
+            return torch.matmul(a, b)
+
+        compiled_fn = torch.compile(large_matmul, backend="inductor")
+        # Warm up outside the profiled region to avoid compile-time activity in
+        # the trace we validate below.
+        compiled_fn(a_warmup, b_warmup)
+        # Spyre execution is asynchronous, so drain warmup work before the
+        # profiled region starts.
+        torch.spyre.synchronize()
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        ) as prof:
+            # Move inputs during profiling so HtoD memcpy events are required in
+            # the exported trace.
+            a = a_cpu.to(device)
+            b = b_cpu.to(device)
+            output = compiled_fn(a, b)
+            # Force memset activity in the profiled region.
+            scratch = torch.zeros((M, N), dtype=torch.float16, device=device)
+            # Move the result back to CPU during profiling so DtoH memcpy events
+            # are also required in the exported trace.
+            output.cpu()
+            # Drop a temporary device allocation in the profiled region so a
+            # memory release event can be emitted before export.
+            del scratch
+            # Flush device work before the profile closes so async events land in
+            # the trace before export.
+            torch.spyre.synchronize()
+
+        with TemporaryFileName(mode="w+") as trace_path:
+            prof.export_chrome_trace(trace_path)
+
+            with open(trace_path) as f:
+                data = json.load(f)
+
+            self.assertIn("traceEvents", data, "Chrome trace is missing 'traceEvents'")
+            trace_events = data["traceEvents"]
+            self.assertTrue(trace_events, "No trace events in trace")
+
+            # Require Spyre event categories and validate their timing fields.
+            memcpy_events = [e for e in trace_events if e.get("cat") == "gpu_memcpy"]
+            htod_events = [e for e in memcpy_events if "HtoD" in e.get("name", "")]
+            dtoh_events = [e for e in memcpy_events if "DtoH" in e.get("name", "")]
+            self.assertTrue(htod_events, "Expected at least one HtoD memcpy event")
+            self.assertTrue(dtoh_events, "Expected at least one DtoH memcpy event")
+
+            def has_invalid_timing(event):
+                return event.get("ts") in (0, None) or event.get("dur") in (0, None)
+
+            htod_invalid = [e for e in htod_events if has_invalid_timing(e)]
+            dtoh_invalid = [e for e in dtoh_events if has_invalid_timing(e)]
+            self.assertFalse(
+                htod_invalid,
+                f"{len(htod_invalid)} HtoD memcpy event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in htod_invalid),
+            )
+            self.assertFalse(
+                dtoh_invalid,
+                f"{len(dtoh_invalid)} DtoH memcpy event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_invalid),
+            )
+
+            memset_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "gpu_memset" and e.get("name") == "Memset (Device)"
+            ]
+            self.assertTrue(memset_events, "Expected at least one device memset event")
+            memset_invalid = [e for e in memset_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memset_invalid,
+                f"{len(memset_invalid)} memset event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memset_invalid),
+            )
+
+            memrelease_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "privateuse1_driver"
+                and e.get("name") == "Memory (Release)"
+            ]
+            self.assertTrue(
+                memrelease_events, "Expected at least one memory release event"
+            )
+            memrelease_invalid = [e for e in memrelease_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memrelease_invalid,
+                f"{len(memrelease_invalid)} memory release event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memrelease_invalid),
+            )
+
+            # Require kernel events and validate their timing fields
+            kernel_events = [e for e in trace_events if e.get("cat") == "kernel"]
+            self.assertTrue(kernel_events, "Expected at least one kernel event")
+            kernel_invalid = [e for e in kernel_events if has_invalid_timing(e)]
+            self.assertFalse(
+                kernel_invalid,
+                f"{len(kernel_invalid)} kernel event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in kernel_invalid),
+            )
+
 
 def test_package_importable():
     """
@@ -359,6 +480,17 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(
             )
             assert all(isinstance(handle_id, str) for handle_id in debug_handles)
             assert debug_handles == list(descriptor.debug_handle_ids)
+            # Raw 32-bit device timestamps TS1..TS5. Raw ordering is not
+            # asserted: the counter wraps and unfilled slots read 0.
+            cycles_ts = args.get("cycles_ts")
+            assert isinstance(cycles_ts, list), (
+                "args.cycles_ts must be a JSON array, not a quoted string"
+            )
+            assert len(cycles_ts) == 5
+            assert all(
+                isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts
+            )
+            assert any(cycles_ts), "all-zero kernel cycles_ts: counters failed"
 
     def lineage(handle):
         yield handle
@@ -455,6 +587,22 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, (
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
+
+    # Memcpy events carry cycles_ts only when the record has counters; flex
+    # currently reports every DMA without them, so today the key is absent.
+    # Either way, an emitted array must be valid and never all zero.
+    for e in h2d_events + d2h_events:
+        cycles_ts = e.get("args", {}).get("cycles_ts")
+        if cycles_ts is None:
+            continue
+        assert isinstance(cycles_ts, list), (
+            "args.cycles_ts must be a JSON array, not a quoted string"
+        )
+        assert len(cycles_ts) == 5
+        assert all(isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts)
+        assert any(cycles_ts), "memcpy cycles_ts emitted with all slots zero"
+    for e in memset_events:
+        assert "cycles_ts" not in e.get("args", {}), "memset never carries cycles_ts"
 
 
 @pytest.mark.requires_spyre_profiler

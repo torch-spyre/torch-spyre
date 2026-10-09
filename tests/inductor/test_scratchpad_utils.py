@@ -170,6 +170,38 @@ class ExternalOperandTest(TestCase):
                     self.assertEqual(views, {})
                     project.assert_not_called()
 
+    def test_a_drained_collective_is_not_a_user_of_the_carry(self):
+        """A drain plan repoints this collective at a post-loop copy, so the
+        carry it still reads before the push is judged by its other users."""
+        graph = SimpleNamespace(try_get_buffer=lambda name: None)
+        writer = mock.Mock(iteration_space_ownership=None)
+        writer.get_name.return_value = "writer"
+        collective = mock.Mock(spec=ExternKernel)
+        collective.get_name.return_value = "all_reduce"
+        write = mock.sentinel.write
+        view = SimpleNamespace(work_slice_dims=[], same_partition=lambda _: True)
+        utils = "torch_spyre._inductor.scratchpad.utils"
+        for drained, cores in ((None, -1), ({_BUF: "all_reduce"}, 1)):
+            with (
+                self.subTest(drained=drained),
+                mock.patch(
+                    f"{utils}._get_buffer_user_deps",
+                    return_value={_BUF: [(writer, write), (collective, None)]},
+                ),
+                mock.patch(
+                    f"{utils}._per_core_view_on_buf", return_value=(view, False, True)
+                ),
+                mock.patch(
+                    f"{utils}.op_read_writes",
+                    return_value=SimpleNamespace(writes={write}),
+                ),
+            ):
+                counts, _reasons, views = get_ncores_for_buffers(
+                    graph, drained_readers=drained
+                )
+                self.assertEqual(counts, {_BUF: cores})
+                self.assertEqual(_BUF in views, drained is not None)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,6 +80,49 @@ def capability_declaration(case: dict) -> tuple:
     return decl, ""
 
 
+class DryRunClient:
+    """A dry run's client: reads reach the database (none: nothing recorded), writes are kept."""
+
+    READS = ("SELECT", "WITH", "EXISTS", "SHOW", "DESCRIBE", "DESC", "EXPLAIN")
+
+    def __init__(self, client=None):
+        # rows: table -> would-be rows; counts: database-qualified, as v1 and v2 share names.
+        self.client, self.rows, self.counts, self.statements = client, {}, {}, []
+
+    def _is_read(self, sql: str) -> bool:
+        return sql.lstrip().split(None, 1)[0].upper() in self.READS
+
+    def query(self, sql, *args, **kwargs):
+        if not self._is_read(sql):
+            self.statements.append(sql)
+            return _Rows([])
+        if self.client is not None:
+            return self.client.query(sql, *args, **kwargs)
+        return _Rows([(0,)] if "count()" in sql else [])
+
+    def command(self, sql, *args, **kwargs):
+        if not self._is_read(sql):
+            self.statements.append(sql)
+            return None
+        return self.client.command(sql, *args, **kwargs) if self.client else 0
+
+    def insert(self, table, rows, column_names=None, database=None, **kwargs):
+        self.rows.setdefault(table, []).extend(dict(zip(column_names, r)) for r in rows)
+        name = f"{database}.{table}" if database else table
+        self.counts[name] = self.counts.get(name, 0) + len(rows)
+
+    def report(self) -> str:
+        """What the run would have written: rows per table, then each other write."""
+        lines = [f"    {n:6} row(s) -> {t}" for t, n in sorted(self.counts.items())]
+        lines += ["    " + " ".join(s.split()[:3]) + " ..." for s in self.statements]
+        return "\n".join(lines) or "    nothing"
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.result_rows = rows
+
+
 class RunWriter:
     """Base for a writer over an (identity, fact) table pair."""
 
@@ -575,7 +618,7 @@ class BenchmarkWriter(RunWriter):
         ident_rows: dict[str, schema.BenchmarkRow] = {}
         facts: dict[tuple[str, str], schema.BenchmarkRunRow] = {}
         skipped = 0
-        for b in benchmarks:
+        for b in BenchmarkId.rank_kernels(component, benchmarks):
             name, tags = b.get("name", ""), b.get("tags") or []
             disc = b.get("disc") or {}
             bid = BenchmarkId.derive(
@@ -771,6 +814,19 @@ class ArtifactWriter:
         )
 
     @classmethod
+    def ref_recorded(cls, client, db: str, artifact_id: str, ref: str) -> bool:
+        """Does `artifact_refs` already hold this ref for this artifact?"""
+        return bool(ref) and (
+            cls.ref_table.count_rows(
+                client,
+                db,
+                "artifact_id = {artifact_id:UUID} AND ref = {ref:String}",
+                {"artifact_id": artifact_id, "ref": ref},
+            )
+            > 0
+        )
+
+    @classmethod
     def tag_recorded(cls, client, db: str, tag: str, artifact_id: str) -> bool:
         """Does this tag already point at this artifact? (Also a plain MergeTree.)"""
         return (
@@ -869,8 +925,8 @@ class ArtifactWriter:
             }
             cls.artifact_table.insert(client, [row], db=db)
         method, ref_kind = cls.ref_shape(identity.kind)
-        if identity.ref:
-            # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
+        # Checked, not left to the ReplacingMergeTree: unmerged repeats are read as duplicates.
+        if identity.ref and not cls.ref_recorded(client, db, aid, identity.ref):
             ref_row: schema.ArtifactRefRow = {
                 "artifact_id": aid,
                 "method": method,
@@ -1024,41 +1080,11 @@ class ArtifactWriter:
         base = DerivedId.norm(base_artifact_id)
         # aid == base means the leg ran the image UNCHANGED, so the artifact is the
         # one the orchestrator already recorded, and our own row would be a duplicate.
-        if aid != base and not cls.artifact_recorded(client, db, aid):
-            identity = ArtifactIdentity.from_gha(comp, base, installed, a)
-            # Keyed on the caller's id: the record it came from is the authority.
-            cls.artifact_table.insert(
-                client,
-                [
-                    {
-                        "artifact_id": aid,
-                        "component": comp,
-                        "arch": a,
-                        "kind": "image",
-                        # The hashed name, not a display string.
-                        "artifact_name": base,
-                        # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
-                        "origin": "built",
-                        "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"]
-                        if base
-                        else [],
-                        "context_deps": [],
-                        "sources": [(repo, git_ref, git_sha)]
-                        if (repo or git_ref or git_sha)
-                        else [],
-                        "props": cls._props(
-                            {
-                                # The digest GhaArtifactId put in the id12 slot.
-                                "id12": identity.id12,
-                                **dict(identity.inputs),
-                                "run_url": run_url,
-                                "source": "gha",
-                            }
-                        ),
-                    }
-                ],
-                db=db,
-            )
+        if aid != base:
+            cls.insert_gha_artifact(
+                client, db, aid, comp, base, installed, a,
+                sources=[(repo, git_ref, git_sha)], run_url=run_url,
+            )  # fmt: skip
         return cls.insert_result(
             client,
             db,
@@ -1072,6 +1098,41 @@ class ArtifactWriter:
             props={"run_url": run_url, "source": "gha"},
             attempt=attempt,
         )
+
+    @classmethod
+    def insert_gha_artifact(
+        cls, client, db: str, aid: str, component: str, base: str, installed: str, arch: str,
+        *, sources=(), run_url: str = "",
+    ) -> bool:  # fmt: skip
+        """Record a GHA leg's delta on `base` once, keyed on the caller's id (the record it came
+        from is the authority); True when a row was written."""
+        if cls.artifact_recorded(client, db, aid):
+            return False
+        identity = ArtifactIdentity.from_gha(component, base, installed, arch)
+        row: schema.ArtifactRow = {
+            "artifact_id": aid,
+            "component": DerivedId.norm(component),
+            "arch": DerivedId.arch(arch),
+            "kind": "image",
+            # The hashed name, not a display string.
+            "artifact_name": base,
+            # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
+            "origin": "built",
+            "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"] if base else [],
+            "context_deps": [],
+            "sources": [tuple(s) for s in sources if any(s)],
+            "props": cls._props(
+                {
+                    # The digest GhaArtifactId put in the id12 slot.
+                    "id12": identity.id12,
+                    **dict(identity.inputs),
+                    "run_url": run_url,
+                    "source": "gha",
+                }
+            ),
+        }
+        cls.artifact_table.insert(client, [row], db=db)
+        return True
 
     @staticmethod
     def _props(values: dict) -> dict:

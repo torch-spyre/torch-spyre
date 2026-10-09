@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 import copy
 import functools
 import hashlib
-import json
 from pathlib import Path
-import shutil
 import subprocess
 from unittest.mock import patch as mock_patch
 import torch
@@ -28,6 +27,10 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
 import unittest
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.work_division import OpSplitSpace
 
 DEVICE = torch.device("spyre")
 
@@ -490,6 +493,39 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
+def _check_expect_fail_unstable(prefix, cases):
+    """Validate the ``expect_fail_unstable`` entries of one PARAMS item."""
+    entries = cases.get("expect_fail_unstable", {})
+    ops = cases.get("ops_dict") or {}
+    generated = set(cases["param_sets"]) | {
+        f"{op}_{case}" for op in ops for case in cases["param_sets"]
+    }
+    for key, reason in entries.items():
+        assert reason and reason.strip(), (
+            f"{prefix}: expect_fail_unstable entry {key!r} needs a reason"
+        )
+        assert key in generated, (
+            f"{prefix}: expect_fail_unstable entry {key!r} matches no generated test"
+        )
+        for other in ("expect_fail", "skip", "device_fault", "expect_raise"):
+            assert key not in cases.get(other, ()), (
+                f"{prefix}: {key!r} is in both expect_fail_unstable and {other}"
+            )
+
+
+def _expect_raise_test(test, fragment):
+    """Wrap a generated test so it passes only if it raises with ``fragment``."""
+
+    @functools.wraps(test)
+    def raising(self):
+        with pytest.raises(Exception, match=fragment):
+            test(self)
+
+    # Marks the test for test_inductor_ops_lx_planning.py, which does not wrap it.
+    raising._expects_raise = True
+    return raising
+
+
 class ParameterizedTestMeta(type):
     def __new__(mcs, name, bases, namespace):
         param_map = namespace.get("PARAMS", {})
@@ -503,9 +539,35 @@ class ParameterizedTestMeta(type):
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
             expect_fail = cases.get("expect_fail", [])
+            # {case or "<op>_<case>": reason}: a non-strict xfail, for a case that
+            # fails but is known to pass on some runs. A strict xfail that passes
+            # fails the run, which would make such a case a flaky failure.
+            expect_fail_unstable = cases.get("expect_fail_unstable", {})
+            _check_expect_fail_unstable(test_name_prefix, cases)
             skip_list = cases.get("skip", [])
             # {case: reason}: an xfail still runs on the card, so a case that faults it is skipped.
             device_fault = cases.get("device_fault", {})
+            # {case or "<op>_<case>": fragment}: a negative test. The body must raise,
+            # and the message must match the fragment, so a case that stops raising,
+            # or raises for another reason, fails.
+            expect_raise = cases.get("expect_raise", {})
+            used_expect_raise = set()
+            # The fragment is what separates "rejected for the documented reason" from
+            # "failed some other way": "" matches any exception, None is a bare raise.
+            for key, fragment in expect_raise.items():
+                assert isinstance(fragment, str) and fragment.strip(), (
+                    f"{test_name_prefix}: expect_raise[{key!r}] needs a non-empty "
+                    "message fragment"
+                )
+            for overlap, other in (
+                (expect_fail, "expect_fail"),
+                (skip_list, "skip"),
+                (device_fault, "device_fault"),
+            ):
+                both = set(expect_raise) & set(overlap)
+                assert not both, (
+                    f"{test_name_prefix}: {sorted(both)} in both expect_raise and {other}"
+                )
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -539,6 +601,29 @@ class ParameterizedTestMeta(type):
                             namespace[test_name] = pytest.mark.skip(
                                 reason=f"Skipped for {marked}"
                             )(namespace[test_name])
+                        elif test_case in expect_raise or op_case in expect_raise:
+                            marked = op_case if op_case in expect_raise else test_case
+                            # A bare key covers every op, so compare per test, not just
+                            # the raw keys: expect_raise={"c"} and expect_fail=["a_c"]
+                            # would otherwise lose the xfail silently.
+                            assert (
+                                test_case not in expect_fail
+                                and op_case not in expect_fail
+                            ), (
+                                f"{test_name_prefix}: {test_name} is in both "
+                                "expect_raise and expect_fail"
+                            )
+                            assert (
+                                test_case not in expect_fail_unstable
+                                and op_case not in expect_fail_unstable
+                            ), (
+                                f"{test_name_prefix}: {test_name} is in both "
+                                "expect_raise and expect_fail_unstable"
+                            )
+                            used_expect_raise.add(marked)
+                            namespace[test_name] = _expect_raise_test(
+                                namespace[test_name], expect_raise[marked]
+                            )
                         else:
                             # An expect_fail entry may target either the bare param
                             # key (xfails every op for that shape) or the specific
@@ -546,7 +631,20 @@ class ParameterizedTestMeta(type):
                             # op), so a single op can be marked without affecting the
                             # others sharing the shape.
                             op_case_match = op_case in expect_fail
-                            if test_case in expect_fail or op_case_match:
+                            unstable_key = next(
+                                (
+                                    k
+                                    for k in (op_case, test_case)
+                                    if k in expect_fail_unstable
+                                ),
+                                None,
+                            )
+                            if unstable_key is not None:
+                                namespace[test_name] = pytest.mark.xfail(
+                                    reason=f"Unstable: {expect_fail_unstable[unstable_key]}",
+                                    strict=False,
+                                )(namespace[test_name])
+                            elif test_case in expect_fail or op_case_match:
                                 marked = op_case if op_case_match else test_case
                                 namespace[test_name] = pytest.mark.xfail(
                                     reason=f"Expected fail for {marked}", strict=True
@@ -580,10 +678,26 @@ class ParameterizedTestMeta(type):
                         namespace[test_name] = pytest.mark.skip(
                             reason=f"Faults the device: {device_fault[test_case]}"
                         )(namespace[test_name])
+                    elif test_case in expect_raise:
+                        used_expect_raise.add(test_case)
+                        namespace[test_name] = _expect_raise_test(
+                            namespace[test_name], expect_raise[test_case]
+                        )
                     elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
                             reason=f"Expected fail for {test_case}", strict=True
                         )(namespace[test_name])
+                    elif test_case in expect_fail_unstable:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Unstable: {expect_fail_unstable[test_case]}",
+                            strict=False,
+                        )(namespace[test_name])
+
+            unused = set(expect_raise) - used_expect_raise
+            assert not unused, (
+                f"{test_name_prefix}: expect_raise entry {sorted(unused)} matches no "
+                "generated test (typo, or the case is skipped)"
+            )
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
@@ -884,67 +998,27 @@ def capture_backend_output_dirs():
         yield output_dirs
 
 
-def requires_dxp_standalone():
-    """Skip the calling test unless ``dxp_standalone`` is on PATH.
+def mock_op_split_space(
+    domains: dict,
+    output_axes: Iterable,
+    *,
+    op: Any = None,
+    legal: Callable[[dict], bool] | None = None,
+) -> "OpSplitSpace":
+    """An ``OpSplitSpace`` over stated domains, legal wherever ``legal`` says
+    (everywhere by default). The real legality rules are tested against the
+    enumeration in ``test_work_division.py``; a test of what *asks* a space
+    only needs some rule."""
+    from unittest.mock import MagicMock
 
-    Bundles are compiled by dbo-opt, so dxp_standalone is no longer needed to
-    build or run a kernel.  The debug re-lowering below is the one thing that
-    still requires it: ``--use-dxp`` with ``DXP_DEBUG=1`` writes the
-    ``debug/sdsc_*/*.out.out.out.json`` payloads these assertions read, and
-    dbo-opt has no equivalent.  So the payload check is only meaningful where
-    that binary exists, and a missing one is an environment fact rather than a
-    product failure -- skip rather than fail.
-    """
-    if shutil.which("dxp_standalone") is None:
-        pytest.skip(
-            "dxp_standalone not on PATH: the --use-dxp/DXP_DEBUG debug payload "
-            "this assertion reads has no dbo-opt equivalent"
-        )
+    from torch_spyre._inductor.work_division import OpSplitSpace
 
-
-def assert_lx_only_relayout_payload(output_dirs):
-    """The compiled bundle's SDSC payload carries exactly one LX relayout op and
-    no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
-    HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
-    re-lowering of the same bundle, not a second device execution.
-
-    Skips when dxp_standalone is unavailable -- see requires_dxp_standalone.
-    """
-    requires_dxp_standalone()
-
-    for output_dir in output_dirs:
-        subprocess.run(
-            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
-            check=True,
-            env={**os.environ, "DXP_DEBUG": "1"},
-        )
-    payloads = [
-        json.loads(path.read_text())
-        for output_dir in output_dirs
-        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
-    ]
-    assert payloads, "DeepTools emitted no debug SDSC payloads"
-    nodes = []
-    pending = list(payloads)
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            nodes.append(value)
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    lx_ops = [
-        node
-        for node in nodes
-        if isinstance(node.get("op"), dict) and node["op"].get("name") == "STCDPOpLx"
-    ]
-    assert len(lx_ops) == 1
-    op_names = [node["name"] for node in nodes if isinstance(node.get("name"), str)]
-    assert not any(
-        token in name.lower()
-        for name in op_names
-        for token in ("dma", "restickify", "stcdpophbm")
+    context = MagicMock()
+    context.axes = list(domains)
+    context.is_legal.side_effect = legal or (lambda splits: True)
+    return OpSplitSpace(
+        op=MagicMock() if op is None else op,
+        context=context,
+        output_axes=frozenset(output_axes),
+        factor_domains=domains,
     )
-    labeled_ds = lx_ops[0]["labeledDs_"]
-    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
-    return lx_ops[0]["op"]["prodConsList"]

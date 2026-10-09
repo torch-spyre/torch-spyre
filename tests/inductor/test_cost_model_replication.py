@@ -41,7 +41,9 @@ from torch_spyre._inductor.cost_model import (
     CostParams,
     OpFeatures,
     _fused_hbm_bytes,
+    _loop_operand_request_excess,
     _partitioned_operand_read_excess,
+    _read_burst_excess_ns,
     _replicated_operand_reads,
     explain,
     predict_ops,
@@ -378,6 +380,188 @@ def test_a_bundle_with_any_looped_op_keeps_its_price():
     assert _partitioned_operand_read_excess([advancing], _COST_PARAMS) == 0
 
 
+def _expert_loop_projection(cores, *, trips=4, **fields):
+    """A per-expert projection in a ``for_each_tile`` loop, as the extractor records it.
+
+    The loop tiles none of the op's own dims. The weight is the operand the loop walks
+    (its address advances with the loop variable and is read once across the loop,
+    ``loop_factor`` 1); the activation is re-entered at one address every trip.
+    """
+    op = _projection(cores, 1, loop_trip=trips, **fields)
+    op.args = [
+        dataclasses.replace(a, loop_factor=trips)
+        if a.role == "input" and a.elems != W_ELEMS
+        else dataclasses.replace(
+            a, advances_with_loop_var=True, has_partitioning_candidate=True
+        )
+        if a.role == "input"
+        else a
+        for a in op.args
+    ]
+    return op
+
+
+def _coarse_tiled_dense_matmul(cores=32, trips=4, size=4096):
+    """A row-tiled dense matmul under automatic coarse tiling: A advances with the
+    row loop (``loop_factor`` 1, exactly like the expert weight above) and the weight
+    is re-entered at one address every trip.  The loop variable is not a
+    ``for_each_tile`` one."""
+    a_elems, w_elems = size * size // trips, size * size
+    return OpFeatures(
+        name="matmul_row_tiling",
+        is_reduction=True,
+        out_elems=size * size // trips,
+        cores=cores,
+        dtype_bytes=2,
+        args=[
+            ArgTraffic("buf2", "output", False, size * size // trips),
+            ArgTraffic("arg0_1", "input", False, a_elems, is_boundary=True),
+            ArgTraffic(
+                "arg1_1", "input", False, w_elems, loop_factor=trips, is_boundary=True
+            ),
+        ],
+        is_matmul=True,
+        matmul_macs=size**3,
+        matmul_rows_per_core=size / trips / cores,
+        matmul_cols_per_core=float(size),
+        matmul_m_split=cores,
+        matmul_a_bytes=2 * a_elems,
+        matmul_b_bytes=2 * w_elems,
+        loop_trip=trips,
+        tiles_output_dim=True,
+    )
+
+
+def test_a_for_each_tile_loop_prices_the_operand_it_walks_and_nothing_else():
+    """A counted for_each_tile loop changes which operand is priced, not whether any is.
+
+    The operand the loop walks is priced as partitioned across the op's cores with the
+    single-pass arithmetic; the operand the loop re-enters at one address carries the
+    trip count and keeps its price.
+    """
+    p = _COST_PARAMS
+    op = _expert_loop_projection(25)
+    assert _partitioned_operand_read_excess([op], p) == pytest.approx(_excess_ns(25))
+    # The walked operand alone: drop the re-entered activation, same price.
+    weight_only = dataclasses.replace(
+        op, args=[a for a in op.args if a.elems == W_ELEMS or a.role == "output"]
+    )
+    assert _partitioned_operand_read_excess([weight_only], p) == pytest.approx(
+        _excess_ns(25)
+    )
+    # Re-entered, or advancing without being walked once: not the priced class.
+    for change in (
+        {"advances_with_loop_var": False},
+        {"loop_factor": 4},
+        {"has_partitioning_candidate": False},
+    ):
+        unpriced = _expert_loop_projection(25)
+        unpriced.args[2] = dataclasses.replace(unpriced.args[2], **change)
+        assert _partitioned_operand_read_excess([unpriced], p) == 0
+    # A counted loop with no matmul has no tiled operand to price.
+    pointwise = dataclasses.replace(_expert_loop_projection(25), is_matmul=False)
+    assert _partitioned_operand_read_excess([pointwise], p) == 0
+
+
+def test_a_for_each_tile_loop_price_depends_on_how_many_cores_stream_the_operand():
+    p = _COST_PARAMS
+    priced = [
+        _partitioned_operand_read_excess([_expert_loop_projection(cores)], p)
+        for cores in (8, 16, 25, 32)
+    ]
+    assert priced[0] == pytest.approx(_excess_ns(8))
+    assert priced[0] > priced[1] > priced[2] > priced[3] == 0
+    # The number of cores is all it reads: two 32-core shapes are not ranked by it.
+    shaped = [
+        _partitioned_operand_read_excess(
+            [
+                dataclasses.replace(
+                    _expert_loop_projection(1), cores=32, matmul_m_split=m
+                )
+            ],
+            p,
+        )
+        for m in (1, 2, 32)
+    ]
+    assert shaped == [0, 0, 0]
+
+
+def test_the_for_each_tile_price_is_symbolic_in_the_core_count_and_matches_numeric():
+    cores = sympy.Symbol("cores", integer=True, positive=True)
+    sym = _expert_loop_projection(1)
+    sym.cores = cores
+    expr = _partitioned_operand_read_excess([sym], _COST_PARAMS)
+    at = sympy.lambdify([cores], expr, modules="math")
+    for c in (4, 8, 16, 32):
+        concrete = _partitioned_operand_read_excess(
+            [
+                _expert_loop_projection(1)
+                if c == 1
+                else dataclasses.replace(_expert_loop_projection(1), cores=c)
+            ],
+            _COST_PARAMS,
+        )
+        assert at(c) == pytest.approx(concrete, rel=1e-9, abs=1e-6)
+
+
+def test_an_unpartitionable_loop_read_keeps_the_price_without_delivery_estimation():
+    off = dataclasses.replace(_COST_PARAMS, mm_partitioned_read_gbps_per_core=0.0)
+    cores = sympy.Symbol("cores", integer=True, positive=True)
+    for c in (8, 16, 32, cores):
+        op = dataclasses.replace(_expert_loop_projection(1), cores=c)
+        op.args = [
+            dataclasses.replace(a, has_partitioning_candidate=False) for a in op.args
+        ]
+        assert _partitioned_operand_read_excess([op], _COST_PARAMS) == 0
+        difference = sympy.simplify(
+            predict_ops([op], _COST_PARAMS) - predict_ops([op], off)
+        )
+        assert difference.is_zero is True
+
+
+def test_a_coarse_tiled_dense_matmul_keeps_its_price():
+    """A 4096^3 row-tiled matmul under coarse tiling (4 trips, tiles an output dim):
+    A advances with the loop (factor 1) and the weight is re-entered (factor 4), the
+    same factors an expert loop records for its walked and re-entered operands, but the
+    loop is not a for_each_tile loop and nothing here is priced -- alone, in a bundle,
+    and at every core count."""
+    p = _COST_PARAMS
+    off = dataclasses.replace(p, mm_partitioned_read_gbps_per_core=0.0)
+    for cores in (8, 16, 32):
+        op = _coarse_tiled_dense_matmul(cores)
+        assert (op.loop_trip, op.tiles_output_dim) == (4, True)
+        assert [a.loop_factor for a in op.args] == [1, 1, 4]
+        assert _partitioned_operand_read_excess([op], p) == 0
+        assert _partitioned_operand_read_excess([op, _projection(25, 1)], p) == 0
+        assert predict_ops([op], p) == predict_ops([op], off)
+
+
+def test_a_mixed_bundle_prices_the_walked_operand_and_leaves_single_pass_matmuls():
+    """Looped and single-pass matmuls in one bundle: the loop's walked operand is
+    priced and a single-pass matmul keeps its previous price (zero), because the bundle
+    is not all single-pass."""
+    p = _COST_PARAMS
+    other = _projection(25, 1)
+    other.args[2] = dataclasses.replace(other.args[2], name="arg99_1")
+    mixed = [_expert_loop_projection(25), other]
+    assert _partitioned_operand_read_excess([other], p) == pytest.approx(_excess_ns(25))
+    assert _partitioned_operand_read_excess(mixed, p) == pytest.approx(_excess_ns(25))
+
+
+def test_a_bundle_with_any_looped_op_keeps_its_price_outside_the_walked_operand():
+    looped = [
+        {"loop_trip": 4},
+        {"tiles_output_dim": True},
+        {"tiles_reduction_dim": True},
+    ]
+    for fields in looped:
+        bundle = [_projection(25, 1), _projection(25, 1, **fields)]
+        assert _partitioned_operand_read_excess(bundle, _COST_PARAMS) == 0
+    advancing = _projection(25, 1)
+    advancing.args[0] = dataclasses.replace(advancing.args[0], loop_factor=4)
+    assert _partitioned_operand_read_excess([advancing], _COST_PARAMS) == 0
+
+
 def test_reused_replicated_resident_or_unknown_operands_keep_their_price():
     p = _COST_PARAMS
     # Row reuse: prefill rows, or a GQA group sharing one KV head, feed each
@@ -503,6 +687,121 @@ def test_cp_sat_follows_symbolic_weight_replication_and_residency():
             exact = _excess_ns(cores) if partitioned and cores < 32 else 0.0
             got = _solve_pinned(expr, menu, i, residency=resident)
             assert got == pytest.approx(exact, rel=1e-3, abs=1.0), (menu[i], resident)
+
+
+def _with_run(op, run, **fields):
+    """``op`` with a proven per-core DMA run of ``run`` bytes on its weight read,
+    one trip's share of the weight per invocation."""
+    op.args[2] = dataclasses.replace(
+        op.args[2],
+        read_run_bytes=run,
+        read_tile_elems=W_ELEMS // op.loop_trip,
+        **fields,
+    )
+    return op
+
+
+def _requests_excess_ns(run, ns=7.5):
+    """The weight's DMA request time beyond bytes/peak over the whole loop."""
+    return W_BYTES * (ns / run - 1 / 150)
+
+
+def test_loop_operand_requests_skip_resident_and_single_pass_reads():
+    """The request term is ``(1 - is_lx)`` times the excess, symbolically, and prices
+    looped matmuls only, so it stays disjoint from the single-pass estimate."""
+    p = _COST_PARAMS
+    added = _requests_excess_ns(128) - _excess_ns(16)
+    assert added > 0
+    is_lx = sympy.Symbol("is_lx_w", integer=True, nonnegative=True)
+    resident = _with_run(_expert_loop_projection(16), 128, is_lx=is_lx)
+    term = sympy.sympify(_loop_operand_request_excess([resident], p))
+    assert term.subs(is_lx, 1) == 0
+    assert float(term.subs(is_lx, 0)) == pytest.approx(added, rel=1e-9)
+    assert _read_burst_excess_ns([resident], p) == 0
+    single = _with_run(_projection(16, 1), 128)
+    assert _loop_operand_request_excess([single], p) == 0
+    assert _read_burst_excess_ns([single], p) > 0
+    # Without a proven per-trip footprint, the general burst term still applies.
+    fallback = _expert_loop_projection(16)
+    fallback.args[2] = dataclasses.replace(fallback.args[2], read_run_bytes=128)
+    assert _loop_operand_request_excess([fallback], p) == 0
+    assert _read_burst_excess_ns([fallback], p) > 0
+    # A coarse loop has no for_each_tile advance verdict. Proven request geometry
+    # still owns its read, but it receives no loop-delivery estimate.
+    coarse = _with_run(_expert_loop_projection(16), 128, advances_with_loop_var=False)
+    assert _partitioned_operand_read_excess([coarse], p) == 0
+    assert _loop_operand_request_excess([coarse], p) == pytest.approx(
+        _requests_excess_ns(128)
+    )
+    assert _read_burst_excess_ns([coarse], p) == 0
+
+
+@pytest.mark.parametrize("boundary", [True, False])
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_a_weight_read_by_two_looped_matmuls_is_counted_by_its_owner(boundary, order):
+    """Use A, 4 cores and 256 B runs: delivery-bound. Use B, 16 cores and 128 B
+    runs: request-bound, slower than A's delivery. A graph input is one load: its
+    composed price is the slowest use (B's requests), not A's delivery plus B's
+    requests beyond B's delivery. An internal buffer is two loads, each read at
+    its own slower bottleneck."""
+    p = _COST_PARAMS
+    a = (_excess_ns(4), _requests_excess_ns(256))
+    b = (_excess_ns(16), _requests_excess_ns(128))
+    assert a[0] > a[1] > 0 and b[1] > a[0] > b[0] > 0
+    uses = [
+        _with_run(_expert_loop_projection(cores), run, is_boundary=boundary)
+        for cores, run in ((4, 256), (16, 128))
+    ]
+    uses = [uses[i] for i in order]
+    delivery = _partitioned_operand_read_excess(uses, p)
+    composed = (
+        delivery
+        + _loop_operand_request_excess(uses, p)
+        + _read_burst_excess_ns(uses, p)
+    )
+    if boundary:
+        assert delivery == pytest.approx(a[0], rel=1e-9)
+        assert composed == pytest.approx(b[1], rel=1e-9)
+    else:
+        assert delivery == pytest.approx(a[0] + b[0], rel=1e-9)
+        assert composed == pytest.approx(a[0] + b[1], rel=1e-9)
+
+
+@pytest.mark.parametrize("boundary", [True, False])
+def test_cp_sat_composes_two_symbolic_readers_by_ownership(boundary):
+    """Symbolic splits change both bottlenecks and which shared reader wins."""
+    n, k = sympy.symbols("split_n split_k", integer=True, positive=True)
+    uses = [
+        _with_run(_expert_loop_projection(cores), extent / cores, is_boundary=boundary)
+        for cores, extent in ((n, 4096), (k, 8192))
+    ]
+    delivery = _partitioned_operand_read_excess(uses, _COST_PARAMS)
+    extra = _loop_operand_request_excess(uses, _COST_PARAMS)
+    assert delivery.free_symbols == extra.free_symbols == {n, k}
+    menu = [(4, 16), (16, 4), (32, 16), (16, 32)]
+    rows = []
+    for i, cores in enumerate(menu):
+        parts = [max(0, _excess_ns(c)) for c in cores]
+        requests = [
+            max(
+                0,
+                _requests_excess_ns(
+                    extent / c, ns=_COST_PARAMS.transport_dma_ns_per_request[c]
+                ),
+            )
+            for c, extent in zip(cores, (4096, 8192))
+        ]
+        aggregate = max if boundary else sum
+        rows.append([max(a, b) for a, b in zip(parts, requests)])
+        expected = aggregate(rows[-1])
+        assert float(
+            (delivery + extra).subs(dict(zip((n, k), cores)))
+        ) == pytest.approx(expected)
+        assert _solve_pinned(delivery + extra, menu, i) == pytest.approx(
+            expected, abs=2.0
+        )
+    assert any(min(row) > 0 for row in rows)  # shared max differs from internal sum
+    assert len({row.index(max(row)) for row in rows}) == 2
 
 
 def test_explain_reports_the_limit():
