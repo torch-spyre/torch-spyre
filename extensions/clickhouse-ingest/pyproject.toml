@@ -13,10 +13,14 @@ dependencies = [
     # module here hard-imports `regex` and must declare it or the next consumer gets ImportError.
     # Unlike ortools it ships ppc64le/s390x wheels, so this costs the p/z ingests nothing.
     "regex",
+    # registry/resolver read tag_families.yaml with it, imported lazily so identity.py and
+    # derive-artifact-id still import with no third-party module. Pure Python on every arch.
+    "pyyaml",
 ]
 
 [project.scripts]
 spyre-mark-retried = "spyre_clickhouse_ingest.mark_retried:main"
+spyre-clickhouse-ingest = "spyre_clickhouse_ingest.__main__:main"
 
 [project.optional-dependencies]
 # Only the self-serve sandbox server (sandbox_server.py) needs these; the ingests never import it.
@@ -48,3 +52,4 @@ packages = ["spyre_clickhouse_ingest", "spyre_clickhouse_ingest.schema"]
 
 [tool.setuptools.package-data]
 "spyre_clickhouse_ingest.schema" = ["*.sql", "migrations/*.sql"]
+"spyre_clickhouse_ingest" = ["tag_families.yaml"]

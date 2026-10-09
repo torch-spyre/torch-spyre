@@ -17,12 +17,14 @@ import math
 import os
 import platform
 import sys
+import warnings
 import pytest
 import unittest
 import torch
 import torch.nn.functional as F
 
 
+from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
@@ -423,6 +425,26 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     )
 ]
 
+# Cases the predicate above flags that now pass on every config (base and both LX
+# planning classes). Listing them here, rather than loosening the predicate, keeps
+# the still-failing cases generated from the same rule.
+_TO_DTYPE_OP_NOW_PASSING = {
+    "bfloat16_to_bool_4x68",
+    "bfloat16_to_bool_68",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "float16_to_bfloat16_4x68",
+    "float16_to_bfloat16_68",
+    "float16_to_bool_4x68",
+    "float16_to_bool_68",
+    "float32_to_bool_4x16",
+    "float32_to_bool_4x68",
+    "float32_to_bool_68",
+}
+TO_DTYPE_OP_EXPECT_FAIL = [
+    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
+]
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -447,10 +469,54 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
 # pairs (see test_upcast_consumed_on_partial_stick). The implicit round
 # trip still hits an unsupported op on these shapes.
 _ROUND_TRIP_PASSING_PARTIAL_STICK = ("float16_to_float32_68", "bfloat16_to_float32_68")
-TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+_TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_PASSING_PARTIAL_STICK
+]
+
+# Further round-trip cases that now pass on every config. They differ between the
+# add and copy variants, so each variant gets its own expect_fail list. The implicit
+# variant is the same as the shared implicit list minus its own passing cases.
+_ROUND_TRIP_ADD_NOW_PASSING = {
+    "bfloat16_to_float16_4x16",
+    "bfloat16_to_float16_4x32",
+    "bfloat16_to_float16_4x63",
+    "bfloat16_to_float16_4x68",
+    "bfloat16_to_float16_68",
+    "bfloat16_to_float32_4x63",
+    "float16_to_float32_4x63",
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
+    "bfloat16_to_float32_4x16",
+    "float16_to_float32_4x16",
+}
+_ROUND_TRIP_IMPLICIT_NOW_PASSING = {
+    "float32_to_float16_4x16",
+    "float32_to_float16_4x63",
+}
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_ADD_NOW_PASSING
+]
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
+    case
+    for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
+    if case not in _ROUND_TRIP_COPY_NOW_PASSING
+]
+# Fails with a value mismatch, but passed once in a cold-cache full run. Cause not
+# investigated (see #5285), so it is a non-strict xfail.
+_ROUND_TRIP_IMPLICIT_UNSTABLE = {
+    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+}
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
+    case
+    for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+    if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
+    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1044,10 +1110,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # exp miscompiles on an unaligned trailing extent (issue #3799);
             # the same extent passes through a mul chain in test_pow_int.
-            "expect_fail": [
-                "0.3_fp16_2d_unaligned",
-                "2.5_fp16_2d_unaligned",
-            ],
+            # These fail because the work-division planner splits the unaligned
+            # dimension across cores, which the backend cannot mask, but the
+            # generated program differs on some runs and then compiles and can
+            # pass (#5285). A strict xfail would turn that into a flaky failure,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "0.3_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+                "2.5_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+            },
         },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
@@ -1060,6 +1131,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),),
                     ((67, 256),),
                     ((67, 71, 256),),
+                ]
+            ),
+        },
+        # A unary op on a view with reordered non-stick dims miscompiled in
+        # deeptools (issue #4869).
+        ("test_pointwise_unary_permuted_view", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "abs": lambda x: torch.abs(x.permute(1, 0, 2, 3)),
+                "neg": lambda x: torch.neg(x.permute(1, 0, 2, 3)),
+                "abs_add": lambda x: torch.abs(x.permute(1, 0, 2, 3)) + 1,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((4, 4, 64, 64),),
+                    ((8, 8, 64, 512),),
                 ]
             ),
         },
@@ -1891,8 +1977,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "large_dim_0_1",
                 "large_dim_0_1_nopad",
-                "large_dim_0_2",
-                "large_dim_0_2_nopad",
                 "large_dim_1_2",
                 "large_dim_1_2_nopad",
             ],
@@ -2282,7 +2366,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44_scalar32"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_256_scalar128": (
@@ -2328,7 +2411,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["1d_44"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_64": (
@@ -3295,7 +3377,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "tuple": (((64, 64)), 1024.0),
                 "size": (torch.Size([64, 128]), 1024.0),
             },
-            "expect_fail": ["value_2"],
         },
         (
             "test_dropout_functional",
@@ -4077,7 +4158,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int_true": (torch.tensor([1], dtype=torch.int64),),
                 "int_false": (torch.tensor([0], dtype=torch.int64),),
             },
-            "expect_fail": ["float32_true", "float32_false", "negative_true"],
         },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
@@ -4157,31 +4237,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     False,
                 ),
                 "gqa_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
@@ -5075,10 +5156,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": [
                 "fp16_3d_dim_2",
                 "fp16_3d_dim_neg1",
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
@@ -5848,7 +5925,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -6065,7 +6142,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
         },
         (
             "test_round_trip_to_dtype_implicit",
@@ -6074,6 +6151,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
+            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
         },
         (
             "test_reduction_with_to_dtype",
@@ -7850,15 +7928,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.logsumexp (stable error signature: InductorError: "
-            "IndexError: list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_logsumexp_keepdim0_known_xfail(self):
+    def test_logsumexp_keepdim0(self):
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(
             lambda x: torch.logsumexp(x, dim=0, keepdim=False),
@@ -8370,18 +8440,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, dst, src, run_eager=False)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
+        """
+        Verify that cumsum executes via the CPU fallback path and emits
+        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        """
+
         def fn(t):
-            t = torch.exp(t)  # compiled op
+            t = torch.exp(t)
             t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
-            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
+            t = torch.exp(t.clamp(-1, 1))
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        print(f"Warn {len(record)}")
+        fallback_warnings = [
+            w
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+            and "aten.cumsum" in str(w.message)
+        ]
+        assert len(fallback_warnings) > 0, (
+            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"All captured: {[str(w.message) for w in captured]}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
@@ -8459,7 +8543,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+        # -65504 is the fp16 limit: the pointwise lx wrap's (x + x) / 2 overflows
+        # fp16 on the CPU but not in DLFloat16, so give the lx wraps an fp64
+        # reference to transform.
+        self.compare_with_cpu(
+            fn,
+            needs_device=True,
+            cpu_compile=False,
+            dlfloat16_reference=torch.full(*args, dtype=torch.float64),
+        )
 
     def test_full_bfloat16_cpu(self):
         """Compiled BF16 ``full`` stays in native Spyre lowering."""
