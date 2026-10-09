@@ -4786,9 +4786,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            "expect_fail": [
-                "fp32_3d_dim_neg1",
-            ],
+            # #4492: the backend rejects stick masking for 32-bit types, but only
+            # some builds do. These pass on CI's deeptools and fail on some others,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+            },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
                 "fp16_2d_dim_0": (
@@ -4991,10 +4994,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            "expect_fail": [
-                "fp32_3d_dim_2",
-                "fp32_3d_dim_neg1",
-            ],
+            # #4492: the backend rejects stick masking for 32-bit types, but only
+            # some builds do. These pass on CI's deeptools and fail on some others,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "fp32_3d_dim_2": "fp32 stick masking, passes on CI, #4492",
+                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
