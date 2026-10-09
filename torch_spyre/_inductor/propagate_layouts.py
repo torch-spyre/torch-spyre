@@ -212,7 +212,7 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
 
 
 def _compute_dim_order(stick_dim, size, coords):
-    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
+    """Order dimensions with stick_dim last and zero-coordinate dims to its left."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
     dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
     dim_order += [stick_dim]
@@ -952,21 +952,13 @@ def _canonical_stl_from_collapsed_host(
     reduction_type: str,
     label: str,
 ) -> SpyreTensorLayout:
-    """Build the canonical STL for a matmul input by collapsing host dims.
+    """Build Pass 3's canonical matmul STL from host geometry.
 
-    Constructs the canonical ``SpyreTensorLayout`` directly from the host
-    geometry, collapsing any mixed-radix dims that jointly carry ``matmul_var``
-    into one logical dim.  This is the single authoritative path for Pass 3.
-
-    Single-host-dim case (Case A): the host already has exactly one dim for
-    ``matmul_var``; build the STL directly from it (``compute_restickify_target_layout``
-    can produce different results depending on candidate order, so we bypass it).
-
-    Multi-host-dim case (Case B): validate the chain is affine, full-range,
-    and contiguous, then merge the dims.
-
-    Raises ``Unsupported`` on invalid chains.  Does not call ``matching_dim`` or
-    ``compute_restickify_target_layout``.
+    Collapse dims carrying ``matmul_var`` only when they form an affine,
+    full-range contiguous chain; otherwise raise ``Unsupported``. Order the
+    result with the output-layout rule, treating constant read coordinates as
+    inactive. For example, ``[1, M, K]`` stores K-sticks outer with contiguous
+    rows, like ``[M, K]``; a fixed nonzero batch offset uses the same order.
     """
     host_coords = host_coordinates(arg.layout, arg.dep, None)
     host_dims = [
@@ -981,6 +973,7 @@ def _canonical_stl_from_collapsed_host(
         stick_dim = host_dims[0]
         canonical_size = host_size
         canonical_stride = host_stride
+        canonical_coords = host_coords
     else:
         zeroed_index = arg.dep.index.xreplace({matmul_var: sympy.S.Zero})
         var_delta = sympy.expand(arg.dep.index - zeroed_index)
@@ -1027,19 +1020,22 @@ def _canonical_stl_from_collapsed_host(
         insert_at = min(host_dims)
         canonical_size = []
         canonical_stride = []
+        canonical_coords = []
         stick_dim = -1
         for dim, (size, stride) in enumerate(zip(host_size, host_stride)):
             if dim == insert_at:
                 stick_dim = len(canonical_size)
                 canonical_size.append(var_range)
                 canonical_stride.append(int(var_stride))
+                canonical_coords.append(matmul_var)
             if dim not in collapsed_dims:
                 canonical_size.append(size)
                 canonical_stride.append(stride)
+                canonical_coords.append(host_coords[dim])
         assert stick_dim >= 0
 
-    dim_order = [dim for dim in range(len(canonical_size)) if dim != stick_dim]
-    dim_order.append(stick_dim)
+    order_coords = [c if c.free_symbols else sympy.S.Zero for c in canonical_coords]
+    dim_order = _compute_dim_order(stick_dim, canonical_size, order_coords)
     return SpyreTensorLayout(
         canonical_size,
         canonical_stride,

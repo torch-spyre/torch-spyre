@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest import mock
 
 import sympy
 
@@ -37,9 +38,11 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
 )
+from torch_spyre._inductor.nonstick_dim_order import _matmul_reorder_stl
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
+    _compute_dim_order,
     _find_alt_target_stl,
     _flat_dense_projection_x_layout,
     find_stick_compatible_input_layout,
@@ -55,6 +58,10 @@ from torch_spyre._inductor.views import (
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
+
+# Patched to True so compute_restickify_needed applies its matmul-edge rule
+# (a factorized input must restickify) without building a matmul op.
+_IS_MATMUL_OP = "torch_spyre._inductor.pass_utils._is_matmul_op"
 
 
 class TestCoordinates(TestCase):
@@ -739,7 +746,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         dtype = get_device_dtype(torch.float16)
         factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
         canonical = SpyreTensorLayout(
-            [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
+            [1, 8, 4096], [32768, 4096, 1], torch.float16, [1, 0, 2]
         )
 
         for layouts in ([factorized, canonical], [canonical, factorized]):
@@ -757,7 +764,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [1, 64, 4096],
             [262144, 4096, 1],
             torch.float16,
-            [0, 1, 2],
+            [1, 0, 2],
         )
 
         result = find_stick_compatible_input_layout(
@@ -769,12 +776,425 @@ class TestFactorizedMatmulCandidates(TestCase):
             self.assertEqual(
                 device_coordinates(result, arg.dep, None),
                 [
-                    arg.dep.var_names[0],
-                    sympy.floor(contraction / 64),
                     0,
+                    sympy.floor(contraction / 64),
+                    arg.dep.var_names[0],
                     sympy.Mod(contraction, 64),
                 ],
             )
+
+    def _attention_output_scenario(self, rows, heads=8, head_dim=128):
+        """The o_proj input in Granite's rank-local attention: SDPA's output,
+        kept by the attention kernel as [H, D/64, L, 64] and read by o_proj as
+        the [L, H*D] matrix.  ``rows`` = 1 is a decode step."""
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        K = heads * head_dim
+        if rows == 1:
+            # M = 1 folds the row variable away.
+            dep = MemoryDep("x", contraction, (generated, contraction), (4096, K))
+        else:
+            dep = MemoryDep(
+                "x",
+                K * m + contraction,
+                (m, generated, contraction),
+                (rows, 4096, K),
+            )
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, rows, heads, head_dim],
+            [rows * K, K, head_dim, 1],
+        )
+        source = SpyreTensorLayout(
+            [heads, head_dim // 64, rows, 64],
+            [head_dim, 64, K, 1],
+            get_device_dtype(torch.float16),
+        )
+        return PropArg(dep, host, [source]), m, contraction, K
+
+    def test_o_proj_input_is_k_sticks_outer(self):
+        """o_proj reads its input K-sticks outer, the order of a 2-D [M, K]
+        read, not rows outer: the batch of one does not take the tiles."""
+        for rows in (512, 64):
+            with self.subTest(rows=rows):
+                arg, m, contraction, K = self._attention_output_scenario(rows)
+                with V.set_graph_handler(SimpleNamespace()):
+                    source = device_coordinates(arg.layouts[0], arg.dep, None)
+                # The source is factorized (the contraction var sits on two
+                # outer axes), so the edge restickifies to Pass 3's layout.
+                self.assertEqual(
+                    sum(contraction in c.free_symbols for c in source[:-1]), 2
+                )
+
+                result = find_stick_compatible_input_layout(
+                    arg, contraction, BATCH_MATMUL_OP, "x"
+                )
+
+                self.assertEqual(
+                    result,
+                    SpyreTensorLayout(
+                        [1, rows, K], [rows * K, K, 1], torch.float16, [1, 0, 2]
+                    ),
+                )
+                self.assertEqual(list(result.device_size), [1, K // 64, rows, 64])
+                with V.set_graph_handler(SimpleNamespace()):
+                    self.assertEqual(
+                        device_coordinates(result, arg.dep, None),
+                        [
+                            0,
+                            sympy.floor(contraction / 64),
+                            m,
+                            sympy.Mod(contraction, 64),
+                        ],
+                    )
+                    # On a matmul edge the factorized source restickifies to
+                    # exactly this layout.
+                    with mock.patch(_IS_MATMUL_OP, return_value=True):
+                        self.assertEqual(
+                            compute_restickify_needed(
+                                arg.layouts[0], arg.layout, arg.dep, result, arg.dep
+                            ),
+                            (True, result),
+                        )
+
+                # The flat-M builder lays the same read out the same way when
+                # o_proj's output is 2-D.
+                generated = arg.dep.var_names[1]
+                y = PropArg(
+                    MemoryDep(
+                        "y",
+                        K * generated + contraction,
+                        arg.dep.var_names,
+                        arg.dep.size,
+                    ),
+                    FixedLayout(torch.device("cpu"), torch.float16, [4096, K], [K, 1]),
+                    [SpyreTensorLayout([4096, K], [K, 1], torch.float16, [1, 0])],
+                )
+                flat = _flat_dense_projection_x_layout(
+                    arg,
+                    y,
+                    FixedLayout(
+                        torch.device("cpu"), torch.float16, [rows, 4096], [4096, 1]
+                    ),
+                    MemoryDep(
+                        "out", 4096 * m + generated, arg.dep.var_names, arg.dep.size
+                    ),
+                    contraction,
+                    rows,
+                    4096,
+                )
+                data_dims = [i for i, s in enumerate(result.device_size) if s != 1]
+                self.assertEqual(
+                    [result.device_size[i] for i in data_dims], list(flat.device_size)
+                )
+                self.assertEqual(
+                    [result.stride_map[i] for i in data_dims], list(flat.stride_map)
+                )
+
+    def test_o_proj_input_at_decode_is_unchanged(self):
+        """With one row every non-stick dim has size one: nothing moves."""
+        arg, _, contraction, K = self._attention_output_scenario(1)
+
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_OP, "x"
+        )
+
+        self.assertEqual(
+            result, SpyreTensorLayout([1, 1, K], [K, K, 1], torch.float16, [0, 1, 2])
+        )
+
+    def test_real_leading_batch_keeps_host_dim_order(self):
+        """A leading batch that holds data keeps the host dim order."""
+        b, m, generated, contraction = sympy.symbols(
+            "b m generated contraction", integer=True, nonnegative=True
+        )
+        B, L, H, D = 2, 64, 8, 128
+        K = H * D
+        dep = MemoryDep(
+            "x",
+            L * K * b + K * m + contraction,
+            (b, m, generated, contraction),
+            (B, L, 4096, K),
+        )
+        host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, L, H, D], [L * K, K, D, 1]
+        )
+        source = SpyreTensorLayout(
+            [B, H, D // 64, L, 64],
+            [L * K, D, 64, K, 1],
+            get_device_dtype(torch.float16),
+        )
+
+        result = find_stick_compatible_input_layout(
+            PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+        )
+
+        self.assertEqual(
+            result,
+            SpyreTensorLayout([B, L, K], [L * K, K, 1], torch.float16, [0, 1, 2]),
+        )
+
+    def test_batch_of_one_before_a_real_batch_is_invisible(self):
+        """[1, B, M, K] is stored exactly like [B, M, K]: the batch of one
+        moves out of the tile slot and the real batch keeps it."""
+        b, m, generated, contraction = sympy.symbols(
+            "b m generated contraction", integer=True, nonnegative=True
+        )
+        B, L, H, D = 2, 64, 8, 128
+        K = H * D
+        dep = MemoryDep(
+            "x",
+            L * K * b + K * m + contraction,
+            (b, m, generated, contraction),
+            (B, L, 4096, K),
+        )
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, B, L, H, D],
+            [B * L * K, L * K, K, D, 1],
+        )
+        source = SpyreTensorLayout(
+            [B, H, D // 64, L, 64],
+            [L * K, D, 64, K, 1],
+            get_device_dtype(torch.float16),
+        )
+
+        result = find_stick_compatible_input_layout(
+            PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+        )
+
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(
+                [1, B, L, K], [B * L * K, L * K, K, 1], torch.float16, [1, 2, 0, 3]
+            ),
+        )
+        real_batch = SpyreTensorLayout(
+            [B, L, K], [L * K, K, 1], torch.float16, [0, 1, 2]
+        )
+
+        def physical(stl):
+            return [
+                (size, step)
+                for size, step in zip(stl.device_size, stl.stride_map)
+                if size != 1
+            ]
+
+        self.assertEqual(physical(result), physical(real_batch))
+        self.assertEqual(physical(result), [(L, K), (K // 64, 64), (B, L * K), (64, 1)])
+
+    def test_real_batch_below_the_rows_is_where_nonstick_dim_order_differs(self):
+        """Two rules choose which dim sits in the slot between a matmul input's
+        two stick dims, on different layouts. Pass 3 (_compute_dim_order, the
+        output rule) builds the target a factorized input is restickified to;
+        nonstick_dim_order reorders the producer's committed_stl after
+        optimize_restickify and before restickify insertion, so it never sees
+        the Pass 3 target. It moves the largest data dim into the slot.
+        With a real batch B they
+        agree while B >= M and differ when the rows M outnumber it: Pass 3
+        keeps B in the slot, the reorder moves M there. That was already so
+        for [B, M, K]; a batch of one in front, [1, B, M, K], now behaves the
+        same way instead of putting the batch of one in the slot."""
+        b, m, generated, contraction = sympy.symbols(
+            "b m generated contraction", integer=True, nonnegative=True
+        )
+        H, D, L = 8, 128, 64
+        K = H * D
+        for B in (2, 64, 128):
+            for lead in ((), (1,)):
+                with self.subTest(B=B, M=L, leading=lead):
+                    n = len(lead)
+                    dep = MemoryDep(
+                        "x",
+                        L * K * b + K * m + contraction,
+                        (b, m, generated, contraction),
+                        (B, L, 4096, K),
+                    )
+                    host = FixedLayout(
+                        torch.device("cpu"),
+                        torch.float16,
+                        [*lead, B, L, H, D],
+                        [B * L * K] * n + [L * K, K, D, 1],
+                    )
+                    source = SpyreTensorLayout(
+                        [B, H, D // 64, L, 64],
+                        [L * K, D, 64, K, 1],
+                        get_device_dtype(torch.float16),
+                    )
+                    target = find_stick_compatible_input_layout(
+                        PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+                    )
+
+                    # The producer of the same [*lead, B, M, K] tensor, laid out
+                    # by the output rule, then reordered as nonstick_dim_order
+                    # reorders a matmul input's producer.
+                    size = [*lead, B, L, K]
+                    coords = [0] * n + [b, m, contraction]
+                    producer = SpyreTensorLayout(
+                        size,
+                        [B * L * K] * n + [L * K, K, 1],
+                        torch.float16,
+                        _compute_dim_order(n + 2, size, coords),
+                    )
+                    write = MemoryDep(
+                        "x",
+                        L * K * b + K * m + contraction,
+                        (b, m, contraction),
+                        (B, L, K),
+                    )
+                    with V.set_graph_handler(SimpleNamespace()):
+                        reordered = (
+                            _matmul_reorder_stl(producer, write, "x") or producer
+                        )
+
+                    # The slot is the dim between the stick's tile index and
+                    # its 64 elements.
+                    self.assertEqual(target.device_size[-2], B)
+                    self.assertEqual(producer.device_size[-2], B)
+                    self.assertEqual(reordered.device_size[-2], max(B, L))
+                    self.assertEqual(target.stride_map[-2], L * K)
+                    self.assertEqual(producer.stride_map[-2], L * K)
+                    self.assertEqual(reordered.stride_map[-2], K if B < L else L * K)
+
+    def test_unread_leading_dim_does_not_take_the_tiles(self):
+        """A leading dim the read never moves along holds no data for it, so
+        it leaves the tile slot to the rows, whatever its size."""
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        L, K = 64, 1024
+        for batch in (1, 2):
+            for offset in range(batch):
+                with self.subTest(batch=batch, offset=offset):
+                    # Reads one fixed batch: the index has no batch variable.
+                    dep = MemoryDep(
+                        "x",
+                        offset * L * K + K * m + contraction,
+                        (m, generated, contraction),
+                        (L, 4096, K),
+                    )
+                    host = FixedLayout(
+                        torch.device("cpu"),
+                        torch.float16,
+                        [batch, L, K],
+                        [L * K, K, 1],
+                    )
+                    candidate = SpyreTensorLayout(
+                        [batch, L, K], [L * K, K, 1], torch.float16, [0, 1, 2]
+                    )
+
+                    result = find_stick_compatible_input_layout(
+                        PropArg(dep, host, [candidate]),
+                        contraction,
+                        BATCH_MATMUL_OP,
+                        "x",
+                    )
+
+                    self.assertEqual(
+                        result,
+                        SpyreTensorLayout(
+                            [batch, L, K], [L * K, K, 1], torch.float16, [1, 0, 2]
+                        ),
+                    )
+                    self.assertEqual(list(result.device_size), [batch, K // 64, L, 64])
+
+    def test_other_projection_inputs_keep_their_layout(self):
+        """q/k/v, gate/up and down read an unfactorized [1, M, K] activation:
+        whatever layout its producer chose, the matmul edge needs no
+        restickify, and each 2-D weight keeps its own layout."""
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        for K, N in ((4096, 1536), (4096, 3200), (3200, 4096)):
+            for rows in (512, 64):
+                dep = MemoryDep(
+                    "x",
+                    K * m + contraction,
+                    (m, generated, contraction),
+                    (rows, N, K),
+                )
+                host = FixedLayout(
+                    torch.device("cpu"),
+                    torch.float16,
+                    [1, rows, K],
+                    [rows * K, K, 1],
+                )
+                for dim_order in ([0, 1, 2], [1, 0, 2]):
+                    with self.subTest(K=K, N=N, rows=rows, dim_order=dim_order):
+                        candidate = SpyreTensorLayout(
+                            [1, rows, K], [rows * K, K, 1], torch.float16, dim_order
+                        )
+                        with V.set_graph_handler(SimpleNamespace()):
+                            coords = device_coordinates(candidate, dep, None)
+                        self.assertEqual(
+                            sum(contraction in c.free_symbols for c in coords[:-1]), 1
+                        )
+                        required = find_stick_compatible_input_layout(
+                            PropArg(dep, host, [candidate]),
+                            contraction,
+                            BATCH_MATMUL_OP,
+                            "x",
+                        )
+                        with (
+                            V.set_graph_handler(SimpleNamespace()),
+                            mock.patch(_IS_MATMUL_OP, return_value=True),
+                        ):
+                            self.assertEqual(
+                                compute_restickify_needed(
+                                    candidate, host, dep, required, dep
+                                ),
+                                (False, None),
+                            )
+                with self.subTest(K=K, N=N, rows=rows, operand="weight"):
+                    y_dep = MemoryDep(
+                        "y",
+                        K * generated + contraction,
+                        (m, generated, contraction),
+                        (rows, N, K),
+                    )
+                    weight = SpyreTensorLayout([N, K], [K, 1], torch.float16, [1, 0])
+                    required = find_stick_compatible_input_layout(
+                        PropArg(
+                            y_dep,
+                            FixedLayout(
+                                torch.device("cpu"), torch.float16, [N, K], [K, 1]
+                            ),
+                            [weight],
+                        ),
+                        generated,
+                        BATCH_MATMUL_OP,
+                        "y",
+                    )
+                    self.assertEqual(required, weight)
+
+                    batched_weight = SpyreTensorLayout(
+                        [1, N, K], [N * K, K, 1], torch.float16, [0, 2, 1]
+                    )
+                    required = find_stick_compatible_input_layout(
+                        PropArg(
+                            y_dep,
+                            FixedLayout(
+                                torch.device("cpu"),
+                                torch.float16,
+                                [1, N, K],
+                                [N * K, K, 1],
+                            ),
+                            [batched_weight],
+                        ),
+                        generated,
+                        BATCH_MATMUL_OP,
+                        "y",
+                    )
+                    self.assertEqual(
+                        required,
+                        SpyreTensorLayout(
+                            [1, N, K], [N * K, K, 1], torch.float16, [2, 0, 1]
+                        ),
+                    )
+                    self.assertEqual(list(required.device_size), [1, N // 64, K, 64])
 
     def test_rejects_noncontiguous_or_partial_factorized_chain(self):
         """Only a full, gap-free mixed-radix view is safe to collapse."""

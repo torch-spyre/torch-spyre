@@ -955,6 +955,39 @@ def test_fused_attention_projection_uses_exact_flat_m_layout():
     )
 
 
+@pytest.mark.parametrize("rows", [64, 512])
+def test_attention_projection_with_leading_unit_batch(rows):
+    """Compile the factorized SDPA output through reshape and shared projection."""
+    heads, dim = 2, 128
+    q, k, v = [torch.randn(1, heads, rows, dim, dtype=torch.float16) for _ in range(3)]
+    weight = torch.randn((heads * dim, 128), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        return attention.transpose(1, 2).reshape(1, rows, heads * dim) @ weight
+
+    compare_with_cpu(fn, q, k, v, weight, run_eager=False, atol=0.02, rtol=0.05)
+
+
+def test_projection_bmm_with_leading_unit_batch():
+    """A leading unit dimension preserves the real batch in compiled matmul."""
+    x = torch.randn((1, 2, 2, 64, 128), dtype=torch.float16)
+    weight = torch.randn((1, 2, 256, 128), dtype=torch.float16) * 0.1
+
+    def fn(x, weight):
+        factorized = torch.sin(x).transpose(2, 3).reshape(1, 2, 64, 256)
+        return factorized @ weight
+
+    compare_with_cpu(
+        fn,
+        x,
+        weight,
+        run_eager=False,
+        atol=0.02,
+        rtol=0.05,
+    )
+
+
 def test_opt_two_independent_conflicts():
     """(a+b.t()) + (e.t()+f.t()+g) — two separate conflicts."""
     a, b, e, f, g = _make_tensors(5, S, S)
