@@ -1075,12 +1075,21 @@ def multi_reduction_k_split_blocked(
     ``dbo-opt``'s DDL template for plain reductions (``summeanmaxexx2.ddl``)
     cannot generate cross-core accumulation code when the op has more than one
     reduction variable, even if only one is split.  Example: ``flatten(0,1)``
-    on ``(2,3,4)`` followed by ``sum(dim=0)`` produces an iteration space
-    ``{d0: 4, d1: 6}`` where neither ``d0`` nor ``d1`` appears in the output
-    coords -- both are reduction variables.  ``work_distribution_pass`` would
-    split ``d1`` across cores (satisfying ``_one_reduction_split_at_most``),
-    but ``dbo-opt`` still rejects with "More than one reduction dim is split
-    across cores: not currently supported".
+    on ``(2,3,4)`` followed by ``sum()`` (full reduction) produces an iteration
+    space ``{d0: 4, d1: 6}`` where neither ``d0`` nor ``d1`` appears in the
+    output coords (output is scalar) -- both are reduction variables.
+    ``work_distribution_pass`` would split ``d1`` across cores (satisfying
+    ``_one_reduction_split_at_most``), but ``dbo-opt`` still rejects with "More
+    than one reduction dim is split across cores: not currently supported".
+
+    Note: ``_one_reduction_split_at_most`` in ``WorkDivisionContext`` prevents
+    splitting *two* reduction vars simultaneously, but it still allows splitting
+    one.  This constraint is the load-bearing guard: when there are 2+
+    reduction vars, it blocks splitting *any* of them, because even a single
+    split triggers the dbo-opt error.
+
+    Single-dim plain reductions are left unconstrained because WSR's
+    ``_insert_combine_op`` already handles cross-core accumulation for them.
 
     Structured ops (matmul, topk, pool, conv, depthwise conv) have their own
     DDL templates that handle multi-dim iteration spaces; they are excluded via
