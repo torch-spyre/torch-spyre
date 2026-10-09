@@ -60,6 +60,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
+| `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 
 ## Naming an artifact (simple -> advanced)
 
@@ -149,7 +150,8 @@ grep -rn 'scripts/ingest_xml\.py' --include='*.y*ml' --include='Jenkinsfile*' --
 
 `test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
 and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`),
-and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`).
+and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`), and `ci_run_timings`
+(DDL: `schema/48-ci-run-timings.sql`).
 The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
 
 The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned

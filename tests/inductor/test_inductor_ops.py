@@ -17,12 +17,14 @@ import math
 import os
 import platform
 import sys
+import warnings
 import pytest
 import unittest
 import torch
 import torch.nn.functional as F
 
 
+from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
@@ -505,10 +507,16 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
+# Fails with a value mismatch, but passed once in a cold-cache full run. Cause not
+# investigated (see #5285), so it is a non-strict xfail.
+_ROUND_TRIP_IMPLICIT_UNSTABLE = {
+    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+}
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
+    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1102,10 +1110,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # exp miscompiles on an unaligned trailing extent (issue #3799);
             # the same extent passes through a mul chain in test_pow_int.
-            "expect_fail": [
-                "0.3_fp16_2d_unaligned",
-                "2.5_fp16_2d_unaligned",
-            ],
+            # These fail because the work-division planner splits the unaligned
+            # dimension across cores, which the backend cannot mask, but the
+            # generated program differs on some runs and then compiles and can
+            # pass (#5285). A strict xfail would turn that into a flaky failure,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "0.3_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+                "2.5_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+            },
         },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
@@ -1118,6 +1131,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),),
                     ((67, 256),),
                     ((67, 71, 256),),
+                ]
+            ),
+        },
+        # A unary op on a view with reordered non-stick dims miscompiled in
+        # deeptools (issue #4869).
+        ("test_pointwise_unary_permuted_view", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "abs": lambda x: torch.abs(x.permute(1, 0, 2, 3)),
+                "neg": lambda x: torch.neg(x.permute(1, 0, 2, 3)),
+                "abs_add": lambda x: torch.abs(x.permute(1, 0, 2, 3)) + 1,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((4, 4, 64, 64),),
+                    ((8, 8, 64, 512),),
                 ]
             ),
         },
@@ -4189,31 +4217,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     False,
                 ),
                 "gqa_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
@@ -6102,6 +6131,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
+            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
         },
         (
             "test_reduction_with_to_dtype",
@@ -8346,18 +8376,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, dst, src, run_eager=False)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
+        """
+        Verify that cumsum executes via the CPU fallback path and emits
+        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        """
+
         def fn(t):
-            t = torch.exp(t)  # compiled op
+            t = torch.exp(t)
             t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
-            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
+            t = torch.exp(t.clamp(-1, 1))
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        print(f"Warn {len(record)}")
+        fallback_warnings = [
+            w
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+            and "aten.cumsum" in str(w.message)
+        ]
+        assert len(fallback_warnings) > 0, (
+            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"All captured: {[str(w.message) for w in captured]}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
