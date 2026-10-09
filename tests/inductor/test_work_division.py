@@ -1085,7 +1085,7 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
 
 
 class TestMatmulRowOrderSplitDomains(unittest.TestCase):
-    def test_flattened_staggered_rows_keep_producer_order(self):
+    def test_flattened_staggered_rows_allow_backend_reordering(self):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         rows, n, k = (_isym(name) for name in ("rows", "n", "k"))
@@ -1111,7 +1111,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         )
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
-            frozenset({2, 4, 8}),
+            frozenset({1, 2, 4, 8}),
         )
         # Matching physical row order must not ban a one-core matmul.
         ctx.output_td = TensorDep(
@@ -1123,7 +1123,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
             frozenset({1, 2, 4, 8}),
         )
         ctx.output_td = output
-        # A non-matmul with the same accesses is outside this guard.
+        # Non-matmuls retain the same contiguous-ownership split domain.
         ctx.op = _computed_buffer((8, 64))
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
