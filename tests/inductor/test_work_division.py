@@ -34,6 +34,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache
 from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import (
     DataFormats,
@@ -55,19 +56,29 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
     ScratchpadAllocator,
 )
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
+from torch_spyre._inductor.wsr.enumerate_tilings import (
+    TilingSpace,
+    build_tiling_space,
+    enumerate_tile_options,
+)
+
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
@@ -1090,7 +1101,7 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
 
 
 class TestMatmulRowOrderSplitDomains(unittest.TestCase):
-    def test_flattened_staggered_rows_keep_producer_order(self):
+    def test_flattened_staggered_rows_allow_backend_reordering(self):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         rows, n, k = (_isym(name) for name in ("rows", "n", "k"))
@@ -1116,7 +1127,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         )
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
-            frozenset({2, 4, 8}),
+            frozenset({1, 2, 4, 8}),
         )
         # Matching physical row order must not ban a one-core matmul.
         ctx.output_td = TensorDep(
@@ -1128,7 +1139,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
             frozenset({1, 2, 4, 8}),
         )
         ctx.output_td = output
-        # A non-matmul with the same accesses is outside this guard.
+        # Non-matmuls retain the same contiguous-ownership split domain.
         ctx.op = _computed_buffer((8, 64))
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
@@ -2450,47 +2461,28 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
             )
 
-    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
-        """A drained carry under the carry-read gate: resident only if readers agree.
-
-        ``plain`` is a ``for_each_tile`` carry: filled before the loop, updated
-        in place by ``update`` and returned from the graph. Inside the loop,
-        ``consumer`` reads the update's name, so it reads the storage's bytes.
-        The post-loop drain plan makes this mutated graph output eligible for
-        LX, which is exactly when the read edge above starts to matter. The
-        real drain validator, buffer build, CP-SAT solve and push run on one
-        small graph (fill, update, reader, then an op after the loop):
-
-        * the reader can slice the storage the way the storage is owned: the
-          storage is resident, stays live to the graph exit, and the push emits
-          one drain clone after the loop's last member;
-        * every reader division slices it another way (same core count, other
-          axes, as in #4990): the edge admits no pair, the solver keeps the
-          storage in HBM, and the push emits nothing.
-        """
-        try:
-            from ortools.sat.python import cp_model  # noqa: F401
-        except ImportError:
-            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-        from torch.utils._ordered_set import OrderedSet
-
+    @staticmethod
+    def _rw(reads, writes):
         x = _isym("x")
+        return SimpleNamespace(
+            reads=OrderedSet(MemoryDep(n, x, (x,), (8,)) for n in reads),
+            writes=OrderedSet(MemoryDep(n, x, (x,), (8,)) for n in writes),
+        )
 
-        def dep(name):
-            return MemoryDep(name, x, (x,), (8,))
+    def _drained_carry_graph(self, after_loop, outputs):
+        """A small graph around one drained ``for_each_tile`` carry.
 
-        def rw(reads, writes):
-            return SimpleNamespace(
-                reads=OrderedSet(dep(n) for n in reads),
-                writes=OrderedSet(dep(n) for n in writes),
-            )
+        ``plain`` is filled before the loop and updated in place by
+        ``update``.  Inside the loop, ``consumer`` reads the update's name, so
+        it reads the storage's bytes.  ``after_loop`` runs after the loop and
+        ``outputs`` are the graph outputs.
+        """
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 
         storage_op = self.op_by_name["plain"]
         update_op = self._carry_update()
         reader_op = self.consumer_op
-        tail_op = self._op("tail")
-        ops = [storage_op, update_op, reader_op, tail_op]
+        ops = [storage_op, update_op, reader_op, *after_loop]
         for op in ops:
             op.name = op.get_name()
             op.layout = _fixed_tiled_layout((8, 64))
@@ -2498,15 +2490,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         graph = MagicMock()
         graph.operations = ops
         graph.graph_input_names = []
-        graph.graph_outputs = [storage_op]
-        graph.get_output_names.return_value = ["plain"]
+        graph.graph_outputs = list(outputs)
+        graph.get_output_names.return_value = [op.get_name() for op in outputs]
         graph.get_buffer.side_effect = op_by_name.get
         # The drain's FX clone reads the storage's own FX node.
         graph.graph = torch.fx.Graph()
         storage_op.origins = OrderedSet([graph.graph.placeholder("plain")])
 
-        # One counted loop holds the update and the reader; the fill and the
-        # tail run outside it. The update writes through the storage.
+        # One counted loop holds the update and the reader. The update writes
+        # through the storage.
         loop = CoarseTileInfo(
             loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
         )
@@ -2523,12 +2515,93 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         update_op.layout.target = storage_op
         self.rw.update(
             {
-                storage_op: rw([], ["plain"]),
-                update_op: rw(["plain"], ["update"]),
-                reader_op: rw(["update"], ["consumer"]),
-                tail_op: rw([], ["tail"]),
+                storage_op: self._rw([], ["plain"]),
+                update_op: self._rw(["plain"], ["update"]),
+                reader_op: self._rw(["update"], ["consumer"]),
             }
         )
+        return graph, ops
+
+    def _plan_solve_push(self, graph, divisions, mem_usage, residency):
+        """Run the real drain validator, buffer build, CP-SAT solve and push.
+
+        Returns ``(plans, built, solved, editor_cls)``, with buffers by name.
+        """
+        allocator = CoOptimizingAllocator(
+            allocator_module._make_cpsat_solver, size=4096
+        )
+        with ExitStack() as stack:
+            stack.enter_context(self._patches())
+            for target, kwargs in (
+                ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
+                ("allocator.clone_at_graph_boundaries", {"return_value": True}),
+                ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
+                ("allocator.materialize_lx_relayouts", {}),
+            ):
+                stack.enter_context(
+                    patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
+                )
+            stack.enter_context(
+                patch.object(
+                    allocator,
+                    "_residency_by_buf",
+                    side_effect=lambda *a, **k: residency,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
+                )
+            )
+            stack.enter_context(patch.object(allocator, "_set_one_allocation"))
+            editor_cls = stack.enter_context(
+                patch.object(allocator_module, "GraphEditor")
+            )
+            # The validator asks the real editor which collectives it rewrites.
+            editor_cls.collective_operand_name.side_effect = (
+                GraphEditor.collective_operand_name
+            )
+
+            plans = allocator_module.validated_drain_plans(
+                graph, division_is_fixed=False
+            )
+            allocator._validated_drain_plans = plans
+            built = allocator._build_cd_bound_buffers(
+                graph, {}, allocator_module._DivisionMap(divisions, set())
+            )
+            solver = allocator.layout_planning(built, allocator.size)
+            solved = {b.name: b for b in solver.plan_layout()}
+            # _commit_divisions would record the committed ownership here.
+            for op in graph.operations:
+                op.iteration_space_ownership = object()
+            allocator._push_allocation(graph, list(solved.values()), [])
+        return plans, {b.name: b for b in built}, solved, editor_cls
+
+    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
+        """A drained carry under the carry-read gate: resident only if readers agree.
+
+        The carry of :meth:`_drained_carry_graph` is returned from the graph,
+        and ``tail`` runs after the loop. The post-loop drain plan makes this
+        mutated graph output eligible for LX, which is exactly when the read
+        edge of ``consumer`` starts to matter. The real drain validator, buffer
+        build, CP-SAT solve and push run on it:
+
+        * the reader can slice the storage the way the storage is owned: the
+          storage is resident, stays live to the graph exit, and the push emits
+          one drain clone after the loop's last member;
+        * every reader division slices it another way (same core count, other
+          axes, as in #4990): the edge admits no pair, the solver keeps the
+          storage in HBM, and the push emits nothing.
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+
+        tail_op = self._op("tail")
+        storage_op = self.op_by_name["plain"]
+        graph, ops = self._drained_carry_graph([tail_op], [storage_op])
+        self.rw[tail_op] = self._rw([], ["tail"])
         mem_usage = {
             "plain": {"size": 256, "op_inputs": []},
             # A mutation alias is unsized, as mem_usage_by_buf reports it.
@@ -2536,69 +2609,31 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             "consumer": {"size": 256, "op_inputs": ["update"]},
             "tail": {"size": 256, "op_inputs": []},
         }
-
-        def residency(*_args, **_kwargs):
-            # The verdicts _residency_by_buf gives these ops: the plan clears
-            # the storage's "graph output mutated after production" refusal
-            # (TestLoopCarryLxEligibility covers that branch); the update is a
-            # mutation alias, never an LX buffer itself.
-            return {
-                "plain": None,
-                "update": "op not allowed",
-                "consumer": None,
-                "tail": None,
-            }
+        # The verdicts _residency_by_buf gives these ops: the plan clears the
+        # storage's "graph output mutated after production" refusal
+        # (TestLoopCarryLxEligibility covers that branch); the update is a
+        # mutation alias, never an LX buffer itself.
+        residency = {
+            "plain": None,
+            "update": "op not allowed",
+            "consumer": None,
+            "tail": None,
+        }
 
         def run(reader_divs):
-            allocator = CoOptimizingAllocator(
-                allocator_module._make_cpsat_solver, size=4096
-            )
             divisions = {
                 "plain": self.parent_divs,
                 "update": self.parent_divs,
                 "consumer": reader_divs,
                 "tail": self.parent_divs[:1],
             }
-            with ExitStack() as stack:
-                stack.enter_context(self._patches())
-                for target, kwargs in (
-                    ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
-                    ("allocator.clone_at_graph_boundaries", {"return_value": True}),
-                    ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
-                    ("allocator.materialize_lx_relayouts", {}),
-                ):
-                    stack.enter_context(
-                        patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
-                    )
-                stack.enter_context(
-                    patch.object(allocator, "_residency_by_buf", side_effect=residency)
-                )
-                stack.enter_context(
-                    patch.object(
-                        allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
-                    )
-                )
-                stack.enter_context(patch.object(allocator, "_set_one_allocation"))
-                editor_cls = stack.enter_context(
-                    patch.object(allocator_module, "GraphEditor")
-                )
-
-                plans = allocator_module.validated_drain_plans(
-                    graph, division_is_fixed=False
-                )
-                self.assertEqual(set(plans), {"plain"})
-                self.assertIs(plans["plain"].anchor_op, reader_op)
-                allocator._validated_drain_plans = plans
-                built = allocator._build_cd_bound_buffers(
-                    graph, {}, allocator_module._DivisionMap(divisions, set())
-                )
-                solver = allocator.layout_planning(built, allocator.size)
-                solved = {b.name: b for b in solver.plan_layout()}
-                # _commit_divisions would record the committed ownership here.
-                for op in ops:
-                    op.iteration_space_ownership = object()
-                allocator._push_allocation(graph, list(solved.values()), [])
-            return plans["plain"], {b.name: b for b in built}, solved, editor_cls
+            plans, built, solved, editor_cls = self._plan_solve_push(
+                graph, divisions, mem_usage, residency
+            )
+            self.assertEqual(set(plans), {"plain"})
+            self.assertIs(plans["plain"].anchor_op, self.consumer_op)
+            self.assertIsNone(plans["plain"].collective)
+            return plans["plain"], built, solved, editor_cls
 
         with self.subTest("reader splits like the storage"):
             plan, built, solved, editor_cls = run(self.consumer_divs[:2])
@@ -2634,6 +2669,97 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.change_graph_output.assert_not_called()
             # Why: the reader's edge on the storage exists but admits no pair.
             self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
+
+    def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
+        """A carry whose only post-loop use is an all_reduce stays in LX.
+
+        The all_reduce's whole-buffer read has no residency edge, so as a
+        parent of the all_reduce the carry admits no division pair, which
+        forces it -- and every in-loop update -- into HBM.  The plan gives the
+        all_reduce a post-loop drain to read instead: the carry is no longer
+        its parent, the carry is resident, the push repoints the all_reduce at
+        the drain, and the carry's lifetime still ends at the all_reduce
+        rather than the graph exit (``tail`` runs after it).
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+
+        storage_op = self.op_by_name["plain"]
+        all_reduce = MagicMock(spec=AllReduceAsyncFallback)
+        all_reduce.get_name.return_value = "all_reduce"
+        all_reduce.inputs = [TensorBox(StorageBox(storage_op))]
+        tail_op = self._op("tail")
+        graph, ops = self._drained_carry_graph([all_reduce, tail_op], [tail_op])
+        # An extern kernel reads and writes whole buffers.
+        self.rw[all_reduce] = SimpleNamespace(
+            reads=OrderedSet([StarDep("plain")]),
+            writes=OrderedSet([StarDep("all_reduce")]),
+        )
+        self.rw[tail_op] = self._rw(["all_reduce"], ["tail"])
+        mem_usage = {
+            "plain": {"size": 256, "op_inputs": []},
+            "update": {"size": -1, "op_inputs": ["plain"]},
+            "consumer": {"size": 256, "op_inputs": ["update"]},
+            # An extern kernel's FixedLayout output is unsized.
+            "all_reduce": {"size": -1, "op_inputs": ["plain"]},
+            "tail": {"size": 256, "op_inputs": ["all_reduce"]},
+        }
+        residency = {
+            "plain": None,
+            "update": "op not allowed",
+            "consumer": None,
+            "all_reduce": "op not allowed",
+            "tail": None,
+        }
+        divisions = {
+            "plain": self.parent_divs,
+            "update": self.parent_divs,
+            "consumer": self.consumer_divs[:2],
+            "all_reduce": [CoreDivision(splits={})],
+            "tail": self.parent_divs[:1],
+        }
+
+        def run(with_plan):
+            real_plans = allocator_module.validated_drain_plans
+            plans_fn = real_plans if with_plan else (lambda *a, **k: {})
+            with patch.object(allocator_module, "validated_drain_plans", plans_fn):
+                return self._plan_solve_push(graph, divisions, mem_usage, residency)
+
+        with self.subTest("the collective is drained"):
+            plans, built, solved, editor_cls = run(with_plan=True)
+            self.assertEqual(set(plans), {"plain"})
+            plan = plans["plain"]
+            self.assertIs(plan.collective, all_reduce)
+            self.assertIsNotNone(solved["plain"].address)
+            self.assertNotIn("plain", built["all_reduce"].parents)
+            # Live to the all_reduce (index 3), not to the graph exit (5).
+            self.assertEqual(built["plain"].end_time, ops.index(all_reduce) + 1)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_called_once_with(
+                storage_op,
+                [],
+                input=False,
+                private=True,
+                after_fx=plan.loop_origin,
+                lower_anchor=plan.anchor_op,
+            )
+            drain = editor.push_allocation_with_clone.return_value
+            editor.replace_collective_operand.assert_called_once_with(
+                all_reduce, "plain", drain
+            )
+            editor.change_graph_output.assert_not_called()
+
+        with self.subTest("without a plan the all_reduce edge keeps it in HBM"):
+            _plans, built, solved, editor_cls = run(with_plan=False)
+            self.assertIsNone(solved["plain"].address)
+            self.assertIn("plain", built["all_reduce"].parents)
+            self.assertNotIn("plain", built["all_reduce"].cd_parent_matches)
+            editor_cls.return_value.replace_collective_operand.assert_not_called()
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
@@ -3193,6 +3319,189 @@ class TestOpSplitSpace(unittest.TestCase):
             )
 
 
+_SPEC_ON_DIM_0 = TileSpec((TileAxis(host_dim=0, count=2),))
+_SPEC_ON_DIM_1 = TileSpec((TileAxis(host_dim=1, count=2),))
+
+
+class TestOpSplitSpacePerTileFrame(unittest.TestCase):
+    """A tiled division is judged in its per-tile frame. #4768's end-to-end
+    shape: fp16 ``(1, 8195, 256, 64)`` on 4 cores overflows ``MAX_SPAN_BYTES``
+    at every untiled split -- the span is measured on dim 1, and no factor of
+    8195 = 5 * 11 * 149 fits 4 cores -- while dim 1 tiled 5 ways fits."""
+
+    def test_a_tiling_admits_splits_the_untiled_op_cannot_take(self):
+        shape = (1, 8195, 256, 64)
+        op = _computed_buffer(shape)
+        syms = [Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(4)]
+        index = sum(sym * stride for sym, stride in zip(syms, op.layout.stride))
+        write = MemoryDep("buf0", index, tuple(syms), shape)
+        op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads=set(), writes={write})
+        )
+        space = work_division_module.build_op_split_space(
+            op, 4, tiling=TilingSpace(max_dims=1, output_counts={1: [5]})
+        )
+        by_5 = TileSpec((TileAxis(host_dim=1, count=5),))
+
+        def admitted(tiling):
+            domains = [space.factor_domain(axis, tiling) for axis in space.axes]
+            return [
+                list(factors)
+                for factors in itertools.product(*domains)
+                if space.admits(dict(zip(space.axes, factors)), tiling)
+            ]
+
+        self.assertEqual(admitted(TileSpec()), [])
+        self.assertEqual(admitted(by_5), [[1, 1, 1, 1], [1, 1, 2, 1], [1, 1, 4, 1]])
+
+
+class TestOpSplitSpaceTiling(unittest.TestCase):
+    """The tiling half of the space: a coarse tiling and a core division are
+    one candidate, and the tiling narrows what the division may be."""
+
+    def setUp(self):
+        self.x, self.y = _isym("x"), _isym("y")
+        # Host dim 0 has extent 8 -- four divisors untiled, fewer per tile.
+        self.op = _computed_buffer((8, 128), name="tiled")
+        self.case = _CandidateCase(
+            name="tiling",
+            op=self.op,
+            it_space={self.x: 8, self.y: 128},
+            output_td=_tensor_dep("tiled", (8, 128), (self.x, self.y)),
+            max_cores=32,
+            axes=(self.x, self.y),
+            candidates=[],
+            probes=[],
+        )
+        # The write dep the enumerator resolves the stick dim through.
+        self.op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads=set(), writes={self.case.output_td.dep})
+        )
+        self.tiling = TilingSpace(max_dims=2, output_counts={0: [2, 4]})
+
+    @contextmanager
+    def _space(self, tiling, coords=None):
+        coords = [self.x, self.y] if coords is None else coords
+        with (
+            self.case.patches(),
+            patch.object(work_division_module, "op_out_coords", return_value=coords),
+            patch.object(coarse_tiling_module, "op_out_coords", return_value=coords),
+            patch.object(
+                coarse_tiling_module,
+                "iteration_space_from_op",
+                return_value=self.case.it_space,
+            ),
+        ):
+            yield work_division_module.build_op_split_space(
+                self.op, self.case.max_cores, tiling=tiling
+            )
+
+    def test_the_tiling_half_agrees_with_the_enumeration(self):
+        """The seam ``test_space_admits_exactly_the_enumerated_candidates``
+        pins for the split half: what the list carries, the space admits."""
+        options = enumerate_tile_options(self.op, max_options=1000)
+        self.assertGreater(len(options), 1)  # non-vacuity
+        with self._space(build_tiling_space(self.op)) as space:
+            for spec in options:
+                self.assertTrue(space.admits_tiling(spec), spec.label)
+
+    def test_a_dim_the_coords_do_not_resolve_is_not_offered(self):
+        """``tile_counts`` could not narrow the axis such a dim cuts."""
+        with self._space(self.tiling, coords=[sympy.Integer(0), self.y]) as space:
+            self.assertTrue(space.tiling.is_empty)
+            self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_0))
+
+    def test_a_tile_level_narrows_the_axis_it_cuts(self):
+        """The ragged half: coarse tiling emits equal tiles, so a core split of
+        a tiled axis has to divide the *per-tile* extent."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            self.assertEqual(space.factor_domain(self.x), [1, 2, 4, 8])
+            self.assertEqual(space.factor_domain(self.x, tiled), [1, 2])
+            # The untouched axis keeps its whole domain.
+            self.assertEqual(
+                space.factor_domain(self.y, tiled), space.factor_domain(self.y)
+            )
+            self.assertTrue(space.admits({self.x: 4, self.y: 1}))
+            self.assertFalse(space.admits({self.x: 4, self.y: 1}, tiled))
+            self.assertTrue(space.admits({self.x: 2, self.y: 1}, tiled))
+
+    def test_a_tiling_the_op_cannot_take_is_refused_with_its_splits(self):
+        with self._space(self.tiling) as space:
+            self.assertFalse(space.admits({self.x: 1, self.y: 1}, _SPEC_ON_DIM_1))
+            self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_1))
+
+    def test_a_step_moves_one_axis_or_one_level_but_never_both(self):
+        untiled = TileSpec()
+        with self._space(self.tiling) as space:
+            seed = space.division({self.x: 2, self.y: 1})
+            moves = space.neighbours(seed)
+            for division in moves:
+                changed_tiling = division.tiling != untiled
+                changed_splits = division.output_splits != seed.output_splits
+                self.assertNotEqual(changed_tiling, changed_splits, division.label)
+            # Both kinds are offered, and a tiling step keeps the splits.
+            self.assertIn(
+                (2, TileSpec((TileAxis(host_dim=0, count=2),))),
+                [(d.output_splits.get(self.x, 1), d.tiling) for d in moves],
+            )
+            self.assertIn(4, [d.output_splits.get(self.x, 1) for d in moves])
+
+    def test_the_split_steps_at_a_tiling_stay_inside_its_narrower_domain(self):
+        tiled = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            at_tiling = space.neighbours(space.division({self.x: 1}, tiled))
+            for division in at_tiling:
+                if division.tiling == tiled:
+                    self.assertIn(division.output_splits.get(self.x, 1), (1, 2))
+
+    def test_without_a_tiling_space_nothing_is_tiled_and_nothing_is_offered(self):
+        """What every engine but the SA co-optimizer gets: the answers are
+        the ones a space that never knew about tilings gave."""
+        with self._space(None) as space:
+            self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_0))
+            self.assertFalse(space.admits({self.x: 1}, _SPEC_ON_DIM_0))
+            self.assertEqual(space.tiling_options(TileSpec()), [])
+            seed = space.division({self.x: 2, self.y: 1})
+            self.assertTrue(all(d.tiling.is_untiled for d in space.neighbours(seed)))
+
+
+class TestAxisByHostDim(unittest.TestCase):
+    """``TileAxis.host_dim`` indexes ``op_out_coords``, and the axis a level
+    cuts is read off it by the lowering's own resolver."""
+
+    def setUp(self):
+        self.d0, self.d1, self.d2 = _isym("d0"), _isym("d1"), _isym("d2")
+
+    def _mapping(self, coords, axes):
+        with (
+            patch.object(work_division_module, "op_out_coords", return_value=coords),
+            patch.object(coarse_tiling_module, "op_out_coords", return_value=coords),
+            patch.object(
+                coarse_tiling_module,
+                "iteration_space_from_op",
+                return_value=dict.fromkeys(axes, 1),
+            ),
+        ):
+            return work_division_module._axis_by_host_dim(MagicMock(), axes)
+
+    def test_a_size_1_dim_shifts_the_frame(self):
+        # No symbol is minted for a size-1 dim, so host 1 is the axis ``d0``
+        # cuts; a positional frame would map it to ``d1``.
+        axes = [self.d0, self.d1, self.d2]
+        self.assertEqual(
+            self._mapping([sympy.Integer(0), self.d0, self.d1, self.d2], axes),
+            {1: self.d0, 2: self.d1, 3: self.d2},
+        )
+
+    def test_only_a_single_known_axis_resolves(self):
+        other = _isym("other")
+        self.assertEqual(
+            self._mapping([self.d0 * 8 + self.d1, other, self.d2], [self.d0, self.d2]),
+            {2: self.d2},
+        )
+
+
 class TestResidencyEdgeInversion(unittest.TestCase):
     """Propagating a division across an edge by *constructing* the other end's
     division instead of scanning its menu for a compatible entry."""
@@ -3233,6 +3542,42 @@ class TestResidencyEdgeInversion(unittest.TestCase):
             {self.r, self.c},
             op=self.consumer,
         )
+
+    def _tiled_consumer_space(self, counts):
+        return mock_op_split_space(
+            {self.r: [1, 2, 4, 8], self.c: [1, 2]},
+            {self.r, self.c},
+            op=self.consumer,
+            tiling=TilingSpace(max_dims=2, output_counts=counts),
+        )
+
+    def test_the_tiling_crosses_the_edge_where_the_far_side_can_take_it(self):
+        """What forms a tiling group at all: the run of ops the residency
+        relation reaches has to agree on one ``TileSpec``, so the inverse
+        carries it rather than re-deciding on each side."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        consumer_space = self._tiled_consumer_space({0: [2]})
+        with self._geometry():
+            division = self._edge().consumer_division_for(
+                CoreDivision({self.x: 4}, tiling=tiled), consumer_space
+            )
+        self.assertIsNotNone(division)
+        self.assertEqual(division.tiling, tiled)
+        self.assertEqual(_by_name(division.output_splits), {"r": 4})
+
+    def test_a_tiling_the_far_side_refuses_costs_the_level_not_the_edge(self):
+        """Losing a tiling level is a worse plan; losing the edge is a worse
+        state. So the untiled inverse is taken, and the edge survives."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        consumer_space = self._tiled_consumer_space({0: [4]})  # 2 is not offered
+        self.assertFalse(consumer_space.admits_tiling(tiled))  # non-vacuity
+        with self._geometry():
+            division = self._edge().consumer_division_for(
+                CoreDivision({self.x: 4}, tiling=tiled), consumer_space
+            )
+        self.assertIsNotNone(division)
+        self.assertTrue(division.tiling.is_untiled)
+        self.assertEqual(_by_name(division.output_splits), {"r": 4})
 
     def _edge(self):
         return work_division_module.ResidencyEdge(
@@ -3367,7 +3712,9 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         that reproduces the geometry being illegal means no edge -- not an
         illegal division."""
         space = self.consumer_space
-        space.context.is_legal.side_effect = lambda splits: splits[self.r] != 4
+        space.context.is_legal.side_effect = (
+            lambda splits, tile_counts=None: splits[self.r] != 4
+        )
         with self._geometry():
             edge = self._edge()
             self.assertIsNone(

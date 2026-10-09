@@ -728,6 +728,45 @@ def test_the_extractor_stamps_reads_of_graph_inputs():
     assert stamps[("input", "buf0")] is False
 
 
+def _transport_flags(
+    monkeypatch, used_ops, *, reduction_type=None, geometry=(128, 4096)
+):
+    """(transport_compute_read, transport_read_run_bytes) the real extractor stamps on an
+    op whose body uses ``used_ops``. The source-run geometry has its own tests; it is
+    stubbed so this pins only how the extractor decides the flag."""
+    from torch._inductor.virtualized import V
+
+    op = _extractable_op("buf1", ["buf0"])
+    op.data = SimpleNamespace(
+        reduction_type=reduction_type,
+        inner_fn_opcount=lambda: SimpleNamespace(used_ops=set(used_ops)),
+    )
+    monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *_: geometry)
+    with V.set_graph_handler(_StubGraph(inputs=[], outputs=[])):
+        feats = dcm.extract_op_features(op)
+    return feats.transport_compute_read, feats.transport_read_run_bytes
+
+
+def test_the_extractor_flags_an_arithmetic_read_and_not_a_copy_or_reduction(
+    monkeypatch,
+):
+    """Covers the wiring itself: the pricing tests build ``OpFeatures`` by hand, so
+    without this the extractor could stop setting ``transport_compute_read`` and every
+    other test would still pass."""
+    assert _transport_flags(monkeypatch, {"load", "tanh"}) == (True, 128)
+    assert _transport_flags(monkeypatch, {"load"}) == (False, 128)
+    # A reduction is not a one-input arithmetic read: it is never transport-priced.
+    assert _transport_flags(monkeypatch, {"load", "add"}, reduction_type="sum") == (
+        False,
+        None,
+    )
+    # No proven source run, nothing to price.
+    assert _transport_flags(monkeypatch, {"load", "tanh"}, geometry=(None, None)) == (
+        False,
+        None,
+    )
+
+
 def test_the_extractor_stamps_the_write_of_a_graph_output():
     graph = _StubGraph(inputs=["arg0_1"], outputs=["buf1"])
     assert _stamps(_extractable_op("buf1", ["arg0_1"]), graph)[("output", "op_buf1")]

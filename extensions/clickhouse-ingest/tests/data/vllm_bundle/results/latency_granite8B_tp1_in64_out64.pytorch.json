@@ -1,0 +1,28 @@
+[
+  {
+    "benchmark": {
+      "name": "latency",
+      "extra_info": {
+        "args": {
+          "model": "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+          "tensor_parallel_size": 1,
+          "input_len": 64,
+          "output_len": 64,
+          "batch_size": 1,
+          "num_iters": 2
+        }
+      }
+    },
+    "model": {
+      "name": "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+    },
+    "metric": {
+      "name": "latency",
+      "benchmark_values": [
+        0.7093,
+        0.7155
+      ],
+      "extra_info": {}
+    }
+  }
+]

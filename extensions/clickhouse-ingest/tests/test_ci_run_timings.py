@@ -328,6 +328,24 @@ def test_a_non_pr_run_is_written_with_an_empty_trigger_pr():
         CiRunTimings.row(r)
 
 
+def test_a_main_push_names_its_repo_and_merged_pr_without_a_trigger_pr():
+    batch = _batch()
+    batch["run"].update(
+        trigger_pr="", pr_components=[], trigger_source="main-push", base_ref=""
+    )
+    batch["run"].update(repo="torch-spyre", pr_number="5294")
+    for r in _rows(batch):
+        assert (r["trigger_pr"], r["repo"], r["pr_number"]) == ("", "torch-spyre", 5294)
+        assert r["is_pr_component"] is False
+        CiRunTimings.row(r)
+
+
+def test_a_trigger_pr_outranks_a_given_repo_and_pr_number():
+    batch = _batch()
+    batch["run"].update(repo="other", pr_number="1")
+    assert {(r["repo"], r["pr_number"]) for r in _rows(batch)} == {("deeptools", 4500)}
+
+
 def test_a_retried_build_keeps_both_attempts():
     batch = _batch()
     first = dict(batch["builds"][0], state="failed", result="FAILURE")

@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/torch-spyre/torch-spyre/tree/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/bundle.schema.json",
+  "title": "spyre_v2 results bundle: bundle.json, schema_version 1",
+  "description": "bundle.json, minimal: an artifact (artifact_id, or image with arch) and test_type (implied perf for kind vllm), beside at least one results file. Every other key is optional and derived at ingest when absent: component and arch from the artifact, run_key as manual:<uploader>:<bundle sha256>, files[] (checked when present). A blank artifact field counts as absent.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Default 1; a newer version is refused.",
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "kind": {
+      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg.",
+      "enum": [
+        "junit",
+        "vllm"
+      ]
+    },
+    "artifact_id": {
+      "description": "The tested artifact's spyre_v2 artifact_id, tried first; it must already be recorded.",
+      "type": "string",
+      "pattern": "^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$"
+    },
+    "image": {
+      "description": "The pulled image by digest, <repo>@sha256:<digest>, with arch: the fallback when artifact_id is absent or unrecorded. With both, they must name the same artifact.",
+      "type": "string",
+      "pattern": "^([^\\s@]+@sha256:[0-9a-f]{64})?$"
+    },
+    "artifact": {
+      "description": "Compatibility: any `artifacts resolve` spec; id: and image: specs are read as artifact_id / image.",
+      "type": "string"
+    },
+    "component": {
+      "description": "The suite's owner, a test_case_id hash input. Default: the artifact's component.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "arch": {
+      "description": "Where the tests ran. Default: the artifact's arch. Needed with an image alone.",
+      "enum": [
+        "x86_64",
+        "s390x",
+        "ppc64le"
+      ]
+    },
+    "test_type": {
+      "description": "The tier; artifact_results.test_type's CHECK set.",
+      "enum": [
+        "smoke",
+        "unit",
+        "integration",
+        "regression",
+        "trunk",
+        "perf",
+        "fvt",
+        "fvt-static",
+        "fvt-dynamic",
+        "svt",
+        "svt-static",
+        "svt-dynamic",
+        "model_ops",
+        "model_modules",
+        "model_support"
+      ]
+    },
+    "run_key": {
+      "description": "Unique per run: manual:<who>:<token>, or a Jenkins <JOB_NAME>#<BUILD_NUMBER> (then the run_id equals a connected v2Results run's). Default: manual:<uploader>:<bundle sha256>.",
+      "type": "string",
+      "pattern": "^(manual:[A-Za-z0-9._@+-]+:[A-Za-z0-9-]+|[^#\\s]+#[0-9]+)$"
+    },
+    "jenkins_run_key": {
+      "description": "Alias of a Jenkins run_key; when both are set they must be equal.",
+      "type": "string",
+      "pattern": "^[^#\\s]+#[0-9]+$"
+    },
+    "run_url": {
+      "description": "The run's own page, if it has one; default: the processed bundle's URL.",
+      "type": "string"
+    },
+    "workflow": {
+      "type": "string"
+    },
+    "started_at": {
+      "description": "ISO-8601 with a zone, e.g. 2026-10-09T08:00:00Z.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tag_family": {
+      "description": "Jenkins run keys only: a manual bundle records verdicts, never tags.",
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "runner": {
+      "description": "Where it ran: host, user, image (the pulled ref@digest), cards, ...",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "env": {
+      "description": "Free-form environment notes, kept with the bundle.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "string"
+    },
+    "uploader": {
+      "description": "Who built the bundle; the relay records the Artifactory uploader instead.",
+      "type": "string"
+    },
+    "sealed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "files": {
+      "description": "Every file of the bundle but bundle.json. results/*.xml (junit) or results/*.json (vllm) are ingested; attachments/ are kept, not ingested.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(results/[^/]+\\.(xml|json)|attachments/[^\\s]+)$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "perf": {
+      "description": "vllm bundles: run context. tensor_parallel/input_len/output_len must agree with each file's <mode>_<model>_tp<N>_in<N>_out<N> name; model names a benchmark whose records name none; state is the verdict (default passed).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "tensor_parallel": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "input_len": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "output_len": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "cards": {
+          "type": "string"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "head_branch": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        }
+      }
+    }
+  }
+}

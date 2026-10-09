@@ -105,14 +105,6 @@ class TestDatatypeScalarOperations:
         """
         Test FP16 scalar with FP16/FP32 tensors.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-        if execution_mode == "eager" and tensor_dtype == torch.float32:
-            pytest.xfail(reason="to_dtype on float32 (IEEE_FP32) not supported")
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def fp16_scalar_mul(x):
             scalar = torch.tensor(0.125, dtype=scalar_dtype, device=x.device)
@@ -151,11 +143,6 @@ class TestDatatypeScalarOperations:
     @pytest.mark.parametrize("bool_val", [True, False])
     def test_bool_scalar(self, execution_mode, bool_val):
         """Test Boolean scalars."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        if not bool_val:
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def bool_mul(x):
             return x * bool_val
@@ -212,7 +199,7 @@ class TestDatatypeScalarOperations:
                 reason="Spyre backend does not support int32/int16 dtype - causes Signal Abort in data format converter"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif torch_dtype in (None, torch.float16) and execution_mode == "compiled":
+        elif torch_dtype is None and execution_mode == "compiled":
             pytest.xfail(
                 reason="Constant tensor mul fails - IndexError on empty args during layout propagation."
             )
@@ -267,9 +254,12 @@ class TestDatatypeScalarOperations:
         _compare_modes(execution_mode, type_promo_op, x, atol=atol, rtol=rtol)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-    @pytest.mark.xfail(reason="Spyre backend does not support dtype Double(FP64)")
     def test_mixed_dtype_chain_fp64_fp32_fp16(self, execution_mode):
-        """Test mixed dtype chain: FP64 → FP32 → FP16."""
+        """FP64 → FP32 → FP16 chain: the FP64 input is rejected.
+
+        Both modes fail when the FP64 tensor is moved to the device, before
+        ``torch.compile`` runs, so they pin the same check.
+        """
 
         def mixed_chain(x):
             x_fp32 = x.to(torch.float32)
@@ -277,7 +267,8 @@ class TestDatatypeScalarOperations:
             return x_scaled.to(torch.float16)
 
         x = cached_randn((128, 64), dtype=torch.float64)
-        _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
+        with pytest.raises(Exception, match="does not support dtype Double"):
+            _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize(
         "dtype,scalar_value,atol,rtol",
@@ -608,7 +599,9 @@ class TestNegativeScalarOperations:
                 reason="Mixed-dtype tensors sharing stick variable not supported"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1639
-        if expected_behavior in ["overflow_to_inf", "overflow_or_large"]:
+        if expected_behavior == "overflow_to_inf" or (
+            expected_behavior == "overflow_or_large" and execution_mode == "compiled"
+        ):
             pytest.xfail(
                 reason="backend does not support dtype conversion in comparison operations"
             )
