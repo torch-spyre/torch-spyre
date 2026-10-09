@@ -507,10 +507,13 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
-# Fails with a value mismatch, but passed once in a cold-cache full run. Cause not
-# investigated (see #5285), so it is a non-strict xfail.
+# These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
+# the xfail-marked tests, each has passed in some of them). The bfloat16 case is the
+# sibling of the float16 one. Cause not investigated (see #5285), so they are
+# non-strict xfails.
 _ROUND_TRIP_IMPLICIT_UNSTABLE = {
     "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+    "bfloat16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
 }
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
