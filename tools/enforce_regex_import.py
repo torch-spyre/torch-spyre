@@ -64,9 +64,6 @@ def main() -> int:
         # derive the pytorch release branch from pyproject.toml. Must run
         # without third-party deps to stay portable across both call sites.
         "tools/get_torch_minor.py",
-        # Writes offline results bundles on air-gapped test hosts, from a --no-deps wheel or
-        # as a single copied file, so it runs on the standard library alone.
-        "extensions/clickhouse-ingest/spyre_clickhouse_ingest/offline.py",
     }
 
     for filepath in files:
