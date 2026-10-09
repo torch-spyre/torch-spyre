@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 import copy
 import functools
@@ -26,6 +27,10 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
 import unittest
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.work_division import OpSplitSpace
 
 DEVICE = torch.device("spyre")
 
@@ -488,6 +493,26 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
+def _check_expect_fail_unstable(prefix, cases):
+    """Validate the ``expect_fail_unstable`` entries of one PARAMS item."""
+    entries = cases.get("expect_fail_unstable", {})
+    ops = cases.get("ops_dict") or {}
+    generated = set(cases["param_sets"]) | {
+        f"{op}_{case}" for op in ops for case in cases["param_sets"]
+    }
+    for key, reason in entries.items():
+        assert reason and reason.strip(), (
+            f"{prefix}: expect_fail_unstable entry {key!r} needs a reason"
+        )
+        assert key in generated, (
+            f"{prefix}: expect_fail_unstable entry {key!r} matches no generated test"
+        )
+        for other in ("expect_fail", "skip", "device_fault"):
+            assert key not in cases.get(other, ()), (
+                f"{prefix}: {key!r} is in both expect_fail_unstable and {other}"
+            )
+
+
 class ParameterizedTestMeta(type):
     def __new__(mcs, name, bases, namespace):
         param_map = namespace.get("PARAMS", {})
@@ -501,6 +526,11 @@ class ParameterizedTestMeta(type):
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
             expect_fail = cases.get("expect_fail", [])
+            # {case or "<op>_<case>": reason}: a non-strict xfail, for a case that
+            # fails but is known to pass on some runs. A strict xfail that passes
+            # fails the run, which would make such a case a flaky failure.
+            expect_fail_unstable = cases.get("expect_fail_unstable", {})
+            _check_expect_fail_unstable(test_name_prefix, cases)
             skip_list = cases.get("skip", [])
             # {case: reason}: an xfail still runs on the card, so a case that faults it is skipped.
             device_fault = cases.get("device_fault", {})
@@ -544,7 +574,20 @@ class ParameterizedTestMeta(type):
                             # op), so a single op can be marked without affecting the
                             # others sharing the shape.
                             op_case_match = op_case in expect_fail
-                            if test_case in expect_fail or op_case_match:
+                            unstable_key = next(
+                                (
+                                    k
+                                    for k in (op_case, test_case)
+                                    if k in expect_fail_unstable
+                                ),
+                                None,
+                            )
+                            if unstable_key is not None:
+                                namespace[test_name] = pytest.mark.xfail(
+                                    reason=f"Unstable: {expect_fail_unstable[unstable_key]}",
+                                    strict=False,
+                                )(namespace[test_name])
+                            elif test_case in expect_fail or op_case_match:
                                 marked = op_case if op_case_match else test_case
                                 namespace[test_name] = pytest.mark.xfail(
                                     reason=f"Expected fail for {marked}", strict=True
@@ -581,6 +624,11 @@ class ParameterizedTestMeta(type):
                     elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
                             reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
+                    elif test_case in expect_fail_unstable:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Unstable: {expect_fail_unstable[test_case]}",
+                            strict=False,
                         )(namespace[test_name])
 
             # Remove base function if parameterized
@@ -880,3 +928,29 @@ def capture_backend_output_dirs():
 
     with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
         yield output_dirs
+
+
+def mock_op_split_space(
+    domains: dict,
+    output_axes: Iterable,
+    *,
+    op: Any = None,
+    legal: Callable[[dict], bool] | None = None,
+) -> "OpSplitSpace":
+    """An ``OpSplitSpace`` over stated domains, legal wherever ``legal`` says
+    (everywhere by default). The real legality rules are tested against the
+    enumeration in ``test_work_division.py``; a test of what *asks* a space
+    only needs some rule."""
+    from unittest.mock import MagicMock
+
+    from torch_spyre._inductor.work_division import OpSplitSpace
+
+    context = MagicMock()
+    context.axes = list(domains)
+    context.is_legal.side_effect = legal or (lambda splits: True)
+    return OpSplitSpace(
+        op=MagicMock() if op is None else op,
+        context=context,
+        output_axes=frozenset(output_axes),
+        factor_domains=domains,
+    )
