@@ -49,6 +49,15 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
+def strict_xfail(request, raises, reason):
+    """Mark the running test as a strict xfail that must fail with ``raises``.
+
+    Unlike ``pytest.xfail`` this runs the body, so the test XPASSes (and fails,
+    being strict) once the gap is fixed, and any other failure still fails.
+    """
+    request.applymarker(pytest.mark.xfail(raises=raises, strict=True, reason=reason))
+
+
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0

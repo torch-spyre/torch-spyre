@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch._dynamo as dynamo
 
-from utils_inductor import DEVICE, cached_randn, compare_with_cpu
+from utils_inductor import DEVICE, cached_randn, compare_with_cpu, strict_xfail
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -42,15 +42,6 @@ def _rejecting_double(condition):
     if condition:
         return pytest.raises(Exception, match=_DOUBLE_REJECTED)
     return contextlib.nullcontext()
-
-
-def _strict_xfail(request, raises, reason):
-    """Mark the running test as a strict xfail that must fail with ``raises``.
-
-    Unlike ``pytest.xfail`` this runs the body, so the test XPASSes (and fails,
-    being strict) once the gap is fixed, and any other failure still fails.
-    """
-    request.applymarker(pytest.mark.xfail(raises=raises, strict=True, reason=reason))
 
 
 def _run_spyre(execution_mode, fn, *args):
@@ -148,7 +139,7 @@ class TestDatatypeScalarOperations:
     def test_integer_scalar_types(self, request, execution_mode, dtype, value):
         """Test integer scalars with FP32 tensor."""
         if execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 NotImplementedError,
                 "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
@@ -188,7 +179,7 @@ class TestDatatypeScalarOperations:
                 reason="SIGFPE in SpyreTensorLayout::init for an FP64 scalar (#5335)"
             )
         if execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 torch._inductor.exc.InductorError,
                 "the scalar constant becomes a 0-D CPU buffer in the compiled "
@@ -220,7 +211,7 @@ class TestDatatypeScalarOperations:
                 reason="Spyre backend does not support int32/int16 dtype - causes Signal Abort in data format converter"
             )
         if torch_dtype is None:
-            _strict_xfail(
+            strict_xfail(
                 request,
                 AssertionError,
                 "an FP32 0-D device tensor times an FP16 tensor returns FP32; the CPU "
@@ -262,7 +253,7 @@ class TestDatatypeScalarOperations:
         Test various type promotion scenarios.
         """
         if tensor_dtype == torch.float32 and execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 NotImplementedError,
                 "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
@@ -337,7 +328,7 @@ class TestDatatypeScalarOperations:
                 reason="SIGFPE in SpyreTensorLayout::init for an FP64 scalar (#5335)"
             )
         if execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 torch._inductor.exc.InductorError,
                 "the scalar constant becomes a 0-D CPU buffer in the compiled "
@@ -554,14 +545,14 @@ class TestNegativeScalarOperations:
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         elif expected_behavior == "all_inf_nonzero":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 NotImplementedError,
                 "the test indexes the device result with a mask, which needs "
                 "aten::index.Tensor_out (#1219)",
             )
         elif expected_behavior == "all_neg_inf":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 AssertionError,
                 "multiplying by an infinite scalar returns NaN for some elements "
@@ -630,13 +621,13 @@ class TestNegativeScalarOperations:
         Test FP16 overflow and underflow scenarios.
         """
         if expected_behavior == "overflow_to_inf":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 AssertionError,
                 "x * 1e10 in FP16 returns [inf, nan, nan], not all inf",
             )
         elif expected_behavior == "overflow_or_large" and execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 torch._inductor.exc.InductorError,
                 "Cannot resolve target for 'index_expr' (#4502)",
@@ -820,7 +811,7 @@ class TestNegativeScalarOperations:
         ``test_cross_device_scalar_op_allowed`` in ``tests/test_spyre.py``)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1598
         if execution_mode == "compiled":
-            _strict_xfail(
+            strict_xfail(
                 request,
                 torch._inductor.exc.InductorError,
                 "the 0-D CPU tensor becomes a CPU-layout buffer in the compiled "
