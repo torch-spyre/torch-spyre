@@ -61,6 +61,7 @@ from .identity import (
     split_case_tags,
     tags_for_case,
 )
+from .options import ci_tags
 from .resolver import Resolution, ensure, ensure_artifact, resolve, resolve_artifact
 from .junit import (
     JUnitXml,
@@ -148,6 +149,7 @@ __all__ = [
     "hw_schema",
     "insert_artifact",
     "insert_artifact_result",
+    "ci_tags",
     "insert_benchmarks",
     "insert_capabilities",
     "insert_gha_artifact_result",
