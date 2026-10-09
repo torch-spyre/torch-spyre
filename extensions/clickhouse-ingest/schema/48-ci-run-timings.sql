@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS ci_run_timings
     attempt                UInt16 DEFAULT 1,                                              -- e.g. 1 (2 for a retry)
 
     -- The run, as on its pipeline_runs row; trigger_pr is '' for a non-PR run, base_ref is
-    -- the branch the trigger PR targets.
+    -- the branch the trigger PR targets. A main push has no trigger_pr but may still give repo
+    -- and pr_number: the pushed repo and the PR it merged.
     trigger_kind           LowCardinality(String) DEFAULT '',                             -- e.g. 'upstream' (also 'manual', 'timer')
     trigger_source         LowCardinality(String) DEFAULT '',                             -- e.g. 'spyre-test' (also 'main-push', 'merge-queue')
     preset                 LowCardinality(String) DEFAULT '',                             -- e.g. 'trigger-pr-validation'
@@ -35,8 +36,10 @@ CREATE TABLE IF NOT EXISTS ci_run_timings
     verdict                LowCardinality(String) DEFAULT '',                             -- e.g. 'green' (also 'yellow', 'red')
     run_result             LowCardinality(String) DEFAULT '',                             -- e.g. 'success' (also 'failure', 'unstable', 'aborted')
     superseded             Bool DEFAULT false,                                            -- e.g. false
+    -- The event that asked for the run, then the launcher that picked it up: a /spyre-test
+    -- comment and its poller, or a main push's merge (commit time) and its main-push-build.
     pickup_path            LowCardinality(String) DEFAULT '',                             -- e.g. 'webhook' (also 'poller')
-    comment_at             Nullable(DateTime64(3, 'UTC')),                                -- e.g. '2026-10-08 10:00:00.000' (/spyre-test commented)
+    comment_at             Nullable(DateTime64(3, 'UTC')),                                -- e.g. '2026-10-08 10:00:00.000' (/spyre-test commented, or main push merged)
     picked_up_at           Nullable(DateTime64(3, 'UTC')),                                -- e.g. '2026-10-08 10:00:05.000'
     run_scheduled_at       Nullable(DateTime64(3, 'UTC')),                                -- e.g. '2026-10-08 10:00:06.000'
     -- Not Nullable: it is the partition key, and a replaced row must land in the same partition.
