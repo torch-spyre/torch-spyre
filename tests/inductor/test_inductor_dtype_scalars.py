@@ -105,14 +105,6 @@ class TestDatatypeScalarOperations:
         """
         Test FP16 scalar with FP16/FP32 tensors.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-        if execution_mode == "eager" and tensor_dtype == torch.float32:
-            pytest.xfail(reason="to_dtype on float32 (IEEE_FP32) not supported")
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def fp16_scalar_mul(x):
             scalar = torch.tensor(0.125, dtype=scalar_dtype, device=x.device)
@@ -151,11 +143,6 @@ class TestDatatypeScalarOperations:
     @pytest.mark.parametrize("bool_val", [True, False])
     def test_bool_scalar(self, execution_mode, bool_val):
         """Test Boolean scalars."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        if not bool_val:
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def bool_mul(x):
             return x * bool_val
@@ -212,7 +199,7 @@ class TestDatatypeScalarOperations:
                 reason="Spyre backend does not support int32/int16 dtype - causes Signal Abort in data format converter"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif torch_dtype in (None, torch.float16) and execution_mode == "compiled":
+        elif torch_dtype is None and execution_mode == "compiled":
             pytest.xfail(
                 reason="Constant tensor mul fails - IndexError on empty args during layout propagation."
             )
@@ -612,7 +599,9 @@ class TestNegativeScalarOperations:
                 reason="Mixed-dtype tensors sharing stick variable not supported"
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1639
-        if expected_behavior in ["overflow_to_inf", "overflow_or_large"]:
+        if expected_behavior == "overflow_to_inf" or (
+            expected_behavior == "overflow_or_large" and execution_mode == "compiled"
+        ):
             pytest.xfail(
                 reason="backend does not support dtype conversion in comparison operations"
             )

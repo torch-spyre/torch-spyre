@@ -114,11 +114,6 @@ class TestTensorScalarCoreArithmetic:
         """
         ``clone()`` then ``add_(1)``, ``mul_(2)``, ``div_(0.5)`` (in-place scalar chain).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: 'RuntimeError: In-device copy (.clone()) not implemented'"
-            )
 
         def inplace_ops(x):
             y = x.clone()
@@ -261,11 +256,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_dropout_scalar_p(self, execution_mode):
         """SDPA with ``dropout(attn, p=0.1, training=False)`` — scalar dropout probability."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def attention_with_dropout(q, k, v):
             d_k = q.size(-1)
@@ -291,11 +281,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_score_temperature_divisor_scalar(self, execution_mode):
         """SDPA: divide logits by ``(sqrt(d_k) * temperature)`` with scalar ``temperature=2.0``."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def temperature_attention(q, k, v):
             d_k = q.size(-1)
@@ -326,11 +311,6 @@ class TestSdpaScalarHyperparameters:
         This is *not* a full GQA/MQA implementation (no explicit KV repeat); it exercises
         broadcast matmul + scalar ``1/sqrt(d_k)`` on Spyre.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: In-device copy not implemented (required for MQA operations)"
-            )
 
         def sdpa_broadcast_kv(q, k, v):
             d_k = q.size(-1)
@@ -401,11 +381,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_cross_sequence_length(self, execution_mode):
         """SDPA with Q seq len ≠ KV seq len (scalar ``1/sqrt(d_k)`` scaling only)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def cross_attention(q, k, v):
             d_k = q.size(-1)
@@ -429,11 +404,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_self_attention_single_tensor(self, execution_mode):
         """SDPA: Q, K, V all from one tensor ``x`` (scalar ``1/sqrt(d_k)``)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def self_attention(x):
             # Self attention: Q, K, V all from same source
@@ -458,11 +428,6 @@ class TestSdpaScalarHyperparameters:
         if execution_mode == "eager":
             pytest.xfail(
                 reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
             )
 
         def causal_attention(q, k, v):
@@ -494,11 +459,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_additive_score_bias_scalar(self, execution_mode):
         """SDPA: add scalar ``0.1`` to all attention logits before softmax."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def attention_with_bias(q, k, v):
             d_k = q.size(-1)

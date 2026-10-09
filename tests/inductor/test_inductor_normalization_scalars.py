@@ -110,12 +110,6 @@ class TestNormalizationScalarOperations:
     def test_rmsnorm(self, execution_mode, eps, dtype, batch, seq, hidden):
         """Test RMSNorm with various epsilon values and configurations."""
 
-        # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-        if dtype == torch.float32:
-            pytest.xfail(
-                reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-            )
-
         def rmsnorm(x):
             rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
             return x / rms
@@ -195,13 +189,8 @@ class TestNormalizationScalarOperations:
             execution_mode, rmsnorm_fp32_upcast, x, weight, atol=1e-2, rtol=1e-2
         )
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_rmsnorm_with_weight(self, execution_mode):
         """Test RMSNorm with learnable weight parameter."""
-        pytest.xfail(
-            "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-        )
-
         eps = 1e-6
         hidden_size = 768
 
@@ -466,16 +455,6 @@ class TestModelScalarOperations:
         self, execution_mode, batch, heads, seq, d_k
     ):
         """``matmul(Q,K^T) / sqrt(d_k)`` — scaled dot-product logits only (no V); several (batch, heads, seq) configs."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1730
-        if seq == 1024 and execution_mode == "compiled":
-            pytest.xfail(
-                reason="Assertion Error: Numerical mismatch (45-48% elements) for seq=1024"
-            )
         scale = 1.0 / math.sqrt(d_k)
 
         def scaled_qk_logits(q, k):
@@ -674,9 +653,6 @@ class TestModelScalarOperations:
 
     def test_log_sum_exp_stability(self, execution_mode):
         """Stable log-sum-exp (``max`` + ``log`` + ``sum(exp)``), not ``torch.logsumexp``."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/453
-        if execution_mode == "eager":
-            pytest.xfail(reason="Max (aten::max.dim_max) operation not implemented")
 
         def log_sum_exp(x):
             max_val = torch.max(x, dim=-1, keepdim=True)[0]
