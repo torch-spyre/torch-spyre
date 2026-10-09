@@ -109,6 +109,8 @@ run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-
 `<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
 scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
 `ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
+Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
 **SDK**:
 

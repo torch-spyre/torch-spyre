@@ -1327,6 +1327,16 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
+    if _opt(args, "capability_legs_only"):
+        # The leg's own tier is another writer's (the orchestrator's) on the same run_id.
+        own = _opt(args, "trigger_type").strip()
+        admitted = [
+            a
+            for a in admitted
+            if a[1] in schema_model.CAPABILITY_TYPE_VALUES and a[1] != own
+        ]
+        if not admitted:
+            return True
     if not (admitted or _opt(args, "artifact")):
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
         return True
@@ -1449,6 +1459,13 @@ def main(argv=None):
     )
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
+    parser.add_argument(
+        "--capability-legs-only",
+        action="store_true",
+        help="Write only the capability-typed artifact_results legs (model_ops, ...) other than "
+        "--trigger-type's: for a Jenkins leg whose own verdict the orchestrator writes under "
+        "the same run_id.",
+    )
     parser.add_argument(
         "--ci-event",
         default="",

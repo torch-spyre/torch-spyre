@@ -1146,3 +1146,40 @@ def test_the_deprecated_script_path_forwards_to_the_package():
     assert out.returncode == 0, out.stderr
     assert "spyre_clickhouse_ingest results" in out.stdout
     assert "[deprecated]" in out.stderr
+
+
+def test_capability_legs_only_leaves_the_leg_verdict_to_the_orchestrator(ingest):
+    c = _ArtifactClient()
+    legs = {
+        (_RUN_ID, "regression"): {"failed": 1, "total": 9, "duration_s": 2.0},
+        (_RUN_ID, "model_modules"): {"failed": 0, "total": 4, "duration_s": 1.0},
+    }
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    rows = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert [(r["test_type"], r["result_kind"]) for r in rows] == [
+        ("model_modules", "capability")
+    ]
+
+
+def test_capability_legs_only_with_no_capability_leg_writes_nothing(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 9, "duration_s": 2.0}}
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    assert c.inserts == []
+
+
+def test_capability_legs_only_skips_the_tier_the_orchestrator_already_judges(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 4, "duration_s": 1.0}}
+    args = _args(capability_legs_only=True, trigger_type="model_ops")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    assert c.inserts == []
