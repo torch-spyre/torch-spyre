@@ -1073,14 +1073,14 @@ def multi_reduction_k_split_blocked(
     """Block K-splits for plain scalar reductions with more than one reduction variable.
 
     ``dbo-opt``'s DDL template for plain reductions (``summeanmaxexx2.ddl``)
-    cannot generate cross-core accumulation code when the op has more than one
-    reduction variable, even if only one is split.  Example: ``flatten(0,1)``
-    on ``(2,3,4)`` followed by ``sum()`` (full reduction) produces an iteration
-    space ``{d0: 4, d1: 6}`` where neither ``d0`` nor ``d1`` appears in the
-    output coords (output is scalar) -- both are reduction variables.
-    ``work_distribution_pass`` would split ``d1`` across cores (satisfying
-    ``_one_reduction_split_at_most``), but ``dbo-opt`` still rejects with "More
-    than one reduction dim is split across cores: not currently supported".
+    rejects kernels where more than one reduction variable is present, even if
+    only one is split across cores: "More than one reduction dim is split
+    across cores: not currently supported".  Example: ``flatten(0,1)`` on
+    ``(2,3,4)`` followed by ``sum(dim=0)`` produces an iteration space where
+    both ``d0`` and ``d1`` are reduction variables (neither appears in the
+    output coords).  ``work_distribution_pass`` splits one of them across
+    cores (satisfying ``_one_reduction_split_at_most``), but ``dbo-opt``
+    still rejects it.
 
     Note: ``_one_reduction_split_at_most`` in ``WorkDivisionContext`` prevents
     splitting *two* reduction vars simultaneously, but it still allows splitting
