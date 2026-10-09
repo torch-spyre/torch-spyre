@@ -1936,6 +1936,9 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if not skip_cast:
+        # Spliced loop bodies no longer have FX bindings for splitting this cast.
+        converted_condition.realize()
 
     result = lowering.where(converted_condition, converted_self, converted_other)
 
