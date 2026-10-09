@@ -575,8 +575,11 @@ class TestSpyreModelOps(TestCase):
         # Build test_sample with per-tensor layout awareness. An op that needs a
         # specific element arrangement (e.g. QFP8WT for the _scaled_mm weight)
         # declares it on its adapter, as the YAML is traced from the model and
-        # does not carry it.
+        # does not carry it. Likewise an op whose adapter rebuilds an input on
+        # the device (e.g. re-quantizing the _scaled_mm activation) declares the
+        # host dtype that input must be cast to first.
         arrangements = adapter.arg_arrangements or ()
+        host_dtypes = adapter.arg_host_dtypes or ()
         test_args = []
         for i, (cpu_arg, spec_arg) in enumerate(
             zip(
@@ -585,6 +588,9 @@ class TestSpyreModelOps(TestCase):
             )
         ):
             arrangement = arrangements[i] if i < len(arrangements) else None
+            host_dtype = host_dtypes[i] if i < len(host_dtypes) else None
+            if host_dtype is not None and torch.is_tensor(cpu_arg):
+                cpu_arg = cpu_arg.to(host_dtype)
             if arrangement is not None and torch.is_tensor(cpu_arg):
                 test_args.append(
                     to_spyre_with_arrangement(cpu_arg, arrangement, test_device)
