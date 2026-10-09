@@ -299,6 +299,7 @@ def _try_gather_ia_constraint(
         buf.get_name(),
         indirect_device_pos,
     )
+    # right-to-left scan; only the innermost indirect dim is handled
     return new_stl, {0}
 
 
@@ -306,14 +307,14 @@ def _try_scatter_ia_constraint(
     buf: ComputedBuffer | InputBuffer,
     op: ComputedBuffer,
 ) -> tuple[SpyreTensorLayout, set[int]] | None:
-    """Rotate the scattered dim of a scatter destination to device position 0.
+    """Shift all indirect dims of a scatter destination left to positions 0, 1, ...
 
     buf is the scatter destination buffer (ComputedBuffer or InputBuffer); op is
     the scatter op. Uses buf.get_layout() (not _real_layout) because at phase 1
     time buf may still have FlexibleLayout or FixedLayout — both have concrete
     .size and .stride sufficient to extract scatter symbol sizes via
-    _scatter_access_subs_and_sizes. Returns (new_stl, {0}) if rotation needed,
-    None if already compliant or not applicable.
+    _scatter_access_subs_and_sizes. Returns (new_stl, pinned_positions) if a
+    shift is needed, None if already compliant or not applicable.
     """
     stl = _buf_stl(buf)
     if stl is None:
@@ -351,16 +352,22 @@ def _try_scatter_ia_constraint(
     indirect_device_pos = sorted(
         len(stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
     )
+    # Compliant means all indirect dims are already at positions 0..k-1.
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
         return None
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos[0])
+    # Rotate the last (innermost) indirect dim to position 0, reproducing the
+    # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
+    # write coords right-to-left and rotated the first hit.
+    new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
-        indirect_device_pos[0],
+        indirect_device_pos[-1],
     )
-    return new_stl, {0}
+    # TODO: this pin is only validated for k=1; for k>1 the other indirect dims
+    # may not land at 1..k-1 after a single-pivot rotation (follow-up PR).
+    return new_stl, set(range(len(indirect_device_pos)))
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:

@@ -365,6 +365,85 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
+    @pytest.mark.parametrize("num_corrections", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "following_step", ["ComputeOnDevice", "DataTransfer", None]
+    )
+    def test_prepare_host_compute_sequence(self, num_corrections, following_step):
+        """Multiple correction blobs must prepare before the device compute."""
+        job_exec_plan = []
+        for i in range(num_corrections):
+            job_exec_plan.extend(
+                [
+                    {
+                        "command": "ComputeOnHost",
+                        "properties": {
+                            "ohandle": f"correction{i}",
+                            "size": "256",
+                            "ishape": ["0"],
+                            "ihandle": "",
+                            "hcm": {"vdci": {}, "senConstants": []},
+                        },
+                    },
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": f"correction{i}",
+                            "dev_ptr": str(120259084288 + i * 256),
+                            "size": "256",
+                        },
+                    },
+                ]
+            )
+
+        if following_step == "ComputeOnDevice":
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+        elif following_step == "DataTransfer":
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "result",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            if following_step != "ComputeOnDevice":
+                error = (
+                    "Incomplete step sequence"
+                    if following_step is None
+                    else f"Step ordering violation at step {num_corrections}:"
+                )
+                with pytest.raises(RuntimeError, match=error):
+                    torch_spyre._C.prepare_kernel(spyrecode_dir)
+                return
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            assert job_plan.num_steps() == num_corrections + 1
+            assert [job_plan.get_step_type(i) for i in range(job_plan.num_steps())] == [
+                "HostCompute"
+            ] * num_corrections + ["Compute"]
+            assert [
+                job_plan.get_step_stream_role(i) for i in range(job_plan.num_steps())
+            ] == ["Prep"] * num_corrections + ["Dev"]
+            assert all(
+                job_plan.get_step_pipeline_barrier(i)
+                for i in range(job_plan.num_steps())
+            )
+
     def test_prepare_emits_bare_split_triple(self):
         """prepare emits the bare split triple, independent of the flag.
 
