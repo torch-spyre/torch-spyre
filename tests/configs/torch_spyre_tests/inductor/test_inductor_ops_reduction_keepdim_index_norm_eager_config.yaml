@@ -28,8 +28,6 @@ test_suite_config:
           mode: mandatory_success
         # Xfail for failing tests related to PR #2179 (FP32 reduction ops)
         - names:
-            - TestOps::test_mean_keepdim1_mean_fp16_3d_dim_2_spyre
-            - TestOps::test_mean_keepdim1_mean_fp16_3d_dim_neg1_spyre
             - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_2_spyre
             - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_neg1_spyre
             - TestOps::test_sum_keepdim1_sum_fp32_3d_dim_neg1_spyre

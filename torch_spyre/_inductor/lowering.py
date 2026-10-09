@@ -149,17 +149,21 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    An overload is eligible if it appears in either ``lowering.decompositions``
+    (the Spyre+Inductor merged table) *or* ``torch._decomp.get_decompositions``
+    (the raw upstream table that ``make_fallback``'s CI guard checks directly).
+    Checking both tables closes the gap where an overload is present in the
+    global post-autograd table (e.g. via ``_refs`` registrations) but absent
+    from Inductor's decomposition table — which is what caused the CI guard to
+    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
     """
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
             if (
                 overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+                or bool(torch._decomp.get_decompositions([overload]))
+            ) and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added

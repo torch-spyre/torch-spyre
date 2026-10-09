@@ -106,6 +106,11 @@ class Sandbox:
             "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
             "(run_key, arch, component, image, kind)",
         ),
+        (
+            "ci_run_timings",
+            "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
+            "(run_key, entry, component, artifact_name, arch, leg, attempt)",
+        ),
     )
 
     @classmethod
@@ -176,7 +181,9 @@ class Sandbox:
 
     @staticmethod
     def columns(client, table_expr: str) -> list:
-        return [r[0] for r in client.query(f"DESCRIBE TABLE {table_expr}").result_rows]
+        """The insertable columns: a MATERIALIZED or ALIAS one refuses an explicit insert."""
+        rows = client.query(f"DESCRIBE TABLE {table_expr}").result_rows
+        return [r[0] for r in rows if r[2] not in ("MATERIALIZED", "ALIAS")]
 
     @classmethod
     def seed(cls, client, db: str, f: SeedFilter) -> list:

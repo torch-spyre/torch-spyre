@@ -74,6 +74,7 @@ def test_each_dimension_precedes_its_fact():
         ("artifacts", "artifact_results"),
         ("artifacts", "artifact_tags"),
         ("pipeline_runs", "pipeline_run_legs"),
+        ("pipeline_runs", "ci_run_timings"),
     ):
         assert order.index(dim) < order.index(fact)
 
@@ -102,3 +103,25 @@ def test_a_reseed_skips_keys_the_sandbox_holds(table, template, key):
     assert sql.endswith(
         f"AND {key} GLOBAL NOT IN (SELECT {key.strip('()')} FROM sandbox_x.{table})"
     )
+
+
+class _Describe:
+    def __init__(self, rows):
+        self.result_rows = rows
+
+
+class _DescribeClient:
+    def query(self, sql):
+        return _Describe(
+            [
+                ("run_key", "String", "", ""),
+                ("kind", "LowCardinality(String)", "DEFAULT", "'image'"),
+                ("leg", "String", "MATERIALIZED", "arrayStringConcat(test_modes, ',')"),
+                ("x", "String", "ALIAS", "run_key"),
+            ]
+        )
+
+
+def test_columns_leave_out_the_ones_an_insert_may_not_name():
+    # ci_run_timings derives leg and its *_ms: naming one in the seed INSERT is an error.
+    assert Sandbox.columns(_DescribeClient(), "sandbox_x.t") == ["run_key", "kind"]

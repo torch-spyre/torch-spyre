@@ -132,6 +132,31 @@ class TestExpectRaise(unittest.TestCase):
                 lambda self, op, mode: None,
             )
 
+    def test_entry_also_in_expect_fail_unstable_is_rejected(self):
+        # Otherwise the expect_raise wrapper wins and the unstable entry is silently
+        # ignored.
+        with pytest.raises(AssertionError, match="expect_fail_unstable"):
+            _make(
+                {
+                    "param_sets": {"c": ("reject",)},
+                    "expect_raise": {"c": "mixed EA"},
+                    "expect_fail_unstable": {"c": "flaky"},
+                },
+                _base,
+            )
+
+    def test_bare_expect_raise_and_op_specific_unstable_are_rejected(self):
+        with pytest.raises(AssertionError, match="expect_fail_unstable"):
+            _make(
+                {
+                    "ops_dict": {"a": "a", "b": "b"},
+                    "param_sets": {"c": ("reject",)},
+                    "expect_raise": {"c": "mixed EA"},
+                    "expect_fail_unstable": {"a_c": "flaky"},
+                },
+                lambda self, op, mode: None,
+            )
+
     def test_entry_that_matches_no_case_is_rejected(self):
         with pytest.raises(AssertionError, match="matches no"):
             _make(

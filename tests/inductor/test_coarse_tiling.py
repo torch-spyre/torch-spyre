@@ -11318,12 +11318,15 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             patch.object(
                 allocator, "_residency_by_buf", return_value=dict.fromkeys(by_name)
             ),
+            patch.object(allocator, "_parent_residency_edges", return_value={}),
             patch.object(allocator, "_cd_parent_matches", return_value={}),
             patch.object(allocator, "_cd_parent_relayouts", return_value={}),
         ):
             in_place = allocator._determine_in_place_division_invariant(graph)
             self.assertEqual(in_place["reader"], ["carry"])
-            built = allocator._build_cd_bound_buffers(graph, in_place, divisions)
+            built = allocator._build_cd_bound_buffers(
+                graph, in_place, allocator_module._DivisionMap(divisions, set())
+            )
 
         # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
         _check_in_place_relationships(built)

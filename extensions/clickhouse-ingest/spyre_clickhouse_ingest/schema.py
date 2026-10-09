@@ -49,6 +49,18 @@ PIPELINE_TYPE_VALUES = frozenset(
     {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
 )
 RUN_STATE_VALUES = frozenset({"running", "finished"})
+# ci_run_timings: one row per build or test entry. A build was built, reused from a concurrent
+# build, dropped (already published) or failed; '' is a state not reported.
+TIMING_ENTRY_VALUES = frozenset({"build", "test"})
+TIMING_BUILD_STATE_VALUES = frozenset({"built", "reused", "dropped", "failed", ""})
+TIMING_TEST_STATE_VALUES = frozenset({"passed", "failed", "error", ""})
+TIMING_STATE_VALUES = {
+    "build": TIMING_BUILD_STATE_VALUES,
+    "test": TIMING_TEST_STATE_VALUES,
+}
+TIMING_EXECUTOR_VALUES = frozenset(
+    {"gha-ephemeral", "gha-standing", "jenkins-local", "jenkins-job", ""}
+)
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
@@ -531,6 +543,93 @@ class PipelineRuns(Table):
     )
 
 
+class CiRunTimings(Table):
+    """One component build or test leg of an orchestrator run, trigger to teardown.
+
+    Executor-neutral: a GHA workflow and a Jenkins `make test` fill the same provision/exec
+    columns. `leg` and every `*_ms` are MATERIALIZED in the DDL, so they are not modelled here:
+    the server derives them and ignores a value a writer supplies.
+    """
+
+    name = "ci_run_timings"
+    columns = (
+        "run_key",
+        "updated_at",
+        "entry",
+        "component",
+        "artifact_name",
+        "arch",
+        "id12",
+        "kind",
+        "test_modes",
+        "attempt",
+        "trigger_kind",
+        "trigger_source",
+        "preset",
+        "build_mode",
+        "trigger_pr",
+        "repo",
+        "pr_number",
+        "sha",
+        "base_ref",
+        "is_pr_component",
+        "build_url",
+        "verdict",
+        "run_result",
+        "superseded",
+        "pickup_path",
+        "comment_at",
+        "picked_up_at",
+        "run_scheduled_at",
+        "run_started_at",
+        "pr_queued_at",
+        "pr_running_at",
+        "run_ended_at",
+        "state",
+        "result",
+        "gating",
+        "url",
+        "agent",
+        "queued_at",
+        "started_at",
+        "ended_at",
+        "executor",
+        "provision_started_at",
+        "provision_ended_at",
+        "exec_dispatched_at",
+        "exec_started_at",
+        "exec_ended_at",
+        "exec_runs",
+        "exec_jobs",
+        "exec_result",
+        "exec_urls",
+        "exec_run_keys",
+        "cards",
+        "runner_died",
+        "failure_reason",
+        "failed_stage",
+        "props",
+    )
+    # run_started_at is the partition key and not Nullable.
+    required = ("run_key", "entry", "component", "arch", "run_started_at")
+    enums = (
+        ("entry", TIMING_ENTRY_VALUES),
+        ("executor", TIMING_EXECUTOR_VALUES),
+    )
+
+    @classmethod
+    def row(cls, values: Mapping[str, Any]) -> list[Any]:
+        """As Table.row, plus chk_timing_state: the allowed states depend on the entry."""
+        ordered = super().row(values)
+        allowed = TIMING_STATE_VALUES[values["entry"]]
+        if values["state"] not in allowed:
+            raise SchemaError(
+                f"{cls.name}: {values['entry']} state {values['state']!r} violates the "
+                f"DDL CHECK (allowed: {sorted(allowed)})"
+            )
+        return ordered
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -543,6 +642,7 @@ ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
 PIPELINE_RUNS = PipelineRuns
+CI_RUN_TIMINGS = CiRunTimings
 
 TABLES = {
     t.name: t
@@ -558,6 +658,7 @@ TABLES = {
         Capabilities,
         CapabilityRuns,
         PipelineRuns,
+        CiRunTimings,
     )
 }
 

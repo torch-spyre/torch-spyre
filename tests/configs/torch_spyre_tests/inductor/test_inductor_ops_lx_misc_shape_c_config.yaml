@@ -27,7 +27,7 @@ test_suite_config:
             - LxPlanning.*::test_unfold_2d_dim_neg_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_2d_square_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_3d_dim0_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_unfold_3d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_3d_dim1_lx_planning_pointwise
             - LxPlanning.*::test_unfold_3d_dim2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_4d_batch_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_4d_cnn_lx_planning_(pointwise|reduction)
@@ -37,7 +37,6 @@ test_suite_config:
             - LxPlanning.*::test_unfold_edge_nopad_37_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_edge_pow2_64_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_t_2d_49159x4096_lx_planning_reduction
-            - LxPlanning.*::test_t_2d_contiguous_1088x320_lx_planning_reduction
             - LxPlanning.*::test_t_2d_contiguous_4096x49280_lx_planning_reduction
             - LxPlanning.*::test_t_2d_contiguous_49280x4096_lx_planning_reduction
             - LxPlanning.*::test_transpose_2d_large_dim_0_1_lx_planning_(pointwise|reduction)

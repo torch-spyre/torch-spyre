@@ -573,14 +573,7 @@ class TestNegativeScalarOperations:
         "dtype",
         [
             pytest.param(torch.float32, id="fp32"),
-            pytest.param(
-                torch.float16,
-                id="fp16",
-                marks=pytest.mark.xfail(
-                    reason="float16 device NaN converts to -inf on the way to "
-                    "the host, so the NaN is not observable there"
-                ),
-            ),
+            pytest.param(torch.float16, id="fp16"),
         ],
     )
     def test_negative_power_nan_result(self, execution_mode, dtype):
