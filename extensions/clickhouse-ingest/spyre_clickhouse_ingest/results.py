@@ -79,6 +79,7 @@ from spyre_clickhouse_ingest.resolver import (
     misc_warning,
     named,
 )
+from spyre_clickhouse_ingest.writer import DryRunClient
 import regex as re
 
 # ---------------------------------------------------------------------------
@@ -1379,8 +1380,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         )
         return False
     if r.dry_run:
-        print(f"  v2: dry run -- {r.artifact_id} [{r.source}], nothing written")
-        return True
+        print(f"  v2: dry run -- {r.artifact_id} [{r.source}]")
     identity = r.identity
     aid = identity.artifact_id
     recorded = True
@@ -1538,6 +1538,10 @@ def main(argv=None):
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', '443')} ..."
     )
     client = get_client()
+    if args.dry_run:
+        # Every write below goes through this one client, so none reaches the database.
+        client = DryRunClient(client)
+        print("  dry run: reads only, nothing is written")
     # One client, both generations: v2 is reached by QUALIFYING every statement with this
     # database name (see target_database). "" means v2 is not configured, which every v2 site
     # treats as "skip".
@@ -1913,6 +1917,8 @@ def main(argv=None):
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
         )
+    if args.dry_run:
+        print("  dry run -- nothing written; would write:\n" + client.report())
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"
