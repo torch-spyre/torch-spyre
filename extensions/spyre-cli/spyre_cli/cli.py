@@ -24,16 +24,36 @@ def cli():
 @cli.command()
 @click.option("-i", "--input", multiple=True, help="input tensor")
 @click.option("-o", "--output", multiple=True, help="output tensor")
+@click.option(
+    "--bind",
+    multiple=True,
+    metavar="SYM=N",
+    help="bind a symbolic dimension, e.g. --bind s0=128",
+)
 @click.argument("path", default=".")
-def launch(path, input, output):
-    """Launch Spyrecode."""
+def launch(path, input, output, bind):
+    """Launch Spyrecode.
+
+    With no -i/-o, the tensors are built from the folder's launch_spec.json.
+    Given explicitly, they are checked against it when one is present.
+    """
 
     input = list(input)
     output = list(output)
-    if output == []:
+
+    bindings = {}
+    for item in bind:
+        if "=" not in item:
+            raise ValueError(f"Expected --bind SYM=N, got: {item}")
+        sym, _, value = item.partition("=")
+        bindings[sym] = int(value)
+
+    # An output is required only when describing the tensors by hand: a spec
+    # already says which arguments are outputs.
+    if output == [] and input != []:
         raise ValueError("At least 1 output tensor expected!")
 
-    launch_from_cli(path, input, output)
+    launch_from_cli(path, input, output, bindings)
 
 
 def main():
