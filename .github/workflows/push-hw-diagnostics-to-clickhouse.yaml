@@ -76,11 +76,13 @@ jobs:
       - name: Resolve suite tier
         id: extract-tier
         env:
-          TIER: ${{ steps.test-type.outputs.value }}
+          TIER_ARTIFACT: ${{ steps.test-type.outputs.value }}
         run: |
-          if [ -z "${TIER}" ] && [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
+          TIER=""
+          if [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
             TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/^[a-z_-]* (\([a-z_-]*\))$/\1/p')
           fi
+          TIER="${TIER:-${TIER_ARTIFACT}}"
           echo "Resolved tier: ${TIER:-<none>, using ${TRIGGERING_WORKFLOW}}"
           echo "tier=${TIER:-${TRIGGERING_WORKFLOW}}" >> "${GITHUB_OUTPUT}"
 
