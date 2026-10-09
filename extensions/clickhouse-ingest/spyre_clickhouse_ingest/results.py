@@ -68,6 +68,7 @@ from spyre_clickhouse_ingest.options import (
     add_artifact_options,
     artifact_options,
     artifact_spec,
+    ci_tags,
 )
 from spyre_clickhouse_ingest.registry import MISC, tag_families
 from spyre_clickhouse_ingest.resolver import (
@@ -76,6 +77,7 @@ from spyre_clickhouse_ingest.resolver import (
     misc_warning,
     named,
 )
+from spyre_clickhouse_ingest.writer import DryRunClient
 import regex as re
 
 # ---------------------------------------------------------------------------
@@ -1326,10 +1328,27 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
+    if _opt(args, "capability_legs_only"):
+        # The leg's own tier is another writer's (the orchestrator's) on the same run_id.
+        own = _opt(args, "trigger_type").strip()
+        admitted = [
+            a
+            for a in admitted
+            if a[1] in schema_model.CAPABILITY_TYPE_VALUES and a[1] != own
+        ]
+        if not admitted:
+            return True
     if not (admitted or _opt(args, "artifact")):
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
         return True
     options = artifact_options(args)
+    options["tags"] += ci_tags(
+        *(
+            _opt(args, k)
+            for k in ("ci_event", "repository", "branch", "sha", "pr_number")
+        ),
+        day=_opt(args, "tag_date"),
+    )
     # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
     kept, args.misc_tags = [], []
     for tag in options["tags"]:
@@ -1373,8 +1392,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         )
         return False
     if r.dry_run:
-        print(f"  v2: dry run -- {r.artifact_id} [{r.source}], nothing written")
-        return True
+        print(f"  v2: dry run -- {r.artifact_id} [{r.source}]")
     identity = r.identity
     aid = identity.artifact_id
     recorded = True
@@ -1441,6 +1459,19 @@ def main(argv=None):
     )
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
+    parser.add_argument(
+        "--capability-legs-only",
+        action="store_true",
+        help="Write only the capability-typed artifact_results legs (model_ops, ...) other than "
+        "--trigger-type's: for a Jenkins leg whose own verdict the orchestrator writes under "
+        "the same run_id.",
+    )
+    parser.add_argument(
+        "--ci-event",
+        default="",
+        help="The CI event that built the leg's artifact (push | pull_request | schedule | ...); "
+        "tags it as options.ci_tags() spells, beside any --tag.",
+    )
     parser.add_argument(
         "--jenkins-run-key",
         default="",
@@ -1512,6 +1543,10 @@ def main(argv=None):
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', '443')} ..."
     )
     client = get_client()
+    if args.dry_run:
+        # Every write below goes through this one client, so none reaches the database.
+        client = DryRunClient(client)
+        print("  dry run: reads only, nothing is written")
     # One client, both generations: v2 is reached by QUALIFYING every statement with this
     # database name (see target_database). "" means v2 is not configured, which every v2 site
     # treats as "skip".
@@ -1887,6 +1922,8 @@ def main(argv=None):
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
         )
+    if args.dry_run:
+        print("  dry run -- nothing written; would write:\n" + client.report())
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"

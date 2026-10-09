@@ -106,6 +106,12 @@ writes nothing; with `--lookup off` it needs no database.
 a run tested; `--platform` is a deprecated alias of `--arch`, and `--tag-date` defaults to the
 run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-id's record
 (= `--artifact gha:<record>`); a bare `--artifact-id` that is not recorded writes no verdict.
+`--ci-event push|pull_request|schedule` also tags that artifact as Jenkins tags its builds:
+`<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
+scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
+`ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
+Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
 **SDK**:
 

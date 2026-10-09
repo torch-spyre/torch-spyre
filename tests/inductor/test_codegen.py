@@ -993,6 +993,32 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         )
 
 
+class TestClipConstants(InductorTestCase):
+    def test_unbounded_limits_use_device_format(self):
+        for data_format, limit, expected in (
+            (DataFormats.SEN169_FP16, 8573157376.0, (0xFFFE, 0x7FFE)),
+            (
+                DataFormats.IEEE_FP32,
+                float("inf"),
+                (0xFF800000, 0x7F800000),
+            ),
+        ):
+            with self.subTest(data_format=data_format):
+                info = generate_constant_info(
+                    data_format, {"clipMin": -limit, "clipMax": limit}, 1
+                )
+                self.assertEqual(
+                    [entry["data_"]["data_"]["[0, 0, 0]"] for entry in info.values()],
+                    [[str(value)] for value in expected],
+                )
+                self.assertTrue(
+                    all(
+                        entry["dataFormat_"] == data_format.name
+                        for entry in info.values()
+                    )
+                )
+
+
 class TestMaskingConstId(InductorTestCase):
     """maskingConstId_ must resolve to the samv-maskvalue constant.
 
