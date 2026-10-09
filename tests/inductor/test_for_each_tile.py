@@ -86,9 +86,9 @@ inductor names a fused kernel after every op it fused (`cpp_fused_add_copy_...`)
 the while_loop prologue clones every carried operand under `if not should_loop:`, so
 grepping the wrapper text counts copies that either do not exist or are not ours.
 
-Every tensor stays on CPU and the compiled backend is stock inductor: what is under test
-is the graph `for_each_tile` traces to, which is device-independent, so no Spyre device
-and no Spyre backend compiler is required.
+Every tensor stays on CPU. Lowering checks use stock inductor; graph-reuse checks capture
+and execute the traced graph directly. What is under test is the device-independent graph
+`for_each_tile` traces to, so no Spyre device or Spyre backend compiler is required.
 
 Run:
 
@@ -102,6 +102,7 @@ import itertools
 import os
 import unittest
 from typing import NamedTuple
+from unittest.mock import patch
 
 import torch
 from torch._inductor.utils import run_and_get_code
@@ -632,6 +633,47 @@ class TestForEachTileLowering(unittest.TestCase):
         self._assert_lowers(
             fn, args, ref, name="B_split_n", loops=1, materializations=2
         )
+
+    def test_pytree_map_outputs_reuse_graph(self):
+        for axis in (0, -1):
+            with self.subTest(axis=axis):
+                graphs = []
+
+                def capture(gm, _):
+                    graphs.append(gm)
+                    return gm.forward
+
+                def kernel(x):
+                    def body(_, tiles):
+                        (tile,) = tiles
+                        return None, (
+                            tile + 1,
+                            {"sums": tile.sum(dim=1 if axis == 0 else 0)},
+                        )
+
+                    return for_each_tile(
+                        body, (x,), dims=(axis,), tile_size=32, out_dim=axis
+                    )[1]
+
+                torch._dynamo.reset()
+                with (
+                    patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    compiled = torch.compile(
+                        kernel, backend=capture, fullgraph=True, dynamic=False
+                    )
+                    for step in range(2):
+                        x = (
+                            torch.arange(96 * 64, dtype=torch.float32).reshape(96, 64)
+                            + step
+                        )
+                        shifted, stats = compiled(x)
+                        torch.testing.assert_close(shifted, x + 1)
+                        torch.testing.assert_close(
+                            stats["sums"], x.sum(dim=1 if axis == 0 else 0)
+                        )
+                self.assertEqual(len(graphs), 1)
 
     def test_split_k(self):
         """C: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.

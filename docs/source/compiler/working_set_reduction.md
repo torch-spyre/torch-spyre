@@ -89,7 +89,8 @@ def for_each_tile(
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of each returned output leaf. Tiles may be a tensor or a pytree of
+            tensors. ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -117,6 +118,9 @@ that a purely elementwise tiling doesn't need: `init` threads a **carry**
 each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Output leaves may have different ranks; `out_dim` is normalized separately for
+each leaf.
 
 For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable
