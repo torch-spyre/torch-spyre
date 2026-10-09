@@ -1505,7 +1505,8 @@ def _partitioned_operand_terms(ops: list, p: "CostParams"):
         return
     single_pass = all(_is_single_pass(op) for op in ops)
     for op in ops:
-        if not op.is_matmul:
+        # A symbolic trip count (a prospective tiling) leaves eligibility unknown.
+        if not op.is_matmul or _is_sym(op.loop_trip):
             continue
         looped = op.loop_trip > 1
         for arg in op.args:
@@ -1647,7 +1648,7 @@ def _loop_repeated_read_excess_ns(ops: list, p: "CostParams"):
             continue
         for arg in op.args:
             lf = getattr(arg, "loop_factor", 1) or 1
-            if arg.role != "input" or arg.broadcast or lf <= 1:
+            if arg.role != "input" or arg.broadcast or (not _is_sym(lf) and lf <= 1):
                 continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             total += arg.elems * (lf - 1) * op.dtype_bytes * (1 - is_lx) * per_byte
@@ -2053,7 +2054,9 @@ def _matmul_batch_split_ns(ops: list, p: CostParams):
         m_max = max(1, int(m_extent) // max(1, p.mm_batch_split_min_m_rows))
         if m_max <= 1:
             continue
-        trip = max(1, int(getattr(o, "loop_trip", 1) or 1))
+        trip = getattr(o, "loop_trip", 1) or 1
+        if not _is_sym(trip):
+            trip = max(1, int(trip))
 
         def log2(value):
             if isinstance(value, sympy.Basic) and value.free_symbols:
@@ -2368,9 +2371,11 @@ def operand_request_cost_available(
     matmul (``loop_trip > 1``) whose read geometry the extractor proved, at a
     calibration the law covers. A single-pass matmul is never priced here, so this
     term is disjoint from any single-pass delivery estimate. Unknown geometry
-    declines (the read keeps its previous price); it is never priced as zero."""
+    declines (the read keeps its previous price); it is never priced as zero, nor
+    is a symbolic trip count (a prospective tiling) taken as looped."""
     return (
         op.is_matmul
+        and not _is_sym(op.loop_trip)
         and op.loop_trip > 1
         and arg.role == "input"
         and _dma_request_law_available(
@@ -2697,7 +2702,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     eff = 1.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
@@ -2805,7 +2810,7 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     eff, eff_rows = 1.0, None
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -3015,7 +3020,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     lines = []
     for o in ops:
         r, w, lx = o.read_bytes(), o.write_bytes(), o.lx_bytes()
-        loop = f" loop_trip={o.loop_trip}" if o.loop_trip > 1 else ""
+        tiled = _is_sym(o.loop_trip) or o.loop_trip > 1
+        loop = f" loop_trip={o.loop_trip}" if tiled else ""
         pat = f" [{o.hbm_pattern}]" if getattr(o, "hbm_pattern", "") else ""
         lines.append(f"  {o.name:<12} read={r}B write={w}B lx={lx}B{loop}{pat}")
         for a in o.args:
@@ -3151,7 +3157,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if o.tiles_output_dim and o.loop_trip > 1 and rpc:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)

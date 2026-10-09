@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import dataclasses
 import operator
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -458,8 +459,9 @@ def derive_tiling_groups(
     the group boundary. The stretch is every op since the nest last changed,
     not only the current group: that over-splits only where the producer is
     already in an earlier group, and it keeps where a group starts a function of
-    the ops between a consumer and what it reads, which a search re-tiling one
-    op at a time relies on. Returns ``(ops, level counts)`` per group.
+    the ops between a consumer and what it reads, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``). Returns
+    ``(ops, level counts)`` per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
@@ -577,6 +579,40 @@ def tile_misread(
     return None
 
 
+@dataclasses.dataclass
+class TileReads:
+    """Whether ``consumer`` reads ``producer`` tile by tile under a pair of
+    specs -- :func:`tile_misread` over every read of it, the question
+    :func:`derive_tiling_groups` asks of an edge in a stretch -- memoized per
+    pair, for a search that asks it per move."""
+
+    graph: GraphLowering
+    producer: Operation
+    consumer: Operation
+    _memo: dict[tuple[TileSpec, TileSpec], bool] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+
+    def aligned(self, producer_spec: TileSpec, consumer_spec: TileSpec) -> bool:
+        key = (producer_spec, consumer_spec)
+        if key not in self._memo:
+            name = self.producer.get_name()
+            self._memo[key] = all(
+                tile_misread(
+                    self.graph,
+                    self.producer,
+                    producer_spec,
+                    self.consumer,
+                    consumer_spec,
+                    read,
+                )
+                is None
+                for read in op_read_writes(self.consumer).reads
+                if read.name == name
+            )
+        return self._memo[key]
+
+
 def _derive_hint_id_base(graph: GraphLowering) -> int:
     """``max(hint_id present in the graph, default=-1) + 1``.
 
@@ -613,8 +649,19 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     is what keeps it inert until a solver hands it real choices.
     """
 
-    def __init__(self, choices: Mapping[str, TileSpec]):
+    def __init__(
+        self,
+        choices: Mapping[str, TileSpec],
+        staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
+    ) -> None:
         self._choices = dict(choices)
+        # ``(source, sizing op)`` pairs a planner placed a staging copy for,
+        # each mapped to the readers that copy may serve. ``None`` runs no read
+        # copies at all: an HBM staging tile costs a write and a read to save
+        # nothing (``CoarseTileReadCopyBuffer``).
+        self._staged_reads = staged_reads
+        # Copy name -> the pair it was staged for, once ``apply_pass`` ran.
+        self.staged_copies: dict[str, tuple[str, str]] = {}
 
     def apply_pass(self, graph: GraphLowering) -> None:
         groups_specs = derive_tiling_groups(graph, self._choices)
@@ -675,10 +722,12 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         validate_coarse_tile_groups(groups)
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
-        # every op already carries a committed FixedTiledLayout. Use the
-        # post-stickify entry point (run_read_copies=False): a read copy-in here
-        # would only be a useless HBM-to-HBM copy, exactly as the sibling
-        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
-        coarse_tile_post_stickify(
-            graph, groups=groups, group_idx_offset=group_idx_offset
+        # every op already carries a committed FixedTiledLayout, and the
+        # post-stickify entry point is the right one. Unlike the span-overflow
+        # caller it stages reads: the solve placed the copies it names.
+        self.staged_copies = coarse_tile_post_stickify(
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+            staged_reads=self._staged_reads,
         )

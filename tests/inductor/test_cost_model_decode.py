@@ -1284,6 +1284,7 @@ def _allocator_features(
         "buf1": SimpleNamespace(
             sym_core_divs=menu[chosen] if isinstance(chosen, int) else chosen,
             core_divisions=[CoreDivision(splits=dict(s)) for s in menu],
+            sym_tile_counts={},
         )
     }
     with V.set_graph_handler(graph or _StubGraph()):

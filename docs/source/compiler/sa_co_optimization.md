@@ -34,7 +34,7 @@ The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
 identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
-`clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
+`min(200n, 50000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
 
 ### Where the candidates come from
@@ -74,15 +74,14 @@ reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in 
 has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
 tilings that pay through LX residency.
 
-That payoff is not a cost term. Every tiling-sensitive term in the cost model is a derate bounded by
-1.0 and an untiled op has a working set of 0, so the objective can rank tilings against each other
-but never above not tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as
-well as `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid
-in the HBM traffic residency then frees.
+That payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0 and
+an untiled op has a working set of 0, so those can rank tilings against each other but never above
+not tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as well as
+`output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
+HBM traffic residency then frees.
 
-The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds, which
-waits on `TILE_CHOICES_ARE_APPLIED`: nothing applies a chosen `TileSpec` yet, so today no engine is
-offered one.
+The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: this
+engine, and `config.auto_coarse_tiling` (off by default; see its comment).
 
 Three move types:
 
@@ -93,9 +92,13 @@ Three move types:
   score-identical positions that a permutation move usually offers. Its weight drops to 0 while
   every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
   of them already in, only a structural move can still pay.
-* **flip** (weight 0.3) — move one buffer one step: change a single axis's split factor to another
-  its domain admits, *or* edit one coarse tile level (add, remove, or recount), then ripple,
-  resizing its per-core footprint and refreshing LX-eligibility for it and its parents.
+* **flip** (weight 0.3) — one step from the drawn buffer's division: a single axis's split factor,
+  *or* one coarse tile level, never both. A division step is the drawn buffer's alone. A tiling step
+  moves a **boundary**: `_retile_boundary` re-specs the drawn op's run from it to one end, truncated
+  at the first op that refuses the spec. Runs are the groups `derive_tiling_groups` forms, measured
+  over `CoreDivisionBuffer.op_position`. Tile levels are concatenated onto the neighbour list, not
+  weighted against it (`OpSplitSpace.neighbours`).
+
 * **recolor** (weight 0.2) — draw a splitting anchor division, flood the residency relation
   bidirectionally from it, and recolor everything it reaches.
 
@@ -103,7 +106,12 @@ Three move types:
   one-axis moves (the core budget blocks a factor going up, a span floor blocks it coming down), so
   its anchor is drawn from the whole space. A generated anchor draws its tiling first, and the flood
   carries that tiling to each op that can take it: a coarse tiling group is a run of consecutive ops
-  agreeing on one `TileSpec`, so the flood is what forms one.
+  on one loop nest, each reading the others tile by tile (`coarse_tiling.TileReads`), so the flood
+  is what forms one.
+
+  The flood reaches producers and consumers, not a contiguous run, so
+  `_trim_tilings_to_anchor_run` strips the `TileSpec` from every op outside the anchor's run and
+  leaves its splits alone. Flip moves a boundary; recolor repaints a region.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
@@ -121,6 +129,35 @@ accumulation to reorder.
 Reproducible is not stable: the trajectory is chaotic, so compare two revisions over several seeds,
 never one.
 :::
+
+### What the tiling costs, as an objective symbol
+
+`CoreDivisionBuffer.sym_tile_counts` declares one symbol per iteration axis the buffer's tiling
+space offers a level on; a candidate leaving an axis untiled binds it to 1.
+`CoOptimizingAllocator._extract_op_features` passes those symbols to the extractor as prospective
+tile counts, which set `loop_trip` and each arg's `loop_factor` and nothing else
+(`dump_cost_model._loop_features` says why `tiles_output_dim` stays false).
+
+### Residency across a tiling boundary, and the copy that restores it
+
+A coarse-tiled op reading a buffer produced outside its run reads it at an address that advances
+per tile, which an LX address cannot: `_read_across_a_tiling_boundary` refuses that buffer LX.
+`CoarseTileReadCopyBuffer` gives the residency back. It is the tile-local staging copy
+`coarse_tile`'s Pass 1 builds, predicted before the solve so the anneal places it, and the apply
+stages only the copies that were placed. `_staged_reads` states when a prediction is live; a
+resident one is credited `(r - 1) * size` for its `r` readers, capped by `_read_copy_credit` at
+what the objective charges for its source being in HBM. A read `_read_copy_can_be_sized` refuses —
+every broadcast and matmul operand (`TODO(span-overflow-read-copy)`) — is read directly.
+
+## The apply round
+
+`CoOptimizingAllocator._apply_chosen_tilings` runs `CoarseTilingPass` on the chosen `TileSpec`s
+before the divisions are committed, so the ownership is built against the already-tiled op;
+`_commit_divisions` re-keys each tiled op's splits to its live symbols (`_live_splits`) and refuses
+only a split above 1 on an axis the tiling squeezed away. The anneal's placement stands, and the
+companion buffers the apply mints stay in HBM. A refusal raises: it is a defect in
+`OpSplitSpace.admits`, not a graph to route around. `_check_priced_footprints` then checks that each
+tiled buffer's applied per-core footprint is the one it was placed at.
 
 ## The objective
 
@@ -154,6 +191,12 @@ or a `sumcol`-style reduction) either drops that rate silently or, if the read r
 whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
 the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
+
+**Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
+writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group. It
+rides outside `cost_expr` because `op_features` is extracted from the untiled graph: the tile-count
+symbols price the loop over each op, but that buffer exists only once the apply has run; see
+`_companion_bytes`.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has

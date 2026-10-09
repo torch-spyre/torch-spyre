@@ -42,11 +42,11 @@ Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 After stamping, each entry point runs its own sequence of passes.
 ``coarse_tile_pre_stickify`` runs ``_insert_all_read_copy_ops``,
 ``_insert_all_reduction_ops``, then ``_insert_all_write_copy_ops``;
-``coarse_tile_post_stickify`` skips ``_insert_all_read_copy_ops`` and runs
-only the latter two. All three passes allocate full-sized output buffers
-and insert copy/mutation/reduction ops for tiled operations whose results
-are consumed outside the loop, driven by the ``PropagationPlan`` each op's
-``loop_info`` already carries from planning.
+``coarse_tile_post_stickify`` runs ``_insert_all_read_copy_ops`` only for a
+caller that places the copies, then the latter two. All three passes allocate
+full-sized output buffers and insert copy/mutation/reduction ops for tiled
+operations whose results are consumed outside the loop, driven by the
+``PropagationPlan`` each op's ``loop_info`` already carries from planning.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
 rewiring in this file, read "Appendix: How IR rewiring works, and why it's
@@ -63,7 +63,8 @@ import collections
 import dataclasses
 import enum
 import logging
-from typing import NamedTuple
+from collections.abc import Collection, Mapping
+from typing import NamedTuple, Optional
 
 import sympy
 from sympy import Expr
@@ -2743,6 +2744,43 @@ def _fused_iteration_symbol_remap(
     )
 
 
+class IterationFrame(NamedTuple):
+    """An op's iteration symbols as captured before a range rewrite, for
+    :func:`iteration_symbol_remap` after it."""
+
+    # ``None`` where the symbols could not be matched to raw dims one to one.
+    logical: tuple[_LogicalIterationSymbol, ...] | None
+    symbols: tuple[sympy.Symbol, ...]
+
+
+def capture_iteration_frame(op: ComputedBuffer) -> IterationFrame:
+    try:
+        logical = _capture_logical_iteration_symbols(op)
+    except Unsupported:
+        logical = None
+    return IterationFrame(logical, tuple(iteration_space_from_op(op)))
+
+
+def iteration_symbol_remap(
+    op: ComputedBuffer, before: IterationFrame
+) -> dict[sympy.Symbol, sympy.Symbol]:
+    """Old-to-new symbols for ``op`` after a rewrite of its output ranges.
+
+    A dim a tile shrinks to extent 1 loses its symbol and renumbers every later
+    one; it has no entry here. Raises ``Unsupported`` where the correspondence
+    cannot be proven.
+    """
+    if before.logical is not None:
+        remap = _order_preserving_symbol_remap(
+            op, before.logical, _capture_logical_iteration_symbols(op)
+        )
+    else:
+        remap = _fused_iteration_symbol_remap(
+            op, before.symbols, max_trailing_removals=0
+        )
+    return dict(remap.pairs)
+
+
 def _apply_work_div_symbol_remap(
     op: ComputedBuffer, remap: _IterationSymbolRemap | None
 ) -> None:
@@ -3135,7 +3173,7 @@ def coarse_tile_pre_stickify(
 
     Plans and inserts read copy-ins (Pass 1), reduction machinery (Pass 2),
     and write copy-outs (Pass 3). See coarse_tile_post_stickify for the
-    post-stickification counterpart, which never needs Pass 1.
+    post-stickification counterpart, which runs Pass 1 only for a planner.
     """
     _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=True)
 
@@ -3144,7 +3182,8 @@ def coarse_tile_post_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
-) -> None:
+    staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
+) -> dict[str, tuple[str, str]]:
     """Span-overflow coarse tiling.  Runs POST-stickification.
 
     Parameters
@@ -3162,13 +3201,22 @@ def coarse_tile_post_stickify(
         so span-overflow group IDs do not collide with any hint-driven
         groups already stamped by an earlier coarse_tile_pre_stickify call.
 
-    Every op's device layout is already committed by layout propagation by
-    the time this runs, so Pass 1 (read copy-ins) is skipped
-    unconditionally: a read-copy here would only produce an HBM-to-HBM copy
-    with no layout-reconciliation benefit. See coarse_tile_pre_stickify for
-    the pre-stickification counterpart.
+    staged_reads:
+        The ``(source, sizing op)`` pairs a planner placed a staging copy for,
+        each mapped to the readers it may serve; Pass 1 stages exactly those
+        (see _plan_read_copies). None, the span-overflow caller, skips Pass 1:
+        an HBM staging tile costs a write and a read to save nothing.
+
+    Returns the copies staged for ``staged_reads``, by name. See
+    coarse_tile_pre_stickify for the pre-stickification counterpart.
     """
-    _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=False)
+    return _coarse_tile_common(
+        graph,
+        groups,
+        group_idx_offset,
+        run_read_copies=staged_reads is not None,
+        staged_reads=staged_reads,
+    )
 
 
 def _coarse_tile_common(
@@ -3176,16 +3224,23 @@ def _coarse_tile_common(
     groups: list[tuple],
     group_idx_offset: int,
     run_read_copies: bool,
-) -> None:
+    staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
+) -> dict[str, tuple[str, str]]:
     """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
 
     Shared plan-then-transform body for both stickify entry points --
-    run_read_copies is an internal-only switch (never exposed publicly) so
-    the two ~10-step orchestration bodies aren't duplicated. See
+    run_read_copies selects Pass 1, so the two ~10-step orchestration bodies
+    aren't duplicated. See
     coarse_tile_pre_stickify/coarse_tile_post_stickify for the two public
     entry points that call this.
+
+    staged_reads restricts Pass 1 to the (source, sizing op) pairs a planner
+    decided to place, and each to the readers it may serve; None stages every
+    read found -- see _plan_read_copies.
+    Returns the copies staged for those pairs, by name.
     """
     operations = graph.operations
+    staged_copies: dict[str, tuple[str, str]] = {}
 
     # Planning: decide every op's tiling attributes with zero mutation.
     # If any op needs carry propagation or requests disabled reduction
@@ -3232,16 +3287,17 @@ def _coarse_tile_common(
     # Pass 1: read copy-ins. _plan_read_copies runs here (after every
     # group's _apply_plan above, not alongside _plan_tiling_propagation)
     # because it needs op.loop_info stamped and ranges already divided --
-    # see _plan_read_copies's own docstring. Skipped entirely when
-    # run_read_copies is False (the post-stickify call site, where layout
-    # propagation already ran and a read-copy buys nothing).
+    # see _plan_read_copies's own docstring. Skipped when run_read_copies is
+    # False: post-stickify with no planner to place the copies, where a copy
+    # could only land in HBM.
     if run_read_copies:
         read_copy_plans = _plan_read_copies(
             operations,
             retiled_infos_by_group,
             predivision_unit_steps_by_op,
+            staged_reads=staged_reads,
         )
-        _insert_all_read_copy_ops(operations, read_copy_plans)
+        staged_copies = _insert_all_read_copy_ops(operations, read_copy_plans)
 
     # Pass 2: reduction machinery (accumulator/fill/combine), using each
     # op's now-stamped loop_info.propagation.reduction. Must run after Pass
@@ -3298,6 +3354,7 @@ def _coarse_tile_common(
     _log_propagation_self_check(operations, predicted_kind_by_name)
     validate_writer_tile_advance(operations)
     validate_reader_tile_advance(operations)
+    return staged_copies
 
 
 def validate_writer_tile_advance(operations: list[Operation]) -> None:
@@ -4127,8 +4184,6 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     _insert_all_read_copy_ops and _find_outside_consumers (same outer-key
     comparison, mirrored here on the read side).
     """
-    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
-
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return []
@@ -4137,58 +4192,73 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     result = []
     for d in reads:
-        if d.is_indirect():
-            # A gather's pool read (`index = 256*d1 + ... + 32768*tmp0`, tmp0 the
-            # loaded page number) has no tile to stage: its window is whatever the
-            # index tensor names at runtime, and the gathered axis carries no
-            # iteration variable to size one from. Staging it pins the gather to
-            # pool row 0, since the copy's inner_fn substitutes only dep.var_names
-            # and tmp0 falls out as 0.
-            #
-            # Reading the pool directly needs no copy: the read is full-extent on
-            # every dim it does index, so unlike the tile-scoped reads this
-            # function intercepts, its index is already what the full-size buffer
-            # wants. (enforce_indirect_access_layout likewise expects the real
-            # pool.)
-            continue
-        if not d.var_names:
-            # A point read -- one element, no iteration var (e.g. the page
-            # index a gather's own index_select reads out of the block table,
-            # `index = 32*u0`). Same "nothing to stage" case as the gather
-            # above, one step upstream: a tile-scoped index is what makes a
-            # direct read of a full-size buffer wrong, and a point read has
-            # no tile-scoped index to be wrong -- its whole address is a
-            # base plus, when it moves with the spliced loop, the per-trip
-            # advance _point_splice_advance_for_dep records. Staging it
-            # would also mean restickifying a single int32 element into
-            # scratch, which the backend has no op for.
-            continue
-        buf = V.graph.get_buffer(d.name)
-        # Graph inputs are TensorBox(StorageBox(InputBuffer))-wrapped in
-        # V.graph.get_buffer's result (see graph_inputs); unwrap to check.
-        unwrapped = buf
-        if isinstance(unwrapped, TensorBox):
-            unwrapped = unwrapped.data
-        if isinstance(unwrapped, StorageBox):
-            unwrapped = unwrapped.data
-        carry_record = getattr(unwrapped, "_loop_carry_record", None)
-        if (
-            isinstance(carry_record, LoopCarryRecord)
-            and carry_record.storage_name == d.name
-        ):
-            # A non-stacking for_each_tile carry is persistent scratch, not a
-            # full tensor being windowed by this loop.  Its storage has the
-            # same logical extent on every trip, and the joint scratchpad
-            # solver constrains its physical ownership against both readers
-            # and the aliased update.  Let those users read it directly.
-            continue
-        if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer)):
-            result.append(d)
-        elif isinstance(unwrapped, ComputedBuffer):
-            producer_li = getattr(unwrapped, "loop_info", None)
+        source = _stageable_read_source(d)
+        if isinstance(source, ComputedBuffer):
+            producer_li = getattr(source, "loop_info", None)
             if producer_li is None or producer_li.loop_group_id[0] != outer_key:
                 result.append(d)
+        elif source is not None:
+            result.append(d)
     return result
+
+
+def _stageable_read_source(d: MemoryDep) -> Buffer | None:
+    """The unwrapped source of ``d`` if Pass 1 could stage it, group aside.
+
+    Every test :func:`_full_buffer_read_deps` puts to one read except whether a
+    computed source's producer shares the reader's group, so the joint solver's
+    copy prediction, which runs before any group exists, filters the same way.
+    """
+    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
+
+    if d.is_indirect():
+        # A gather's pool read (`index = 256*d1 + ... + 32768*tmp0`, tmp0 the
+        # loaded page number) has no tile to stage: its window is whatever the
+        # index tensor names at runtime, and the gathered axis carries no
+        # iteration variable to size one from. Staging it pins the gather to
+        # pool row 0, since the copy's inner_fn substitutes only dep.var_names
+        # and tmp0 falls out as 0.
+        #
+        # Reading the pool directly needs no copy: the read is full-extent on
+        # every dim it does index, so unlike the tile-scoped reads this
+        # function intercepts, its index is already what the full-size buffer
+        # wants. (enforce_indirect_access_layout likewise expects the real
+        # pool.)
+        return None
+    if not d.var_names:
+        # A point read -- one element, no iteration var (e.g. the page
+        # index a gather's own index_select reads out of the block table,
+        # `index = 32*u0`). Same "nothing to stage" case as the gather
+        # above, one step upstream: a tile-scoped index is what makes a
+        # direct read of a full-size buffer wrong, and a point read has
+        # no tile-scoped index to be wrong -- its whole address is a
+        # base plus, when it moves with the spliced loop, the per-trip
+        # advance _point_splice_advance_for_dep records. Staging it
+        # would also mean restickifying a single int32 element into
+        # scratch, which the backend has no op for.
+        return None
+    buf = V.graph.get_buffer(d.name)
+    # Graph inputs are TensorBox(StorageBox(InputBuffer))-wrapped in
+    # V.graph.get_buffer's result (see graph_inputs); unwrap to check.
+    unwrapped = buf
+    if isinstance(unwrapped, TensorBox):
+        unwrapped = unwrapped.data
+    if isinstance(unwrapped, StorageBox):
+        unwrapped = unwrapped.data
+    carry_record = getattr(unwrapped, "_loop_carry_record", None)
+    if (
+        isinstance(carry_record, LoopCarryRecord)
+        and carry_record.storage_name == d.name
+    ):
+        # A non-stacking for_each_tile carry is persistent scratch, not a
+        # full tensor being windowed by this loop.  Its storage has the
+        # same logical extent on every trip, and the joint scratchpad
+        # solver constrains its physical ownership against both readers
+        # and the aliased update.  Let those users read it directly.
+        return None
+    if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer, ComputedBuffer)):
+        return unwrapped
+    return None
 
 
 def _graph_output_names() -> set[str]:
@@ -4993,7 +5063,8 @@ def _insert_one_read_copy(
     *,
     predivision_unit_steps: tuple[tuple[tuple[int, Expr, Expr], ...], ...] = (),
     loop_invariant: bool = False,
-) -> str:
+    staged: bool = False,
+) -> str | None:
     """Build and insert one tile-sized copy op for a single full-buffer read.
 
     sizing_op reads (or is the first of a group of ops that all read) a
@@ -5030,7 +5101,10 @@ def _insert_one_read_copy(
     coincide with insert_before_op but is not guaranteed to by contract).
 
     Returns the inserted copy buffer's name (copy_buf.get_name()) -- callers
-    patch consumers separately via _patch_consumer_to_read_copy.
+    patch consumers separately via _patch_consumer_to_read_copy. Returns None,
+    building nothing, for a ``staged`` copy whose device layout cannot be
+    resized: its LX reservation was priced at the resized layout, not the
+    row-major fallback, so its readers read the source directly instead.
     """
     insert_idx = operations.index(insert_before_op)
     full_buf = V.graph.get_buffer(dep.name)
@@ -5310,6 +5384,16 @@ def _insert_one_read_copy(
                 stick_host_dim=stick_hd,
             )
         except RuntimeError:
+            if staged:
+                logger.debug(
+                    "_insert_one_read_copy: cannot resize %r (full_size=%s "
+                    "tile_size=%s); not staging %s",
+                    full_layout.device_layout,
+                    full_size_ints,
+                    tile_size_ints,
+                    copy_name,
+                )
+                return None
             # Non-standard device layout (e.g. post-restickify HBM strides
             # that don't correspond to contiguous host strides).  Fall
             # back to a default row-major allocation, preserving
@@ -5993,6 +6077,84 @@ def _patch_consumer_to_read_copy(
     )
 
 
+def _read_copy_can_be_sized(dep: MemoryDep) -> bool:
+    """Whether :func:`_insert_one_read_copy` can size a tile copy of ``dep``.
+
+    Its post-stickify branch pairs the source's non-unit committed dims with the
+    reader's iteration extents positionally, and raises where the two counts
+    differ (``TODO(span-overflow-read-copy)``). The planner asks first and
+    drops such a read, which is then read directly; the raise stays as the
+    backstop for a read that reaches the inserter another way.
+    """
+    full_buf = V.graph.get_buffer(dep.name)
+    if isinstance(full_buf, TensorBox):
+        full_buf = full_buf.data
+    if isinstance(full_buf, StorageBox):
+        full_buf = full_buf.data
+    layout = getattr(full_buf, "layout", None)
+    if not isinstance(layout, FixedTiledLayout):
+        return True
+    return sum(1 for extent in layout.size if int(extent) != 1) == len(dep.size)
+
+
+def _read_copy_key(dep: MemoryDep) -> tuple:
+    """Pass 1's identity for a read: reads with equal keys share one copy.
+
+    ``dep.index.coeff(v)`` is a *linear* coefficient, blind to a constant
+    offset (``64*d0 + d1`` and ``64*d0 + d1 + 5`` have equal coeffs), and two
+    reads differing only there must not share a copy: ``_insert_one_read_copy``
+    sizes it from the sizing op's own ``dep.index``, so a merged-in consumer at
+    another offset would read wrong or out-of-bounds data. So the offset is in
+    the key.
+    """
+    offset = dep.index - sum(dep.index.coeff(v) * v for v in dep.var_names)
+    return (
+        dep.name,
+        tuple(dep.index.coeff(v) for v in dep.var_names),
+        offset,
+        tuple(dep.size),
+    )
+
+
+def _pass1_reader(op: Operation) -> bool:
+    """Whether Pass 1 considers ``op``'s reads for staging at all."""
+    from torch_spyre._inductor.wsr.for_each_tile_lowering import _marker_dim
+
+    # A tile_dim_marker op that _consume_tile_dim_markers left materialized
+    # (StarDep-shaped consumer branch -- see its own comment) is not an
+    # ordinary tile computation: its per-iteration offset read (the very thing
+    # it exists to carry for its StarDep consumer) is not a candidate for
+    # read-copy sharing/hoisting -- that offset is exactly what _rescale_index
+    # cannot resolve, since it is real per-marker state, not a tiled dim any
+    # group member's loop divides.
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, (Pointwise, Reduction))
+        and _marker_dim(op) is None
+    )
+
+
+def stageable_read_keys(op: Operation) -> dict[str, frozenset[tuple]]:
+    """``source -> read keys`` for the reads of ``op`` Pass 1 could stage.
+
+    The joint solver's prediction of the copies :func:`_plan_read_copies` will
+    mint, taken on the untiled op: the same op filter, the same per-read filter
+    (:func:`_stageable_read_source`, :func:`_read_copy_can_be_sized`) and the
+    same key. Group membership is left to the caller, since it depends on the
+    tilings being chosen.
+    """
+    if not _pass1_reader(op):
+        return {}
+    keys: dict[str, set[tuple]] = {}
+    for dep in op.get_read_writes().reads:
+        if not isinstance(dep, MemoryDep) or dep.name == op.get_name():
+            continue
+        if _stageable_read_source(dep) is None or not _read_copy_can_be_sized(dep):
+            continue
+        keys.setdefault(dep.name, set()).add(_read_copy_key(dep))
+    return {source: frozenset(found) for source, found in keys.items()}
+
+
 def _plan_read_copies(
     operations: list[Operation],
     retiled_infos_by_group: list[
@@ -6003,8 +6165,18 @@ def _plan_read_copies(
         tuple[tuple[tuple[tuple[int, Expr, Expr], ...], ...], ...],
     ]
     | None = None,
+    staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
 ) -> dict[tuple[int, ...], ReadCopyPlan]:
     """Plan Pass 1's read-copy sharing, with zero mutation.
+
+    ``staged_reads`` maps the ``(source, sizing op)`` pairs to stage to the
+    readers each may serve; ``None`` -- the pre-stickify caller -- stages every
+    read it finds. Pre-stickification staging is obligatory: the copy
+    reconciles a full-buffer layout with a tile-sized consumer's. Afterwards an
+    HBM staging tile costs a write and a read to save nothing -- the copy sits
+    inside the counted loop, since a hoisted one needs a loop-invariant read,
+    which is the shape :func:`_read_copy_can_be_sized` refuses -- so only the
+    planner deciding residency can say which reads to stage.
 
     For each group, collects every ComputedBuffer op's
     _full_buffer_read_deps and groups equivalent reads (same buffer name,
@@ -6020,8 +6192,6 @@ def _plan_read_copies(
     op.get_read_writes() to reflect post-division ranges, neither of which
     holds before _apply_plan runs for that op's group.
     """
-    from torch_spyre._inductor.wsr.for_each_tile_lowering import _marker_dim
-
     op_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
     operations_by_name = {
         op.get_name(): op for op in operations if isinstance(op, ComputedBuffer)
@@ -6034,46 +6204,56 @@ def _plan_read_copies(
         # canonical key -> list of (op, dep) in operations order.
         keyed: dict[tuple, list[tuple[Operation, MemoryDep]]] = {}
         for op in group_ops:
-            if not isinstance(op, ComputedBuffer):
-                continue
-            if not isinstance(op.data, (Pointwise, Reduction)):
-                continue
-            if _marker_dim(op) is not None:
-                # A tile_dim_marker op that _consume_tile_dim_markers left
-                # materialized (StarDep-shaped consumer branch -- see its
-                # own comment) is not an ordinary tile computation: its
-                # per-iteration offset read (the very thing it exists to
-                # carry for its StarDep consumer) is not a candidate for
-                # read-copy sharing/hoisting -- that offset is exactly what
-                # _rescale_index cannot resolve, since it is real per-marker
-                # state, not a tiled dim any group member's loop divides.
+            if not _pass1_reader(op):
                 continue
             for dep in _full_buffer_read_deps(op):
-                # dep.index.coeff(v) is a *linear* coefficient: it is blind
-                # to any constant offset in the index (e.g. 64*d0 + d1 and
-                # 64*d0 + d1 + 5 have identical coeffs). Two reads that
-                # differ only in a constant offset (e.g. a shifted/windowed
-                # read) must not collapse to the same key -- _insert_one_
-                # read_copy sizes the shared copy from only the sizing
-                # op's own dep.index, so a merged-in consumer at a
-                # different real offset would silently read wrong or
-                # out-of-bounds data. Include the offset explicitly.
-                offset = dep.index - sum(dep.index.coeff(v) * v for v in dep.var_names)
-                key = (
-                    dep.name,
-                    tuple(dep.index.coeff(v) for v in dep.var_names),
-                    offset,
-                    tuple(dep.size),
-                )
-                keyed.setdefault(key, []).append((op, dep))
+                if not _read_copy_can_be_sized(dep):
+                    logger.debug(
+                        "coarse_tile: not staging %s's read of %s -- the tile "
+                        "copy cannot be sized against its committed layout",
+                        op.get_operation_name(),
+                        dep.name,
+                    )
+                    continue
+                keyed.setdefault(_read_copy_key(dep), []).append((op, dep))
+
+        # Order each key's (op, dep) pairs by their position in `operations`,
+        # not by group_ops's own order, so insert_before_op_name/sizing_op_name
+        # pick the op that is actually first in the real operations list.
+        for op_deps in keyed.values():
+            op_deps.sort(key=lambda pair: op_position[pair[0].get_operation_name()])
+
+        if staged_reads is not None:
+            # A planner's pair names the source and the entry's sizing op, and
+            # maps to the readers its reservation covers. Reading directly is
+            # always correct, so an entry is dropped where the reservation
+            # cannot hold it alone: two entries claiming one pair (one op
+            # reading the source at two offsets) would share it, and a reader
+            # outside it would read the copy past its lifetime.
+            claims = collections.Counter(
+                (key[0], op_deps[0][0].get_name()) for key, op_deps in keyed.items()
+            )
+            kept: dict[tuple, list[tuple[Operation, MemoryDep]]] = {}
+            for key, op_deps in keyed.items():
+                pair = (key[0], op_deps[0][0].get_name())
+                covered = staged_reads.get(pair)
+                if covered is None:
+                    continue
+                if claims[pair] == 1 and all(
+                    op.get_name() in covered for op, _dep in op_deps
+                ):
+                    kept[key] = op_deps
+                else:
+                    logger.debug(
+                        "coarse_tile: not staging %s for %s -- its placed copy "
+                        "cannot hold it alone",
+                        pair[0],
+                        pair[1],
+                    )
+            keyed = kept
 
         entries: list[ReadCopyEntry] = []
         for n, (key, op_deps) in enumerate(keyed.items()):
-            # Order this key's (op, dep) pairs by their position in
-            # `operations`, not by group_ops's own order, so
-            # insert_before_op_name/sizing_op_name pick the op that is
-            # actually first in the real operations list.
-            op_deps.sort(key=lambda pair: op_position[pair[0].get_operation_name()])
             sizing_op, sizing_dep = op_deps[0]
             sizing_info = sizing_op.loop_info  # type: ignore[attr-defined]
             hoist_decisions: list[_ReadCopyHoistDecision] = []
@@ -6180,6 +6360,9 @@ def _plan_read_copies(
                         decision is _ReadCopyHoistDecision.ELIGIBLE
                         for decision in hoist_decisions
                     ),
+                    staged_pair=(key[0], sizing_op.get_name())
+                    if staged_reads is not None
+                    else None,
                 )
             )
         if entries:
@@ -6191,8 +6374,11 @@ def _plan_read_copies(
 def _insert_all_read_copy_ops(
     operations: list[Operation],
     read_copy_plans: dict[tuple[int, ...], ReadCopyPlan],
-) -> None:
+) -> dict[str, tuple[str, str]]:
     """Pass 1: execute a precomputed ReadCopyPlan per group.
+
+    Returns ``copy name -> staged pair`` for each copy a planner placed, which
+    is how that planner finds its copies again (hint-route copies carry none).
 
     Transformation's Pass 1 (see the plan/execute split design and
     _plan_read_copies). All sharing/dedup decisions were already made by
@@ -6202,6 +6388,7 @@ def _insert_all_read_copy_ops(
     _plan_read_copies) and before Pass 2/3's Reduction/copy-out dispatch,
     which reads an op's *current* reads/loader.
     """
+    staged: dict[str, tuple[str, str]] = {}
     for plan in read_copy_plans.values():
         for entry in plan.entries:
             name_to_op = {
@@ -6220,7 +6407,10 @@ def _insert_all_read_copy_ops(
                 insert_before_op=insert_before_op,
                 predivision_unit_steps=entry.predivision_unit_steps,
                 loop_invariant=entry.loop_invariant,
+                staged=entry.staged_pair is not None,
             )
+            if new_copy_name is None:
+                continue
             for consumer_name in entry.consumer_op_names:
                 consumer = name_to_op[consumer_name]
                 _patch_consumer_to_read_copy(
@@ -6230,6 +6420,9 @@ def _insert_all_read_copy_ops(
                     operations,
                     loop_invariant=entry.loop_invariant,
                 )
+            if entry.staged_pair is not None:
+                staged[new_copy_name] = entry.staged_pair
+    return staged
 
 
 # ---------------------------------------------------------------------------

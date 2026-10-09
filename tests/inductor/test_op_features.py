@@ -44,6 +44,11 @@ from torch_spyre._inductor.cost_model import (
     predict_by_bundle,
     predict_ops,
 )
+from torch_spyre._inductor.dump_cost_model import (
+    _loop_factor_for_index,
+    _loop_features,
+    _tiled_symbols_per_level,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
@@ -60,6 +65,23 @@ def _entries():
     for gname, g in _graphs().items():
         for bname, b in g["buffers"].items():
             yield gname, bname, b
+
+
+def _first_features():
+    """(graph, buffer, OpFeatures) for each captured buffer's first feature
+    record, skipping buffers without one."""
+    for gname, bname, b in _entries():
+        raw = next((f for f in b["features"] if f is not None), None)
+        if raw is not None:
+            yield gname, bname, op_from_dict(raw)
+
+
+def _assert_linearizable(test, expr, allowed_exps) -> None:
+    """No ``Piecewise``, and every ``Pow`` exponent in ``allowed_exps``: the
+    proxy for what ``_SympyExprToCpSat`` can linearize."""
+    test.assertFalse(expr.atoms(sympy.Piecewise))
+    for pow_ in expr.atoms(sympy.Pow):
+        test.assertIn(pow_.exp, allowed_exps, f"non-invertible power {pow_}")
 
 
 class CandidateDivisionTest(TestCase):
@@ -83,7 +105,9 @@ class CandidateDivisionTest(TestCase):
         divisions = [CoreDivision(splits={m: 16}), CoreDivision(splits={m: 8, n: 2})]
         expected = [{m: 16, n: 1, k: 1}, {m: 8, n: 2, k: 1}]
         buffers = {
-            "out": SimpleNamespace(sym_core_divs={m: split}, core_divisions=divisions)
+            "out": SimpleNamespace(
+                sym_core_divs={m: split}, core_divisions=divisions, sym_tile_counts={}
+            )
         }
         with (
             patch(
@@ -286,14 +310,9 @@ class SymbolicTiledFeatureTest(TestCase):
         objective and falls back to its lexicographic solve, so neutralising the
         derate is what keeps the objective usable, not a shortcut around it.
         """
-        for _, _, b in _entries():
-            raw = next((f for f in b["features"] if f is not None), None)
-            if raw is None:
-                continue
-            expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
-            self.assertFalse(expr.atoms(sympy.Piecewise))
-            for pow_ in expr.atoms(sympy.Pow):
-                self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
+        for _, _, op in _first_features():
+            expr = sympy.sympify(predict_ops([self._symbolize(op)]))
+            _assert_linearizable(self, expr, (-1,))
 
     def test_a_loop_reread_arg_does_not_consult_symbolic_mem(self):
         """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and
@@ -456,6 +475,105 @@ class SymbolicTiledFeatureTest(TestCase):
             self._leaked_symbols(expr),
             "a non-residency symbol leaked into the bundle-level cost",
         )
+
+
+class ProspectiveTilingTest(TestCase):
+    """Features extracted against tile counts nobody has applied yet
+    (``extract_op_features``'s ``tile_counts``)."""
+
+    TILES = sympy.Symbol("tiles_buf0_d0", integer=True, positive=True)
+    OTHER = sympy.Symbol("tiles_buf0_d1", integer=True, positive=True)
+
+    def test_the_prospective_trip_replaces_the_ir_reading(self):
+        """``_loop_features`` never touches ``op.loop_info`` when tile counts
+        are given. Both flags stay false: they gate branches, not values."""
+        d0 = sympy.Symbol("d0")
+        trip, tiles_red, tiles_out = _loop_features(None, {d0: self.TILES})
+        self.assertEqual(trip, self.TILES)
+        self.assertFalse(tiles_red)
+        self.assertFalse(tiles_out)
+
+    def test_no_tile_counts_fall_through_to_the_ir(self):
+        self.assertEqual(_loop_features(None, None), (1, False, False))
+
+    def test_an_arg_repeats_at_a_level_its_index_does_not_carry(self):
+        """The asymmetry the whole per-arg factor exists for: an operand whose
+        address does not depend on the tiled axis is re-entered every iteration,
+        so it is transferred ``trip`` times; one that walks the axis is
+        transferred once. Static in the index, symbolic in the count."""
+        d0, d1 = sympy.symbols("d0 d1")
+        levels = _tiled_symbols_per_level(None, {d0: self.TILES})
+        self.assertEqual(levels, [(self.TILES, {d0}, 1)])
+        self.assertEqual(_loop_factor_for_index(d0 + 2048 * d1, levels), 1)
+        self.assertEqual(_loop_factor_for_index(d1, levels), self.TILES)
+
+    def test_two_levels_multiply_per_arg(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        counts = {d0: self.TILES, d1: self.OTHER}
+        self.assertEqual(_loop_features(None, counts)[0], self.TILES * self.OTHER)
+        levels = _tiled_symbols_per_level(None, counts)
+        self.assertEqual(_loop_factor_for_index(d0, levels), self.OTHER)
+        self.assertEqual(_loop_factor_for_index(d1, levels), self.TILES)
+        self.assertEqual(
+            _loop_factor_for_index(sympy.Symbol("r0"), levels),
+            self.TILES * self.OTHER,
+        )
+        self.assertEqual(_loop_factor_for_index(d0 + d1, levels), 1)
+
+    def _prospectively_tiled(self, op: OpFeatures) -> OpFeatures:
+        """``op`` as the co-optimizing path now presents it: an undecided trip
+        count, the output advancing (an output-axis level cuts a dim its write
+        index covers), and every input re-read once per iteration.
+
+        The per-arg factors are stated here rather than derived, because a
+        captured feature record carries no index expressions -- which index
+        carries the tiled symbol is :meth:`test_an_arg_repeats_at_a_level_its_
+        index_does_not_carry`'s subject. All-inputs-invariant is the worst case
+        and so the sharpest test of the substitution below.
+        """
+        args = [
+            dataclasses.replace(a, loop_factor=1 if a.role == "output" else self.TILES)
+            for a in op.args
+        ]
+        return dataclasses.replace(op, args=args, loop_trip=self.TILES)
+
+    def test_substituting_one_tile_reproduces_the_untiled_prediction(self):
+        """A tile count bound to 1 is untiled, so the price must be exactly the
+        untiled one."""
+        checked = 0
+        for gname, bname, untiled in _first_features():
+            tiled = sympy.sympify(predict_ops([self._prospectively_tiled(untiled)]))
+            # Subset, not equality: an op with no input args (flash_attention's
+            # buf0) re-reads nothing, so the symbol cancels out of its price
+            # entirely. That it does NOT cancel where there is something to
+            # re-read is the next test.
+            self.assertLessEqual(tiled.free_symbols, {self.TILES}, f"{gname}/{bname}")
+            self.assertAlmostEqual(
+                float(tiled.subs(self.TILES, 1)),
+                float(predict_ops([untiled])),
+                places=6,
+                msg=f"{gname}/{bname}",
+            )
+            checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_the_tile_count_raises_the_prediction_it_is_read_into(self):
+        """Non-vacuity for the test above: the substitution is not trivially
+        equal because the expression ignores the symbol. A re-read operand costs
+        more as the loop runs more times, which is the one channel a tiling
+        reaches this path through."""
+        raised = 0
+        for _, _, op in _first_features():
+            expr = sympy.sympify(predict_ops([self._prospectively_tiled(op)]))
+            raised += float(expr.subs(self.TILES, 8)) > float(expr.subs(self.TILES, 1))
+        self.assertGreater(raised, 0, "no captured op prices its re-read at all")
+
+    def test_the_prospective_expression_stays_linearizable(self):
+        # A tile count entering as a plain multiplier keeps the sibling tiled
+        # test's proxy.
+        for _, _, op in _first_features():
+            expr = sympy.sympify(predict_ops([self._prospectively_tiled(op)]))
+            _assert_linearizable(self, expr, (-1, self.TILES))
 
 
 class SymbolicMatmulSplitCostTest(TestCase):
