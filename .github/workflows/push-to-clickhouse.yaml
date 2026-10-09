@@ -30,6 +30,13 @@ on:
         required: false
         type: string
         default: torch-spyre
+      test_type:
+        description: >-
+          Suite tier to record (trunk | regression | integration | ...). Blank reads the run's
+          "test-type" artifact; set it to re-ingest a run that predates that artifact.
+        required: false
+        type: string
+        default: ''
       clickhouse_env:
         description: >-
           ClickHouse instance for a MANUAL re-ingest: "prod" (the CLICKHOUSE_*
@@ -84,10 +91,15 @@ on:
         required: false
         type: string
         default: ''
+      test_type:
+        description: Suite tier. Blank reads the run's "test-type" artifact.
+        required: false
+        type: string
+        default: ''
       display_title:
         description: >-
-          run-name of the triggering run, which is how the suite tier is recovered
-          ("integration-tests (<tier>)") without a second API call.
+          run-name of the triggering run; the tier fallback for a run with no "test-type"
+          artifact, read only when it equals workflow_name ("integration-tests (<tier>)").
         required: false
         type: string
         default: ''
@@ -183,9 +195,7 @@ jobs:
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
       TRIGGERING_AT: ${{ github.event.workflow_run.created_at || inputs.triggered_at || '' }}
-      # display_title carries "integration-tests (<test_type>)" via that workflow's
-      # run-name: — this is the only way a workflow_run-triggered job can recover the
-      # original dispatch tier (integration/regression/smoke/etc) without an extra API call.
+      # Tier fallback only (see "Resolve suite tier"): for most workflows this is a PR title.
       TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || inputs.triggering_event || '' }}
@@ -341,13 +351,30 @@ jobs:
       # Parse each XML file and insert rows into ClickHouse.
       # `python -m spyre_clickhouse_ingest results`, via ingest-xml-to-clickhouse.
       # ---------------------------------------------------------------------------
-      - name: Extract suite tier from display title
+      # _test_matrix uploads the tier it ran as the "test-type" artifact.
+      - name: Recover suite tier
+        id: test-type
+        if: inputs.test_type == ''
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          repository: ${{ env.TRIGGERING_REPO }}
+          artifact-name: test-type
+          label: Suite tier
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # tier is a run_id hash input. The title fallback covers runs older than the artifact, and
+      # only a run-name (which workflow_run.name then repeats): a PR title's "(#1234)" is no tier.
+      - name: Resolve suite tier
         id: extract-tier
+        env:
+          TIER_INPUT: ${{ inputs.test_type }}
+          TIER_ARTIFACT: ${{ steps.test-type.outputs.value }}
         run: |
-          # display_title is "integration-tests (regression)" / "integration-tests (integration)" / etc.
-          # Fall back to empty (the ingest defaults it to 'unknown') for manual workflow_dispatch
-          # re-ingests or older runs whose display_title predates this convention.
-          TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          TIER="${TIER_INPUT:-${TIER_ARTIFACT}}"
+          if [ -z "${TIER}" ] && [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
+            TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/^[a-z_-]* (\([a-z_-]*\))$/\1/p')
+          fi
           echo "Resolved tier: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
 
