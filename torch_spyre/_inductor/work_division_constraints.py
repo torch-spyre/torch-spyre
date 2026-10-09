@@ -1072,27 +1072,25 @@ def multi_reduction_k_split_blocked(
 ) -> ConstraintResult:
     """Block K-splits for plain scalar reductions with more than one reduction variable.
 
-    ``dbo-opt``'s DDL template for plain reductions (``summeanmaxexx2.ddl``)
-    rejects kernels where more than one reduction variable is present, even if
-    only one is split across cores: "More than one reduction dim is split
-    across cores: not currently supported".  Example: ``flatten(0,1)`` on
-    ``(2,3,4)`` followed by ``sum(dim=0)`` produces an iteration space where
-    both ``d0`` and ``d1`` are reduction variables (neither appears in the
-    output coords).  ``work_distribution_pass`` splits one of them across
-    cores (satisfying ``_one_reduction_split_at_most``), but ``dbo-opt``
-    still rejects it.
+    The backend rejects plain reduction kernels where more than one reduction
+    variable is present, even if only one is split across cores ("More than one
+    reduction dim is split across cores: not currently supported").  Example:
+    ``flatten(0,1)`` on ``(2,3,4)`` followed by ``sum(dim=0)`` produces an
+    iteration space where both ``d0`` and ``d1`` are reduction variables
+    (neither appears in the output coords).  ``work_distribution_pass`` splits
+    one of them across cores (satisfying ``_one_reduction_split_at_most``), but
+    the backend still rejects it.
 
     Note: ``_one_reduction_split_at_most`` in ``WorkDivisionContext`` prevents
     splitting *two* reduction vars simultaneously, but it still allows splitting
     one.  This constraint is the load-bearing guard: when there are 2+
-    reduction vars, it blocks splitting *any* of them, because even a single
-    split triggers the dbo-opt error.
+    reduction vars, it blocks splitting *any* of them.
 
     Single-dim plain reductions are left unconstrained because WSR's
     ``_insert_combine_op`` already handles cross-core accumulation for them.
 
-    Structured ops (matmul, topk, pool, conv, depthwise conv) have their own
-    DDL templates that handle multi-dim iteration spaces; they are excluded via
+    Structured ops (matmul, topk, pool, conv, depthwise conv) have dedicated
+    backend support for multi-dim iteration spaces; they are excluded via
     ``_STRUCTURED_REDUCTION_TYPES``.
     """
     if not isinstance(ctx.op.data, Reduction):
