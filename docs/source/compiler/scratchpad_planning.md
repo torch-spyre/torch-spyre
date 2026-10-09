@@ -596,6 +596,31 @@ The same gate applies to `layout_solver` values of `"greedy"`, `"bestfit"`,
 or `"firstfit"` combined with `co_optimizing_lx_planning`, since none of
 those solvers is core-division-capable either.
 
+#### Local cost tables
+
+`CPSAT_LOCAL_COST_TABLES=1` (off by default) adds redundant tables to the
+priced joint solve. Each table combines cost terms that depend on one
+core-division choice and at most two ordinary LX-residency decisions.
+Linking their combined cost to those choices can strengthen the solver's
+lower bound and shorten the proof that its best plan is optimal.
+
+The original constraints and floating-point objective are retained. Integer
+weights select an auxiliary cost projection, and the same weights are used
+on both sides of its equality. Rounding those weights does not change the
+cost being optimized. CP-SAT still applies its usual internal floating-point
+objective scaling; the tables do not change its optimality tolerances.
+Unsupported dependencies and groups exceeding the construction or integer
+limits are skipped. Tables are limited to 2,048 states per group and 16,384
+states per solve.
+
+This is an experimental tradeoff: the tables add construction time, Boolean
+variables, and constraints, and can make some workloads slower. They do not
+guarantee an optimality proof within the default 60-second solve budget.
+For longer diagnostic runs, set both `CPSAT_LOCAL_COST_TABLES=1` and
+`CPSAT_TIME_LIMIT_SECONDS=1800` before starting Python. That gives each solve
+up to 30 minutes; a timeout can still return a merely feasible plan.
+Table construction happens before, and is additional to, the solve budget.
+
 #### Solver-driven coarse tiling
 
 `config.auto_coarse_tiling` (env var `AUTO_COARSE_TILING=1`, off by

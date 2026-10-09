@@ -484,66 +484,52 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 def ops_in_offset_mutation_component(
     graph: GraphLowering,
 ) -> set[str]:
-    """Names of ops data-connected to a sliced in-place mutation that writes at
-    a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
+    """Pin the forward dependency closure of constant-offset mutation storage.
 
-    Such a mutation and everything fused with it land in one SDSC. The offset
-    write's codegen assumes the target buffer keeps the slicing the eager path
-    chose; if the co-optimizing allocator re-slices any op in that fused kernel
-    (a different core division), the deeptools scheduler can no longer place the
-    offset write and aborts the compile (``DtException: "There must be at least
-    one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``). This is the root
-    cause of the ``slice_stick_mutation_*`` co-optimizing-allocator failures --
-    the division change, *not* LX residency (the abort reproduces with pinning
-    fully disabled).
+    Re-slicing an offset write or its downstream users can make its address
+    arithmetic unschedulable or produce wrong results, including when all
+    involved buffers are in HBM. ``cd_parent_matches`` only constrains LX
+    residency, so adding mutation edges there cannot replace this guard.
 
-    The caller pins every op in this set to its upstream (fixed) division, so
-    the offset-write SDSC keeps the schedulable slicing the greedy /
-    placement-only path uses. Fusion boundaries are unknown at planning time, so
-    the SDSC is over-approximated by the undirected data-dependency component
-    containing the offset write: producer chain (the value written), the
-    mutation target it aliases, and the consumers of that target. Over-approxi-
-    mation only forgoes a division optimization (correct, never a new failure --
-    a fixed division is exactly what greedy uses).
+    Follow reads from buffer to consumer, and MutationLayout links in both
+    directions: an update and its target share storage. This also follows
+    copy-backs and zero-offset writes reached through arbitrarily long reader
+    chains. There is no hop limit. A reached writer brings its target and all
+    of that target's readers into the closure, regardless of graph order.
 
-    Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
-    offsets (coarse tiling) are not offset writes, so no component is seeded and
-    coarse tiling is not constrained.
+    Do not follow ordinary reads backwards to their producers: the solver's
+    residency gate already protects reads from independently re-sliced
+    producers. In particular, padding an FFN input must not pin the upstream
+    attention block (issue #4990). Downstream ops are conservatively pinned;
+    this is a dependency boundary, not an exact address-dependence analysis.
+
+    Symbolic coarse-tile offsets do not seed the walk; see
+    :func:`_writes_at_constant_offset`.
     """
-    # Undirected adjacency over buffer names (op.name == its output buffer,
-    # Inductor convention). Edges: producer<->operand (read deps) and a
-    # MutationLayout op <-> its aliased target buffer.
-    adj: dict[str, set[str]] = {}
+    seeds = [op.name for op in graph.operations if _writes_at_constant_offset(op)]
+    if not seeds:
+        return set()
 
-    def link(a: str, b: str) -> None:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    seeds: list[str] = []
+    successors: dict[str, set[str]] = {}
+    op_names = {op.name for op in graph.operations}
     for op in graph.operations:
         for dep in op_read_writes(op).reads:
-            name = getattr(dep, "name", None)
-            if name:
-                link(op.name, name)
+            successors.setdefault(dep.name, set()).add(op.name)
         layout = getattr(op, "layout", None)
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            try:
-                link(op.name, layout.target.get_name())
-            except (AttributeError, TypeError):
-                pass
-        if _writes_at_constant_offset(op):
-            seeds.append(op.name)
+            target = layout.target.get_name()
+            successors.setdefault(op.name, set()).add(target)
+            successors.setdefault(target, set()).add(op.name)
 
-    op_names = {op.name for op in graph.operations}
-    component: set[str] = set()
+    reached: set[str] = set()
     stack = list(seeds)
     while stack:
-        node = stack.pop()
-        if node in component:
+        name = stack.pop()
+        if name in reached:
             continue
-        component.add(node)
-        stack.extend(adj.get(node, ()))
-    return component & op_names
+        reached.add(name)
+        stack.extend(successors.get(name, ()))
+    return reached & op_names
 
 
 def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:

@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import sympy
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
@@ -1641,6 +1641,55 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(result["mm_out"].chosen_division)
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "division gate tests need ortools")
+class TestCpSatDivisionGate(TestCase):
+    def test_gate_preserves_exact_allowed_assignments(self):
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _gate_divisions
+
+        class Solutions(cp_model.CpSolverSolutionCallback):
+            def __init__(self, variables):
+                super().__init__()
+                self.variables = variables
+                self.values = set()
+
+            def on_solution_callback(self):
+                self.values.add(tuple(self.value(v) for v in self.variables))
+
+        pairs = [(0, 0), (0, 2), (1, 1), (1, 1)]
+        for compatible, shared, fixed, negated in (
+            ([], False, False, False),
+            (pairs, False, False, False),
+            (pairs, False, False, True),
+            (pairs, True, False, False),
+            (pairs, False, True, False),
+            ([(0, 0)], True, True, False),
+        ):
+            with self.subTest(
+                compatible=compatible, shared=shared, fixed=fixed, negated=negated
+            ):
+                model = cp_model.CpModel()
+                source = model.new_int_var(0, 0 if fixed else 1, "source")
+                dest = source if shared else model.new_int_var(0, 2, "dest")
+                enabled = model.new_bool_var("enabled")
+                gate = enabled.Not() if negated else enabled
+                _gate_divisions(model, compatible, source, dest, gate)
+                self.assertEqual(len(model.proto.variables), 2 if shared else 3)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                solver.parameters.enumerate_all_solutions = True
+                solutions = Solutions([source, dest, enabled])
+                self.assertEqual(solver.solve(model, solutions), cp_model.OPTIMAL)
+                expected = {
+                    (i, j, flag)
+                    for i, j, flag in itertools.product(
+                        range(1 if fixed else 2), range(3), range(2)
+                    )
+                    if (not shared or i == j)
+                    and ((not flag if not negated else flag) or (i, j) in compatible)
+                }
+                self.assertEqual(solutions.values, expected)
+
+
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat printer tests need ortools")
 class TestSympyExprToCpSatPrinter(TestCase):
     """Direct unit tests for ``_SympyExprToCpSat``'s Piecewise/relational-
@@ -1678,6 +1727,175 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver, sym_map = self._optimize(expr, {"x": (0, 10)}, maximize=True)
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
+
+    def test_repeated_piecewise_guards_preserve_every_assignment(self):
+        # Different prices share overlapping guards. The first matching branch
+        # must win, and repeated terms must not duplicate the guard encoding.
+        x, y = sympy.symbols("x y", integer=True)
+        expressions = [
+            sympy.Piecewise(
+                (k * x + y, sympy.And(x >= 1, y <= 1)),
+                (x - k * y, sympy.Or(x >= 2, y <= 0)),
+                (k + x * y, True),
+            )
+            for k in range(1, 17)
+        ]
+        model = cp_model.CpModel()
+        variables = {name: model.new_int_var(-1, 3, name) for name in ("x", "y")}
+        printer = _SympyExprToCpSat(model, variables, {})
+        costs = [printer.convert(expr) for expr in expressions]
+        guards = [
+            v
+            for v in model.proto.variables
+            if v.name.startswith(("cond_", "and_", "or_"))
+        ]
+        self.assertLessEqual(len(guards), 12)
+        model.minimize(sum(costs))
+        for a, b in itertools.product(range(-1, 4), repeat=2):
+            with self.subTest(x=a, y=b):
+                fixed = model.clone()
+                fixed.add(variables["x"] == a)
+                fixed.add(variables["y"] == b)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                expected = sum(expr.subs({x: a, y: b}) for expr in expressions)
+                self.assertAlmostEqual(solver.objective_value, float(expected))
+
+    def test_repeated_constant_conditions_do_not_create_decisions(self):
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        variable = model.new_int_var(-2, 2, "y")
+        printer = _SympyExprToCpSat(model, {"x": 2, "y": variable}, {})
+        expressions = [
+            sympy.Piecewise((k * y, x < k), (y - k, True)) for k in range(1, 17)
+        ]
+        model.minimize(sum(printer.convert(expr) for expr in expressions))
+        self.assertFalse(any(v.name.startswith("cond_") for v in model.proto.variables))
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 1
+        self.assertEqual(solver.solve(model), cp_model.OPTIMAL)
+        expected = min(
+            sum(expr.subs({x: 2, y: value}) for expr in expressions)
+            for value in range(-2, 3)
+        )
+        self.assertAlmostEqual(solver.objective_value, float(expected))
+
+    def test_division_tables_preserve_costs_for_every_assignment(self):
+        # Two selectors and a free residency flag exercise single-menu tables,
+        # coupled costs, and predicates that become constant over a whole menu.
+        x, y, z, resident = sympy.symbols(
+            "split_x split_y split_z resident", integer=True
+        )
+        expressions = [
+            1e-6 * x**2 * y + sympy.Min(0.125 * x * y, 3.25),
+            1000 * y / x + 0.25 * sympy.log(x, 2),
+            x * y * z * (1 - resident),
+            # The single-menu table fits, but multiplying its wide integer
+            # by z does not. The original factored terms still fit the bound.
+            sympy.Piecewise((80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)) * z,
+            sympy.Piecewise(
+                (0.25 * x * y, sympy.And(x >= 2, y >= 2)),
+                (1e-6 * x**2, sympy.Or(x <= 1, y <= 1)),
+                (3, True),
+            )
+            * (1 - resident),
+            sympy.Piecewise(
+                (x * resident, sympy.And(x > 0, y > 0, evaluate=False)),
+                (y, True),
+            ),
+        ]
+        model = cp_model.CpModel()
+        selectors = [
+            model.new_int_var(0, n - 1, f"div_{i}") for i, n in enumerate((4, 2))
+        ]
+        wrappers = [types.SimpleNamespace(division=var) for var in selectors]
+        sym_map = {"resident": model.new_bool_var("resident")}
+        buffer_map = {}
+        for name, owner, raw in (
+            ("split_x", 0, [1, 2, 4, 8]),
+            ("split_y", 0, [8, 2, 4, 1]),
+            ("split_z", 1, [1, 3]),
+        ):
+            var = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(selectors[owner], raw, var)
+            sym_map[name] = var
+            buffer_map[name] = wrappers[owner], raw
+        printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        with mock.patch.object(conventional, "_division_table", return_value=None):
+            expected = [conventional.convert(expr) for expr in expressions]
+        actual = [printer.convert(expr) for expr in expressions]
+        self.assertTrue(printer._untabled_expr_cache)
+        self.assertTrue(
+            any(v.name.startswith("division_cost_") for v in model.proto.variables)
+        )
+        self.assertIsNone(printer._division_table(x * z))
+        for i, j, flag in itertools.product(range(4), range(2), (0, 1)):
+            with self.subTest(division=i, other=j, resident=flag):
+                fixed = model.clone()
+                for var, value in zip((*selectors, sym_map["resident"]), (i, j, flag)):
+                    fixed.add(var == value)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                for new, old in zip(actual, expected):
+                    self.assertAlmostEqual(
+                        solver.float_value(new), solver.float_value(old), places=7
+                    )
+
+    def test_candidate_domains_without_selectors_remain_independent(self):
+        # These menus calibrate reciprocal scales, but do not identify a
+        # shared division. Their different lengths must not be broadcast or
+        # mistaken for scalar constants by the table optimization.
+        x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
+        menus = {"split_x": [1, 2, 4], "split_y": [1, 3]}
+        model = cp_model.CpModel()
+        variables = {
+            name: model.new_int_var_from_domain(cp_model.Domain.FromValues(raw), name)
+            for name, raw in menus.items()
+        }
+        printer = _SympyExprToCpSat(
+            model, variables, {name: (None, raw) for name, raw in menus.items()}
+        )
+        expression = 120 * y / x + sympy.Piecewise(
+            (20 * x, sympy.And(x >= 2, y >= 3)), (1, True)
+        )
+        model.minimize(printer.convert(expression))
+        for a, b in itertools.product(menus["split_x"], menus["split_y"]):
+            with self.subTest(x=a, y=b):
+                fixed = model.clone()
+                fixed.add(variables["split_x"] == a)
+                fixed.add(variables["split_y"] == b)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.objective_value, float(expression.subs({x: a, y: b}))
+                )
+
+    def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
+        x = sympy.Symbol("split_x", integer=True)
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        wrapper = types.SimpleNamespace(division=division)
+        var = model.new_int_var(1, 5, "split_x")
+        model.add_element(division, [1, 3, 5], var)
+        printer = _SympyExprToCpSat(
+            model, {"split_x": var}, {"split_x": (wrapper, [1, 3, 5])}
+        )
+        printer.convert(x**2)
+        count = len(model.proto.variables)
+        printer.convert(0.25 * x**2 + 1.5)
+        self.assertEqual(len(model.proto.variables), count)
+        # The exact integer table would exceed the product bound. Preserve the
+        # original affine expression instead of inventing a rounding scale.
+        wide = [1, 2, _MAX_PRODUCT_BOUND + 3]
+        printer = _SympyExprToCpSat(
+            model, {"split_x": var}, {"split_x": (wrapper, wide)}
+        )
+        self.assertIsNone(printer._division_table(1e-6 * x))
+        self.assertEqual(len(model.proto.variables), count)
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
@@ -2397,6 +2615,256 @@ class TestInvScale(TestCase):
         self.assertEqual([v for v in raw if scale % v], [7])
         self.assertEqual([v for v in raw if 864 % v], [7])
         self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "ortools not installed")
+class TestLocalCostTables(TestCase):
+    @staticmethod
+    def _add(model, divisions, residency, start):
+        from torch_spyre._inductor.scratchpad.cost_tables import add_cost_tables
+
+        return add_cost_tables(
+            model,
+            divisions=divisions,
+            residency=residency,
+            first_variable=start[0],
+            first_constraint=start[1],
+        )
+
+    @staticmethod
+    def _start(model):
+        return len(model.proto.variables), len(model.proto.constraints)
+
+    def _check_unchanged(self, before, after):
+        self.assertEqual(
+            str(before.proto.floating_point_objective),
+            str(after.proto.floating_point_objective),
+        )
+        for old, new in zip(before.proto.variables, after.proto.variables):
+            self.assertEqual(str(old), str(new))
+        for old, new in zip(before.proto.constraints, after.proto.constraints):
+            self.assertEqual(str(old), str(new))
+        self.assertEqual(after.validate(), "")
+
+    def test_preserves_every_choice_with_signed_arithmetic_and_guards(self):
+        # Arbitrary variable names exercise structural recovery. Signed division,
+        # products, complementary predicates, OR, and an affine Min operand all
+        # contribute to a single coupled cost; compare with independent Python.
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 3, "choice")
+        a, b = [model.new_bool_var(name) for name in ("a", "b")]
+        xs, ds = [-8, -4, 2, 5], [2, 3, 7, 9]
+        x = model.new_int_var(-8, 5, "x")
+        denominator = model.new_int_var(2, 9, "denominator")
+        model.add_element(choice, xs, x)
+        model.add_element(choice, ds, denominator)
+        start = self._start(model)
+        quotient = model.new_int_var(-100, 0, "quotient")
+        model.add_division_equality(quotient, -101, denominator)
+        product = model.new_int_var(-8, 5, "product")
+        model.add_multiplication_equality(product, [x, a])
+        negative = model.new_bool_var("negative")
+        model.add(x <= -4).only_enforce_if(negative)
+        model.add(x >= -3).only_enforce_if(negative.Not())
+        guard = model.new_bool_var("guard")
+        model.add_bool_or([negative, b]).only_enforce_if(guard)
+        model.add_bool_and([negative.Not(), b.Not()]).only_enforce_if(guard.Not())
+        charged = model.new_int_var(-8, 5, "charged")
+        model.add_multiplication_equality(charged, [product, guard])
+        subtotal = model.new_int_var(-8, 105, "subtotal")
+        model.add(subtotal == charged - quotient)
+        capped = model.new_int_var(-8, 20, "capped")
+        model.add_min_equality(capped, [subtotal, 20])
+        model.minimize(
+            0.125 * product + 0.375 * quotient - 0.25 * capped + 0.0625 * charged
+        )
+        before = model.clone()
+        stats = self._add(model, [choice], [a, b], start)
+        self.assertEqual(stats["groups"], 1)
+        self.assertEqual(stats["states"], 16)
+        self._check_unchanged(before, model)
+        for d, av, bv in itertools.product(range(4), (0, 1), (0, 1)):
+            with self.subTest(choice=d, a=av, b=bv):
+                fixed = model.clone()
+                for var, value in ((choice, d), (a, av), (b, bv)):
+                    fixed.add(var == value)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                q = -(101 // ds[d])  # CP-SAT truncates signed division toward zero.
+                product_value = xs[d] * av
+                charge = product_value if xs[d] <= -4 or bv else 0
+                expected = (
+                    0.125 * product_value
+                    + 0.375 * q
+                    - 0.25 * min(charge - q, 20)
+                    + 0.0625 * charge
+                )
+                self.assertEqual(solver.objective_value, expected)
+
+    def test_unmodelled_decisions_do_not_enter_local_tables(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 2, "choice")
+        resident, external = [model.new_bool_var(n) for n in ("resident", "external")]
+        x = model.new_int_var(1, 4, "x")
+        model.add_element(choice, [1, 2, 4], x)
+        start = self._start(model)
+        known = model.new_int_var(0, 4, "known")
+        unknown = model.new_int_var(0, 4, "unknown")
+        model.add_multiplication_equality(known, [x, resident])
+        model.add_multiplication_equality(unknown, [x, external])
+        model.minimize(0.25 * x + 0.5 * known + 0.125 * unknown)
+        before = model.clone()
+        stats = self._add(model, [choice], [resident], start)
+        self.assertEqual(stats, {"groups": 1, "states": 6, "terms": 2})
+        self._check_unchanged(before, model)
+        for d, flag, extra in itertools.product(range(3), (0, 1), (0, 1)):
+            fixed = model.clone()
+            for var, value in ((choice, d), (resident, flag), (external, extra)):
+                fixed.add(var == value)
+            solver = cp_model.CpSolver()
+            solver.parameters.num_search_workers = 1
+            self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+            self.assertEqual(
+                solver.objective_value,
+                [1, 2, 4][d] * (0.25 + 0.5 * flag + 0.125 * extra),
+            )
+
+    def test_complementary_affine_branches(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 3, "choice")
+        flag = model.new_bool_var("flag")
+        start = self._start(model)
+        branched = model.new_int_var(-3, 8, "branched")
+        model.add(branched == 2 * choice + 2).only_enforce_if(flag)
+        model.add(branched == -choice).only_enforce_if(flag.Not())
+        model.minimize(0.125 * choice + 0.375 * branched)
+        before = model.clone()
+        self.assertEqual(self._add(model, [choice], [flag], start)["states"], 8)
+        self._check_unchanged(before, model)
+        for d, f in itertools.product(range(4), (0, 1)):
+            fixed = model.clone()
+            fixed.add(choice == d)
+            fixed.add(flag == f)
+            solver = cp_model.CpSolver()
+            solver.parameters.num_search_workers = 1
+            self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+            self.assertEqual(
+                solver.objective_value, 0.125 * d + 0.375 * (2 * d + 2 if f else -d)
+            )
+
+    def test_production_planner_preserves_optimum_and_budget(self):
+        from torch_spyre._inductor.scratchpad import cost_tables
+
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                config.patch({"cpsat_local_cost_tables": enabled}),
+            ):
+                buf = CoreDivisionBuffer(
+                    "output",
+                    128,
+                    [0, 1],
+                    core_divisions=_divs(),
+                    residency_reason="no consumer reads it from LX",
+                )
+                # Couple compute and residency costs. A cost depending only
+                # on division is already folded into one table by the printer.
+                cost = (
+                    32.0 / buf.sym_cores
+                    + 0.5 * buf.sym_cores
+                    + 0.25 * buf.sym_cores * buf.sym_is_lx
+                )
+                tables = []
+                add = cost_tables.add_cost_tables
+
+                def record(model, **kwargs):
+                    before = model.clone()
+                    stats = add(model, **kwargs)
+                    self._check_unchanged(before, model)
+                    tables.append(stats)
+                    return stats
+
+                planner = CpSatLayoutSolver([buf], size=1024, alignment=1)
+                with mock.patch.object(cost_tables, "add_cost_tables", record):
+                    (result,) = planner.plan_layout_and_core_divisions(cost)
+                self.assertEqual(result.chosen_division, 0)
+                self.assertEqual(float(cost.subs(solved_bindings([result]))), 10.0)
+                self.assertEqual(planner.last_solve_stats["status"], "OPTIMAL")
+                self.assertEqual(
+                    planner.last_solve_stats["limit_s"], config.cpsat_time_limit_seconds
+                )
+                self.assertEqual(len(tables), int(enabled))
+                if enabled:
+                    self.assertEqual(tables[0]["groups"], 1)
+
+    def test_half_reification_is_not_a_functional_definition(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 2, "choice")
+        resident = model.new_bool_var("resident")
+        start = self._start(model)
+        gate = model.new_bool_var("gate")
+        model.add_bool_and([resident]).only_enforce_if(gate)
+        cost = model.new_int_var(0, 2, "cost")
+        model.add_multiplication_equality(cost, [choice, gate])
+        model.minimize(0.5 * choice + 0.25 * cost)
+        before = str(model.proto)
+        self.assertEqual(self._add(model, [choice], [resident], start)["groups"], 0)
+        self.assertEqual(str(model.proto), before)
+
+    def test_nonfunctional_cycles_are_left_alone(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 1, "choice")
+        start = self._start(model)
+        x, y = [model.new_int_var(0, 3, n) for n in ("x", "y")]
+        model.add_multiplication_equality(x, [y, 1])
+        model.add_multiplication_equality(y, [x, 1])
+        model.minimize(0.1 * x + 0.2 * y)
+        before = str(model.proto)
+        self.assertEqual(self._add(model, [choice], [], start)["groups"], 0)
+        self.assertEqual(str(model.proto), before)
+
+    def test_large_tables_and_integer_activity_are_left_alone(self):
+        # The second menu fits the state limit, but its dense weighted-row sum
+        # would overflow the permitted integer activity. Neither optimization
+        # may leave a partially built table behind.
+        for count, base in ((2049, 4096), (2048, 1 << 40)):
+            with self.subTest(count=count, base=base):
+                model = cp_model.CpModel()
+                choice = model.new_int_var(0, count - 1, "choice")
+                x, y = [model.new_int_var(0, base, n) for n in ("x", "y")]
+                model.add_element(choice, [base - i for i in range(count)], x)
+                model.add_element(choice, [base - 2 * i for i in range(count)], y)
+                start = self._start(model)
+                model.minimize(0.1 * x + 0.3 * y)
+                before = str(model.proto)
+                self.assertEqual(self._add(model, [choice], [], start)["groups"], 0)
+                self.assertEqual(str(model.proto), before)
+
+    def test_wide_residency_support_is_left_alone(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 3, "choice")
+        flags = [model.new_bool_var(f"flag{i}") for i in range(3)]
+        start = self._start(model)
+        terms = []
+        for i, flag in enumerate(flags):
+            value = model.new_int_var(0, 3, f"value{i}")
+            model.add_multiplication_equality(value, [choice, flag])
+            terms.append(value * (0.25 * (i + 1)))
+        model.minimize(sum(terms))
+        before = str(model.proto)
+        self.assertEqual(self._add(model, [choice], flags, start)["groups"], 0)
+        self.assertEqual(str(model.proto), before)
+
+    def test_integer_objective_is_left_alone(self):
+        model = cp_model.CpModel()
+        choice = model.new_int_var(0, 3, "choice")
+        model.minimize(choice)
+        before = str(model.proto)
+        self.assertEqual(
+            self._add(model, [choice], [], self._start(model))["groups"], 0
+        )
+        self.assertEqual(str(model.proto), before)
 
 
 if __name__ == "__main__":

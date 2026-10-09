@@ -728,8 +728,14 @@ Environment Variables
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``1``)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
-     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
-       disables the limit)
+     - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
+       disables the limit). Applies separately to each optimization phase.
+       A timeout may return a feasible plan without proving optimality.
+   * - ``CPSAT_LOCAL_COST_TABLES``
+     - Add redundant local cost tables to priced joint CP-SAT solves
+       (default ``0``). May shorten optimality proofs by strengthening cost
+       bounds, at the expense of construction time and extra variables.
+       Preserves the objective and the solve budget.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)

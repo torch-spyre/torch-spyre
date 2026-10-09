@@ -180,13 +180,11 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     if not compatible:
         model.Add(enforce_lit == 0)
         return
-    pair_lits = []
-    for i, j in compatible:
-        lit = model.NewBoolVar("")
-        model.Add(src_div == i).OnlyEnforceIf(lit)
-        model.Add(dst_div == j).OnlyEnforceIf(lit)
-        pair_lits.append(lit)
-    model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
+    # Let CP-SAT encode the relation as a table, instead of introducing a
+    # Boolean and two implications for every compatible pair on every edge.
+    model.add_allowed_assignments([src_div, dst_div], compatible).only_enforce_if(
+        enforce_lit
+    )
 
 
 @dataclass
@@ -589,7 +587,152 @@ class _SympyExprToCpSat(Printer):
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
+        self._allow_tables = True
+        # These caches belong to one converter/model. A class-level @cache
+        # would retain every converter and its CP model across compilations.
+        self._expr_cache: dict = {}
+        self._untabled_expr_cache: dict = {}
+        self._condition_cache: dict = {}
+        self._conjunction_cache: dict = {}
+        self._candidate_cache: dict = {}
+        self._division_table_cache: dict = {}
         super().__init__()
+
+    def _print(self, expr, **kwargs):
+        if expr not in self._expr_cache:
+            table = (
+                self._division_table(expr) if self._allow_tables and expr.args else None
+            )
+            self._expr_cache[expr] = (
+                super()._print(expr, **kwargs) if table is None else table
+            )
+        return self._expr_cache[expr]
+
+    def _candidate_values(self, expr):
+        """Evaluate an expression over at most one buffer's division menu.
+
+        Residency and other free decisions stop evaluation at that node. Work
+        on the rewritten expression, including its reciprocal/log scales and
+        Min/Max rounding, so tabulation does not change the cost model.
+        """
+        if expr not in self._candidate_cache:
+            self._candidate_cache[expr] = self._evaluate_candidates(expr)
+        return self._candidate_cache[expr]
+
+    def _evaluate_candidates(self, expr):
+        if expr in (sympy.true, sympy.false):
+            return None, bool(expr)
+        if expr.is_Number:
+            return None, int(expr) if expr.is_Integer else float(expr)
+        if expr.is_Symbol:
+            mapped = self._sym_map.get(expr.name)
+            if isinstance(mapped, (int, float)):
+                return None, mapped
+            name = expr.name
+            prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
+            raw_name = name[len(prefix) :]
+            entry = self._buffer_map.get(raw_name)
+            if entry is None:
+                wrapper = self._sym_map.get(f"_division_of_{name}")
+                if wrapper is None:
+                    return None
+                entry = wrapper, range(len(wrapper.buffer.core_divisions))
+            wrapper, raw = entry
+            if wrapper is None:
+                # Domain-only entries can set reciprocal scales without a
+                # shared division selector. Keep their arithmetic symbolic;
+                # their candidate arrays are not scalar constants or a table.
+                return None
+            if prefix == "inv_":
+                scale = self._inv_scale(raw_name)
+                raw = [scale // v for v in raw]
+            elif prefix == "log2_":
+                raw = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            values = np.asarray(raw, dtype=object)
+            if all(v == values[0] for v in values):
+                return None, values[0]
+            return wrapper, values
+
+        if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
+            return None  # Preserve the ordinary printer's required default.
+        args = (
+            [part for pair in expr.args for part in pair]
+            if expr.is_Piecewise
+            else expr.args
+        )
+        evaluated = [self._candidate_values(arg) for arg in args]
+        if any(value is None for value in evaluated):
+            return None
+        owners = [value[0] for value in evaluated if value[0] is not None]
+        owner = owners[0] if owners else None
+        if any(other is not owner for other in owners):
+            return None
+        values = [value[1] for value in evaluated]
+        if expr.is_Add:
+            result = sum(values)
+        elif expr.is_Mul:
+            result = math.prod(values)
+        elif expr.is_Pow:
+            result = values[0] ** values[1]
+        elif isinstance(expr, (sympy.Min, sympy.Max)):
+            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Relational:
+            result = _operator_map[expr.rel_op](*values)
+        elif expr.func in (sympy.And, sympy.Or):
+            operation = np.logical_and if expr.func is sympy.And else np.logical_or
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Piecewise:
+            result = values[-2]
+            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
+                result = np.where(cond, value, result)
+        elif expr.func is sympy.KroneckerDelta:
+            result = np.equal(*values)
+        else:
+            return None
+        return owner, result
+
+    def _division_table(self, expr):
+        evaluated = self._candidate_values(expr)
+        if evaluated is None:
+            return None
+        owner, values = evaluated
+        if owner is None:
+            return np.asarray(values).item()
+        raw = np.asarray(values, dtype=object).reshape(-1).tolist()
+        # An exact affine encoding of the binary floating values, without
+        # introducing another rounding scale. If its integer range is too
+        # large, lower the expression normally and try its smaller children.
+        if not all(math.isfinite(v) for v in raw):
+            return None
+        rationals = [Fraction(v) for v in raw]
+        base = min(rationals)
+        denominator = math.lcm(*(v.denominator for v in rationals))
+        differences = [int((v - base) * denominator) for v in rationals]
+        divisor = math.gcd(*differences)
+        if divisor == 0:
+            return raw[0]
+        table = tuple(v // divisor for v in differences)
+        if max(table) > _MAX_PRODUCT_BOUND:
+            return None
+        scale = Fraction(divisor, denominator)
+        offset = int(base) if base.denominator == 1 else float(base)
+        coefficient = int(scale) if scale.denominator == 1 else float(scale)
+        if Fraction(offset) != base or Fraction(coefficient) != scale:
+            return None
+        key = owner.division.index, table
+        if key not in self._division_table_cache:
+            var = self._model.new_int_var_from_domain(
+                cp_model.Domain.FromValues(table), f"division_cost_{self._count}"
+            )
+            self._count += 1
+            self._model.add_element(owner.division, table, var)
+            self._division_table_cache[key] = var
+        return coefficient * self._division_table_cache[key] + offset
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
@@ -889,7 +1032,29 @@ class _SympyExprToCpSat(Printer):
 
     def _print_Mul(self, expr):
         args = [self._print(arg) for arg in expr.args]
-        return self._print_multiply(args)
+        try:
+            return self._print_multiply(args)
+        except ValueError:
+            if not self._allow_tables:
+                raise
+            # A table can combine an affine sum into one wider integer, whose
+            # product exceeds the bound even though each original term fits.
+            # Keep the original factorization locally. Unused table helpers
+            # are removed by presolve; other expressions can still tabulate.
+            # Reuse this converter's variable namespace and guard caches.
+            self._allow_tables = False
+            self._expr_cache, self._untabled_expr_cache = (
+                self._untabled_expr_cache,
+                self._expr_cache,
+            )
+            try:
+                return self._print(expr)
+            finally:
+                self._expr_cache, self._untabled_expr_cache = (
+                    self._untabled_expr_cache,
+                    self._expr_cache,
+                )
+                self._allow_tables = True
 
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
@@ -1029,23 +1194,44 @@ class _SympyExprToCpSat(Printer):
         return self._print(expr.base) ** self._print(expr.exp)
 
     def _print_condition(self, cond):
-        if not isinstance(cond, sympy.core.relational.Relational):
-            return self._print(cond)
+        if cond in self._condition_cache:
+            return self._condition_cache[cond]
         cond_expr = self._print(cond)
+        if isinstance(cond_expr, (cp_model.IntVar, cp_model_helper.NotBooleanVariable)):
+            self._condition_cache[cond] = cond_expr
+            return cond_expr
+        if isinstance(cond_expr, (bool, int)):
+            # Fixed divisions turn many symbolic predicates into constants.
+            var = self._model.new_constant(int(cond_expr))
+            self._condition_cache[cond] = var
+            return var
+        if not isinstance(cond, sympy.core.relational.Relational):
+            return cond_expr
         not_cond_expr = self._print(sympy.Not(cond))
         var = self._model.new_bool_var(f"cond_{self._count}")
         self._count += 1
         self._model.Add(cond_expr).OnlyEnforceIf(var)
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
+        self._condition_cache[cond] = var
         return var
+
+    def _conjunction(self, lits):
+        # Expanded cost terms often have different values under exactly the
+        # same branch guard. Share the guard even when the Piecewise differs.
+        key = tuple(sorted({lit.index for lit in lits}))
+        if key not in self._conjunction_cache:
+            var = self._model.new_bool_var(f"and_{self._count}")
+            self._count += 1
+            self._model.add_bool_and(lits).only_enforce_if(var)
+            self._model.add_bool_or([lit.Not() for lit in lits]).only_enforce_if(
+                var.Not()
+            )
+            self._conjunction_cache[key] = var
+        return self._conjunction_cache[key]
 
     def _print_And(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
-        and_var = self._model.new_bool_var(f"and_{self._count}")
-        self._count += 1
-        self._model.AddBoolAnd(lits).OnlyEnforceIf(and_var)
-        self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
-        return and_var
+        return self._conjunction(lits)
 
     def _print_Or(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
@@ -1067,12 +1253,7 @@ class _SympyExprToCpSat(Printer):
                 cond_var = self._print_condition(cond)
                 lits = [cond_var, *not_prev]
                 not_prev = [*not_prev, cond_var.Not()]
-            piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
-            self._count += 1
-            self._model.AddBoolAnd(lits).OnlyEnforceIf(piecewise_var)
-            self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(
-                piecewise_var.Not()
-            )
+            piecewise_var = self._conjunction(lits)
             result += self._print_multiply_two(piecewise_var, self._print(val))
         return result
 
@@ -1354,11 +1535,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             buffer_map[symbol.name] = (t, t.cores_used)
 
         try:
+            first_cost_variable = len(model.proto.variables)
+            first_cost_constraint = len(model.proto.constraints)
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
                 model.minimize(cp_cost)
+                if config.cpsat_local_cost_tables:
+                    from .cost_tables import add_cost_tables
+
+                    tables = add_cost_tables(
+                        model,
+                        divisions=[
+                            t.division
+                            for t in tensors.values()
+                            if isinstance(t, _CoreDivisionBufferWithCpVars)
+                            and isinstance(t.division, cp_model.IntVar)
+                        ],
+                        residency=[
+                            t.in_buffer
+                            for t in tensors.values()
+                            if not isinstance(t.buffer, RelayoutCopyBuffer)
+                        ],
+                        first_variable=first_cost_variable,
+                        first_constraint=first_cost_constraint,
+                    )
+                    logger.debug("[CP-SAT layout solver] local cost tables: %s", tables)
             status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(

@@ -3288,17 +3288,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         gated per buffer (``_residency_by_buf``) and by the solver, so ineligible
         ops still participate as producers/consumers in the match.
 
-        Exception: ops data-connected to a sliced in-place mutation (a constant-
-        offset write, e.g. ``x[:, 32:96] = ...``) are pinned to their upstream
-        (fixed) division. Re-slicing any op fused into the offset write's SDSC
-        makes the deeptools scheduler reject it (``DtException: "There must be at
-        least one valid candidate"``), the root cause of the
-        ``slice_stick_mutation_*`` failures. Keeping the fixed division there
-        matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization when that division also satisfies hard
-        work-division constraints. Otherwise LX planning raises ``Unsupported``
-        rather than committing an illegal division. See
-        ``utils.ops_in_offset_mutation_component``.
+        Constant-offset writes, their storage aliases and their forward
+        dependency closure keep their committed division. This protects offset
+        address arithmetic even in HBM, where residency edges do not constrain
+        division choices. Upstream producers remain free to optimize. See
+        ``utils.ops_in_offset_mutation_component``. As with every fixed pin,
+        an illegal committed division raises ``Unsupported`` rather than
+        bypassing hard work-division constraints.
 
         Whatever the path, every candidate returned is within the ``sencores`` budget
         -- asserted here because nothing downstream re-checks it (issue #4387).
@@ -3348,7 +3344,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
             elif op.name in offset_mutation_ops:
-                reason = "offset mutation component"
+                reason = "offset mutation forward closure"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
             elif op.name in layout_group_reason:
