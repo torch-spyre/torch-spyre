@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import math
 import os
@@ -8239,36 +8240,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "Issue #1800: Memory corruption in indexed views of permuted tensors "
                 "(torch-spyre GitHub)"
             )
-        if variant == "vit_attention_cls_token":
-            pytest.xfail(
-                "Issue #543 (eager): aten::_reshape_alias not implemented in eager mode; "
-                "Issue #1731 (compiled): Spyre SIGABRT in fused_bmm_transpose compilation "
-                "(torch-spyre GitHub)"
-            )
-        if (
-            variant
-            in (
-                "attn_scaled_dot_product",
-                "transformer_encoder_attention",
-                "transformer_decoder_cross_attention",
-            )
-            and execution_mode == "eager"
-        ):
-            pytest.xfail(
-                "Issue #543: aten::_reshape_alias not implemented in eager mode "
-                "(torch-spyre GitHub)"
-            )
 
         fn, call_args = _pattern_resolve(variant, args)
         atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
-        compare_with_cpu(
-            fn,
-            *call_args,
-            atol=atol,
-            rtol=rtol,
-            run_compile=(execution_mode == "compiled"),
-            run_eager=(execution_mode == "eager"),
-        )
+        # The ViT attention with a CLS token has an unaligned token dim that the
+        # planner splits across cores; the backend cannot mask that (#5285). The
+        # softmax kernel fails in dbo-opt in both modes.
+        with (
+            pytest.raises(
+                Exception,
+                match="Cannot currently apply coordinate masking for dimensions "
+                "split across cores",
+            )
+            if variant == "vit_attention_cls_token"
+            else contextlib.nullcontext()
+        ):
+            compare_with_cpu(
+                fn,
+                *call_args,
+                atol=atol,
+                rtol=rtol,
+                run_compile=(execution_mode == "compiled"),
+                run_eager=(execution_mode == "eager"),
+            )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
