@@ -63,6 +63,12 @@ class LaunchArgLayout:
     element_arrangement: str
 
     @classmethod
+    def from_dict(cls, raw: dict) -> "LaunchArgLayout":
+        """Parse a spec's ``layout`` block, ignoring keys this build predates."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
+
+    @classmethod
     def from_device_layout(cls, device_layout) -> "LaunchArgLayout":
         """Build from a ``SpyreTensorLayout``.
 
@@ -90,7 +96,22 @@ class LaunchArg:
     role: str
     shape: list[Any]
     dtype: str
-    layout: LaunchArgLayout
+    layout: Optional[LaunchArgLayout] = None
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "LaunchArg":
+        layout = raw.get("layout")
+        return cls(
+            arg_index=raw["arg_index"],
+            role=raw["role"],
+            shape=list(raw["shape"]),
+            dtype=raw["dtype"],
+            layout=LaunchArgLayout.from_dict(layout) if layout else None,
+        )
+
+    def resolved_shape(self, bindings: Optional[dict] = None) -> list[int]:
+        """This argument's extents, with symbols bound."""
+        return resolve_shape(self.shape, bindings)
 
 
 def _enum_name(value) -> str:
@@ -150,6 +171,37 @@ class LaunchSpec:
             },
         )
 
+    @classmethod
+    def from_dict(cls, raw: dict) -> "LaunchSpec":
+        """Parse a spec read off disk into typed records.
+
+        Unknown top-level keys are ignored so a newer minor spec still loads;
+        a newer *major* is refused by ``load_launch_spec`` before this runs.
+        """
+        return cls(
+            kernel_name=raw["kernel_name"],
+            args=sorted(
+                (LaunchArg.from_dict(a) for a in raw["args"]),
+                key=lambda a: a.arg_index,
+            ),
+            pool_size=raw.get("pool_size", 0),
+            bundle_symbolic_args=raw.get("bundle_symbolic_args", True),
+            emitter=raw.get("emitter"),
+            symbol_kinds=list(raw.get("symbol_kinds", [])),
+            symbols=dict(raw.get("symbols", {})),
+            version=raw.get("version", LAUNCH_SPEC_VERSION),
+        )
+
+    @property
+    def caller_passes_pool(self) -> bool:
+        """Whether the launch must prepend a pool tensor ahead of ``args``."""
+        return self.pool_size > 0
+
+    @property
+    def arg_offset(self) -> int:
+        """Where ``args[0]`` sits among the tensors a launch passes."""
+        return 1 if self.caller_passes_pool else 0
+
     def to_dict(self) -> dict:
         """The JSON object written to disk.
 
@@ -170,6 +222,31 @@ class LaunchSpec:
         if self.symbols:
             out["symbols"] = self.symbols
         return out
+
+
+class UnboundSymbol(Exception):
+    """A shape names a symbol the caller did not bind."""
+
+
+def resolve_shape(shape: Sequence, bindings: Optional[dict] = None) -> list[int]:
+    """``shape`` with any symbol replaced by its binding.
+
+    Shared by everything that turns a recorded shape into extents -- the
+    validator and whoever builds tensors -- so the two cannot disagree about
+    what a symbolic dimension means. Raises rather than defaulting: an unbound
+    symbol means the caller never said what size to launch at, and picking one
+    silently is how a plausible-looking wrong shape gets built.
+    """
+    bindings = bindings or {}
+    out = []
+    for dim in shape:
+        if isinstance(dim, int):
+            out.append(dim)
+        elif dim in bindings:
+            out.append(int(bindings[dim]))
+        else:
+            raise UnboundSymbol(str(dim))
+    return out
 
 
 def launch_args_to_dicts(args: Sequence[LaunchArg]) -> list[dict]:
@@ -242,28 +319,31 @@ def load_launch_spec(code_dir: str) -> Optional[dict]:
     return spec
 
 
-def spyre_layout_from_spec(layout: dict):
+def spyre_layout(layout: Optional[LaunchArgLayout]):
     """Build a ``SpyreTensorLayout`` from a spec's ``layout`` block.
 
     Returns None when the block cannot be turned into a layout (an older spec
     missing a field, or an enum spelling this build does not know), so a caller
     can fall back to the default arrangement rather than fail.
     """
+    if layout is None:
+        return None
     from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
     try:
-        device_size = [int(d) for d in layout["device_size"]]
-        stride_map = [int(x) for x in layout["stride_map"]]
-        device_dtype = getattr(DataFormats, layout["device_dtype"])
-        arrangement = getattr(
-            ElementArrangement, layout.get("element_arrangement", "STANDARD")
+        return SpyreTensorLayout(
+            [int(d) for d in layout.device_size],
+            [int(x) for x in layout.stride_map],
+            getattr(DataFormats, layout.device_dtype),
+            getattr(ElementArrangement, layout.element_arrangement or "STANDARD"),
         )
-    except (KeyError, TypeError, AttributeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
+        # An enum spelling this build does not know, or a field it predates:
+        # fall back to the default arrangement rather than fail the launch.
         return None
-    return SpyreTensorLayout(device_size, stride_map, device_dtype, arrangement)
 
 
-def _layout_mismatch(arg: dict, tensor) -> Optional[str]:
+def _layout_mismatch(arg: LaunchArg, tensor) -> Optional[str]:
     """How ``tensor``'s device layout differs from what ``arg`` records.
 
     None when they agree, or when the comparison cannot be made. A tensor whose
@@ -271,10 +351,7 @@ def _layout_mismatch(arg: dict, tensor) -> Optional[str]:
     succeed and return wrong data, which is exactly what the spec exists to
     prevent, so this is reported like any other mismatch.
     """
-    spec_layout = arg.get("layout")
-    if not spec_layout:
-        return None
-    want = spyre_layout_from_spec(spec_layout)
+    want = spyre_layout(arg.layout)
     if want is None:
         return None
     try:
@@ -302,26 +379,28 @@ def _layout_mismatch(arg: dict, tensor) -> Optional[str]:
 
 
 def check_launch_spec(
-    spec: dict, tensors: Sequence, bindings: Optional[dict] = None
+    spec, tensors: Sequence, bindings: Optional[dict] = None
 ) -> list[str]:
     """Return the ways ``tensors`` disagree with ``spec``; empty means well-formed.
 
-    Reports every problem rather than the first, so one run tells the caller
-    everything to fix. Well-formed is not correct: this checks count, shape and
-    dtype, and says nothing about the values in the tensors.
+    ``spec`` may be a ``LaunchSpec`` or the dict read off disk. Reports every
+    problem rather than the first, so one run tells the caller everything to
+    fix. Well-formed is not correct: this checks count, shape, dtype and layout,
+    and says nothing about the values in the tensors.
     """
-    problems: list[str] = []
-    args = sorted(spec["args"], key=lambda a: a["arg_index"])
-    pool_size = spec.get("pool_size", 0)
-    offset = 1 if pool_size > 0 else 0
+    if not isinstance(spec, LaunchSpec):
+        spec = LaunchSpec.from_dict(spec)
 
-    expected_n = len(args) + offset
+    problems: list[str] = []
+    offset = spec.arg_offset
+    expected_n = len(spec.args) + offset
+
     if len(tensors) != expected_n:
         note = ""
         if offset:
             note = (
-                f" ({len(args)} kernel args + 1 caller-supplied pool tensor of "
-                f"{pool_size} bytes)"
+                f" ({len(spec.args)} kernel args + 1 caller-supplied pool "
+                f"tensor of {spec.pool_size} bytes)"
             )
         # Positions no longer line up, so per-arg checks would be noise.
         return [f"expected {expected_n} tensors{note}, got {len(tensors)}"]
@@ -329,32 +408,23 @@ def check_launch_spec(
     if offset:
         pool = tensors[0]
         got_bytes = pool.numel() * pool.element_size()
-        if got_bytes != pool_size:
+        if got_bytes != spec.pool_size:
             problems.append(
-                f"pool tensor (position 0): expected {pool_size} bytes, "
+                f"pool tensor (position 0): expected {spec.pool_size} bytes, "
                 f"got {got_bytes}"
             )
 
-    symbols = spec.get("symbols", {})
-    bindings = bindings or {}
-    for arg in args:
-        tensor = tensors[arg["arg_index"] + offset]
-        where = f"arg {arg['arg_index']} ({arg['role']})"
+    for arg in spec.args:
+        tensor = tensors[arg.arg_index + offset]
+        where = f"arg {arg.arg_index} ({arg.role})"
 
-        want_shape = []
-        unbound = False
-        for dim in arg["shape"]:
-            if isinstance(dim, int):
-                want_shape.append(dim)
-            elif dim in bindings:
-                want_shape.append(int(bindings[dim]))
-            else:
-                problems.append(
-                    f"{where}: dimension '{dim}' is symbolic and unbound "
-                    f"(known symbols: {sorted(symbols) or 'none recorded'})"
-                )
-                unbound = True
-        if unbound:
+        try:
+            want_shape = arg.resolved_shape(bindings)
+        except UnboundSymbol as e:
+            problems.append(
+                f"{where}: dimension '{e}' is symbolic and unbound "
+                f"(known symbols: {sorted(spec.symbols) or 'none recorded'})"
+            )
             continue
 
         got_shape = list(tensor.shape)
@@ -367,8 +437,8 @@ def check_launch_spec(
             )
 
         got_dtype = str(tensor.dtype).removeprefix("torch.")
-        if got_dtype != arg["dtype"]:
-            problems.append(f"{where}: expected dtype {arg['dtype']}, got {got_dtype}")
+        if got_dtype != arg.dtype:
+            problems.append(f"{where}: expected dtype {arg.dtype}, got {got_dtype}")
 
         mismatch = _layout_mismatch(arg, tensor)
         if mismatch:
