@@ -1759,6 +1759,33 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
+        model = cp_model.CpModel()
+        a, b = [model.new_bool_var("") for _ in range(2)]
+        value = model.new_int_var(-2, 3, "value")
+        printer = _SympyExprToCpSat(model, {}, {})
+        multiply = printer._print_multiply_two
+        cost = (
+            multiply(a.Not(), value)
+            + 3 * multiply(b, value)
+            + 2 * multiply(a, b.Not())
+            + multiply(model.new_constant(0), value)
+            + multiply(model.new_constant(1), value)
+        )
+        model.minimize(cost)
+        for av, bv, x in itertools.product((0, 1), (0, 1), range(-2, 4)):
+            with self.subTest(a=av, b=bv, value=x):
+                fixed = model.clone()
+                for var, chosen in ((a, av), (b, bv), (value, x)):
+                    fixed.add(var == chosen)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertEqual(
+                    solver.objective_value,
+                    (1 - av) * x + 3 * bv * x + 2 * av * (1 - bv) + x,
+                )
+
     def test_a_repeated_condition_reuses_its_literal(self):
         x, y = sympy.symbols("x y", integer=True)
         model = cp_model.CpModel()

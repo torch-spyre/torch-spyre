@@ -648,7 +648,6 @@ class _SympyExprToCpSat(Printer):
         # would retain every converter and its CP model across compilations.
         self._expr_cache: dict = {}
         self._untabled_expr_cache: dict = {}
-        self._condition_cache: dict = {}
         self._conjunction_cache: dict = {}
         self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
@@ -1115,6 +1114,10 @@ class _SympyExprToCpSat(Printer):
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
             return a * b
+        if isinstance(a, cp_model_helper.NotBooleanVariable):
+            return b - self._print_multiply_two(a.Not(), b)
+        if isinstance(b, cp_model_helper.NotBooleanVariable):
+            return self._print_multiply_two(b, a)
         if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
             return self._print_multiply([a, b])
         if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
@@ -1144,7 +1147,9 @@ class _SympyExprToCpSat(Printer):
         elif len(ints) == 0:
             return math.prod(nonints)
 
-        name = "_product_" + "_".join([arg.name for arg in ints])
+        # Names need not be unique: in particular, both Boolean constants
+        # have an empty name. Cache by the variables' actual model identity.
+        name = "_product_" + "_".join(str(arg.index) for arg in ints)
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
@@ -1284,17 +1289,12 @@ class _SympyExprToCpSat(Printer):
 
     @memoize_method
     def _print_condition(self, cond):
-        if cond in self._condition_cache:
-            return self._condition_cache[cond]
         cond_expr = self._print(cond)
         if isinstance(cond_expr, (cp_model.IntVar, cp_model_helper.NotBooleanVariable)):
-            self._condition_cache[cond] = cond_expr
             return cond_expr
         if isinstance(cond_expr, (bool, int)):
             # Fixed divisions turn many symbolic predicates into constants.
-            var = self._model.new_constant(int(cond_expr))
-            self._condition_cache[cond] = var
-            return var
+            return self._model.new_constant(int(cond_expr))
         if not isinstance(cond, sympy.core.relational.Relational):
             return cond_expr
         not_cond_expr = self._print(sympy.Not(cond))
@@ -1302,7 +1302,6 @@ class _SympyExprToCpSat(Printer):
         self._count += 1
         self._model.Add(cond_expr).OnlyEnforceIf(var)
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
-        self._condition_cache[cond] = var
         return var
 
     def _conjunction(self, lits):
