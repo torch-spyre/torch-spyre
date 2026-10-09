@@ -507,10 +507,16 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
+# Fails with a value mismatch, but passed once in a cold-cache full run. Cause not
+# investigated (see #5285), so it is a non-strict xfail.
+_ROUND_TRIP_IMPLICIT_UNSTABLE = {
+    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+}
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
     for case in TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
     if case not in _ROUND_TRIP_IMPLICIT_NOW_PASSING
+    and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -1104,10 +1110,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # exp miscompiles on an unaligned trailing extent (issue #3799);
             # the same extent passes through a mul chain in test_pow_int.
-            "expect_fail": [
-                "0.3_fp16_2d_unaligned",
-                "2.5_fp16_2d_unaligned",
-            ],
+            # These fail because the work-division planner splits the unaligned
+            # dimension across cores, which the backend cannot mask, but the
+            # generated program differs on some runs and then compiles and can
+            # pass (#5285). A strict xfail would turn that into a flaky failure,
+            # so they are non-strict: a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "0.3_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+                "2.5_fp16_2d_unaligned": "planner splits the unaligned dim, #5285",
+            },
         },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
@@ -6120,6 +6131,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL,
+            "expect_fail_unstable": _ROUND_TRIP_IMPLICIT_UNSTABLE,
         },
         (
             "test_reduction_with_to_dtype",

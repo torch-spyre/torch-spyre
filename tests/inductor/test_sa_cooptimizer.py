@@ -36,6 +36,7 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from unittest import TestCase
 
 import sympy
@@ -48,6 +49,10 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
+    _GeneratedDivisions,
+    _TableRelation,
+    _ViewRelation,
+    _one_axis_apart,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
@@ -62,6 +67,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     TileSpec,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
+from utils_inductor import mock_op_split_space
 
 
 def _seed_footprint(buffers):
@@ -490,6 +496,46 @@ class DeterminismTest(TestCase):
                 )
 
 
+class GoldenSolveTest(TestCase):
+    """Two synthetic solves pinned to recorded results.
+
+    The determinism tests check only that the code agrees with itself; this
+    catches a change in what the search returns. Re-record it when a change to
+    the search is deliberate."""
+
+    # (case, capacity as a fraction of the seed footprint) ->
+    # (chosen_division per buffer, address per buffer, best_score)
+    _GOLDEN = {
+        ("multi_region", 4): (
+            [1, 1, 1, 0, 0, 0, 1, 1, 1],
+            [0, 65536, None, 0, 65536, None, 0, 32768, 65536],
+            1280000,
+        ),
+        ("k_split_consumers", 2): (
+            [0, 0, 1, 0, 0],
+            [None, 0, 65536, 98304, 0],
+            640000,
+        ),
+    }
+
+    def test_solves_match_the_recorded_results(self):
+        graphs = synthetic_graphs()
+        for (case, fraction), expected in self._GOLDEN.items():
+            buffers = copy.deepcopy(graphs[case][0].buffers)
+            cap = _seed_footprint(buffers) // fraction
+            solver = SaCoOptimizingSolver(buffers, cap, 128)
+            out = solver.plan_layout_and_core_divisions()
+            self.assertEqual(
+                (
+                    [b.chosen_division for b in out],
+                    [b.address for b in out],
+                    solver.best_score,
+                ),
+                expected,
+                f"{case} cap=1/{fraction}",
+            )
+
+
 class ImprovementSmokeTest(TestCase):
     """At a tight capacity the search should usually *improve* on the seed for at
     least one captured graph -- evidence the moves actually do something, beyond
@@ -513,11 +559,11 @@ def _div(partition):
     return CoreDivision(splits=({1: partition} if partition > 1 else {}))
 
 
-def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
-    """A minimal buffer with a 3-entry menu (index 0 trivial, 1 split-2, 2
-    split-4) and the given parent-compatibility pairs. ``size`` / ``uses`` are
-    overridable for the fixtures that need layout pressure (the flood tests do
-    not care)."""
+def _cdbuf(name, parents, matches, size=1024, uses=(0, 1), divisions=None):
+    """A minimal buffer with the given parent-compatibility pairs and menu, by
+    default a 3-entry one (index 0 trivial, 1 split-2, 2 split-4). ``size`` /
+    ``uses`` are overridable for the fixtures that need layout pressure (the
+    flood tests do not care)."""
     return CoreDivisionBuffer(
         name=name,
         size=size,
@@ -525,7 +571,9 @@ def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
         first_use_is_read=False,
         in_place_parents=[],
         residency_reason=None,
-        core_divisions=[_div(1), _div(2), _div(4)],
+        core_divisions=list(
+            [_div(1), _div(2), _div(4)] if divisions is None else divisions
+        ),
         parents=parents,
         cd_parent_matches=matches,
         boundary=BufferType.Intermediate,
@@ -538,7 +586,7 @@ def _flood(buffers, anchor_name, index):
     solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
     solver._precompute_topology()
     anchor = solver._name_to_idx[anchor_name]
-    result = solver._flood_region(anchor, solver._configs[anchor][index])
+    result = solver._flood_region(anchor, solver._sources[anchor].configs[index])
     return {buffers[i].name: config.menu_index for i, config in result.items()}
 
 
@@ -610,7 +658,7 @@ class RegionRecolorTest(TestCase):
             solver = _primed(copy.deepcopy(buffers), _seed_footprint(buffers))
             for anchor in solver._anchor_candidates:
                 anchored += 1
-                for config in solver._nontrivial_menu[anchor]:
+                for config in solver._sources[anchor].splitting:
                     largest = max(largest, len(solver._flood_region(anchor, config)))
         self.assertGreater(anchored, 0, "no graph offered a splittable anchor")
         self.assertGreater(largest, 1, "every region was a singleton")
@@ -626,7 +674,7 @@ class RegionRecolorTest(TestCase):
             cap = max(1, _seed_footprint(buffers) // 2)
             solver = _primed(copy.deepcopy(buffers), cap)
             for anchor in solver._anchor_candidates:
-                config = solver._nontrivial_menu[anchor][0]
+                config = solver._sources[anchor].splitting[0]
                 assignment = solver._flood_region(anchor, config)
                 solver._apply_recolor(assignment)
                 addresses = solver.packer.addresses
@@ -688,7 +736,7 @@ class SnapshotRestoreTest(TestCase):
     def _mutate(self, solver):
         """A division change (resize + eligibility ripple) plus a reinsertion --
         between them they move addresses, quality and ``chosen``."""
-        solver._atomic_flip(2, solver._configs[2][2])
+        solver._atomic_flip(2, solver._sources[2].configs[2])
         solver.packer.rotate(0, 5)
 
     def test_adopt_round_trips_state(self):
@@ -815,7 +863,7 @@ class AllEligibleResidentTest(TestCase):
             for _ in range(50):
                 if solver._rng.random() < 0.5:
                     idx = solver._rng.choice(solver._flippable_ops)
-                    configs = solver._configs[idx]
+                    configs = solver._sources[idx].configs
                     solver._atomic_flip(
                         idx, configs[solver._rng.randrange(len(configs))]
                     )
@@ -836,7 +884,7 @@ class AllEligibleResidentTest(TestCase):
         self.assertFalse(solver._eligible(idx))
         before = solver._n_eligible
         snap = solver._snapshot()
-        solver._atomic_flip(idx, solver._configs[idx][1])
+        solver._atomic_flip(idx, solver._sources[idx].configs[1])
         self.assertTrue(solver._eligible(idx))
         self.assertFalse(solver._eligible(solver._name_to_idx["B6"]))
         self.assertEqual(solver._n_eligible, before + 1)
@@ -1106,7 +1154,7 @@ class ForeignParentTest(TestCase):
         # The owned edge survives; the unowned one leaves no trace behind.
         self.assertEqual(solver._parents_idx[1], {0})
         self.assertEqual(solver._children_idx[0], [1])
-        self.assertEqual(set(solver._edge_pairs), {(0, 1)})
+        self.assertEqual(set(solver._relations), {(0, 1)})
 
     def test_graph_with_only_unowned_parents_still_solves(self):
         bufs = [
@@ -1182,7 +1230,7 @@ class CostExprScoringTest(TestCase):
         solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
         cost_expr = buffers[0].sym_cores * 10
         solver.plan_layout_and_core_divisions(cost_expr)
-        configs = solver._configs[0]
+        configs = solver._sources[0].configs
         self.assertEqual(
             solver._score_fn([configs[0]], frozenset()), utils.to_fixed_us(10 / 1000)
         )
@@ -1217,7 +1265,7 @@ class CostExprScoringTest(TestCase):
             syms[0] * 10 + syms[1] * 100 + syms[2] * 1000 + 5000 * (1 - buf.sym_is_lx)
         )
         solver.plan_layout_and_core_divisions(cost_expr)
-        split_4x2 = [solver._configs[0][2]]
+        split_4x2 = [solver._sources[0].configs[2]]
         self.assertEqual(
             solver._score_fn(split_4x2, frozenset()),
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000 + 5000) / 1000),
@@ -1257,7 +1305,7 @@ class CanonicalKeyTest(TestCase):
 
     def test_the_key_is_derived_not_supplied(self):
         # The constructor takes no key, so a config's key cannot disagree with
-        # the division it identifies -- what dedup and memoization rest on.
+        # the config it identifies -- what dedup and memoization rest on.
         division = CoreDivision(splits={0: 4, 1: 2}, reduction_syms=frozenset([1]))
         self.assertEqual(DivisionConfig(division, 0).key, _canonical_key(division))
 
@@ -1327,14 +1375,268 @@ class ConfigStateTest(TestCase):
                     f"{case}[{gi}] {buf.name}",
                 )
 
-    def test_a_menu_may_carry_the_same_choice_twice(self):
-        # Real menus do (see DivisionConfig); nothing here collapses them.
+    def test_a_repeated_split_map_stays_a_menu_entry_of_its_own(self):
+        # A menu that carries one split map twice is a clone's: its entries are
+        # synthesized one per consumer, out of that consumer's own iteration
+        # symbols, and deduplicated by physical partition -- and Inductor's
+        # symbols are positional, so two consumers indexing the buffer
+        # differently can commit the same map. Both entries are choices.
         buf = _cdbuf("A", [], {})
         buf.core_divisions = [_div(1), _div(2), _div(2)]
         solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
         solver._precompute_topology()
-        configs = solver._configs[0]
-        self.assertEqual(len(configs), 3)
-        self.assertEqual(configs[1], configs[2])
-        self.assertNotEqual(configs[1].menu_index, configs[2].menu_index)
-        self.assertEqual(len(solver._nontrivial_menu[0]), 2)
+        configs = solver._sources[0].configs
+        self.assertEqual([config.menu_index for config in configs], [0, 1, 2])
+        self.assertEqual(len({config.key for config in configs}), 3)
+        # The split map is still the identity of the position that owns it, so a
+        # generated config, which is keyed by one, meets the entry it names.
+        self.assertEqual(configs[1].key, _canonical_key(configs[1].division))
+        self.assertEqual(solver._menu_position(0, configs[2]), 2)
+
+
+def _axis_div(**factors):
+    """A division over the two named axes ``d0`` / ``d1``, factor 1 dropped."""
+    axes = {"d0": _AXIS_0, "d1": _AXIS_1}
+    return CoreDivision(splits={axes[name]: f for name, f in factors.items() if f > 1})
+
+
+_AXIS_0 = sympy.Symbol("d0", integer=True, positive=True)
+_AXIS_1 = sympy.Symbol("d1", integer=True, positive=True)
+# The cross product over two axes, as an enumeration would emit it.
+_TWO_AXIS_MENU = [
+    _axis_div(d0=first, d1=second) for first in (1, 2, 4) for second in (1, 2)
+]
+
+
+def _two_axis_space(legal=None):
+    return mock_op_split_space(
+        {_AXIS_0: [1, 2, 4], _AXIS_1: [1, 2]}, {_AXIS_0, _AXIS_1}, legal=legal
+    )
+
+
+class DivisionSourceTest(TestCase):
+    """Where a buffer's candidate divisions come from, and what one move
+    reaches: the two sources have to answer alike, since which one a buffer
+    gets is the allocator's choice and not the search's."""
+
+    def test_both_sources_offer_the_same_one_axis_moves(self):
+        menu = _primed(
+            [_cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )._sources[0]
+        generated = _GeneratedDivisions(_two_axis_space(), menu.seed())
+        for config in menu.configs:
+            self.assertEqual(
+                {c.key for c in generated.neighbours(config)},
+                {c.key for c in menu.neighbours(config)},
+                config.division.label,
+            )
+        # Non-vacuity: a move alphabet reaching the whole menu from anywhere
+        # would not be a one-axis one.
+        self.assertLess(len(menu.neighbours(menu.seed())), len(_TWO_AXIS_MENU) - 1)
+
+    def test_one_axis_apart_counts_the_dropped_factor_of_one(self):
+        # ``{d0: 2}`` and ``{d0: 2, d1: 2}`` differ in one axis even though one
+        # map has an entry the other has not.
+        self.assertTrue(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=2, d1=2)))
+        self.assertTrue(_one_axis_apart(_axis_div(), _axis_div(d1=2)))
+        self.assertFalse(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=4, d1=2)))
+        self.assertFalse(_one_axis_apart(_axis_div(d0=2), _axis_div(d0=2)))
+
+    def test_a_source_with_nothing_to_offer_is_filtered_out_statically(self):
+        pinned = _cdbuf("A", [], {}, divisions=[_axis_div()])
+        solver = _primed(
+            [pinned, _cdbuf("B", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )
+        self.assertEqual(solver._flippable(), [1])
+        self.assertEqual(solver._anchor_candidates, [1])
+        # And the generated side agrees: a single-factor domain cannot move.
+        frozen = _GeneratedDivisions(
+            mock_op_split_space({_AXIS_0: [1]}, {_AXIS_0}), solver._sources[0].seed()
+        )
+        self.assertFalse(frozen.can_move())
+        self.assertFalse(frozen.can_split())
+        self.assertTrue(
+            _GeneratedDivisions(
+                _two_axis_space(), solver._sources[1].seed()
+            ).can_split()
+        )
+
+    def test_a_recolor_anchor_splits_and_reaches_past_one_axis(self):
+        """Recolor is the long-range move: its anchor is drawn from the whole
+        space, not from the one-axis neighbours a flip takes."""
+        menu = _primed(
+            [_cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)], 1 << 30
+        )._sources[0]
+        generated = _GeneratedDivisions(_two_axis_space(), menu.seed())
+        rng = rnd.Random(0)
+        for source in (menu, generated):
+            drawn = [source.anchor(source.seed(), rng) for _ in range(60)]
+            labels = {c.division.label for c in drawn if c is not None}
+            self.assertNotIn(_axis_div().label, labels, "an anchor never unsplits")
+            # Both scales are reachable from the unsplit seed: one axis-step,
+            # and a division two axis-steps away that no flip could reach.
+            self.assertIn(_axis_div(d0=2).label, labels)
+            self.assertIn(_axis_div(d0=4, d1=2).label, labels)
+        # A generated draw that comes out unsplit is a no-op step, not an
+        # unsplitting anchor.
+        self.assertTrue(
+            any(generated.anchor(generated.seed(), rng) is None for _ in range(60))
+        )
+        # An op with no splitting division to draw offers no anchor.
+        frozen = _primed([_cdbuf("A", [], {}, divisions=[_axis_div()])], 1 << 30)
+        self.assertIsNone(frozen._sources[0].anchor(frozen.chosen[0], rng))
+
+
+class GeneratedWriteBackTest(TestCase):
+    """A generated division carries no menu position, so the write-back is
+    where it is given one -- the allocator's contract, unchanged."""
+
+    def test_a_generated_choice_the_menu_carries_resolves_to_its_position(self):
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space()
+        solver = _primed([buf], 1 << 30)
+        source = solver._sources[0]
+        self.assertIsInstance(source, _GeneratedDivisions)
+        config = source.config_for(_axis_div(d0=4, d1=2))
+        self.assertIsNone(config.menu_index)
+        solver.chosen = [config]
+        solver._write_back()
+        self.assertEqual(len(buf.core_divisions), len(_TWO_AXIS_MENU))
+        self.assertEqual(
+            buf.core_divisions[buf.chosen_division].label,
+            _axis_div(d0=4, d1=2).label,
+        )
+
+    def test_a_division_the_menu_does_not_carry_is_registered(self):
+        # What a truncated menu leaves.
+        buf = _cdbuf("A", [], {}, divisions=[_axis_div(), _axis_div(d0=2)])
+        buf.division_space = _two_axis_space()
+        solver = _primed([buf], 1 << 30)
+        config = solver._sources[0].config_for(_axis_div(d0=4, d1=2))
+        solver.chosen = [config]
+        solver._write_back()
+        self.assertEqual(buf.chosen_division, 2)
+        self.assertEqual(buf.core_divisions[2].label, _axis_div(d0=4, d1=2).label)
+
+
+class EdgeRelationTest(TestCase):
+    """The edge relation the residency gate and the recolor flood ask."""
+
+    @staticmethod
+    def _pair_graph(matches, spaces=False, edge=None):
+        parent = _cdbuf("P", [], {}, divisions=_TWO_AXIS_MENU)
+        child = _cdbuf("C", ["P"], {"P": matches}, divisions=_TWO_AXIS_MENU)
+        if spaces:
+            parent.division_space = _two_axis_space()
+            child.division_space = _two_axis_space()
+        if edge is not None:
+            child.residency_edges = {"P": edge}
+        return _primed([parent, child], 1 << 30)
+
+    def test_a_pair_does_not_spread_across_a_repeated_split_map(self):
+        # Two menu entries carrying one split map are two entries -- a clone's
+        # are synthesized per consumer, so a shared map is not a shared slicing.
+        # The projection is onto keys and keeps no position, so it has to keep
+        # the two apart: a pair naming the later entry must leave the earlier
+        # one incompatible, which is the physical check the pair stands for.
+        divisions = [_axis_div(), _axis_div(d0=2), _axis_div(d0=2)]
+        parent = _cdbuf("P", [], {}, divisions=divisions)
+        child = _cdbuf("C", ["P"], {"P": [(2, 2)]}, divisions=divisions)
+        solver = _primed([parent, child], 1 << 30)
+        relation = solver._relations[(0, 1)]
+        parent_configs = solver._sources[0].configs
+        self.assertEqual(len(parent_configs), 3, "the repeated entries merged")
+        checked, unchecked = parent_configs[2], parent_configs[1]
+        child_checked = solver._sources[1].configs[2]
+        self.assertNotEqual(checked, unchecked)
+        self.assertTrue(relation.compatible(checked, child_checked))
+        self.assertFalse(relation.compatible(unchecked, child_checked))
+        self.assertEqual(relation.child_for(checked), child_checked)
+        self.assertIsNone(relation.child_for(unchecked))
+
+    def test_the_table_serves_a_generated_config(self):
+        """The reason a graph where only some ops generate is not a mixture of
+        two answers: a generated division is one the enumeration would have
+        carried, so the table knows its key."""
+        solver = self._pair_graph([(1, 1)])
+        relation = solver._relations[(0, 1)]
+        generated = _GeneratedDivisions(
+            _two_axis_space(), solver._sources[0].seed()
+        ).config_for(_TWO_AXIS_MENU[1])
+        self.assertIsNone(generated.menu_index)
+        self.assertTrue(relation.compatible(generated, solver._sources[1].configs[1]))
+
+    def test_the_view_relation_is_taken_only_where_both_ends_generate(self):
+        edge = mock.MagicMock()
+        self.assertIsInstance(
+            self._pair_graph([], spaces=True, edge=edge)._relations[(0, 1)],
+            _ViewRelation,
+        )
+        for kwargs in ({"spaces": True}, {"edge": edge}, {}):
+            self.assertIsInstance(
+                self._pair_graph([], **kwargs)._relations[(0, 1)],
+                _TableRelation,
+            )
+
+    def test_the_view_relation_asks_the_edge_once_per_choice(self):
+        parent_source = _GeneratedDivisions(
+            _two_axis_space(), _config(_axis_div(), menu_index=0)
+        )
+        child_source = _GeneratedDivisions(
+            _two_axis_space(), _config(_axis_div(), menu_index=0)
+        )
+        edge = mock.MagicMock()
+        edge.consumer_division_for.return_value = _axis_div(d0=2)
+        edge.parent_division_for.return_value = None
+        edge.compatible.return_value = True
+        relation = _ViewRelation(edge, parent_source, child_source)
+        parent = parent_source.config_for(_axis_div(d0=2))
+        for _ in range(3):
+            child = relation.child_for(parent)
+            self.assertTrue(relation.compatible(parent, child))
+            self.assertIsNone(relation.parent_for(parent))
+        self.assertEqual(child.division.label, _axis_div(d0=2).label)
+        self.assertIsNone(child.menu_index)
+        self.assertEqual(edge.consumer_division_for.call_count, 1)
+        self.assertEqual(edge.parent_division_for.call_count, 1)
+        self.assertEqual(edge.compatible.call_count, 1)
+
+
+class MoveAlphabetTest(TestCase):
+    """A flip proposes one axis's factor, one step."""
+
+    def test_a_flip_lands_on_a_one_axis_neighbour(self):
+        solver = _primed(
+            [
+                _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU),
+                _cdbuf("B", [], {}, divisions=_TWO_AXIS_MENU),
+            ],
+            1 << 30,
+        )
+        seen = set()
+        for _ in range(40):
+            before = list(solver.chosen)
+            solver._execute_move("flip")
+            moved = [i for i in range(2) if solver.chosen[i].key != before[i].key]
+            self.assertLessEqual(len(moved), 1)
+            for i in moved:
+                self.assertTrue(
+                    _one_axis_apart(solver.chosen[i].division, before[i].division),
+                    f"{before[i].division.label} -> {solver.chosen[i].division.label}",
+                )
+                seen.add(solver.chosen[i].key)
+        self.assertGreater(len(seen), 1, "no flip changed a division")
+
+    def test_a_flip_with_no_neighbour_left_is_a_no_op(self):
+        # Legal only at the extremes, so the seed has no one-axis move at all:
+        # the move is skipped rather than made illegal or forced.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(
+            legal=lambda splits: splits[_AXIS_0] * splits[_AXIS_1] in (1, 8)
+        )
+        solver = _primed([buf], 1 << 30)
+        self.assertEqual(solver._flippable_ops, [0])
+        self.assertEqual(solver._sources[0].neighbours(solver.chosen[0]), [])
+        before = list(solver.chosen)
+        solver._execute_move("flip")
+        self.assertEqual(solver.chosen, before)

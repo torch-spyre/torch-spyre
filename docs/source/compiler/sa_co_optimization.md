@@ -14,9 +14,10 @@ allocator and the other solvers, see [Scratchpad Planning](scratchpad_planning.m
 
 `config.layout_solver = "simulated_annealing"` with `co_optimizing_lx_planning` routes to
 `CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver)`. The allocator builds one
-`CoreDivisionBuffer` per graph buffer — carrying the candidate division menu and the
-`cd_parent_matches` compatibility relation — and hands the list to the solver, which mutates it
-in place with a `chosen_division` and an `address`.
+`CoreDivisionBuffer` per graph buffer — carrying the candidate division menu, the
+`cd_parent_matches` compatibility relation, and, where it could derive them, the per-candidate
+machinery that stands in for both (`division_space` and `residency_edges`) — and hands the list to
+the solver, which mutates it in place with a `chosen_division` and an `address`.
 
 It runs as a **pre-scheduling pass**: `V.graph` is live but
 `V.graph.scheduler` is still `None`, so fusion has not happened yet. Anything the engine wants to
@@ -31,10 +32,23 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
 `PermutationBasedLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
-identifying the choice it makes, and the `menu_index` it was enumerated at. The seed is every
+identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
 `clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
+
+### Where the candidates come from
+
+Each buffer gets a `_DivisionSource`, and the engine asks nothing else: the seed, the divisions one
+axis-step away (`neighbours`, what a flip proposes), and a splitting division to flood from
+(`anchor`, what a recolor proposes). A buffer whose producing op has an `OpSplitSpace` *generates*
+those (`_GeneratedDivisions`); the rest read the enumerated menu (`_MenuDivisions`). Each
+producer→consumer edge likewise gets an `_EdgeRelation`, which the residency gate and the recolor
+flood ask: computed per candidate off the buffer's geometry where both ends generate
+(`_ViewRelation`, which inverts the per-core view to construct the other end's division), and the
+`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). The one thing still
+keyed by menu position is the `chosen_division` written back; a generated division the menu does
+not carry is appended to it then.
 
 Three move types:
 
@@ -45,10 +59,15 @@ Three move types:
   score-identical positions that a permutation move usually offers. Its weight drops to 0 while
   every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
   of them already in, only a structural move can still pay.
-* **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
-  ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
-* **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
-  non-trivial (split) anchor config and recolor everything it reaches.
+* **flip** (weight 0.3) — move one buffer one axis-step: change a single axis's split factor to
+  another its domain admits, then ripple, resizing its per-core footprint and refreshing
+  LX-eligibility for it and its parents.
+* **recolor** (weight 0.2) — draw a splitting anchor division, flood the residency relation
+  bidirectionally from it, and recolor everything it reaches.
+
+  This is the search's **long-range** move: an op's legal divisions are not connected by
+  one-axis moves (the core budget blocks a factor going up, a span floor blocks it coming down), so
+  its anchor is drawn from the whole space.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
@@ -62,6 +81,11 @@ A run is **bit-for-bit reproducible**: the RNG is seeded, every domain it draws 
 index-ordered, and the score is an integer fixed-point quantity, so there is no float
 accumulation to reorder.
 
+:::{warning}
+Reproducible is not stable: the trajectory is chaotic, so compare two revisions over several seeds,
+never one.
+:::
+
 ## The objective
 
 **`cost_expr`** is `CoOptimizingAllocator._solve`'s symbolic prediction for the whole graph —
@@ -70,8 +94,8 @@ every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engi
 expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
 symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
-from whether its owning buffer's name is in `resident`, a split symbol's value from
-`chosen[idx].splits`. The compiled formula is evaluated fresh every step; unlike the
+from whether its owning buffer's name is in `resident`, a split symbol's value from the config
+`chosen[idx]` itself. The compiled formula is evaluated fresh every step; unlike the
 `BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
 tracking, and so nothing to invalidate on a rejected move.
 
