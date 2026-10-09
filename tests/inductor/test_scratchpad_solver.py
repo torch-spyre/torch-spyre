@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import sympy
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -1845,6 +1845,92 @@ class TestSympyExprToCpSatPrinter(TestCase):
             for value in range(-2, 3)
         )
         self.assertAlmostEqual(solver.objective_value, float(expected))
+
+    def test_division_tables_preserve_costs_for_every_assignment(self):
+        # Two selectors and a free residency flag exercise single-menu tables,
+        # coupled costs, and predicates that become constant over a whole menu.
+        x, y, z, resident = sympy.symbols(
+            "split_x split_y split_z resident", integer=True
+        )
+        expressions = [
+            1e-6 * x**2 * y + sympy.Min(0.125 * x * y, 3.25),
+            1000 * y / x + 0.25 * sympy.log(x, 2),
+            x * y * z * (1 - resident),
+            # The single-menu table fits, but multiplying its wide integer
+            # by z does not. The original factored terms still fit the bound.
+            sympy.Piecewise((80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)) * z,
+            sympy.Piecewise(
+                (0.25 * x * y, sympy.And(x >= 2, y >= 2)),
+                (1e-6 * x**2, sympy.Or(x <= 1, y <= 1)),
+                (3, True),
+            )
+            * (1 - resident),
+            sympy.Piecewise(
+                (x * resident, sympy.And(x > 0, y > 0, evaluate=False)),
+                (y, True),
+            ),
+        ]
+        model = cp_model.CpModel()
+        selectors = [
+            model.new_int_var(0, n - 1, f"div_{i}") for i, n in enumerate((4, 2))
+        ]
+        wrappers = [types.SimpleNamespace(division=var) for var in selectors]
+        sym_map = {"resident": model.new_bool_var("resident")}
+        buffer_map = {}
+        for name, owner, raw in (
+            ("split_x", 0, [1, 2, 4, 8]),
+            ("split_y", 0, [8, 2, 4, 1]),
+            ("split_z", 1, [1, 3]),
+        ):
+            var = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(selectors[owner], raw, var)
+            sym_map[name] = var
+            buffer_map[name] = wrappers[owner], raw
+        printer = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        conventional = _SympyExprToCpSat(model, dict(sym_map), buffer_map)
+        with mock.patch.object(conventional, "_division_table", return_value=None):
+            expected = [conventional.convert(expr) for expr in expressions]
+        actual = [printer.convert(expr) for expr in expressions]
+        self.assertTrue(printer._untabled_expr_cache)
+        self.assertTrue(
+            any(v.name.startswith("division_cost_") for v in model.proto.variables)
+        )
+        self.assertIsNone(printer._division_table(x * z))
+        for i, j, flag in itertools.product(range(4), range(2), (0, 1)):
+            with self.subTest(division=i, other=j, resident=flag):
+                fixed = model.clone()
+                for var, value in zip((*selectors, sym_map["resident"]), (i, j, flag)):
+                    fixed.add(var == value)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                for new, old in zip(actual, expected):
+                    self.assertAlmostEqual(
+                        solver.float_value(new), solver.float_value(old), places=7
+                    )
+
+    def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
+        x = sympy.Symbol("split_x", integer=True)
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, 2, "division")
+        wrapper = types.SimpleNamespace(division=division)
+        var = model.new_int_var(1, 5, "split_x")
+        model.add_element(division, [1, 3, 5], var)
+        printer = _SympyExprToCpSat(
+            model, {"split_x": var}, {"split_x": (wrapper, [1, 3, 5])}
+        )
+        printer.convert(x**2)
+        count = len(model.proto.variables)
+        printer.convert(0.25 * x**2 + 1.5)
+        self.assertEqual(len(model.proto.variables), count)
+        # The exact integer table would exceed the product bound. Preserve the
+        # original affine expression instead of inventing a rounding scale.
+        wide = [1, 2, _MAX_PRODUCT_BOUND + 3]
+        printer = _SympyExprToCpSat(
+            model, {"split_x": var}, {"split_x": (wrapper, wide)}
+        )
+        self.assertIsNone(printer._division_table(1e-6 * x))
+        self.assertEqual(len(model.proto.variables), count)
 
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
