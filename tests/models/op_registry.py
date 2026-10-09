@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
 from torch.testing._internal.opinfo.core import (  # noqa: F401
     SampleInput,
 )
+
+# Imported both as tests.models.op_registry (v1) and as top-level op_registry (v2).
+try:
+    from .op_numerics import assert_matmul_close, scaled_mm_reference
+except ImportError:
+    from op_numerics import assert_matmul_close, scaled_mm_reference  # type: ignore[no-redef]
 
 
 @dataclass(frozen=True)
@@ -36,12 +42,22 @@ class OpAdapter:
         fn: The actual callable to execute (e.g., torch.mul or a wrapper function)
         is_inplace: Whether this operation modifies tensors in-place
         pre: Optional preprocessing hook to normalize SampleInput before execution
+        arg_arrangements: Optional ElementArrangement name per positional arg
+            (input first) that the tensor must have on the device; None
+            entries, or args past the end, use the default placement
+        reference: Optional CPU reference called with the CPU SampleInput in
+            place of fn; its result is what `compare` receives as reference
+        compare: Optional comparator(ref, got, *, case_name, description)
+            replacing the default atol/rtol comparison
     """
 
     name: str
     fn: Callable[..., Any]
     is_inplace: bool = False
     pre: Optional[Callable[[SampleInput], SampleInput]] = None
+    arg_arrangements: Optional[Tuple[Optional[str], ...]] = None
+    reference: Optional[Callable[..., Any]] = None
+    compare: Optional[Callable[..., None]] = None
 
 
 # -----------------------------
@@ -464,6 +480,14 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
     "torch.Tensor.truediv": OpAdapter("torch.Tensor.truediv", _tensor_truediv),
     "torch._grouped_mm": OpAdapter("torch._grouped_mm", torch._grouped_mm),
+    # The model feeds a STANDARD activation and a QFP8WT KERNEL weight.
+    "torch.ops.aten._scaled_mm": OpAdapter(
+        "torch.ops.aten._scaled_mm",
+        torch.ops.aten._scaled_mm,
+        arg_arrangements=("STANDARD", "QFP8WT"),
+        reference=scaled_mm_reference,
+        compare=assert_matmul_close,
+    ),
     "torch.ops.transformers.grouped_mm_fallback": OpAdapter(
         "torch.ops.transformers.grouped_mm_fallback", _grouped_mm_fallback
     ),
