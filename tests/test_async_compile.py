@@ -60,7 +60,30 @@ def test_single_worker_compiles_inline_without_starting_pool():
     assert task is None
     wait_ready.assert_not_called()
     pool.assert_not_called()
-    compile_backend.assert_called_once_with("sdsc_0", "/tmp/kernel", dict(os.environ))
+    compile_backend.assert_called_once_with(
+        "sdsc_0", "/tmp/kernel", dict(os.environ), 60.0
+    )
+
+
+def test_backend_timeout_is_resolved_in_parent_for_pool_workers():
+    """A runtime config change must reach the pool, whose workers import config
+    fresh and would otherwise see only the env-derived default."""
+    pool = _RecordingPool()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    for configured, expected in ((900.0, 900.0), (0.0, None)):
+        with (
+            torch._inductor.config.patch({"compile_threads": 2}),
+            spyre_config.patch({"backend_compile_timeout_seconds": configured}),
+            patch.object(compiler, "wait_pool_ready"),
+            patch.object(compiler, "use_process_pool", return_value=True),
+            patch.object(compiler, "process_pool", return_value=pool),
+        ):
+            compiler._submit_backend_compile("sdsc_0", "/tmp/kernel")
+
+        fn, args = pool.calls[-1]
+        assert fn is async_compile_mod._run_backend_compiler
+        assert args[3] == expected
 
 
 def test_sdsc_submits_all_backend_jobs_before_wait():

@@ -821,6 +821,10 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS``
+     - Wall-clock limit on one backend-compiler (``dbo-opt``) invocation,
+       on both the SDSC bundle and KTIR paths (default ``60``; ``0``
+       disables the limit)
    * - ``ENABLE_LX_CONTEXT_SWITCHING``
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
