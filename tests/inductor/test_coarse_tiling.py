@@ -101,9 +101,9 @@ from torch_spyre._inductor.wsr.tile_prediction import (
 )
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    CoarseTilingPass,
     _derive_group_idx_offset,
     _derive_hint_id_base,
+    apply_tilings,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
@@ -9700,7 +9700,7 @@ class TestPredictFrameReduction(unittest.TestCase):
         ``reduction_ranges`` -- false as soon as a size-1 reduction dim is
         squeezed away, and the hint then names a symbol the op does not carry,
         so the applier silently tiles nothing. Going through the real lowering
-        is both faithful (it is what ``CoarseTilingPass`` does) and immune to
+        is both faithful (it is what ``apply_tilings`` does) and immune to
         that, and it mirrors ``TestPredictFrame._apply_and_compare``.
         """
         ranges_before = list(op.data.ranges)
@@ -11164,8 +11164,8 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
-class TestCoarseTilingPassEquivalence(unittest.TestCase):
-    """CoarseTilingPass reduces to the hint path.
+class TestApplyTilingsEquivalence(unittest.TestCase):
+    """``apply_tilings`` reduces to the hint path.
 
     Both paths call the same coarse_tile(); the pass just builds its (groups,
     group_idx_offset, dim_hints) inputs from a TileSpec instead of pre-stamped
@@ -11216,13 +11216,16 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_fields = self._loop_fields(ref)
         ref_range = ref.data.ranges[0]
 
-        # CoarseTilingPass: same tiling expressed as a TileSpec.
+        # apply_tilings: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
         self.assertEqual(got.data.ranges[0], Integer(64))
+        # The tile still iterates dim 0, so its one symbol is the one it had.
+        c0 = sympy.Symbol("c0")
+        self.assertEqual(got.symbols_on_tile, {c0: c0})
 
     def test_nested_two_level_matches_hint_path(self):
         ref = _make_hinted_op(
@@ -11235,9 +11238,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_ranges = list(ref.data.ranges)
 
         got = self._bare([256, 128], "op0")
-        CoarseTilingPass(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
-        ).apply_pass(_graph([got]))
+        apply_tilings(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+        )
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
@@ -11246,7 +11249,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
         g = _graph(ops)
-        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        apply_tilings({"op0": spec, "op2": spec}, g)
         hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
         self.assertEqual(hint_ids, [[0], [1]])
         self.assertNotEqual(
@@ -11283,7 +11286,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        CoarseTilingPass({}).apply_pass(g)
+        apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(
@@ -11291,8 +11294,8 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             )
 
 
-class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
-    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+class TestApplyTilingsRegionRefusal(unittest.TestCase):
+    """``apply_tilings`` refuses to tile an op inside a ``for_each_tile`` region.
 
     A region spans every op between the first and last op one outermost loop
     stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
@@ -11359,7 +11362,7 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op0": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
@@ -11369,13 +11372,13 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_tiles_op_after_the_loop(self):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
-        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))

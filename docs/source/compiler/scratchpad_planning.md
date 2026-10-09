@@ -610,7 +610,11 @@ along with its core division. It has no effect with any other solver.
   Ops a `spyre_hint` or `for_each_tile` loop already tiles, every op inside
   a `for_each_tile` region, restickifies and mutations are offered only the
   untiled option. Each tiling gets its own division menu, enumerated on the
-  per-tile frame.
+  per-tile frame. A division may split the tiled dim itself across cores,
+  by a factor that divides one tile's extent: the solve owns the divisions
+  of every op it tiles, so the ops of a nest agree on that split, and a
+  cut's copy op follows its producer's. Ops a hint or a `for_each_tile`
+  loop tiled keep their tiled dims whole.
 - **Matching.** A producer/consumer pair of divisions is compatible when
   the two agree on core ownership and on tile ownership of the buffer they
   share, both taken on the untiled buffer: tile `t` must touch the same
@@ -626,20 +630,40 @@ along with its core division. It has no effect with any other solver.
 - **Loop groups.** Consecutive ops that run the same loop nest (the same
   trip count at each level) share a loop group. The solve requires every
   producer/consumer edge inside a group to be a compatible pair.
-  `CoarseTilingPass` checks each such edge again and starts a new group at a
+  `apply_tilings` checks each such edge again and starts a new group at a
   consumer that does not read its producer tile by tile, which then reads the
   producer's full buffer; a plan from this solve never has one.
+- **Placement under a tiling.** The solve places the graph its tilings
+  produce, not the untiled one. A *cut* is a tiled op whose value must be
+  copied out of its nest, for a consumer outside it or as a graph output:
+  a copy op right after it drains each tile into a full-sized HBM buffer,
+  which the outside consumer reads. The tile itself stays an LX candidate,
+  read by that copy, so a consumer outside the nest does not hold it out
+  of LX and neither does being a graph output. Lifetimes follow the nest:
+  a tile lives until its last reader in the nest, or its copy; an untiled
+  buffer that a tiled op reads is read again on every iteration and lives
+  until that op's nest ends. An in-place handoff from a tiled buffer needs
+  its reader in the same nest. The solver records every buffer a tiling
+  holds past its last use in `lifetime_extensions` (the op it is held
+  through, why, and whether it still resides) and logs each at debug level.
 - **Objective.** The cost expression is not used, since it has no term for
   tile size or loop-group boundaries. The solve ranks plans
-  lexicographically: LX residency, then *cuts* (tiled ops whose value must
-  be copied out of their nest, for a consumer outside it or as a graph
-  output), then parallelism, division shape and, last, the fewest tiles.
-- **Materialize and re-plan.** When the solve picks any tiling,
-  `CoarseTilingPass` applies it and the allocation is solved again over the
-  tiled graph with no tilings offered; that second plan is the one
-  committed. A `SolveError` from the first solve falls back to greedy
-  placement over the untouched graph, and one from the second solve over
-  the tiled graph.
+  lexicographically: HBM traffic, then the number of cuts, then
+  parallelism, division shape and, last, the fewest tiles. Traffic counts
+  what a cut moves whether or not its tile resides: the copy's write of
+  the full buffer and every outside consumer's read of it, plus the tile's
+  own write and the copy's read of it when the tile is spilled.
+- **One solve.** When the solve picks any tiling, `apply_chosen_tilings`
+  applies it, and the core divisions are then committed onto the tiled
+  graph's ops as a second pass: each op takes the division the solve chose
+  for it, and an op the apply added, a cut's copy op, takes the division of
+  the op it drains. Nothing is solved again, and the tiled graph's buffers
+  are not built again to check the plan: it is taken as it stands. A
+  division that splits a dim its tile no longer iterates raises `SolveError`
+  before anything is committed, and a resident buffer whose readers do not
+  agree on how it is sliced fails the ownership check that follows. A
+  `SolveError` from the solve falls back to greedy placement over the
+  untouched graph, and one raised after the apply over the tiled graph.
 
 ### Joint SA co-optimization
 

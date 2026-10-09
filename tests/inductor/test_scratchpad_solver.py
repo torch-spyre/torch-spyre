@@ -29,7 +29,11 @@ import sympy
 from unittest import TestCase
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    ScratchpadAllocator,
+    _lx_planning_size,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -145,7 +149,42 @@ class TestExhaustiveSearchResidency(TestCase):
 
         self.assertIsNone(result["producer"].address)
         self.assertIsNotNone(result["consumer"].address)
-        self.assertEqual(solver.spill_reasons["producer"], "core div mismatch")
+        self.assertEqual(result["producer"].spill_reason, "core div mismatch")
+
+
+class TestAllocatorSpillReasons(TestCase):
+    """The allocator reports spill reasons from the solved buffers alone."""
+
+    def _solve(self, *extra):
+        barred = LifetimeBoundBuffer(
+            "barred", 64, [0, 1], residency_reason="op not allowed"
+        )
+        first = LifetimeBoundBuffer("first", 128, [0, 2])
+        return GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+
+    def test_placement_allocator(self):
+        # "late" is live while "first" fills the scratchpad.
+        allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        graph = types.SimpleNamespace(operations=[])
+        reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            graph, allocation
+        )
+        self.assertEqual(set(reasons), {"barred", "late"})
+        self.assertEqual(reasons["barred"], "op not allowed")
+        self.assertIn("no room on scratchpad", reasons["late"])
+
+    def test_joint_allocator_labels_ops_a_tiling_added(self):
+        allocation = self._solve()
+        operations = [types.SimpleNamespace(name=b.name) for b in allocation]
+        operations.append(types.SimpleNamespace(name="tile_copy", solver_tiled=True))
+        graph = types.SimpleNamespace(operations=operations)
+        reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            graph, allocation
+        )
+        self.assertEqual(
+            reasons,
+            {"barred": "op not allowed", "tile_copy": "added by coarse tiling"},
+        )
 
 
 class TestLxPlanningContract(TestCase):
@@ -396,8 +435,8 @@ class BaseLayoutSolverTests:
 
         self.assertIsNone(result["barred"].address)
         self.assertIsNotNone(result["free"].address)
-        self.assertEqual(self.last_solver.spill_reasons["barred"], reason)
-        self.assertNotIn("free", self.last_solver.spill_reasons)
+        self.assertEqual(result["barred"].spill_reason, reason)
+        self.assertIsNone(result["free"].spill_reason)
 
     def test_barred_in_place_parent_does_not_orphan_its_child(self):
         # A barred parent leaves a dangling in_place_parents name once it is
@@ -1206,7 +1245,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         solver = self.solver_class([leaf], size=256, alignment=1)
         result = solver.plan_layout_and_core_divisions()
         self.assertIsNone(result[0].address)
-        self.assertEqual(solver.spill_reasons["leaf"], "no consumer reads it from LX")
+        self.assertEqual(result[0].spill_reason, "no consumer reads it from LX")
 
     def test_oversized_min_footprint_is_spilled(self):
         # Even the smallest candidate footprint (total/4 = 250) exceeds the
@@ -1368,15 +1407,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         solver = self.solver_class([leaf, big, C], size=200, alignment=1)
         result = {b.name: b for b in solver.plan_layout_and_core_divisions()}
 
-        # All three spill; each carries a reason keyed by buffer name.
+        # All three spill; each carries its reason.
         self.assertIsNone(result["big"].address)
-        self.assertIn("big", solver.spill_reasons)
-        self.assertIn("capacity", solver.spill_reasons["big"])
-        self.assertIn("leaf", solver.spill_reasons)
-        self.assertIn("no consumer", solver.spill_reasons["leaf"])
+        self.assertIn("capacity", result["big"].spill_reason)
+        self.assertIn("no consumer", result["leaf"].spill_reason)
         # A resident buffer gets no spill reason.
-        for name, buf in result.items():
-            self.assertEqual(buf.address is None, name in solver.spill_reasons)
+        for buf in result.values():
+            self.assertEqual(buf.address is None, buf.spill_reason is not None)
 
     def test_balance_prefers_balanced_division(self):
         # verify the solver prefers the balanced core split
@@ -1604,6 +1641,307 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             cd_parent_matches={"c": [(0, 0)]},
         )
         self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
+
+    def _plan(self, buffers, size):
+        return {
+            buf.name: buf
+            for buf in self.solver_class(
+                buffers, size=size, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+
+    @staticmethod
+    def _sink(parent):
+        return CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [99],
+            core_divisions=_whole(),
+            parents=[parent],
+            cd_parent_matches={parent: [(0, 0)]},
+        )
+
+    def test_a_cut_tile_resides_though_its_reader_is_outside_the_nest(self):
+        # p can only be tiled and its reader c only untiled, so c reads p's
+        # copied-out full buffer from HBM and asks nothing of the tile. The
+        # table has no pair for the edge, which once held p out of LX; the
+        # tile is read by its copy op and resides.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p", 128, [0, 1], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+
+    def test_a_cut_tile_takes_the_space_it_resides_in(self):
+        # q is alive across p's write. p's tile (64) and q (64) do not both fit
+        # in 100, and keeping the tile saves more traffic than keeping q: a
+        # spilled tile is written to HBM and read back by its copy. With p
+        # held out of LX, as it once was at a cut, q would have resided.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        q = CoreDivisionBuffer("q", 64, [0, 2], core_divisions=_whole())
+        p = CoreDivisionBuffer(
+            "p", 128, [1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        r = CoreDivisionBuffer(
+            "r",
+            1,
+            [2, 3],
+            core_divisions=_whole(),
+            parents=["q", "p"],
+            cd_parent_matches={"q": [(0, 0)]},
+        )
+        res = self._plan([q, p, r, self._sink("r")], size=100)
+        self.assertIsNotNone(res["p"].address)
+        self.assertIsNone(res["q"].address)
+
+    def test_a_cut_tile_resides_only_as_its_copy_can_read_it(self):
+        # p is a cut, so its copy op is the tile's reader. The copy walks p's
+        # output and has no reduction axis: it reads the tile from LX only
+        # where each core holds a slice of that output. Splitting the
+        # reduction axis as well uses twice the cores, and the solve once took
+        # that division for a tile it had placed in LX, which the tiled graph
+        # then spilled, as no division of the copy could read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out, red = sympy.Symbol("d0"), sympy.Symbol("d1")
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={out: 2}, tiling=spec),
+                CoreDivision(
+                    splits={out: 2, red: 2},
+                    reduction_syms=frozenset({red}),
+                    tiling=spec,
+                ),
+            ],
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+        self.assertEqual(res["p"].chosen_division, 0)
+
+    def test_a_buffer_read_by_a_nest_lives_until_the_nest_ends(self):
+        # w is untiled and read by b, the first op of the nest b, c. Every
+        # iteration of the nest reads w again, so it stays alive through c and
+        # c's copy. Untiled lifetimes end w at b, and then w + b (80) and
+        # b + c (80) both fit in 100; held to the end of the nest, w + b + c
+        # (120) do not, and w is the cheapest of the three to spill.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled = [CoreDivision(tiling=spec)]
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=tiled,
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            80,
+            [2, 3],
+            core_divisions=tiled,
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0)]},
+        )
+        res = self._plan([w, b, c, self._sink("c")], size=100)
+        self.assertIsNone(res["w"].address)
+        self.assertIsNotNone(res["b"].address)
+        self.assertIsNotNone(res["c"].address)
+
+    def test_a_lifetime_a_nest_extends_is_reported(self):
+        # The buffers of the test above. w's last use is b, at op 1, and the
+        # nest b, c ends with c's copy, so w is held through op 2 and that
+        # copy. Neither tile is reported: b ends at its reader c as it would
+        # untiled, and c's is freed by its copy, before the sink would read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled = [CoreDivision(tiling=spec)]
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=tiled,
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            80,
+            [2, 3],
+            core_divisions=tiled,
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0)]},
+        )
+        solver = self.solver_class([w, b, c, self._sink("c")], size=100, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertEqual(set(solver.lifetime_extensions), {"w"})
+        held = solver.lifetime_extensions["w"]
+        self.assertEqual(
+            (held.last_use, held.held_through, held.through_copy), (1, 2, True)
+        )
+        self.assertIn("b reads it", held.cause)
+        self.assertFalse(held.resident)
+
+    def test_a_tile_held_for_its_copy_is_reported(self):
+        # Untiled, a graph output is needed only at its own write, op 0. Tiled,
+        # the copy op that runs right after has to read the tile.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out = CoreDivisionBuffer(
+            "out",
+            128,
+            [0],
+            core_divisions=[CoreDivision(tiling=spec)],
+            boundary=BufferType.Output,
+            residency_reason="no consumer reads it from LX",
+        )
+        solver = self.solver_class([out], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        held = solver.lifetime_extensions["out"]
+        self.assertEqual(
+            (held.last_use, held.held_through, held.through_copy), (0, 0, True)
+        )
+        self.assertIn("copy", held.cause)
+        self.assertTrue(held.resident)
+
+    def test_a_buffer_barred_from_lx_has_no_lifetime_to_report(self):
+        # w is read by the nest b runs, but it may never reside, so the nest
+        # holds nothing of it in LX.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        w = CoreDivisionBuffer(
+            "w", 40, [0, 1], core_divisions=_whole(), residency_reason="op not allowed"
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        solver = self.solver_class([w, b, self._sink("b")], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertNotIn("w", solver.lifetime_extensions)
+
+    def test_a_buffer_its_reader_shuts_out_has_no_lifetime_to_report(self):
+        # The table has no pair for w and its tiled reader b: b walks w slice
+        # by slice, which an untiled w in LX cannot serve. w is out of LX for
+        # that, not for how long the nest would hold it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b", 80, [1, 2], core_divisions=[CoreDivision(tiling=spec)], parents=["w"]
+        )
+        solver = self.solver_class([w, b, self._sink("b")], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertNotIn("w", solver.lifetime_extensions)
+
+    def test_a_tiled_graph_output_resides_as_a_tile(self):
+        # Nothing reads a graph output from LX while it is untiled. Tiled, its
+        # copy op does, so the bar holds only for the untiled candidate.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        reason = "no consumer reads it from LX"
+        tiled_out = CoreDivisionBuffer(
+            "tiled_out",
+            128,
+            [0],
+            core_divisions=[CoreDivision(tiling=spec)],
+            boundary=BufferType.Output,
+            residency_reason=reason,
+        )
+        untiled_out = CoreDivisionBuffer(
+            "untiled_out",
+            128,
+            [1],
+            core_divisions=_whole(),
+            boundary=BufferType.Output,
+            residency_reason=reason,
+        )
+        res = self._plan([tiled_out, untiled_out], size=1 << 20)
+        self.assertIsNotNone(res["tiled_out"].address)
+        self.assertIsNone(res["untiled_out"].address)
+
+    def test_a_cut_is_charged_the_traffic_of_its_copy(self):
+        # Untiled, p (128) does not fit in 100 and spills: one write and c's
+        # read. Tiled, its tile fits -- but c is outside the nest, so the copy
+        # still writes p to HBM and c still reads it from there. Tiling saves
+        # nothing, and with no charge for the copy it would look free.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(), CoreDivision(tiling=spec)],
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            1,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0)]},
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        chosen = res["p"].core_divisions[res["p"].chosen_division]
+        self.assertTrue(chosen.tiling.is_untiled)
+
+    def test_tiling_is_chosen_when_it_keeps_a_chain_resident(self):
+        # Untiled, neither p nor c (128 each) fits in 100. Tiled into one nest,
+        # p's tile hands its slot to c's in place and both reside; only c's
+        # copy and the sink's read reach HBM.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        either = [CoreDivision(), CoreDivision(tiling=spec)]
+        p = CoreDivisionBuffer("p", 128, [0, 1], core_divisions=list(either))
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [1, 2],
+            core_divisions=list(either),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0), (1, 1)]},
+            in_place_parents=["p"],
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        for name in ("p", "c"):
+            chosen = res[name].core_divisions[res[name].chosen_division]
+            self.assertEqual(chosen.tiling, spec, name)
+            self.assertIsNotNone(res[name].address, name)
+        self.assertEqual(res["p"].address, res["c"].address)
+
+    def test_a_skip_connection_is_cut_where_an_untiled_op_splits_the_run(self):
+        # Op order a, b, c: b reads a, and c reads a and b. a and c can only be
+        # tiled and b only untiled, so b splits the run although a feeds c
+        # directly. a is then a cut: b and c both read its full copy from HBM,
+        # and its tile is free once the copy has drained it. LX holds one tile
+        # (64), so a's and c's both reside only because a's does not wait for
+        # c, its last reader in op order.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        a = CoreDivisionBuffer(
+            "a", 128, [0, 1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["a"],
+            residency_reason="keep b out of the choice",
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)]},
+        )
+        res = self._plan([a, b, c, self._sink("c")], size=64)
+        self.assertIsNotNone(res["a"].address)
+        self.assertIsNotNone(res["c"].address)
 
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the
@@ -2125,7 +2463,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([LifetimeBoundBuffer("solo", 40, [0, 1])], 256, 1)
         (buf,) = solver.plan_layout()
         self.assertIsNotNone(buf.address)
-        self.assertNotIn("solo", solver.spill_reasons)
+        self.assertIsNone(buf.spill_reason)
 
     def test_spilled_buffer_records_reason(self):
         # A buffer larger than capacity is pinned out up front and carries the
@@ -2135,9 +2473,9 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([small, huge], 256, 1)
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["huge"].address)
-        self.assertIn("capacity", solver.spill_reasons["huge"])
+        self.assertIn("capacity", result["huge"].spill_reason)
         self.assertIsNotNone(result["small"].address)
-        self.assertNotIn("small", solver.spill_reasons)
+        self.assertIsNone(result["small"].spill_reason)
 
     def test_allocator_residency_reason_is_honoured(self):
         # The allocator's hard bars (e.g. the restickify cross-frame barrier)
@@ -2155,7 +2493,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["barred"].address)
         self.assertEqual(
-            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
+            result["barred"].spill_reason, "read by restickify (cross-frame barrier)"
         )
         self.assertIsNotNone(result["free"].address)
 
