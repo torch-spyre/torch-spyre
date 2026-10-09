@@ -30,9 +30,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     RelayoutCharge,
+    TileAxis,
+    TileSpec,
     cost_expr_record,
     solved_bindings,
 )
+from torch_spyre._inductor.work_division import OpSplitSpace
+from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
 _CORE = sympy.Symbol("core_id")
 
@@ -84,6 +88,32 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
     # division 1 of P splits axis 0 four ways and leaves axis 1 whole.
     splits = {str(k): b[sym] for k, sym in p.sym_core_divs.items()}
     assert set(splits.values()) == {4, 1}
+
+
+def test_solved_bindings_bind_the_chosen_tiling_per_axis():
+    d0, d1 = sympy.symbols("d0 d1")
+    space = OpSplitSpace(
+        op=None,
+        context=None,
+        output_axes=frozenset({d0, d1}),
+        factor_domains={},
+        tiling=TilingSpace(max_dims=2, output_counts={0: [4], 1: [2]}),
+        axis_by_host_dim={0: d0, 1: d1},
+    )
+    tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+    t = CoreDivisionBuffer(
+        "T",
+        64,
+        [0, 1],
+        core_divisions=[CoreDivision(splits={d1: 2}, tiling=tiling)],
+        division_space=space,
+    )
+    t.address, t.chosen_division = 0, 0
+    tiles = t.sym_tile_counts
+    b = solved_bindings([t])
+    assert b[tiles[d0]] == 4 and b[tiles[d1]] == 1, "d1 is split, not tiled"
+    rec = cost_expr_record(10 * tiles[d0] + tiles[d1], [], [t])
+    assert rec["objective_ns"] == 41.0
 
 
 def test_record_evaluates_every_term_under_the_solved_plan():

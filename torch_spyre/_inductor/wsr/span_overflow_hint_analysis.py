@@ -260,6 +260,8 @@ def _post_tile_layout_for_splits(
             original_layout.device_layout,
             [int(s) for s in original_layout.size],
             [int(s) for s in new_size],
+            old_host_stride=[int(s) for s in original_layout.stride],
+            new_host_stride=[int(s) for s in new_stride],
         )
     except RuntimeError as exc:
         raise Unsupported(

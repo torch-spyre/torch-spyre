@@ -17,13 +17,14 @@
 import contextlib
 import dataclasses
 import functools
-import pytest
 import os
+import random
 import sys
+import pytest
 import torch
 import unittest
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import SimpleNamespace
 from typing import Optional
 
@@ -45,6 +46,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     _spec_within_read_distance,
@@ -64,33 +66,9 @@ except ImportError:
     _HAS_ORTOOLS = False
 
 
-def expected_unimplemented(fn):
-    """Expect a test to fail *only* by reaching an unbuilt part of the feature.
-
-    ``unittest.expectedFailure`` absorbs any exception, so a test written
-    against a gate that does not exist yet would be satisfied by the resulting
-    ``AttributeError`` -- and would stay satisfied after the feature landed
-    wrong.  This narrows the expectation to one declared cause and fails the
-    test on anything else, including a clean pass (the signal to delete the
-    marker).
-
-    Because it is imperative rather than a pytest mark, ``-m 'not xfail'`` does
-    not deselect these; they still run and still xfail at runtime.
-
-    Nothing here is specific to coarse tiling; it belongs in
-    ``utils_inductor.py`` once a second suite wants it.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        try:
-            fn(self, *args, **kwargs)
-        except NotImplementedError as exc:
-            pytest.xfail(f"not built yet: {exc}")
-        else:
-            self.fail(f"{fn.__name__} passed -- remove @expected_unimplemented")
-
-    return wrapper
+# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
+# (with ``co_optimizing_lx_planning``, on by default).
+_TILING_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
 
 
 # The trip counts of a loop nest, outermost level first.  An op at an outer
@@ -180,6 +158,10 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
+    sa_may_stay_untiled:
+        Why the SA co-optimizer's own objective prices this model untiled, so
+        its *auto* mode is an expected failure rather than a broken search;
+        ``None`` where tiling pays.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -191,6 +173,7 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
+    sa_may_stay_untiled: Optional[str] = None
 
     @property
     def explicit_nest(self) -> _Counts:
@@ -297,13 +280,17 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
+        # Only a joint solver chooses tilings; elsewhere the flag is inert.
+        if auto_tiling and layout_solver not in _TILING_SOLVERS:
+            raise NotImplementedError(f"{layout_solver} does not choose tilings")
+
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # Auto tiling needs the joint CP-SAT co-opt path on (R8.1): the solver
-        # carries and applies the tiling candidates only under
-        # co_optimizing_lx_planning + layout_solver="cpsat". The two gates
-        # default off, so they are patched on only for the auto modes.
+        # Auto tiling needs a joint co-opt path on: the solver carries and
+        # applies the tiling candidates only under co_optimizing_lx_planning,
+        # and only once auto_coarse_tiling is on, which defaults off -- so the
+        # gates are patched on only for the auto modes.
         tiling_cfg = (
             dict(
                 co_optimizing_lx_planning=True,
@@ -383,17 +370,17 @@ class AutomatedCoarseTilingTests(
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
-        if solver == "simulated_annealing":
-            raise NotImplementedError
         cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
+        self._assert_matches_cpu(case, device, cpu)
+        if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
+            pytest.xfail(case.sa_may_stay_untiled)
         self.assertTrue(
             tiling,
             "Auto tiling is on and no loops were written, but no op was "
             "coarse-tiled -- the tile search found nothing to do",
         )
-        self._assert_matches_cpu(case, device, cpu)
 
     def _check_loops_preserved_with_auto(
         self, case: "_TilingCase", solver: str
@@ -484,6 +471,10 @@ class AutomatedCoarseTilingTests(
             explicit_auto_pins=(("S", 2), ("Dout", 2)),
             atol=0.02,
             rtol=0.05,
+            # Tiling buf5 two ways on dim 1 gains nothing in the expression and
+            # adds a 5120 ns copy-out; the SA tiled it only where its anneal
+            # stopped short, and #5103's burst term moved that stop.
+            sa_may_stay_untiled="the SA's objective prices this MLP untiled",
         )
 
     def _swiglu_case(self) -> "_TilingCase":
@@ -574,10 +565,6 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["solver_method"] in ("simulated_annealing") and params[
-            "tiling_mode"
-        ] in ("auto"):
-            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
@@ -1144,3 +1131,130 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
         apply.assert_called_once_with(self._CHOICES)
         self.assertIs(result[0], second_solver)
         self.assertIs(result[1], second_allocation)
+
+
+class _HeldDivisions(sa._GeneratedDivisions):
+    """A buffer's divisions restricted to one tiling, and optionally one split."""
+
+    spec = TileSpec()
+    pinned = False
+
+    def can_move(self) -> bool:
+        return not self.pinned and super().can_move()
+
+    def can_split(self) -> bool:
+        return not self.pinned and super().can_split()
+
+    def retiled(
+        self, config: sa.DivisionConfig, tiling: TileSpec
+    ) -> Optional[sa.DivisionConfig]:
+        return super().retiled(config, tiling) if tiling == self.spec else None
+
+    def _step_moves(self, config: sa.DivisionConfig) -> list[sa.DivisionConfig]:
+        if self.pinned:
+            return []
+        return [c for c in super()._step_moves(config) if c.tiling == self.spec]
+
+    def _draw_tiling(self, rng: random.Random) -> TileSpec:
+        return self.spec
+
+    def anchor(
+        self, config: sa.DivisionConfig, rng: random.Random
+    ) -> Optional[sa.DivisionConfig]:
+        c = None if self.pinned else super().anchor(config, rng)
+        return c if c is None or c.tiling == self.spec else None
+
+
+def _hold_tilings(
+    hold: Mapping[str, tuple[int, Optional[dict[str, int]]]], held: set[str]
+) -> contextlib.ExitStack:
+    """Hold each ``hold`` buffer's tiling (host dim x 2) and optional splits.
+
+    Every other buffer still anneals. The recolor flood assigns configs without
+    asking a source, so it is filtered too. ``held`` collects the buffers held.
+    """
+    build = sa.SaCoOptimizingSolver._build_sources
+    flood = sa.SaCoOptimizingSolver._flood_region
+
+    def build_sources(solver: sa.SaCoOptimizingSolver) -> None:
+        build(solver)
+        for i, (buf, src) in enumerate(zip(solver._bufs, solver._sources)):
+            if not isinstance(src, sa._GeneratedDivisions):
+                continue
+            source = _HeldDivisions(src.space, src.seed_config)
+            if buf.name in hold:
+                host_dim, pin = hold[buf.name]
+                source.spec = TileSpec((TileAxis(host_dim=host_dim, count=2),))
+                splits = {a: (pin or {}).get(str(a), 1) for a in src.space.axes}
+                assert src.space.admits(splits, source.spec), (buf.name, splits)
+                division = src.space.division(splits, source.spec)
+                source.seed_config = src.config_for(division)
+                source.pinned = pin is not None
+                held.add(buf.name)
+            solver._sources[i] = source
+
+    def flood_region(
+        solver: sa.SaCoOptimizingSolver, anchor: int, config: sa.DivisionConfig
+    ) -> dict[int, sa.DivisionConfig]:
+        return {
+            k: v
+            for k, v in flood(solver, anchor, config).items()
+            if v.tiling == solver._sources[k].spec
+        }
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(
+        patch.object(sa.SaCoOptimizingSolver, "_build_sources", build_sources)
+    )
+    stack.enter_context(
+        patch.object(sa.SaCoOptimizingSolver, "_flood_region", flood_region)
+    )
+    return stack
+
+
+class HeldSolverTilingTests(unittest.TestCase):
+    """States the SA co-optimizer can reach, held so the result is deterministic."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        torch.compiler.reset()
+        self.addCleanup(torch.compiler.reset)
+
+    def test_gqa_query_tiled_in_two_groups_and_split_on_kv_heads(self):
+        # buf0 (q transposed to [b, hq, s, d]) and buf1 (q viewed [b, hkv, g, s,
+        # d] times the scale) are tiled on s in two single-op groups, and buf1
+        # is split 8 ways on hkv. buf1 reads buf0's copy-out through a view
+        # traced at full scale; rescaling it again read heads 8*hkv + 2*g.
+        b, s, hq, hkv, d = 1, 64, 32, 8, 128
+
+        def attention(
+            qh: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor
+        ) -> torch.Tensor:
+            q, k, v = (t.transpose(1, 2) for t in (qh, kh, vh))
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, enable_gqa=True
+            )
+            return out.transpose(1, 2).reshape(b, s, hq * d)
+
+        args = [
+            torch.randn(b, s, heads, d, dtype=torch.float16) for heads in (hq, hkv, hkv)
+        ]
+        expected = attention(*(arg.float() for arg in args))
+        held: set[str] = set()
+        with (
+            t_inductor_config.patch(force_disable_caches=True),
+            ts_inductor_config.patch(
+                lx_planning=True,
+                auto_coarse_tiling=True,
+                layout_solver="simulated_annealing",
+                co_optimizing_lx_planning=True,
+            ),
+            _hold_tilings({"buf0": (2, None), "buf1": (3, {"d0": 8})}, held),
+        ):
+            compiled = torch.compile(attention, dynamic=False)
+            actual = compiled(*(arg.to(DEVICE_NAME) for arg in args))
+
+        self.assertEqual(held, {"buf0", "buf1"})
+        actual = actual.to("cpu").float()
+        rel_l2 = float((actual - expected).norm() / expected.norm())
+        self.assertLess(rel_l2, 0.01)  # fp16 lands at 0.003

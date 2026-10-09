@@ -22,13 +22,13 @@ from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import sympy
+from torch._inductor.utils import sympy_index_symbol
 import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
-    FlexibleLayout,
     Pointwise,
     Reduction,
 )
@@ -45,7 +45,6 @@ from torch_spyre._C import (
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
@@ -93,6 +92,8 @@ from torch_spyre._inductor.work_division import (
     span_reduction_pass,
 )
 from torch_spyre._inductor.work_division_constraints import (
+    JOINT_TILING_AND_DIVISION_ATTR,
+    coarse_tile_local_dim_split_domains,
     ConstraintResult,
     WorkDivConstraintContext,
     aligned_ownership_split_domains,
@@ -109,7 +110,7 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-from utils_inductor import mock_op_split_space
+from utils_inductor import fixed_tiled_layout, mock_op_split_space
 
 
 def _isym(name):
@@ -119,22 +120,9 @@ def _isym(name):
     return Symbol(name, integer=True, positive=True)
 
 
-def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
-    """Build the same kind of physical layout used by real Spyre lowering."""
-    size = list(shape)
-    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
-    within_stick_dim = len(size) - 1
-    dim_order = [i for i in range(len(size)) if i != within_stick_dim]
-    dim_order.append(within_stick_dim)
-    device_layout = SpyreTensorLayout(size, stride, dtype, dim_order)
-    if element_arrangement is not None:
-        device_layout = device_layout.with_element_arrangement(element_arrangement)
-    return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
-
-
 def _tensor_dep(name, shape, symbols, element_arrangement=None, dtype=torch.float16):
     """Build a real TensorDep for a contiguous access over ``symbols``."""
-    layout = _fixed_tiled_layout(
+    layout = fixed_tiled_layout(
         shape, dtype=dtype, element_arrangement=element_arrangement
     )
     index = sympy.Integer(0)
@@ -152,7 +140,7 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     else:
         data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
-    layout = _fixed_tiled_layout(shape)
+    layout = fixed_tiled_layout(shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
@@ -383,9 +371,9 @@ class TestEmptyLxEligibility(unittest.TestCase):
         quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
         """
 
-        empty = _fixed_tiled_layout((0, 64))
-        nonempty = _fixed_tiled_layout((64, 64))
-        zero_extent = _fixed_tiled_layout((64, 64))
+        empty = fixed_tiled_layout((0, 64))
+        nonempty = fixed_tiled_layout((64, 64))
+        zero_extent = fixed_tiled_layout((64, 64))
         zero_extent.device_layout = SpyreTensorLayout(
             [1, 0, 64],
             [64, 64, 1],
@@ -460,7 +448,7 @@ class TestAlignedOwnershipSplitDomains(unittest.TestCase):
         output_td = _tensor_dep("repeat", (6, 128), (rows, cols))
         source = TensorDep(
             dep=MemoryDep("x", source_index(rows, cols), (rows, cols), (6, 128)),
-            layout=_fixed_tiled_layout(source_shape),
+            layout=fixed_tiled_layout(source_shape),
         )
         ctx = _make_context(
             op,
@@ -506,7 +494,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
             (96, frozenset({1})),
         ):
             with self.subTest(feature_extent=feature_extent):
-                source_layout = _fixed_tiled_layout((2, 8192, feature_extent))
+                source_layout = fixed_tiled_layout((2, 8192, feature_extent))
                 source_dep = MemoryDep(
                     "source",
                     8192 * feature_extent * head + feature + feature_extent * key,
@@ -536,7 +524,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
             loop_tiled_dims=[[]],
         )
         output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
-        source_layout = _fixed_tiled_layout((2, 128, 128))
+        source_layout = fixed_tiled_layout((2, 128, 128))
         source_dep = MemoryDep(
             "source",
             128 * 128 * head + feature + 128 * key,
@@ -1110,7 +1098,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         )
         lhs = TensorDep(
             MemoryDep("lhs", 64 * rows + k, (rows, k), (8, 64)),
-            _fixed_tiled_layout(
+            fixed_tiled_layout(
                 (2, 4, 64), element_arrangement=ElementArrangement.FP32_TO_DL16
             ),
         )
@@ -1132,7 +1120,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         # Matching physical row order must not ban a one-core matmul.
         ctx.output_td = TensorDep(
             MemoryDep("out", 64 * rows + n, (rows, n), (8, 64)),
-            _fixed_tiled_layout((2, 4, 64)),
+            fixed_tiled_layout((2, 4, 64)),
         )
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
@@ -1241,11 +1229,11 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
                 MemoryDep(
                     "override_input", b * 1024 + m * 128 + n, (b, m, n), (4, 8, 128)
                 ),
-                _fixed_tiled_layout((4, 8, 128)),
+                fixed_tiled_layout((4, 8, 128)),
             ),
-            SchedNodeArg(kernel_dep, _fixed_tiled_layout((4, 128, 8))),
+            SchedNodeArg(kernel_dep, fixed_tiled_layout((4, 128, 8))),
         ]
-        override_layout = _fixed_tiled_layout(
+        override_layout = fixed_tiled_layout(
             (4, 128, 8), element_arrangement=ElementArrangement.QFP8WT
         )
         constrained_var = next(
@@ -2485,7 +2473,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         ops = [storage_op, update_op, reader_op, *after_loop]
         for op in ops:
             op.name = op.get_name()
-            op.layout = _fixed_tiled_layout((8, 64))
+            op.layout = fixed_tiled_layout((8, 64))
         op_by_name = {op.name: op for op in ops}
         graph = MagicMock()
         graph.operations = ops
@@ -3150,6 +3138,250 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             allocator._division_map(graph)
 
+    def test_a_tiling_the_applied_graph_did_not_get_is_refused(self):
+        """A tiled buffer is placed at a footprint the applied graph must have."""
+        spec = TileSpec((TileAxis(0, 4),))
+        buf = CoreDivisionBuffer(
+            name="buf0",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[CoreDivision(tiling=spec)],
+            chosen_division=0,
+        )
+        graph = SimpleNamespace(
+            get_buffer=lambda name: SimpleNamespace(
+                layout=SimpleNamespace(device_layout=object())
+            )
+        )
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        # Priced at 1024 bytes over 1 core x 4 tiles = 256.
+        with patch.object(
+            allocator_module, "get_device_size_in_bytes", return_value=256
+        ):
+            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+        # The graph kept the full extent: the address is spaced for a quarter of
+        # what will be written there.
+        with (
+            patch.object(
+                allocator_module, "get_device_size_in_bytes", return_value=1024
+            ),
+            self.assertRaises(Unsupported) as caught,
+        ):
+            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+        self.assertIn("buf0", str(caught.exception))
+
+
+class _SqueezingTilingPass:
+    """Stands in for ``CoarseTilingPass``: divides each chosen op's ranges, which
+    is the part of the apply that renumbers its iteration symbols."""
+
+    def __init__(self, choices, staged_reads=None):
+        self.choices = choices
+        self.staged_copies = {}
+
+    def apply_pass(self, graph):
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_ranges
+
+        for op in graph.operations:
+            for level in self.choices[op.get_operation_name()].axes:
+                _divide_ranges(op, sympy.Integer(level.count), [level.host_dim])
+
+
+class _ReplacingTilingPass(_SqueezingTilingPass):
+    """Also swaps each op for a new object, as the apply does for an op it
+    redirects to a companion's full buffer (``replace_computed_buffer_body``)."""
+
+    def apply_pass(self, graph):
+        from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
+
+        super().apply_pass(graph)
+        for op in list(graph.operations):
+            replace_computed_buffer_body(
+                op, op.data, graph.operations, pass_name="test"
+            )
+
+
+class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
+    """A tile that shrinks a dim to extent 1 drops that dim's loop symbol and
+    renumbers every later one. The splits the solve chose, keyed by the
+    pre-apply symbols, must still commit on the axes they were chosen for."""
+
+    @contextmanager
+    def _applied(
+        self,
+        sizes,
+        tiling,
+        splits_by_position,
+        floors_by_position=None,
+        tiling_pass=_SqueezingTilingPass,
+    ):
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V, ops
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        strides = [math.prod(sizes[i + 1 :]) for i in range(len(sizes))]
+
+        def inner_fn(index):
+            return ops.load("x", sum(s * i for s, i in zip(strides, index)))
+
+        with V.set_graph_handler(
+            SimpleNamespace(sizevars=SizeVarAllocator(), name_to_buffer={})
+        ):
+            op = ComputedBuffer(
+                name="tiled",
+                layout=FixedLayout(torch.device("cpu"), torch.float16, sizes),
+                data=Pointwise(
+                    device=torch.device("cpu"),
+                    dtype=torch.float16,
+                    inner_fn=inner_fn,
+                    ranges=[sympy.Integer(s) for s in sizes],
+                ),
+            )
+            op.operation_name = op.name
+            op.iteration_space_ownership = None
+            before = list(iteration_space_from_op(op))
+            if floors_by_position:
+                op._work_division_span_min_splits = {
+                    before[p]: f for p, f in floors_by_position.items()
+                }
+            graph = MagicMock(operations=[op])
+            allocation = [
+                CoreDivisionBuffer(
+                    name=op.name,
+                    size=2 * math.prod(sizes),
+                    uses=[0],
+                    core_divisions=[
+                        CoreDivision(
+                            splits={
+                                before[p]: f for p, f in splits_by_position.items()
+                            },
+                            tiling=tiling,
+                        )
+                    ],
+                    chosen_division=0,
+                )
+            ]
+            allocator = CoOptimizingAllocator(MagicMock(), size=1)
+            with (
+                patch.object(CoOptimizingAllocator, "_solver_chooses_tilings", True),
+                patch(
+                    "torch_spyre._inductor.scratchpad.coarse_tiling.CoarseTilingPass",
+                    tiling_pass,
+                ),
+                patch.object(
+                    allocator_module, "commit_iteration_space_ownership"
+                ) as commit,
+            ):
+                allocator._apply_chosen_tilings(graph, allocation)
+                yield SimpleNamespace(
+                    allocator=allocator,
+                    graph=graph,
+                    allocation=allocation,
+                    op=op,
+                    commit=commit,
+                )
+
+    @staticmethod
+    def _by_extent(op, splits):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        extents = iteration_space_from_op(op)
+        return {int(extents[sym]): factor for sym, factor in splits.items()}
+
+    def _committed(self, applied):
+        applied.allocator._commit_divisions(applied.graph, applied.allocation)
+        (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+        return self._by_extent(applied.op, committed)
+
+    def test_splits_follow_their_axes_past_a_squeezed_dim(self):
+        with self._applied(
+            [4, 64, 256, 128],
+            TileSpec((TileAxis(host_dim=0, count=4),)),
+            {1: 16, 2: 2},
+            floors_by_position={1: 16},
+        ) as applied:
+            # Positionally re-read, these would land 16 on the 256 axis and 2
+            # on the 128 stick axis.
+            self.assertEqual(self._committed(applied), {64: 16, 256: 2})
+            self.assertEqual(
+                self._by_extent(
+                    applied.op,
+                    applied.op._work_division_span_min_splits,
+                ),
+                {64: 16},
+            )
+
+    def test_a_split_on_the_only_other_axis_survives(self):
+        with self._applied(
+            [32, 1024], TileSpec((TileAxis(host_dim=0, count=32),)), {1: 4}
+        ) as applied:
+            self.assertEqual(self._committed(applied), {1024: 4})
+
+    @staticmethod
+    def _minted(name, sizes, source):
+        """A copy op the apply would mint, over ``sizes``, reading ``source``."""
+        from torch._inductor.virtualized import ops
+
+        strides = [math.prod(sizes[i + 1 :]) for i in range(len(sizes))]
+        copy = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(torch.device("cpu"), torch.float16, sizes),
+            data=Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(
+                    source, sum(s * i for s, i in zip(strides, index))
+                ),
+                ranges=[sympy.Integer(s) for s in sizes],
+            ),
+        )
+        copy.operation_name = copy.name
+        return copy
+
+    def test_a_staged_read_copy_takes_its_readers_live_splits(self):
+        with self._applied(
+            [4, 64, 256, 128], TileSpec((TileAxis(host_dim=0, count=4),)), {1: 16}
+        ) as applied:
+            copy = self._minted("coarse_tile_read_copy_x", [1, 64, 256, 128], "x")
+            applied.graph.get_buffer.return_value = applied.op
+            applied.allocator._commit_staged_read_copy_divisions(
+                applied.graph,
+                applied.allocation,
+                [(copy, ("x", "tiled"), {"tiled"})],
+            )
+            (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+            self.assertEqual(self._by_extent(copy, committed), {64: 16})
+
+    def test_the_copy_out_takes_its_tiled_ops_live_splits(self):
+        with self._applied(
+            [4, 64, 256, 128],
+            TileSpec((TileAxis(host_dim=0, count=4),)),
+            {1: 16, 2: 2},
+        ) as applied:
+            copy = self._minted("coarse_tile_copy_tiled", [1, 64, 256, 128], "tiled")
+            applied.graph.operations.append(copy)
+            applied.graph.qualify_name.side_effect = lambda name: name
+            applied.graph.get_buffer.return_value = applied.op
+            applied.allocator._commit_copy_out_divisions(
+                applied.graph, applied.allocation, {"tiled"}
+            )
+            (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+            self.assertEqual(self._by_extent(copy, committed), {64: 16, 256: 2})
+
+    def test_the_live_op_is_marked_as_jointly_tiled(self):
+        with self._applied(
+            [32, 1024],
+            TileSpec((TileAxis(host_dim=0, count=32),)),
+            {1: 4},
+            tiling_pass=_ReplacingTilingPass,
+        ) as applied:
+            (live,) = applied.graph.operations
+            self.assertIsNot(live, applied.op)
+            self.assertTrue(getattr(live, JOINT_TILING_AND_DIVISION_ATTR, False))
+
 
 class TestTopKConstraints(unittest.TestCase):
     def test_topk_uses_minimum_supported_split_domains(self):
@@ -3512,7 +3744,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         shape = (8, 128)  # 128 fp16 elements = 2 sticks, so both dims can split
         self.producer = _computed_buffer(shape, name="p")
         self.consumer = _computed_buffer(shape, name="cons")
-        layout = _fixed_tiled_layout(shape)
+        layout = fixed_tiled_layout(shape)
         self.write_dep = MemoryDep("p", 128 * self.x + self.y, (self.x, self.y), shape)
         self.read_dep = MemoryDep("p", 128 * self.r + self.c, (self.r, self.c), shape)
         consumer_write = MemoryDep(
@@ -3766,7 +3998,7 @@ class TestMultiReadEdgeInversion(unittest.TestCase):
                 reads=list(read_deps),
             ),
         }
-        layout = _fixed_tiled_layout(case.shape)
+        layout = fixed_tiled_layout(case.shape)
         graph = SimpleNamespace(
             _repeat_info={}, get_buffer=lambda name: SimpleNamespace(layout=layout)
         )
@@ -3881,3 +4113,37 @@ class TestMultiReadEdgeInversion(unittest.TestCase):
             )
         )
         self.assertEqual(paired, {"whole", "sy/2"})
+
+
+class TestJointTilingAndDivisionExemption(unittest.TestCase):
+    """``coarse_tile_local_dim_split_domains`` pins a coarse-tile-local dim's
+    core split to 1 because ``work_distribution``/``span_reduction`` divide each
+    op independently. A solver that chose the tiling and the division together
+    is not in that position -- the same ground the user-hint exemption stands on
+    -- so it is exempt, and only it."""
+
+    def _tiled_op(self, marked):
+        op = MagicMock()
+        op.get_name.return_value = "buf0"
+        op.loop_info = SimpleNamespace(
+            loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]]
+        )
+        op.data = SimpleNamespace(ranges=[sympy.Integer(8)])
+        op.dim_hints = []
+        setattr(op, JOINT_TILING_AND_DIVISION_ATTR, marked)
+        return op
+
+    def _pins(self, op):
+        ctx = _make_context(
+            op,
+            output_td=MagicMock(),
+            it_space={sympy_index_symbol("d0"): sympy.Integer(8)},
+        )
+        return coarse_tile_local_dim_split_domains(ctx).allowed_splits
+
+    def test_an_unmarked_tiled_op_is_pinned_to_one(self):
+        pins = self._pins(self._tiled_op(marked=False))
+        self.assertEqual({str(k): sorted(v) for k, v in pins.items()}, {"d0": [1]})
+
+    def test_a_jointly_chosen_op_is_exempt(self):
+        self.assertEqual(self._pins(self._tiled_op(marked=True)), {})

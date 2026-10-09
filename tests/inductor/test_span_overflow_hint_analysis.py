@@ -65,9 +65,12 @@ from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
+from utils_inductor import (  # noqa: E402
+    compare_with_cpu,
+    fixed_tiled_layout,
+    mock_backend_compiler,
+)
 
-from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
@@ -82,7 +85,6 @@ from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _dims_to_hints,
     span_overflow_groups,
 )
-from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scratchpad.allocator import (
     _drop_read_distance_violations,
     _op_read_span_is_evaluable,
@@ -111,23 +113,6 @@ _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
-def _fixed_tiled_layout(shape, dtype=torch.float16):
-    """Build the same kind of physical layout used by real Spyre lowering."""
-    size = list(shape)
-    stride = list(FlexibleLayout.contiguous_strides(size))
-    stride_ints = [int(s) for s in stride]
-    size_ints = [int(s) for s in size]
-    if not size_ints:
-        device_layout = SpyreTensorLayout([], dtype)
-        return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
-
-    within_stick_dim = len(size_ints) - 1
-    dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
-    dim_order.append(within_stick_dim)
-    device_layout = SpyreTensorLayout(size_ints, stride_ints, dtype, dim_order)
-    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
-
-
 def _output_symbols_for_shape(shape):
     if len(shape) == 0:
         return ()
@@ -154,7 +139,7 @@ def _pointwise_op(shape, name="buf0"):
     """Return a real ComputedBuffer with a lightweight Pointwise mock."""
     data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
-    layout = _fixed_tiled_layout(shape)
+    layout = fixed_tiled_layout(shape)
     op = ComputedBuffer(
         name=name,
         layout=layout,
@@ -173,7 +158,7 @@ def _reduction_op(shape, reduction_ranges=(64,), name="buf0", reduction_type="su
     data.ranges = list(shape)
     data.reduction_ranges = list(reduction_ranges)
     data.reduction_type = reduction_type
-    layout = _fixed_tiled_layout(shape)
+    layout = fixed_tiled_layout(shape)
     op = ComputedBuffer(
         name=name,
         layout=layout,
@@ -2280,7 +2265,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (m, k),
             (4_194_304, 64),
         )
-        input_layout = _fixed_tiled_layout((4_194_304, 64))
+        input_layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch(
@@ -2320,7 +2305,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (k, n),
             (65536, 64),
         )
-        input_layout = _fixed_tiled_layout((65536, 64))
+        input_layout = fixed_tiled_layout((65536, 64))
 
         with (
             patch(
@@ -2359,7 +2344,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (b, k),
             (4_194_304, 64),
         )
-        lhs_layout = _fixed_tiled_layout((4_194_304, 64))
+        lhs_layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch(
@@ -2429,7 +2414,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (m, k),
             (4_194_304, 64),
         )
-        lhs_layout = _fixed_tiled_layout((4_194_304, 64))
+        lhs_layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch(
@@ -2493,7 +2478,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (n, k),
             (4_194_304, 64),
         )
-        rhs_layout = _fixed_tiled_layout((4_194_304, 64))
+        rhs_layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch(
@@ -2530,7 +2515,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
-        rhs_layout = _fixed_tiled_layout((65536, 64))
+        rhs_layout = fixed_tiled_layout((65536, 64))
 
         with (
             patch(
@@ -2571,7 +2556,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
-        rhs_layout = _fixed_tiled_layout((65536, 64))
+        rhs_layout = fixed_tiled_layout((65536, 64))
 
         with (
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
@@ -2602,7 +2587,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
-        rhs_layout = _fixed_tiled_layout((65536, 64))
+        rhs_layout = fixed_tiled_layout((65536, 64))
 
         with (
             patch.object(
@@ -3006,10 +2991,10 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         k = sympy.Symbol("k")
         unrelated = MemoryDep("activation", sympy.Symbol("m"), (), ())
-        unrelated_layout = _fixed_tiled_layout((128,))
+        unrelated_layout = fixed_tiled_layout((128,))
         unrelated_layout.size[0] = sympy.Symbol("s0")
         rhs = MemoryDep("rhs", k, (k,), (128,))
-        rhs_layout = _fixed_tiled_layout((128,))
+        rhs_layout = fixed_tiled_layout((128,))
 
         with (
             patch.object(
@@ -3123,7 +3108,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
         )
         b, m, n, k = sympy.symbols("b m n k")
-        layout = _fixed_tiled_layout((1, 16, 64))
+        layout = fixed_tiled_layout((1, 16, 64))
         out_dep = MemoryDep("buf0", m * 64 + n, (b, m, n), (1, 16, 64))
         lhs = MemoryDep("lhs", b * 1024 + k * 16 + m, (b, k, m), (1, 64, 16))
         rhs = MemoryDep("rhs", b * 4096 + k * 64 + n, (b, k, n), (1, 64, 64))
@@ -3145,7 +3130,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         lhs = MemoryDep("lhs", k * 4_194_304 + m, (k, m), (64, 4_194_304))
-        layout = _fixed_tiled_layout((64, 4_194_304, 64))
+        layout = fixed_tiled_layout((64, 4_194_304, 64))
 
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
@@ -3175,7 +3160,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         lhs = MemoryDep("lhs", m * 65536 + k, (m, k), (8192, 65536))
-        layout = _fixed_tiled_layout((8192, 65536))
+        layout = fixed_tiled_layout((8192, 65536))
 
         def inner_stride(
             _device_coords,
@@ -3570,7 +3555,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (k, m),
             (65536, 64),
         )
-        lhs_layout = _fixed_tiled_layout((65536, 64))
+        lhs_layout = fixed_tiled_layout((65536, 64))
 
         with (
             patch(
@@ -3711,7 +3696,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         bad_dep = MemoryDep("bad", bad_sym, (bad_sym,), (16,))
         good_dep = MemoryDep("good", good_sym, (good_sym,), (16,))
         op.get_read_writes.return_value = SimpleNamespace(reads=[bad_dep, good_dep])
-        good_layout = _fixed_tiled_layout((16,))
+        good_layout = fixed_tiled_layout((16,))
 
         def fake_fixed_read_layout(buf):
             if buf == "bad":
@@ -3775,7 +3760,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         k = sympy.Symbol("k")
         rhs_dep = MemoryDep("rhs", k, (k,), (128,))
-        padded_layout = _fixed_tiled_layout((129,))
+        padded_layout = fixed_tiled_layout((129,))
 
         with (
             patch.object(
@@ -3845,7 +3830,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (m, n, k),
             (8192, 256, 64),
         )
-        input_layout = _fixed_tiled_layout((8192, 256, 64))
+        input_layout = fixed_tiled_layout((8192, 256, 64))
 
         with (
             patch(
@@ -3874,7 +3859,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (k, m, n),
             (65536, 4_194_304, 64),
         )
-        input_layout = _fixed_tiled_layout((65536, 4_194_304, 64))
+        input_layout = fixed_tiled_layout((65536, 4_194_304, 64))
 
         with (
             patch(
@@ -3919,8 +3904,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             return_value={b: 0, m: 1, n: 2},
         ):
             input_deps = [
-                (dep0, _fixed_tiled_layout((64, 16))),
-                (dep1, _fixed_tiled_layout((64, 64))),
+                (dep0, fixed_tiled_layout((64, 16))),
+                (dep1, fixed_tiled_layout((64, 64))),
             ]
             symbol_to_dim = _bmm_output_symbol_to_dim(
                 op,
@@ -3940,7 +3925,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (k, n, m),
             (64, 64, 8192),
         )
-        input_layout = _fixed_tiled_layout((64, 64, 8192))
+        input_layout = fixed_tiled_layout((64, 64, 8192))
 
         with (
             patch(
@@ -3975,7 +3960,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (k, m, n),
             (64, 8192, 8192),
         )
-        input_layout = _fixed_tiled_layout((64, 8192))
+        input_layout = fixed_tiled_layout((64, 8192))
 
         with (
             patch(
@@ -4177,7 +4162,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         op = _reduction_op((4_194_304,), reduction_ranges=(64,))
         m, k = sympy.symbols("m k")
         dep = MemoryDep("arg0", m * 64 + k, (m, k), (4_194_304, 64))
-        layout = _fixed_tiled_layout((4_194_304, 64))
+        layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
@@ -4207,7 +4192,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             (k0, k1, n),
             (8192, 8192, 64),
         )
-        layout = _fixed_tiled_layout((8192, 8192, 64))
+        layout = fixed_tiled_layout((8192, 8192, 64))
 
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
@@ -4235,7 +4220,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         m, k = sympy.symbols("m k")
         dep0 = MemoryDep("arg0", m * 64 + k, (m, k), (4_194_304, 64))
         dep1 = MemoryDep("arg1", m * 64 + k, (m, k), (4_194_304, 64))
-        layout = _fixed_tiled_layout((4_194_304, 64))
+        layout = fixed_tiled_layout((4_194_304, 64))
 
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
@@ -4253,7 +4238,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         op = _reduction_op((4_194_304,), reduction_ranges=(64,))
         m, k = sympy.symbols("m k")
         dep = MemoryDep("bias", k, (k,), (64,))
-        layout = _fixed_tiled_layout((64,))
+        layout = fixed_tiled_layout((64,))
 
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
@@ -4381,7 +4366,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             (k, n, m),
             (64, 64, 8192),
         )
-        layout = _fixed_tiled_layout((64, 64, 8192))
+        layout = fixed_tiled_layout((64, 64, 8192))
 
         with (
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
@@ -4901,8 +4886,8 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             symbol_to_dim = _bmm_output_symbol_to_dim(
                 op,
                 [
-                    (dep0, _fixed_tiled_layout((64, 16))),
-                    (dep1, _fixed_tiled_layout((64, 64))),
+                    (dep0, fixed_tiled_layout((64, 16))),
+                    (dep1, fixed_tiled_layout((64, 64))),
                 ],
             )
 
@@ -4938,7 +4923,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             reduction_ranges[0],
         )
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (real_extent, 64))
-        rhs_layout = _fixed_tiled_layout((real_extent, 64))
+        rhs_layout = fixed_tiled_layout((real_extent, 64))
         return op, (b, m, n, k), rhs_dep, rhs_layout
 
     def _plan_with_reduction_dim_overflow(
@@ -5110,7 +5095,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         op = _reduction_op((20,), reduction_ranges=(65536,), reduction_type="sum")
         m, k = sympy.symbols("m k")
         dep = MemoryDep("arg0", m * 65536 + k, (m, k), (20, 65536))
-        layout = _fixed_tiled_layout((20, 65536))
+        layout = fixed_tiled_layout((20, 65536))
         with (
             patch.object(soha, "MAX_SPAN_BYTES", 1024),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
@@ -5266,7 +5251,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         op = _reduction_op((4_194_304,), reduction_ranges=(64,), reduction_type="sum")
         m, k = sympy.symbols("m k")
         dep = MemoryDep("arg0", m * 64 + k, (m, k), (4_194_304, 64))
-        layout = _fixed_tiled_layout((4_194_304, 64))
+        layout = fixed_tiled_layout((4_194_304, 64))
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
@@ -5297,7 +5282,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         int_data.reduction_type = "min"
         int_op = ComputedBuffer(
             name="buf0",
-            layout=_fixed_tiled_layout((64,), dtype=torch.int32),
+            layout=fixed_tiled_layout((64,), dtype=torch.int32),
             data=int_data,
         )
         self.assertFalse(soha._supports_reduction_range_tiling(int_op))
@@ -5319,12 +5304,12 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         int_data.reduction_type = "min"
         op = ComputedBuffer(
             name="buf0",
-            layout=_fixed_tiled_layout((1, 1, 64), dtype=torch.int32),
+            layout=fixed_tiled_layout((1, 1, 64), dtype=torch.int32),
             data=int_data,
         )
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
-        rhs_layout = _fixed_tiled_layout((65536, 64), dtype=torch.int32)
+        rhs_layout = fixed_tiled_layout((65536, 64), dtype=torch.int32)
         with (
             patch.object(soha, "MAX_SPAN_BYTES", 5 * 1024 * 1024),
             patch.object(
@@ -5349,7 +5334,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             (k0, m, k1),
             (2, 4096, 64),
         )
-        layout = _fixed_tiled_layout((2, 4096, 64))
+        layout = fixed_tiled_layout((2, 4096, 64))
         with (
             # best case: k0(2) * [m->1, k1->64] * k1_stick(64) * 2 B = 16 KiB;
             # charging m at full 4096 -> ~1 MiB, which this limit would flag.
@@ -5389,7 +5374,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             (k, h, n),
             (65536, 100, 64),
         )
-        rhs_layout = _fixed_tiled_layout((65536, 100, 64))
+        rhs_layout = fixed_tiled_layout((65536, 100, 64))
         with (
             # Tiny on purpose: the old (buggy) estimate for this shape is
             # ~800 MB and would trip any realistic limit; the fix skips the
@@ -5450,7 +5435,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         op = _reduction_op((1, 1, 64), reduction_ranges=(4096,), reduction_type="sum")
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (4096, 64))
-        rhs_layout = _fixed_tiled_layout((4096, 64))
+        rhs_layout = fixed_tiled_layout((4096, 64))
         with (
             patch.object(soha, "MAX_SPAN_BYTES", 4096),
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
@@ -5476,7 +5461,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             (k0, m, k1),
             (8, 65536, 1024),
         )
-        layout = _fixed_tiled_layout((8, 65536, 1024))
+        layout = fixed_tiled_layout((8, 65536, 1024))
         with (
             patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
@@ -5527,7 +5512,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         )
         b, m, n, k = sympy.symbols("b m n k")
         rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
-        rhs_layout = _fixed_tiled_layout((65536, 64))
+        rhs_layout = fixed_tiled_layout((65536, 64))
         with (
             patch.object(soha, "MAX_SPAN_BYTES", 5 * 1024 * 1024),
             patch.object(

@@ -354,15 +354,25 @@ def _resize_device_layout(
             new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
         )
 
-    # Pass 3: update tile-count dims (unmatched_j — all must equal expected tile-count).
+    # Pass 3: update tile-count dims (unmatched_j — all must equal expected
+    # tile-count). Where a non-stick host dim Pass 1 left unmatched has that
+    # size too, the dim may be that host dim's instead, which resizing it as
+    # the tile count would leave at full size: only the stride tells them
+    # apart.
+    expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
+    tc_stride = eps * old_hs[pstar]
     for j in unmatched_j:
-        expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
-        if orig_ds[j] != expected_tc:
+        ambiguous = any(
+            p != pstar and p not in matched_p and old_host_size[p] == orig_ds[j]
+            for p in range(ndim)
+        )
+        if orig_ds[j] != expected_tc or (ambiguous and orig_sm[j] != tc_stride):
             raise RuntimeError(
                 f"_resize_device_layout: device dim {j} "
                 f"(stride_map={orig_sm[j]}, device_size={orig_ds[j]}) was not "
-                f"matched as a non-stick dim and does not equal the expected "
-                f"tile-count {expected_tc} for stick host dim {pstar} "
+                f"matched as a non-stick dim and is not the tile-count dim "
+                f"(size {expected_tc}, stride_map {tc_stride}) of "
+                f"stick host dim {pstar} "
                 f"(old_host_size={old_host_size}) in {orig_stl!r}. "
                 f"This layout is not supported by the device-native reconstruction."
             )

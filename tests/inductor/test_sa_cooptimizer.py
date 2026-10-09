@@ -36,17 +36,18 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest import TestCase
 
 import sympy
 
+from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
-    _MIN_STEPS,
-    _STEPS_PER_BUFFER,
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
@@ -65,13 +66,20 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
 from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
+    CoarseTileReadCopyBuffer,
     CoreDivision,
     CoreDivisionBuffer,
     TileAxis,
     TileSpec,
+    cost_expr_record,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
-from utils_inductor import mock_op_split_space
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    mock_op_split_space,
+    patch_row_major_out_coords,
+)
 
 
 def _seed_footprint(buffers):
@@ -671,7 +679,7 @@ class RegionRecolorTest(TestCase):
         # After a recolor, every op the flood reached carries the flooded config
         # and the placement the packer holds for it reflects that division's
         # footprint
-        # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
+        # -- i.e. the resize ripple in ``_apply_assignment`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
         for case, gi, buffers in _all_cases():
@@ -680,7 +688,7 @@ class RegionRecolorTest(TestCase):
             for anchor in solver._anchor_candidates:
                 config = solver._sources[anchor].splitting[0]
                 assignment = solver._flood_region(anchor, config)
-                solver._apply_recolor(assignment)
+                solver._apply_assignment(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
                 for op, flooded in assignment.items():
@@ -755,28 +763,6 @@ class SnapshotRestoreTest(TestCase):
 
 
 class StepBudgetTest(TestCase):
-    """``clamp(_STEPS_PER_BUFFER * n, _MIN_STEPS, _MAX_STEPS)`` -- the same shape
-    the layout-only annealer's schedule uses, so neither engine grows without
-    bound."""
-
-    @staticmethod
-    def _budget(n):
-        """The budget ``_anneal`` computes for ``n`` buffers."""
-        return min(_MAX_STEPS, max(_MIN_STEPS, _STEPS_PER_BUFFER * n))
-
-    def test_rate_applies_between_the_floor_and_the_ceiling(self):
-        self.assertEqual(self._budget(100), _STEPS_PER_BUFFER * 100)
-
-    def test_floor_applies_to_tiny_graphs(self):
-        self.assertEqual(self._budget(1), _MIN_STEPS)
-
-    def test_ceiling_caps_large_graphs(self):
-        binds_at = _MAX_STEPS // _STEPS_PER_BUFFER
-        self.assertEqual(self._budget(binds_at * 4), _MAX_STEPS)
-        # Inert across the validated corpus: the largest captured graph is n=79,
-        # far below where the ceiling starts binding.
-        self.assertGreater(binds_at, 79)
-
     def test_ceiling_is_higher_than_the_layout_only_annealer(self):
         """The joint engine searches divisions too, so it wants a larger budget
         at the same buffer count (and must not silently inherit the smaller one).
@@ -1279,6 +1265,38 @@ class CostExprScoringTest(TestCase):
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
+    def test_the_tile_count_symbol_drives_the_score(self):
+        # The tiling half of the two tests above: a chosen ``TileSpec`` reaches
+        # the scorer through the per-axis symbol its buffer declares, and an
+        # axis no level cuts values at 1 rather than dropping out.
+        buf = _cdbuf("A", [], {})
+        buf.division_space = _two_axis_space(tiling=_tiling_space({0: [2, 4], 1: [2]}))
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        syms = buf.sym_tile_counts
+        # One per dim the space offers a level on, not one per axis: an axis
+        # nothing can tile carries no decision to price.
+        self.assertEqual(set(syms), {_AXIS_0, _AXIS_1})
+        cost_expr = syms[_AXIS_0] * 10 + syms[_AXIS_1] * 100
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        untiled = _config(CoreDivision(splits={_AXIS_0: 2}))
+        tiled = _config(CoreDivision(splits={_AXIS_0: 2}, tiling=_TILE_4))
+        self.assertEqual(
+            solver._score_fn([untiled], frozenset()),
+            utils.to_fixed_us((10 + 100) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([tiled], frozenset()),
+            utils.to_fixed_us((4 * 10 + 100) / 1000),
+        )
+
+    def test_a_space_without_tilings_declares_no_tile_symbol(self):
+        # Every engine but this one, and this one with auto_coarse_tiling off.
+        plain = _cdbuf("A", [], {})
+        self.assertEqual(plain.sym_tile_counts, {})
+        plain.division_space = _two_axis_space()
+        self.assertEqual(plain.sym_tile_counts, {})
+
     def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
         # A dynamic-shape symbol (or anything else the allocator's build could
         # have left in) that isn't one of these buffers' own symbols must not
@@ -1398,6 +1416,405 @@ class ConfigStateTest(TestCase):
         self.assertEqual(solver._menu_position(0, configs[2]), 2)
 
 
+def _read_copy(source, reader, readers=None, conflicting=(), size=1024, uses=(0, 1)):
+    readers = tuple(readers or (reader,))
+    return CoarseTileReadCopyBuffer(
+        name=f"__spyre_coarse_tile__:read:{source}:{reader}",
+        size=size,
+        uses=list(uses),
+        first_use_is_read=False,
+        in_place_parents=[],
+        residency_reason=None,
+        core_divisions=[CoreDivision()],
+        parents=[],
+        cd_parent_matches={},
+        boundary=BufferType.Intermediate,
+        source=source,
+        reader=reader,
+        readers=readers,
+        conflicting=tuple(conflicting),
+    )
+
+
+def _staging_solver(
+    readers, copies_for, source_position=None, conflicting=(), ops=None, misreads=None
+):
+    """Tileable ``ops`` (default ``readers``) at positions 0.., source ``S``
+    (tileable where it has a position), and one predicted copy per name in
+    ``copies_for``, read by ``readers``. ``misreads`` maps an op to the ops it
+    reads along no tiled dim as written."""
+    bufs = []
+    ops = readers if ops is None else ops
+    for at, name in enumerate(ops):
+        buf = _run_buffer(name, at, _two_axis_space(tiling=_tiling_space()))
+        buf.tile_reads = {
+            parent: mock.Mock(aligned=mock.Mock(return_value=False))
+            for parent in (misreads or {}).get(name, ())
+        }
+        bufs.append(buf)
+    if source_position is None:
+        bufs.append(_cdbuf("S", [], {}, divisions=_TWO_AXIS_MENU))
+    else:
+        bufs.append(
+            _run_buffer("S", source_position, _two_axis_space(tiling=_tiling_space()))
+        )
+    for name in copies_for:
+        bufs.append(_read_copy("S", name, readers=readers, conflicting=conflicting))
+    return _primed(bufs, 1 << 30)
+
+
+def _tile(solver, names, spec):
+    for name in names:
+        solver.chosen[solver._name_to_idx[name]] = _config(
+            CoreDivision({_AXIS_0: 2}, tiling=spec)
+        )
+
+
+class StagedReadCopyTest(TestCase):
+    """A predicted staging copy (``CoarseTileReadCopyBuffer``), sized and gated
+    on its reader's config (``SaCoOptimizingSolver._staged_reads``)."""
+
+    def _solver(self, readers=("R", "B")):
+        return _staging_solver(readers, copies_for=readers[:1])
+
+    def _copy(self, solver, reader):
+        return solver._name_to_idx[f"__spyre_coarse_tile__:read:S:{reader}"]
+
+    def test_it_is_sized_against_the_readers_tiling(self):
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_4))
+        # 1024 bytes over the reader's 2 cores and 4 tiles.
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 128)
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 256)
+
+    def test_an_untiled_reader_leaves_it_absent(self):
+        # Nothing to stage, so the slot is held at zero and ineligible.
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}))
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 0)
+        self.assertFalse(solver._eligible(3))
+
+    def test_a_tiled_group_makes_it_eligible(self):
+        solver = self._solver()
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertTrue(solver._eligible(3))
+
+    def test_the_saving_is_over_the_reads_it_replaces_beyond_the_first(self):
+        # See ``_read_copy_savings``.
+        solver = self._solver(readers=("R", "B", "C"))
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        self.assertEqual(
+            sum(solver._read_copy_savings([None] * 4 + [0]).values()), 2 * 1024
+        )
+        self.assertEqual(sum(solver._read_copy_savings([None] * 5).values()), 0)
+
+    def test_it_carries_no_division_decision(self):
+        # Pinned to one no-op division, so it is in neither move set.
+        solver = self._solver()
+        self.assertNotIn(3, solver._flippable())
+        self.assertNotIn(3, solver._anchor_candidates)
+
+    def test_a_source_tiled_in_another_run_has_no_copy(self):
+        """Pass 3 repoints the copy at such a source's ``full_buf``, which no
+        placed pair names; it is not predicted rather than followed."""
+        solver = _staging_solver(("R", "B"), copies_for=("R",), source_position=3)
+        _tile(solver, ["R", "B"], _TILE_2)
+        _tile(solver, ["S"], _TILE_4)
+        self.assertEqual(solver._staged_reads(3), 0)
+        self.assertFalse(solver._eligible(3))
+        self.assertEqual(sum(solver._read_copy_savings([None] * 3 + [0]).values()), 0)
+
+    def test_a_source_in_the_readers_own_run_has_no_copy(self):
+        # Loop-internal scratch: the apply stages nothing, so nothing is owed.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), source_position=2)
+        _tile(solver, ["R", "B", "S"], _TILE_2)
+        self.assertFalse(solver._eligible(3))
+        self.assertEqual(sum(solver._read_copy_savings([None] * 3 + [0]).values()), 0)
+
+    def test_only_the_groups_first_reader_has_a_copy(self):
+        """The apply mints one copy per read in a group, sized on its first
+        reader, so a later reader's prediction is dead while the group holds
+        an earlier one -- and live once a boundary makes it first."""
+        solver = _staging_solver(("R", "B", "C"), copies_for=("R", "B"))
+        first, second = self._copy(solver, "R"), self._copy(solver, "B")
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        self.assertEqual(solver._staged_reads(first), 3)
+        self.assertFalse(solver._eligible(second))
+        _tile(solver, ["R"], _TILE_4)
+        self.assertFalse(solver._eligible(first))
+        self.assertEqual(solver._staged_reads(second), 2)
+
+    def test_reads_are_counted_over_the_group_not_the_run(self):
+        solver = _staging_solver(("R", "B", "C"), copies_for=("R",))
+        _tile(solver, ["R", "B"], _TILE_2)
+        _tile(solver, ["C"], _TILE_4)
+        placed = [None] * 4 + [0]
+        self.assertEqual(sum(solver._read_copy_savings(placed).values()), 1024)
+
+    def test_reads_are_counted_over_the_applied_group(self):
+        # B misreads R, so the apply puts them in two groups: R reads alone.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), misreads={"B": ["R"]})
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertEqual(solver._staged_reads(3), 0)
+
+    def test_a_group_reading_the_source_another_way_has_no_copy(self):
+        # The apply would stage B's other read as a second copy.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), conflicting=("B",))
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertFalse(solver._eligible(3))
+        _tile(solver, ["B"], _TILE_4)
+        self.assertFalse(solver._eligible(3))  # R alone saves nothing
+
+    def test_a_placed_copy_matches_a_from_scratch_packer(self):
+        """Every buffer a copy's existence depends on ripples to it -- readers,
+        a non-reader between them, an op before them a reader misreads, the
+        source -- through both a flip and a multi-op assignment, so the
+        incremental packer stays equal to one rebuilt from the state, and each
+        copy's span-bounded run walk agrees with the whole graph's."""
+        specs = [None, _TILE_2, _TILE_4]
+
+        def config(spec):
+            if spec is None:
+                return _config(CoreDivision({_AXIS_0: 2}))
+            return _config(CoreDivision({_AXIS_0: 2}, tiling=spec))
+
+        for seed in range(20):
+            rng = rnd.Random(seed)
+            s = _staging_solver(
+                ("R", "B", "C"),
+                copies_for=("R", "B"),
+                source_position=5,
+                conflicting=("C",) if seed % 3 == 0 else (),
+                ops=("X", "R", "M", "B", "C"),
+                misreads={"B": ["X"], **({"C": ["M"]} if seed % 2 else {})},
+            )
+            n = len(s._bufs)
+            positional = [
+                s._name_to_idx[name] for name in ("X", "R", "M", "B", "C", "S")
+            ]
+            for step in range(15):
+                if rng.random() < 0.5:
+                    s._atomic_flip(rng.choice(positional), config(rng.choice(specs)))
+                else:
+                    ops = rng.sample(positional, rng.randint(1, 3))
+                    s._apply_assignment({op: config(rng.choice(specs)) for op in ops})
+                eligible = [s._eligible(i) for i in range(n)]
+                tag = f"seed={seed} step={step}"
+                self.assertEqual(s._n_eligible, sum(eligible), tag)
+                for copy_ in s._read_copy_span:
+                    self.assertEqual(
+                        s._staged_reads(copy_),
+                        s._staged_reads(copy_, list(s._runs())),
+                        tag,
+                    )
+                fresh = make_permutation_packer(
+                    s._lifetime_buffers(
+                        [s._per_core_size(i, s.chosen[i]) for i in range(n)]
+                    ),
+                    list(s.packer.permutation),
+                    s.limit,
+                    s.alignment,
+                    eligible=eligible,
+                )
+                self.assertEqual(list(fresh.addresses), list(s.packer.addresses), tag)
+
+
+def _staging_graph(reads):
+    """A graph whose op ``name`` reads source ``S`` at each offset in
+    ``reads[name]``, in the dict's order, and ``T`` where that list is empty;
+    plus a tileable solver buffer per op at its position and one for ``S``."""
+    load_s, load_t = ir_input_loader("S", [65]), ir_input_loader("T", [65])
+
+    def reader(name, offsets):
+        def inner_fn(index):
+            (i,) = index
+            loads = [load_s([i + off]) for off in offsets] or [load_t([i])]
+            return sum(loads[1:], loads[0])
+
+        return ir_computed_buffer(name, [64], inner_fn)[1]
+
+    operations = [reader(name, offsets) for name, offsets in reads.items()]
+    buffers = [
+        _run_buffer(op.get_name(), at, _two_axis_space(tiling=_tiling_space()))
+        for at, op in enumerate(operations)
+    ]
+    buffers.append(_cdbuf("S", [], {}, divisions=_TWO_AXIS_MENU))
+    return SimpleNamespace(operations=operations), buffers
+
+
+class StagedReadCopyCreditTest(TestCase):
+    """What the score credits for a resident staged copy is bounded by what the
+    objective charges for its source being in HBM, so the score stays
+    non-negative however little the expression prices those reads."""
+
+    def _solver(self, cost_expr):
+        solver = _staging_solver(("R", "B", "C"), ["R"])
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        solver._score_fn = solver._build_score_fn(cost_expr)
+        return solver
+
+    def _credit(self, solver):
+        addresses = [None] * 4 + [0]
+        resident = frozenset({solver._bufs[4].name})
+        base = solver._score_fn(solver.chosen, resident)
+        return solver._read_copy_credit(addresses, resident, base)
+
+    def test_the_credit_is_the_saving_while_the_source_is_charged_more(self):
+        source_lx = _staging_solver(("R",), [])._bufs[1].sym_is_lx
+        solver = self._solver(1e6 * (1 - source_lx))
+        saving = utils.to_fixed_us(2 * 1024 / solver._hbm_bytes_per_us)
+        self.assertEqual(self._credit(solver), saving)
+
+    def test_the_credit_is_capped_at_what_the_source_is_charged(self):
+        source_lx = _staging_solver(("R",), [])._bufs[1].sym_is_lx
+        solver = self._solver(1.0 + 2.0 * (1 - source_lx))
+        self.assertEqual(self._credit(solver), utils.to_fixed_us(2.0 / 1000))
+
+    def test_an_expression_that_does_not_price_the_source_credits_nothing(self):
+        solver = self._solver(sympy.Float(5.0))
+        self.assertEqual(self._credit(solver), 0)
+
+    def test_the_memory_only_objective_credits_a_placed_copy_once(self):
+        solver = _staging_solver(("R", "B", "C"), ["R"])
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        placed, spilled = [None] * 4 + [0], [None] * 5
+        self.assertEqual(solver._objective(placed), solver._objective(spilled))
+        saving = utils.to_fixed_us(2 * 1024 / solver._hbm_bytes_per_us)
+        self.assertEqual(solver._read_copy_credit(placed, None, 0), saving)
+
+    def test_annealing_a_staged_copy_the_expression_does_not_price(self):
+        """Regression: crediting the full saving here took the score below
+        zero, and ``to_fixed_us`` raised during temperature calibration."""
+        readers = [
+            _run_buffer(n, p, _two_axis_space(tiling=_tiling_space()))
+            for p, n in ((0, "R"), (1, "Q"))
+        ]
+        source = _run_buffer("S", 2)
+        source.op_position = None
+        for reader in readers:
+            reader.parents = ["S"]
+        bufs = [
+            *readers,
+            source,
+            _read_copy("S", "R", readers=("R", "Q")),
+        ]
+        cost_expr = sum(1e6 / b.sym_tile_counts[_AXIS_0] for b in readers)
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertGreaterEqual(solver.best_score, 0)
+
+
+class StagedReadCopyPredictionTest(TestCase):
+    """``_coarse_tile_read_copies`` predicts, per (source, reader), the copies
+    ``_plan_read_copies`` could mint, keyed on the same read key."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self._graph_ctx = V.set_graph_handler(
+            GraphLowering(fx.symbolic_trace(lambda: None))
+        )
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _predict(self, reads):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        graph, buffers = _staging_graph(reads)
+        allocator = SimpleNamespace(_solver_chooses_tilings=True)
+        return CoOptimizingAllocator._coarse_tile_read_copies(allocator, graph, buffers)
+
+    def test_every_reader_but_the_last_is_predicted_once(self):
+        copies = self._predict({"A": [0], "B": [0], "C": [0]})
+        self.assertEqual([c.reader for c in copies], ["A", "B"])
+        for copy_ in copies:
+            self.assertEqual(copy_.readers, ("A", "B", "C"))
+
+    def test_a_reader_with_two_reads_of_the_source_is_not_predicted(self):
+        # x[1:] + x[:-1]: two copies would share one reservation.
+        self.assertEqual(self._predict({"A": [0, 1], "B": [0]}), [])
+
+    def test_a_reader_reading_it_another_way_is_conflicting(self):
+        (copy_,) = self._predict({"A": [0], "B": [1]})
+        self.assertEqual(copy_.conflicting, ("B",))
+
+    def test_it_lives_until_the_runs_last_reader(self):
+        """The copy is read by every group op reading the source, not just
+        the first, so its interval runs to the last of them."""
+        (copy_,) = self._predict({"A": [0], "M": [], "B": [0]})
+        self.assertEqual((copy_.uses[0], copy_.uses[-1]), (0, 2))
+
+
+class StagedReadCopyJoinTest(TestCase):
+    """The apply's copies are joined to the solve's reservations by the pair
+    ``CoarseTilingPass`` reports, and a copy one reservation cannot hold alone
+    is left in HBM rather than stamped."""
+
+    def _allocator(self, staged):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator._staged_copies = dict(staged)
+        allocator._tiling_symbol_remaps = {}
+        allocator._set_one_allocation = mock.Mock()
+        return allocator
+
+    @staticmethod
+    def _op(name, reads=()):
+        from torch._inductor.dependencies import MemoryDep
+
+        d0 = sympy.Symbol("d0")
+        deps = [MemoryDep(source, d0, (d0,), (64,)) for source in reads]
+        return SimpleNamespace(
+            name=name, get_read_writes=lambda: SimpleNamespace(reads=deps)
+        )
+
+    def _setup(self, operations, readers=("R", "B")):
+        reader = _cdbuf("R", [], {}, divisions=[CoreDivision()])
+        reader.chosen_division = 0
+        copy_ = _read_copy("S", "R", readers=readers)
+        copy_.address = 256
+        graph = mock.Mock(operations=operations)
+        graph.get_buffer.return_value.get_layout.return_value = SimpleNamespace()
+        return graph, [reader, copy_]
+
+    def test_a_hint_route_copy_is_left_alone(self):
+        """The hint pass mints copies under the same name prefix before the
+        solve, and nothing predicted them."""
+        ops = [
+            self._op("coarse_tile_read_copy_0_x_0", ["x"]),
+            self._op("H", ["coarse_tile_read_copy_0_x_0"]),
+            self._op("coarse_tile_read_copy_1_S_0", ["S"]),
+            self._op("R", ["coarse_tile_read_copy_1_S_0"]),
+            self._op("B", ["coarse_tile_read_copy_1_S_0"]),
+        ]
+        graph, allocation = self._setup(ops)
+        allocator = self._allocator({"coarse_tile_read_copy_1_S_0": ("S", "R")})
+        allocator._stamp_staged_read_copies(
+            graph, allocation, allocator._staged_read_copies(graph), {}
+        )
+        (call,) = allocator._set_one_allocation.call_args_list
+        self.assertEqual(call.args[1], 256)
+
+    def test_a_reader_past_the_reservations_lifetime_keeps_it_in_hbm(self):
+        ops = [
+            self._op("coarse_tile_read_copy_1_S_0", ["S"]),
+            self._op("R", ["coarse_tile_read_copy_1_S_0"]),
+            self._op("Z", ["coarse_tile_read_copy_1_S_0"]),
+        ]
+        graph, allocation = self._setup(ops)
+        allocator = self._allocator({"coarse_tile_read_copy_1_S_0": ("S", "R")})
+        allocator._stamp_staged_read_copies(
+            graph, allocation, allocator._staged_read_copies(graph), {}
+        )
+        allocator._set_one_allocation.assert_not_called()
+
+
 def _axis_div(**factors):
     """A division over the two named axes ``d0`` / ``d1``, factor 1 dropped."""
     axes = {"d0": _AXIS_0, "d1": _AXIS_1}
@@ -1506,6 +1923,44 @@ class DivisionSourceTest(TestCase):
 
 _TILE_2 = TileSpec((TileAxis(host_dim=0, count=2),))
 _TILE_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+
+
+class TilingBoundaryResidencyTest(TestCase):
+    """``SaCoOptimizingSolver._read_across_a_tiling_boundary``."""
+
+    def _pair(self, parent_tiling=TileSpec(), child_tiling=TileSpec()):
+        parent = _cdbuf("P", [], {}, divisions=_TWO_AXIS_MENU)
+        child = _cdbuf("C", ["P"], {"P": [(0, 0)]}, divisions=_TWO_AXIS_MENU)
+        for buf in (parent, child):
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([parent, child], 1 << 30)
+        solver.chosen[0] = _config(CoreDivision(tiling=parent_tiling))
+        solver.chosen[1] = _config(CoreDivision(tiling=child_tiling))
+        return solver
+
+    def test_an_untiled_producer_read_by_a_tiled_consumer_is_refused(self):
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertTrue(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertFalse(solver._eligible(0))
+
+    def test_an_untiled_pair_is_untouched(self):
+        solver = self._pair()
+        self.assertFalse(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertTrue(solver._eligible(0))
+
+    def test_a_tiled_producer_keeps_its_residency(self):
+        for child_tiling in (_TILE_2, _TILE_4, TileSpec()):
+            solver = self._pair(parent_tiling=_TILE_2, child_tiling=child_tiling)
+            self.assertFalse(
+                solver._read_across_a_tiling_boundary(0, solver.chosen[0]),
+                child_tiling.label,
+            )
+
+    def test_the_consumer_side_is_not_refused(self):
+        # The gate is about being *read* across the boundary, not about reading
+        # across it: the tiled consumer's own output is per-tile scratch.
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertFalse(solver._read_across_a_tiling_boundary(1, solver.chosen[1]))
 
 
 def _menu_seed():
@@ -1818,9 +2273,9 @@ class MoveAlphabetTest(TestCase):
         self.assertEqual(solver.chosen, before)
 
 
-class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
-    """Only the annealer may choose a coarse tiling, and only once something
-    applies it."""
+class TestCoarseTilingIsGatedOnTheFlag(TestCase):
+    """Only the annealer may choose a coarse tiling, and only with
+    ``auto_coarse_tiling`` on."""
 
     @staticmethod
     def _allocator(layout_planning):
@@ -1828,14 +2283,505 @@ class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
             layout_planning=layout_planning, size=1
         )
 
-    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
-        self.assertFalse(self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings)
-        self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
-
-    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+    def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
         """Only a search that generates divisions can carry a ``TileSpec``."""
-        with mock.patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
-            self.assertTrue(
-                self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings
+        for flag in (False, True):
+            with (
+                self.subTest(auto_coarse_tiling=flag),
+                mock.patch.object(ts_config, "auto_coarse_tiling", flag),
+            ):
+                self.assertEqual(
+                    self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings,
+                    flag,
+                )
+                self.assertFalse(
+                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                )
+
+
+def _run_buffer(name, position, space=None):
+    """A two-axis buffer that sits at a stated operation position, so it can be
+    part of a coarse-tiling run."""
+    buf = _cdbuf(name, [], {}, divisions=_TWO_AXIS_MENU)
+    buf.uses = [position, position + 1]
+    buf.op_position = position
+    buf.division_space = space
+    return buf
+
+
+def _run_solver(names, untiled=(), parents=None):
+    """A primed solver over ``names`` at consecutive operation positions, each
+    with a tiling space unless named in ``untiled``; ``parents`` maps a name to
+    the producers it reads. A ``None`` name leaves its position to an operation
+    with no buffer."""
+    bufs = []
+    for position, name in enumerate(names):
+        if name is None:
+            continue
+        buf = _run_buffer(
+            name,
+            position,
+            _two_axis_space(tiling=None if name in untiled else _tiling_space()),
+        )
+        buf.parents = list((parents or {}).get(name, ()))
+        bufs.append(buf)
+    return _primed(bufs, 1 << 30)
+
+
+def _tiled(solver, idx, tiling=_TILE_4):
+    """Buffer ``idx``'s current splits under ``tiling``."""
+    return solver._sources[idx].retiled(solver.chosen[idx], tiling)
+
+
+class ContiguousTilingRunTest(TestCase):
+    """A tiling group is a contiguous run of the operation list, because that is
+    what ``derive_tiling_groups`` forms and what ``_validate_contiguous``
+    demands. Both structural moves write their tilings as contiguous stretches
+    of runs."""
+
+    def test_a_run_is_the_maximal_stretch_agreeing_on_the_tiling(self):
+        solver = _run_solver("ABC")
+        self.assertEqual(solver._run_bounds(0), (0, 2))  # all untiled: one run
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(1), (1, 1))
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+
+    def test_an_operation_with_no_buffer_breaks_a_run(self):
+        # Position 1 belongs to an operation the solver does not own -- nothing
+        # can carry a tiling to it, so it is untiled and the run stops there.
+        solver = _run_solver(["A", None, "C"])
+        solver.chosen[0] = _tiled(solver, 0)
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+
+    def test_the_trim_strips_a_tiling_the_anchors_run_does_not_reach(self):
+        solver = _run_solver("ABC")
+        # What a flood over the residency relation can produce: A and C tiled,
+        # B (between them) left alone: two groups at apply time.
+        assignment = {0: _tiled(solver, 0), 2: _tiled(solver, 2)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual(trimmed[0].tiling, _TILE_4)
+        self.assertTrue(trimmed[2].tiling.is_untiled)
+        # The splits are the flood's business and are left exactly as they were.
+        self.assertEqual(trimmed[2].splits, assignment[2].splits)
+
+    def test_a_buffer_with_no_operation_position_may_hold_no_tiling(self):
+        # An input clone, or any buffer built without operation order: it is in
+        # no run, so nothing can establish that a group containing it is
+        # contiguous, and declining is the safe direction.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        self.assertIsNone(solver._position_of[0])
+        assignment = {0: _tiled(solver, 0)}
+        self.assertTrue(
+            solver._trim_tilings_to_anchor_run(0, assignment)[0].tiling.is_untiled
+        )
+
+    def test_a_boundary_flip_respecs_one_whole_side_of_the_run(self):
+        solver = _run_solver("ABCD")
+        solver._retile_boundary(1, _tiled(solver, 1))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        # Whichever side was drawn, it is a contiguous stretch containing the
+        # drawn op and reaching one end of its run -- A..H or H..Z.
+        self.assertIn(tiled, ([0, 1], [1, 2, 3]))
+
+    def test_a_boundary_flip_truncates_at_an_op_that_refuses_the_tiling(self):
+        # C has no tiling space, so it can take no tiling at all. The walk stops
+        # there rather than skipping it (which would break contiguity) or
+        # abandoning the move (which would make long runs immovable).
+        solver = _run_solver("ABCD", untiled="C")
+        self.assertIsNone(_tiled(solver, 2))
+        with mock.patch.object(solver._rng, "random", return_value=0.0):  # forward
+            solver._retile_boundary(0, _tiled(solver, 0))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        self.assertEqual(tiled, [0, 1])
+
+    def test_a_search_with_no_tiling_space_never_takes_the_boundary_arm(self):
+        solver = _run_solver("ABCD", untiled="ABCD")
+        with mock.patch.object(solver, "_retile_boundary") as boundary:
+            for _ in range(200):
+                solver._execute_move("flip")
+        boundary.assert_not_called()
+
+
+def _attention_ops():
+    """``KT = K^T``, ``S = Q @ KT``, ``V``, ``O = S @ V`` as IR, in that order,
+    under the caller's graph handler: tiling host dim 0 of all four, ``S``
+    reduces over ``KT``'s tiled dim and ``O`` over ``V``'s."""
+    from torch._inductor.virtualized import ops
+
+    buf, load_input = ir_computed_buffer, ir_input_loader
+    load_q, load_k = load_input("q", [8, 16]), load_input("k", [8, 16])
+    load_kt, kt = buf("KT", [16, 8], lambda i: load_k([i[1], i[0]]))
+    load_s, s = buf(
+        "S",
+        [8, 8],
+        lambda i, r: ops.mul(load_q([i[0], r[0]]), load_kt([r[0], i[1]])),
+        reduction_ranges=[16],
+    )
+    load_v, v = buf("V", [8, 16], load_input("v_in", [8, 16]))
+    _, o = buf(
+        "O",
+        [8, 16],
+        lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+        reduction_ranges=[8],
+    )
+    return [kt, s, v, o]
+
+
+def _permuted_stretch_ops():
+    """``P``, ``C = P`` permuted, ``D = C + P`` permuted, as IR under the
+    caller's graph handler: tiling host dim 0, ``C`` misreads ``P`` and ``D``
+    reads ``C`` as written but misreads ``P``."""
+    from torch._inductor.virtualized import ops
+
+    buf = ir_computed_buffer
+    load_p, p = buf("P", [4, 8, 128], ir_input_loader("in0", [4, 8, 128]))
+    load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+    _, d = buf(
+        "D",
+        [8, 4, 128],
+        lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+    )
+    return [p, c, d]
+
+
+class ApplyGroupAgreementTest(TestCase):
+    """The SA's runs are the groups ``derive_tiling_groups`` forms, including
+    where a reader walks a run member's tiled host dim differently than that
+    member writes it -- the attention chain's ``S = Q @ K^T`` and ``O = S @ V``
+    both reduce over what the positional spec tiles upstream."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self.enterContext(
+            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None)))
+        )
+        self.enterContext(patch_row_major_out_coords())
+
+    def _solver(self, operations):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        from torch._inductor.virtualized import V
+
+        op_by_name = {op.get_name(): op for op in operations}
+        bufs = []
+        for at, op in enumerate(operations):
+            buf = _run_buffer(
+                op.get_name(), at, _two_axis_space(tiling=_tiling_space())
             )
-            self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
+            buf.tile_reads = CoOptimizingAllocator._tile_reads(V.graph, op, op_by_name)
+            buf.parents = sorted(buf.tile_reads)
+            bufs.append(buf)
+        solver = _primed(bufs, 1 << 30)
+        for idx in range(len(bufs)):
+            solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        return solver
+
+    def _assert_runs_are_the_applied_groups(self, operations, expected):
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            derive_tiling_groups,
+        )
+
+        solver = self._solver(operations)
+        from torch._inductor.virtualized import V
+
+        groups = derive_tiling_groups(
+            SimpleNamespace(operations=operations, get_buffer=V.graph.get_buffer),
+            {op.get_name(): _TILE_2 for op in operations},
+        )
+        position = {op.get_name(): at for at, op in enumerate(operations)}
+        applied = {
+            position[op.get_name()]: (
+                position[ops[0].get_name()],
+                position[ops[-1].get_name()],
+            )
+            for ops, _spec in groups
+            for op in ops
+        }
+        self.assertEqual(sorted(set(applied.values())), expected)
+        self.assertEqual(
+            {p: solver._run_bounds(p) for p in range(len(operations))}, applied
+        )
+
+    def test_the_runs_are_the_applied_groups(self):
+        self._assert_runs_are_the_applied_groups(
+            _attention_ops(), [(0, 0), (1, 2), (3, 3)]
+        )
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted.
+        self._assert_runs_are_the_applied_groups(
+            _permuted_stretch_ops(), [(0, 0), (1, 1), (2, 2)]
+        )
+
+    def test_the_trim_strips_a_tiling_carried_across_a_misaligned_read(self):
+        solver = self._solver(_attention_ops())
+        assignment = {i: solver.chosen[i] for i in range(4)}
+        trimmed = solver._trim_tilings_to_anchor_run(1, assignment)
+        self.assertEqual(
+            [trimmed[i].tiling.is_untiled for i in range(4)],
+            [True, False, False, True],
+        )
+
+    def test_a_boundary_flip_stops_at_a_misaligned_read(self):
+        tiled = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        for position, draw, expected in (
+            (1, 0.0, [False, True, True, False]),  # forward: O misreads V
+            (3, 0.9, [False, False, False, True]),  # back: likewise
+        ):
+            solver = self._solver(_attention_ops())
+            for idx in range(4):
+                solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}))
+            with mock.patch.object(solver._rng, "random", return_value=draw):
+                solver._retile_boundary(position, tiled)
+            self.assertEqual(
+                [not solver.chosen[i].tiling.is_untiled for i in range(4)], expected
+            )
+
+    def test_the_view_relation_carries_no_tiling_across_a_misaligned_read(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        edge = mock.MagicMock()
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        relation = _ViewRelation(
+            edge,
+            parent_source,
+            child_source,
+            lambda spec: all(axis.host_dim == 1 for axis in spec.axes),
+        )
+        tiled = parent_source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
+        self.assertTrue(relation.parent_for(tiled).tiling.is_untiled)
+        self.assertEqual(relation.child_for(tiled).division.output_splits, {_AXIS_0: 2})
+
+    def test_the_edge_relation_takes_the_readers_alignment(self):
+        parent = _run_buffer("P", 0, _two_axis_space(tiling=_tiling_space()))
+        child = _run_buffer("C", 1, _two_axis_space(tiling=_tiling_space()))
+        child.parents = ["P"]
+        child.residency_edges = {"P": mock.MagicMock()}
+        reads = mock.MagicMock()
+        reads.aligned.side_effect = lambda parent_spec, child_spec: all(
+            axis.host_dim == 1 for axis in child_spec.axes
+        )
+        child.tile_reads = {"P": reads}
+        relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
+        self.assertFalse(relation.carries(_TILE_2))
+        self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))
+
+    def test_the_companions_are_the_applied_groups(self):
+        # [KT] [S, V] [O]: KT escapes to S, S and V to O; each pays the copy's
+        # write and one full-extent read while resident. One run would pay 0.
+        solver = self._solver(_attention_ops())
+        self.assertEqual(solver._companion_bytes([0] * 4), 3 * 2 * 1024)
+
+
+class CompanionBufferPricingTest(TestCase):
+    """A tiling shrinks what a buffer holds, not what it moves. For an op whose
+    output leaves its tiling group the apply allocates a full-extent companion,
+    drains one tile into it per iteration and repoints the outside consumers at
+    it -- none of which is in features extracted from the untiled graph. Priced
+    honestly, tiling pays for an op whose consumers stay inside its own run and
+    costs a full HBM round trip for one that is not resident."""
+
+    SIZE = 1024  # ``_cdbuf``'s
+
+    @staticmethod
+    def _addresses(solver, resident):
+        return [0 if i in resident else None for i in range(len(solver._bufs))]
+
+    def test_an_untiled_state_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_search_with_no_tiling_space_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]}, untiled="AB")
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_consumer_inside_the_run_costs_nothing(self):
+        # Nothing escapes, so the apply keeps the buffer as loop-internal
+        # scratch and allocates no companion -- the shape the recolor flood
+        # exists to build, and the only one where tiling is free.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        for idx in (0, 1):
+            solver.chosen[idx] = _tiled(solver, idx)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_the_search_tiles_a_run_its_output_stays_inside(self):
+        # A feeds B and nothing else. Untiled, no per-core footprint fits beside
+        # the other (8192 / 8 cores = 1024 > 512), so both spill; tiled 4 ways
+        # in one run, both fit and A's output never leaves the run. The search
+        # has to find that on its own, and the objective has to let it pay.
+        bufs = [self._sized_run_buffer("A", 0), self._sized_run_buffer("B", 1)]
+        bufs[1].parents = ["A"]
+        bufs[1].residency_edges = {"A": self._identity_edge()}
+        solver = SaCoOptimizingSolver(bufs, 512, 128)
+        with self.assertLogs(sa_module.logger, level="DEBUG") as logs:
+            solver.plan_layout_and_core_divisions()
+        self.assertEqual([config.tiling for config in solver.chosen], [_TILE_4] * 2)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertTrue(all(buf.address is not None for buf in bufs))
+        self.assertEqual(solver.best_score, 0)
+        self.assertIn(
+            f"tiled A, B at {_TILE_4.label}; companion HBM traffic 0 bytes",
+            "\n".join(logs.output),
+        )
+
+    def test_a_search_that_keeps_no_tiling_says_so(self):
+        # Everything fits untiled, so no tiling pays.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        with self.assertLogs(sa_module.logger, level="INFO") as logs:
+            solver.plan_layout_and_core_divisions()
+        self.assertIn(
+            "kept no coarse tiling; 2 buffer(s) could tile", "\n".join(logs.output)
+        )
+
+    @staticmethod
+    def _sized_run_buffer(name, position):
+        buf = _run_buffer(name, position, _two_axis_space(tiling=_tiling_space()))
+        buf.size = 8192
+        return buf
+
+    @staticmethod
+    def _identity_edge():
+        """A residency edge whose consumer reads the producer's view as written,
+        so the two ends agree exactly when their splits do."""
+        edge = mock.MagicMock()
+        edge.compatible.side_effect = lambda parent, child: parent == child
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        return edge
+
+    def test_a_resident_buffer_pays_the_copy_out_and_its_outside_readers(self):
+        # A tiled, B and C untiled and reading it: A's run is itself alone, so
+        # both readers take the full buffer from HBM, and residency of the
+        # per-tile scratch no longer serves them.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})),
+            3 * self.SIZE,  # the copy's write + two full-extent reads
+        )
+
+    def test_a_spilled_buffer_pays_the_scratch_round_trip_instead(self):
+        # Not resident, the per-tile scratch is itself in HBM: the copy reads it
+        # back and writes the full buffer, and the readers were already charged.
+        # Independent of how many readers there are.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
+        )
+
+    def test_a_resident_tiled_graph_output_pays_nothing(self):
+        # The copy's write IS the externally visible write, which the model
+        # charges whether or not the buffer is resident (#4271), so it replaces
+        # a write already counted rather than adding one.
+        solver = _run_solver("A")
+        solver._bufs[0].boundary = BufferType.Output
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+
+    def test_a_consumer_with_no_operation_position_counts_as_outside(self):
+        # Nothing can carry a tiling to a buffer in no run, so a group
+        # containing it is not known to be contiguous; charging is the safe
+        # direction, matching what ``_trim_tilings_to_anchor_run`` refuses.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        solver._bufs[1].op_position = None
+        solver._precompute_topology()
+        solver.chosen = solver._seed_configs()
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
+        )
+
+    def test_the_score_carries_the_companion_traffic(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        before = solver._score()
+        with mock.patch.object(solver, "_companion_bytes", return_value=4096):
+            after = solver._score()
+        self.assertEqual(
+            after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
+        )
+
+
+class CostDumpScoreTest(TestCase):
+    """The cost dump's ``score_ns`` is what the search minimized: ``cost_expr``
+    plus the terms :meth:`SaCoOptimizingSolver._score` adds outside it."""
+
+    def _solved(self):
+        # A tiled alone with two untiled readers, so its output escapes.
+        bufs = [_run_buffer("A", 0, _two_axis_space(tiling=_tiling_space()))]
+        for position, name in ((1, "B"), (2, "C")):
+            bufs.append(_run_buffer(name, position, _two_axis_space()))
+            bufs[-1].parents = ["A"]
+        cost_expr = 1e6 / bufs[0].sym_tile_counts[_AXIS_0]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        return solver, cost_expr, result
+
+    def _record(self, solver, cost_expr, result):
+        return cost_expr_record(
+            cost_expr,
+            [],
+            result,
+            off_expression_ns=solver.off_expression_ns(),
+            score_ns=solver.score_ns(),
+        )
+
+    def _assert_score(self, record, solver):
+        self.assertAlmostEqual(record["score_ns"], solver.best_score / 1000, places=2)
+        self.assertAlmostEqual(
+            record["score_ns"],
+            record["objective_ns"] + sum(record["off_expression_ns"].values()),
+            places=2,
+        )
+
+    def test_score_ns_is_the_best_score_with_a_companion(self):
+        solver, cost_expr, result = self._solved()
+        record = self._record(solver, cost_expr, result)
+        self.assertGreater(record["off_expression_ns"]["companions"], 0)
+        self.assertNotAlmostEqual(
+            record["objective_ns"], solver.best_score / 1000, places=2
+        )
+        self._assert_score(record, solver)
+
+    def test_score_ns_subtracts_the_read_copy_credit(self):
+        # Two tiled readers of an untiled source, staged through one copy.
+        readers = [
+            _run_buffer(n, p, _two_axis_space(tiling=_tiling_space()))
+            for p, n in ((0, "R"), (1, "Q"))
+        ]
+        source = _run_buffer("S", 2)
+        source.op_position = None
+        for reader in readers:
+            reader.parents = ["S"]
+        bufs = [
+            *readers,
+            source,
+            _read_copy("S", "R", readers=("R", "Q")),
+        ]
+        cost_expr = 1e5 * (1 - source.sym_is_lx) + sum(
+            1e6 / b.sym_tile_counts[_AXIS_0] for b in readers
+        )
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        record = self._record(solver, cost_expr, result)
+        self.assertAlmostEqual(
+            record["off_expression_ns"]["read_copy_savings"],
+            -1024 * 1000 / solver._hbm_bytes_per_us,
+            places=2,
+        )
+        self._assert_score(record, solver)

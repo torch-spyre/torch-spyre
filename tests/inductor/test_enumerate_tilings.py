@@ -27,7 +27,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sympy
-import torch
 
 from torch import fx
 from torch._dynamo.source import ConstantSource
@@ -35,7 +34,6 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
-    FlexibleLayout,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
@@ -45,7 +43,6 @@ from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
-from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr.enumerate_tilings import (
     _MAX_AUTO_TILE_SPLIT_COUNT,
@@ -53,24 +50,12 @@ from torch_spyre._inductor.wsr.enumerate_tilings import (
     build_tiling_space,
     enumerate_tile_options,
 )
+from utils_inductor import fixed_tiled_layout
 
 
 # ---------------------------------------------------------------------------
 # Device-free op builders (mirrors test_span_overflow_hint_analysis.py)
 # ---------------------------------------------------------------------------
-def _fixed_tiled_layout(shape, dtype=torch.float16):
-    """A physical layout whose within-stick (innermost) dim is the last one."""
-    size = list(shape)
-    stride = list(FlexibleLayout.contiguous_strides(size))
-    stride_ints = [int(s) for s in stride]
-    size_ints = [int(s) for s in size]
-    within_stick_dim = len(size_ints) - 1
-    dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
-    dim_order.append(within_stick_dim)
-    device_layout = SpyreTensorLayout(size_ints, stride_ints, dtype, dim_order)
-    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
-
-
 def _write_dep(name, shape, layout):
     # Integer, as Inductor's index symbols are, so the stick coordinate
     # simplifies to the form ``_stick_host_dim`` resolves.
@@ -88,7 +73,7 @@ def _write_dep(name, shape, layout):
 def _pointwise_op(shape, name="buf0"):
     data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
-    layout = _fixed_tiled_layout(shape)
+    layout = fixed_tiled_layout(shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     write, _ = _write_dep(name, shape, layout)
@@ -110,7 +95,7 @@ def _reduction_op(out_shape, reduction_ranges, name="buf0", reduction_type="sum"
     data.ranges = list(out_shape)
     data.reduction_ranges = list(reduction_ranges)
     data.reduction_type = reduction_type
-    layout = _fixed_tiled_layout(out_shape)
+    layout = fixed_tiled_layout(out_shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
 
@@ -583,6 +568,15 @@ class TestTilingSpace(unittest.TestCase):
         op = _pointwise_op((512, 256, 128))
         self.assertFalse(build_tiling_space(op).is_empty)  # non-vacuity
         op.dim_hints = [object()]
+        space = build_tiling_space(op)
+        self.assertTrue(space.is_empty)
+        self.assertEqual(space.enumerate(), [TileSpec()])
+
+    def test_a_loop_group_member_without_hints_is_offered_nothing(self):
+        # ``coarse_tile`` adds members -- a group's copy-out, a restickify of a
+        # tiled read -- that carry ``loop_info`` but no ``dim_hints``.
+        op = _pointwise_op((512, 256, 128))
+        op.loop_info = object()
         space = build_tiling_space(op)
         self.assertTrue(space.is_empty)
         self.assertEqual(space.enumerate(), [TileSpec()])

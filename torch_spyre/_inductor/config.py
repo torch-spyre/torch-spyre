@@ -241,7 +241,9 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # Append one JSON record per co-optimized graph to this file: the symbolic cost
 # objective the solver minimized (per-bundle terms and relayout charges as sympy
 # ``srepr`` strings), the symbol values the solve chose, and each term evaluated
-# under them. Read by the summarize-sdsc skill. Empty = off.
+# under them, plus any terms the engine adds outside the expression and the
+# total it minimized (see ``cost_expr_record``). Read by the summarize-sdsc
+# skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
@@ -351,11 +353,18 @@ native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower()
     "yes",
 )
 
-# Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
+# Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
-# selects. Off by default, and inert unless the joint CP-SAT co-opt path is
-# active (co_optimizing_lx_planning and layout_solver == "cpsat"). Ops a
-# spyre_hint or for_each_tile loop already tiles keep that tiling.
+# selects. Off by default, and inert unless a joint co-opt path is active
+# (co_optimizing_lx_planning, with layout_solver "cpsat" or
+# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
+# keep that tiling.
+#
+# Under the SA co-optimizer, anything the apply refuses raises rather than
+# falling back, so any gap between what the search believes it may tile and
+# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
+# search sees is only part of what ``predict_ops`` charges a real tiling, so it
+# is not yet a calibrated brake on the tiling axis.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out

@@ -376,6 +376,16 @@ def test_unbatched_or_disabled_batch_split_costs_nothing(monkeypatch):
     assert cm._matmul_batch_split_ns([op], off) == 0
 
 
+def test_batch_split_cost_scales_with_a_prospective_tile_count(monkeypatch):
+    # The co-optimizer prices a tileable op with its undecided tile count.
+    tiles = sympy.Symbol("tiles", integer=True, positive=True)
+    p = CostParams()
+    cm, op = _bmm(monkeypatch, 16, 4, 1024, 2, loop_trip=tiles)
+    assert (
+        cm._matmul_batch_split_ns([op], p) == p.mm_batch_split_ns_per_step * tiles * 2
+    )
+
+
 def test_batch_split_cost_follows_symbolic_splits(monkeypatch):
     s0, s1, sm = sympy.symbols(
         "split_bmm_d0 split_bmm_d1 split_bmm_d2", integer=True, positive=True
