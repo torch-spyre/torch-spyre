@@ -1048,21 +1048,26 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       restricts *tiling* ``max``/``min`` to floating point (their identity is
       +/-inf, which cast wrong into an integer accumulator), but an integer
       max/min's reduction-only overflow is exactly as unfixable as a float
-      one's -- ``_K_SPLIT_COMBINE_SUPPORTED`` pins plain reduction vars to
-      split=1 regardless of dtype -- so this check must still fire for it, or
-      that overflow is silently dropped instead.  Everything outside the
-      family -- matmul (incl. fp8), conv, top-k, welford -- is owned by
-      another pass (work division cross-core splits matmul/conv/pool/top-k K
-      via ``_K_SPLIT_COMBINE_SUPPORTED``) or has no combine path here at all,
-      and must keep its historical silent-skip;
+      one's -- ``multi_reduction_k_split_blocked`` pins plain reduction vars
+      with 2+ reduction dims to split=1 regardless of dtype -- so this check
+      must still fire for it, or that overflow is silently dropped instead.
+      Everything outside the family -- matmul (incl. fp8), conv, top-k,
+      welford -- is owned by another pass (work division cross-core splits
+      matmul/conv/pool/top-k K) or has no combine path here at all, and must
+      keep its historical silent-skip;
     * the overflowing coordinate itself is controlled only by reduction
       symbols, so no output-range tile touches it;
     * the span still exceeds the limit in the *best case* computed by
       ``_best_case_inner_span``, which is more aggressive than any
       output-range coarse tile or any N-way work-division core split, so if
       even that leaves the span over the limit, no output mechanism can close
-      it -- only a reduction-range split, which this op cannot do
-      (``_K_SPLIT_COMBINE_SUPPORTED`` also excludes plain reductions).
+      it -- only a reduction-range split or a K-split.
+
+    Single-dim plain reductions (``_sole_real_reduction_range_pos`` returns
+    non-None) are excluded from the abort: ``multi_reduction_k_split_blocked``
+    only pins reduction vars when there are 2+ reduction dims, so
+    ``work_distribution_pass`` can legally K-split a single-dim plain
+    reduction and bring its span under the limit.
 
     ``max_cores`` is therefore not consulted: the best case already bounds
     every core-split outcome.
@@ -1075,9 +1080,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (plain
-    reductions are pinned to split=1), and the op reaches the backend over the
-    limit.
+    ``span_reduction_pass`` cannot split the reduced axis either (multi-dim
+    plain reductions are pinned to split=1), and the op reaches the backend
+    over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False
@@ -1122,6 +1127,11 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
                 # not assume untileable from it.
                 continue
             if span_elems * best_inner * itemsize > MAX_SPAN_BYTES:
+                if _sole_real_reduction_range_pos(op) is not None:
+                    # Single-dim plain reductions can K-split (see
+                    # multi_reduction_k_split_blocked); let
+                    # work_distribution_pass handle the overflow.
+                    continue
                 return True
     return False
 
@@ -2328,12 +2338,12 @@ def plan_span_overflow_tile(
             # it.
             #
             # The BMM exemption is not arbitrary: work division cross-core
-            # splits a matmul's K range (BATCH_MATMUL_OP is in
-            # work_division_constraints._K_SPLIT_COMBINE_SUPPORTED), so a
-            # BMM K-only rejection here is genuinely recoverable downstream and
-            # keeps its historical None.  Plain sum/prod/max/min are pinned to
-            # split=1 there and have no such recovery, so dropping their
-            # overflow just defers the failure to the backend.
+            # splits a matmul's K range, so a BMM K-only rejection here is
+            # genuinely recoverable downstream and keeps its historical None.
+            # Multi-dim plain sum/prod/max/min are pinned to split=1 by
+            # multi_reduction_k_split_blocked and have no such recovery, so
+            # dropping their overflow just defers the failure to the backend.
+            # Single-dim plain reductions are handled by the caller.
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: the reduced axis overflows "
                 "and no legal, stick-aligned reduction-range split within "
