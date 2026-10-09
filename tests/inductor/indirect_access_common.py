@@ -472,7 +472,10 @@ def run_e2e(
     )
 
     diff = torch.abs(reference.float() - result.float()).amax().item()
-    close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
+    # close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
+    close = torch.allclose(
+        result.float(), reference.float(), atol=atol, rtol=rtol, equal_nan=True
+    )
 
     if expect_close is True:
         test.assertTrue(

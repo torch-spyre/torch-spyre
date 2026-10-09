@@ -224,6 +224,68 @@ class _ScatterScenarios:
         # different order; layout corruption is orders of magnitude larger.
         torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
 
+    def test_index_copy_fp8_e4m3_kv_cache(self):
+        """Test FP8 (torch.float8_e4m3fn) static KV cache in-place scatter update.
+
+        Exercises [B, H, max_seq, D] pinned cache with FP8 E4M3 (128 elements/stick)
+        and dim-2 in-place index_copy_ writes (prefill and decode steps).
+        """
+        Bn, H, L, D, M = 1, 8, 128, 128, 512
+        dtype = torch.float8_e4m3fn
+        elem_stick = get_elem_in_stick(dtype)  # 128 for FP8
+
+        # Create pinned FP8 cache layout with L (sequence dim) at device coordinate 0
+        cache_layout = SpyreTensorLayout(
+            device_size=[
+                M,
+                H,
+                (D + elem_stick - 1) // elem_stick,
+                Bn,
+                elem_stick,
+            ],
+            stride_map=[D, M * D, elem_stick, H * M * D, 1],
+            device_dtype=get_device_dtype(dtype),
+        )
+
+        dst = torch.zeros(Bn, H, M, D, dtype=dtype)
+        src_prefill = torch.randint(-10, 10, (Bn, H, L, D), dtype=torch.int8).to(dtype)
+        idx_prefill = torch.arange(L, dtype=torch.int64)
+
+        def prefill_kernel(dst, src, idx):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        # PyTorch eager CPU lacks native Float8 index_copy_, so compute reference in float32
+        expected_prefill = dst.to(torch.float32).clone()
+        expected_prefill.index_copy_(2, idx_prefill, src_prefill.to(torch.float32))
+        expected_prefill = expected_prefill.to(dtype)
+
+        actual_prefill = torch.compile(prefill_kernel, dynamic=False)(
+            dst.to("spyre", device_layout=cache_layout),
+            src_prefill.to("spyre"),
+            idx_prefill.to("spyre"),
+        ).to("cpu")
+        torch.testing.assert_close(actual_prefill.to(torch.float32), expected_prefill.to(torch.float32))
+
+        # Decode step (1 token append at pos = 128)
+        src_decode = torch.randint(-10, 10, (Bn, H, 1, D), dtype=torch.int8).to(dtype)
+        idx_decode = torch.tensor([L], dtype=torch.int64)
+
+        def decode_kernel(dst, src, idx):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        expected_decode = expected_prefill.to(torch.float32).clone()
+        expected_decode.index_copy_(2, idx_decode, src_decode.to(torch.float32))
+        expected_decode = expected_decode.to(dtype)
+
+        actual_decode = torch.compile(decode_kernel, dynamic=False)(
+            actual_prefill.to("spyre", device_layout=cache_layout),
+            src_decode.to("spyre"),
+            idx_decode.to("spyre"),
+        ).to("cpu")
+        torch.testing.assert_close(actual_decode.to(torch.float32), expected_decode.to(torch.float32))
+        
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
         M, N, P = 16, 1024, 7

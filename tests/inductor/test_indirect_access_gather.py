@@ -327,7 +327,23 @@ class _GatherScenarios:
         self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
+    
+    def test_index_select_fp8_e4m3(self):
+        """FP8 (torch.float8_e4m3fn) gather via index_select on SEN143_FP8.
 
+        Verifies that keepbyindex correctly processes 128-elems/stick FP8 source
+        tensors and produces FP8 output without raising Unsupported op_spec errors.
+        """
+        M, N, P = 128, 256, 32
+        dtype = torch.float8_e4m3fn
+        x = self.to_spyre(torch.randint(-10, 10, (M, N), dtype=torch.int8).to(dtype))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+    
     def test_index_select_with_exp(self):
         x, i = self._xi(P=32)
         self._stage_and_e2e(
