@@ -160,15 +160,8 @@ def ingest(args) -> int:
     return 0
 
 
-def regex_match(pattern: str, value: str) -> bool:
-    """The schema's patterns as written; offline.py hand-codes the same ones without `re`."""
-    import regex
-
-    return bool(regex.search(pattern, value))
-
-
 def _ingest(root: Path, args) -> dict:
-    meta = check(root, match=regex_match)
+    meta = check(root)
     key = run_key(meta)
     if not is_manual(key) and args.trusted_job_prefix:
         if not any(key.startswith(p) for p in args.trusted_job_prefix):
