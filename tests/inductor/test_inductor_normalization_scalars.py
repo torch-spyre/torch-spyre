@@ -700,9 +700,8 @@ class TestModelScalarOperations:
             execution_mode, moe_loss, main_loss, aux_loss, atol=4e-3, rtol=4e-3
         )
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4720 (clip on IEEE_FP32)
     def test_quantization_scale_int8(self, execution_mode):
-        """INT8 quantization with scale factor: the fp32 clamp is rejected."""
+        """Test INT8 quantization with scale factor."""
 
         scale = 127.0
 
@@ -710,8 +709,7 @@ class TestModelScalarOperations:
             return torch.clamp(x * scale, -128.0, 127.0)
 
         x = torch.rand((256, 256)) * 2.0 - 1.0
-        with pytest.raises(Exception, match=r"clip on DataFormats\.IEEE_FP32"):
-            _compare_modes(execution_mode, quantize_int8, x, atol=1e-3, rtol=1e-3)
+        _compare_modes(execution_mode, quantize_int8, x, atol=1e-3, rtol=1e-3)
 
     def test_attention_dense_scores_block_mask_scalar(self, execution_mode):
         """Dense attention scores + block-structured mask and scalar fill (not ``torch.sparse``)."""
