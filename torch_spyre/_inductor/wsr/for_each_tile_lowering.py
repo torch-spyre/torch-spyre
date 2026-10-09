@@ -98,7 +98,7 @@ from torch._inductor.virtualized import V
 from .. import timing_recorder
 from ..deadcode_elimination import deadcode_elimination
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import format_operations
+from ..pass_utils import _identity_load, format_operations
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -145,27 +145,6 @@ class _CondInnerFnRecorder(DefaultHandler):
         # the op name so the caller can decline with a useful reason.
         self.compare_ops.append(f"unexpected:{name}")
         return f"__unexpected_{name}__"
-
-
-class _IdentityLoadRecorder(DefaultHandler):
-    """Recognize a Pointwise body that returns exactly one load.
-
-    ``WhileLoop.create`` uses such bodies to repair an input's strides before
-    handing it to the loop body.  After a for_each_tile WhileLoop is spliced,
-    that otherwise-benign whole-input materialization sits inside the counted
-    loop.  This recorder lets the post-splice contraction below prove the copy
-    is an identity without inspecting ``inner_fn`` closures.
-    """
-
-    def __init__(self) -> None:
-        self.value = object()
-        self.loads: list[tuple[str, Any]] = []
-
-    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        if name != "load" or self.loads:
-            raise ValueError("not a single-load identity")
-        self.loads.append((args[0], args[1]))
-        return self.value
 
 
 def _first_placeholder_name(cond_graph) -> str | None:
@@ -717,6 +696,7 @@ def _inline_marker_into_consumer(
     (the closed-over ``capture`` is rebound to None) so later re-evaluations of
     this long-lived inner_fn stop recording.
     """
+    from torch._inductor.ir import Scatter
     from torch._inductor.virtualized import V
 
     from torch_spyre._inductor.pass_utils import (
@@ -736,6 +716,16 @@ def _inline_marker_into_consumer(
             return _orig_inner(*args)
 
     object.__setattr__(consumer_op.data, "inner_fn", new_inner_fn)
+    if isinstance(consumer_op.data, Scatter):
+        orig_indexer = consumer_op.data.output_indexer
+
+        def new_output_indexer(*args, _orig_indexer=orig_indexer):
+            with V.set_ops_handler(
+                _InlineMarkerHandler(V.ops, marker_name, marker_op, capture)
+            ):
+                return _orig_indexer(*args)
+
+        object.__setattr__(consumer_op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(consumer_op.data)
 
     result = replace_computed_buffer_body(
@@ -1924,46 +1914,6 @@ def _recordable_op_names(group_ops: list["ir.Operation"]) -> list[str]:
         return names
 
     return _walk(group_ops, nested=False)
-
-
-def _identity_load(
-    op: "ir.Operation",
-) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]] | None:
-    """Return the sole load performed by a pure pointwise identity.
-
-    The generated exact-stride normalizations this recognizes are ordinary
-    Pointwise buffers, not a dedicated IR node.  Run their body under a
-    recording handler so accepting one is based on behavior (one load whose
-    value is returned unchanged), not an origin name or a fragile graph
-    pattern.
-    """
-    from torch._inductor import ir
-
-    if not isinstance(op, ir.ComputedBuffer) or not isinstance(op.data, ir.Pointwise):
-        return None
-
-    indices = tuple(
-        sympy.Symbol(f"_fet_identity_i{i}", integer=True)
-        for i in range(len(op.data.ranges))
-    )
-    recorder = _IdentityLoadRecorder()
-    try:
-        with V.set_ops_handler(recorder):
-            result = op.data.inner_fn(indices)
-    except Exception:  # noqa: BLE001
-        # This is a speculative recognizer over arbitrary pointwise bodies.
-        # Any body that cannot execute under the recording handler is simply
-        # not the generated single-load identity this optimization needs.
-        return None
-    # V.ops is an OpsWrapper, so scalar handler results normally come back as
-    # OpsValue(value).  Accept the unwrapped form too for direct unit tests.
-    if (
-        getattr(result, "value", result) is not recorder.value
-        or len(recorder.loads) != 1
-    ):
-        return None
-    name, index = recorder.loads[0]
-    return name, sympy.sympify(index), indices
 
 
 class _IdentityChainLoadHandler(WrapperHandler):

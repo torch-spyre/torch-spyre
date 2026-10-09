@@ -118,6 +118,10 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+A functional `index_copy` into a carried output preserves its caller's initializer.
+The compiler removes a full carry clone only when its addresses, shape, strides
+and offset are unchanged.
+
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
 `1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).

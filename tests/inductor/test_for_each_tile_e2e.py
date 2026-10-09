@@ -52,12 +52,14 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 
 import functools
 import unittest
+import warnings
 from unittest.mock import patch
 
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -106,6 +108,7 @@ from for_each_tile_fixtures import (
     paged_gather_nested_fn,
     paged_gather_nested_reference,
     paged_gather_reference,
+    scatter_carry_fn,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
     split_k_caller_init_fn,
@@ -196,6 +199,74 @@ class TestForEachTileE2E(_DynamoResetTestCase):
     # remove the two effects that tolerance was compensating for.
     ATOL = 1e-2
     RTOL = 1e-2
+
+    def test_scatter_carry_runtime_indices_and_preserved_initializer(self):
+        from torch._dynamo.utils import counters
+
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        generator = torch.Generator().manual_seed(930)
+        for rows, inner, transpose_source in (
+            (32, (64,), False),
+            (64, (1, 64), False),
+            (64, (4, 64), False),
+            (64, (4, 64), True),
+        ):
+            compiled = torch.compile(
+                functools.partial(scatter_carry_fn, transpose_source=transpose_source),
+                fullgraph=True,
+                dynamic=False,
+            )
+            with (
+                self.subTest(rows=rows, inner=inner, transpose_source=transpose_source),
+                spyre_config.patch(backend_loop_unroll=False),
+                warnings.catch_warnings(),
+                torch.inference_mode(),
+            ):
+                warnings.simplefilter("error", FallbackWarning)
+                for case in range(2):
+                    values = (
+                        torch.randn(
+                            4, rows, *inner, generator=generator, dtype=torch.float16
+                        )
+                        * 0.125
+                    )
+                    if transpose_source:
+                        values = values.permute(0, 2, 3, 1).contiguous()
+                    indices = torch.stack(
+                        [
+                            torch.randperm(6 * rows, generator=generator)[:rows]
+                            for _ in range(4)
+                        ]
+                    )
+                    initial = torch.full((6 * rows, *inner), 3.0, dtype=torch.float16)
+                    expected = initial.clone()
+                    acc = torch.zeros_like(values[0])
+                    for value, ids in zip(values, indices):
+                        acc = acc + value
+                        source = acc.permute(2, 0, 1) if transpose_source else acc
+                        expected.index_copy_(0, ids, source)
+                    # Each visit's int32 sticks must be adjacent. The default
+                    # interleaved table layout does not walk the second stick.
+                    index_layout = SpyreTensorLayout(
+                        device_size=[4, rows // 32, 32],
+                        stride_map=[rows, 32, 1],
+                        device_dtype=get_device_dtype(torch.int32),
+                    )
+                    inputs = (
+                        values.to(DEVICE_NAME),
+                        indices.to(dtype=torch.int32).to(
+                            DEVICE_NAME, device_layout=index_layout
+                        ),
+                        initial.to(DEVICE_NAME),
+                    )
+                    before = counters["stats"]["unique_graphs"]
+                    actual = compiled(*inputs).cpu()
+                    if case:
+                        self.assertEqual(counters["stats"]["unique_graphs"], before)
+                    torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.02)
+                    torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
     @staticmethod
     def _operands():

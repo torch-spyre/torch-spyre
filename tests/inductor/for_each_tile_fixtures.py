@@ -1366,3 +1366,23 @@ def consumed_row_fn(table: torch.Tensor) -> torch.Tensor:
     acc0 = torch.zeros_like(table[0])
     final, _ = for_each_tile(body, (table,), dims=(0,), tile_size=1, init=acc0)
     return final
+
+
+def scatter_carry_fn(values, indices, output, *, transpose_source=False):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(carry, tiles):
+        acc, dst = carry
+        value, ids = tiles
+        updated = acc + value[0]
+        source = updated.permute(2, 0, 1) if transpose_source else updated
+        return (updated, dst.index_copy(0, ids[0], source)), None
+
+    (_, result), _ = for_each_tile(
+        body,
+        (values, indices),
+        dims=(0, 0),
+        tile_size=1,
+        init=(torch.zeros_like(values[0]), output),
+    )
+    return result
