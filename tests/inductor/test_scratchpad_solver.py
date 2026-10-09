@@ -1909,6 +1909,36 @@ class TestSympyExprToCpSatPrinter(TestCase):
                         solver.float_value(new), solver.float_value(old), places=7
                     )
 
+    def test_candidate_domains_without_selectors_remain_independent(self):
+        # These menus calibrate reciprocal scales, but do not identify a
+        # shared division. Their different lengths must not be broadcast or
+        # mistaken for scalar constants by the table optimization.
+        x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
+        menus = {"split_x": [1, 2, 4], "split_y": [1, 3]}
+        model = cp_model.CpModel()
+        variables = {
+            name: model.new_int_var_from_domain(cp_model.Domain.FromValues(raw), name)
+            for name, raw in menus.items()
+        }
+        printer = _SympyExprToCpSat(
+            model, variables, {name: (None, raw) for name, raw in menus.items()}
+        )
+        expression = 120 * y / x + sympy.Piecewise(
+            (20 * x, sympy.And(x >= 2, y >= 3)), (1, True)
+        )
+        model.minimize(printer.convert(expression))
+        for a, b in itertools.product(menus["split_x"], menus["split_y"]):
+            with self.subTest(x=a, y=b):
+                fixed = model.clone()
+                fixed.add(variables["split_x"] == a)
+                fixed.add(variables["split_y"] == b)
+                solver = cp_model.CpSolver()
+                solver.parameters.num_search_workers = 1
+                self.assertEqual(solver.solve(fixed), cp_model.OPTIMAL)
+                self.assertAlmostEqual(
+                    solver.objective_value, float(expression.subs({x: a, y: b}))
+                )
+
     def test_division_table_reuses_affine_values_and_falls_back_for_range(self):
         x = sympy.Symbol("split_x", integer=True)
         model = cp_model.CpModel()

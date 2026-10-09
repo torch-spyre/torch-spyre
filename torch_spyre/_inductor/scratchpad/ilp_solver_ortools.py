@@ -694,6 +694,11 @@ class _SympyExprToCpSat(Printer):
                     return None
                 entry = wrapper, range(len(wrapper.buffer.core_divisions))
             wrapper, raw = entry
+            if wrapper is None:
+                # Domain-only entries can set reciprocal scales without a
+                # shared division selector. Keep their arithmetic symbolic;
+                # their candidate arrays are not scalar constants or a table.
+                return None
             if prefix == "inv_":
                 scale = self._inv_scale(raw_name)
                 raw = [scale // v for v in raw]
