@@ -667,12 +667,12 @@ class SuperDSCScheduling(BaseScheduling):
             buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
+            tail = ""
             if method == "sdsc":
                 from torch_spyre.execution.kernel_cache import precompute_kernel_key
 
                 # pool_size is passed only for a pooled kernel (sdsc's default
                 # 0 otherwise); the precomputed key hashes the value passed.
-                tail = ""
                 pool_size = 0
                 if kernel._kernel_uses_hbm_pool():
                     pool_size = kernel.pool_size
@@ -682,9 +682,15 @@ class SuperDSCScheduling(BaseScheduling):
                 precomputed_key = precompute_kernel_key(
                     src_code, kernel_name, pool_size
                 )
-                buf.writeline(f"{tail}, precomputed_key={precomputed_key!r})")
-            else:
-                buf.writeline(")")
+                tail += f", precomputed_key={precomputed_key!r}"
+            # Per-argument host shape/dtype for the launch spec. Passed through
+            # the generated wrapper so it survives a wrapper-cache replay in a
+            # later process, where V.graph no longer exists. Emitted outside
+            # src_code, which is the cache-key and dedup input.
+            launch_args = kernel.launch_args()
+            if launch_args:
+                tail += f", launch_args={launch_args!r}"
+            buf.writeline(f"{tail})")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
             metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
