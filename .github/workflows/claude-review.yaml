@@ -1,5 +1,5 @@
 name: Claude PR Review (on-hardware)
-run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number || github.event.pull_request.number }}
+run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
 
 # ---------------------------------------------------------------------------
 # On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner
@@ -9,14 +9,14 @@ run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-stati
 on:
   issue_comment:
     types: [created]
-  pull_request:
+  pull_request: # TODO: remove before merging (testing only)
     types: [opened, synchronize, reopened]
 
 concurrency:
   # Static and hardware reviews must not block each other. Hardware reviews are
   # still serialized per PR so a cancelled run cannot corrupt the Spyre cache.
   group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number ||
-    github.event.pull_request.number }}
+    github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
   cancel-in-progress: false
 
 permissions:
@@ -43,6 +43,7 @@ jobs:
     #
     # No trailing delimiter after the command: a comment with notes on later
     # lines has CRLF (not a space) after it, and GHA literals can't encode it.
+    # TODO: restore this if: before merging (commented out for testing)
     # if: >-
     #   github.event.issue.pull_request &&
     #   startsWith(github.event.comment.body, '/claude-review') &&
@@ -59,8 +60,22 @@ jobs:
       CI: ''
 
     steps:
-      # Authoritative access gate (see the if: comment). curl, not gh -- gh is
-      # installed further down. Rejects anything below write.
+      # Reject comments that start with /claude-review but are not exactly one
+      # of the two supported commands (e.g. /claude-reviewer, /claude-review-statc).
+      # The first token is the command; anything after whitespace is ignored.
+      - name: Validate trigger command
+        if: github.event_name == 'issue_comment'
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          cmd="${BODY%%[[:space:]]*}"
+          case "$cmd" in
+            /claude-review|/claude-review-static) ;;
+            *) echo "::error::Unknown command '${cmd}'; expected /claude-review or /claude-review-static." ; exit 1 ;;
+          esac
+
+      # Authoritative access gate (see the if: comment). curl, not gh.
+      # Rejects anything below write.
       - name: Verify commenter has write access
         if: github.event_name == 'issue_comment'
         env:
@@ -78,7 +93,7 @@ jobs:
             *) echo "::error::${ACTOR} lacks write access (${perm:-none}); refusing review." ; exit 1 ;;
           esac
 
-      # Ack that the run was picked up. curl, not gh (not installed yet);
+      # Ack that the run was picked up. curl, not gh;
       # best-effort so a failed reaction never blocks the review.
       - name: Acknowledge trigger comment
         if: github.event_name == 'issue_comment'
@@ -98,8 +113,6 @@ jobs:
       # PR itself (gh pr checkout) when it must run the changed code on hardware.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
 
       - name: Install Claude Code CLI
         env:
@@ -115,20 +128,8 @@ jobs:
           mkdir -p "$HOME"
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      # gh is required by /code-review to pull diff and post comments
-      - name: Install GitHub CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          ver="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/cli/cli/releases/latest \
-            | grep -oP '"tag_name":\s*"v\K[^"]+')"
-          curl -fsSL "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_amd64.tar.gz" \
-            | tar -xz -C /tmp
-          install -m 0755 "/tmp/gh_${ver}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # gh is pre-installed in the runner image; expose it on PATH.
+          echo "/home/senuser/.local/bin" >> "$GITHUB_PATH"
 
       - name: Claude review
         id: claude
@@ -145,13 +146,17 @@ jobs:
           API_TIMEOUT_MS: '1200000'
           GH_TOKEN: ${{ github.token }}
           SPYRE_KB_MCP_URL: ${{ secrets.SPYRE_KB_MCP_URL }}
-          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
         run: |
+          : "${ANTHROPIC_BASE_URL:?ANTHROPIC_BASE_URL secret is not set}"
+          : "${ANTHROPIC_AUTH_TOKEN:?ANTHROPIC_AUTH_TOKEN secret is not set}"
+
           # Device env is only needed for the hardware review. Source it from
           # the real home before switching HOME below.
           if [ "$REVIEW_MODE" = "hardware" ]; then
             source "$HOME/.bashrc"
             source /etc/profile.d/ibm-aiu-setup.sh
+            set +u
           fi
 
           # claude was installed under this HOME (the image's ~/.local is
@@ -170,7 +175,7 @@ jobs:
           else
             prompt_file=.github/claude-review-prompt.txt
           fi
-          prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/" "$prompt_file")"
+          prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/g" "$prompt_file")"
 
           # This CLI build does NOT provide a github_inline_comment MCP server,
           # so /code-review --comment posts through the gh CLI fallback.
@@ -192,7 +197,7 @@ jobs:
           # the completion signal is the outcome reaction in the next step.
           claude -p "$prompt" \
             --model 'claude-opus-5-5[1m]' \
-            --max-turns 60 \
+            --max-turns 100 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \
             --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
