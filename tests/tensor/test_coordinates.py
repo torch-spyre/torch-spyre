@@ -1021,5 +1021,53 @@ class TestNormalizeCoordinatesFusion(TestCase):
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
 
 
+class TestRestickifyAtStickAlignedOffset(TestCase):
+    """Restickify planning for a read of the stick's host dim at an offset
+    (issue #4883): rows of a [512, 512] tensor whose sticks run along rows,
+    restickified to the canonical layout, whose sticks run along columns."""
+
+    HOST = FixedLayout(torch.device("cpu"), torch.float16, [512, 512], [512, 1])
+    SOURCE = SpyreTensorLayout(
+        [8, 512, 64], [32768, 1, 512], get_device_dtype(torch.float16)
+    )
+    CANONICAL = SpyreTensorLayout(
+        [8, 512, 64], [64, 512, 1], get_device_dtype(torch.float16)
+    )
+
+    def _target(self, dep):
+        with V.set_graph_handler(SimpleNamespace()):
+            return compute_restickify_needed(
+                self.SOURCE, self.HOST, dep, self.CANONICAL, dep
+            )
+
+    def test_rows_from_zero(self):
+        """The baseline: two rows from row 0 restickify to the canonical layout."""
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        dep = MemoryDep("src", 512 * d0 + d1, (d0, d1), (2, 512))
+        self.assertEqual(self._target(dep), (True, self.CANONICAL))
+
+    def test_single_row_at_a_stick_boundary(self):
+        """A single row reads the stick dim at a constant index, which leaves
+        the stick coordinate with no variable to match."""
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        for row in (0, 64, 448):
+            with self.subTest(row=row):
+                dep = MemoryDep("src", 512 * row + d0, (d0,), (512,))
+                self.assertEqual(self._target(dep), (True, self.CANONICAL))
+
+    def test_rows_from_a_stick_boundary(self):
+        """Rows from 64 give the host coordinate d0 + 64 for the stick d0."""
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        dep = MemoryDep("src", 512 * (d0 + 64) + d1, (d0, d1), (2, 512))
+        self.assertEqual(self._target(dep), (True, self.CANONICAL))
+
+    def test_single_row_inside_a_stick_stays_infeasible(self):
+        """A row inside a stick is lane 5 of every stick, which the restickify
+        cannot express: it must stay infeasible, not get a wrong target."""
+        d0 = sympy.Symbol("d0", integer=True, nonnegative=True)
+        dep = MemoryDep("src", 512 * 5 + d0, (d0,), (512,))
+        self.assertEqual(self._target(dep), (True, None))
+
+
 if __name__ == "__main__":
     run_tests()
