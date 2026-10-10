@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
 from .. import config
@@ -214,6 +214,7 @@ def _post_tile_layout_for_splits(
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
     op_name: str,
+    stick_host_dim: int | None,
 ) -> FixedTiledLayout:
     """Build the actual per-tile Spyre layout for one or more host splits.
 
@@ -253,13 +254,21 @@ def _post_tile_layout_for_splits(
             )
         new_size[selected_host_dim] = full_size // split_count
 
-    new_stride = list(FlexibleLayout.contiguous_strides(new_size))
+    try:
+        new_stride = compute_tile_stride(
+            original_layout.size, original_layout.stride, new_size
+        )
+    except Unsupported as exc:
+        raise Unsupported(f"Cannot auto-tile {op_name}: {exc}") from exc
 
     try:
         device_layout = _resize_device_layout(
             original_layout.device_layout,
             [int(s) for s in original_layout.size],
             [int(s) for s in new_size],
+            stick_host_dim=stick_host_dim,
+            old_host_stride=[int(s) for s in original_layout.stride],
+            new_host_stride=[int(s) for s in new_stride],
         )
     except RuntimeError as exc:
         raise Unsupported(
@@ -1840,6 +1849,7 @@ def _remaining_span_candidates_after_tile(
         op.layout,
         split_by_host_dim,
         op.get_name(),
+        _stick_host_dim(op, op.layout.device_layout),
     )
     remaining = _output_span_candidates_from_op(
         op,
