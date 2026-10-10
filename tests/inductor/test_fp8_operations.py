@@ -286,6 +286,35 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (2, 12, 384, 128),
+            (1, 12, 384, 128),
+            (1, 12, 384, 384),
+            (2, 12, 128, 128),
+            (1, 12, 128, 128),
+        ],
+        ids=lambda s: "x".join(str(d) for d in s),
+    )
+    def test_quantize_dequantize_fp8_attention_shapes(self, shape):
+        """Test FP8 quantize/dequantize at the 4D attention activation shapes.
+
+        These are mat1 of the test_fp8_scaled_bmm shapes in test_inductor_ops.py,
+        so the activation quantizer can be checked without a matmul in the graph.
+        """
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
     def test_fp8_scaled_mm_separate_compilation(self):
         """Regression test for FP8 batchmatmulfp8 SDSC crash under separate compilation.
 

@@ -62,6 +62,7 @@ from .pass_utils import (
     device_coordinates,
     finite_upper_or_none,
     get_mem_deps_from_rw,
+    host_coordinates,
     input_layout_for_operation,
     invert_per_core_view,
     iteration_space_from_op,
@@ -383,6 +384,19 @@ def multi_dim_iteration_space_split(
     return splits
 
 
+def _qfp8wt_stick_coords(td: TensorDep) -> list[Expr]:
+    """Coordinates spanned by a QFP8WT tensor's 2D stick: its K and N dims.
+
+    For a rank-2 weight [K, N] these are the last two device coordinates. Once
+    the weight has batch dims ([..., K, N]) the generic stick layout puts the
+    outermost host dim at device position -2, so that slice names a batch dim
+    instead of K; read K and N off the host coordinates there.
+    """
+    if len(td.layout.size) <= 2:
+        return td.device_coords[-2:]
+    return host_coordinates(td.layout, td.dep, None)[-2:]
+
+
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
@@ -424,10 +438,10 @@ def adjust_it_space_for_sticks(
             hasattr(td.layout.device_layout, "element_arrangement")
             and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
         ):
-            # For QFP8WT, last two device dimensions are the 2D stick [2, 64]
+            # For QFP8WT, the 2D stick [2, 64] spans the weight's K and N dims.
             # Both need to be treated as atomic 128-byte units
             stick_vars = []
-            for coord in td.device_coords[-2:]:
+            for coord in _qfp8wt_stick_coords(td):
                 if len(coord.free_symbols) == 1:
                     var = next(iter(coord.free_symbols))
                     if var in adjusted_space:

@@ -1025,6 +1025,37 @@ def _(
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
 
 
+@torch.library.custom_op("spyre::scaled_bmm", mutates_args=(), device_types="spyre")
+def scaled_bmm(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Raw FP8 batched matrix multiplication, with no scaling or bias applied.
+
+    The batched counterpart to spyre.scaled_mm: mat1 [*batch, M, K] @
+    mat2 [*batch, K, N] -> [*batch, M, N], with matching leading batch dims.
+    Consumers (fms-model-optimizer / vLLM) call this for FP8 attention QK,
+    e.g. query[B, H, S, D] @ key_T[B, H, D, S].
+
+    There is no aten batched equivalent of _scaled_mm to decompose from, so
+    unlike spyre.scaled_mm this op is called directly. Scaling is likewise
+    NOT applied here - callers multiply by scale_a * scale_b afterward, the
+    same split scaled_mm_decomp uses.
+
+    Maps to: deeptools batchmatmulfp8.
+    """
+    pass
+
+
+@scaled_bmm.register_fake
+def _(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:
+    # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
+    output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
 @torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
 def qfp8wt(input: torch.Tensor) -> torch.Tensor:
     pass
