@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings} ...` (also `spyre-clickhouse-ingest`)."""
+"""`python -m spyre_clickhouse_ingest {artifacts|results|ci-run-timings|dispatch} ...` (also `spyre-clickhouse-ingest`)."""
 
 import sys
 
@@ -22,7 +22,7 @@ OFFLINE_FLAGS = ("--offline", "--validate-only", "--upload")
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = ("artifacts", "results", "ci-run-timings")
+    commands = ("artifacts", "results", "ci-run-timings", "dispatch")
     if not argv or argv[0] not in commands:
         sys.exit(
             f"usage: python -m spyre_clickhouse_ingest {{{'|'.join(commands)}}} ..."
@@ -32,6 +32,8 @@ def main(argv=None):
         from .artifacts import main as run
     elif command == "ci-run-timings":
         from .ci_run_timings import main as run
+    elif command == "dispatch":
+        from .dispatch import main as run
     elif any(a.split("=")[0] in OFFLINE_FLAGS for a in rest):
         from .offline import main as run
     else:
