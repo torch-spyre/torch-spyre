@@ -749,17 +749,20 @@ PYBIND11_MODULE(_C, m) {
       [](c10::DeviceIndex device) {
         auto& allocator = spyre::SpyreAllocator::instance();
         auto stats = allocator.getDeviceStats(device);
+        const auto agg =
+            static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
         py::dict result;
         result["allocated_bytes.all.current"] =
-            stats
-                .allocated_bytes[static_cast<size_t>(
-                    c10::CachingAllocator::StatType::AGGREGATE)]
-                .current;
-        result["allocation.all.current"] =
-            stats
-                .allocation[static_cast<size_t>(
-                    c10::CachingAllocator::StatType::AGGREGATE)]
-                .current;
+            stats.allocated_bytes[agg].current;
+        result["allocated_bytes.all.peak"] = stats.allocated_bytes[agg].peak;
+        result["allocated_bytes.all.allocated"] =
+            stats.allocated_bytes[agg].allocated;
+        result["reserved_bytes.all.current"] =
+            stats.reserved_bytes[agg].current;
+        result["reserved_bytes.all.peak"] = stats.reserved_bytes[agg].peak;
+        result["reserved_bytes.all.allocated"] =
+            stats.reserved_bytes[agg].allocated;
+        result["allocation.all.current"] = stats.allocation[agg].current;
         return result;
       },
       py::arg("device"), "Get allocator statistics for a device");

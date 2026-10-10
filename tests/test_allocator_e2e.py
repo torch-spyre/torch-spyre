@@ -36,6 +36,9 @@ def get_allocator_stats():
     stats = torch.spyre._spyre_get_allocator_stats(0)
     return {
         "allocated_bytes": stats.get("allocated_bytes.all.current", 0),
+        "allocated_bytes_peak": stats.get("allocated_bytes.all.peak", 0),
+        "reserved_bytes": stats.get("reserved_bytes.all.current", 0),
+        "reserved_bytes_peak": stats.get("reserved_bytes.all.peak", 0),
         "num_allocs": stats.get("allocation.all.current", 0),
     }
 
@@ -1029,6 +1032,320 @@ class TestAllocatorE2E(TestCase):
             f"Expected {initial_allocated_bytes}, got {final_stats['allocated_bytes']}. "
             f"Delta: {final_stats['allocated_bytes'] - initial_allocated_bytes} bytes.",
         )
+
+    def test_get_memory_info_returns_tensor_region_capacity(self):
+        """
+        Test: torch.accelerator.get_memory_info returns Tensor-region free and total bytes.
+
+        Verifies that get_memory_info is implemented (does not throw
+        NotImplementedError) and returns a plausible pair of values where
+        total > 0 and free <= total.
+        """
+        device = torch.device("spyre", 0)
+        free, total = torch.accelerator.get_memory_info(device)
+
+        self.assertGreater(
+            total,
+            0,
+            "Tensor-region total capacity must be > 0",
+        )
+        self.assertGreaterEqual(
+            free,
+            0,
+            "Tensor-region free bytes must be >= 0",
+        )
+        self.assertLessEqual(
+            free,
+            total,
+            "Free bytes must not exceed total capacity",
+        )
+
+    def test_get_memory_info_decreases_on_allocation(self):
+        """
+        Test: get_memory_info free bytes decrease by the aligned allocation size on Tensor alloc.
+
+        Allocates a Tensor, checks that free bytes decreased by exactly the
+        Flex-aligned size (same delta as allocated_bytes.all.current), and that
+        release restores the free bytes to the original value.
+        """
+        device = torch.device("spyre", 0)
+
+        free_before, total_before = torch.accelerator.get_memory_info(device)
+
+        tensor = torch.empty((1024,), device="spyre", dtype=torch.float32)
+        stats_after_alloc = get_allocator_stats()
+        aligned_size = (
+            stats_after_alloc["allocated_bytes"] - self.initial_stats["allocated_bytes"]
+        )
+
+        free_after_alloc, total_after_alloc = torch.accelerator.get_memory_info(device)
+
+        self.assertEqual(
+            total_before,
+            total_after_alloc,
+            "Total capacity must not change after allocation",
+        )
+        self.assertEqual(
+            free_before - free_after_alloc,
+            aligned_size,
+            "Free bytes should decrease by exactly the aligned allocation size",
+        )
+
+        del tensor
+        gc.collect()
+
+        free_after_free, _ = torch.accelerator.get_memory_info(device)
+        self.assertEqual(
+            free_after_free,
+            free_before,
+            "Free bytes should be restored after tensor release",
+        )
+
+    def test_reserved_bytes_equals_allocated_bytes(self):
+        """
+        Test: reserved_bytes.all.current == allocated_bytes.all.current for live Tensor allocations.
+
+        SpyreAllocator has no caching pool, so the reserved and allocated counts
+        must be equal at all times for Tensor allocations.
+        """
+        initial = self.initial_stats
+
+        tensor = torch.empty((2048,), device="spyre", dtype=torch.float32)
+        stats_live = get_allocator_stats()
+
+        self.assertEqual(
+            stats_live["reserved_bytes"],
+            stats_live["allocated_bytes"],
+            "reserved_bytes must equal allocated_bytes while a Tensor is live",
+        )
+        self.assertGreater(
+            stats_live["reserved_bytes"] - initial["reserved_bytes"],
+            0,
+            "reserved_bytes must increase after Tensor allocation",
+        )
+
+        del tensor
+        gc.collect()
+
+        stats_after = get_allocator_stats()
+        self.assertEqual(
+            stats_after["reserved_bytes"],
+            initial["reserved_bytes"],
+            "reserved_bytes must return to baseline after Tensor release",
+        )
+        self.assertEqual(
+            stats_after["allocated_bytes"],
+            initial["allocated_bytes"],
+            "allocated_bytes must return to baseline after Tensor release",
+        )
+
+    def test_memory_reserved_api(self):
+        """
+        Test: torch.accelerator.memory_reserved returns reserved_bytes.all.current.
+
+        The generic accelerator API must agree with the internal stat exposed by
+        _spyre_get_allocator_stats.  Also verifies that a live Tensor actually
+        drives the counter above the baseline (so the equality check can't pass
+        vacuously on a pair of zeros), and that reserved == allocated (no cache
+        pool).
+        """
+        device = torch.device("spyre", 0)
+
+        tensor = torch.empty((4096,), device="spyre", dtype=torch.float32)
+
+        internal_reserved = get_allocator_stats()["reserved_bytes"]
+        api_reserved = torch.accelerator.memory_reserved(device)
+
+        self.assertGreater(
+            api_reserved,
+            self.initial_stats["reserved_bytes"],
+            "reserved_bytes must be above baseline while a Tensor is live",
+        )
+        self.assertEqual(
+            api_reserved,
+            internal_reserved,
+            "torch.accelerator.memory_reserved must match reserved_bytes.all.current",
+        )
+        self.assertEqual(
+            api_reserved,
+            torch.accelerator.memory_allocated(device),
+            "reserved_bytes must equal allocated_bytes (no cache pool)",
+        )
+
+        del tensor
+        gc.collect()
+
+    def test_peak_reserved_reset(self):
+        """
+        Test: reset_peak_memory_stats resets reserved_bytes peak to the current
+        reserved bytes.
+
+        Allocates a Tensor to drive a non-zero peak, resets the peak stats via
+        the public accelerator API, and confirms the peak drops to the current
+        value (not necessarily 0).  Also checks that the accumulated reset
+        clears the accumulated counter, verifying the counter was non-zero
+        before the reset.
+        """
+        # Allocate to create a non-zero peak
+        tensor = torch.empty((8192,), device="spyre", dtype=torch.float32)
+        del tensor
+        gc.collect()
+
+        stats_before_reset = get_allocator_stats()
+        self.assertGreater(
+            stats_before_reset["reserved_bytes_peak"],
+            0,
+            "reserved_bytes peak must be > 0 after an allocation",
+        )
+
+        torch.accelerator.reset_peak_memory_stats("spyre")
+        stats_after_peak_reset = get_allocator_stats()
+        self.assertEqual(
+            stats_after_peak_reset["reserved_bytes_peak"],
+            stats_after_peak_reset["reserved_bytes"],
+            "reserved_bytes peak must equal current reserved bytes after reset",
+        )
+
+        # Verify accumulated reset clears the accumulated counter.
+        # Allocate first so there is something to accumulate, then confirm the
+        # counter is non-zero before resetting (so the assertEqual can't pass
+        # vacuously).
+        tensor2 = torch.empty((8192,), device="spyre", dtype=torch.float32)
+        del tensor2
+        gc.collect()
+
+        raw_stats_before = torch.spyre._spyre_get_allocator_stats(0)
+        self.assertGreater(
+            raw_stats_before.get("reserved_bytes.all.allocated", 0),
+            0,
+            "reserved_bytes.all.allocated must be > 0 before accumulated reset",
+        )
+
+        torch.accelerator.reset_accumulated_memory_stats("spyre")
+        raw_stats = torch.spyre._spyre_get_allocator_stats(0)
+        accumulated_reserved = raw_stats.get("reserved_bytes.all.allocated", -1)
+        self.assertEqual(
+            accumulated_reserved,
+            0,
+            "reserved_bytes.all.allocated must be 0 after reset_accumulated_stats",
+        )
+
+    def test_program_allocation_excluded_from_stats(self):
+        """
+        Test: Program allocations affect neither Tensor free/total bytes nor
+        the Tensor-only allocator stats.
+
+        SpyreAllocator gates allocated_bytes and reserved_bytes updates on
+        MemoryType::Tensor.  prepare_kernel() issues one MemoryType::Program
+        allocation. executeAllocate() calls SpyreAllocator::allocate()
+        (recordAlloc, N bytes), moves the CompositeAddress into job_allocation_,
+        then drops the DataPtr (recordRelease, 0 bytes because the address was
+        moved out). Both calls fire before prepare_kernel() returns, while
+        job_plan still owns the Program memory. Neither call may change the
+        Tensor-only counters.
+
+        The only Python-reachable path that issues a MemoryType::Program
+        allocation is prepare_kernel(): its "Allocate" command calls
+        SpyreAllocator::allocate(size, AllocationDirective{MemoryType::Program}).
+
+        Note: get_memory_info() free bytes cover the whole Flex Tensor region,
+        including Flex-internal buffers that bypass SpyreAllocator. With
+        FLEX_SKIP_TIMESTAMP_CALIBRATION=0, the TimestampCalibrator can allocate
+        such a buffer on a background thread, so the exact free-bytes check is
+        skipped in that configuration.
+        """
+        import json
+        import os
+        import tempfile
+
+        import torch_spyre
+
+        initial = self.initial_stats
+
+        def make_spyrecode_dir(tmpdir):
+            """Write a minimal valid spyrecode.json (1 Allocate + 1 InitTransfer)."""
+            spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+            os.makedirs(spyrecode_dir, exist_ok=True)
+            spyrecode_json = {
+                "JobPreparationPlan": [
+                    # executeAllocate() calls SpyreAllocator::allocate(size,
+                    # MemoryType::Program) (recordAlloc), moves the
+                    # CompositeAddress into job_allocation_, then drops the
+                    # DataPtr (recordRelease, 0 bytes).
+                    {"command": "Allocate", "properties": {"size": "4096"}},
+                    {
+                        "command": "InitTransfer",
+                        "properties": {
+                            "init_bin_file": "init_binary.bin",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    },
+                ],
+                "JobExecPlan": [
+                    {
+                        "command": "ComputeOnDevice",
+                        "properties": {"job_bin_ptr": "120259084288"},
+                    }
+                ],
+            }
+            with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+                json.dump(spyrecode_json, f)
+            with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+                f.write(b"\x00" * 1024)
+            return spyrecode_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = make_spyrecode_dir(tmpdir)
+
+            free_before, total_before = torch.accelerator.get_memory_info("spyre")
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            # The Program allocation is still owned by job_plan at this point.
+            self.assertGreater(
+                job_plan.job_allocation_size(),
+                0,
+                "job_plan must own a non-zero Program allocation after prepare_kernel",
+            )
+
+            free_live, total_live = torch.accelerator.get_memory_info("spyre")
+            # With FLEX_SKIP_TIMESTAMP_CALIBRATION=0, Flex's TimestampCalibrator
+            # can allocate a Tensor-region buffer on a background thread after
+            # the first device launch, so an exact free-bytes comparison is
+            # unreliable there. By default calibration only arms for a profiling
+            # session, and this test opens none.
+            if os.environ.get("FLEX_SKIP_TIMESTAMP_CALIBRATION") != "0":
+                self.assertEqual(
+                    free_live,
+                    free_before,
+                    "Program allocation must not consume Tensor-region free bytes",
+                )
+            self.assertEqual(
+                total_live,
+                total_before,
+                "Program allocation must not change Tensor total bytes",
+            )
+
+            stats_after = get_allocator_stats()
+
+            self.assertEqual(
+                stats_after["allocated_bytes"],
+                initial["allocated_bytes"],
+                "allocated_bytes must not change after a Program allocation",
+            )
+            self.assertEqual(
+                stats_after["reserved_bytes"],
+                initial["reserved_bytes"],
+                "reserved_bytes must not change after a Program allocation",
+            )
+            self.assertEqual(
+                stats_after["num_allocs"],
+                initial["num_allocs"],
+                "allocation count must not change after a Program allocation",
+            )
+
+            del job_plan
 
 
 if __name__ == "__main__":

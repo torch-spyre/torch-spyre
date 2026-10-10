@@ -76,11 +76,24 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
   return stats_;
 }
 
+std::pair<size_t, size_t> SpyreAllocator::getMemoryInfo(
+    c10::DeviceIndex device) {
+  int64_t active_device_id = flex::RuntimeContext::getInstance()->getDeviceID();
+  TORCH_CHECK(static_cast<int64_t>(device) == active_device_id,
+              "SpyreAllocator::getMemoryInfo: requested device index ", device,
+              " does not match the active device (", active_device_id, ")");
+  auto flex_alloc = getFlexAllocator();
+  flex::MemoryStats mem_stats =
+      flex_alloc->getMemoryStats(flex::MemoryType::Tensor);
+  return {mem_stats.free_bytes, mem_stats.total_bytes};
+}
+
 void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
   std::lock_guard<std::mutex> lock(stats_mutex_);
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_accumulated();
+        stats_.reserved_bytes[stat_type].reset_accumulated();
         stats_.allocation[stat_type].reset_accumulated();
       });
 }
@@ -90,56 +103,83 @@ void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_peak();
+        stats_.reserved_bytes[stat_type].reset_peak();
         stats_.allocation[stat_type].reset_peak();
       });
 }
 
-void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
+void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id,
+                                 flex::MemoryType memory_type) {
+  // User-visible accounting (stats and profiler) is Tensor-only.
+  // Program and other non-Tensor allocations must not appear in user-visible
+  // memory stats: on release the CompositeAddress has already been moved out,
+  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
+  if (memory_type != flex::MemoryType::Tensor) {
+    return;
+  }
   int64_t total_allocated;
+  int64_t total_reserved;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     c10::CachingAllocator::for_each_selected_stat_type(
         stat_types, [&](size_t stat_type) {
           stats_.allocation[stat_type].increase(1);
           stats_.allocated_bytes[stat_type].increase(nbytes);
+          stats_.reserved_bytes[stat_type].increase(nbytes);
         });
     total_allocated = stats_
                           .allocated_bytes[static_cast<size_t>(
                               c10::CachingAllocator::StatType::AGGREGATE)]
                           .current;
+    total_reserved = stats_
+                         .reserved_bytes[static_cast<size_t>(
+                             c10::CachingAllocator::StatType::AGGREGATE)]
+                         .current;
   }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
-  c10::reportMemoryUsageToProfiler(
-      data,
-      nbytes,           // alloc_size
-      total_allocated,  // total_allocated
-      total_allocated,  // total_reserved (currently same as total_allocated)
-      curr_device);
+  c10::reportMemoryUsageToProfiler(data,
+                                   nbytes,           // alloc_size
+                                   total_allocated,  // total_allocated
+                                   total_reserved,   // total_reserved
+                                   curr_device);
 }
 
-void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
+void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id,
+                                   flex::MemoryType memory_type) {
+  // User-visible accounting (stats and profiler) is Tensor-only.
+  // Program and other non-Tensor allocations must not appear in user-visible
+  // memory stats: on release the CompositeAddress has already been moved out,
+  // so nbytes would be 0 and would leave an unmatched +N in the profiler.
+  if (memory_type != flex::MemoryType::Tensor) {
+    return;
+  }
   int64_t total_allocated;
+  int64_t total_reserved;
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     c10::CachingAllocator::for_each_selected_stat_type(
         stat_types, [&](size_t stat_type) {
           stats_.allocation[stat_type].decrease(1);
           stats_.allocated_bytes[stat_type].decrease(nbytes);
+          stats_.reserved_bytes[stat_type].decrease(nbytes);
         });
     total_allocated = stats_
                           .allocated_bytes[static_cast<size_t>(
                               c10::CachingAllocator::StatType::AGGREGATE)]
                           .current;
+    total_reserved = stats_
+                         .reserved_bytes[static_cast<size_t>(
+                             c10::CachingAllocator::StatType::AGGREGATE)]
+                         .current;
   }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
-  c10::reportMemoryUsageToProfiler(
-      data,
-      -static_cast<int64_t>(nbytes),  // alloc_size
-      total_allocated,                // total_allocated
-      total_allocated,  // total_reserved (currently same as total_allocated)
-      curr_device);
+  c10::reportMemoryUsageToProfiler(data,
+                                   -static_cast<int64_t>(nbytes),  // alloc_size
+                                   total_allocated,  // total_allocated
+                                   total_reserved,   // total_reserved
+                                   curr_device);
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
@@ -173,14 +213,15 @@ c10::DataPtr SpyreAllocator::allocate(
   // accurate memory profiling.
   size_t actual_nbytes = composite_addr.total_size();
 
-  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
+  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id,
+                                 directive.memory_type);
   void* ctx_void = static_cast<void*>(ctx);
 
   // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
   // This pointer is never dereferenced — it serves only as a unique token for
   // memory profiling (recordAlloc/recordRelease).
   void* data_void = static_cast<void*>(ctx);
-  recordAlloc(actual_nbytes, data_void, device_id);
+  recordAlloc(actual_nbytes, data_void, device_id, directive.memory_type);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
@@ -196,7 +237,7 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
   size_t nbytes = ctx->composite_addr.total_size();
 
   SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
-                                           ctx->device_id);
+                                           ctx->device_id, ctx->memory_type);
   delete ctx;
 }
 
