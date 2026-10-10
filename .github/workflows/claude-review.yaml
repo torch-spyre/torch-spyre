@@ -1,5 +1,5 @@
 name: Claude PR Review (on-hardware)
-run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
+run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
 
 # ---------------------------------------------------------------------------
 # On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner
@@ -9,13 +9,6 @@ run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-stati
 on:
   issue_comment:
     types: [created]
-  # Temporary pull_request trigger for testing only -- remove before merging.
-  # With issue_comment as the sole trigger: the concurrency group is correct
-  # (github.event.issue.number is the PR number), the checkout gets the default
-  # branch (prompt files, not PR code), and the agent uses gh pr checkout to
-  # fetch the PR code itself when needed.
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -47,17 +40,16 @@ jobs:
     # non-review comments cannot displace a pending review.
     concurrency:
       group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number
-        || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
+        }}
       cancel-in-progress: false
 
-    # TODO: restore this if: before merging (commented out for testing)
-    # if: >-
-    #   github.event.issue.pull_request &&
-    #   startsWith(github.event.comment.body, '/claude-review') &&
-    #   contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     # The static review still runs on the self-hosted fleet (required for model
     # connectivity) but on the card-less pool (spyre_pf_x0), so it never
     # contends for an accelerator.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/claude-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ${{ fromJSON(startsWith(github.event.comment.body, '/claude-review-static') && '["x86_64","spyre_pf_x0","linux","image_torch_spyre"]' || '["x86_64","spyre_pf_x1","linux","image_torch_spyre"]')
       }}
     timeout-minutes: 60
@@ -71,7 +63,6 @@ jobs:
       # of the two supported commands (e.g. /claude-reviewer, /claude-review-statc).
       # The first token is the command; anything after whitespace is ignored.
       - name: Validate trigger command
-        if: github.event_name == 'issue_comment'
         env:
           BODY: ${{ github.event.comment.body }}
         run: |
@@ -84,7 +75,6 @@ jobs:
       # Authoritative access gate (see the if: comment). curl, not gh.
       # Rejects anything below write.
       - name: Verify commenter has write access
-        if: github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.event.comment.user.login }}
@@ -103,7 +93,6 @@ jobs:
       # Ack that the run was picked up. curl, not gh;
       # best-effort so a failed reaction never blocks the review.
       - name: Acknowledge trigger comment
-        if: github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -167,7 +156,7 @@ jobs:
           API_TIMEOUT_MS: '1200000'
           GH_TOKEN: ${{ github.token }}
           SPYRE_KB_MCP_URL: ${{ secrets.SPYRE_KB_MCP_URL }}
-          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           : "${ANTHROPIC_BASE_URL:?ANTHROPIC_BASE_URL secret is not set}"
           : "${ANTHROPIC_AUTH_TOKEN:?ANTHROPIC_AUTH_TOKEN secret is not set}"
@@ -233,7 +222,7 @@ jobs:
       # pass/fail pair. always() so a timeout or error still signals -- this is
       # the only completion signal when the agent dies before posting a summary.
       - name: React with review outcome
-        if: always() && github.event_name == 'issue_comment'
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
