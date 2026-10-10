@@ -177,6 +177,10 @@ jobs:
           # read-only for this uid); set it so the CLI is found and can write
           # its runtime state. gh authenticates via GH_TOKEN.
           export HOME="${RUNNER_TEMP}/claude-home"
+          # Allow git operations on the image's install root (owned by senuser,
+          # job runs as a different uid).
+          git config --global --add safe.directory /home/senuser/torch-spyre
+
 
           # Build the MCP config from the secret URL in-shell so the URL stays
           # masked (never interpolated into the rendered workflow).
