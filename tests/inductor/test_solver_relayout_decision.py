@@ -37,11 +37,15 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import sympy
 
 pytest.importorskip("ortools")
 
+import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import ilp_solver_ortools
@@ -80,6 +84,55 @@ def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expecte
         "P", "C", candidates, divisions, costs
     )
     assert [c.group for c in kept] == expected
+
+
+def test_relayout_consumer_costs_prices_the_lx_source_only(monkeypatch):
+    """One predicted cost per distinct consumer division (#4616), computed
+    with the candidate's source pinned in LX and every other read plus the
+    consumer's own output priced in HBM -- the shortlist that feeds
+    ``_cap_relayout_groups`` must not silently price the copy's own source as
+    an ordinary HBM read too."""
+    consumer_op = SimpleNamespace(get_name=lambda: "C")
+    monkeypatch.setattr(
+        allocator_module,
+        "op_read_writes",
+        lambda op: SimpleNamespace(
+            reads=[SimpleNamespace(name="P"), SimpleNamespace(name="other")]
+        ),
+    )
+    candidates = [
+        _candidate("C", 0, 5000.0, group=0, j=0),
+        _candidate("C", 0, 3000.0, group=1, j=1),
+    ]
+    consumer_divs = ["div0", "div1"]  # opaque: _work_slices is mocked below
+    seen = []
+
+    def fake_work_slices(op, division):
+        return {"division": division}
+
+    def fake_extract(op, work_slices, is_lx):
+        seen.append((op, work_slices, dict(is_lx)))
+        return work_slices
+
+    monkeypatch.setattr(
+        "torch_spyre._inductor.scratchpad.sa_cooptimizer._work_slices",
+        fake_work_slices,
+    )
+    monkeypatch.setattr(
+        "torch_spyre._inductor.dump_cost_model.extract_op_features", fake_extract
+    )
+    monkeypatch.setattr(
+        "torch_spyre._inductor.cost_model.predict_ops",
+        Mock(side_effect=[10.0, 20.0]),
+    )
+
+    costs = CoOptimizingAllocator._relayout_consumer_costs(
+        consumer_op, consumer_divs, "P", candidates
+    )
+
+    assert costs == {0: 10.0, 1: 20.0}
+    assert [ws["division"] for _, ws, _ in seen] == ["div0", "div1"]
+    assert all(is_lx == {"P": True, "other": False, "C": False} for _, _, is_lx in seen)
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -365,6 +418,18 @@ def test_price_disagreement_within_a_group_is_an_error():
 def test_group_without_its_source_gets_no_copy():
     c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
     assert CoOptimizingAllocator._relayout_copy_buffers([c]) == []
+
+
+def test_group_whose_span_exceeds_the_lx_budget_gets_no_copy():
+    """A destination span the LX budget can never hold gets no copy either
+    (#4595): building one would only add a buffer the solver must place and
+    prove out for nothing. A budget that does fit the same span still gets
+    its copy, sized by that span exactly."""
+    p = _producer([0, 2])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0, destination_span=32)])
+    assert CoOptimizingAllocator._relayout_copy_buffers([p, c], capacity=16) == []
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c], capacity=32)
+    assert copy.per_core_footprint == 32
 
 
 # ---------------------------------------------------------------------------

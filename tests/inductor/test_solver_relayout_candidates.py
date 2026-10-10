@@ -264,6 +264,32 @@ def test_same_ownership_in_two_spellings_is_not_a_relayout():
         )
 
 
+def test_unsupported_relayout_transition_reason_is_named_directly():
+    """The one safety net that stops the solver offering a relayout between
+    two ownerships that PROJECT to the same logical division: named directly
+    here rather than only reached as a side effect of the "collapsed" reader
+    case elsewhere. Two views spelled differently but owning the same
+    physical slices must refuse; a genuinely different division must not."""
+
+    from torch_spyre._inductor.op_spec import TensorWorkDivision
+
+    x = Symbol("x")
+    same = TensorWorkDivision({x: 4}, {x: Mod(_CORE_ID, 4)}, num_cores=4)
+    same_again = TensorWorkDivision(
+        {x: 4}, {x: Mod(_CORE_ID + 4, 4)}, num_cores=4
+    )  # a different spelling of the same owners
+    different = TensorWorkDivision({x: 2}, {x: Mod(_CORE_ID, 2)}, num_cores=4)
+
+    assert same.same_ownership(same_again)
+    assert not same.same_ownership(different)
+    assert (
+        lx_relayout._unsupported_relayout_transition_reason(same, same_again)
+        == "cannot emit: distinct physical ownerships collapse to the same "
+        "logical work division"
+    )
+    assert lx_relayout._unsupported_relayout_transition_reason(same, different) is None
+
+
 def test_candidate_without_a_measured_span_is_rejected():
     """The committed path declines a relayout whose span it cannot measure
     (#3440); the solver path must not carry such a candidate into a solve,
