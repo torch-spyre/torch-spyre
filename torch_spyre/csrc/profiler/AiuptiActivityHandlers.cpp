@@ -334,15 +334,6 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     default:
       break;
   }
-
-  // checkTimestampOrder(&*runtime_activity);
-  // if (outOfRange(*runtime_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*runtime_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   runtime_activity->log(*logger);
 }
 
@@ -386,15 +377,6 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
-
-  // checkTimestampOrder(&*kernel_activity);
-  // if (outOfRange(*kernel_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*kernel_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   kernel_activity->log(*logger);
 }
 
@@ -514,15 +496,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   } else {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
   }
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memcpy_activity);
-  // if (outOfRange(*memcpy_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memcpy_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memcpy_activity->log(*logger);
 }
 
@@ -551,8 +524,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
         traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
         fmt::format("Memory ({})",
                     memoryOperationName(activity->memory_operation_type)));
-    // memcpyName(
-    //     activity->memcpy_type, activity->mem_src, activity->mem_dst));
     auto& mem_activity = traceBuffer_.activities.back();
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
@@ -581,14 +552,6 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     } else {
       recordMemoryStream(mem_activity->device, mem_activity->resource, " ");
     }
-    // checkTimestampOrder(&*mem_activity);
-    // if (outOfRange(*mem_activity)) {
-    //   traceBuffer_.span.opCount -= 1;
-    //   traceBuffer_.gpuOpCount -= 1;
-    //   removeCorrelatedPtiActivities(&*mem_activity);
-    //   traceBuffer_.activities.pop_back();
-    //   return;
-    // }
     mem_activity->log(*logger);
   }
 
@@ -627,7 +590,6 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
     const AIUpti_ActivityMemset* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  // TODO(mamaral): implement the libaiupti to add external correlation ID
   cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
       linkedActivity(activity->correlation_id, cpuCorrelationMap_);
@@ -661,16 +623,6 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   } else {
     recordMemoryStream(memset_activity->device, memset_activity->resource, " ");
   }
-
-  // TODO(mamaral): verify if we can enable this
-  // checkTimestampOrder(&*memset_activity);
-  // if (outOfRange(*memset_activity)) {
-  //   traceBuffer_.span.opCount -= 1;
-  //   traceBuffer_.gpuOpCount -= 1;
-  //   removeCorrelatedPtiActivities(&*memset_activity);
-  //   traceBuffer_.activities.pop_back();
-  //   return;
-  // }
   memset_activity->log(*logger);
 }
 
