@@ -466,13 +466,13 @@ class TestFfdcCollect:
         missing = report["collector"]["missing_fields"]
         assert "failure.exception_type" in missing
         assert "failure.traceback" in missing
-        # REQUIRED_FIELDS has 11 entries; exc=None leaves exception_type and
-        # traceback as None (2 missing, 9 present).
-        # round(100 * 9 / 11, 1) == 81.8  — hardcoded to catch formula regressions.
-        assert len(REQUIRED_FIELDS) == 11, (
+        # REQUIRED_FIELDS has 10 entries; exc=None leaves exception_type and
+        # traceback as None (2 missing, 8 present).
+        # round(100 * 8 / 10, 1) == 80.0  — hardcoded to catch formula regressions.
+        assert len(REQUIRED_FIELDS) == 10, (
             "Update the expected_pct below if REQUIRED_FIELDS changes"
         )
-        assert report["collector"]["completeness_pct"] == 81.8
+        assert report["collector"]["completeness_pct"] == 80.0
         assert report["collector"]["completeness_pct"] < 100.0
 
     def test_metadata_fields_present(self):
@@ -499,7 +499,7 @@ class TestFfdcCollect:
             report = self._collect_to_tmpdir(exc, failure_category=CATEGORY_UNKNOWN)
 
         env = report["environment"]
-        for key in ("TORCH_COMPILE_DEBUG", "TORCH_SPYRE_DEBUG", "SPYRE_INDUCTOR_LOG"):
+        for key in ("TORCH_COMPILE_DEBUG", "TORCH_SPYRE_DEBUG"):
             assert key in env
 
     def test_capture_latency_is_positive(self):

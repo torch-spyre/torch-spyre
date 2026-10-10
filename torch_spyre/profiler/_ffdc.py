@@ -70,7 +70,6 @@ REQUIRED_FIELDS = [
     "failure.traceback",
     "environment.TORCH_COMPILE_DEBUG",
     "environment.TORCH_SPYRE_DEBUG",
-    "environment.SPYRE_INDUCTOR_LOG",
     "artifacts.searched",
 ]
 
@@ -254,8 +253,6 @@ def _report_sort_key(report_path: Path) -> Optional[str]:
 _ENV_KEYS = [
     "TORCH_COMPILE_DEBUG",
     "TORCH_SPYRE_DEBUG",
-    "SPYRE_INDUCTOR_LOG",
-    "SPYRE_INDUCTOR_LOG_LEVEL",
     "DUMP_SPYRE_CODE",
     "TORCH_LOGS",
     "TORCHINDUCTOR_FORCE_DISABLE_CACHES",
