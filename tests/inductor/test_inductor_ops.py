@@ -4828,11 +4828,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
+            # Both cases pass on CI's deeptools and fail on other builds, so they are
+            # non-strict: a pass is reported, not an error.
             # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
+            # some builds do.
+            # #5358: dbo-opt intermittently fails program verification for the fp32
+            # reduction over the 256-wide last dim on deeptools main.
             "expect_fail_unstable": {
                 "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
             },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
@@ -5219,6 +5223,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5467,6 +5478,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
