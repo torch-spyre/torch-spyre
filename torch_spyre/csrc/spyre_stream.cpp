@@ -282,6 +282,14 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
+void SpyreStream::copyRaw(const flex::SharedPool& pool, size_t slot_id,
+                          const flex::CompositeAddress* device_address,
+                          bool to_device,
+                          std::optional<flex::Range> range) const {
+  resolveRuntimeHandle()->copyRaw(pool, slot_id, device_address, to_device,
+                                  range);
+  
+void SpyreStream::launchHostCompute(flex::HostComputeParams* params) const {
 flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
