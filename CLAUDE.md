@@ -60,9 +60,12 @@ them with `PARAMS`, and `pr-review` checks them.
 
 ### Say exactly what is expected
 
-- An xfail is `strict=True` with `raises=<exception type>`, so any other failure, or an
-  unexpected pass, fails the test. CI runs xfail-marked tests, and a strict XPASS fails
-  the run. When a bug is fixed, the same PR removes its xfail.
+- An xfail is `strict=True`, so an unexpected pass fails the test. Where you write the
+  marker (`@pytest.mark.xfail`, `strict_xfail`) also give it `raises=<exception type>`,
+  so any other failure fails the test too. The `expect_fail` key is strict but cannot
+  narrow the exception; for a failure with a stable error use `expect_raise`. CI runs
+  xfail-marked tests, and a strict XPASS fails the run. When a bug is fixed, the same
+  PR removes its xfail.
 - `expect_fail_unstable` (non-strict) is only for an outcome that really varies between
   runs or backend builds, with a reason and an issue. It is not a way to silence a
   strict XPASS you do not understand.
@@ -75,7 +78,9 @@ them with `PARAMS`, and `pr-review` checks them.
   become a positive one. Keep xfail for wrong values and bugs.
 - Every xfail and skip says why. For a bug, the reason describes the failure **today**
   and cites an **open** issue; a reason that cites a closed issue, or names an error
-  the body no longer hits, is stale. (A skip for a missing hardware or configuration
+  the body no longer hits, is stale. Give `expect_fail` as a `{case: reason}` mapping,
+  not a list, so the reason and the issue appear in the xfail report; a list only names
+  the case. (A skip for a missing hardware or configuration
   condition, such as `SENCORES=1`, needs no issue.) To check a reason, run the body
   with the expectation disabled (`--runxfail`; OOT-wrapped tests still convert the
   failure to an xfail, with the original message in `wasxfail`).

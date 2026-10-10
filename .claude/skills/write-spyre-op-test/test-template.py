@@ -63,7 +63,7 @@ class TestMyOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # skill and "Test Invariants" in CLAUDE.md), then add the matching key to
         # the entry above, next to "param_sets":
         #   "expect_raise": {"case_name": "message fragment"},  # stable rejection
-        #   "expect_fail": ["case_name"],  # wrong values or a bug; cite the issue
+        #   "expect_fail": {"case_name": "reason, #issue"},  # wrong values or a bug
         #   "expect_fail_unstable": {"case_name": "reason, #issue"},  # varies
         # --- Example: Concrete test without ops_dict ---
         # Generates: test_my_specific_op_{case_name}

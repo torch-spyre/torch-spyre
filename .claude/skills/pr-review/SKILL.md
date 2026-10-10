@@ -112,8 +112,10 @@ adds, changes or removes an `xfail`, `skip`, `expect_*` key or `pytest.raises` i
 - No `pytest.xfail(...)` in a test body or helper, and no `try`/`except` that turns an
   error into an xfail or skip. Use a marker, a `PARAMS` key or `strict_xfail`
   (**BLOCKER**: the test then cannot XPASS).
-- An xfail is strict with `raises=`. `expect_fail_unstable` needs a reason and an issue
-  and must be an outcome that really varies.
+- An xfail is strict, and has `raises=` where the author writes the marker
+  (`@pytest.mark.xfail`, `strict_xfail`). `expect_fail` is a `{case: reason}` mapping
+  that cites the issue. `expect_fail_unstable` needs a reason and an issue and must be
+  an outcome that really varies.
 - A stable rejection or missing feature is an assertion (`expect_raise`, or
   `pytest.raises(match=...)` with `@expects_raise`), with a `TODO` if it is a missing
   feature. A failure that kills the process is a `skip`, not an xfail.

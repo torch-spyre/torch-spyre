@@ -190,7 +190,7 @@ reports an xfail, with the original message in `wasxfail`) and see what it does:
 |---|---|
 | passes | nothing: remove the entry |
 | raises a stable error (a deliberate rejection, or a missing feature) | `expect_raise` |
-| returns wrong values, or hits a bug | `expect_fail` (strict xfail), citing an open issue |
+| returns wrong values, or hits a bug | `expect_fail` (strict xfail) as `{case: reason}`, citing an open issue |
 | passes on some runs or some backend builds | `expect_fail_unstable` (non-strict), citing an issue |
 | kills the process or faults the device | `skip` or `device_fault`, citing an issue |
 
@@ -203,15 +203,19 @@ The keys sit next to `param_sets` in `PARAMS`:
     # {case or "<op>_<case>": message fragment}. Must raise, and the message must
     # match. Fails if it stops raising ("DID NOT RAISE") or raises something else.
     "expect_raise": {"fp32_4x32": "cannot rescale device layout"},
-    # [case, ...]. Strict xfail: fails if the case starts passing. Add a comment
-    # with the issue.
-    "expect_fail": ["fp16_67x71"],  # #1234
+    # {case or "<op>_<case>": reason}. Strict xfail: fails if the case starts passing.
+    # The reason, with the issue, appears in the xfail report. A plain list of cases
+    # also works, but its reason only names the case.
+    "expect_fail": {"fp16_67x71": "wrong values, #1234"},
     # {case or "<op>_<case>": reason}. Non-strict xfail, for an outcome that varies.
     "expect_fail_unstable": {"fp16_4x63": "passes on some runs, #5285"},
 },
 ```
 
 - A bare case name applies to every op in `ops_dict`; `"<op>_<case>"` to one op.
+- `expect_fail` is strict but cannot narrow the exception with `raises=`, so a failure
+  with a stable error is better as `expect_raise`. An `expect_fail` mapping entry needs
+  a non-empty reason; that is checked when the class is created.
 - `expect_raise` and `expect_fail_unstable` entries that match no generated test, or
   that also appear under another key, fail when the class is created. A stale
   `expect_fail` or `skip` entry is silently ignored, so delete entries when you fix
