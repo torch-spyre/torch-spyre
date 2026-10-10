@@ -1875,8 +1875,20 @@ def iter_var_id(stick_expr) -> int:
 
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
-        # The iteration space of a Pointwise is that of its output
-        return next(iter(n.read_writes.writes)).ranges.copy()
+        # The iteration space of a Pointwise is that of its output.
+        # For a Scatter (subclass of Pointwise) with a sub-stick destination, the
+        # write dep ranges may be empty (the mutation target has no per-element loop
+        # var when the last dim is size-1 with a constant coordinate).  Fall back to
+        # the read deps' ranges so the scheduler gets the correct iteration count.
+        result = next(iter(n.read_writes.writes)).ranges.copy()
+        if not result:
+            for dep in n.read_writes.reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                for sym, size in dep.ranges.items():
+                    if sym not in result:
+                        result[sym] = size
+        return result
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
         # Inductor shares sympy symbols across all tensor accesses in a Reduction's

@@ -34,6 +34,7 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
+    KEEP_BY_INDEX_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -44,7 +45,6 @@ from torch_spyre._inductor.constants import (
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
@@ -491,11 +491,11 @@ def _get_padded_iteration_space(
     """
     padding: dict = {}
     unpadded_extent = dict(sdsc_iteration_space)
-    for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
+    for sdsc_arg, op_spec_arg, d_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
-        for dim in dim_order:
+        for dim in d_order:
             if dim not in stick_dim_order:
                 continue
             effective_stick_size = (
@@ -1205,6 +1205,7 @@ def _create_sdsc_tensors(
         injected_dims = {}
     mb_sym = injected_dims.get("mb_sym")
     index_stick_syms = injected_dims.get("index_stick_syms")
+    indirect_stick_sym = injected_dims.get("indirect_stick_sym")
     layouts: dict = {}
     # matmul and conv share the two-input tensor treatment: each arg keeps its
     # own natural (per-tensor) dim order and the weight gets the KERNEL layout
@@ -1316,18 +1317,63 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
 
-        # Step 2: Handle reduced dimensions — skip for index tensors.
+        # Step 2: Handle reduced dimensions.
+        # Normally skip for index tensors.  Exception: in a sub-stick indirect
+        # scatter (op_stick_dim is None, has_indirect_access), the KERNEL_IDX
+        # tensor may have fewer dims than N_.  For example, a (T, KV, 1) scatter
+        # with a 1D slot_mapping has N_ = {mb:T, out:KV, y:64}, but the
+        # KERNEL_IDX device coordinates only carry "mb" (the scatter iteration)
+        # while "out" (KV_heads) is a regular loop variable the index broadcasts
+        # over.  Every HBM-pinned tensor's layoutDimOrder_ must cover all dims in
+        # N_ where it is referenced; omitting "out" from the KERNEL_IDX layout causes
+        # a dimension mismatch.
+        # Adding "out" as a reduced (scale=-1 broadcast) dim to the KERNEL_IDX
+        # layout fixes this — the index tensor is broadcast across KV heads.
         if (
             use_op_dims
             and dim_order != dims
             and not _is_topk(op_spec.op)
             and not _is_keep_by_index(op_spec.op)
         ):
+            # Sub-stick indirect SCATTER: the KERNEL_IDX (slot_mapping) is broadcast
+            # over the middle dimensions (e.g. KV_heads) that are not present in the
+            # index tensor's own coordinates but ARE in op_dim_order.  These must be
+            # added as reduced (scale=-1, broadcast) dims so the SDSC knows the index
+            # tensor repeats for each KV head.
+            #
+            # This must NOT fire for GATHER (index_select): the index there is also
+            # sub-stick (the read-source has last dim < stick), but the KERNEL_IDX
+            # only selects which page/row to read — it does NOT broadcast over the
+            # inner B×KV dimensions.  Adding extra dims to KERNEL_IDX for gather
+            # causes wrong address computations and hardware errors.
+            #
+            # Distinction: scatter writes to the LAST arg (which has IndirectAccess);
+            # gather reads from an intermediate arg (IndirectAccess on args[:-1]) and
+            # writes to a fresh output (args[-1] has no IndirectAccess).
+            is_substick_indirect_scatter_index = (
+                has_indirect_access
+                and i in index_tensor_indices
+                and op_stick_dim is None
+                and is_indirect_value_tensor(op_spec.args[-1])
+            )
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
+            elif is_substick_indirect_scatter_index:
+                # Sub-stick indirect scatter: add missing op_dim_order dims as
+                # reduced (broadcast) dims on the KERNEL_IDX tensor.
+                reduced_dims = [
+                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                ]
+                dim_order = dim_order + reduced_dims
+                logger.debug(
+                    "_create_sdsc_tensors: added broadcast dims %s to KERNEL_IDX "
+                    "arg %d for sub-stick indirect scatter",
+                    reduced_dims,
+                    i,
+                )
 
         if is_matmul and i == 0 and matmul_x_reuse_dims:
             # Two cases for reuse dims on x:
@@ -1355,9 +1401,20 @@ def _create_sdsc_tensors(
             dim_order = dim_order + batch_reuse
 
         # Step 3: Handle missing stick dimension — skip for index tensors.
-        if op_stick_dim is None:
-            if not (has_indirect_access and i in index_tensor_indices):
-                stick_dim = next(d for d in dims if d not in op_dim_order)
+        if op_stick_dim is None and not (
+            has_indirect_access and i in index_tensor_indices
+        ):
+            if indirect_stick_sym is not None:
+                # Sub-stick indirect scatter: the stick sym was injected into the
+                # iteration space by compile_op_spec (e.g. "y":64).  Use it directly
+                # as the stick dim for value/destination tensors.  The first-missing-dim
+                # fallback below would wrongly pick the outer loop variable (e.g. mb=T)
+                # as the stick, causing the token loop to be treated as the stick
+                # and padded up to stick size — which then mismatches the physical
+                # device layout and triggers a dimension mismatch.
+                stick_dim = indirect_stick_sym
+            else:
+                stick_dim = next((d for d in dims if d not in op_dim_order), None)
                 # The chosen dim is absent from the *op*'s dim_order, but an
                 # individual arg may already carry it: a conv2d kernel tensor
                 # gets ki/kj added explicitly by _get_device_dim_order (they are
@@ -1366,8 +1423,8 @@ def _create_sdsc_tensors(
                 # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
                 # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
                 # rejects with "external allocations with repeated dimensions".
-                if stick_dim not in dim_order:
-                    dim_order = dim_order + [stick_dim]
+            if stick_dim is not None and stick_dim not in dim_order:
+                dim_order = dim_order + [stick_dim]
 
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
@@ -1532,7 +1589,7 @@ def _create_sdsc_tensors(
         # Injected stick dims: set max_dim_size=1 for all tensors
         # that carry them in dim_order.
         if index_stick_syms:
-            for idx, stick_sym in index_stick_syms.items():
+            for stick_sym in index_stick_syms.values():
                 if stick_sym in dim_order:
                     injected_dim_sizes[stick_sym] = 1
 
@@ -2144,6 +2201,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     stick_sym.name,
                 )
 
+    indirect_stick_sym: Symbol | None = None
     if op_stick_dim is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
             # Pool/depthwise-conv op where C fits in one stick (e.g. C=1): the
@@ -2181,10 +2239,41 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             else:
                 sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
         else:
-            # A degenerate dim has logical size 1; _get_padded_iteration_space
-            # later pads it up to a full stick, per arg by that arg's own width.
             stick_sym = _first_free_dim_label(sdsc_iteration_space)
-            sdsc_iteration_space[stick_sym] = 1
+            if has_indirect_access:
+                # For indirect-access ops (scatter/gather) with a sub-stick last
+                # dim (op_stick_dim is None because the 1-element logical dim was
+                # squeezed out of the iteration space), args[0] is the KERNEL_IDX
+                # (int32, 32 elems/stick) — not the fp16 value tensor (64
+                # elems/stick).  Using the wrong stick size produces an incorrect
+                # stick dimension in N_ (e.g. "y:32" instead of "y:64").
+                # Find the value tensor arg (the one with IndirectAccess coords).
+                val_arg = next(
+                    (
+                        op_spec.args[j]
+                        for j in range(len(op_spec.args))
+                        if j not in index_tensor_indices
+                        and is_indirect_value_tensor(op_spec.args[j])
+                    ),
+                    None,
+                )
+                # Read stick size from the value tensor if found; fall back to args[0].
+                sdsc_iteration_space[stick_sym] = (
+                    val_arg.device_dtype.elems_per_stick()
+                    if val_arg is not None
+                    else op_spec.args[0].device_dtype.elems_per_stick()
+                )
+                # Remember which sym is the stick so _create_sdsc_tensors step 3
+                # can use it for value/destination tensors instead of mistakenly
+                # picking the first outer loop dim (e.g. mb=T) as the stick.
+                # Only for scatter (args[-1] has IndirectAccess) — not for gather
+                # (args[-1] is a fresh output without IndirectAccess).
+                if is_indirect_value_tensor(op_spec.args[-1]):
+                    indirect_stick_sym = stick_sym
+            else:
+                # A degenerate dim has logical size 1; _get_padded_iteration_space
+                # later pads it up to a full stick, per arg by that arg's own width.
+                sdsc_iteration_space[stick_sym] = 1
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
@@ -2223,6 +2312,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
+    # For sub-stick indirect scatter/gather (op_stick_dim is None, has_indirect_access),
+    # the stick sym (e.g. "y") was added to sdsc_iteration_space above but is absent from
+    # every value/destination tensor's layoutDimOrder_ unless _create_sdsc_tensors step 3
+    # is told which sym IS the stick.  Pass it explicitly so step 3 can use it instead of
+    # picking the first outer iteration dim (which is wrong).
+    if indirect_stick_sym is not None:
+        injected_dims["indirect_stick_sym"] = indirect_stick_sym
     if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
         input_arg = op_spec.args[0]
         output_arg = op_spec.args[-1]
