@@ -36,12 +36,16 @@ class OpAdapter:
         fn: The actual callable to execute (e.g., torch.mul or a wrapper function)
         is_inplace: Whether this operation modifies tensors in-place
         pre: Optional preprocessing hook to normalize SampleInput before execution
+        uninitialized_output: Whether the output holds uninitialized memory (e.g.,
+            torch.empty_like). Its element values are non-deterministic, so only
+            tensor metadata (shape, dtype, layout, stride) is compared
     """
 
     name: str
     fn: Callable[..., Any]
     is_inplace: bool = False
     pre: Optional[Callable[[SampleInput], SampleInput]] = None
+    uninitialized_output: bool = False
 
 
 # -----------------------------
@@ -458,7 +462,9 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.to": OpAdapter("torch.to", _tensor_to),
     "torch.type_as": OpAdapter("torch.Tensor.type_as", torch.Tensor.type_as),
     # Creation
-    "torch.empty_like": OpAdapter("torch.empty_like", torch.empty_like),
+    "torch.empty_like": OpAdapter(
+        "torch.empty_like", torch.empty_like, uninitialized_output=True
+    ),
     "torch.ge": OpAdapter("torch.ge", _torch_ge),
     "torch.histc": OpAdapter("torch.histc", torch.histc),
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
