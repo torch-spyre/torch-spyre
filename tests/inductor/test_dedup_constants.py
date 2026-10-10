@@ -43,9 +43,11 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
+from torch_spyre._inductor import pass_counters
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.dedup_constants import dedup_and_promote_constants
 from torch_spyre._inductor.ir import SpyreConstantFallback
+from torch_spyre._inductor.pass_counters import READ_WRITES_EXTRACTIONS
 from torch_spyre._inductor.pass_utils import NameSwapHandler
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
@@ -916,13 +918,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         x = torch.randn(2, 8, k_aligned, dtype=dtype, device="spyre")
         w1 = torch.randn(2, k_aligned, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -938,10 +933,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "fixture shape changed.",
             )
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             self.assertEqual(
                 calls,
@@ -982,13 +976,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w3 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1009,37 +996,41 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "PRECONDITION: no dedup group with >=3 constants (D>=2). "
                 "Not a dedup failure.",
             )
-            n_ops_at_entry = len(graph.operations)
+            n_computed = sum(isinstance(op, ComputedBuffer) for op in graph.operations)
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             # In the single-sweep implementation, each ComputedBuffer in
             # graph.operations at pass entry is visited exactly once,
-            # so the call count is at most n_ops_at_entry.
+            # so the call count is at most n_computed.
             #
             # A regression that rebuilds the reverse index inside the
-            # per-duplicate loop would call get_read_writes on each op
-            # once per duplicate; with D >= 2 in the largest group the
-            # call count would be at least 2 * (number of ComputedBuffer
-            # candidates) > n_ops_at_entry.
+            # per-duplicate loop would call get_read_writes on each
+            # ComputedBuffer once per duplicate; with D >= 2 in the
+            # largest group the call count would be at least
+            # 2 * n_computed.
             #
             # The tight invariant this guard enforces:
             #
-            #     get_read_writes calls <= n_ops_at_entry.
+            #     get_read_writes calls <= n_computed.
             #
-            # Any per-duplicate rebuild would blow past this bound.
+            # Any per-duplicate rebuild would blow past this bound. It counts
+            # ComputedBuffers rather than all ops because constants and other
+            # extern kernels are never counted: against an op-count bound, a
+            # rebuild passes whenever ComputedBuffers are half the graph or
+            # less.
             self.assertLessEqual(
                 calls,
-                n_ops_at_entry,
+                n_computed,
                 f"regression guard: dedup called "
                 f"ComputedBuffer.get_read_writes {calls} times on a graph "
-                f"with {n_ops_at_entry} ops at pass entry. A single-sweep "
-                "reverse-index build should make at most one call per op. "
-                "A count materially larger than N suggests the index is "
-                "being rebuilt per duplicate (regression).",
+                f"with {n_computed} ComputedBuffers at pass entry. A "
+                "single-sweep reverse-index build should make at most one "
+                "call per ComputedBuffer. A count materially larger "
+                "suggests the index is being rebuilt per duplicate "
+                "(regression).",
             )
             # Also assert a lower bound so a broken impl that made zero
             # get_read_writes calls (and never built the index) does not
@@ -1106,13 +1097,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w1 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1155,10 +1139,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             object.__setattr__(graph, "get_output_names", patched_get_output_names)
 
             try:
-                with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                    counter["n"] = 0
+                with pass_counters.counted_region() as counts:
                     dedup_and_promote_constants(graph)
-                    calls = counter["n"]
+                calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
             finally:
                 # Restore -- best-effort; the test raises _TestStopSignal
                 # right after this so the graph will not be used.

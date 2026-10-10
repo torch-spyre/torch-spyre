@@ -772,8 +772,8 @@ Environment Variables
        op-spec IR at pipeline stage boundaries (default empty)
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
-       pass pipeline and per pass, with input/output graph sizes
-       (default ``0``)
+       pass pipeline and per pass, with input/output graph sizes and
+       analysis-call counts (default ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
