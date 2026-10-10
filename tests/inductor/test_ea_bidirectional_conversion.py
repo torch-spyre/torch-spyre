@@ -545,4 +545,58 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
     assert_ea(z32, ea_of(src_dev))
 
 
+_FRESH_ALLOCATION_PROGRAMS = {
+    "cat_dim0": lambda a, b: torch.cat([a.float(), b.float()]),
+    "cat_stick_dim": lambda a, b: torch.cat([a.float(), b.float()], dim=1),
+    "stack": lambda a, b: torch.stack([a.float(), b.float()]),
+    "pad_rows": lambda a, b: torch.nn.functional.pad(a.float(), (0, 0, 0, 4)),
+}
+
+
+def _small_int_fp16(shape, modulus, base=0):
+    # Integers <= 1024 are exact in DLFloat16, so results compare bit-exact.
+    return (torch.arange(shape[0] * shape[1]) % modulus + base).reshape(shape).half()
+
+
+@pytest.mark.parametrize("program", list(_FRESH_ALLOCATION_PROGRAMS))
+def test_staggered_into_fresh_allocation(program):
+    """cat, stack and F.pad of upcasts keep DL16_TO_FP32 in their fresh output."""
+    fn = _FRESH_ALLOCATION_PROGRAMS[program]
+    a = _small_int_fp16((4, 64), 7)
+    b = _small_int_fp16((4, 64), 5, base=10)
+
+    out = torch.compile(fn)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out, ElementArrangement.DL16_TO_FP32)
+
+    def round_trip(a, b):
+        return fn(a, b).half()
+
+    out16 = torch.compile(round_trip)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+    assert_ea(out16, ElementArrangement.STANDARD)
+    assert torch.equal(out16.cpu(), round_trip(a, b))
+
+
+def test_cat_of_staggered_and_standard_raises():
+    """One allocation cannot hold a staggered and a STANDARD writer."""
+    a = _small_int_fp16((4, 64), 7)
+    c = torch.ones(4, 64, dtype=torch.float32)
+
+    def fn(a, c):
+        return torch.cat([a.float(), c])
+
+    with pytest.raises(Exception, match="mixed element arrangements"):
+        torch.compile(fn)(a.to(DEVICE_NAME), c.to(DEVICE_NAME))
+
+
+def test_pad_of_staggered_inside_stick_pair_raises():
+    """A pad that ends inside a DL16_TO_FP32 stick pair cannot keep the stagger."""
+    a = _small_int_fp16((4, 64), 7)
+
+    def fn(a):
+        return torch.nn.functional.pad(a.float(), (0, 32))
+
+    with pytest.raises(Exception, match="not whole units"):
+        torch.compile(fn)(a.to(DEVICE_NAME))
+
+
 # Made with Bob

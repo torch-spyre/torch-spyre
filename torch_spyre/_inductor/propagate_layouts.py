@@ -2257,8 +2257,12 @@ def _align_single_source_producer(
 
 def _scan_mutation_layout_inputs(
     operations: list[Operation],
-) -> tuple[dict[str, SpyreTensorLayout], dict[str, int]]:
-    """One walk of ``operations`` gathering ``(alt_stls, consumer_counts)``.
+) -> tuple[
+    dict[str, SpyreTensorLayout], dict[str, int], dict[str, list[ComputedBuffer]]
+]:
+    """One walk of ``operations`` gathering ``(alt_stls, consumer_counts, writers)``.
+
+    ``writers`` maps each mutation target to the ops writing it, in order.
 
     Aliasing writes into one target must agree on a single alt layout, so
     ``alt_stls`` is keyed by buffer rather than by op. An internal buffer takes
@@ -2333,7 +2337,92 @@ def _scan_mutation_layout_inputs(
                     f"not yet supported"
                 )
             alt_stls[name] = alt_stl
-    return alt_stls, consumer_counts
+    return alt_stls, consumer_counts, groups
+
+
+def _fresh_allocation_layout(
+    op: Operation, writers: list[ComputedBuffer]
+) -> SpyreTensorLayout:
+    """Device layout of a no-op allocation, tagged with what its writers store.
+
+    An Inductor ``empty`` (the output of ``cat`` or ``constant_pad_nd``) has no
+    inputs, so its layout is fixed here, before any of its mutation writers is
+    visited, and each writer then adopts it. The writers' sources come earlier in
+    topological order and are already laid out, so a staggered element
+    arrangement among them is carried onto the allocation rather than written
+    into a buffer tagged STANDARD.
+    """
+    stl = generic_layout(op)
+    name = op.get_name()
+    source_eas: set[ElementArrangement] = set()
+    for writer in writers:
+        reads = [r for r in writer.get_read_writes().reads if r.name != name]
+        for arg in _get_prop_args(reads, strict=False):
+            source_eas.update(s.element_arrangement for s in arg.layouts)
+    staggered_eas = source_eas & STAGGERED_EAS
+    if not staggered_eas:
+        return stl
+    if len(source_eas) > 1:
+        # TODO: support mixed arrangements; needs an arrangement-converting
+        # copy.
+        raise Unsupported(
+            f"writers of {name} store mixed element arrangements "
+            f"{sorted(ea.name for ea in source_eas)}"
+        )
+    stl = stl.with_element_arrangement(next(iter(staggered_eas)))
+    for writer in writers:
+        _check_whole_stagger_units(writer, op.get_layout(), stl)
+    return stl
+
+
+def _check_whole_stagger_units(
+    writer: ComputedBuffer, target_layout: FixedLayout, target_stl: SpyreTensorLayout
+) -> None:
+    """Raise unless ``writer`` covers whole stagger units of the stick dim.
+
+    Both staggered arrangements interleave the elements of one fp16 stick (a
+    DL16_TO_FP32 stick pair, or one FP32_TO_DL16 stick), so a write at an offset
+    or with an extent inside such a unit cannot keep the arrangement, and a
+    generic layout whose stick dim ends inside one has no room for its last unit.
+    """
+    c_size = [concretize_expr(s) for s in target_layout.size]
+    c_stride = [concretize_expr(s) for s in target_layout.stride]
+    stick_dim = next(
+        (
+            d
+            for d in reversed(range(len(c_size)))
+            if c_size[d] > 1 and c_stride[d] == target_stl.stride_map[-1]
+        ),
+        None,
+    )
+    if stick_dim is None:
+        return
+    unit = get_elem_in_stick(torch.float16)
+    output_dep = next(iter(writer.get_read_writes().writes))
+    coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
+    syms = coord.free_symbols
+    offset = coord.subs({s: 0 for s in syms})
+    extent: int | None
+    if not syms:
+        extent = 1
+    elif len(syms) == 1 and coord - offset == next(iter(syms)):
+        extent = _concrete_int(output_dep.ranges.get(next(iter(syms))))
+    else:
+        extent = None
+    whole_units = (
+        extent is not None
+        and offset.is_integer
+        and int(offset) % unit == 0
+        and extent % unit == 0
+        and c_size[stick_dim] % unit == 0
+    )
+    if not whole_units:
+        # TODO: support writes that split a stagger unit.
+        raise Unsupported(
+            f"{writer.get_name()} writes {target_stl.element_arrangement.name} "
+            f"data at stick-dim coordinate {coord}, not whole units of {unit} "
+            f"elements"
+        )
 
 
 def _find_alt_target_stl(
@@ -2633,14 +2722,18 @@ def propagate_spyre_tensor_layouts(
                     tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
-    mutation_alts, mutation_consumer_counts = _scan_mutation_layout_inputs(operations)
+    mutation_alts, mutation_consumer_counts, mutation_writers = (
+        _scan_mutation_layout_inputs(operations)
+    )
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
     # performed to compute the set of possible output SpyreTensorLayouts.
     for op in operations:
         if op.is_no_op():
-            op.layouts = [generic_layout(op)]
+            op.layouts = [
+                _fresh_allocation_layout(op, mutation_writers.get(op.get_name(), []))
+            ]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
             layout = op.maybe_get_layout()
