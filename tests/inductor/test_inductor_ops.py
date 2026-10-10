@@ -1332,7 +1332,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # A pointwise op over y.expand_as(x), where y has a size-1 last dim, is its
         # own FX node and so is realized at x's size. Its consumer pairs it with
         # x, which needs no restickify.
-        ("test_expand_size1_pointwise", "test_expand_size1_pointwise_cpu"): {
+        ("test_expand_size1_pointwise", "test_expand_size1_cpu"): {
             "ops_dict": {
                 "abs": lambda x, y: x + y.expand_as(x).abs(),
                 "add_then_gt": lambda x, y: x > y.expand_as(x) + 1,
@@ -1355,6 +1355,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ("3x5x1_unexpanded", (3, 5, 1), (3, 5, 1)),
                     ("100x1_unexpanded", (100, 1), (100, 1)),
                     ("3x5x1_non_stick_dim_expanded", (3, 5, 1), (3, 1, 1)),
+                ]
+                for dtype in [torch.float16, torch.float32]
+            },
+        },
+        # A reduction over y.expand_as(x), where y has a size-1 last dim, keeps the
+        # expanded dim in its output although its input does not index it.
+        ("test_expand_size1_reduction", "test_expand_size1_cpu"): {
+            "ops_dict": {
+                "sum": lambda x, y: y.expand_as(x).sum(1),
+                "sum_then_add": lambda x, y: x.sum(1) + y.expand_as(x).sum(1),
+                "amax_then_add": lambda x, y: x.amax(1) + y.expand_as(x).amax(1),
+            },
+            "param_sets": {
+                f"{name}_{_dtype_name(dtype)}": (
+                    _cached_randint(x_shape, dtype),
+                    _cached_randint(y_shape, dtype) - 200,
+                )
+                for name, x_shape, y_shape in [
+                    ("3x5x128", (3, 5, 128), (3, 5, 1)),
+                    ("3x5x100_unaligned", (3, 5, 100), (3, 5, 1)),
+                    ("4d", (2, 3, 8, 64), (2, 3, 8, 1)),
+                    # Control: the size-1 last dim is not expanded.
+                    ("3x5x1_unexpanded", (3, 5, 1), (3, 5, 1)),
                 ]
                 for dtype in [torch.float16, torch.float32]
             },
@@ -7459,7 +7482,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, a, b)
 
-    def test_expand_size1_pointwise_cpu(self, op, x, y):
+    def test_expand_size1_cpu(self, op, x, y):
         # A restickify here means the expanded operand kept its
         # one-element-per-stick layout.
         with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
