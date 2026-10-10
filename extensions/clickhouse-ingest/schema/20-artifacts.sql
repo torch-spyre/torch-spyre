@@ -164,3 +164,34 @@ TTL ts + INTERVAL 90 DAY DELETE WHERE state = 'running';
 -- A sparse junction, not a spine: only a minority of runs land a row here, so run metadata must
 -- not live on this table. state='running' is advisory only (ClickHouse has no locks); the TTL
 -- reaps orphaned rows from crashed runs, and the tier gate accepts only 'passed'.
+
+-- Why a leg did not pass, when the reason arrives after artifact_results' write-once verdict (a
+-- later collector, a backfill). Read through v_artifact_results_enriched, which also folds in the
+-- verdict row's own props; one row per (verdict, source), the highest confidence wins on read.
+CREATE TABLE IF NOT EXISTS artifact_result_reasons
+(
+    updated_at        DateTime64(3, 'UTC') DEFAULT now64(3),
+    artifact_id       UUID,
+    run_id            UUID,
+    result_kind       LowCardinality(String),
+    test_type         LowCardinality(String),
+    failure_reason    LowCardinality(String),
+    failure_subreason LowCardinality(String) DEFAULT '',
+    failure_detail    String DEFAULT '',
+    failure_log_url   String DEFAULT '',
+    failure_wait_s    UInt32 DEFAULT 0,
+    -- 3 = the writer's own classification, 2 = classified from the console, 1 = inferred.
+    confidence        UInt8 DEFAULT 1,
+    source            LowCardinality(String),
+    props             Map(LowCardinality(String), String),
+    audit_uuid        UUID DEFAULT generateUUIDv7(),
+    audit_timestamp   DateTime64(3) DEFAULT now64(3),
+
+    -- diagnose_failure.py's categories plus the five no-verdict outcomes it cannot see in a log.
+    CONSTRAINT chk_failure_reason CHECK failure_reason IN
+        ('test_failure','build_error','infra_disk','infra_network','infra_auth',
+         'infra_capacity','infra_hardware','infra_timeout','infra_env','superseded',
+         'aborted','dependency_failed','pipeline_error','ingest_error','unknown')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (artifact_id, run_id, result_kind, test_type, source);

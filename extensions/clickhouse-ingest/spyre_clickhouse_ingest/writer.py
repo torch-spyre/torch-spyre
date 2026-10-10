@@ -791,6 +791,16 @@ class ArtifactWriter:
     ref_table = schema.ArtifactRefs
     tag_table = schema.ArtifactTags
     result_table = schema.ArtifactResults
+    reason_table = schema.ArtifactResultReasons
+    FAILURE_PROPS = (
+        "failure_reason",
+        "failure_subreason",
+        "failure_detail",
+        "failure_log_url",
+        "failure_wait_s",
+        "failure_confidence",
+    )
+    FAILURE_DETAIL_MAX = 300
 
     # kind -> (method, ref_kind) of the address artifact_refs records.
     REF_SHAPE = {
@@ -996,20 +1006,16 @@ class ArtifactWriter:
     ) -> bool:
         """One verdict of one leg on one artifact; refuses a partial key, skips a repeat.
 
-        Given an attempt, the verdict replaces any from an earlier attempt of the same run.
+        Given an attempt, the verdict replaces any from an earlier attempt of the same run. A
+        repeat that explains a failure lands its reason in artifact_result_reasons instead.
         """
         aid, rid, a = (
             DerivedId.norm(artifact_id),
             DerivedId.norm(run_id),
             DerivedId.arch(arch),
         )
-        kind = result_kind or (
-            "performance"
-            if test_type == "perf"
-            else "capability"
-            if test_type in schema.CAPABILITY_TYPE_VALUES
-            else "functional"
-        )
+        kind = cls._result_kind(test_type, result_kind)
+        props = cls.failure_props(state, props)
         if not (aid and rid and a):
             print(
                 f"  [warn] v2: artifact result skipped -- artifact_id={aid or '<blank>'} "
@@ -1018,6 +1024,18 @@ class ArtifactWriter:
             )
             return False
         if cls.result_recorded(client, db, aid, rid, kind, test_type, attempt):
+            if props.get("failure_reason"):
+                cls.insert_reason(
+                    client,
+                    db,
+                    artifact_id=aid,
+                    run_id=rid,
+                    test_type=test_type,
+                    result_kind=kind,
+                    props=props,
+                    confidence=int(props.get("failure_confidence") or 3),
+                    source=props.get("source") or "writer",
+                )
             return True
         if attempt:
             where, params = cls._verdict_key(aid, rid, kind, test_type)
@@ -1040,6 +1058,81 @@ class ArtifactWriter:
             ),
         }
         cls.result_table.insert(client, [result_row], db=db)
+        return True
+
+    @staticmethod
+    def _result_kind(test_type: str, result_kind: str = "") -> str:
+        return result_kind or (
+            "performance"
+            if test_type == "perf"
+            else "capability"
+            if test_type in schema.CAPABILITY_TYPE_VALUES
+            else "functional"
+        )
+
+    @classmethod
+    def failure_props(cls, state: str, props) -> dict:
+        """`props` with failure_* kept only on a failed/error verdict, its reason in the taxonomy."""
+        out = dict(props or {})
+        if state not in ("failed", "error"):
+            return {k: v for k, v in out.items() if k not in cls.FAILURE_PROPS}
+        reason = out.get("failure_reason", "")
+        if reason and reason not in schema.FAILURE_REASON_VALUES:
+            print(
+                f"  [warn] v2: failure_reason {reason!r} is not in the taxonomy; "
+                "recorded as unknown",
+                file=sys.stderr,
+            )
+            out["failure_subreason"] = out.get("failure_subreason") or reason
+            out["failure_reason"] = "unknown"
+        if out.get("failure_detail"):
+            out["failure_detail"] = str(out["failure_detail"])[: cls.FAILURE_DETAIL_MAX]
+        if "failure_wait_s" in out:
+            # Whole seconds, as the view's toUInt32OrZero reads them; a bad value is dropped.
+            try:
+                out["failure_wait_s"] = str(int(float(out["failure_wait_s"])))
+            except (TypeError, ValueError):
+                out.pop("failure_wait_s")
+        return out
+
+    @classmethod
+    def insert_reason(
+        cls,
+        client,
+        db: str,
+        *,
+        artifact_id: str,
+        run_id: str,
+        test_type: str,
+        props,
+        source: str,
+        confidence: int = 1,
+        result_kind: str = "",
+    ) -> bool:
+        """Why one verdict did not pass, from its failure_* props; best-effort, never raises."""
+        p = cls.failure_props("failed", props)
+        if not p.get("failure_reason"):
+            return False
+        row: schema.ArtifactResultReasonRow = {
+            "artifact_id": DerivedId.norm(artifact_id),
+            "run_id": DerivedId.norm(run_id),
+            "result_kind": cls._result_kind(test_type, result_kind),
+            "test_type": test_type,
+            "failure_reason": p["failure_reason"],
+            "failure_subreason": p.get("failure_subreason", ""),
+            "failure_detail": p.get("failure_detail", ""),
+            "failure_log_url": p.get("failure_log_url") or p.get("run_url", ""),
+            "failure_wait_s": int(p.get("failure_wait_s") or 0),
+            "confidence": confidence,
+            "source": source,
+            "props": {},
+        }
+        try:
+            cls.reason_table.insert(client, [row], db=db)
+        except Exception as err:
+            # The verdict already stands; a database without the table only loses the reason.
+            print(f"  [warn] v2: failure reason not recorded: {err!r}", file=sys.stderr)
+            return False
         return True
 
     @classmethod
@@ -1156,6 +1249,7 @@ capabilities_already_ingested = CapabilityWriter.already_ingested
 insert_capabilities = CapabilityWriter.insert
 artifact_already_recorded = ArtifactWriter.artifact_recorded
 artifact_result_already_recorded = ArtifactWriter.result_recorded
+insert_artifact_result_reason = ArtifactWriter.insert_reason
 insert_gha_artifact_result = ArtifactWriter.insert_gha_result
 insert_artifact = ArtifactWriter.insert_artifact
 insert_artifact_result = ArtifactWriter.insert_result

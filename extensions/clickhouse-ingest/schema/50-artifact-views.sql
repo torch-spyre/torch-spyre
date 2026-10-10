@@ -124,18 +124,117 @@ SELECT
     total_tests > 0 AS suite_ran,
     -- 'running' is advisory only (a crashed run keeps this row until the 90-day TTL); shown
     -- here for the drill-down, but aggregating callers must exclude it (see v_tier_trend).
-    CAST(r.state = 'running' AS UInt8) AS is_advisory
+    CAST(r.state = 'running' AS UInt8) AS is_advisory,
+    -- Why a failed/error leg did not pass ('' otherwise). A reasons row wins only by outranking
+    -- the verdict's own props; failed cases are the fallback, then 'unknown'.
+    if(r.state NOT IN ('failed', 'error'), '',
+       multiIf(coalesce(x.x_conf, 0) > r.own_conf, x.x_reason,
+               r.own_reason != '', r.own_reason,
+               failed + errors > 0, 'test_failure',
+               'unknown')) AS failure_reason,
+    if(failure_reason = '', '',
+       if(coalesce(x.x_conf, 0) > r.own_conf, x.x_subreason, r.own_subreason)) AS failure_subreason,
+    if(failure_reason = '', '',
+       substringUTF8(multiIf(coalesce(x.x_conf, 0) > r.own_conf, x.x_detail,
+                         r.own_detail != '', r.own_detail,
+                         failed + errors > 0,
+                         concat(toString(failed + errors), ' of ', toString(total_tests), ' cases failed'),
+                         ''), 1, 300)) AS failure_detail,
+    if(failure_reason = '', '',
+       multiIf(coalesce(x.x_conf, 0) > r.own_conf AND x.x_log_url != '', x.x_log_url,
+               r.props['failure_log_url'] != '', r.props['failure_log_url'],
+               r.props['run_url'])) AS failure_log_url,
+    if(failure_reason = '', toUInt32(0),
+       if(coalesce(x.x_conf, 0) > r.own_conf, x.x_wait_s,
+          toUInt32OrZero(r.props['failure_wait_s']))) AS failure_wait_s,
+    startsWith(failure_reason, 'infra_') AS failure_is_infra,
+    multiIf(failure_reason = '', '',
+            coalesce(x.x_conf, 0) > r.own_conf, x.x_source,
+            r.own_conf >= 2, 'writer',
+            'derived') AS failure_source
 FROM
 (
     -- One row per verdict, the latest: a leg writes a 'running' seed before its final state and a
     -- re-push repeats it, so raw rows count a run's counters twice. A run can hold a functional
     -- and a capability verdict for one artifact, hence result_kind/test_type in the key.
-    SELECT *
+    -- own_*: the reason the verdict row itself carries -- props.failure_* (3, or its failure_confidence), else the stale-leg
+    -- cleanup's closed_reason, a dead runner or diagnose_failure's category (2). closed_reason only
+    -- explains an 'error' close: on 'failed' it says why the row was missing, not why it failed.
+    SELECT
+        *,
+        if(startsWith(props['diagnosis'], '{'),
+           JSONExtractString(props['diagnosis'], 'category'), props['diagnosis']) AS dg_cat,
+        multiIf(props['failure_reason'] != '', props['failure_reason'],
+                state = 'error' AND startsWith(props['closed_reason'], 'parent_superseded'), 'superseded',
+                state = 'error' AND props['closed_reason'] = 'parent_manual_abort', 'aborted',
+                state = 'error' AND props['closed_reason'] = 'parent_groovy_compile_error', 'pipeline_error',
+                state = 'error' AND props['closed_reason'] = 'ch_write_timeout', 'ingest_error',
+                state = 'error' AND props['closed_reason'] = 'parent_hung_jenkins_restart', 'infra_capacity',
+                props['runner_died'] IN ('1', 'true'), 'infra_capacity',
+                -- the pre-taxonomy spelling of ingest_error/result_lost
+                dg_cat = 'infra_result_lost', 'ingest_error',
+                dg_cat NOT IN ('', 'unknown'), dg_cat,
+                '') AS own_reason,
+        multiIf(props['failure_reason'] != '', props['failure_subreason'],
+                state = 'error' AND startsWith(props['closed_reason'], 'parent_superseded'), 'by_newer_run',
+                state = 'error' AND props['closed_reason'] = 'parent_manual_abort', 'user',
+                state = 'error' AND props['closed_reason'] = 'parent_groovy_compile_error', 'groovy_compile',
+                state = 'error' AND props['closed_reason'] = 'ch_write_timeout', 'ch_write_timeout',
+                state = 'error' AND props['closed_reason'] = 'parent_hung_jenkins_restart', 'jenkins_restart',
+                props['runner_died'] IN ('1', 'true'), 'runner_died',
+                dg_cat = 'infra_result_lost', 'result_lost',
+                '') AS own_subreason,
+        multiIf(props['failure_reason'] != '', props['failure_detail'],
+                startsWith(props['diagnosis'], '{'),
+                if(JSONExtractString(props['diagnosis'], 'evidence') != '',
+                   JSONExtractString(props['diagnosis'], 'evidence'),
+                   JSONExtractString(props['diagnosis'], 'why')),
+                state = 'error', props['closed_reason'],
+                '') AS own_detail,
+        -- A writer's props rank 3 unless it marked them a default (results' failure_confidence=1).
+        toUInt8(multiIf(props['failure_reason'] != '', toUInt8OrDefault(props['failure_confidence'], toUInt8(3)),
+                        own_reason != '', 2, 0)) AS own_conf
     FROM artifact_results
     ORDER BY ts DESC, audit_timestamp DESC
     LIMIT 1 BY artifact_id, run_id, result_kind, test_type
 ) AS r
 LEFT JOIN v_artifacts AS a ON a.artifact_id = r.artifact_id
+LEFT JOIN (
+    -- The best reasons row per verdict: each source's latest (so an unmerged older row cannot
+    -- win), then the highest confidence across sources.
+    SELECT
+        artifact_id,
+        run_id,
+        result_kind,
+        test_type,
+        max(s_conf)                                    AS x_conf,
+        argMax(s_reason,    (s_conf, s_updated_at))    AS x_reason,
+        argMax(s_subreason, (s_conf, s_updated_at))    AS x_subreason,
+        argMax(s_detail,    (s_conf, s_updated_at))    AS x_detail,
+        argMax(s_log_url,   (s_conf, s_updated_at))    AS x_log_url,
+        argMax(s_wait_s,    (s_conf, s_updated_at))    AS x_wait_s,
+        argMax(source,      (s_conf, s_updated_at))    AS x_source
+    FROM
+    (
+        SELECT
+            artifact_id,
+            run_id,
+            result_kind,
+            test_type,
+            source,
+            max(updated_at)                           AS s_updated_at,
+            argMax(confidence,        updated_at)     AS s_conf,
+            argMax(failure_reason,    updated_at)     AS s_reason,
+            argMax(failure_subreason, updated_at)     AS s_subreason,
+            argMax(failure_detail,    updated_at)     AS s_detail,
+            argMax(failure_log_url,   updated_at)     AS s_log_url,
+            argMax(failure_wait_s,    updated_at)     AS s_wait_s
+        FROM artifact_result_reasons
+        GROUP BY artifact_id, run_id, result_kind, test_type, source
+    )
+    GROUP BY artifact_id, run_id, result_kind, test_type
+) AS x ON x.artifact_id = r.artifact_id AND x.run_id = r.run_id
+      AND x.result_kind = r.result_kind AND x.test_type = r.test_type
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
     -- run_case_counters, not test_case_runs: pre-aggregated, one row per run; sum() is still
@@ -180,9 +279,41 @@ SELECT
     e.duration_s   AS duration_s,
     e.pass_rate    AS pass_rate,
     e.suite_ran    AS suite_ran,
-    e.ts           AS ts
+    e.ts           AS ts,
+    e.failure_reason    AS failure_reason,
+    e.failure_subreason AS failure_subreason,
+    e.failure_detail    AS failure_detail,
+    e.failure_log_url   AS failure_log_url,
+    e.failure_wait_s    AS failure_wait_s,
+    e.failure_is_infra  AS failure_is_infra,
+    e.failure_source    AS failure_source
 FROM v_tag_resolution AS tr
 INNER JOIN v_artifact_results_enriched AS e ON e.artifact_id = tr.artifact_id;
+
+-- Every failed/error verdict with its reason, for "why" roll-ups (per arch, per tag family).
+CREATE VIEW IF NOT EXISTS v_artifact_result_reasons AS
+SELECT
+    artifact_id,
+    run_id,
+    component,
+    artifact_name,
+    run_arch,
+    result_kind,
+    test_type,
+    state,
+    ts,
+    failed,
+    errors,
+    total_tests,
+    failure_reason,
+    failure_subreason,
+    failure_detail,
+    failure_log_url,
+    failure_wait_s,
+    failure_is_infra,
+    failure_source
+FROM v_artifact_results_enriched
+WHERE failure_reason != '';
 
 -- The membership list behind a tag: which artifacts are in it, with their addresses. Separate
 -- from v_tag_results so an untested member (no results to inner-join against) still shows up.

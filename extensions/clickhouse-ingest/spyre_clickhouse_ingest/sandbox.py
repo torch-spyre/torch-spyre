@@ -98,6 +98,7 @@ class Sandbox:
             "artifact_id",
         ),
         ("artifact_results", "{runs}", "run_id"),
+        ("artifact_result_reasons", "{runs}", "run_id"),
         ("artifact_subscriptions", "1", "subscription_id"),
         (
             "artifact_dispatches",

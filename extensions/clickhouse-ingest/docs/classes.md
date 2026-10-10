@@ -186,7 +186,7 @@ DepEntry.component(entry)   # the component the entry names, without its pin
 > column alone — resolve an `id12` via `props['id12']` on the row it names,
 > never by treating the string as an id you can look up directly.
 
-### The ten concrete tables
+### The concrete tables
 
 | Class | Table | Identity column | Use case |
 |---|---|---|---|
@@ -200,6 +200,7 @@ DepEntry.component(entry)   # the component the entry names, without its pin
 | `ArtifactRefs` | `artifact_refs` | — | How a consumer obtains an artifact. |
 | `ArtifactTags` | `artifact_tags` | — | What a channel tag pointed to as of `ts`. |
 | `ArtifactResults` | `artifact_results` | — (fact) | One leg's verdict on one artifact. |
+| `ArtifactResultReasons` | `artifact_result_reasons` | — (one row per verdict and source) | Why a verdict did not pass, when the reason arrives after the write-once verdict. |
 
 Every table is also exposed as an `UPPER_CASE` constant
 (`TEST_CASES`, `ARTIFACT_RESULTS`, …) and via the `TABLES` dict keyed by name
@@ -290,7 +291,17 @@ other shard look already-ingested.
 ArtifactWriter.artifact_recorded(client, db, artifact_id)
 ArtifactWriter.result_recorded(client, db, artifact_id, run_id, result_kind, test_type)
 ArtifactWriter.insert_gha_result(client, db, *, artifact_id, component, arch, run_id, test_type, state, ...)
+ArtifactWriter.insert_reason(client, db, *, artifact_id, run_id, test_type, props, source, confidence=1)
 ```
+
+**Failure reasons.** A failed/error verdict carries `props.failure_reason` (one of
+`schema.FAILURE_REASON_VALUES`), `failure_subreason`, `failure_detail` (≤300 chars),
+`failure_log_url` and `failure_wait_s` (whole seconds); any other state has them stripped. `results`
+fills `test_failure` (or `ingest_error`/`no_cases`) when no `--result-prop failure_*=` is given, marked
+`failure_confidence=1` so any later collector outranks it. The
+verdict is write-once, so a repeat that carries a reason writes it to `artifact_result_reasons`
+instead; `v_artifact_results_enriched` resolves the two, plus the older `diagnosis`/`closed_reason`
+props, into its `failure_*` columns.
 
 **Use case.** `python -m spyre_clickhouse_ingest results`, given a non-empty `--artifact-id` from
 `derive-gha-artifact-id`, records both the artifact a GHA leg ran *and* its
