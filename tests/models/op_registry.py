@@ -222,6 +222,15 @@ def _torch_neg(a):
     return -a
 
 
+def _torch_histc(input, bins=100, min=0, max=0):
+    # CPU histc has no int kernel; the model case is int32 expert ids. Build the
+    # CPU reference in float32 and cast the counts back. Non-CPU inputs go
+    # straight to torch.histc (the Spyre fallback handles the cast itself).
+    if input.device.type == "cpu" and not input.is_floating_point():
+        return torch.histc(input.to(torch.float32), bins, min, max).to(input.dtype)
+    return torch.histc(input, bins, min, max)
+
+
 def _torch_truediv(a, b):
     return a.__truediv__(b)
 
@@ -460,7 +469,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     # Creation
     "torch.empty_like": OpAdapter("torch.empty_like", torch.empty_like),
     "torch.ge": OpAdapter("torch.ge", _torch_ge),
-    "torch.histc": OpAdapter("torch.histc", torch.histc),
+    "torch.histc": OpAdapter("torch.histc", _torch_histc),
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
     "torch.Tensor.truediv": OpAdapter("torch.Tensor.truediv", _tensor_truediv),
     "torch._grouped_mm": OpAdapter("torch._grouped_mm", torch._grouped_mm),
