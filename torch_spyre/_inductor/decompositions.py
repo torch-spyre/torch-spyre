@@ -1567,6 +1567,10 @@ spyre_decompositions_to_exclude = [
     # decomps and let the mm/bmm survive to mm_to_bmm_pass (2.11 behavior).
     torch.ops.aten.mm,
     torch.ops.aten.bmm,
+    # Upstream aten.clamp decomposition splits clamp(x, min, max) into
+    # clamp_min + clamp_max. Spyre's native "clip" op handles both bounds
+    # in one instruction, but only if aten.clamp reaches lowering undecomposed.
+    torch.ops.aten.clamp,
 ]
 
 OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]
