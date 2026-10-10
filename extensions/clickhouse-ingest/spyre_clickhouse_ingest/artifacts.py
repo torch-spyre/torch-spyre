@@ -95,11 +95,24 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
         (f"release-{date}", RELEASE_FAMILY, tag_props),
         ("release", RELEASE_FAMILY, tag_props),
     ]
-    # A manifest list's content is its per-arch images, recorded as `<arch>=<digest>`.
-    deps = [
-        [f"{a}={d}" for a, d in sorted(i.get("manifests", {}).items())]
-        for i in manifest.get("images", [])
-    ]
+    # A manifest list's content is its per-arch images, recorded as `<arch>=<digest>`, and its
+    # props.source_artifact_id names those images' artifact_ids (space-joined).
+    deps, leaves = [], []
+    for i in manifest.get("images", []):
+        repo = i["ref"].partition("@")[0]
+        per_arch = sorted(i.get("manifests", {}).items())
+        deps.append([f"{a}={d}" for a, d in per_arch])
+        leaves.append(
+            " ".join(
+                sorted(
+                    ArtifactIdentity.from_image(
+                        f"{repo}@{d}", a, i.get("component", "")
+                    ).artifact_id
+                    for a, d in per_arch
+                )
+            )
+        )
+    props = {"release": name, "run_url": run_url, "source": "release"}
     return [
         ArtifactWriter.insert_artifact(
             client,
@@ -107,12 +120,12 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
             identity,
             origin="promoted",
             sources=sources,
-            identity_deps=identity_deps,
-            props={"release": name, "run_url": run_url, "source": "release"},
+            identity_deps=identity_deps or [],
+            props={**props, **({"source_artifact_id": leaf_ids} if leaf_ids else {})},
             tags=tags,
         )
-        for identity, identity_deps in zip_longest(
-            release_identities(manifest), deps, fillvalue=[]
+        for identity, identity_deps, leaf_ids in zip_longest(
+            release_identities(manifest), deps, leaves
         )
     ]
 
