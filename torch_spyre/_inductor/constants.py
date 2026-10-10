@@ -19,6 +19,9 @@ from torch_spyre._C import ElementArrangement
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+# Back-end op for a RESTICKIFY_OP whose input is FP32_TO_DL16-staggered: the
+# back end writes the output in logical order.
+RESTICKIFY_FP32_TO_DL16_OP = "ReStickifyOpHBMFp32ToDl16"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
