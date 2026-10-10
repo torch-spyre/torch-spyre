@@ -35,7 +35,7 @@ def source(value: str) -> tuple:
     raise argparse.ArgumentTypeError(f"--source wants repo@[ref@]sha, got {value!r}")
 
 
-def _pair(value: str) -> tuple:
+def pair(value: str) -> tuple:
     key, sep, val = value.partition("=")
     if not (sep and key):
         raise argparse.ArgumentTypeError(f"wants key=value, got {value!r}")
@@ -139,7 +139,7 @@ def add_artifact_options(
         "--prop",
         dest="props",
         action="append",
-        type=_pair,
+        type=pair,
         default=[],
         help="artifact prop k=v, repeatable",
     )
@@ -147,7 +147,7 @@ def add_artifact_options(
         "--tag-prop",
         dest="tag_props",
         action="append",
-        type=_pair,
+        type=pair,
         default=[],
         help="tag prop k=v, repeatable",
     )

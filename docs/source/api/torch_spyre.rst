@@ -738,6 +738,13 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
+   * - ``SPYRE_BACKEND_LOOP_UNROLL``
+     - Enable SDSC-bundle backend loop unrolling (default ``1``). Set ``0``
+       to preserve counted device loops; this requires autopilot. Set before
+       importing torch-spyre. Accepts case-insensitive ``1``/``true``/``yes``
+       and ``0``/``false``/``no``; invalid values raise an error. The resolved
+       boolean is part of the kernel cache key. See
+       :doc:`/compiler/working_set_reduction` for Python configuration.
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default

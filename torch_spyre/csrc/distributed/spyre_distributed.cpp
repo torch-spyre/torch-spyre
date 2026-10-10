@@ -19,6 +19,7 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
@@ -41,11 +42,27 @@ enum class CollectiveKind { Broadcast, AllGather, AllReduce };
 // Structure to hold pending async work
 struct PendingWork {
   CollectiveKind kind;
-  std::shared_ptr<spyre_comms::WorkSchedule> work;
+  std::unique_ptr<spyre_comms::WorkSchedule> work;
   std::vector<at::Tensor> rank_outputs;
   int64_t chunk_size = 0;
   std::vector<at::Tensor> hold_tensors;
+  // Opaque handle keeping borrowed tensor storage alive for the lifetime of
+  // the WorkSchedule.  Passed to spyre_comms::relinquish_work_schedule() when
+  // the wait is skipped so spyre-comms can release it only after the schedule
+  // is fully retired.
+  std::shared_ptr<void> keep_alive;
 };
+
+// Build a keep_alive payload that owns a vector of tensors via shared_ptr.
+// The returned shared_ptr<void> keeps every tensor in `tensors` alive until it
+// is released, without exposing the PyTorch type to spyre-comms.
+static std::shared_ptr<void> make_tensor_keep_alive(
+    std::vector<at::Tensor> tensors) {
+  // Allocate the vector on the heap and wrap it as opaque void.
+  auto* holder = new std::vector<at::Tensor>(std::move(tensors));
+  return std::shared_ptr<void>(
+      holder, [](void* p) { delete static_cast<std::vector<at::Tensor>*>(p); });
+}
 
 // Global map to track pending async operations.
 // Key: SharedOwnerCtx* (stable per-allocation identity). PendingWork holds
@@ -54,6 +71,20 @@ struct PendingWork {
 static std::unordered_map<spyre::SharedOwnerCtx*, PendingWork>
     pending_work_map_;
 static std::mutex work_map_mutex_;
+
+// spyre-comms does not report failures through WorkSchedule::wait(), so check
+// the schedule state and the Flex stream error flag instead.
+static void check_collective_errors(spyre_comms::WorkSchedule& work) {
+  TORCH_CHECK(
+      work.getState() != spyre_comms::WorkScheduleState::State::DONE_ERROR,
+      "[SpyreCCL]: collective failed");
+  // Check only the default stream that spyre-comms submits onto.
+  // RuntimeContext::hasStreamError() aggregates all registered streams, so a
+  // fault on an unrelated non-default stream would incorrectly reject a
+  // successful collective.
+  TORCH_CHECK(!spyre::getDefaultStreamRuntimeHandle()->needsShutdown(),
+              "[SpyreCCL]: device stream error during collective");
+}
 
 // Compile-time plan cache.
 enum class PlanKind { Broadcast, AllReduce, AllGather };
@@ -109,6 +140,14 @@ std::shared_ptr<spyre_comms::Context> ensure_context() {
   auto context = spyre_comms::get_world_context();
   if (context == nullptr) {
     SPYRE_RUNTIME_DEBUG() << "Initializing spyre-comms library";
+    // Spyre Comms is initialised with the default Flex stream handle.  Because
+    // all collective operations are injected into that same stream, Flex
+    // enforces ordering between comms operations and any surrounding compute
+    // kernels.  This data-dependency ordering is what makes skipping
+    // work->wait() in spyre_wait_work_impl valid: the device itself serialises
+    // the collective result before any subsequent operation on the stream can
+    // consume it.  Torch Spyre calls synchronize() when exposing results to the
+    // user, so there is no gap at the end of the graph either.
     spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
                                     spyre::getDefaultStreamRuntimeHandle());
     context = spyre_comms::get_world_context();
@@ -325,6 +364,10 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
 
   work_schedule->start();
 
+  // Build keep_alive to hold the output tensor storage for the duration of
+  // the WorkSchedule.  broadcast borrows the buffer address of `output`.
+  auto ka = make_tensor_keep_alive({output});
+
   // Store pending work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
@@ -333,7 +376,10 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
                 "intervening wait_work");
     pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::Broadcast,
                                                std::move(work_schedule),
-                                               {output}});
+                                               {output},
+                                               0,
+                                               {output},
+                                               std::move(ka)});
   }
 
   return output;
@@ -374,15 +420,22 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
 
   work_schedule->start();
 
+  // Build keep_alive to hold the input tensor storage for the duration of
+  // the WorkSchedule.  allreduce borrows the buffer address of `input`.
+  auto ka = make_tensor_keep_alive({input});
+
   // Store pending work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
     TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
                 "allreduce_run called twice on the same allocation without "
                 "intervening wait_work");
-    pending_work_map_.emplace(
-        ctx, PendingWork{
-                 CollectiveKind::AllReduce, std::move(work_schedule), {input}});
+    pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::AllReduce,
+                                               std::move(work_schedule),
+                                               {input},
+                                               0,
+                                               {input},
+                                               std::move(ka)});
   }
 
   return input;
@@ -446,6 +499,10 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   TORCH_CHECK(output_ctx != nullptr,
               "SharedOwnerCtx is null for output tensor");
 
+  // Build keep_alive from rank_outputs before moving them into PendingWork.
+  // allgather borrows the buffer addresses of every per-rank output tensor.
+  auto ka = make_tensor_keep_alive(rank_outputs);
+
   // Store pending work with rank_outputs for assembly in wait_work
   {
     std::lock_guard<std::mutex> lock(work_map_mutex_);
@@ -456,7 +513,8 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
                                                       std::move(work_schedule),
                                                       std::move(rank_outputs),
                                                       input.size(0),
-                                                      {output}});
+                                                      {output},
+                                                      std::move(ka)});
   }
 
   return output;
@@ -486,10 +544,37 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
                           << pending_work_map_.size();
   }
 
-  // Lock released — concurrent wait_work and run ops can now proceed
+  // Lock released — concurrent wait_work and run ops can now proceed.
+  // The wait is enforced only when opted in with
+  // TORCH_SPYRE_DIST_ENFORCE_WAIT=1 and the current stream is the default Flex
+  // stream that Spyre Comms uses (see ensure_context()).  Other streams are not
+  // ordered with it.
+  static const bool enforce_wait = []() {
+    const char* env = std::getenv("TORCH_SPYRE_DIST_ENFORCE_WAIT");
+    return env && std::string(env) == "1";
+  }();
+
   if (pending.work) {
-    pending.work->wait();
-    SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
+    const c10::Device device = tensor.device();
+    const bool skip_wait =
+        !enforce_wait && spyre::getCurrentStream(device).id() ==
+                             spyre::getDefaultStream(device).id();
+    if (!skip_wait) {
+      pending.work->wait();
+      check_collective_errors(*pending.work);
+      SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
+    } else {
+      // If we are skipping the wait, relinquish ownership to spyre-comms so
+      // the WorkSchedule stays alive until finalize_library() drains it.
+      // This prevents ~WorkSchedule() from firing inline here and forcing an
+      // unwanted synchronous wait().  Pass the keep_alive bundle so that the
+      // borrowed tensor buffers remain valid until spyre-comms retires the
+      // schedule.
+      check_collective_errors(*pending.work);
+      spyre_comms::relinquish_work_schedule(std::move(pending.work),
+                                            std::move(pending.keep_alive));
+      SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped";
+    }
   }
 
   if (pending.kind == CollectiveKind::AllGather) {

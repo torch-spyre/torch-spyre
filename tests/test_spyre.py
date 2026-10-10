@@ -14,6 +14,7 @@
 
 # Owner(s): ["module: cpp"]
 
+import functools
 import os
 import warnings
 from contextlib import contextmanager
@@ -48,10 +49,26 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
 )
+
+
+def _expect_raise(match):
+    """Decorator: the test passes only if it raises with a message matching ``match``."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
-    reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
-)
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
+_SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
@@ -325,7 +342,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_RAISES_FP8],
             ),
             subtest(
                 (

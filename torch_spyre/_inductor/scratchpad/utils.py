@@ -14,6 +14,7 @@
 
 
 import math
+from collections.abc import Mapping
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -580,7 +581,9 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering, cache: Optional[dict] = None
+    graph: GraphLowering,
+    cache: Optional[dict] = None,
+    drained_readers: Optional[Mapping[str, str]] = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -595,12 +598,19 @@ def get_ncores_for_buffers(
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
+
+    ``drained_readers`` maps a loop-carry storage to the collective that a
+    validated drain plan will repoint at the post-loop drain.  The judge runs
+    before that rewrite, so that collective's use is not one of the storage's.
     """
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
+        drained_reader = (drained_readers or {}).get(buf_name)
+        if drained_reader is not None:
+            users = [(op, dep) for op, dep in users if op.get_name() != drained_reader]
         layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
         if is_empty_tiled_layout(layout):
             # Reject before the unsplit whole-buffer view shortcut and before

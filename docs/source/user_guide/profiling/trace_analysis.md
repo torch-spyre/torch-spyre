@@ -41,7 +41,8 @@ trimmed excerpt looks like this:
      "pid": 3153, "tid": 3153, "ts": 1707279511678215, "dur": 40},
     {"ph": "X", "cat": "kernel", "name": "spyre_matmul",
      "pid": 3153, "tid": 7, "ts": 1707279511678260, "dur": 96,
-     "args": {"device": 0}}
+     "args": {"device": 0,
+              "cycles_ts": [3463433774,3463433774,3463434222,3463440085,3463440094]}}
   ]
 }
 ```

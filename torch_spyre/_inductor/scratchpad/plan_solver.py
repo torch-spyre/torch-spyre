@@ -199,7 +199,7 @@ class TileSpec:
     Ordered -- where the core-division splits are dicts and so order-free --
     because tile levels *nest*: swapping two levels is a different plan. Frozen
     and hashable. The empty spec is *untiled*, and is the inert default every
-    :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    :class:`CoreDivision` carries unless a solver chose otherwise.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -374,9 +374,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
         the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        are excluded (see :attr:`TileSpec.output_tile_count`); where no
+        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
+        ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(

@@ -64,7 +64,10 @@ from spyre_clickhouse_ingest import (
     tables_present,
 )
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
+from spyre_clickhouse_ingest.offline import add_offline_options
+from spyre_clickhouse_ingest.offline import main as offline_main
 from spyre_clickhouse_ingest.options import (
+    pair,
     add_artifact_options,
     artifact_options,
     artifact_spec,
@@ -1325,7 +1328,10 @@ def _admitted_legs(legs: dict):
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
-    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    result_props = dict(_opt(args, "result_props") or [])
+    source = result_props.pop("source", "") or (
+        "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    )
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
     if _opt(args, "capability_legs_only"):
@@ -1407,7 +1413,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
             state=state,
             arch=args.arch,
             duration_s=acc["duration_s"],
-            props={"run_url": run_url, "source": source},
+            props={**result_props, "run_url": run_url, "source": source},
             attempt=getattr(args, "run_attempt", 0),
         ):
             print(
@@ -1427,7 +1433,8 @@ def _gha_run_url(args) -> str:
     return f"{server}/{repo}/actions/runs/{rid}"
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
+    """`results`' flags, the offline bundle ones included (offline.add_offline_options)."""
     parser = argparse.ArgumentParser(prog="spyre_clickhouse_ingest results")
     parser.add_argument("--xml-dir", default=None)
     parser.add_argument("--xml-file", default=None)
@@ -1494,6 +1501,14 @@ def main(argv=None):
         arch_required=False,
     )
     parser.add_argument(
+        "--result-prop",
+        dest="result_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
@@ -1516,7 +1531,18 @@ def main(argv=None):
         "replacement tables only), or both (the migration window). Also settable via "
         "INGEST_SCHEMA so a workflow can set it once for every leg.",
     )
-    args = parser.parse_args(argv)
+    add_offline_options(parser)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.offline or args.validate_only or args.upload:
+        return offline_main(argv)
+    if args.from_bundle:
+        from spyre_clickhouse_ingest.bundle import ingest
+
+        return ingest(args)
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot
