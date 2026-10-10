@@ -26,6 +26,8 @@ test_suite_config:
             - TestOps::test_max_sub_broadcast.*
             - TestOps::test_sub_alpha.*
             - TestOps::test_sub_broadcast.*
+            - TestOps::test_expand_size1_pointwise.*
+            - TestOps::test_expand_size1_reduction.*
             - TestOps::test_sub_scalar.*
             - TestOps::test_scalar_cpu.*
             # regression tests

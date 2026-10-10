@@ -334,6 +334,38 @@ def _candidate_output_stls(
     return stls
 
 
+def _compatible_output_stick_exprs(
+    stick_expr: sympy.Expr, out_coords, dep: MemoryDep
+) -> list[sympy.Expr]:
+    """Output stick expressions one input can feed without a restickify.
+
+    ``stick_expr`` is the input's device stick coordinate, ``dep`` its load and
+    ``out_coords`` the output's host coordinates. The result starts with
+    ``stick_expr`` itself, the preserved layout.
+
+    A stick of constant 0 is a size-1 stick, which says nothing about where the
+    output's stick goes. For such an input, the coordinate of each output dim it
+    is expanded along is added, e.g. ``d2`` for ``y`` ``[3, 5, 1]`` read through
+    ``y.expand(3, 5, 128)``, or both ``d1`` and ``d2`` for ``[3, 1, 1]`` expanded
+    to ``[3, 64, 128]``. Every lane of a stick on such a dim needs the same input
+    element, which the op broadcasts, so ``stick_compatible`` accepts the pair.
+
+    The consumer picks among the returned sticks, e.g. a full-size operand on the
+    expanded last dim or a transposed one on another expanded dim; the size-1
+    stick stays for a consumer with a size-1 last dim.
+    """
+    if stick_expr != 0:
+        return [stick_expr]
+    in_syms = dep.index.free_symbols
+    # An expanded dim is indexed by a variable the input's load lacks, so the
+    # input's element does not vary along it. A dim the input does index is left
+    # out: a stick there would gather elements from several input sticks.
+    expanded_dim_coords = [
+        coord for coord in out_coords if coord.is_symbol and coord not in in_syms
+    ]
+    return [stick_expr, *expanded_dim_coords]
+
+
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     """Reject fixed-layout ops when any input has a stick expression with a constant offset.
 
@@ -504,6 +536,8 @@ def _single_arg_op_layout(
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
         )
+        in_coords = host_coordinates(in_layout, dep, None)
+        out_coords = host_coordinates(output, output_dep, None)
 
         # Do not preserve the input layout for reduction ops listed in
         # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
@@ -513,17 +547,27 @@ def _single_arg_op_layout(
             data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
             and reduction_var in x_stick_expr.free_symbols
         ):
-            # Try to preserve input layout
-            out_stl = _output_stl_from_stick_expr(
-                x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-            )
-            if out_stl is not None:
-                return [out_stl]
+            # Try to preserve input layout. Over an expanded input, a stick on an
+            # expanded dim comes first: the back-end compiler cannot divide a
+            # reduction into a one-element-per-stick output of unaligned width
+            # across cores.
+            output_stls = [
+                out_stl
+                for expr in reversed(
+                    _compatible_output_stick_exprs(x_stick_expr, out_coords, dep)
+                )
+                for out_stl in [
+                    _output_stl_from_stick_expr(
+                        expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+                    )
+                ]
+                if out_stl is not None
+            ]
+            if output_stls:
+                return output_stls
 
         # Try alternative layouts when input layout is not supported.
         # Skip the dim already known to produce an unsupported stick.
-        in_coords = host_coordinates(in_layout, dep, None)
-        out_coords = host_coordinates(output, output_dep, None)
         skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
         # Prefer stick-aligned input dims; fall back to unaligned dims (padded
@@ -733,13 +777,21 @@ def _single_arg_op_layout(
     if in_device_coords is None:
         return []
     stick_expr = in_device_coords[-1]
+    stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
 
     # Try to preserve input layout, fall back to scanning all output dims
-    out_stl = _output_stl_from_stick_expr(
-        stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-    )
-    if out_stl is not None:
-        return [out_stl]
+    output_stls = [
+        out_stl
+        for expr in stick_exprs
+        for out_stl in [
+            _output_stl_from_stick_expr(
+                expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+            )
+        ]
+        if out_stl is not None
+    ]
+    if output_stls:
+        return output_stls
     return _candidate_output_stls(
         out_coords,
         output_dep,
@@ -1580,13 +1632,18 @@ def _multi_arg_pointwise_layouts(
         output_ea = ElementArrangement.STANDARD
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     stick_exprs = {
-        dc[-1]
+        stick
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
         for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
+        for stick in _compatible_output_stick_exprs(dc[-1], out_coords, arg.dep)
     }
 
     # Bool physical format resolution: see resolve_output_formats's docstring.
@@ -1599,10 +1656,6 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [
-        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
-    ]
-    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):

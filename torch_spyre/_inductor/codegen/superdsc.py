@@ -2077,6 +2077,24 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    if (
+        op_spec.is_reduction
+        and not (is_matmul or is_pool or has_indirect_access)
+        and not _is_conv(op_spec.op)
+        and not _is_topk(op_spec.op)
+        and not _is_keep_by_index(op_spec.op)
+    ):
+        # A reduction fed by a broadcast has output dims its input lacks. Make them
+        # op dims too, so the input marks them broadcast instead of taking one as
+        # its stick.
+        out_dim_order, out_stick_dim = _get_device_dim_order(
+            op_spec.args[-1], symbol_mapping
+        )
+        op_dim_order = op_dim_order + [
+            d for d in out_dim_order if d not in op_dim_order
+        ]
+        if op_stick_dim is None:
+            op_stick_dim = out_stick_dim
 
     # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
     # require at least one outer spatial dim beyond the stick; inject a
