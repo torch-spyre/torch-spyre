@@ -575,12 +575,15 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
 # These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
-# the xfail-marked tests, each has passed in some of them). The bfloat16 case is the
-# sibling of the float16 one. Cause not investigated (see #5285), so they are
-# non-strict xfails.
+# the xfail-marked tests, each has passed in some of them), so they are non-strict
+# xfails. They fail on a single core as well, with the signature of the lost second
+# stick of a pair below (#5361), so splitting a dim across cores (#5285) does not
+# explain them; #5285 tracks the intermittency.
 _ROUND_TRIP_IMPLICIT_UNSTABLE = {
-    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
-    "bfloat16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+    "float16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
+    "bfloat16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
 }
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
@@ -589,6 +592,50 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
     and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
 ]
+
+# The round trips left in the three lists above return the right number of elements
+# with about half of them zero (#5361). The upcast value is staggered, so an fp16
+# stick is spread over a pair of fp32 sticks, in interleaved groups of four
+# elements; when the stick dim does not fill whole pairs, the pair's second stick is
+# missing. It happens in two ways:
+# - 4x16 and 4x63: the second stick is not allocated, so it fails on one core too;
+# - 4x68: it is allocated, but work division leaves it to no core, so it passes
+#   with SENCORES=1.
+_PAIR_SECOND_STICK_LOST = (
+    "the staggered fp32 value lacks the second stick of a stick pair, so half the "
+    "elements come back as zero (#5361)"
+)
+_PAIR_SECOND_STICK_UNSPLIT = (
+    "work division leaves the second stick of a stick pair to no core; correct "
+    "with SENCORES=1 (#5361)"
+)
+_ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
+    "4x16": _PAIR_SECOND_STICK_LOST,
+    "4x63": _PAIR_SECOND_STICK_LOST,
+    "4x68": _PAIR_SECOND_STICK_UNSPLIT,
+}
+
+
+def _round_trip_pair_reasons(cases):
+    """``{case: reason}`` for round trips that lose the second stick of a pair.
+
+    A case whose shape has no reason raises KeyError: a new failing shape has to
+    be looked at before it is given one.
+    """
+    return {
+        case: _ROUND_TRIP_PAIR_REASON_BY_SHAPE[case.rsplit("_", 1)[1]] for case in cases
+    }
+
+
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
