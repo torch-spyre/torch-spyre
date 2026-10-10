@@ -29,6 +29,7 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
+#include <flex/memory_interface/shared_host_pool.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -286,6 +287,35 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
+  py::class_<flex::SharedPool>(m, "SharedPool")
+      .def("slot_count", &flex::SharedPool::SlotCount)
+      .def("slot_bytes", &flex::SharedPool::SlotBytes)
+      .def("name", &flex::SharedPool::Name)
+      .def("total_bytes", &flex::SharedPool::TotalBytes);
+
+  py::class_<flex::SharedHostPool, flex::SharedPool>(m, "SharedHostPool")
+      .def_static(
+          "create_or_attach",
+          [](const std::string& name, size_t num_slots, size_t slot_bytes) {
+            spyre::startRuntime();
+            // CreateOrAttach() can block while another process initializes
+            // the pool, so release the GIL for it.
+            py::gil_scoped_release release;
+            return flex::SharedHostPool::CreateOrAttach(
+                spyre::GlobalRuntime::get(), name, num_slots, slot_bytes);
+          },
+          py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
+      .def_static(
+          "unlink_by_name", &flex::SharedHostPool::UnlinkByName,
+          "Unlink the named pool's shm names, both the data segment and "
+          "its .ctl segment. The memory itself survives until the last "
+          "attacher closes it, and this ignores the attach refcount, so "
+          "it is only for test cleanup or recovering from a crashed "
+          "owner. Do not call it while a live pool with the same name "
+          "may exist, or later attachers will create and join a "
+          "different backing segment.",
+          py::arg("name"), py::call_guard<py::gil_scoped_release>());
+
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
@@ -330,30 +360,34 @@ PYBIND11_MODULE(_C, m) {
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
             if (version == 1) {
-              // Version 1 had: (version, device_size, dim_map, stride_map,
-              // device_dtype) — discard dim_map
+              // Version 1 had: (version, device_size, dim_map,
+              // stride_map, device_dtype) — discard dim_map
               if (t.size() != 5) {
                 throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v1: wrong tuple size");
+                    "Invalid SpyreTensorLayout pickle v1: wrong tuple "
+                    "size");
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[3].cast<std::vector<int64_t>>(),
                                               t[4].cast<DataFormats>());
             } else if (version == 2) {
-              // Version 2: (version, device_size, stride_map, device_dtype)
+              // Version 2: (version, device_size, stride_map,
+              // device_dtype)
               if (t.size() != 4) {
                 throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v2: wrong tuple size");
+                    "Invalid SpyreTensorLayout pickle v2: wrong tuple "
+                    "size");
               }
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[2].cast<std::vector<int64_t>>(),
                                               t[3].cast<DataFormats>());
             } else if (version == 3) {
-              // Version 3: (version, device_size, stride_map, device_dtype,
-              // element_arrangement)
+              // Version 3: (version, device_size, stride_map,
+              // device_dtype, element_arrangement)
               if (t.size() != 5) {
                 throw py::value_error(
-                    "Invalid SpyreTensorLayout pickle v3: wrong tuple size");
+                    "Invalid SpyreTensorLayout pickle v3: wrong tuple "
+                    "size");
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
@@ -403,12 +437,14 @@ PYBIND11_MODULE(_C, m) {
         py::overload_cast<const spyre::SpyreTensorLayout&>(
             &spyre::get_device_size_in_bytes),
         py::arg("layout"),
-        "Return padded storage bytes for a layout with known device geometry.");
+        "Return padded storage bytes for a layout with known device "
+        "geometry.");
   m.def("get_device_size_in_bytes",
         py::overload_cast<const std::vector<int64_t>&, const DataFormats&>(
             &spyre::get_device_size_in_bytes),
         py::arg("device_size"), py::arg("device_dtype"),
-        "Return whole-stick storage bytes; reject undefined format geometry.");
+        "Return whole-stick storage bytes; reject undefined format "
+        "geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
@@ -439,11 +475,13 @@ PYBIND11_MODULE(_C, m) {
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
-        "Fill a spyre tensor with a scalar value using device-side FillDMA",
+        "Fill a spyre tensor with a scalar value using device-side "
+        "FillDMA",
         py::arg("self"), py::arg("value"));
 
-  // Read-only view of a device tensor's CompositeAddress (chunk geometry).
-  // The handle keeps the source tensor's allocation alive for its lifetime.
+  // Read-only view of a device tensor's CompositeAddress (chunk
+  // geometry). The handle keeps the source tensor's allocation alive
+  // for its lifetime.
   py::class_<spyre::CompositeChunkInfo>(m, "CompositeChunkInfo")
       .def_readonly("region_id", &spyre::CompositeChunkInfo::region_id)
       .def_readonly("offset", &spyre::CompositeChunkInfo::offset)
@@ -477,7 +515,8 @@ PYBIND11_MODULE(_C, m) {
       });
 
   m.def("get_composite_address", &spyre::get_composite_address_handle,
-        "Return a read-only handle over the device address backing a Spyre "
+        "Return a read-only handle over the device address backing a "
+        "Spyre "
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
 
@@ -556,8 +595,8 @@ PYBIND11_MODULE(_C, m) {
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
-            // Single source of truth for step-type identification (also used by
-            // the P2-14 ordering validator). Returns
+            // Single source of truth for step-type identification (also
+            // used by the P2-14 ordering validator). Returns
             // HostCompute/H2D/D2H/Compute or Unknown.
             return spyre::stepKindName(spyre::classifyStep(*plan.steps[idx]));
           },
@@ -569,7 +608,8 @@ PYBIND11_MODULE(_C, m) {
             return plan.steps[idx]->getPipelineBarrier();
           },
           py::arg("idx"),
-          "Get the pipeline_barrier flag for the step at the given index")
+          "Get the pipeline_barrier flag for the step at the given "
+          "index")
       .def(
           "get_step_stream_role",
           [](const spyre::JobPlan& plan, size_t idx) {
@@ -578,7 +618,8 @@ PYBIND11_MODULE(_C, m) {
                                                                       : "Dev";
           },
           py::arg("idx"),
-          "Get the stream role (Prep/Dev) for the step at the given index")
+          "Get the stream role (Prep/Dev) for the step at the given "
+          "index")
       .def(
           "get_step_name",
           [](const spyre::JobPlan& plan,
@@ -628,33 +669,37 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
         py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
-        "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
+        "Prepare a kernel from a SpyreCode directory and return a "
+        "JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
-        "    stream (SpyreStream, optional): Stream to use for initialization "
+        "    stream (SpyreStream, optional): Stream to use for "
+        "initialization "
         "transfers.\n"
         "        If None, uses the current stream. Defaults to None.\n\n"
         "    profiler_name (str, optional): Bounded base name for "
         "profiler-visible compute events. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
-  // Bind the current-stream overload (resolves the current stream internally).
-  // Without symbolic_args (back-compat, empty payload → legacy address loop).
-  m.def(
-      "launch_jobplan",
-      static_cast<void (*)(  // NOLINT(whitespace/parens)
-          const spyre::JobPlan&, const std::vector<at::Tensor>&,
-          std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
-      py::arg("job_plan"), py::arg("args"),
-      py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
-      "Launch a prepared JobPlan with the given tensor arguments.\n\n"
-      "Args:\n"
-      "    job_plan: The JobPlan to execute\n"
-      "    args: Sequence of input/output tensors\n"
-      "    symbolic_args: Optional typed per-symbol payload. When non-empty,\n"
-      "        JobPlanStepHostCompute resolves each correction slot by kind\n"
-      "        rather than blindly iterating tensors. Empty (default)\n"
-      "        preserves today's legacy behavior.");
+  // Bind the current-stream overload (resolves the current stream
+  // internally). Without symbolic_args (back-compat, empty payload →
+  // legacy address loop).
+  m.def("launch_jobplan",
+        static_cast<void (*)(  // NOLINT(whitespace/parens)
+            const spyre::JobPlan&, const std::vector<at::Tensor>&,
+            std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
+        py::arg("job_plan"), py::arg("args"),
+        py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+        "Args:\n"
+        "    job_plan: The JobPlan to execute\n"
+        "    args: Sequence of input/output tensors\n"
+        "    symbolic_args: Optional typed per-symbol payload. When "
+        "non-empty,\n"
+        "        JobPlanStepHostCompute resolves each correction slot by "
+        "kind\n"
+        "        rather than blindly iterating tensors. Empty (default)\n"
+        "        preserves today's legacy behavior.");
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
   // that Python tests can verify the HostComputeArg ordering without needing
@@ -685,11 +730,13 @@ PYBIND11_MODULE(_C, m) {
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
-  // Direct binding of the pure P2-14 ordering checker so a role-misplacement
-  // rejection can be tested without constructing real steps (a real HostCompute
-  // needs a deeptools::Hcm + pinned buffers). Takes parallel lists of StepKind
-  // names ("HostCompute"/"H2D"/... per stepKindName) and StreamRole names
-  // ("Prep"/"Dev"), returns "" when valid or a human-readable error otherwise.
+  // Direct binding of the pure P2-14 ordering checker so a
+  // role-misplacement rejection can be tested without constructing real
+  // steps (a real HostCompute needs a deeptools::Hcm + pinned buffers).
+  // Takes parallel lists of StepKind names ("HostCompute"/"H2D"/... per
+  // stepKindName) and StreamRole names
+  // ("Prep"/"Dev"), returns "" when valid or a human-readable error
+  // otherwise.
   m.def(
       "check_job_plan_step_ordering",
       [](const std::vector<std::string>& kind_names,
@@ -710,17 +757,20 @@ PYBIND11_MODULE(_C, m) {
         return spyre::checkJobPlanStepOrdering(kinds, roles);
       },
       py::arg("kind_names"), py::arg("role_names"),
-      "Validate a projected two-stream step ordering; '' if valid else the "
+      "Validate a projected two-stream step ordering; '' if valid else "
+      "the "
       "error message.");
 
   // ── Test-only validator projection hook (#7a) ──
-  // Projects a REAL prepared plan's steps through the SAME path validate()
-  // uses -- classifyStep(*step) + step->role() -- in a caller-specified index
-  // order, then runs the ordering checker. Exercises the JobPlanStep->(kind,
-  // role) projection end-to-end, where a real plan-wiring bug would live (the
-  // check_job_plan_step_ordering binding takes name lists and bypasses this
-  // projection). Passing a permuted `order` injects a role-ordering
-  // violation over the real step objects. Returns '' if valid else the error.
+  // Projects a REAL prepared plan's steps through the SAME path
+  // validate() uses -- classifyStep(*step) + step->role() -- in a
+  // caller-specified index order, then runs the ordering checker.
+  // Exercises the JobPlanStep->(kind, role) projection end-to-end,
+  // where a real plan-wiring bug would live (the
+  // check_job_plan_step_ordering binding takes name lists and bypasses
+  // this projection). Passing a permuted `order` injects a
+  // role-ordering violation over the real step objects. Returns '' if
+  // valid else the error.
   m.def(
       "_test_project_and_check_ordering",
       [](const spyre::JobPlan& plan, const std::vector<size_t>& order) {
@@ -739,8 +789,10 @@ PYBIND11_MODULE(_C, m) {
         return spyre::checkJobPlanStepOrdering(kinds, roles);
       },
       py::arg("plan"), py::arg("order"),
-      "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
-      "validate() does) in the given index order, then run the ordering "
+      "TEST-ONLY: project REAL plan steps (classifyStep + role(), "
+      "exactly as "
+      "validate() does) in the given index order, then run the "
+      "ordering "
       "checker. Returns '' if valid else the error message.");
 
   // Allocator statistics functions
@@ -780,7 +832,8 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  // ── Typed stream error API ───────────────────────────────────────────────
+  // ── Typed stream error API
+  // ───────────────────────────────────────────────
 
   py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
       .value("Success", spyre::SpyreStreamError::Success)
@@ -810,6 +863,7 @@ PYBIND11_MODULE(_C, m) {
   m.def(
       "get_device_state", []() { return spyre::SpyreGetDeviceState(); },
       "Return the SpyreDeviceState aggregate for the process. "
-      "Returns NotInitialized when the runtime has not been created yet; "
+      "Returns NotInitialized when the runtime has not been created "
+      "yet; "
       "callers should treat this as 'proceed / no error'.");
 }
