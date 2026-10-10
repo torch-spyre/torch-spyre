@@ -759,6 +759,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
                     chosen[idx].splits.get(key, 1)
                 )
+            for key, sym in buf.sym_tile_counts.items():
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
+                    buf.core_divisions[chosen[idx]].tiling.count_for(key)
+                )
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):

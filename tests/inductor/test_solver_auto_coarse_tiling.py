@@ -324,6 +324,9 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                # Raise, not warn, when CP-SAT cannot lower the cost objective:
+                # a fallback solve still tiles as pinned, so it would pass.
+                _cpsat_warn_on_cost_expr=False,
                 **tiling_cfg,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),

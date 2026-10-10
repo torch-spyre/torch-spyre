@@ -2134,7 +2134,7 @@ def _minmax(sympy_fn, builtin_fn, args, kwargs):
     sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
     otherwise defers to ``builtin_fn``, which also handles ``default``."""
     if len(args) == 1:
-        values = args[0]
+        values = list(args[0])
     else:
         values = args
     if "key" not in kwargs and any(isinstance(a, sympy.Basic) for a in values):
