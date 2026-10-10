@@ -149,6 +149,7 @@ def collect_work_division_constraints(
         keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
         multi_reduction_k_split_blocked,
+        overlapping_window_split_domains,
     ):
         result = constraint(ctx)
 
@@ -1071,3 +1072,111 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
             sym: frozenset({1}) for sym in indirect_forbidden_split_syms(ctx.op)
         }
     )
+
+
+def overlapping_coordinate_extents(
+    coordinate: Expr, ranges: dict[Symbol, int]
+) -> dict[Symbol, tuple[int, Symbol]]:
+    """Overlapped variables of one device coordinate.
+
+    A coordinate whose variables sweep overlapping element ranges, such as
+    ``2*w + k`` with ``k`` in ``[0, 4)`` from ``x.unfold(dim, 4, 2)``, has no
+    nested-dimension form. ``normalize_coordinates`` (views.py) splits the
+    device dimension by stride ratio, so ``k`` gets a device dimension of size
+    ``2`` while it iterates over ``4`` values. The backend lays every dimension
+    out by its iteration extent, so with ``k`` sweeping 4 values and ``w``
+    sweeping several on one core, ``w`` -- and every dimension outside it -- is
+    addressed with ``4/2`` times its real stride (issue #5347).
+
+    Returns ``{inner: (size, outer)}`` for every term whose range exceeds the
+    device dimension ``size`` that ``normalize_coordinates`` gives it (same
+    ``(num, mod)`` term order), ``outer`` being the term it overlaps.
+    Coordinates with a non-linear term (``floor``, ``Mod``), or whose strides
+    do not nest, are not analysed.
+    """
+    terms = []
+    for term, coeff in coordinate.as_coefficients_dict().items():
+        if not isinstance(term, Symbol) or term not in ranges or coeff <= 0:
+            return {}
+        if ranges[term] > 1:
+            terms.append((int(coeff), ranges[term], term))
+    terms.sort(key=lambda t: (t[0], t[1], str(t[2])))
+    overlaps: dict[Symbol, tuple[int, Symbol]] = {}
+    for (step, extent, var), (next_step, _, outer) in zip(terms, terms[1:]):
+        if next_step % step:
+            return {}
+        size = next_step // step
+        if extent > size:
+            overlaps[var] = (size, outer)
+    return overlaps
+
+
+def _moves_coordinate(coordinate: Expr, var: Symbol, extent: int) -> bool:
+    """Whether ``var`` changes ``coordinate`` (``floor(c/64)`` with ``c < 64`` does not)."""
+    others = {v: 0 for v in coordinate.free_symbols if v != var}
+    base = coordinate.subs(others)
+    return extent > 1 and base.subs(var, 0) != base.subs(var, extent - 1)
+
+
+def overlapping_window_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Split an overlapping (unfold-style) read so no core sweeps an overlap.
+
+    See ``overlapping_coordinate_extents``. Either of two divisions makes the
+    in-core addressing exact:
+
+    - the overlapped (window) variable keeps at most its device-dimension size
+      on each core (``x.unfold(0, 3, 1)``'s window variable is split three
+      ways); SuperDSC then emits that dimension with a negative backGap so its
+      layout extent is the physical one, and the per-core start address carries
+      the overlap;
+    - or, when the window variable is reduced (``unfold(...).sum(-1)``) and so
+      cannot be split across cores, every core gets a single value of the
+      overlapping outer variable and of every variable on a device dimension
+      outside it, so the inflated outer strides are never applied.
+
+    A core budget too small for the required split surfaces as an Unsupported
+    domain conflict rather than a kernel that reads the wrong rows. Pooling and
+    convolution reads realize their windows through dedicated SDSC fields and
+    are left alone.
+    """
+    if (
+        isinstance(ctx.op.data, Reduction)
+        and ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES
+    ):
+        return ConstraintResult()
+    ranges = {
+        v: int(size)
+        for v, size in ((v, concretize_expr(e)) for v, e in ctx.it_space.items())
+        if not getattr(size, "free_symbols", None)
+    }
+    caps: dict[Symbol, int] = {}
+    pinned: set[Symbol] = set()
+    for td in ctx.input_tds:
+        coords = td.device_coords
+        for axis, coordinate in enumerate(coords[:-1]):
+            overlaps = overlapping_coordinate_extents(coordinate, ranges)
+            for var, (size, outer) in overlaps.items():
+                caps[var] = min(size, caps.get(var, size))
+                if var in ctx.reduction_vars:
+                    pinned.add(outer)
+                    pinned.update(
+                        v
+                        for c in coords[:axis]
+                        for v in c.free_symbols
+                        if v in ranges and _moves_coordinate(c, v, ranges[v])
+                    )
+    # A reduced window variable may also stay whole (split 1): its outer
+    # variables are then pinned instead.
+    allowed = {
+        var: frozenset(
+            s
+            for s in divisors(ranges[var])
+            if ranges[var] // s <= size or (s == 1 and var in ctx.reduction_vars)
+        )
+        for var, size in caps.items()
+    }
+    for var in pinned:
+        allowed[var] = allowed.get(var, frozenset({ranges[var]})) & {ranges[var]}
+    return ConstraintResult(allowed_splits=allowed)

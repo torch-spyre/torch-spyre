@@ -103,6 +103,8 @@ from torch_spyre._inductor.work_division_constraints import (
     indirect_access_split_domains,
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
+    overlapping_coordinate_extents,
+    overlapping_window_split_domains,
     qfp8wt_matmul_k_split_domains,
     qfp8wt_split_domains,
     reduction_window_blocked_vars,
@@ -487,6 +489,110 @@ class TestAlignedOwnershipSplitDomains(unittest.TestCase):
         ctx, rows = self._context((6, 128), lambda d0, d1: 128 * d0 + d1)
         result = aligned_ownership_split_domains(ctx)
         self.assertNotIn(rows, result.allowed_splits)
+
+
+class TestOverlappingWindowSplitDomains(unittest.TestCase):
+    """Issue #5347: an unfold-style read sweeps overlapping rows of one device dim."""
+
+    def test_unfold_window_is_capped_at_its_device_dim(self):
+        # x.unfold(d, 4, 2): row 2*w + k, k's device dim holds 2 of its 4 values.
+        w, k = _isym("w"), _isym("k")
+        self.assertEqual(
+            overlapping_coordinate_extents(2 * w + k, {w: 7, k: 4}), {k: (2, w)}
+        )
+
+    def test_equal_steps_cap_the_shorter_window_axis(self):
+        # x.unfold(0, 3, 1): row w + k; normalize_coordinates orders k (range 3)
+        # inside w (range 8) and gives it a size-1 device dim.
+        w, k = _isym("w"), _isym("k")
+        self.assertEqual(
+            overlapping_coordinate_extents(w + k, {w: 8, k: 3}), {k: (1, w)}
+        )
+
+    def test_non_overlapping_terms_are_free(self):
+        w, k = _isym("w"), _isym("k")
+        # unfold(size=2, step=2): windows tile the dim exactly.
+        self.assertEqual(overlapping_coordinate_extents(2 * w + k, {w: 8, k: 2}), {})
+        # A size-1 window variable cannot overlap.
+        self.assertEqual(overlapping_coordinate_extents(2 * w + k, {w: 8, k: 1}), {})
+        self.assertEqual(overlapping_coordinate_extents(w, {w: 8}), {})
+
+    def test_only_the_overlapping_term_is_capped(self):
+        a, b, c = _isym("a"), _isym("b"), _isym("c")
+        self.assertEqual(
+            overlapping_coordinate_extents(6 * a + 2 * b + c, {a: 2, b: 3, c: 4}),
+            {c: (2, b)},
+        )
+
+    def test_unanalysable_coordinates_are_skipped(self):
+        w, k = _isym("w"), _isym("k")
+        self.assertEqual(
+            overlapping_coordinate_extents(sympy.floor(w / 2) + k, {w: 8, k: 4}), {}
+        )
+        # Strides that do not nest (3 is not a multiple of 2).
+        self.assertEqual(
+            overlapping_coordinate_extents(3 * w + 2 * k, {w: 4, k: 4}), {}
+        )
+
+    def _unfold_sum_context(self):
+        # sum(x.unfold(1, 4, 2), dim=0) over x of shape (8, 16, 6): the read
+        # index 12*w + j + 6*k + 96*b puts 2*w + k on x's row dim.
+        w, j, k, b = (_isym(n) for n in ("w", "j", "k", "b"))
+        op = _computed_buffer((7, 6, 4), name="buf0", reduction_type="sum")
+        output_td = _tensor_dep("buf0", (7, 6, 4), (w, j, k))
+        source = TensorDep(
+            dep=MemoryDep("x", 12 * w + j + 6 * k + 96 * b, (w, j, k, b), (7, 6, 4, 8)),
+            layout=_fixed_tiled_layout((8, 16, 6)),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            [source],
+            it_space={w: 7, j: 6, k: 4, b: 8},
+            reduction_vars=[b],
+        )
+        return ctx, k
+
+    def test_unfold_read_domains(self):
+        ctx, k = self._unfold_sum_context()
+        result = overlapping_window_split_domains(ctx)
+        self.assertEqual(result.allowed_splits, {k: frozenset({2, 4})})
+        self.assertFalse(result.blocked)
+
+    def test_collected_with_the_other_constraints(self):
+        ctx, k = self._unfold_sum_context()
+        result = collect_work_division_constraints(ctx)
+        self.assertEqual(result.allowed_splits[k], frozenset({2, 4}))
+
+    def test_reduced_window_pins_the_outer_window_index(self):
+        # sum(x.unfold(1, 4, 2), dim=-1): k is reduced, so rather than being
+        # split it may stay whole on a core that sees a single window w.
+        b, w, j, k = (_isym(n) for n in ("b", "w", "j", "k"))
+        op = _computed_buffer((8, 7, 6), name="buf0", reduction_type="sum")
+        output_td = _tensor_dep("buf0", (8, 7, 6), (b, w, j))
+        source = TensorDep(
+            dep=MemoryDep("x", 96 * b + 12 * w + j + 6 * k, (b, w, j, k), (8, 7, 6, 4)),
+            layout=_fixed_tiled_layout((8, 16, 6)),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            [source],
+            it_space={b: 8, w: 7, j: 6, k: 4},
+            reduction_vars=[k],
+        )
+        domains = overlapping_window_split_domains(ctx).allowed_splits
+        self.assertEqual(domains[k], frozenset({1, 2, 4}))
+        self.assertEqual(domains[w], frozenset({7}))
+        self.assertNotIn(j, domains)
+
+    def test_contiguous_read_is_unconstrained(self):
+        rows, cols = _isym("d0"), _isym("d1")
+        op = _computed_buffer((6, 128))
+        output_td = _tensor_dep("buf0", (6, 128), (rows, cols))
+        source = _tensor_dep("x", (6, 128), (rows, cols))
+        ctx = _make_context(op, output_td, [source], it_space={rows: 6, cols: 128})
+        self.assertEqual(overlapping_window_split_domains(ctx), ConstraintResult())
 
 
 class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
