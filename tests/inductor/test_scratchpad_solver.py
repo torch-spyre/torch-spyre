@@ -27,6 +27,7 @@ from fractions import Fraction
 
 import sympy
 from unittest import TestCase
+from unittest.mock import patch
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
@@ -2237,6 +2238,61 @@ class SolveStatsTest(TestCase):
         self.assertTrue(stats["objective_used"])
         self.assertGreater(stats["variables"], 0)
         self.assertGreater(stats["constraints"], 0)
+        self.assertTrue(stats["sa_seed"]["cost_aware"])
+        self.assertEqual(stats["sa_seed"]["hinted_buffers"], 2)
+
+    def test_seed_hints_do_not_leak_into_the_fallback_ladder(self):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        original = solver._solve_and_record
+        original_seed = solver._add_sa_seed_hints
+        hint_counts = []
+        seeded_hint_counts = []
+
+        def seed(model, *args):
+            result = original_seed(model, *args)
+            seeded_hint_counts.append(len(model.proto.solution_hint.vars))
+            return result
+
+        def solve(cp_solver, model, **kwargs):
+            hint_counts.append(len(model.proto.solution_hint.vars))
+            return original(cp_solver, model, **kwargs)
+
+        with (
+            config.patch({"_cpsat_warn_on_cost_expr": True}),
+            patch.object(
+                _SympyExprToCpSat, "convert", side_effect=ValueError("test fallback")
+            ),
+            patch.object(solver, "_solve_and_record", side_effect=solve),
+            patch.object(solver, "_add_sa_seed_hints", side_effect=seed),
+        ):
+            solver.plan_layout_and_core_divisions(
+                4000 * (1 - solver.buffers[0].sym_is_lx)
+            )
+        self.assertTrue(hint_counts)
+        self.assertTrue(seeded_hint_counts and all(seeded_hint_counts))
+        self.assertEqual(set(hint_counts), {0})
+        self.assertFalse(solver.last_solve_stats["objective_used"])
+        self.assertTrue(solver.last_solve_stats["sa_seed"]["cost_aware"])
+        self.assertEqual(solver.last_solve_stats["sa_seed"]["hinted_buffers"], 2)
+
+    def test_an_optional_seed_assertion_does_not_abort_cp_sat(self):
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
+
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        with patch.object(
+            SaCoOptimizingSolver,
+            "plan_layout_and_core_divisions",
+            side_effect=AssertionError("seed unavailable"),
+        ):
+            result = solver.plan_layout_and_core_divisions(
+                4000 * (1 - solver.buffers[0].sym_is_lx)
+            )
+        self.assertEqual(len(result), 2)
+        self.assertTrue(solver.last_solve_stats["objective_used"])
+        self.assertEqual(
+            solver.last_solve_stats["sa_seed"]["skipped"], "SA seed failed"
+        )
+        self.assertEqual(solver.last_solve_stats["sa_seed"]["error"], "AssertionError")
 
     def test_the_fallback_passes_record_too(self):
         """``_run`` solves in its own occupancy passes when no objective status

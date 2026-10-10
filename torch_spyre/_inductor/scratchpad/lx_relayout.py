@@ -877,10 +877,19 @@ def solver_relayout_pair_cost(
       us broadcasts, flat in fan-out), so this over-states, never under-states,
       the shuffle; the decision is dominated by the consumer's replicated HBM
       re-read on the demote side, priced by the cost model since #4454;
-    - a governing split outside the law's fitted range [2, 8] is DECLINED, not
-      clamped: the reporting path clamps because the shuffle it prices already
-      exists, but the solver must never be offered an option at a price the
-      law was not fitted for.
+    - a governing split below 2 is not an ownership change.
+
+    A governing split above the law's fitted range [2, 8] is priced, not
+    declined: ``relayout_ns`` clamps it into that range, exactly as the
+    reporting path does. The fitted range limits how well the price is known,
+    not what the emitter can move; ``movement_supported`` decides that, as on
+    the committed path, which has no split gate. Declining the pair does not
+    avoid a misprice: it leaves the solver only the HBM round trip - on 16 and
+    32 cores, where row-split norms and reductions live, a write and re-read
+    of the whole tensor. Past 8 the price is an estimate: at split 16 the
+    clamped law under-predicts by about 15% where it was measured (the
+    unclamped law over-predicts by 12-40%, see ``relayout_ns``), and split 32
+    is not measured.
 
     The price is ``relayout_ns`` on a minimal feature vector - the same function
     the reporting path uses, so the two paths cannot drift.
@@ -892,7 +901,7 @@ def solver_relayout_pair_cost(
     than tolerating an out-of-range slot.
     """
     run_elems, split = governing_run_split(source_view, destination_view, device_dims)
-    if run_elems <= 0 or not 2 <= split <= 8:
+    if run_elems <= 0 or split < 2:
         return None
     if not movement_supported(
         source_view, destination_view, num_cores, destination_num_cores or num_cores

@@ -1032,6 +1032,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # division-dependent ineligibility is deliberately *not* expressed here: it
         # must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
+        # FirstFit sees fixed sizes; only expose in-place pairs valid at index 0.
+        # The annealing packer below retains all pairs and gates them dynamically.
+        for i, buf in enumerate(ff_bufs):
+            buf.in_place_parents = [
+                p
+                for p in buf.in_place_parents
+                if sizes[i] <= sizes[self._name_to_idx[p]]
+            ]
         # Deep-copied so FirstFit lays out its own objects, never the ones the
         # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(

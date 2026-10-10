@@ -24,6 +24,7 @@ drift apart.
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
+from torch_spyre._inductor.cost_model import OpFeatures, relayout_ns
 from torch_spyre._inductor.dump_cost_model import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
@@ -135,21 +136,46 @@ def test_gather_fanin_respects_shuffle_register_budget(fragments):
     assert (cost is not None) == supported
 
 
-def test_split_past_fitted_range_is_declined_not_clamped():
-    # Governing split 16 is outside the law's fitted range [2, 8], where it
-    # over-predicts 12-40%. The reporting path clamps (the shuffle already
-    # exists); the solver path must not OFFER an option at a price the law was
-    # never fitted for, so the pair is declined outright.
-    dims = [256, 8, 16, 64]
-    src16 = PerCoreView(((2, 16),), ((2, _CORE_ID),))
-    dst16 = PerCoreView(((0, 16),), ((0, _CORE_ID),))
-    assert governing_run_split(src16, dst16, dims) == (64, 16)
-    assert (
-        solver_relayout_pair_cost(
-            src16, dst16, 16, dims, 256 * 8 * 16 * 64, _DTYPE_BYTES
-        )
-        is None
+def test_split_past_fitted_range_is_priced_at_the_clamped_law():
+    # A row-split norm on 32 cores feeding a 4x8 view: logical [512, 4096] fp16
+    # lays out as [64 sticks, 512 rows, 64], so the source owns 16 rows of every
+    # stick (run 16*64 = 1024 elements, split 32) and each destination gathers
+    # its 128 rows from 8 sources (fan-in 8, within the shuffle budget). The
+    # emitter can move it, so the solver is offered the pair at the price the
+    # reporting path charges: ``relayout_ns`` clamps the governing split to 8.
+    # Declining it would leave the solver only the HBM round trip of 4 MB.
+    dims = [64, 512, 64]
+    rows32 = PerCoreView(((1, 32),), ((1, _CORE_ID),), num_cores=32)
+    tile4x8 = PerCoreView(
+        ((0, 8), (1, 4)),
+        ((0, Mod(_CORE_ID, 8)), (1, floor(_CORE_ID / 8))),
+        num_cores=32,
     )
+    assert governing_run_split(rows32, tile4x8, dims) == (1024, 32)
+    assert lx_relayout.movement_supported(rows32, tile4x8, 32, 32)
+    out_elems = 64 * 512 * 64
+    cost = solver_relayout_pair_cost(rows32, tile4x8, 32, dims, out_elems, _DTYPE_BYTES)
+    clamped = relayout_ns(
+        OpFeatures(
+            name="lx_relayout",
+            is_reduction=False,
+            out_elems=out_elems,
+            cores=32,
+            dtype_bytes=_DTYPE_BYTES,
+            args=[],
+            is_lx_relayout=True,
+            relayout_run_elems=1024,
+            relayout_split=8,
+        )
+    )
+    assert cost == pytest.approx(clamped, rel=1e-12)
+    # A few microseconds, against ~56 us to write 4 MiB to HBM and read it back
+    # at 150 GB/s.
+    assert 1_000 < cost < 5_000
+    # Direction still does not enter.
+    assert solver_relayout_pair_cost(
+        tile4x8, rows32, 32, dims, out_elems, _DTYPE_BYTES
+    ) == pytest.approx(cost, rel=1e-12)
 
 
 def test_split_product_must_equal_core_count():
