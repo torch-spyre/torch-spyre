@@ -259,15 +259,42 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 768), dtype=torch.float32)
         _compare_modes(execution_mode, batchnorm_1d_inference, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377
+    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377 (eager)
+    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/2544 (compiled)
     def test_batchnorm_identity_affine_2d(self, execution_mode, request):
         """2D norm with identity running stats plus gamma/beta."""
         if execution_mode == "eager":
-            # Only the eager variant still fails; compiled passes.
             request.applymarker(
                 pytest.mark.xfail(
                     reason="Spyre: Broadcasting size-1 dimensions - cannot map "
                     "stick expr to host dimension"
+                )
+            )
+        else:
+            # Constant folding reduces the graph (x: fp32 [32, 64, 224, 224]) to:
+            #
+            #   c   = full([1, 64, 1, 1], sqrt(1 + eps))   # = 1.0000050067901611
+            #   out = div(x, c)
+            #
+            # c gets a single layout whose stick is on the channel dim, while x
+            # has its stick on the last dim. An elementwise op needs one stick
+            # variable, and fp32 restickify is not supported (#2544), so
+            # compilation raises "no mechanism to resolve stick incompatibility".
+            #
+            # Before PR #4462 (which stopped using with_int64_fallback), this
+            # passed by accident. `int64 + eps` was cast back to int64 (== 1),
+            # which is wrong: PyTorch promotes int64 + float to float32. Then
+            # sqrt(1) == 1.0 made Inductor fold `div(x, 1.0)` away, so no kernel
+            # was compiled:
+            #
+            #   out = x
+            #
+            # This test is expected to pass once #2544 (fp32 restickify) is fixed.
+            request.applymarker(
+                pytest.mark.xfail(
+                    reason="Spyre: no mechanism to resolve stick incompatibility "
+                    "for fp32 x / [1, C, 1, 1] constant (fp32 restickify, #2544)",
+                    strict=False,
                 )
             )
 

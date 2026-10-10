@@ -172,15 +172,12 @@ SPYRE_FP32_OPS = [
     "prod",
 ]
 
-# Operations the device has a 32-bit integer intrinsic for: `spyreop.addi32toi32`
-# and `spyreop.muli32toi32`, each splitting its operands into halves and finding
-# the carry with a pair of scale factors.  Separate from SPYRE_FP32_OPS because
-# the two are different templates reached by the same op name, and only the KTIR
-# path can spell them -- SDSC still relabels IEEE_INT32 as SENUINT32 for indices.
-SPYRE_INT32_OPS = [
-    "add",
-    "mul",
-]
+# Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
+# their operands are IEEE_INT32 tensors.  Every check that needs to recognise a
+# native int32 op uses this set as its single source of truth.
+ADDI32TOI32_OP = "addi32toi32"
+MULI32TOI32_OP = "muli32toi32"
+SPYRE_INT32_OPS: frozenset[str] = frozenset({ADDI32TOI32_OP, MULI32TOI32_OP})
 
 # DLFloat16's largest finite value (0x7FFE); 0x7FFF is NaN-Infinity.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)

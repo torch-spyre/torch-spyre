@@ -1091,12 +1091,6 @@ class TestRecipes(unittest.TestCase):
                         # need the dialect, which this module deliberately does
                         # not require.
                         self.assertTrue(callable(arm.binding))
-                # A one-armed op has to be reachable at every format, so that arm
-                # cannot list any: a lone arm claiming a format would make
-                # ``Recipe.arm`` refuse every other one.
-                if len(recipe.arms) == 1:
-                    self.assertEqual(recipe.arms[0].dtypes, ())
-
         # Every kind is now registered by some arm, so the mirror assertion is
         # worth making: PAYLOAD stopped being a hook nothing reaches when the
         # ``spyreop`` intrinsics landed on it.
@@ -1180,19 +1174,29 @@ class TestRecipes(unittest.TestCase):
                 ),
             )
 
-    def test_an_op_with_two_spellings_resolves_on_the_format(self):
-        """``add`` is a named linalg op at floats and a spyreop payload at int32.
+    def test_int32_add_has_its_own_recipe_separate_from_float_add(self):
+        """``add`` handles floats only; ``addi32toi32`` is the dedicated int32 entry.
 
-        The point of the arms: one entry per op, and the format picks the spelling.
-        Asserted on the recipe rather than through a plan so it holds without a
-        dialect build -- the bindings stay unresolved thunks.
+        ``SpyreOpFuncs.add`` emits ``addi32toi32`` directly when its operands are
+        IEEE_INT32, so the KTIR layer never sees ``op="add"`` at ``IEEE_INT32``.
+        Two separate recipes, each with one arm, rather than one recipe with two
+        arms.  Asserted on the recipes rather than through a plan so it holds
+        without a dialect build -- the bindings stay unresolved thunks.
         """
-        recipe = ktir.KtirBuilder.RECIPES["add"]
-        self.assertIs(recipe.arm(DataFormats.SEN169_FP16).kind, ktir.BindingKind.NAMED)
-        self.assertIs(recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.PAYLOAD)
-        # Arity is the op's, not the arm's, so both spellings agree on it by
-        # construction rather than by two entries happening to match.
-        self.assertEqual(recipe.arity, 2)
+        add_recipe = ktir.KtirBuilder.RECIPES["add"]
+        int32_recipe = ktir.KtirBuilder.RECIPES["addi32toi32"]
+        # Float add: the single arm is the named linalg op.
+        self.assertIs(
+            add_recipe.arm(DataFormats.SEN169_FP16).kind, ktir.BindingKind.NAMED
+        )
+        # Int32 add: the single arm is a spyreop payload.
+        self.assertIs(
+            int32_recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.PAYLOAD
+        )
+        # Arity is the same for both; two separate entries agree by being declared
+        # identically rather than by sharing a recipe object.
+        self.assertEqual(add_recipe.arity, 2)
+        self.assertEqual(int32_recipe.arity, 2)
 
     def test_an_op_with_one_spelling_reaches_it_at_every_format(self):
         """``sub`` has no integer intrinsic, so its one arm takes every format."""
@@ -1202,19 +1206,22 @@ class TestRecipes(unittest.TestCase):
                 self.assertIs(recipe.arm(dtype).kind, ktir.BindingKind.NAMED)
 
     def test_the_format_reaches_the_step_and_picks_the_surface(self):
-        """An int32 ``add`` plans as a generic, and the step carries the format.
+        """An int32 add plans as a generic, and the step carries the format.
 
         The whole path in one assertion: the spec's format picks the payload arm,
         the payload arm picks ``Surface.GENERIC`` (a scalar builder needs a region),
         and the format lands on the step so emission resolves the same arm without
         seeing the spec.
+
+        Note: the op name is ``addi32toi32`` (not ``add``) because
+        ``SpyreOpFuncs.add`` emits it directly when its operands are IEEE_INT32.
         """
-        spec = make_op_spec("add", dtype=DataFormats.IEEE_INT32)
+        spec = make_op_spec("addi32toi32", dtype=DataFormats.IEEE_INT32)
         [step] = ktir.build_kernel_plan([spec]).steps
         self.assertIs(step.dtype, DataFormats.IEEE_INT32)
         self.assertIs(step.surface, ktir.Surface.GENERIC)
-        # The same op at fp16 is the named linalg op, which states its own
-        # indexing and so needs no record.
+        # The float add is the named linalg op, which states its own indexing and
+        # so needs no record.
         [float_step] = ktir.build_kernel_plan([make_op_spec("add")]).steps
         self.assertIs(float_step.surface, ktir.Surface.BARE)
         self.assertIsNone(float_step.indexing)
@@ -1288,6 +1295,15 @@ class TestArmDispatch(unittest.TestCase):
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             if recipe.dispatch is not ktir.request_by_dtype:
                 continue
+            # All arms claim explicit dtypes: only sweep the formats they serve.
+            arms = ktir._arms(recipe.arms)
+            if all(arm.dtypes for arm in arms):
+                for dtype in {d for arm in arms for d in arm.dtypes}:
+                    with self.subTest(op=op, dtype=dtype):
+                        self.assertIs(
+                            recipe.arm(dtype), recipe.arm(dtype, broadcast=True)
+                        )
+                continue
             for dtype in (*ktir.ElemTypes.NAMES, None):
                 with self.subTest(op=op, dtype=dtype):
                     self.assertIs(recipe.arm(dtype), recipe.arm(dtype, broadcast=True))
@@ -1358,11 +1374,18 @@ class TestArmDispatch(unittest.TestCase):
                     recipe.arm(FP16, broadcast=True).kind, ktir.BindingKind.PAYLOAD
                 )
         int32 = DataFormats.IEEE_INT32
-        for op in ("add", "mul"):
+        # int32 add/mul arrive as ``addi32toi32`` / ``muli32toi32`` — emitted by
+        # ``SpyreOpFuncs.add`` / ``SpyreOpFuncs.mul``.  Each has a single PAYLOAD
+        # arm that explicitly claims IEEE_INT32, so request_by_dtype routes both
+        # aligned and broadcast requests to it directly.
+        for op in ("addi32toi32", "muli32toi32"):
             with self.subTest(op=op):
-                arm = ktir.KtirBuilder.RECIPES[op].arm(int32, broadcast=True)
-                self.assertIs(arm.kind, ktir.BindingKind.PAYLOAD)
+                recipe = ktir.KtirBuilder.RECIPES[op]
+                (arm,) = ktir._arms(recipe.arms)
                 self.assertEqual(arm.dtypes, (int32,))
+                self.assertIs(
+                    recipe.arm(int32, broadcast=True).kind, ktir.BindingKind.PAYLOAD
+                )
         self.assertIs(
             ktir.KtirBuilder.RECIPES["sub"].arm(int32, broadcast=True).kind,
             ktir.BindingKind.NAMED,
@@ -1605,7 +1628,14 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
             if recipe.attrs is not None or recipe.reduces:
                 continue
             with self.subTest(op=op):
-                spec = make_op_spec(op, inputs=recipe.arity)
+                # Format-restricted recipes only serve their claimed dtype(s);
+                # use that instead of the default so build_kernel_plan succeeds.
+                arms = ktir._arms(recipe.arms)
+                if all(arm.dtypes for arm in arms):
+                    dtype = next(iter(arms[0].dtypes))
+                    spec = make_op_spec(op, inputs=recipe.arity, dtype=dtype)
+                else:
+                    spec = make_op_spec(op, inputs=recipe.arity)
                 [step] = ktir.build_kernel_plan([spec]).steps
                 self.assertEqual(step.attrs, ())
 

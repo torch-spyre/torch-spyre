@@ -1922,6 +1922,12 @@ def lower_where(condition, self, other):
     return result
 
 
+# type_promotion_kind=None: DEFAULT performs FP16→FP32 promotion before layout
+# propagation, leaving an IR node with STANDARD EA.  With None the FP16 operand
+# survives into the fused body so propagate_layouts can assign DL16_TO_FP32 EA.
+# The underlying lowering applies default promotion; when both operands stay
+# int32, SpyreOpFuncs.add / SpyreOpFuncs.mul emits the dedicated hardware op
+# (addi32toi32 / muli32toi32).
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
@@ -1936,18 +1942,19 @@ def lower_add(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    return lowering.add(x, y)
 
 
+# Same type_promotion_kind=None rationale as lower_add above.
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    return lowering.mul(x, y)
 
 
 @register_spyre_lowering(
@@ -2354,6 +2361,21 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
+
+
+# convert_input_to_bool=True guarantees operands are cast to 0/1 before the
+# backend sees them.  On 0/1 values maximum(a, b) == a OR b, so the hardware
+# maximum op correctly implements logical OR.  This mirrors logical_and, which
+# uses mul (product of 0/1 values) for the same reason.
+@register_spyre_lowering(
+    torch.ops.aten.logical_or.default,
+    type_promotion_kind=None,
+    convert_input_to_bool=True,
+    override_return_dtype=torch.bool,
+    broadcast=True,
+)
+def lower_logical_or(x, y):
+    return lowering.logical_or(x, y)
 
 
 @register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)

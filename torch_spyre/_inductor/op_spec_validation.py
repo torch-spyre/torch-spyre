@@ -107,8 +107,10 @@ SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
 BINARY_OPS = frozenset(
     {
         "add",
+        "addi32toi32",
         "sub",
         "mul",
+        "muli32toi32",
         "realdiv",
         "maximum",
         "minimum",

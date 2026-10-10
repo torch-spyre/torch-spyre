@@ -11,10 +11,16 @@ test_suite_config:
             - TestOps::test_binary_op_stick_crossing_last_dim
             - TestOps::test_exp_fp16.*
             - TestOps::test_exp_fp32.*
+            # Native int64 add/mul: operands > 2**24 prove addi32toi32/muli32toi32 is used.
+            - TestOps::test_native_int64_large_values.*
+            # Negative-operand broadcast: SENUINT32 label must not corrupt signed fill values.
+            - TestOps::test_native_int64_negative_broadcast.*
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise
         - names:
+            # int64 with values > INT32_MAX: exceeds physical int32 storage on Spyre.
+            - TestOps::test_native_int64_beyond_int32_large_values.*
             # Wrapper methods with broken implementation (call methods without _spyre suffix)
             # Marked as xfail so they don't cause CI to fail
             - TestOps::test_scalar_comparison

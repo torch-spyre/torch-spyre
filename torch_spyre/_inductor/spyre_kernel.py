@@ -176,6 +176,24 @@ def _serialize_value(v):
         return repr(v)
 
 
+def _has_int32_operands(*operands: RValue) -> bool:
+    """Whether the operands are loaded IEEE_INT32 tensors.
+
+    The add/mul lowerings apply default type promotion, so int32 never meets
+    another format here; a mix means that invariant was broken upstream.
+    """
+    kinds = [
+        x.layout.device_layout.device_dtype if isinstance(x, TensorAccess) else type(x)
+        for x in operands
+    ]
+    if DataFormats.IEEE_INT32 not in kinds:
+        return False
+    assert all(kind == DataFormats.IEEE_INT32 for kind in kinds), (
+        f"IEEE_INT32 operand mixed with {kinds}"
+    )
+    return True
+
+
 class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -189,6 +207,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def add(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
 
     @staticmethod
@@ -255,6 +275,10 @@ class SpyreOpFuncs:
         return PointwiseOp("mul", [x, y])
 
     @staticmethod
+    def logical_or(x, y):
+        return PointwiseOp("maximum", [x, y])
+
+    @staticmethod
     def lt(a, b):
         return PointwiseOp("lesserthan", [a, b])
 
@@ -268,6 +292,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def mul(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("muli32toi32", [a, b])
         return PointwiseOp("mul", [a, b])
 
     @staticmethod
@@ -331,7 +357,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def square(x):
-        return PointwiseOp("mul", [x, x])
+        return SpyreOpFuncs.mul(x, x)
 
     @staticmethod
     def sub(a, b):

@@ -3102,36 +3102,27 @@ class KtirBuilder:
     #
     # A repeated key here is ruff F601, so an op cannot be declared twice.
     RECIPES: ClassVar[dict[str, Recipe]] = {
-        # ``add``, ``mul`` and ``sub`` are the ops with more than one spelling, on
-        # two discriminants at once:
+        # ``add``, ``mul`` and ``sub`` each have two arms: a NAMED linalg op for
+        # the common aligned case, and an ``arith`` scalar fallback for broadcast
+        # operands.  A named linalg op states its own identity indexing, so a
+        # broadcast operand's derived map row has nowhere to go
+        # (``_broadcast_surface``); the scalar arm lives in a generic's region,
+        # which states every row, and ``request_scalar_when_broadcast`` selects
+        # it exactly then.  This is what softmax's ``x - rowmax`` needs.
         #
-        #   * the FORMAT -- a named linalg op at floats, and a ``spyreop``
-        #     intrinsic at four-byte integers that splits its operands into halves
-        #     and finds the carry with a pair of scale factors.  A float arm lists
-        #     no formats, so it takes every format the integer arm does not claim.
-        #   * whether an operand is BROADCAST -- a named linalg op states its own
-        #     identity indexing, so a broadcast operand's derived map row has
-        #     nowhere to go (``_broadcast_surface``).  The ``arith`` scalar goes in
-        #     a generic's region, which states every row, so
-        #     ``request_scalar_when_broadcast`` reaches for it exactly then.
-        #     This is what softmax's ``x - rowmax`` needs, and with it the KTIR
-        #     path's softmax matches the SDSC path's exactly (verify.py).
+        # The named arm is FIRST because two dtype-less arms of different kinds
+        # resolve in declaration order, and aligned operands (the named op) are
+        # the common case: every emitter golden is a named ``add``.
         #
-        # The named arm is FIRST in each entry because two dtype-less arms of
-        # different kinds resolve in declaration order (``request_by_dtype``), and
-        # the aligned operands that keep the named op are the common case: every
-        # emitter golden is a named ``add``.
+        # Integer (IEEE_INT32) add/mul arrive as ``addi32toi32`` / ``muli32toi32``
+        # — chosen by ``SpyreOpFuncs.add`` / ``SpyreOpFuncs.mul`` — so these
+        # float entries never see IEEE_INT32.
         "add": Recipe(
             arity=2,
             dispatch=request_scalar_when_broadcast,
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.add),
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.addf),
-                Arm(
-                    kind=BindingKind.PAYLOAD,
-                    binding=lambda: spyreop.addi32toi32,
-                    dtypes=(DataFormats.IEEE_INT32,),
-                ),
             ),
         ),
         "mul": Recipe(
@@ -3140,11 +3131,28 @@ class KtirBuilder:
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.mul),
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.mulf),
-                Arm(
-                    kind=BindingKind.PAYLOAD,
-                    binding=lambda: spyreop.muli32toi32,
-                    dtypes=(DataFormats.IEEE_INT32,),
-                ),
+            ),
+        ),
+        # Native int32 add/mul: OpSpec.op already carries the hardware name when
+        # all operands are IEEE_INT32 — the name is chosen by SpyreOpFuncs.add /
+        # SpyreOpFuncs.mul.  The arm claims IEEE_INT32 explicitly so the default
+        # request_by_dtype dispatch routes both aligned and broadcast requests to
+        # the payload builder directly, without going through
+        # request_scalar_when_broadcast's NAMED-arm filter.
+        "addi32toi32": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.addi32toi32,
+                dtypes=(DataFormats.IEEE_INT32,),
+            ),
+        ),
+        "muli32toi32": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.muli32toi32,
+                dtypes=(DataFormats.IEEE_INT32,),
             ),
         ),
         # No integer arm: there is no ``subi32toi32`` intrinsic, so an int32
