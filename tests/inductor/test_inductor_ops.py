@@ -6329,6 +6329,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_conv2d_silu", "test_conv2d_silu_cpu"): {
+            # torch-spyre lowers a conv as unfold + matmul. The matmul output is
+            # (N, C_out, H_out*W_out), with the flattened spatial dim stored in
+            # 64-element fp16 sticks, and conv2d_via_bmm_decomp then reshapes it
+            # to (N, C_out, H_out, W_out). When W_out is not a multiple of 64,
+            # one output row spans a fractional number of sticks (160/64 = 5/2),
+            # so a plain reshape needs the stick coordinate 5*c1/2, which the
+            # compiler cannot represent ("AssertionError: Unsupported coordinate
+            # expression 5*c1/2", issue #1353). The decomposition must instead
+            # route that reshape through spyre.reshape_via_cpu: a CPU round trip
+            # that returns a fresh device tensor whose layout is solved from
+            # scratch.
+            #
+            # A bare conv does not trigger this. With no consumer, the compiler
+            # is free to pick a convenient output layout and never commits the
+            # bad reshape (bare convs with W_out 160, 96, 80 and 40 all compile
+            # without the routing), which is why the test_conv2d cases do not
+            # catch it. A pointwise op after the conv, as in the real model,
+            # pins the conv output's layout and forces the reshape. SiLU is
+            # used here as an example of such a consumer. Shapes are YOLOv5n's
+            # stride-2 downsample convs.
+            "param_sets": {
+                "1x16x320_ksize3_stride2_pad1_bias": (  # W_out = 160
+                    cached_randn((1, 16, 320, 320)),
+                    cached_randn((32, 16, 3, 3)),
+                    cached_randn((32,)),
+                    (1, 1),
+                    (2, 2),
+                ),
+                "1x32x160_ksize3_stride2_pad1_bias": (  # W_out = 80
+                    cached_randn((1, 32, 160, 160)),
+                    cached_randn((64, 32, 3, 3)),
+                    cached_randn((64,)),
+                    (1, 1),
+                    (2, 2),
+                ),
+            },
+        },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
             # Non-zero padding is an intentional capability gap on the direct
             # depthwise path, not a bug: lower_convolution raises Unsupported
@@ -9705,6 +9743,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
         )
 
+    def test_conv2d_silu_cpu(self, x, weight, bias, padding, stride):
+        def fn(x, weight, bias, padding, stride):
+            return torch.nn.functional.silu(
+                torch.conv2d(x, weight, bias, stride=stride, padding=padding)
+            )
+
+        self.compare_with_cpu(fn, x, weight, bias, padding, stride, atol=0.5, rtol=0.1)
+
     def test_conv2d_direct_base(self, x, weight, bias, stride):
         # Exercises the native conv2d SDSC (lower_convolution), not the
         # im2col+matmul decomposition. Enabled via config.conv2d_direct_lowering
@@ -9790,6 +9836,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             _supported(eps, k=3, hw=8, stride=[2, 2]),  # (8-3)%2==1, ragged
             "ragged strided width must fall back",
         )
+
+    def test_conv2d_bmm_unaligned_width_reshape_via_cpu(self):
+        # Pure-Python routing check (no compile/hardware) on the im2col+matmul
+        # conv decomposition's final reshape, (N, C_out, H_out*W_out) ->
+        # (N, C_out, H_out, W_out). When W_out is not a multiple of the fp16
+        # stick width, a plain reshape of the flat stick axis mints a
+        # fractional stick stride (5*c1/2 + c2/64 for W_out=160, issue #1353)
+        # that normalize_coordinates rejects, so conv2d_via_bmm_decomp must
+        # route it through spyre.reshape_via_cpu. Stick-aligned widths keep the
+        # plain reshape. Shapes are YOLOv5n's stride-2 downsample convs.
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch_spyre._inductor.decompositions import conv2d_via_bmm_decomp
+        from torch_spyre._C import get_elem_in_stick
+
+        eps = get_elem_in_stick(torch.float16)  # 64 at fp16
+
+        def reshape_via_cpu_shapes(hw, stride):
+            x = torch.zeros(1, 16, hw, hw, dtype=torch.float16)
+            w = torch.zeros(32, 16, 3, 3, dtype=torch.float16)
+
+            def decomp(x, w):
+                return conv2d_via_bmm_decomp(
+                    x, w, None, [stride, stride], [1, 1], [1, 1], False, [0, 0], 1
+                )
+
+            gm = make_fx(decomp, tracing_mode="fake")(x, w)
+            return [
+                list(n.args[1])
+                for n in gm.graph.nodes
+                if n.target is torch.ops.spyre.reshape_via_cpu.default
+            ]
+
+        for hw, stride, w_out in [(320, 2, 160), (160, 2, 80), (160, 1, 160)]:
+            self.assertNotEqual(w_out % eps, 0)
+            self.assertIn(
+                [1, 32, w_out, w_out],
+                reshape_via_cpu_shapes(hw, stride),
+                f"W_out={w_out} must reshape through reshape_via_cpu",
+            )
+        for hw, stride, w_out in [(128, 1, 128), (128, 2, 64)]:
+            self.assertEqual(w_out % eps, 0)
+            self.assertNotIn(
+                [1, 32, w_out, w_out],
+                reshape_via_cpu_shapes(hw, stride),
+                f"stick-aligned W_out={w_out} must keep the plain reshape",
+            )
 
     def test_dwise_conv2d_cpu(
         self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride

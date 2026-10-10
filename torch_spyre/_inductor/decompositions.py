@@ -3301,7 +3301,16 @@ def conv2d_via_bmm_decomp(
         bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
         output = output + bias_shaped
 
-    output = output.reshape(N, C_out, H_out, W_out)
+    eps = get_elem_in_stick(output.dtype)  # 64 for fp16
+    if isinstance(W_out, int) and W_out % eps != 0:
+        # Innermost dim of the 4-D view is not stick-aligned; a plain
+        # reshape of the flat (..., H_out*W_out) stick axis into
+        # (..., H_out, W_out) produces a fractional stick stride (#1353).
+        # Route through the CPU fallback so the result is a fresh device
+        # tensor whose layout is re-solved cleanly.
+        output = torch.ops.spyre.reshape_via_cpu(output, (N, C_out, H_out, W_out))
+    else:
+        output = output.reshape(N, C_out, H_out, W_out)
 
     return output
 
