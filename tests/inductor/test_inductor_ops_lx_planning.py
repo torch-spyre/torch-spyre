@@ -70,10 +70,10 @@ def _canonical_test_names(test_cls):
     ``test_cls.PARAMS``, plus all non-parameterized test methods.
 
     For a PARAMS entry with an ``ops_dict``, every op gets one shape (the
-    first ``param_sets`` case that is not in ``expect_fail`` for that op);
-    without an ``ops_dict``, only the first such case is emitted. An
-    ``expect_fail`` case is never copied (see ``_copy_canonical_tests``), so
-    it cannot be the representative.
+    first ``param_sets`` case that is not in ``expect_fail`` or ``expect_raise``
+    for that op); without an ``ops_dict``, only the first such case is emitted.
+    Neither kind of case is ever copied (see ``_copy_canonical_tests``), so it
+    cannot be the representative.
     """
     params = getattr(test_cls, "PARAMS", {})
     canonical = set()
@@ -83,7 +83,10 @@ def _canonical_test_names(test_cls):
         if not param_sets:
             continue
         parameterized_prefixes.append(prefix)
-        expect_fail = set(cases.get("expect_fail", []))
+        # expect_fail and expect_raise cases are not copied either.
+        expect_fail = set(cases.get("expect_fail", [])) | set(
+            cases.get("expect_raise", {})
+        )
         ops_dict = cases.get("ops_dict")
         if ops_dict:
             for op_name in ops_dict:
@@ -141,6 +144,10 @@ def _copy_canonical_tests(
     appended to each name. Unless ``TEST_LX_PLANNING_FULL`` is set, restrict
     to the canonical subset derived from ``TestOps.PARAMS``.
 
+    A test that asserts a rejection (``expect_raise``, tagged ``_expects_raise``)
+    is not copied either: it says nothing about LX planning, and the wrap would
+    only change which op raises.
+
     A test marked xfail in ``src_cls`` is not copied. It fails for a reason
     unrelated to LX planning (an unsupported op, wrong values), and the wrap can
     hide or change that failure: the reduction wrap's atol floor and dim-0 sum
@@ -156,7 +163,7 @@ def _copy_canonical_tests(
             continue
         if name in _DELEGATOR_TESTS:
             continue
-        if _has_xfail_mark(value):
+        if _has_xfail_mark(value) or getattr(value, "_expects_raise", False):
             continue
         if keep is not None and name not in keep:
             continue

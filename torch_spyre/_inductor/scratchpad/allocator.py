@@ -112,7 +112,10 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_group_path,
     counted_loop_lifetime_overrides,
 )
-from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.scratchpad.graph_editor import (
+    GraphEditor,
+    unwrapped_buffer_name,
+)
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -290,10 +293,17 @@ class DrainPlan:
     the residency gate, the lifetime extension and the post-solve push -- never
     re-derived from graph state that later passes mutate.
 
+    The same drain serves a carry whose only post-loop access is a collective
+    (e.g. the TP all_reduce of a traced MoE's expert sum).  A collective needs a
+    materialized HBM operand, so without the drain the carry -- and with it
+    every in-loop update -- stays in HBM.  With ``collective`` set, the
+    drain is an ordinary HBM buffer and the collective is rewired to it.
+
     Attributes
     ----------
     storage_name:
-        The carry's initial storage (also the single graph-output entry).
+        The carry's initial storage; for a graph-output carry also its single
+        graph-output entry.
     update_name:
         Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
     loop_group:
@@ -305,6 +315,9 @@ class DrainPlan:
     loop_origin:
         The exact FX ``while_loop`` HOP node retained by the splice; the drain
         clone's FX node is inserted after it.
+    collective:
+        ``None`` for a graph-output carry.  Otherwise the single post-loop
+        collective reading the storage, which the push repoints at the drain.
     """
 
     storage_name: str
@@ -312,6 +325,7 @@ class DrainPlan:
     loop_group: tuple[int, ...]
     anchor_op: Operation
     loop_origin: Any
+    collective: Optional[Operation] = None
 
 
 def _access_group_path(op: Operation) -> tuple[int, ...]:
@@ -320,17 +334,6 @@ def _access_group_path(op: Operation) -> tuple[int, ...]:
     if isinstance(op, ExternKernel):
         return ()
     return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
-
-
-def _graph_output_buffer_name(entry: Any) -> Optional[str]:
-    """The buffer name a ``graph_outputs`` entry names, or None if unwrappable."""
-
-    node = entry
-    while not isinstance(node, Buffer):
-        node = getattr(node, "data", None)
-        if node is None:
-            return None
-    return node.get_name()
 
 
 def _is_reinterpret_output_entry(entry: Any) -> bool:
@@ -367,10 +370,14 @@ def validated_drain_plans(
     created):
 
     P1  boundary cloning is enabled;
-    P2  exactly one ``graph.graph_outputs`` entry names the storage, and no
-        ReinterpretView sits anywhere on its wrapper chain
+    P2a (graph output) exactly one ``graph.graph_outputs`` entry names the
+        storage, and no ReinterpretView sits anywhere on its wrapper chain
         (``change_graph_output`` replaces the first match, so an aliased entry
-        declines, and it repoints a view in place);
+        declines, and it repoints a view in place); or
+    P2b (collective) no entry names the storage, and its only access outside
+        the loop is one post-loop collective whose operand
+        :meth:`GraphEditor.collective_operand_name` resolves to it
+        (:func:`_sole_post_loop_collective`);
     P3  the storage op carries a ``LoopCarryRecord`` whose ``storage_name`` is
         its own name and whose ``update_name`` resolves to exactly one op;
     P4  that update is the only op mutating the storage;
@@ -429,25 +436,18 @@ def validated_drain_plans(
         storage_mutators = mutators.get(name, [])
         if len(storage_mutators) != 1 or storage_mutators[0] is not update_op:
             continue
-        in_loop_access_elsewhere = any(
-            op is not update_op
-            and _access_group_path(op)
+        # Every access but the initializer's and the update's.
+        accessors = [
+            op
+            for op in graph.operations
+            if op is not storage_op
+            and op is not update_op
             and any(
                 dep.name == name
                 for dep in op_read_writes(op).reads | op_read_writes(op).writes
             )
-            for op in graph.operations
-        )
-        if in_loop_access_elsewhere:
-            continue
-        output_entries = [
-            index
-            for index, entry in enumerate(graph.graph_outputs)
-            if _graph_output_buffer_name(entry) == name
         ]
-        if len(output_entries) != 1:
-            continue
-        if _is_reinterpret_output_entry(graph.graph_outputs[output_entries[0]]):
+        if any(_access_group_path(op) for op in accessors):
             continue
         anchor_op = None
         for op in graph.operations:
@@ -456,14 +456,57 @@ def validated_drain_plans(
                 anchor_op = op
         if anchor_op is None:
             continue
+        output_entries = [
+            index
+            for index, entry in enumerate(graph.graph_outputs)
+            if unwrapped_buffer_name(entry) == name
+        ]
+        collective = None
+        if len(output_entries) == 1:
+            if _is_reinterpret_output_entry(graph.graph_outputs[output_entries[0]]):
+                continue
+        elif output_entries:
+            continue
+        else:
+            collective = _sole_post_loop_collective(graph, name, accessors, anchor_op)
+            if collective is None:
+                continue
         plans[name] = DrainPlan(
             storage_name=name,
             update_name=record.update_name,
             loop_group=update_group,
             anchor_op=anchor_op,
             loop_origin=loop_origin,
+            collective=collective,
         )
     return plans
+
+
+def _sole_post_loop_collective(
+    graph: GraphLowering,
+    name: str,
+    accessors: Sequence[Operation],
+    anchor_op: Operation,
+) -> Optional[Operation]:
+    """The collective that is ``name``'s only access outside its loop, or None.
+
+    ``accessors`` are the ops, other than the storage's initializer and its
+    tagged update, that read or write the storage.  The plan applies only when
+    that is a single op running after the whole loop, and it is a collective
+    whose operand :class:`GraphEditor` can repoint at the drain.  Any other
+    post-loop access would still name the storage once the collective reads the
+    drain -- and an in-place all_reduce's result lives in its operand -- so it
+    declines.
+    """
+
+    if len(accessors) != 1:
+        return None
+    consumer = accessors[0]
+    if GraphEditor.collective_operand_name(consumer) != name:
+        return None
+    if graph.operations.index(consumer) <= graph.operations.index(anchor_op):
+        return None
+    return consumer
 
 
 def _drain_lifetime_end_overrides(
@@ -471,7 +514,7 @@ def _drain_lifetime_end_overrides(
     drain_plans: Mapping[str, DrainPlan],
     graph_end: int,
 ) -> None:
-    """Extend every planned drain storage's lifetime to the graph exit, in place.
+    """Extend each graph-output drain storage's lifetime to the graph exit, in place.
 
     All solver intervals are pre-insertion indices and ``graph_end =
     len(graph.operations)`` is the exclusive end every pre-insertion op lies
@@ -480,12 +523,29 @@ def _drain_lifetime_end_overrides(
     strictly before the fill), which is what makes the post-solve drain read
     safe regardless of where the scheduler eventually places it.  This only
     removes reuse; it adds no unpriced occupancy and no cost term.
+
+    A collective drain is not extended: the collective reads the storage, so
+    the storage already lives until the collective, which must run after the
+    drain it reads.  Extending it would hold every layer's carry in LX to the
+    graph exit.
     """
 
-    for planned_name in drain_plans:
+    for planned_name, plan in drain_plans.items():
+        if plan.collective is not None:
+            continue
         lifetime_end_overrides[planned_name] = max(
             lifetime_end_overrides.get(planned_name, 0), graph_end
         )
+
+
+def _drained_collectives(drain_plans: Mapping[str, DrainPlan]) -> dict[str, str]:
+    """Storage name -> the collective its drain plan repoints at the drain."""
+
+    return {
+        name: plan.collective.get_name()
+        for name, plan in drain_plans.items()
+        if plan.collective is not None
+    }
 
 
 def _clear_loop_membership_metadata(op: Operation) -> None:
@@ -497,8 +557,8 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     surviving ``loop_info`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
     advance in codegen (``_general_tile_advance``), and the records would
-    misclassify it in ``_build_cd_bound_buffers``.  Only the drain branch and
-    the hoisted-input branch of ``_push_allocation`` call this; every other
+    misclassify it in ``_build_cd_bound_buffers``.  Only the two drain branches
+    and the hoisted-input branch of ``_push_allocation`` call this; every other
     clone keeps today's metadata-copy behavior.
     """
 
@@ -1870,7 +1930,8 @@ class ScratchpadAllocator:
         to B itself. The graph is made to have C as its output.
 
         - A buffer that is neither a graph input nor a graph output gets the LX allocation assigned
-        to itself."""
+        to itself.  If it is a loop carry whose drain plan names a collective, a post-loop clone C
+        is also inserted and the collective is made to read C."""
         outputs = set(graph.get_output_names())
         inputs = set(graph.graph_input_names)
 
@@ -1936,6 +1997,26 @@ class ScratchpadAllocator:
                 graph_editor.change_graph_output(buf, new_buffer)
 
             else:
+                drain_plan = drain_plans.get(b.name)
+                if drain_plan is not None and drain_plan.collective is not None:
+                    # The collective needs an HBM operand: give it a post-loop
+                    # copy of the resident carry, exactly like the graph-output
+                    # drain above, and leave the carry itself in LX.
+                    _assert_drain_plan_committed(
+                        graph, b, buffers_by_name, op_by_name, drain_plan
+                    )
+                    drained = graph_editor.push_allocation_with_clone(
+                        buf,
+                        [],
+                        input=False,
+                        private=True,
+                        after_fx=drain_plan.loop_origin,
+                        lower_anchor=drain_plan.anchor_op,
+                    )
+                    _clear_loop_membership_metadata(drained)
+                    graph_editor.replace_collective_operand(
+                        drain_plan.collective, b.name, drained
+                    )
                 self._set_one_allocation(buf, b.address, b.lx_view)
 
         # Keep graph mutation last and in pre-scheduling: solver retries require
@@ -2611,6 +2692,127 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     return index
 
 
+def commit_divisions(
+    graph: GraphLowering,
+    allocation: Sequence[CoreDivisionBuffer],
+) -> None:
+    """Commit the solver's chosen symbol-keyed division for every buffer.
+
+    The solver optimizes a core division for all buffers, not just resident
+    ones: a resident producer and its consumers are pinned by
+    ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
+    slicing (so those commits are mutually consistent), while a spilled
+    buffer is free of that gate -- its accesses round-trip through HBM,
+    which re-slices on load -- so it takes its most parallel candidate.
+    Committing the spilled buffers' divisions too lets the joint solve
+    optimize work division across the whole graph, not only the LX-resident
+    region.
+    """
+    op_by_name = {op.name: op for op in graph.operations}
+    for buf in allocation:
+        op = op_by_name.get(buf.name)
+        if op is None or buf.chosen_division is None:
+            continue
+        cd = buf.core_divisions[buf.chosen_division]
+        if not hasattr(op, "iteration_space_ownership"):
+            # The guard (#4062) means "only refine a division the
+            # work-division pass established", and its real subjects are the
+            # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
+            # they carry no iteration space to own, and the solver leaves
+            # their splits empty, so both tests below skip them.
+            #
+            # An op ``CoarseTilingPass`` synthesises is a different case. It
+            # is created *after* the work-division pass, so it was never
+            # offered ownership -- not deliberately denied it -- yet the
+            # joint solve still enumerates candidates for it, gates it
+            # through ``cd_parent_matches`` against its producer, and picks
+            # a division consistent with that producer's. Skipping it here
+            # drops a decision the solve made: the copy stays undivided
+            # while its producer commits divided, and ``_post_solve``'s
+            # ownership check then rejects a pair the solver never made
+            # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
+            # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
+            # Mint ownership for it so the choice lands.
+            if not isinstance(op, ComputedBuffer) or not cd.splits:
+                continue
+        if not _split_option_is_legal(op, cd.splits):
+            raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+        commit_iteration_space_ownership(op, cd.splits)
+
+
+def commit_lx_views(
+    graph: GraphLowering,
+    allocation: Sequence[LifetimeBoundBuffer],
+    accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+    drained_readers: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Set ``lx_view``, the per-core view LX holds it under, on every resident
+    buffer of ``allocation``."""
+    # A solver-fired relayout source stays resident under ITS committed view
+    # while the consumer it feeds will read the shuffled copy under another.
+    # The judge runs on the pre-materialization graph, where that consumer
+    # still reads the source directly, so it reports the pair as a
+    # mismatch and withholds a view. The plan carries the source view the
+    # enumeration priced and the solver committed, so it is authoritative
+    # here - the same precedence the fixed-division allocator gives
+    # ``plan.source_view`` when it builds its buffers.
+    source_views = {
+        plan.source_name: plan.source_view for plan in accepted_lx_relayouts
+    }
+    # Likewise a drained carry's collective still reads the carry here; the
+    # push repoints it at the drain, so it does not constrain the carry.
+    _, reasons, views = get_ncores_for_buffers(graph, drained_readers=drained_readers)
+    for buffer in allocation:
+        # A relayout copy is not a graph buffer: materialize_lx_relayouts
+        # creates its destination, carrying the plan's view.
+        if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
+            continue
+        view = source_views.get(buffer.name) or views.get(buffer.name)
+        if view is None:
+            reason = reasons.get(buffer.name, "physical ownership was not accepted")
+            raise Unsupported(f"{buffer.name}: {reason}")
+        buffer.lx_view = view
+
+
+def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> None:
+    """Dump what the joint solve actually decided, per buffer.
+
+    The solve's own output is otherwise invisible: the spill log reports
+    residency but not the chosen division or tiling, and nothing reports
+    whether that choice survived ``commit_divisions`` -- which silently
+    skips any op lacking ``iteration_space_ownership``, i.e. every op
+    synthesised after the work-division pass ran. Pairing this against the
+    emitted ``OpSpec`` work slices is how a decided-but-discarded division
+    shows up.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    op_by_name = {op.name: op for op in graph.operations}
+    for buf in allocation:
+        divisions = getattr(buf, "core_divisions", None) or []
+        chosen = getattr(buf, "chosen_division", None)
+        cd = divisions[chosen] if chosen is not None and divisions else None
+        op = op_by_name.get(buf.name)
+        info = getattr(op, "loop_info", None)
+        group = getattr(info, "loop_group_id", None)
+        propagation = getattr(info, "propagation", None)
+        logger.debug(
+            "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+            "size=%s committed=%s",
+            buf.name,
+            group if group is not None else "-",
+            getattr(propagation, "kind", "-"),
+            getattr(info, "loop_count", "-"),
+            cd.label if cd is not None else "-",
+            cd.tiling.label if cd is not None else "-",
+            buf.address,
+            buf.size,
+            "yes"
+            if getattr(op, "iteration_space_ownership", None) is not None
+            else "NO(skipped)",
+        )
+
+
 class _DivisionMap(NamedTuple):
     """Every op's core-division candidates, and which of those lists are the
     whole legal space.
@@ -2624,6 +2826,13 @@ class _DivisionMap(NamedTuple):
 
     divisions: dict[str, list[CoreDivision]]
     enumerated: set[str]
+
+
+# Whether anything applies a solver's chosen ``TileSpec``s to the graph. Nothing
+# does yet, and offering a tiling until then is unsafe: the search prices the
+# per-tile footprint and the packer lays LX out by it, while the untiled graph
+# writes the full extent. Delete this, not set it True, when the apply step lands.
+TILE_CHOICES_ARE_APPLIED = False
 
 
 class CoOptimizingAllocator(ScratchpadAllocator):
@@ -2964,7 +3173,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        return extract_op_features(
+            op,
+            ws,
+            is_lx=is_lx,
+            candidate_work_slices=[
+                _work_slices(op, candidate) for candidate in buffer.core_divisions
+            ],
+        )
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -3026,70 +3242,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
-        self._commit_divisions(graph, allocation)
-        # A solver-fired relayout source stays resident under ITS committed view
-        # while the consumer it feeds will read the shuffled copy under another.
-        # The judge runs on the pre-materialization graph, where that consumer
-        # still reads the source directly, so it reports the pair as a
-        # mismatch and withholds a view. The plan carries the source view the
-        # enumeration priced and the solver committed, so it is authoritative
-        # here - the same precedence the fixed-division allocator gives
-        # ``plan.source_view`` when it builds its buffers.
-        source_views = {
-            plan.source_name: plan.source_view for plan in accepted_lx_relayouts
-        }
-        _, reasons, views = get_ncores_for_buffers(graph)
-        for buffer in allocation:
-            # A relayout copy is not a graph buffer: materialize_lx_relayouts
-            # creates its destination, carrying the plan's view.
-            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
-                continue
-            view = source_views.get(buffer.name) or views.get(buffer.name)
-            if view is None:
-                reason = reasons.get(buffer.name, "physical ownership was not accepted")
-                raise Unsupported(f"{buffer.name}: {reason}")
-            buffer.lx_view = view
-        self._log_solver_decisions(graph, allocation)
-
-    def _log_solver_decisions(
-        self, graph: GraphLowering, allocation: Sequence[Any]
-    ) -> None:
-        """Dump what the joint solve actually decided, per buffer.
-
-        The solve's own output is otherwise invisible: the spill log reports
-        residency but not the chosen division or tiling, and nothing reports
-        whether that choice survived ``_commit_divisions`` -- which silently
-        skips any op lacking ``iteration_space_ownership``, i.e. every op
-        synthesised after the work-division pass ran. Pairing this against the
-        emitted ``OpSpec`` work slices is how a decided-but-discarded division
-        shows up.
-        """
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            divisions = getattr(buf, "core_divisions", None) or []
-            chosen = getattr(buf, "chosen_division", None)
-            cd = divisions[chosen] if chosen is not None and divisions else None
-            op = op_by_name.get(buf.name)
-            info = getattr(op, "loop_info", None)
-            group = getattr(info, "loop_group_id", None)
-            propagation = getattr(info, "propagation", None)
-            logger.debug(
-                "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
-                "size=%s committed=%s",
-                buf.name,
-                group if group is not None else "-",
-                getattr(propagation, "kind", "-"),
-                getattr(info, "loop_count", "-"),
-                cd.label if cd is not None else "-",
-                cd.tiling.label if cd is not None else "-",
-                buf.address,
-                buf.size,
-                "yes"
-                if getattr(op, "iteration_space_ownership", None) is not None
-                else "NO(skipped)",
-            )
+        commit_divisions(graph, allocation)
+        commit_lx_views(
+            graph,
+            allocation,
+            accepted_lx_relayouts,
+            drained_readers=_drained_collectives(self._validated_drain_plans),
+        )
+        log_solver_decisions(graph, allocation)
 
     def _materialize_selection(
         self,
@@ -3466,54 +3626,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # violation coarse tiling exists to prevent, and abort when none fit.
         return _drop_read_distance_violations(op, options, max_cores)
 
-    def _commit_divisions(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-    ) -> None:
-        """Commit the solver's chosen symbol-keyed division for every buffer.
-
-        The solver optimizes a core division for all buffers, not just resident
-        ones: a resident producer and its consumers are pinned by
-        ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
-        slicing (so those commits are mutually consistent), while a spilled
-        buffer is free of that gate -- its accesses round-trip through HBM,
-        which re-slices on load -- so it takes its most parallel candidate.
-        Committing the spilled buffers' divisions too lets the joint solve
-        optimize work division across the whole graph, not only the LX-resident
-        region.
-        """
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            op = op_by_name.get(buf.name)
-            if op is None or buf.chosen_division is None:
-                continue
-            cd = buf.core_divisions[buf.chosen_division]
-            if not hasattr(op, "iteration_space_ownership"):
-                # The guard (#4062) means "only refine a division the
-                # work-division pass established", and its real subjects are the
-                # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
-                # they carry no iteration space to own, and the solver leaves
-                # their splits empty, so both tests below skip them.
-                #
-                # An op ``CoarseTilingPass`` synthesises is a different case. It
-                # is created *after* the work-division pass, so it was never
-                # offered ownership -- not deliberately denied it -- yet the
-                # joint solve still enumerates candidates for it, gates it
-                # through ``cd_parent_matches`` against its producer, and picks
-                # a division consistent with that producer's. Skipping it here
-                # drops a decision the solve made: the copy stays undivided
-                # while its producer commits divided, and ``_post_solve``'s
-                # ownership check then rejects a pair the solver never made
-                # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
-                # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
-                # Mint ownership for it so the choice lands.
-                if not isinstance(op, ComputedBuffer) or not cd.splits:
-                    continue
-            if not _split_option_is_legal(op, cd.splits):
-                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commit_iteration_space_ownership(op, cd.splits)
-
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
     ) -> dict[str, list[str]]:
@@ -3639,14 +3751,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             counted_loop_lifetime_overrides(graph)
         )
         # A planned drain is a new post-solve op that reads the carry storage
-        # after the loop, so the storage must stay live to the graph exit.  This
-        # is inside the solve, so the extension only removes reuse and stays
-        # priced -- it adds no cost term and no capacity.
+        # after the loop, so a graph-output storage must stay live to the graph
+        # exit.  This is inside the solve, so the extension only removes reuse
+        # and stays priced -- it adds no cost term and no capacity.
         drain_plans = self._validated_drain_plans
         if drain_plans:
             _drain_lifetime_end_overrides(
                 lifetime_end_overrides, drain_plans, len(graph.operations)
             )
+        # A collective has no division pair with any resident buffer, so its
+        # edge to a carry would force the carry into HBM.  A planned drain is
+        # what that collective reads instead, so the edge does not exist.
+        drained_collectives = _drained_collectives(drain_plans)
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -3748,7 +3864,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 )
             ]
             size = info["size"]  # total footprint; solver divides per chosen cd
-            parent_proj = info["op_inputs"].copy()
+            parent_proj = [
+                parent
+                for parent in info["op_inputs"]
+                if drained_collectives.get(parent) != output_name
+            ]
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )
@@ -4036,13 +4156,40 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         never look at a space. Building one is not free -- a
         ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
         engine that would ignore the answer does not pay for it.
+
+        Which engine it is *is* the switch, as far as a user is concerned:
+        ``select_allocator`` reaches this solver from exactly two settings
+        (``co_optimizing_lx_planning`` plus
+        ``layout_solver = "simulated_annealing"``), and a separate flag on top
+        could only ever disagree with them.
         """
         return self.layout_planning is SaCoOptimizingSolver
 
-    @staticmethod
-    def _division_space(op: Operation) -> Optional[OpSplitSpace]:
-        """The op's split space."""
-        return build_op_split_space(op, config.sencores)
+    @property
+    def _solver_chooses_tilings(self) -> bool:
+        """Whether the solver this allocator feeds picks coarse tilings too.
+
+        Only a generated division can carry a ``TileSpec`` -- the enumeration
+        has none to offer, so an engine that indexes it could not choose one if
+        it wanted to. Hence :attr:`_solver_generates_divisions`, gated on
+        ``TILE_CHOICES_ARE_APPLIED``.
+        """
+        return TILE_CHOICES_ARE_APPLIED and self._solver_generates_divisions
+
+    def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
+        """The op's split space.
+
+        The tiling half is attached only for the solver that can use it (see
+        :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
+        analysis per output dim, so an engine that would ignore the answer does
+        not pay for it.
+        """
+        # Local: enumerate_tilings imports scratchpad.coarse_tiling, which
+        # imports this module.
+        from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
+
+        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
@@ -4287,6 +4434,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
         is_lx[consumer_op.get_name()] = False
         is_lx[parent] = True
+        candidate_work_slices = [
+            _work_slices(consumer_op, division) for division in consumer_divs
+        ]
         return {
             j: float(
                 predict_ops(
@@ -4295,6 +4445,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             consumer_op,
                             _work_slices(consumer_op, consumer_divs[j]),
                             is_lx=is_lx,
+                            candidate_work_slices=candidate_work_slices,
                         )
                     ],
                     params=_COST_PARAMS,

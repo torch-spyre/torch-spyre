@@ -59,6 +59,9 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `registry.py` | read-only registry access: an image's per-arch leaf, labels and its tag in a tag family |
 | `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
+| `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
+| `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
+| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
@@ -227,6 +230,159 @@ consumer sees none of the producing run's inputs or outputs.
 
 Every step degrades to empty rather than failing: a pre-#1782 image carries no id, and a test
 run must never go red over telemetry.
+
+## Offline results bundles
+
+A run that cannot reach ClickHouse uses the same `results` command, plus `--offline`. That
+covers an isolated lab, an air-gapped host, a person testing by hand, or a vLLM bench run on a
+disconnected system.
+- `--offline` writes a **bundle** instead of connecting.
+- `--upload` puts the bundle in the Artifactory inbox.
+- The `v2-results-relay` job (spyre-frameworks, every 15 minutes) records it with
+  `results --from-bundle`.
+
+The recording goes through the path a connected run takes: `results` for JUnit, and `vllm.py`
+for vLLM bench JSON (the module spyre-inference's live perf ingest uses). So the rows link to the
+artifact exactly as a connected run's do, and differ only in `source=bundle`. A bundle records
+results only: its artifact must already be in spyre_v2, and a manual bundle adds no tags.
+
+| | command |
+|---|---|
+| write | `results --offline --out <dir\|file.tgz> <the usual flags>` |
+| write + upload | `results --offline --upload [--wait] <the usual flags>` |
+| upload one | `results --upload <dir\|tgz> [--as-folder] [--wait]` |
+| check one | `results --from-bundle <dir\|tgz> --validate-only` |
+| record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
+
+The usual flags are `--artifact id:<uuid>`, or `image:<repo>@sha256:<digest>` (and
+`--artifact-id <uuid>` beside an image), plus:
+- `--arch` (default: this host);
+- `--trigger-type <tier>`;
+- `--xml-dir`/`--xml-file`;
+- optional: `--component`, `--jenkins-run-key`, `--run-url`, `--workflow`, `--triggered-at`.
+
+For vLLM bench, `--vllm-results-dir <dir>` (it implies `--kind vllm`, test_type `perf`) and
+optional `--perf k=v`. Flags a bundle does not record are named in a warning.
+
+`--offline`, `--upload` and `--validate-only` use the **standard library only** (Python 3.9+).
+On a host without network access, use either:
+- the wheel: `pip wheel --no-deps extensions/clickhouse-ingest` on a connected host, then
+  `pip install --no-deps spyre_clickhouse_ingest-*.whl` and
+  `python -m spyre_clickhouse_ingest results --offline ...`;
+- or just `spyre_clickhouse_ingest/offline.py` with `bundle.schema.json` beside it:
+  `python offline.py --offline ...` (same flags).
+
+### The bundle
+
+A folder, or a `.tgz` of one:
+
+```
+bundle.json        # bundle.schema.json
+results/           # JUnit *.xml, or (kind vllm) vLLM bench *.json; flat
+attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
+```
+
+The **minimal** bundle.json is the artifact and the tier, beside at least one results file:
+
+```json
+{"artifact_id": "<uuid>", "test_type": "regression"}
+{"image": "<repo>@sha256:<digest>", "arch": "s390x", "test_type": "fvt"}
+{"kind": "vllm", "artifact_id": "<uuid>"}
+```
+
+Everything else is optional (`--offline` writes most of it):
+
+| key | default when absent |
+|---|---|
+| `schema_version` | 1; a newer version is refused |
+| `artifact_id`, `image` | at least one. The id is tried first, else the image on `arch` (lookup only). Both given: they must name the same artifact. Blank = absent |
+| `arch`, `component` | the artifact's (`component` is a test_case_id input; vllm: `spyre-inference`) |
+| `test_type` | required, except `perf` for `kind: vllm` |
+| `run_key` | `manual:<uploader>:<bundle sha256>`: re-uploading the same content stays one run. `<JOB_NAME>#<BUILD_NUMBER>` (alias `jenkins_run_key`) gets the run_id a connected `v2Results` run of that build gets, and is accepted only from trusted jobs (`Spyre-Test/testing/`) |
+| `files` | `[{path, sha256}]`. When present, every file must be listed and match; when absent, nothing is checked but the bundle sha256 is still recorded |
+| `started_at`, `ended_at` | `--offline` reads the JUnit suite timestamps; otherwise unset |
+| `kind`, `perf` | `junit`; for vllm, `{model, tensor_parallel, input_len, output_len, cards, head_sha, head_branch, state}` |
+| `run_url`, `workflow`, `runner`, `env`, `notes`, `uploader`, `sealed_at`, `tag_family`, `tags` | unset (tags for Jenkins keys only) |
+
+The bundle sha256 covers every file's path and content, bundle.json included. Ingest refuses a
+run_key that already has another run's or bundle's results. The verdict's `props` carry
+`source=bundle`, `uploader` (the Artifactory account that uploaded it), `bundle_sha256` and
+`bundle_url`; `bundle_url` is also the `run_url` when the bundle names none.
+
+**vLLM bundles** hold the runner's `results/`: `<test_name>.json` from
+`vllm bench latency|throughput|serve`, and `<test_name>.pytorch.json` when
+`SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1`. Keep the latter: the `latency` samples and the model name
+come from it.
+- `test_name` is `<latency|throughput|serve>_<model>_tp<N>_in<N>_out<N>`, as in spyre-inference's
+  `vllm-benchmarks/` configs. The mode and shapes are the benchmark's identity, and must agree
+  with `perf` when it gives them.
+- The rows are `benchmarks` + `benchmark_runs` (`report_kind=vllm`) and a `perf` / `performance`
+  verdict, `perf.state` (default `passed`).
+- `.cmd`/`.log` files in `--vllm-results-dir` go to `attachments/`.
+
+### Air-gapped flow
+
+1. **While connected**, from the artifact's dashboard page: pull the image **by digest**, and
+   note its artifact id. Nothing after this step needs the network.
+2. **Offline**, run the tests and write the bundle on the test host. pytest writes suite
+   timestamps in local time, so `--offline` reads them there.
+3. **Connected**, upload it.
+
+```
+# JUnit
+pytest ... --junitxml=out/junit.xml
+python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --xml-dir out \
+    --artifact id:<artifact_id> --arch <arch> --trigger-type <tier>
+# vLLM bench (spyre-inference's runner)
+SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 python .github/scripts/run_vllm_benchmarks.py \
+    --configs-dir vllm-benchmarks/benchmarks/spyre --results-dir out ...
+python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --vllm-results-dir out \
+    --artifact id:<artifact_id> --arch <arch> --perf head_sha=<spyre-inference sha>
+# Connected host
+ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundle.tgz --wait
+```
+
+`--wait` polls until the relay has moved the bundle to `processed/` (prints `ingested`) or
+`rejected/` (prints the reason). A host that is connected while it tests can do it in one step,
+`results --offline --upload --wait ...`.
+
+### Uploading by hand
+
+The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/zsp/next/<arch>/v2-results/inbox/<key>/`
+on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
+the full path.
+- `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
+- `<arch>` is `any` when the bundle names none.
+- The bundle goes there as `<name>.tgz` (atomic: preferred), or as a folder `<name>/`.
+- `<name>` is the run key with every character outside `A-Za-z0-9._-` replaced by `_`
+  (`manual_<first 16 of the bundle sha256>` without one), then `-<test_type>`.
+
+A **folder** counts as uploaded once `bundle.json` is in it, so upload that file last. With
+`files[]`, the relay ingests the folder as soon as every listed file matches. Without it, the
+relay ingests once the folder's listing is unchanged across two polls. A folder still incomplete
+after 24 hours is rejected.
+
+```
+ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
+INBOX=zsp/next/<arch>/v2-results/inbox/<key>
+curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
+# a folder, bundle.json last
+(cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
+  curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T "$f" "$ART/$INBOX/<name>/$f"; done)
+# JFrog CLI (these two forms are untested here): the .tgz, or the folder and then bundle.json
+jf rt upload mybundle.tgz "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>.tgz"
+(cd mybundle && jf rt upload --flat=false "results/*" "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/" \
+  && jf rt upload bundle.json "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/")
+```
+
+Uploading needs deploy permission on that repository. The token is `--token`, else
+`$ARTIFACTORY_TOKEN` (with `$ARTIFACTORY_USER`: basic auth), else `~/.netrc` for the host.
+Within 15 minutes the relay moves the bundle to `v2-results/processed/<key>/...`, or to
+`v2-results/rejected/<key>/...` with a `REJECTED.json` giving the reason.
+
+`results --from-bundle` exits `0` ingested or duplicate, `1` failed (retried), `2` rejected,
+`3` incomplete, and prints one JSON line on stdout. With `--dry-run` it runs every check on a
+read-only connection and writes nothing.
 
 ## What is deliberately NOT here
 

@@ -83,10 +83,12 @@ class TestTransposeEdge:
 
     # --- Dtypes ---
 
-    @pytest.mark.xfail(reason="Issue #1545: Complex dtype not supported on Spyre")
     def test_transpose_complex_dtype(self, execution_mode):
+        # Issue #1545: the complex dtype is rejected. Both modes fail when the tensor
+        # is moved to the device, before torch.compile runs.
         x = torch.randn((64, 128), dtype=torch.complex64)
-        _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)
+        with pytest.raises(Exception, match="does not support dtype ComplexFloat"):
+            _compare_mode(execution_mode, lambda t: t.transpose(0, 1), x)
 
     def test_transpose_bool_dtype(self, execution_mode):
         x = torch.randint(0, 2, (64, 128), dtype=torch.bool)
@@ -197,8 +199,6 @@ class TestTransposeEdge:
 
     # --- Materialized copy after transpose (#1859) ---
     def test_transpose_then_clone(self, execution_mode):
-        if execution_mode == "eager":
-            pytest.xfail("Issue #1859: SIGABRT on transpose+clone bundle generation.")
         x = cached_randn((72, 91), dtype=torch.float16)
         _compare_mode(execution_mode, lambda t: t.transpose(0, 1).clone(), x)
 

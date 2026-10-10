@@ -29,8 +29,7 @@ work-division planner. See MULTICORE_SENCORES in indirect_access_common.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
-validating the result and warning that the device values diverge from the CPU
-reference (the backend does not yet implement indirect gather). Scenarios route
+asserting the result matches the CPU reference. Scenarios route
 their compile through _stage_and_e2e (stage check + e2e run); capture-based
 tests call run_e2e directly after their own assertions. The three structural
 tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
@@ -123,9 +122,9 @@ class _GatherScenarios:
         index arg matching the IndirectAccess target, one output, a well-formed
         iteration space and TensorArg metadata, and the index is detected."""
         x, i = self._xi(P=3, two_d=True)
-        # Stage check first (and all the detailed op-spec assertions below) so
-        # they always run; the e2e at the end xfails on the expected
-        # device-side divergence/abort, which would otherwise stop the test.
+        # Stage check and the detailed op-spec assertions run before the e2e at
+        # the end, so a structural regression is reported as itself rather than
+        # as an e2e failure.
         r = self.check(
             lambda x, i: x[i].exp(),
             x,
@@ -207,8 +206,8 @@ class _GatherScenarios:
         }
         # Validate every unary's stage encoding first (all subtests run), then
         # run one representative end-to-end. They share the same gather
-        # structure, and run_e2e xfails on the expected device-side divergence,
-        # which would otherwise stop the loop before later unaries are checked.
+        # structure, and an e2e failure would stop the loop before the later
+        # unaries are checked.
         for label, fn in unaries.items():
             with self.subTest(unary=label):
                 torch._dynamo.reset()
@@ -842,15 +841,13 @@ class _GatherScenarios:
         M, N = 128, 256
         x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         self.name_dims(x, {"M": M, "N": N})
-        # x.exp() is a supported direct op, so its e2e result must match the CPU
-        # reference (expect_close=True) -- unlike the indirect gathers.
+        # x.exp() is a supported direct op, not an indirect gather.
         r = self._stage_and_e2e(
             lambda x: x.exp(),
             x,
             expect=DIRECT_OP_SPEC,
             op="exp",
             detected=False,
-            expect_close=True,
         )
         self.assertFalse(any(op_spec_has_indirect_access(s) for s in r.op_specs))
         self.assertFalse(
@@ -1245,7 +1242,7 @@ class _GatherMulticoreScenarios:
         r < 2048), and the index maps output row i -> value row (i + V/2) % V:
         always a half-table hop, so under any multi-core split the fetched row
         belongs to another core's slice. The gather must match the CPU reference
-        exactly (expect_close=True) -- if the shared value tensor's per-core base
+        exactly -- if the shared value tensor's per-core base
         ever drifted with the work-division slice, a core would read a shifted
         row and diverge. Runs at 32 cores, where the indirect uint32 address cap
         holds the split to 16-way (still cross-core: a V/2 hop lands 8 cores
@@ -1263,7 +1260,6 @@ class _GatherMulticoreScenarios:
             weight,
             idx,
             expect=GATHER_OP_SPEC,
-            expect_close=True,
         )
 
 

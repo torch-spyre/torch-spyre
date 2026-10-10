@@ -52,6 +52,7 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 
 import functools
 import unittest
+import warnings
 from unittest.mock import patch
 
 import torch
@@ -196,6 +197,35 @@ class TestForEachTileE2E(_DynamoResetTestCase):
     # remove the two effects that tolerance was compensating for.
     ATOL = 1e-2
     RTOL = 1e-2
+
+    def test_computed_where_condition_in_broadcast_tile(self):
+        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        def tiled_where(x):
+            def body(accum, tiles):
+                (tile,) = tiles
+                selected = (tile > 0) & (tile < 3)
+                values = tile[None, None]
+                return accum + torch.where(selected, values, -values), None
+
+            result, _ = for_each_tile(
+                body,
+                (x,),
+                dims=(0,),
+                tile_size=64,
+                init=x.new_zeros((1, 1, 64, 128)),
+            )
+            return result
+
+        x = (torch.arange(192 * 128) % 7 - 3).half().reshape(192, 128)
+        expected = torch.where((x > 0) & (x < 3), x, -x)
+        expected = expected.reshape(3, 1, 1, 64, 128).sum(0)
+        with torch.inference_mode(), warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            compiled = torch.compile(tiled_where, fullgraph=True, dynamic=False)
+            actual = compiled(x.to(DEVICE_NAME)).cpu()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     @staticmethod
     def _operands():

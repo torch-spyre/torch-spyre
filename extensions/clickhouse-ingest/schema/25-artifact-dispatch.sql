@@ -2,7 +2,7 @@
 -- trigger did. Subscriptions and requests are written by people (a reviewed INSERT, the
 -- dashboard) and by pipelines (vars/v2Dispatch.groovy); only the spyre-frameworks
 -- artifact-dispatch job writes artifact_dispatches. Matching lives in v_artifact_subscribers
--- (54-dispatch-views.sql), so the dispatcher and the dashboard cannot disagree on who is triggered.
+-- (55-dispatch-views.sql), so the dispatcher and the dashboard cannot disagree on who is triggered.
 
 -- One row per subscription version; the newest updated_at wins, so an edit is a new INSERT.
 -- Every match field is '' (or an empty array) for "any". Secrets never live here: credential_id
