@@ -465,6 +465,34 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
 ]
 
+# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
+# host, and the result is wrong on 27-88% of its elements. The values on the device
+# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
+# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
+# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
+# converting the result back on the device restores the input exactly, which shows
+# the values are right; the other four cannot be checked that way, because the
+# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
+# the partial-stick limit (4x68).
+_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
+_STAGGERED_READBACK_UNCHECKED = (
+    "readback of the staggered cast result is wrong, probably #4393 "
+    "(the values cannot be checked on the device for this shape)"
+)
+_STAGGERED_READBACK_UNCHECKED_CASES = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in ("4x32", "4x68")
+}
+TO_DTYPE_OP_EXPECT_FAIL = {
+    case: (
+        _STAGGERED_READBACK_UNCHECKED
+        if case in _STAGGERED_READBACK_UNCHECKED_CASES
+        else _STAGGERED_READBACK
+    )
+    for case in TO_DTYPE_OP_EXPECT_FAIL
+}
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
