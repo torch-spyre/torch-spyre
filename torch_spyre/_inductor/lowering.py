@@ -24,6 +24,7 @@ import sympy
 import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
+from torch._inductor.graph import SubgraphLowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -2100,7 +2101,7 @@ def _cmp_operand_dtype(tensors):
     return operand_dtype
 
 
-def _lower_cmp_impl(x, y, pointwise_fn):
+def _lower_cmp_impl(x, y, pointwise_fn, op_name: str = ""):
     """Convert both operands to a common float dtype, then apply pointwise_fn.
 
     The operand dtype is computed from the TENSOR operands only, and a Python
@@ -2120,16 +2121,26 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
 
-    # A 0-dim integer predicate compared against a Python int (e.g. a
-    # while_loop / for_each_tile cond ``iter < N``) keeps Inductor's stock
-    # form unchanged.  Such a predicate is pattern-matched by the WhileLoop
-    # lowering (_extract_trip_count in wsr/for_each_tile_lowering.py), which
-    # expects exactly one ``load(iter) < constant(int N)`` op in the cond
-    # graph.  The int -> float cast below would insert a second op and coerce
-    # N to float, breaking both checks and causing silently wrong loop counts.
+    # A 0-dim integer predicate of the form ``iter < N`` (while_loop /
+    # for_each_tile trip counter) must keep Inductor's stock integer form
+    # unchanged.  _extract_trip_count (wsr/for_each_tile_lowering.py) matches
+    # exactly one ``load(iter) < constant(int N)`` op in the cond graph; the
+    # int -> float cast below would insert a second op and coerce N to float,
+    # breaking both the single-op check and the loop count.
+    #
+    # The guard is narrowed to two conditions that are jointly precise:
+    #   1. op_name == "lt" -- _extract_trip_count only accepts lt; every other
+    #      0-dim integer compare (eq/ne/le/gt/ge) in a torch.cond branch or
+    #      while_loop body must still fall through to INT_TO_FLOAT promotion.
+    #   2. isinstance(V.graph, SubgraphLowering) -- the cond graph is always
+    #      compiled inside a SubgraphLowering.  Top-level 0-dim integer compares
+    #      (e.g. model-level torch.eq(i64[], N)) are compiled in a plain
+    #      GraphLowering and must not be skipped.
     dtypes = {t.get_dtype() for t in tensors}
     if (
-        len(dtypes) == 1
+        op_name == "lt"
+        and isinstance(V.graph, SubgraphLowering)
+        and len(dtypes) == 1
         and not next(iter(dtypes)).is_floating_point
         and all(len(t.get_size()) == 0 for t in tensors)
         and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
@@ -2191,7 +2202,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
-        return _lower_cmp_impl(x, y, pw)
+        return _lower_cmp_impl(x, y, pw, op_name=op_name)
 
     @register_spyre_lowering(
         aten_packet.Scalar,
@@ -2202,7 +2213,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _scalar(x, y):
         if _is_host_cmp(x, y):
             return stock_scalar(x, y)
-        return _lower_cmp_impl(x, y, pw)
+        return _lower_cmp_impl(x, y, pw, op_name=op_name)
 
     return _tensor, _scalar
 
