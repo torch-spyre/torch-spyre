@@ -36,7 +36,7 @@ from collections.abc import Mapping, Sequence
 
 import sympy
 
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
@@ -431,97 +431,149 @@ def derive_tiling_groups(
     empty spec) or its nest differs from the run's. Contiguity is a hard
     requirement, not an optimization -- ``validate_coarse_tile_groups`` and
     ``_apply_plan`` both rely on each group occupying one contiguous stretch of
-    the operation list, so a connected component that skipped an intervening
-    untiled op would be rejected at apply time.
+    the operation list.
+
+    Two non-adjacent runs on the same nest are therefore **two groups**, each
+    minting its own hint ids and group id. They are not the same group and not
+    an error: nest equality is structural, so unrelated regions anywhere in the
+    graph collide on a small alphabet (~6 counts per axis over at most two
+    dims), and refusing them would refuse ordinary graphs.
+
+    **Precondition on the caller, which this signature cannot check.** Ops meant
+    to tile together have to be contiguous in ``graph.operations``. A chooser
+    walking producer/consumer reachability is not walking contiguity: an op it
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. That is a mispricing rather than an illegal graph, and a
+    name->spec map carries no region identity to detect it with, so it belongs
+    to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
+    for the illegal case.
 
     Ops in one run may tile different dims: ``host_dim`` is positional in each
     op's own output, so equal specs can tile different dims of a buffer two
-    ops share, and different specs the same one. Whether a consumer reads its
-    in-group producer tile by tile is therefore checked per edge
-    (:func:`_misaligned_group_edge`), not here. Returns ``(ops, level counts)``
-    per group.
+    ops share, and different specs the same one. A run therefore also breaks at
+    a consumer that does not read some producer of its stretch tile by tile
+    (:func:`tile_misread`), which then reads that producer's full buffer across
+    the group boundary. The stretch is every op since the nest last changed,
+    not only the current group: that over-splits only where the producer is
+    already in an earlier group, and it keeps where a group starts a function of
+    the ops between a consumer and what it reads, which a search re-tiling one
+    op at a time relies on. Returns ``(ops, level counts)`` per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
     groups: list[tuple[list[Operation], tuple[int, ...]]] = []
     current_ops: list[Operation] = []
     current_nest: tuple[int, ...] = ()
+    stretch: dict[str, Operation] = {}
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
         nest = spec.level_counts if spec is not None else ()
-        if nest and nest == current_nest:
-            current_ops.append(op)
+        if spec is not None and nest and nest == current_nest:
+            misread = _stretch_misread(graph, op, spec, stretch, choices)
+            if misread is None:
+                current_ops.append(op)
+            else:
+                logger.debug("coarse tiling: new loop group: %s", misread)
+                groups.append((current_ops, current_nest))
+                current_ops = [op]
         else:
             if current_ops:
                 groups.append((current_ops, current_nest))
             current_ops = [op] if nest else []
             current_nest = nest
+            stretch = {}
+        if nest:
+            stretch[op.get_name()] = op
     if current_ops:
         groups.append((current_ops, current_nest))
     return groups
 
 
-def _misaligned_group_edge(
+def _stretch_misread(
     graph: GraphLowering,
-    group_ops: Sequence[Operation],
+    op: Operation,
+    spec: TileSpec,
+    stretch: Mapping[str, Operation],
     choices: Mapping[str, TileSpec],
 ) -> str | None:
-    """Why a consumer in ``group_ops`` cannot read an in-group producer tile by
-    tile, or ``None`` when every such edge lines up.
+    """The first :func:`tile_misread` of ``op`` against a producer in
+    ``stretch`` (keyed by the buffer it writes), or ``None``."""
+    for read in op_read_writes(op).reads:
+        producer = stretch.get(read.name)
+        if producer is None:
+            continue
+        reason = tile_misread(
+            graph,
+            producer,
+            choices[producer.get_operation_name()],
+            op,
+            spec,
+            read,
+        )
+        if reason is not None:
+            return reason
+    return None
+
+
+def tile_misread(
+    graph: GraphLowering,
+    producer: Operation,
+    producer_spec: TileSpec,
+    consumer: Operation,
+    consumer_spec: TileSpec,
+    read: Dep,
+) -> str | None:
+    """Why ``consumer`` under ``consumer_spec`` cannot read ``read`` tile by
+    tile as ``producer`` writes it under ``producer_spec``, or ``None`` when it
+    can.
 
     On tile ``t`` a consumer that shares its producer's loop nest can read only
     what the producer wrote on tile ``t``. That holds exactly when both own the
     buffer they share the same way on every tile (``tile_ownership_view``) and
     the buffer is read in full, since a view compares partitions, not extents.
-    The joint solve only picks groups whose ``cd_parent_matches`` pairs pass
-    the same tests, so this is the check that makes any other choice fail
-    loudly rather than read the wrong tile.
+    ``host_dim`` is positional, so equal specs can disagree here (a permuted
+    reader) and unequal ones agree, and a spec need not resolve on both ops at
+    all; one that does not on either is a misread too.
     """
-    written: dict[str, tuple[Operation, tuple[tuple[sympy.Symbol, int], ...]]] = {}
-    for op in group_ops:
-        spec = choices[op.get_operation_name()]
-        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
-        if loop_vars is None:
-            return reason
-        tile_splits = tuple((v, axis.count) for v, axis in zip(loop_vars, spec.axes))
-        for read in op_read_writes(op).reads:
-            if read.name not in written:
-                continue
-            producer, producer_splits = written[read.name]
-            write = next(
-                (
-                    w
-                    for w in op_read_writes(producer).writes
-                    if w.name == read.name and isinstance(w, MemoryDep)
-                ),
-                None,
-            )
-            if (
-                write is None
-                or not isinstance(read, MemoryDep)
-                or buffer_not_read_in_full(graph, read.name)
-            ):
-                return (
-                    f"{op.get_name()} reads {read.name} through a dependency "
-                    "whose per-tile slice cannot be checked"
-                )
-            produced = tile_ownership_view(
-                _prepare_per_core_view(producer, write, read.name), producer_splits
-            )
-            consumed = tile_ownership_view(
-                _prepare_per_core_view(op, read, read.name), tile_splits
-            )
-            if (
-                produced is None
-                or consumed is None
-                or not produced.same_partition(consumed)
-            ):
-                return (
-                    f"{op.get_name()} ({spec.label}) does not read {read.name} "
-                    f"tile by tile as {producer.get_name()} "
-                    f"({choices[producer.get_operation_name()].label}) writes it"
-                )
-        written[op.get_name()] = (op, tile_splits)
+    write = next(
+        (
+            w
+            for w in op_read_writes(producer).writes
+            if w.name == read.name and isinstance(w, MemoryDep)
+        ),
+        None,
+    )
+    if (
+        write is None
+        or not isinstance(read, MemoryDep)
+        or buffer_not_read_in_full(graph, read.name)
+    ):
+        return (
+            f"{consumer.get_name()} reads {read.name} through a dependency "
+            "whose per-tile slice cannot be checked"
+        )
+    producer_vars, reason = try_resolve_tile_axis_loop_vars(producer, producer_spec)
+    if producer_vars is None:
+        return reason
+    consumer_vars, reason = try_resolve_tile_axis_loop_vars(consumer, consumer_spec)
+    if consumer_vars is None:
+        return reason
+    produced = tile_ownership_view(
+        _prepare_per_core_view(producer, write, read.name),
+        tuple((v, a.count) for v, a in zip(producer_vars, producer_spec.axes)),
+    )
+    consumed = tile_ownership_view(
+        _prepare_per_core_view(consumer, read, read.name),
+        tuple((v, a.count) for v, a in zip(consumer_vars, consumer_spec.axes)),
+    )
+    if produced is None or consumed is None or not produced.same_partition(consumed):
+        return (
+            f"{consumer.get_name()} ({consumer_spec.label}) does not read "
+            f"{read.name} tile by tile as {producer.get_name()} "
+            f"({producer_spec.label}) writes it"
+        )
     return None
 
 
@@ -553,12 +605,12 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
 
     The tiling is an *input* (``choices``: operation name -> TileSpec),
     not a search. Consecutive ops running the same non-empty loop nest form one
-    loop group, provided each in-group consumer reads its producer tile by tile
-    (else ``Unsupported``); the pass mints hint ids and a group-id offset from
+    loop group, split where a consumer does not read its producer tile by tile
+    (:func:`derive_tiling_groups`); the pass mints hint ids and a group-id offset from
     bases derived off the graph, stamps each op's ``dim_hints`` from its own
-    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or
+    all-untiled) ``choices`` it is a no-op and the op count is unchanged -- which
+    is what keeps it inert until a solver hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):
@@ -601,11 +653,6 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 raise Unsupported(
                     f"coarse tiling would re-tile {', '.join(clash)}, "
                     "which a for_each_tile loop already tiles."
-                )
-            reason = _misaligned_group_edge(graph, group_ops, self._choices)
-            if reason is not None:
-                raise Unsupported(
-                    f"coarse tiling: {reason}, so they cannot share a loop nest."
                 )
         # Both bases are derived off the graph *before* this pass stamps any of
         # its own hints/groups, so pre-existing (hint-driven) ids are avoided

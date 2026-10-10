@@ -172,7 +172,11 @@ def pytest_runtest_makereport(item, call):
         )
         if xfail_mark is not None and not device_fault:
             strict = xfail_mark.kwargs.get("strict", False)
-            if rep.skipped or rep.failed:
+            # pytest's own xfail handling reports a strict XPASS as a failed call
+            # with no exception ("[XPASS(strict)] ..."). Only a call that raised
+            # is an expected failure; leave the XPASS failed.
+            raised = call.excinfo is not None
+            if rep.skipped or (rep.failed and raised):
                 reason = _extract_failure_message(rep)
                 rep.outcome = "skipped"
                 rep.wasxfail = (

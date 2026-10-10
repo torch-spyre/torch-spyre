@@ -24,6 +24,13 @@ The report is a *value*, not just a printout, so another pass or an external too
 compare two candidate plans without compiling and running either. That is the point:
 ``report_a.total_us`` vs ``report_b.total_us`` is a cheap plan comparison.
 
+This reporting pass has no candidate menu. It therefore omits the menu-dependent
+loop-delivery estimate, so looped-matmul totals can differ from the allocator's
+objective. It does not reconstruct candidate divisions from the committed plan.
+The DMA requests of a looped matmul's operand reads need no menu; with the delivery
+estimate omitted, the report charges their whole excess over the byte time, where
+the allocator charges only the part beyond that estimate.
+
 NOT related to ``work_division.cost_model_matmul_division``, which is a separate model
 used to choose a matmul work division. This module is the analytical whole-program
 runtime model documented in ``docs/source/compiler/cost_model.md``.

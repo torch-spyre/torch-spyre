@@ -564,7 +564,7 @@ class AutomatedCoarseTilingTests(
 
         The ``auto``/``explicit_auto`` combos were ``@expected_unimplemented``
         while the solver-driven tile search was unbuilt, and briefly
-        ``@expected_lx_ownership_gap`` while _commit_divisions dropped the
+        ``@expected_lx_ownership_gap`` while commit_divisions dropped the
         division the solve had chosen for each ``coarse_tile_copy_*``. Both
         markers retired themselves the moment those modes passed (each fails a
         clean run), so only the ortools skip for the cpsat solver remains.
@@ -612,7 +612,9 @@ def _pointwise_op(shape, name="buf0"):
     layout = _fixed_tiled_layout(shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
-    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    syms = sympy.symbols(
+        " ".join(f"d{i}" for i in range(len(shape))), integer=True, nonnegative=True
+    )
     if not isinstance(syms, tuple):
         syms = (syms,)
     index = sympy.Integer(0)
@@ -642,7 +644,9 @@ def _matmul_op(out_shape=(128, 256), k=64, name="mm"):
     layout = _fixed_tiled_layout(out_shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
-    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(out_shape))))
+    syms = sympy.symbols(
+        " ".join(f"d{i}" for i in range(len(out_shape))), integer=True, nonnegative=True
+    )
     if not isinstance(syms, tuple):
         syms = (syms,)
     index = sympy.Integer(0)
@@ -902,7 +906,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
     def _compile_with_both_tiled_d0(self, fn, args):
         """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
 
-        Bypasses the solve's own pairing, so what is left to refuse an
+        Bypasses the solve's own pairing, so what is left to split an
         out-of-step group is ``CoarseTilingPass`` itself.
         """
 
@@ -916,27 +920,28 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
             return self._compile(fn, args)
 
-    def _assert_group_refused(self, fn):
+    def _assert_group_split(self, fn):
+        """The consumer does not read its producer tile by tile, so the apply
+        starts a new loop group at it, and it reads the producer's full buffer
+        across the boundary."""
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
-        # Not assertRaisesRegex: the OOT harness drops its pattern, and with it
-        # the only thing telling this refusal from any other exception.
-        with self.assertRaises(Exception) as refusal:
-            self._compile_with_both_tiled_d0(fn, (x, y))
-        self.assertIn("cannot share a loop nest", str(refusal.exception))
+        cpu, device, tiling = self._compile_with_both_tiled_d0(fn, (x, y))
+        self._assert_close(device, cpu)
+        self.assertGreater(len(_nests(tiling)), 1, _describe(tiling))
 
-    def test_apply_refuses_a_permuted_consumer_in_the_nest(self):
+    def test_apply_splits_a_permuted_consumer_from_the_nest(self):
         # The consumer's d0 is the producer's dim 1.
-        self._assert_group_refused(lambda x, y: (x + y).permute(1, 0, 2) * 2)
+        self._assert_group_split(lambda x, y: (x + y).permute(1, 0, 2) * 2)
 
-    def test_apply_refuses_a_reducing_consumer_in_the_nest(self):
+    def test_apply_splits_a_reducing_consumer_from_the_nest(self):
         # sum(0) drops the producer's dim 0, so the consumer's d0 is dim 1.
-        self._assert_group_refused(lambda x, y: (x + y).sum(dim=0))
+        self._assert_group_split(lambda x, y: (x + y).sum(dim=0))
 
-    def test_apply_refuses_a_narrowing_consumer_in_the_nest(self):
+    def test_apply_splits_a_narrowing_consumer_from_the_nest(self):
         # Same dim, half the rows: tile t reads 8 rows where the producer
         # wrote 16.
-        self._assert_group_refused(lambda x, y: (x + y)[:32] * 2)
+        self._assert_group_split(lambda x, y: (x + y)[:32] * 2)
 
     def test_apply_refuses_a_tiling_along_a_repeated_axis(self):
         # repeat walks dim 1 of its input twice. Tiled four ways on that axis

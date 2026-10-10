@@ -2380,25 +2380,6 @@ def is_sparse_stl(stl) -> bool:
     return sparse
 
 
-def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
-    """Return True if current_node's FX origin is spyre::compact."""
-    try:
-        if isinstance(current_node, ComputedBuffer):
-            buf = current_node
-        elif isinstance(current_node, SchedulerNode):
-            buf = current_node.node
-        else:
-            return False
-        data = buf.data
-        origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.compact.default
-            for n in origins
-        )
-    except Exception:
-        return False
-
-
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
     """Returns STL to transform the input into the canonical representation the output.
 
@@ -2443,7 +2424,6 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
-    require_exact: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2458,10 +2438,6 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
 
-    require_exact: when true, stick compatibility is insufficient; the input
-    must physically match ``out_stl``.  Fixed-layout consumers use this for
-    cases where the backend representation depends on the complete outer
-    layout, not only on the stick variable (for example a flat-M projection).
     """
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
@@ -2502,10 +2478,8 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
-    exact_layout_mismatch = require_exact and layouts_differ
     if (
         not factorized_layout_mismatch
-        and not exact_layout_mismatch
         and in_stick_offset_free
         and stick_compatible([idc, out_idc])
     ):
@@ -2521,12 +2495,14 @@ def compute_restickify_needed(
     if in_stl.device_dtype != DataFormats.SEN169_FP16:
         return True, None
 
-    if factorized_layout_mismatch or exact_layout_mismatch:
-        # A factorized input places the contraction variable on outer axes AND
-        # the stick, while an exact-layout edge has a consumer whose backend
-        # representation depends on the complete physical ordering.  In both
-        # cases stick_compatible would incorrectly accept the input.  out_stl is
-        # the concrete fixed-layout target selected by the consumer.
+    if factorized_layout_mismatch:
+        # The input layout places the contraction variable on outer axes AND the
+        # stick (factorized layout). The backend would see two contraction dims
+        # even though the var is on the stick — stick_compatible would incorrectly
+        # accept it. out_stl is the canonical collapsed target from
+        # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
+        # always passes [req_stl] as the target list, so the beam search only
+        # queries this function with that canonical result.
         return True, out_stl
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
     target_stick = out_idc[-1]

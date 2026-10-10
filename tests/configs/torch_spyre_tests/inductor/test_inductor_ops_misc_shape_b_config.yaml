@@ -41,8 +41,8 @@ test_suite_config:
             - TestOps::test_reduction_with_to_dtype.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
-            - TestOps::test_restickify_fp32_unsupported_xfail
-            - TestOps::test_restickify_int64_unsupported_xfail
+            - TestOps::test_restickify_fp32_unsupported
+            - TestOps::test_restickify_int64_unsupported
             # multiops split test
             - TestOps::test_multiops_split.*
           mode: mandatory_success

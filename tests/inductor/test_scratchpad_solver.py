@@ -52,6 +52,7 @@ try:
         _MAX_PRODUCT_BOUND,
         CpSatLayoutSolver,
         _SympyExprToCpSat,
+        _simplify_eq_conjunction,
     )
 
     _HAS_ORTOOLS = True
@@ -1679,6 +1680,40 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_a_repeated_condition_reuses_its_literal(self):
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {
+            "x": model.new_int_var(0, 10, "x"),
+            "y": model.new_int_var(0, 10, "y"),
+        }
+        printer = _SympyExprToCpSat(model, sym_map, {})
+        for cond in (x >= 3, sympy.And(x >= 3, y <= 4), sympy.Or(x <= 1, y >= 7)):
+            lit = printer._print_condition(cond)
+            num_vars = len(model.proto.variables)
+            num_constraints = len(model.proto.constraints)
+            self.assertIs(printer._print_condition(cond), lit)
+            self.assertEqual(len(model.proto.variables), num_vars)
+            self.assertEqual(len(model.proto.constraints), num_constraints)
+
+    def test_condition_literals_are_not_shared_between_printers(self):
+        x = sympy.Symbol("x", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 10, "x")}
+        first = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        second = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        self.assertIsNot(first, second)
+
+    def test_a_condition_repeated_across_piecewises_lowers_correctly(self):
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise((1, x >= 3), (5, True)) + sympy.Piecewise(
+            (2 * x, x >= 3), (0, True)
+        )
+        for value in range(6):
+            solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
+            expected = 1 + 2 * value if value >= 3 else 5
+            self.assertEqual(solver.ObjectiveValue(), expected)
+
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
 
@@ -1715,6 +1750,65 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver, sym_map = self._optimize(expr, {"x": (0, 5)}, maximize=True)
         self.assertEqual(solver.ObjectiveValue(), 10)
         self.assertEqual(solver.Value(sym_map["x"]), 2)
+
+    def test_simplify_eq_conjunction(self):
+        x, y = sympy.symbols("x y", integer=True)
+        cases = [
+            (sympy.And(sympy.Eq(x, 2), sympy.Ne(x, 4)), sympy.Eq(x, 2)),
+            (sympy.And(sympy.Eq(x, 2), sympy.Ne(x, 2)), sympy.false),
+            (sympy.And(sympy.Eq(x, 2), sympy.Eq(x, 4)), sympy.false),
+            (
+                sympy.And(sympy.Eq(x, 2), sympy.Ne(y, 4), sympy.Ne(x, 3)),
+                sympy.And(sympy.Eq(x, 2), sympy.Ne(y, 4)),
+            ),
+            (sympy.And(sympy.Ne(x, 2), sympy.Ne(x, 4)), None),
+            (sympy.And(x >= 2, y <= 4), None),
+            (sympy.Eq(x, 2), None),
+        ]
+        for expr, expected in cases:
+            with self.subTest(expr=expr):
+                result = _simplify_eq_conjunction(expr)
+                self.assertEqual(result, expr if expected is None else expected)
+
+    def test_piecewise_eq_chain_lowers_each_branch_to_its_own_literal(self):
+        # Every branch after the first is Eq(x, c) and Ne's of earlier
+        # constants, which simplify to Eq(x, c) alone: no AND literal is
+        # needed until the default branch.
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise(
+            (10, sympy.Eq(x, 0)),
+            (20, sympy.Eq(x, 1)),
+            (30, sympy.Eq(x, 2)),
+            (x, True),
+        )
+        for value in range(5):
+            solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
+            expected = {0: 10, 1: 20, 2: 30}.get(value, value)
+            self.assertEqual(solver.ObjectiveValue(), expected)
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 4, "x")}
+        _SympyExprToCpSat(model, sym_map, {})._print(expr)
+        names = [v.name for v in model.proto.variables]
+        self.assertEqual(sum(n.startswith("and_") for n in names), 1, names)
+        self.assertFalse(any(n.startswith("piecewise_") for n in names), names)
+
+    def test_piecewise_drops_a_branch_that_cannot_hold(self):
+        x = sympy.Symbol("x", integer=True)
+        # Built unevaluated so sympy keeps the shadowed second branch.
+        expr = sympy.Piecewise(
+            (10, sympy.Eq(x, 2)), (20, sympy.Eq(x, 2)), (x, True), evaluate=False
+        )
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 4, "x")}
+        cp_expr = _SympyExprToCpSat(model, sym_map, {})._print(expr)
+        self.assertNotIn("20", str(cp_expr))
+        for value in range(5):
+            model = cp_model.CpModel()
+            sym_map = {"x": model.new_int_var(value, value, "x")}
+            model.maximize(_SympyExprToCpSat(model, sym_map, {})._print(expr))
+            solver = cp_model.CpSolver()
+            self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
+            self.assertEqual(solver.ObjectiveValue(), 10 if value == 2 else value)
 
     def test_conditional_cost_keeps_small_coefficients(self):
         x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)

@@ -24,12 +24,16 @@ Usage:
 import os
 
 import pytest
+import regex as re
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
+from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import TestCase, run_tests
 
 import torch_spyre  # noqa: F401
+from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.wsr import for_each_tile
 
 if "RANK" not in os.environ:
     pytest.skip(
@@ -89,6 +93,36 @@ class AllReduceWithComputeModule(torch.nn.Module):
         z = y + 1.0
         result = torch.ops._c10d_functional.wait_tensor(reduced)
         return result + z
+
+
+_CARRY_M, _CARRY_K, _CARRY_N = 64, 256, 128
+
+
+def _split_k_then_allreduce(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A for_each_tile accumulator whose only post-loop use is an all_reduce."""
+
+    def body(acc, ops):
+        x_tile, y_tile = ops
+        return acc + x_tile @ y_tile, None
+
+    acc, _ = for_each_tile(
+        body,
+        (x, y),
+        dims=(-1, 0),
+        tile_size=64,
+        init=torch.zeros(_CARRY_M, _CARRY_N, device=x.device, dtype=x.dtype),
+    )
+    reduced = torch.ops._c10d_functional.all_reduce(acc, "sum", _GROUP_NAME)
+    return torch.ops._c10d_functional.wait_tensor(reduced) * 2.0
+
+
+def _loop_update_allocations(source: str) -> list[str]:
+    """Allocation kinds of the carry update, the first ``add`` in the LoopSpec."""
+    loop = source[source.index("LoopSpec(") :]
+    update = loop[loop.index("op='add'") :]
+    next_op = update.find("OpSpec(")
+    update = update if next_op < 0 else update[:next_op]
+    return re.findall(r"allocation=\{'(\w+)'", update)
 
 
 class TestAllReduceCompiled(TestCase):
@@ -277,6 +311,40 @@ class TestAllReduceCompiled(TestCase):
                 f"Rank {self.comm_rank}: iteration {iteration} incorrect. "
                 f"Expected {expected_val}, got {result[0].to('cpu').item()}",
             )
+
+    def test_allreduce_of_loop_carry_keeps_carry_in_lx(self):
+        """A loop accumulator reduced across ranks stays in LX while it accumulates.
+
+        The collective needs an HBM operand. Without a post-loop drain the carry
+        itself was that operand, so every trip read and wrote it in HBM.
+        0/1 operands keep every partial sum exact in fp16.
+        """
+        g = torch.Generator().manual_seed(0)
+        x = torch.randint(0, 2, (_CARRY_M, _CARRY_K), generator=g).half()
+        y = torch.randint(0, 2, (_CARRY_K, _CARRY_N), generator=g).half()
+        scale = self.comm_rank + 1
+        rank_sum = self.comm_size * (self.comm_size + 1) / 2
+        expected = (x.float() @ y.float()) * rank_sum * 2.0
+
+        compiled = torch.compile(_split_k_then_allreduce, fullgraph=True)
+        x_dev, y_dev = (x * scale).to(DEVICE), y.to(DEVICE)
+        with spyre_config.patch(
+            {"lx_planning": True, "co_optimizing_lx_planning": True}
+        ):
+            first, sources = run_and_get_code(compiled, x_dev, y_dev)
+            second = compiled(x_dev, y_dev)
+
+        for call, result in (("first", first), ("second", second)):
+            torch.testing.assert_close(
+                result.cpu().float(),
+                expected,
+                atol=0,
+                rtol=0,
+                msg=f"Rank {self.comm_rank}: {call} call incorrect",
+            )
+        source = "\n".join(sources)
+        self.assertIn("allreduce_run(", source)
+        self.assertEqual(_loop_update_allocations(source), ["lx", "lx", "lx"])
 
 
 if __name__ == "__main__":

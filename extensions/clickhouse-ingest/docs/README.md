@@ -19,7 +19,7 @@ entirely separate mechanism worth understanding on its own terms.
    `client.py`, `writer.py`, `junit.py`, the hardware-diagnostics trio, and
    `apply_schema.py`, with concrete real-world use cases drawn from the
    actual consumers below — not hypothetical examples.
-2. **[GitHub Actions](github-actions.md)** — the six reusable composite
+2. **[GitHub Actions](github-actions.md)** — the seven reusable composite
    actions in `torch-spyre/.github/actions/`, and how **torch-spyre**,
    **spyre-inference**, and **hf-adapters** each call them to push test
    results, benchmarks, and capabilities; hardware diagnostics for

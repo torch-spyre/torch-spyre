@@ -18,6 +18,23 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
+
+def _backend_loop_unroll_from_env() -> bool:
+    value = os.environ.get("SPYRE_BACKEND_LOOP_UNROLL", "1")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return True
+    if normalized in ("0", "false", "no"):
+        return False
+    raise ValueError(
+        f"SPYRE_BACKEND_LOOP_UNROLL must be 1/true/yes or 0/false/no, got {value!r}"
+    )
+
+
+# Controls dbo-opt's SDSC-bundle loop unrolling, not the direct KTIR path.
+# Resolve at import like the other options; config.patch can override it.
+backend_loop_unroll: bool = _backend_loop_unroll_from_env()
+
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
@@ -78,6 +95,13 @@ def pool_allocated_by_frontend() -> bool:
 # decomposition remains the default path and the fallback for cases the direct
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
+
+# Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+# buffer in addition to its input buffers. Off by default until the
+# interaction with downstream span limits is fully validated.
+ndo_matmul_output_reorder: bool = (
+    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
+)
 
 # For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
 # spatial dims (i/j) across cores. A strided conv's output coordinates do not
