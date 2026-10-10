@@ -744,7 +744,9 @@ class TestNegativeScalarOperations:
         def grad_mul(x):
             return x * 0.125
 
-        x = cached_randn((10, 10))
+        # cached_randn is lru_cached; clone so requires_grad does not leak
+        # into later tests that reuse the same cache key (e.g. chained mul).
+        x = cached_randn((10, 10)).clone()
         x.requires_grad = True
         result = _run_spyre(execution_mode, grad_mul, x)
         assert result.shape == x.shape
