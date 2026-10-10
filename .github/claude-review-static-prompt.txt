@@ -1,8 +1,5 @@
 /code-review __PR_NUMBER__ --comment
 
-The PR's Python source is checked out at $GITHUB_WORKSPACE.
-
-
 Perform a static review of the code and tests. Do not attempt Spyre hardware
 verification or require a Spyre device. Clearly report that hardware validation was
 not performed when it would be relevant to the review.

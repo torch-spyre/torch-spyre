@@ -9,7 +9,13 @@ run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-stati
 on:
   issue_comment:
     types: [created]
-  pull_request: # TODO: remove before merging (testing only)
+  # Temporary pull_request trigger for testing only -- remove before merging.
+  # With issue_comment as the sole trigger: the concurrency group is correct
+  # (github.event.issue.number is the PR number), the job if: filters out
+  # non-PR and non-review comments so workflow-level concurrency is fine, the
+  # checkout gets the default branch (prompt files, not PR code), and the agent
+  # uses gh pr checkout to fetch the PR code itself when needed.
+  pull_request:
     types: [opened, synchronize, reopened]
 
 concurrency:
@@ -109,8 +115,8 @@ jobs:
             -d '{"content":"eyes"}' \
             || echo "::warning::Could not add :eyes: reaction to the trigger comment"
 
-      # Checkout with no ref = the trusted default branch. The agent pulls the
-      # PR itself (gh pr checkout) when it must run the changed code on hardware.
+      # Checks out the default branch (prompt files). The agent uses
+      # gh pr checkout to fetch the PR code itself when needed.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
