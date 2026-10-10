@@ -24,6 +24,7 @@ test_suite_config:
         # in both wraps collapse to (pointwise|reduction).
         - names:
             - LxPlanning.*::test_pointwise_binary_op_div_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_log_log_zero_val_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
             - LxPlanning.*::test_(pointwise|sqrt|rsqrt|log_|pow_|alias_operands|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*_lx_planning_(pointwise|reduction)

@@ -948,7 +948,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_log",
-            "test_unary_op",
+            "test_log_op",
         ): {
             "ops_dict": {
                 "log": torch.log,  # undefined for zero or negative input
@@ -956,6 +956,97 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "1d_abs_nz": (cached_randn((64,), abs=True) + FP16_EPS,),
                 "2d_abs_nz": (cached_randn((67, 256), abs=True) + FP16_EPS,),
+                "1d_aligned_256": (cached_randn((256,), abs=True) + FP16_EPS,),
+                "2d_pad_shape": (
+                    cached_randn((67, 256), abs=True, differentiation="log_2d")
+                    + FP16_EPS,
+                ),
+                "3d": (cached_randn((67, 71, 256), abs=True) + FP16_EPS,),
+                "4d": (cached_randn((7, 12, 32, 64), abs=True) + FP16_EPS,),
+                "1d_unaligned": (cached_randn((67,), abs=True) + FP16_EPS,),
+                "2d_pad": (cached_randn((63, 129), abs=True) + FP16_EPS,),
+                "3d_pad": (cached_randn((3, 7, 9), abs=True) + FP16_EPS,),
+                "tiny_vals": (
+                    cached_randn((64,), abs=True, differentiation="log_tiny") * FP16_EPS
+                    + FP16_EPS,
+                ),
+                "near_one": (
+                    torch.ones((64,), dtype=torch.float16)
+                    + cached_randn((64,), differentiation="log_near_one") * 0.1,
+                ),
+                "large_vals": (
+                    torch.full(
+                        (64,), torch.finfo(torch.float16).max, dtype=torch.float16
+                    ),
+                ),
+                "ones": (torch.ones((256,), dtype=torch.float16),),
+                "negative_vals": (
+                    -cached_randn((64,), abs=True, differentiation="log_neg")
+                    - FP16_EPS,
+                ),
+                "zero_val": (torch.zeros((64,), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_log_fp32",
+            "test_log_op",
+        ): {
+            "ops_dict": {
+                "log": torch.log,
+            },
+            "param_sets": {
+                "1d_abs_nz_fp32": (
+                    cached_randn((64,), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "2d_abs_nz_fp32": (
+                    cached_randn((67, 256), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "3d_abs_nz_fp32": (
+                    cached_randn((32, 64, 128), abs=True, dtype=torch.float32)
+                    + FP32_EPS,
+                ),
+                "ones_fp32": (torch.ones((256,), dtype=torch.float32),),
+                "tiny_vals_fp32": (
+                    cached_randn(
+                        (64,),
+                        abs=True,
+                        differentiation="log_tiny_fp32",
+                        dtype=torch.float32,
+                    )
+                    * FP32_EPS
+                    + FP32_EPS,
+                ),
+                "negative_vals_fp32": (
+                    -cached_randn(
+                        (64,),
+                        abs=True,
+                        differentiation="log_neg_fp32",
+                        dtype=torch.float32,
+                    )
+                    - FP32_EPS,
+                ),
+                "zero_val_fp32": (torch.zeros((64,), dtype=torch.float32),),
+            },
+        },
+        (
+            "test_log_int",
+            "test_log_op",
+        ): {
+            "ops_dict": {
+                "log": torch.log,
+            },
+            "param_sets": {
+                "1d_int32": (torch.randint(1, 100, (256,), dtype=torch.int32),),
+                "2d_int32": (torch.randint(1, 100, (67, 256), dtype=torch.int32),),
+                "3d_int32": (torch.randint(1, 100, (3, 7, 64), dtype=torch.int32),),
+                "int32_ones": (torch.ones((256,), dtype=torch.int32),),
+                "int32_large": (
+                    torch.full((256,), torch.iinfo(torch.int32).max, dtype=torch.int32),
+                ),
+                "1d_int64": (torch.randint(1, 100, (256,), dtype=torch.int64),),
+                "2d_int64": (torch.randint(1, 100, (67, 256), dtype=torch.int64),),
+                "3d_int64": (torch.randint(1, 100, (3, 7, 64), dtype=torch.int64),),
+                "int64_ones": (torch.ones((256,), dtype=torch.int64),),
             },
         },
         (
@@ -7029,6 +7120,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(op, x, dlfloat16_reference=op(x.to(torch.float64)))
         else:
             self.compare_with_cpu(op, x)
+
+    def test_log_op(self, op, x):
+        if x.dtype == torch.float16:
+            self.compare_with_cpu(op, x, atol=1e-2, rtol=1e-2)
+        else:
+            self.compare_with_cpu(op, x, atol=1e-5, rtol=1e-5)
 
     def test_bool(self):
         dtype = torch.bool

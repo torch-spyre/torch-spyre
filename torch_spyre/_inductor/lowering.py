@@ -2393,6 +2393,36 @@ def lower_any_def(x):
     return to_dtype(result, torch.bool)
 
 
+@register_spyre_lowering(torch.ops.aten.log.default, type_promotion_kind=None)
+def lower_log(x):
+    """Lower aten.log with INT_TO_FLOAT type promotion.
+
+    fp16/fp32 inputs are passed through unchanged; integer inputs are promoted
+    to float before the hardware ``log`` pointwise op is applied.  The result
+    dtype equals the compute dtype (INT_TO_FLOAT does not change the return type
+    for floats, and integer inputs are promoted to float permanently).
+    """
+    x_t = torch.empty(0, dtype=x.get_dtype())
+    _, compute_dtype = elementwise_dtypes(
+        x_t,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+
+    if x.get_dtype() != compute_dtype:
+        x = to_dtype(x, compute_dtype)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=compute_dtype,
+        inner_fn=lambda index: lowering.ops_wrapper("log")(x.make_loader()(index)),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
