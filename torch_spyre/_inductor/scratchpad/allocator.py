@@ -23,7 +23,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
-import torch
 from torch._inductor.ir import (
     TensorBox,
     Buffer,
@@ -1293,18 +1292,9 @@ class ScratchpadAllocator:
         target = getattr(getattr(op, "origin_node", None), "target", None)
         if target is None:
             return []
-        reads = [dep.name for dep in op.get_read_writes().reads]
-        # ``tags`` is an OpOverload attribute; some origin targets (e.g. builtin
-        # functions behind int64 fallbacks) don't have it. Treat a tag-less
-        # target as not-pointwise rather than crashing. The joint-division path
-        # reaches this for ops the residency checks bar on the greedy path.
-        if torch.Tag.pointwise in getattr(target, "tags", ()):
-            # If the op is tagged as pointwise by pytorch upstream
-            # allow all inputs. Does not work for all ops
-            return reads
-        if hasattr(op, "data"):
-            return get_op_pointwise_inputs(op.data)
-        return []
+        # A pointwise ATen target can consume a transposed/broadcast view after
+        # lowering. Its tag does not prove element-for-element storage reuse.
+        return get_op_pointwise_inputs(op)
 
     def _restickify_barrier(
         self,

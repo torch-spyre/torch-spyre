@@ -33,13 +33,24 @@ approximations are both wrong and were both live:
   coordinate. ``test_mod_coordinate_uses_a_real_bound`` is the counter-example.
 """
 
+import operator
 import unittest
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import sympy
+import torch
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ExternKernel, FallbackKernel, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    ExternKernel,
+    FallbackKernel,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+)
+from torch._inductor.sizevars import SizeVarAllocator
+from torch._inductor.virtualized import V, ops
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.utils import (
@@ -60,6 +71,62 @@ d0, d1, d2, d3 = sympy.symbols("d0 d1 d2 d3", integer=True, nonnegative=True)
 # one non-stick device dim, so ``device_size[0]`` is the dim under test.
 _STICK_COORD = sympy.Mod(d0, 64)
 _STICK_SIZE = 64
+
+
+class PointwiseInPlaceInputsTest(TestCase):
+    def test_lowered_indices_determine_reuse(self):
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        def same(i, j):
+            return 64 * i + j
+
+        def transpose(i, j):
+            return i + 64 * j
+
+        cases = [
+            ("identity", [("a", same)], ["a"]),
+            ("transpose", [("a", transpose)], []),
+            ("broadcast", [("a", lambda i, j: j)], []),
+            ("offset", [("a", lambda i, j: same(i, j) + 1)], []),
+            ("per input", [("a", same), ("b", transpose)], ["a"]),
+            ("mixed reads", [("a", same), ("a", transpose)], []),
+            ("mixed reads reversed", [("a", transpose), ("a", same)], []),
+        ]
+        allocator = object.__new__(ScratchpadAllocator)
+        for label, reads, expected in cases:
+            with self.subTest(label=label):
+
+                def inner_fn(index):
+                    values = [
+                        ops.load(name, index_fn(*index)) for name, index_fn in reads
+                    ]
+                    result = values[0]
+                    for value in values[1:]:
+                        result = ops.add(result, value)
+                    return result
+
+                op = ComputedBuffer(
+                    name="output",
+                    layout=FixedLayout(
+                        torch.device("cpu"), torch.float16, [64, 64], [64, 1]
+                    ),
+                    data=Pointwise(
+                        device=torch.device("cpu"),
+                        dtype=torch.float16,
+                        ranges=[64, 64],
+                        inner_fn=inner_fn,
+                    ),
+                )
+                # Both tagged and tag-less origins need real load/store checks.
+                for target in (torch.ops.aten.add.Tensor, operator.add):
+                    with self.subTest(target=target):
+                        op.origin_node = torch.fx.Graph().call_function(target)
+                        with V.set_graph_handler(
+                            SimpleNamespace(sizevars=SizeVarAllocator())
+                        ):
+                            self.assertEqual(
+                                allocator._op_inputs_good_for_lx_inplace(op), expected
+                            )
 
 
 def _graph(extent, ranges):

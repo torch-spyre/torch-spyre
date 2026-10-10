@@ -2025,9 +2025,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         check the loop previously omitted (#3212 follow-up).
 
         Invariant guard: an input read at a different index than the output write
-        must never be offered as an in-place parent pre-solver. For pointwise-tagged
-        ops every read is eligible (so this holds trivially), but the assertion locks
-        the property in against a future regression that drops the per-input check."""
+        must never be offered as an in-place parent pre-solver. The assertion locks
+        the shared gate into this path; index-specific eligibility is covered by
+        PointwiseInPlaceInputsTest."""
         from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))

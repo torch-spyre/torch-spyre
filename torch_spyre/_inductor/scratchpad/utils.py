@@ -15,20 +15,16 @@
 
 import math
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ExternKernel,
     Operation,
-    IRNode,
     Pointwise,
 )
-from torch._inductor.virtualized import V
-from torch._inductor.ops_handler import WrapperHandler
 from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
-import sympy
 
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -697,40 +693,29 @@ def get_ncores_for_buffers(
     return result, mismatch_reasons_cache, accepted_views
 
 
-class _GetLoadStoreIndices(WrapperHandler):
-    def __init__(self, inner):
-        super().__init__(inner)
-        self._load_map = {}
-        self._store_map = {}
+def get_op_pointwise_inputs(op: Operation) -> list[str]:
+    """Inputs whose every read addresses the pointwise output's storage index.
 
-    def load(self, name: str, index: sympy.Expr):
-        self._load_map[name] = index
-        return super().load(name, index)
-
-    def store(self, name: str, index: sympy.Expr, value: Any, mode: Any = None):
-        self._store_map[name] = index
-        return super().store(name, index, value, mode)
-
-
-def get_load_and_store_indices(
-    pointwise: Pointwise,
-) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr]]:
-    handler = _GetLoadStoreIndices(V.MockHandler())
-    index = [sympy.Symbol(f"index{i}") for i in range(len(pointwise.ranges))]
-    with V.set_ops_handler(handler):
-        pointwise.inner_fn(index)
-    return handler._load_map, handler._store_map
-
-
-def get_op_pointwise_inputs(node: IRNode) -> list[str]:
-    if not isinstance(node, Pointwise):
+    Trace the ComputedBuffer, not Pointwise.inner_fn: the latter returns a
+    value without emitting a store, so comparing against its stores is vacuous.
+    Keep every read of each input; one transposed or offset read bars reuse even
+    when another read of that same buffer matches the output.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return []
-    loads, stores = get_load_and_store_indices(node)
-
+    rw = op_read_writes(op)
+    writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+    if len(writes) != 1:
+        return []
+    invalid = {
+        dep.name
+        for dep in rw.reads
+        if not isinstance(dep, MemoryDep) or dep.index != writes[0].index
+    }
     return [
-        inp
-        for inp, load_index in loads.items()
-        if all(store_index == load_index for store_index in stores.values())
+        name
+        for name in dict.fromkeys(dep.name for dep in rw.reads)
+        if name not in invalid
     ]
 
 
