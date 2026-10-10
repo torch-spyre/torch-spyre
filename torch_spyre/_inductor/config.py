@@ -374,4 +374,12 @@ _cpsat_warn_on_cost_expr: bool = True
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
+# Inductor puts all of this config into the key of its compile cache. Some
+# settings only say where to write logs or whether to keep kernels on disk.
+# They never change the compiled code, so leave them out of the key. Without
+# this, a run that only writes its timing log to a new file cannot reuse any
+# cached graph and compiles everything again.
+# These are prefixes: "timing" covers both timing and timing_out.
+_cache_config_ignore_prefix = ["timing", "dump_cost_expr_file", "spyre_kernel_cache"]
+
 install_config_module(sys.modules[__name__])
