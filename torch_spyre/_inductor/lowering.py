@@ -1100,6 +1100,30 @@ def lower_silu(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.batchnormfwd)
+def lower_batchnormfwd(x, scale, shift):
+    fn = lowering.ops_wrapper(torch.ops.spyre.batchnormfwd.__name__)
+
+    def inner_fn(index):
+        # scale/shift are per-channel (dim 1) and broadcast over every other dim.
+        return fn(
+            x.make_loader()(index),
+            scale.make_loader()(index[1:2]),
+            shift.make_loader()(index[1:2]),
+        )
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.spyre.softplus)
 def lower_softplus(x, beta=1.0, threshold=20.0):
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)

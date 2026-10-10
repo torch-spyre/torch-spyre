@@ -202,6 +202,10 @@ class SpyreOpFuncs:
         return PointwiseOp("clip", [x], op_info)
 
     @staticmethod
+    def batchnormfwd(x, scale, shift):
+        return PointwiseOp("batchnormfwd", [x, scale, shift])
+
+    @staticmethod
     def eq(a, b):
         return PointwiseOp("equal", [a, b])
 

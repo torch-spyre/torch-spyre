@@ -1807,6 +1807,66 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+def _spyre_batch_norm_inference(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    # Fold the running stats and affine params into one per-channel scale/shift
+    # so the full-size tensor goes through a single batchnormfwd pass.
+    scale = torch.rsqrt(running_var + eps)
+    if weight is not None:
+        scale = scale * weight
+    shift = -running_mean * scale
+    if bias is not None:
+        shift = shift + bias
+    return torch.ops.spyre.batchnormfwd(input, scale, shift)
+
+
+@register_spyre_decompositions([torch.ops.aten.batch_norm.default])
+def spyre_batch_norm(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    running_mean: Optional[torch.Tensor],
+    running_var: Optional[torch.Tensor],
+    training: bool,
+    momentum: float,
+    eps: float,
+    cudnn_enabled: bool,
+) -> torch.Tensor:
+    if training or running_mean is None or running_var is None:
+        raise Unsupported(
+            "spyre_batch_norm: only inference mode (training=False with running "
+            "stats) is supported"
+        )
+    return _spyre_batch_norm_inference(
+        input, weight, bias, running_mean, running_var, eps
+    )
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten._native_batch_norm_legit_no_training.default]
+)
+def spyre_native_batch_norm_legit_no_training(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    momentum: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output = _spyre_batch_norm_inference(
+        input, weight, bias, running_mean, running_var, eps
+    )
+    # save_mean/save_rstd are empty in inference, matching the upstream decomp.
+    return output, input.new_zeros((0,)), input.new_zeros((0,))
+
+
 @register_spyre_decompositions([torch.ops.aten.silu.default])
 def silu(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.silu(input)

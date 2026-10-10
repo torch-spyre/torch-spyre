@@ -359,6 +359,43 @@ def _dtype_name(dt):
 
 
 @functools.lru_cache(maxsize=None)
+def _batch_norm_args(shape, dtype=torch.float16):
+    """(x, running_mean, running_var, weight, bias) with channels at dim 1."""
+    c = shape[1]
+    return (
+        cached_randn(shape, dtype=dtype),
+        cached_randn((c,), differentiation="mean", dtype=dtype),
+        cached_randn((c,), differentiation="var", abs=True, dtype=dtype) + 0.5,
+        cached_randn((c,), differentiation="weight", dtype=dtype),
+        cached_randn((c,), differentiation="bias", dtype=dtype),
+    )
+
+
+def _batch_norm_args_no_affine(shape, dtype=torch.float16):
+    """Like _batch_norm_args but with weight=None and bias=None (affine=False)."""
+    return _batch_norm_args(shape, dtype)[:3] + (None, None)
+
+
+BATCH_NORM_PARAM_SETS = {
+    "2d": _batch_norm_args((64, 256)),
+    "2d_unaligned_c": _batch_norm_args((64, 67)),
+    "3d": _batch_norm_args((8, 64, 128)),
+    "3d_unaligned_l": _batch_norm_args((8, 64, 71)),
+    "4d": _batch_norm_args((2, 64, 8, 64)),
+    "4d_unaligned_c": _batch_norm_args((2, 67, 8, 64)),
+    "4d_unaligned_w": _batch_norm_args((2, 64, 8, 71)),
+    "4d_singleton_n": _batch_norm_args((1, 64, 8, 64)),
+    "2d_fp32": _batch_norm_args((64, 256), dtype=torch.float32),
+    "4d_fp32": _batch_norm_args((2, 64, 8, 64), dtype=torch.float32),
+    "2d_no_affine": _batch_norm_args_no_affine((64, 256)),
+    "2d_unaligned_c_no_affine": _batch_norm_args_no_affine((64, 67)),
+    "3d_no_affine": _batch_norm_args_no_affine((8, 64, 128)),
+    "4d_no_affine": _batch_norm_args_no_affine((2, 64, 8, 64)),
+    "4d_singleton_n_no_affine": _batch_norm_args_no_affine((1, 64, 8, 64)),
+    "2d_fp32_no_affine": _batch_norm_args_no_affine((64, 256), dtype=torch.float32),
+}
+
+
 def _cached_randint(shape, dtype):
     gen = utils_inductor._make_generator(shape, dtype)
     return torch.randint(0, 512, shape, dtype=dtype, generator=gen)
@@ -3831,19 +3868,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # TODO: aten::native_batch_norm not implemented for the 'spyre' backend
-        # (runtime NotImplementedError before compilation) (issue #1889)
+        # TODO: fp32 per-channel broadcast over a non-stick dim fails in
+        # optimize_restickify ("no mechanism to resolve stick incompatibility");
+        # a plain fp32 x * s.view(1, -1, 1, 1) hits the same error (issue #1377).
         ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
-            "param_sets": {
-                "eval_mode": (
-                    cached_randn((64, 256), dtype=torch.float16),
-                    torch.zeros((256,), dtype=torch.float16),
-                    torch.ones((256,), dtype=torch.float16),
-                    torch.ones((256,), dtype=torch.float16),
-                    torch.zeros((256,), dtype=torch.float16),
-                ),
-            },
-            "expect_fail": ["eval_mode"],
+            "param_sets": BATCH_NORM_PARAM_SETS,
+            "expect_fail": ["4d_fp32"],
         },
         # TODO: TorchInductor compilation failure in the Spyre lowering pass —
         # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
