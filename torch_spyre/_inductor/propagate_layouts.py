@@ -2576,7 +2576,13 @@ def _eager_view_input_layout(
     rank = len(real_input.shape)
     ivars = sympy.symbols(f"_offset_check_i0:{rank}", integer=True, nonnegative=True)
     var_ranges = {v: s for v, s in zip(ivars, real_input.shape)}
-    flat_index = storage_offset + sum(new_stride[d] * ivars[d] for d in range(rank))
+    # sympy.Integer, not the bare int: a rank-0 view (``x[i]`` of a 1-D
+    # tensor) has no index variables, so the sum is empty and the flat index
+    # would otherwise stay a Python int that compute_coordinates cannot
+    # inspect (issue #4330).
+    flat_index = sympy.Integer(storage_offset) + sum(
+        new_stride[d] * ivars[d] for d in range(rank)
+    )
     stick_expr = compute_coordinates(
         list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
     )[-1]

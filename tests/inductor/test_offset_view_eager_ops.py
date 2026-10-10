@@ -30,15 +30,21 @@ slice is already row-contiguous, so it returns a VIEW with ``storage_offset==a``
 and any on-device consumer (RoPE, an in-place norm, ...) would otherwise read /
 write element 0.
 
-Offsets here are stick-aligned (Granite-3.3 QKV: k.off=4096=64 sticks,
-v.off=5120=80 sticks at fp16, elems_per_stick=64); unaligned offsets are a
-separate concern covered by ``test_copy_from_d2d_offsets.py``.
+The QKV cases below use stick-aligned offsets (Granite-3.3 QKV: k.off=4096=64
+sticks, v.off=5120=80 sticks at fp16, elems_per_stick=64). ``TestSelectClone``
+covers offsets that land inside a stick, which the d2d kernel cannot express
+and eager therefore stages through the host; the compiled-path rejection of
+those offsets is covered by ``test_copy_from_d2d_offsets.py``.
 """
+
+import warnings
 
 import pytest
 import torch
 
 import torch_spyre  # noqa: F401
+from torch_spyre._C import get_elem_in_stick
+from torch_spyre.ops.eager import HostStagedCopyWarning
 
 
 DEVICE = "spyre"
@@ -182,3 +188,141 @@ class TestPrefixViewSliceWrite:
                 atol=1e-2,
                 rtol=0,
             )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.int64, torch.int32, torch.float16, torch.bfloat16, torch.float32],
+    ids=str,
+)
+class TestSelectClone:
+    """Eager ``clone()`` of a low-rank view must return the view's own element(s)
+    at ANY storage_offset, aligned or not.
+
+    Regression tests for #4329 and #4330. ``clone`` of a nonzero-offset view runs
+    ``spyre__copy_from`` -> ``spyre::copy_from_d2d``. Two things went wrong for
+    a 0-d ``x[i]`` of a 1-D tensor:
+
+    * #4330: a stick-aligned offset (``x[32]`` at int64) reached layout
+      propagation with a bare-int flat index (a rank-0 view has no index
+      variables), and ``compute_coordinates`` failed on ``.free_symbols``.
+    * #4329: an offset inside a stick (``x[1]``) is not expressible in the d2d
+      kernel coordinate, and eager had no other path, so the clone was refused
+      outright where a host round-trip would have been correct.
+
+    Every case compares against CPU exactly: a clone is a pure copy. The offsets
+    are derived from ``elems_per_stick`` for the dtype so the same three
+    positions (inside the first stick, on the boundary, inside the second) are
+    exercised at every stick width.
+    """
+
+    @staticmethod
+    def _offsets(dtype):
+        eps = get_elem_in_stick(dtype)
+        return {
+            "inside_first_stick": 1,
+            "stick_boundary": eps,
+            "inside_second": eps + 1,
+        }
+
+    @pytest.mark.parametrize(
+        "position", ["inside_first_stick", "stick_boundary", "inside_second"]
+    )
+    def test_scalar_select_clone_matches_cpu(self, dtype, position):
+        off = self._offsets(dtype)[position]
+        x = torch.arange(3 * get_elem_in_stick(dtype)).to(dtype)
+        view = x.to(DEVICE)[off]
+        assert view.storage_offset() == off, "precondition: select is a view"
+
+        got = view.clone()
+
+        assert got.storage_offset() == 0
+        torch.testing.assert_close(got.to("cpu"), x[off], rtol=0, atol=0)
+
+    def test_unaligned_narrow_clone_matches_cpu(self, dtype):
+        """A rank-1 window starting inside a stick (not just a 0-d select)."""
+        eps = get_elem_in_stick(dtype)
+        x = torch.arange(3 * eps).to(dtype)
+        view = x.to(DEVICE)[eps + 1 : eps + 9]
+        assert view.storage_offset() == eps + 1
+
+        got = view.clone()
+
+        torch.testing.assert_close(got.to("cpu"), x[eps + 1 : eps + 9], rtol=0, atol=0)
+
+    def test_rank2_select_inside_stick_matches_cpu(self, dtype):
+        """``x[1, 1]`` and ``x[1, 1:5]`` of a 2-D tensor: the offset lands one
+        element past a row boundary, so it is inside a stick at every width."""
+        eps = get_elem_in_stick(dtype)
+        x = torch.arange(4 * eps).to(dtype).reshape(4, eps)
+        dev = x.to(DEVICE)
+
+        torch.testing.assert_close(dev[1, 1].clone().to("cpu"), x[1, 1], rtol=0, atol=0)
+        torch.testing.assert_close(
+            dev[1, 1:5].clone().to("cpu"), x[1, 1:5], rtol=0, atol=0
+        )
+
+    def test_host_staging_is_announced(self, dtype):
+        """The slow path is correct but must not be silent: a copy staged
+        through the host warns, and the on-device kernel path for an aligned
+        offset does not. The warning is filtered "once" like ``RetileWarning``,
+        and Python's once-filter keys on the message text, so the text must be
+        identical across offsets (else a loop over distinct slices would emit
+        one warning per iteration) while still naming the stick width."""
+        eps = get_elem_in_stick(dtype)
+        dev = torch.arange(3 * eps).to(dtype).to(DEVICE)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")  # observe every emission
+            dev[1].clone()
+            dev[eps + 3].clone()
+            dev[eps].clone()
+
+        staged = [w for w in caught if issubclass(w.category, HostStagedCopyWarning)]
+        assert len(staged) == 2, [str(w.message) for w in caught]
+        assert str(staged[0].message) == str(staged[1].message)
+        assert f"elems_per_stick={eps}" in str(staged[0].message)
+        assert str(dtype) in str(staged[0].message)
+
+    def test_unaligned_source_into_aligned_offset_dst(self, dtype):
+        """``copy_`` from an inside-a-stick source window into a destination
+        window that starts on a stick boundary: the source is staged through the
+        host and the destination offset still goes through the d2d kernel. The
+        whole destination is compared so a write outside the window is caught."""
+        eps = get_elem_in_stick(dtype)
+        src = torch.arange(3 * eps).to(dtype)
+        dst = torch.zeros(3 * eps, dtype=dtype)
+        dev_src = src.to(DEVICE)
+        dev_dst = dst.to(DEVICE)
+
+        dev_dst[eps : eps + 2].copy_(dev_src[1:3])
+
+        ref = dst.clone()
+        ref[eps : eps + 2] = src[1:3]
+        torch.testing.assert_close(dev_dst.to("cpu"), ref, rtol=0, atol=0)
+
+
+class TestUnalignedSourceNeverSilentlyWrong:
+    """The host-staging path for an unaligned source must not trade a loud
+    failure for silent wrong data.
+
+    The H2D DMA writes host order into the destination's storage and ignores
+    strides, so it is only safe when the destination is a plain contiguous
+    buffer at offset 0. Any other destination has to go through the d2d kernel,
+    which either copies correctly or raises. This test accepts both of those
+    outcomes and rejects the third.
+    """
+
+    def test_transposed_destination(self):
+        src = torch.arange(40, dtype=torch.int64)
+        dev_src = src.to(DEVICE)
+        dst = torch.zeros(2, 3, dtype=torch.int64).to(DEVICE).t()
+        assert dst.storage_offset() == 0 and not dst.is_contiguous()
+
+        try:
+            dst.copy_(dev_src[1:7].reshape(3, 2))
+        except Exception:
+            return  # a loud rejection is acceptable
+        torch.testing.assert_close(
+            dst.to("cpu"), src[1:7].reshape(3, 2), rtol=0, atol=0
+        )
