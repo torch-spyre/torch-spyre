@@ -103,7 +103,6 @@ from collections import Counter
 import logging
 import math
 import operator
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -532,37 +531,6 @@ _inv_rel_op = {
     sympy.Gt: sympy.Lt,
     sympy.Lt: sympy.Gt,
 }
-
-
-@cache
-def get_cpu_count() -> int:
-    """CPUs this process may actually use, after spyre-inference's
-    ``threading_config.get_cpu_count``. Resolution order: ``SPYRE_NUM_CPUS``,
-    the cgroup v2 CPU quota, psutil's physical core count, ``os.cpu_count()``.
-
-    ``os.cpu_count()`` reports the host (128 on the dev pods) while the
-    container is limited to 16; CP-SAT with 8x more search workers than cores
-    thrashes instead of searching, and the oversubscription starves everything
-    else in the pod."""
-    env = os.environ.get("SPYRE_NUM_CPUS", "")
-    if env.strip().isdigit() and int(env) > 0:
-        return int(env)
-    try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-        if quota != "max":
-            return max(1, int(quota) // int(period))
-    except (OSError, ValueError):
-        pass
-    try:
-        import psutil
-
-        physical = psutil.cpu_count(logical=False)
-        if physical:
-            return int(physical)
-    except ImportError:
-        pass
-    return os.cpu_count() or 1
 
 
 class _LazyMin(sympy.Min):
@@ -1735,7 +1703,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 max_copies,
             )
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
+            1
+            if torch.are_deterministic_algorithms_enabled()
+            else config.get_cpu_count()
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
