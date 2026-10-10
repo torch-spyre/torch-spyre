@@ -4006,6 +4006,148 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Counts both aligned and unaligned to the 32-entry index stick.
+        ("test_gather_rows", "test_gather_rows_cpu"): {
+            "param_sets": {
+                "2d_table_17_entries": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (17,), dtype=torch.int64),
+                ),
+                "2d_table_32_entries": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (32,), dtype=torch.int64),
+                ),
+                "2d_table_250_entries": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (250,), dtype=torch.int64),
+                ),
+                "2d_table_2d_index": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (3, 20), dtype=torch.int64),
+                ),
+                "3d_table_16_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (16,), dtype=torch.int64),
+                ),
+                "3d_table_40_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (40,), dtype=torch.int64),
+                ),
+                "3d_table_64_entries": (
+                    cached_randn((64, 8, 64)),
+                    torch.randint(0, 64, (64,), dtype=torch.int64),
+                ),
+                "3d_table_1_entry": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (1,), dtype=torch.int64),
+                ),
+                "4d_table_40_entries": (
+                    cached_randn((7, 12, 32, 64)),
+                    torch.randint(0, 7, (40,), dtype=torch.int64),
+                ),
+            },
+        },
+        ("test_gather_rows_weighted_sum", "test_gather_rows_weighted_sum_cpu"): {
+            "param_sets": {
+                "3d_table_16_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (16,), dtype=torch.int64),
+                    cached_randn((16,)),
+                ),
+                "3d_table_32_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (32,), dtype=torch.int64),
+                    cached_randn((32,)),
+                ),
+                "3d_table_40_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (40,), dtype=torch.int64),
+                    cached_randn((40,)),
+                ),
+                "3d_table_250_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (250,), dtype=torch.int64),
+                    cached_randn((250,)),
+                ),
+                "2d_table_17_entries": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (17,), dtype=torch.int64),
+                    cached_randn((17,)),
+                ),
+            },
+        },
+        # Consumers that pull the stick onto the gathered dim, and ones that do not.
+        ("test_gather_rows_fused_consumer", "test_gather_rows_fused_consumer_cpu"): {
+            "ops_dict": {
+                "mul_weight": lambda t, i, w: t[i] * w[:, None, None],
+                "add_weight": lambda t, i, w: t[i] + w[:, None, None],
+                "sum_rows": lambda t, i, w: t[i].sum(0),
+                "sum_inner": lambda t, i, w: t[i].sum(-1),
+                "mean_rows": lambda t, i, w: t[i].mean(0),
+                "amax_rows": lambda t, i, w: (t[i] * w[:, None, None]).amax(0),
+                "square": lambda t, i, w: t[i] * t[i],
+                # A 0-d operand, and operands indexed only by data dims,
+                # which pull the stick the other way.
+                "mul_scalar": lambda t, i, w: t[i] * w[0],
+                "mul_data_weight": lambda t, i, w: t[i] * t[0],
+                "sum_rows_data_weight": lambda t, i, w: (t[i] * t[0]).sum(0),
+            },
+            "param_sets": {
+                "3d_table_16_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (16,), dtype=torch.int64),
+                    cached_randn((16,)),
+                ),
+                "3d_table_40_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (40,), dtype=torch.int64),
+                    cached_randn((40,)),
+                ),
+                "3d_table_32_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (32,), dtype=torch.int64),
+                    cached_randn((32,)),
+                ),
+                "3d_table_64_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (64,), dtype=torch.int64),
+                    cached_randn((64,)),
+                ),
+            },
+        },
+        # Reduction over the gathered dim and a data dim. Positive inputs: at
+        # this depth signed fp16 products cancel, destabilising the reference.
+        ("test_gather_rows_deep_reduce", "test_gather_rows_deep_reduce_cpu"): {
+            "param_sets": {
+                "3d_table_32_entries": (
+                    cached_randn((8, 64, 32), abs=True),
+                    torch.randint(0, 8, (32,), dtype=torch.int64),
+                    cached_randn((32,), abs=True),
+                ),
+                "3d_table_40_entries": (
+                    cached_randn((8, 64, 32), abs=True),
+                    torch.randint(0, 8, (40,), dtype=torch.int64),
+                    cached_randn((40,), abs=True),
+                ),
+            },
+        },
+        ("test_gather_rows_unary_op", "test_gather_rows_unary_op_cpu"): {
+            "ops_dict": {
+                "exp": torch.exp,
+                "abs": torch.abs,
+                "neg": torch.neg,
+            },
+            "param_sets": {
+                "2d_table_17_entries": (
+                    cached_randn((128, 256)),
+                    torch.randint(0, 128, (17,), dtype=torch.int64),
+                ),
+                "3d_table_40_entries": (
+                    cached_randn((8, 64, 32)),
+                    torch.randint(0, 8, (40,), dtype=torch.int64),
+                ),
+            },
+        },
         ("test_embedding", "test_embedding_cpu"): {
             "param_sets": {
                 "basic": (
@@ -8751,6 +8893,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return out
 
         self.compare_with_cpu(fn, input, mat1, mat2, atol=2e-1, rtol=2e-1)
+
+    def test_gather_rows_cpu(self, table, index):
+        """``table[index]`` must match CPU for any index count."""
+        self.compare_with_cpu(lambda t, i: t[i], table, index, run_eager=False)
+
+    def test_gather_rows_weighted_sum_cpu(self, table, index, weight):
+        """A weighted reduction over gathered rows must match CPU."""
+        # One weight per gathered row, broadcast over the table's trailing axes.
+        trailing = (None,) * (table.dim() - 1)
+        self.compare_with_cpu(
+            lambda t, i, w: (t[i] * w[(slice(None), *trailing)]).sum(dim=0),
+            table,
+            index,
+            weight,
+            run_eager=False,
+        )
+
+    def test_gather_rows_fused_consumer_cpu(self, op, table, index, weight):
+        """A gathered result feeding any fused consumer must match CPU."""
+        self.compare_with_cpu(op, table, index, weight, run_eager=False)
+
+    def test_gather_rows_deep_reduce_cpu(self, table, index, weight):
+        """Reducing both the gathered dim and a data dim must match CPU."""
+        self.compare_with_cpu(
+            lambda t, i, w: (t[i] * w[:, None, None]).sum((0, 1)),
+            table,
+            index,
+            weight,
+            run_eager=False,
+        )
+
+    def test_gather_rows_unary_op_cpu(self, op, table, index):
+        """A gathered result consumed by a unary op must still match CPU."""
+        self.compare_with_cpu(lambda t, i: op(t[i]), table, index, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding_cpu(self, indices, weight, padding_idx):

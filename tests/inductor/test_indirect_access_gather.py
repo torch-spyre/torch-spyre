@@ -1233,6 +1233,75 @@ class _GatherMulticoreScenarios:
         self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
+    # -- index entries read vs supplied ----------------------------------
+    @staticmethod
+    def _entry_trip(captured, supplied) -> "tuple[int, int] | None":
+        """``(entries read, core split)`` for the index-entry dim.
+
+        ``N_`` is the dim's whole trip count: one iteration, one entry read.
+        """
+        read = next(
+            (
+                body["N_"][f"{node['layoutDimOrder_'][0]}_"]
+                for _fn, body in iter_sdsc_op_bodies(
+                    bundle_jsons_from_captured(captured)
+                )
+                for node in body.get("scheduleTree_", [])
+                if node.get("indirectAllocType_") == "index_tensor"
+                and len(node["layoutDimOrder_"]) == 1
+            ),
+            None,
+        )
+        if read is None:
+            return None
+        for spec in flatten_op_specs(captured):
+            for arg in spec.args:
+                syms = arg.device_coordinates[-1].free_symbols
+                if len(syms) != 1:
+                    continue
+                entry = spec.iteration_space.get(next(iter(syms)))
+                if entry is not None and int(entry[0]) == supplied:
+                    return read, int(entry[1])
+        return None
+
+    def test_entries_read_match_entries_supplied(self):
+        """A gather must not read index entries that were never supplied.
+
+        Those slots hold whatever the allocator left, and the engine uses what
+        it finds as a table row address.
+
+        Checks the descriptor, not the values: surplus rows land outside the
+        logical output and are discarded, so results stay correct while the
+        fault is present. Values are covered in ``test_inductor_ops.py``.
+        """
+        eps = self.INDEX_ELEMS_PER_STICK
+        table = self.to_spyre(torch.rand(128, 64, 256, dtype=torch.float16))
+        # Partial counts, which planning keeps on one core, and aligned ones,
+        # which it splits -- so both branches below are exercised.
+        for supplied in (16, 40, 250, 1000, 256, 1024):
+            with self.subTest(entries_supplied=supplied):
+                torch._dynamo.reset()
+                index = (torch.arange(supplied) % 128).int().to("spyre")
+                with capture_op_specs() as captured:
+                    torch.compile(self._gather_fn, dynamic=False)(table, index)
+                found = self._entry_trip(captured, supplied)
+                self.assertIsNotNone(found, "no index-entry dim in the bundle")
+                read, split = found
+                expected = supplied if split == 1 else -(-supplied // eps) * eps
+                self.assertEqual(
+                    read,
+                    expected,
+                    f"reads {read} index entries; {supplied} supplied, "
+                    f"{expected} expected at a split of {split}",
+                )
+                if split > 1:
+                    self.assertEqual(
+                        read % (eps * split),
+                        0,
+                        f"{read} entries over {split} cores is not a whole number "
+                        f"of {eps}-entry index sticks each",
+                    )
+
     # -- shared value table: cross-core read correctness ------------------
     def test_gather_cross_core_shared_value(self):
         """Every output row gathers a value row in a DIFFERENT core's work slice,

@@ -1696,7 +1696,9 @@ def _multi_arg_pointwise_layouts(
     # Aligned dims are scanned first; unaligned dims (padded later by
     # insert_restickify_padding) only when nothing aligned yielded a candidate.
     seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
-    all_dims = range(len(output.size)) if not staggered_inputs else []
+    # An indirect op's stick dim is fixed by the tensor it indexes, not free to
+    # choose. A consumer needing a different stick gets its own conversion op.
+    all_dims = [] if (staggered_inputs or ind_names) else range(len(output.size))
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
     for dims in (aligned_dims, unaligned_dims):
         for alt_stick_dim in dims:

@@ -1149,6 +1149,19 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
     return arg_data_format
 
 
+def _index_entry_dim(index_arg, symbol_mapping) -> tuple[Symbol, Symbol] | None:
+    """``(iteration symbol, SDSC dim)`` of an index tensor's entry dim, else None.
+
+    The entry dim is the index tensor's stick dim: its slots hold the entries.
+    """
+    stick = index_arg.device_coordinates[-1]
+    if len(stick.free_symbols) != 1:
+        return None
+    sym = next(iter(stick.free_symbols))
+    dim = symbol_mapping.get(sym)
+    return None if dim is None else (sym, dim)
+
+
 def _collect_index_tensor_layouts(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -2193,24 +2206,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
+    # Only grow the trip count when this dim is actually split across cores:
+    # each core then needs an equal, stick-aligned share. Growing it otherwise
+    # would make the gather read index slots that were never written.
+    if has_indirect_access:
+        found = _index_entry_dim(
+            op_spec.args[next(iter(index_tensor_indices))], symbol_mapping
+        )
+        if found is not None and work_slices.get(found[1], 1) > 1:
+            entry_c, entry_mb = found
             out_arg = op_spec.args[-1]
             for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
                 if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
                     dev = int(out_arg.device_size[pos])
                     if (
                         entry_mb in sdsc_iteration_space
@@ -2309,6 +2316,38 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
     )
+
+    # Each step of the entry dim reads one index entry. An unsplit dim must step
+    # exactly as many times as entries were supplied; stepping further reads
+    # unwritten slots, which the engine uses as row addresses. A split dim steps
+    # the stick-aligned total, which must divide into whole sticks per core.
+    for idx in index_tensor_indices:
+        found = _index_entry_dim(op_spec.args[idx], symbol_mapping)
+        if found is None or found[1] not in sdsc_iteration_space:
+            continue
+        entry_sym, entry_dim = found
+        if entry_sym not in op_spec.iteration_space:
+            continue  # an injected dim, with no supplied count to compare
+        trip = sdsc_iteration_space[entry_dim]
+        slices = work_slices.get(entry_dim, 1)
+        if slices > 1:
+            eps = op_spec.args[idx].device_dtype.elems_per_stick()
+            if trip % (eps * slices):
+                raise ValueError(
+                    f"index-entry dim {entry_dim} is split {slices} ways over "
+                    f"{trip} entries, which is not a whole number of "
+                    f"{eps}-entry index sticks per core"
+                )
+        else:
+            supplied = _resolve_sdsc_size(
+                op_spec.iteration_space[entry_sym][0], op_spec.symbolic_dim_bounds
+            )
+            if trip != supplied:
+                raise ValueError(
+                    f"would read {trip} index entries from "
+                    f"{op_spec.args[idx].name!r} but {supplied} were supplied; "
+                    "the surplus comes from slots never written"
+                )
 
     # For restickify, update backGaps based on the padded iteration space,
     # since non-stick dimensions may now have it_dim_size > dev_dim_size.
