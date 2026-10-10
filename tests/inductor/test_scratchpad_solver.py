@@ -2259,6 +2259,64 @@ class SolveStatsTest(TestCase):
         self.assertFalse(solver.last_solve_stats["objective_used"])
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class UniquenessCheckTest(TestCase):
+    """The tie probe that follows a priced solve: a second plan at the optimum's
+    cost is reported with a warning, and the probe never replaces the plan.
+    """
+
+    _LOGGER = "torch_spyre._inductor.scratchpad.ilp_solver_ortools"
+
+    def setUp(self):
+        # The probe is off by default (SPYRE_ENABLE_UNIQUENESS_CHECK).
+        self.enterContext(config.patch({"enable_uniqueness_check": True}))
+
+    @staticmethod
+    def _solver(size=1 << 20):
+        return CpSatLayoutSolver(
+            [
+                CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+                CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+            ],
+            size,
+        )
+
+    @staticmethod
+    def _spill_cost(buffers):
+        return sum(4000 * (1 - b.sym_is_lx) for b in buffers)
+
+    def test_an_unpriced_residency_is_reported_as_a_tie(self):
+        """Only ``b0`` is priced, so ``b1`` resident or spilled costs the same."""
+        solver = self._solver()
+        with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+            solver.plan_layout_and_core_divisions(self._spill_cost(solver.buffers[:1]))
+        self.assertTrue(
+            any("Non-unique optimal solution" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_fully_priced_plan_is_not_reported(self):
+        """Every other plan spills a priced buffer, so the runner-up is dearer.
+
+        The probe solves for that runner-up, and a plan extracted from
+        it would spill a buffer here despite the probe returning OPTIMAL."""
+        solver = self._solver()
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is not None for b in plan))
+
+    def test_a_plan_with_no_alternative_is_not_reported(self):
+        """Neither buffer fits, force the probe the report INFEASIBLE."""
+        solver = self._solver(size=64)
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is None for b in plan))
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.

@@ -374,4 +374,10 @@ _cpsat_warn_on_cost_expr: bool = True
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
+# Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
+# if an optimal solution is fully priced.
+enable_uniqueness_check: bool = (
+    os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
+)
+
 install_config_module(sys.modules[__name__])
