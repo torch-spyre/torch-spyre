@@ -38,6 +38,7 @@
 #include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
@@ -172,7 +173,7 @@ void SpyreStream::copyProgramAsync(
     void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, /*cpu_storage_bytes=*/0, device_address, nullptr,
+  copyAsyncImpl(prog_cpu_ptr, /*host_capacity=*/0, device_address, nullptr,
                 /*host2device=*/true);
 }
 
@@ -191,9 +192,10 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   const at::Tensor* cpu_tensor = host2device ? &src : &dst;
 
   if (host2device || device2host) {
-    // Host-to-device or device-to-host copy
+    // DCI offsets are relative to storage, so pass the storage base and its
+    // complete accessible extent rather than the tensor's logical view.
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
-    const size_t cpu_storage_bytes = cpu_tensor->storage().nbytes();
+    const size_t host_capacity = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
@@ -201,8 +203,12 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
-                  get_composite_address(*dev_tensor), &dci, host2device);
+    std::shared_ptr<void> host_lifetime;
+    if (device2host) {
+      host_lifetime = std::make_shared<at::Tensor>(*cpu_tensor);
+    }
+    copyAsyncImpl(cpu_ptr, host_capacity, get_composite_address(*dev_tensor),
+                  &dci, host2device, std::move(host_lifetime));
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -226,10 +232,10 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
+void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                                 const flex::CompositeAddress* device_address,
-                                const DataConversionInfo* dci,
-                                bool host2device) const {
+                                const DataConversionInfo* dci, bool host2device,
+                                std::shared_ptr<void> host_lifetime) const {
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
@@ -238,20 +244,47 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
                               host2device, device_address, std::move(dci_ptr));
-    launchH2D(params);
+    try {
+      launchH2D(params);
+    }
+    catch (...) {
+      flex::destroyDmaParams(params);
+      throw;
+    }
     flex::destroyDmaParams(params);
   } else {
-    // Pass the true host buffer capacity so flex can give ConvertData the
-    // correct out_capacity_bytes for dtype-upscaling D2H transfers (e.g.
-    // bf16→fp32), where the host buffer is larger than the device staging
-    // buffer.
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr),
-                              /*iova=*/nullptr, /*use_compute_pipeline=*/false,
-                              /*pipeline_barrier=*/false, /*skip_hazard=*/false,
-                              /*host_capacity_bytes=*/cpu_storage_bytes);
-    launchD2H(params);
+    auto* allocator =
+        static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+    const auto pinned_allocation = allocator->retain(cpu_ptr);
+    flex::DmaParams* params = nullptr;
+    if (pinned_allocation) {
+      TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
+                  "D2H host storage exceeds pinned allocation capacity: ",
+                  host_capacity, " vs ", pinned_allocation.capacity, " bytes");
+      host_lifetime = std::static_pointer_cast<void>(pinned_allocation.owner);
+      params = flex::createDmaParamsWithPinnedBuffer(
+          pinned_allocation.buffer, pinned_allocation.offset, host_capacity,
+          device_address->total_size(), host2device, device_address,
+          std::move(dci_ptr),
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else {
+      params = flex::createDmaParamsWithHostCapacity(
+          cpu_ptr, device_address->total_size(), host2device, device_address,
+          host_capacity, std::move(dci_ptr),
+          /*iova=*/nullptr,
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    }
+    try {
+      launchD2H(params);
+    }
+    catch (...) {
+      flex::destroyDmaParams(params);
+      throw;
+    }
     flex::destroyDmaParams(params);
   }
 }
