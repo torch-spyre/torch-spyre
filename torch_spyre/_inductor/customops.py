@@ -1336,6 +1336,76 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+@torch.library.custom_op(
+    "spyre::compute_grouped_mm_routing_tables",
+    mutates_args=(),
+)
+def compute_grouped_mm_routing_tables(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute index tables on CPU for the on-device pack/BMM/unpack grouped_mm path.
+
+    capacity is passed in by the decomposition (computed from static input shapes),
+    so the real kernel and register_fake always agree on output shapes without any
+    data-dependent computation here.
+
+    Returns:
+      src_indices: [num_experts * capacity], int32 — maps each slot in padded_a
+                   [num_experts, capacity, K] to a row in mat_a, or to total_tokens
+                   (the appended zero-row) for padding slots.
+      dst_indices: [total_tokens], int32 — maps each output token to its position
+                   in flat padded_out [num_experts * capacity, N].
+    """
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    offs_list = offs_cpu.tolist()
+
+    src_indices = torch.full((num_experts * capacity,), total_tokens, dtype=torch.int32)
+    dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
+
+    start = 0
+    for e in range(num_experts):
+        end = offs_list[e]
+        count = end - start
+        if count > capacity:
+            # TODO: support overflow via multiple tiles per expert so that
+            # arbitrarily skewed distributions work without raising here.
+            raise RuntimeError(
+                f"compute_grouped_mm_routing_tables: expert {e} has {count} tokens "
+                f"but capacity={capacity}.  "
+                f"(total_tokens={total_tokens}, num_experts={num_experts})"
+            )
+        if count > 0:
+            slot_start = e * capacity
+            src_indices[slot_start : slot_start + count] = torch.arange(
+                start, start + count, dtype=torch.int32
+            )
+            dst_indices[start : start + count] = torch.arange(
+                slot_start, slot_start + count, dtype=torch.int32
+            )
+        start = end
+
+    return (
+        src_indices.to(device=offs.device),
+        dst_indices.to(device=offs.device),
+    )
+
+
+@compute_grouped_mm_routing_tables.register_fake
+def _(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(num_experts * capacity, dtype=torch.int32, device=offs.device),
+        torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
+    )
+
+
 # LX-safe means: this op's eager body generates no intermediate buffer that
 # could get pinned to LX (today, that requires a nested torch.compile; plain
 # CPU work or a body that never touches a spyre tensor has nothing to plan).
@@ -1347,6 +1417,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends

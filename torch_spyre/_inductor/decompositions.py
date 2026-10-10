@@ -168,6 +168,8 @@ _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT = 1024
 # the allocator remains the authority on whether the value is actually kept.
 _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
 
+_GROUPED_MM_BLOCK_SIZE = 64
+
 
 @dataclasses.dataclass(frozen=True)
 class _SDPATilingConfig:
@@ -3678,6 +3680,131 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+@register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
+def spyre_grouped_mm(
+    self: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decomposition of aten._grouped_mm covering all 4 upstream shape variants:
+
+    1. 2D x 3D with offs (mat_a [T, K] x mat_b [E, K, N]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, capacity, K] @ [E, K, N]
+       -> On-device Unpack (index_select) -> out [T, N].
+    2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
+       Direct 3D BMM -> out [E, M, N].
+    3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, M, K] @ [E, K, capacity]
+       -> On-device Unpack (index_select) -> out [M, T].
+    4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
+       On-device Pack along reduction dim K -> Direct 3D BMM [E, M, capacity] @ [E, capacity, N]
+       -> out [E, M, N].
+    """
+    a_is_2d = self.dim() == 2
+    b_is_2d = mat2.dim() == 2
+    mat2_c = mat2.contiguous()
+
+    if a_is_2d and not b_is_2d:
+        assert offs is not None, "2D x 3D grouped_mm requires offs"
+        total_tokens: int = self.shape[0]
+        K: int = self.shape[1]
+        num_experts: int = mat2.shape[0]
+        N: int = mat2.shape[-1]
+
+        # capacity = 2 × ceil_to_64(T/E), clamped to [64, T].
+        # Raises at runtime if any segment exceeds this; see compute_grouped_mm_routing_tables.
+        tokens_per_expert = (total_tokens + num_experts - 1) // num_experts
+        capacity = max(
+            64, min(total_tokens, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2))
+        )
+
+        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, total_tokens, num_experts, capacity
+        )
+
+        zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
+        self_with_zero = torch.cat([self, zero_row], dim=0)
+        padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+
+        padded_out = torch.bmm(padded_a, mat2_c)
+        flat_out = padded_out.reshape(num_experts * capacity, N)
+        out = torch.index_select(flat_out, 0, dst_indices)
+
+    elif not a_is_2d and not b_is_2d:
+        out = torch.bmm(self, mat2_c)
+
+    elif not a_is_2d and b_is_2d:
+        assert offs is not None, "3D x 2D grouped_mm requires offs"
+        num_experts = self.shape[0]
+        M = self.shape[1]
+        K = self.shape[2]
+        T = mat2.shape[1]
+
+        tokens_per_expert = (T + num_experts - 1) // num_experts
+        capacity = max(64, min(T, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2)))
+
+        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, num_experts, capacity
+        )
+
+        b_2d_T = mat2.transpose(0, 1).contiguous()
+        zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([b_2d_T, zero_row], dim=0)
+        padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()
+
+        padded_out = torch.bmm(self, padded_b)
+        flat_padded_out_T = (
+            padded_out.transpose(1, 2).reshape(num_experts * capacity, M).contiguous()
+        )
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)
+        out = out_T.transpose(0, 1).contiguous()
+
+    elif a_is_2d and b_is_2d:
+        assert offs is not None, "2D x 2D grouped_mm requires offs"
+        num_experts = offs.shape[0]
+        M = self.shape[0]
+        K_total = self.shape[1]
+        N = mat2.shape[1]
+
+        tokens_per_expert = (K_total + num_experts - 1) // num_experts
+        capacity = max(
+            64, min(K_total, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2))
+        )
+
+        src_indices, _ = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, K_total, num_experts, capacity
+        )
+
+        a_T = self.transpose(0, 1).contiguous()
+        zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
+        a_with_zero = torch.cat([a_T, zero_row_a], dim=0)
+        padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, M
+        )
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()
+
+        zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
+        padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, N
+        )
+
+        out = torch.bmm(padded_a, padded_b)
+
+    if bias is not None:
+        out = out + bias
+    if out_dtype is not None:
+        out = out.to(out_dtype)
+    return out
 
 
 @register_spyre_decompositions([torch.ops.aten.triu.default])
