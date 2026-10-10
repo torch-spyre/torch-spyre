@@ -790,10 +790,13 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
-        # DCI doesn't support either direction for these conversions.
+        # DCI doesn't support either direction for these conversions. int64 is
+        # IEEE_INT32 on device, so it shares int32's gap.
         skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
+            (torch.float32, torch.int64),
+            (torch.int64, torch.float32),
         }
 
         # Test supported conversions

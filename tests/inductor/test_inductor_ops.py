@@ -21,8 +21,13 @@ import sys
 import warnings
 import pytest
 import unittest
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
+from torch import fx
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
+from torch._inductor.virtualized import V
 
 
 from torch_spyre.ops.fallbacks import FallbackWarning
@@ -43,6 +48,11 @@ from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.split_multi_ops import (
+    _index_syms,
+    _validate_split_supported,
+)
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -3845,8 +3855,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["eval_mode"],
         },
-        # TODO: TorchInductor compilation failure in the Spyre lowering pass —
-        # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
+        # TODO: group_norm fails layout propagation with a stick incompatibility
+        # (issue #3287).
         ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
             "param_sets": {
                 "8_groups": (
@@ -6637,6 +6647,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # int64 prod over the stick dim decomposes to select+mul, and a
+            # stick-dim select reads one element per stick, a layout only a
+            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -6742,6 +6761,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "param_sets": {
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
+        # int64 arithmetic over rows of one tensor. The rows hold distinct values,
+        # so combining a row with the wrong one gives a wrong answer.
+        ("test_split_multi_ops_view_loads", "test_split_multi_ops_view_loads_cpu"): {
+            "ops_dict": {
+                "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
+                "mul_3_rows": lambda x: x.select(0, 0)
+                * x.select(0, 1)
+                * x.select(0, 2),
+                "add_3_rows": lambda x: x.select(0, 0)
+                + x.select(0, 1)
+                + x.select(0, 2),
+            },
+            "param_sets": {
+                "3x32": (
+                    torch.tensor([[2] * 32, [3] * 32, [5] * 32], dtype=torch.int64),
+                ),
             },
         },
         # A view that splits the stick dim into (heads, D) and then slices or
@@ -8669,6 +8706,84 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
+
+    def test_split_multi_ops_view_loads_cpu(self, op, x):
+        # Small integers convert to fp32 exactly, so any difference is a wrong row.
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
+
+    def test_split_multi_ops_view_loads_guard(self):
+        """split_multi_ops refuses an intermediate only if it combines view loads."""
+
+        def load(vid, name, index):
+            return ("load", vid, (), {"_name": name, "_index": index})
+
+        def validate(sizes, trace):
+            """Run the guard on a hand-built trace over one output dim of 32."""
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                for name, size in sizes.items():
+                    V.graph.name_to_buffer[name] = InputBuffer(
+                        name=name,
+                        layout=FixedLayout(
+                            torch.device("cpu"),
+                            torch.float32,
+                            size,
+                            [32, 1][-len(size) :],
+                        ),
+                    )
+                pointwise = Pointwise.create(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    inner_fn=lambda index: None,
+                    ranges=[32],
+                ).data.data
+                op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
+                intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
+                _validate_split_supported(op, trace, intermediate_ops)
+
+        (i0,) = _index_syms(1)
+        cases = {
+            # The split rebuilds the op over whole buffers, which would pair each
+            # element with itself.
+            "two_rows_of_one_buffer": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0),
+                    load(1, "arg", i0 + 32),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                True,
+            ),
+            # A single tensor operand is reloaded at its own index on replay.
+            "one_view_load": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0 + 32),
+                    ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
+                    ("add", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+            # Two buffers read at their own positions combine correctly.
+            "whole_buffers": (
+                {"a": [32], "b": [32]},
+                [
+                    load(0, "a", i0),
+                    load(1, "b", i0),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+        }
+        for case, (sizes, trace, refused) in cases.items():
+            with self.subTest(case):
+                if refused:
+                    with self.assertRaises(Unsupported):
+                        validate(sizes, trace)
+                else:
+                    validate(sizes, trace)
 
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.
