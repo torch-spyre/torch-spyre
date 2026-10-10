@@ -17,6 +17,7 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <cstring>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
@@ -281,6 +282,41 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
   return "Unknown CBID " + std::to_string(cbid);
 }
 
+
+template <size_t N>
+inline std::string fixedCharField(const char (&field)[N]) {
+  return std::string(field, strnlen(field, N));
+}
+
+// Collective-communication metadata, when the producer set any. Emitted as
+// trace args only, so activity names and grouping are unaffected. The first
+// byte is checked before building a string because most records carry none.
+//
+// Producer contract (libaiupti AIUpti_ActivityCompute/_ActivityMemcpy): the
+// names are fixed char[AIUPTI_COLL_NAME_SIZE] arrays, empty when not set, and
+// coll_bytes is 0 both for a zero-byte transfer and when unknown. flex fills
+// coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
+// all required, so a non-empty coll_algo means coll_bytes was really parsed.
+// On collective records coll_bytes is therefore the number when known
+// (including a real 0) and "" when the label carried no size.
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCollMetadata(trace_activity_type& trace_activity,
+                            const aiupti_activity_type* activity) {
+  if (activity->coll_group[0] != '\0') {
+    trace_activity->addMetadataQuoted("coll_group",
+                                      fixedCharField(activity->coll_group));
+  }
+  if (activity->coll_algo[0] != '\0') {
+    trace_activity->addMetadataQuoted("coll_algo",
+                                      fixedCharField(activity->coll_algo));
+  }
+  if (activity->coll_bytes != 0 || activity->coll_algo[0] != '\0') {
+    trace_activity->addMetadata("coll_bytes", activity->coll_bytes);
+  } else if (activity->coll_group[0] != '\0') {
+    trace_activity->addMetadataQuoted("coll_bytes", "");
+  }
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -374,6 +410,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  addCollMetadata(kernel_activity, activity);
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
@@ -506,6 +543,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   if (hasCyclesTs(activity)) {
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
+  addCollMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,

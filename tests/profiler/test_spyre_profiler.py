@@ -605,6 +605,57 @@ def test_kineto_memcpy_and_memset_events_captured():
         assert "cycles_ts" not in e.get("args", {}), "memset never carries cycles_ts"
 
 
+COLL_ARG_KEYS = ("coll_group", "coll_algo", "coll_bytes")
+
+
+@pytest.mark.requires_spyre_profiler
+def test_non_collective_activities_have_no_coll_args():
+    """
+    Kernel and memcpy events outside a collective carry no coll_* args.
+    """
+    torch._dynamo.reset()
+    model = _ProfilerMLP().half().to(DEVICE_NAME).eval()
+    compiled_input = torch.randn(2, 128, dtype=torch.float16, device=DEVICE_NAME)
+    compiled = torch.compile(model, fullgraph=True)
+    with torch.no_grad():
+        compiled(compiled_input)
+        torch.spyre.synchronize()
+
+    cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        device_tensor = cpu_src.to(DEVICE_NAME)  # H2D memcpy
+        with torch.no_grad():
+            compiled_out = compiled(compiled_input)
+        _ = device_tensor.cpu()  # D2H memcpy
+        _ = compiled_out.cpu()
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    activity_events = [
+        e
+        for e in trace["traceEvents"]
+        if e.get("ph") == "X" and e.get("cat") in {"kernel", "gpu_memcpy"}
+    ]
+    assert any(e["cat"] == "kernel" for e in activity_events), (
+        "Expected at least one compiled kernel event in the AIUPTI-backed trace"
+    )
+    assert any(e["cat"] == "gpu_memcpy" for e in activity_events), (
+        "Expected at least one memcpy event in the AIUPTI-backed trace"
+    )
+    for e in activity_events:
+        leaked = [key for key in COLL_ARG_KEYS if key in e.get("args", {})]
+        assert not leaked, (
+            f"non-collective {e['cat']} event {e.get('name')!r} carries {leaked}"
+        )
+
+
 @pytest.mark.requires_spyre_profiler
 def test_trace_analyzer_device_overlap(tmp_path):
     """Verify Spyre device overlaps using AIU Trace Analyzer."""
