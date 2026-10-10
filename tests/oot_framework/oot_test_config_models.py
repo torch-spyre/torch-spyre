@@ -60,8 +60,8 @@ def _resolve_device_dtype(device_dtype_str: str):
 class InputInitArgs(BaseModel):
     """Optional extra arguments for tensor initialization strategies."""
 
-    low: int = 0  # randint: lower bound
-    high: Optional[int] = None  # randint: upper bound (required)
+    low: Union[int, float] = 0  # randint / uniform: lower bound
+    high: Optional[Union[int, float]] = None  # randint (required) / uniform: upper
     total: Optional[int] = None  # cumsum_offsets: total (required)
     fill_value: Optional[float] = None  # full: fill value (required)
     path: Optional[str] = None  # file: path to .pt / .npy / .safetensors
@@ -162,6 +162,16 @@ class InputTensorSpec(BaseModel):
             raise ValueError(f"eye requires a square 2-D shape, got {self.shape}")
         if self.init == "xavier" and len(self.shape) < 2:
             raise ValueError(f"xavier requires 2-D or larger shape, got {self.shape}")
+        if self.init == "uniform":
+            if not self.resolved_dtype().is_floating_point:
+                raise ValueError(
+                    f"uniform requires a floating-point dtype, got {self.dtype!r}"
+                )
+            low, high = self._uniform_bounds()
+            if not low < high:
+                raise ValueError(
+                    f"uniform requires low < high, got low={low} high={high}"
+                )
         if self.stride is not None and len(self.stride) != len(self.shape):
             raise ValueError(
                 f"stride length {len(self.stride)} must match shape length {len(self.shape)}"
@@ -170,6 +180,54 @@ class InputTensorSpec(BaseModel):
 
     def resolved_dtype(self) -> torch.dtype:
         return _resolve_dtype_str(self.dtype)
+
+    def _uniform_bounds(self) -> tuple[float, float]:
+        """[low, high) for init: uniform; zero-mean [-1, 1) unless overridden."""
+        ia = self.init_args
+        low = float(ia.low) if "low" in ia.model_fields_set else -1.0
+        high = float(ia.high) if ia.high is not None else 1.0
+        return low, high
+
+    def _build_uniform(
+        self, *, seed: Optional[int], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Build an init: uniform tensor.
+
+        Values are drawn from U[low, high) in float32 and rounded once to
+        `dtype`, so every floating dtype (float8 included) gets the same
+        distribution from the same seed. Unlike `rand` (U[0, 1)), the default
+        range is signed and zero-mean: with all-positive inputs a reduction
+        such as a matmul sums to nearly the same value under any permutation
+        of the reduced elements, which hides element-order and sign bugs.
+        Values are clamped to the dtype's finite range, as float8_e4m3fn has
+        no inf and an out-of-range cast would produce NaN.
+        """
+        low, high = self._uniform_bounds()
+        shape = list(self.shape)
+        strided = self.stride is not None or self.storage_offset != 0
+        if strided:
+            stride = (
+                self.stride
+                if self.stride is not None
+                else list(torch.empty(shape).stride())
+            )
+            offset = self.storage_offset
+            numel = offset + (
+                sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
+            )
+        else:
+            numel = math.prod(shape)
+
+        with torch.random.fork_rng(devices=[]):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+            flat = torch.empty(numel, dtype=torch.float32).uniform_(low, high)
+        finfo = torch.finfo(dtype)
+        flat = flat.clamp(finfo.min, finfo.max).to(dtype)
+
+        if strided:
+            return torch.as_strided(flat, shape, stride, offset)
+        return flat.view(shape)
 
     def _effective_dtype(self, dtype_override: Optional[torch.dtype]) -> torch.dtype:
         """Resolve the dtype to build this tensor with.
@@ -302,6 +360,8 @@ class InputTensorSpec(BaseModel):
         # Special cases that don't use make_tensor
         if init == "file":
             return self._load_from_file()
+        elif init == "uniform":
+            return self._build_uniform(seed=seed, dtype=dtype)
         elif init == "arange":
             return torch.arange(shape[0], dtype=dtype)
         elif init == "eye":
@@ -396,6 +456,9 @@ class InputTensorSpec(BaseModel):
         dtype = self._effective_dtype(dtype)
         init = self.init
         ia = self.init_args
+
+        if init == "uniform":
+            return self._build_uniform(seed=seed, dtype=dtype)
 
         with torch.random.fork_rng(devices=[]):
             if seed is not None:
@@ -1374,7 +1437,9 @@ class OpsNamedItem(BaseModel):
             op_name=self.name,
             test_device=test_device,
         )
-        resolved_kw = self.sample_inputs_func.resolved_kwargs(test_device=test_device)
+        resolved_kw = self.sample_inputs_func.resolved_kwargs(
+            test_device=test_device, seed=seed
+        )
         inp = cpu_args[0] if cpu_args else None
         rest = tuple(cpu_args[1:]) if len(cpu_args) > 1 else ()
         return SampleInput(inp, args=rest, kwargs=resolved_kw)

@@ -51,6 +51,7 @@ from oot_framework.oot_test_utilities import (
     _RUNTIME_TAGS,
 )
 from model_ops_capability import capability_properties
+from op_numerics import to_spyre_with_arrangement
 from op_registry import OP_REGISTRY, OpAdapter
 import shared_config
 from torch_spyre.ops.fallbacks import FallbackWarning
@@ -253,6 +254,14 @@ def _to_device(x: Any, device: torch.device) -> Any:
     if isinstance(x, (tuple, list)):
         return type(x)(_to_device(y, device) for y in x)
     return x
+
+
+def _contains_tensor(x: Any) -> bool:
+    if torch.is_tensor(x):
+        return True
+    if isinstance(x, (tuple, list)):
+        return any(_contains_tensor(item) for item in x)
+    return False
 
 
 def _confirm_device(x: Any, expected: torch.device) -> bool:
@@ -563,7 +572,14 @@ class TestSpyreModelOps(TestCase):
 
             return x
 
-        # Build test_sample with per-tensor layout awareness
+        # Build test_sample with per-tensor layout awareness. An op that needs a
+        # specific element arrangement (e.g. QFP8WT for the _scaled_mm weight)
+        # declares it on its adapter, as the YAML is traced from the model and
+        # does not carry it. Likewise an op whose adapter rebuilds an input on
+        # the device (e.g. re-quantizing the _scaled_mm activation) declares the
+        # host dtype that input must be cast to first.
+        arrangements = adapter.arg_arrangements or ()
+        host_dtypes = adapter.arg_host_dtypes or ()
         test_args = []
         for i, (cpu_arg, spec_arg) in enumerate(
             zip(
@@ -571,7 +587,22 @@ class TestSpyreModelOps(TestCase):
                 ops_item.sample_inputs_func.args,
             )
         ):
-            test_args.append(_to_target_device(cpu_arg, spec_arg))
+            arrangement = arrangements[i] if i < len(arrangements) else None
+            host_dtype = host_dtypes[i] if i < len(host_dtypes) else None
+            if host_dtype is not None and torch.is_tensor(cpu_arg):
+                cpu_arg = cpu_arg.to(host_dtype)
+            if arrangement is not None and torch.is_tensor(cpu_arg):
+                test_args.append(
+                    to_spyre_with_arrangement(cpu_arg, arrangement, test_device)
+                )
+            else:
+                test_args.append(_to_target_device(cpu_arg, spec_arg))
+
+        # Tensor kwargs are taken from cpu_sample so both runs see identical
+        # values; device_kwargs only contributes the device-resolved scalars.
+        def _test_kwarg(k: str, v: Any) -> Any:
+            cpu_v = cpu_sample.kwargs.get(k)
+            return _to_target_device(cpu_v if _contains_tensor(cpu_v) else v)
 
         # torch.to names its destination positionally.
         for idx, dev_value in device_arg_values.items():
@@ -586,14 +617,14 @@ class TestSpyreModelOps(TestCase):
                 # resolved_kwargs() raises on a tensor/device_layout spec. If that
                 # changes, this needs the same arg_spec-based layout lookup as
                 # _to_target_device uses for positional args above.
-                kwargs={k: _to_target_device(v) for k, v in device_kwargs.items()},
+                kwargs={k: _test_kwarg(k, v) for k, v in device_kwargs.items()},
             )
         else:
             moved = cpu_sample.transform(lambda x: _to_target_device(x))
             test_sample = SampleInput(
                 moved.input,
                 args=moved.args,
-                kwargs={k: _to_target_device(v) for k, v in device_kwargs.items()},
+                kwargs={k: _test_kwarg(k, v) for k, v in device_kwargs.items()},
             )
 
         # Adapter pre-hook (e.g. dropout sets training=False)
@@ -609,7 +640,10 @@ class TestSpyreModelOps(TestCase):
         try:
             with torch.no_grad(), warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", FallbackWarning)
-                ref_out = fn(cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs)
+                ref_fn = adapter.reference or fn
+                ref_out = ref_fn(
+                    cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs
+                )
                 test_out = _run_op(fn, test_sample, test_device, compile_backend)
                 if adapter.is_inplace:
                     ref_out = cpu_sample.input
@@ -624,16 +658,24 @@ class TestSpyreModelOps(TestCase):
                 f"Output must be on {expected_device}"
             )
 
-            _assert_close(
-                self,
-                _to_device(ref_out, torch.device("cpu")),
-                _to_device(test_out, torch.device("cpu")),
-                atol=atol,
-                rtol=rtol,
-                case_name=method_name,
-                description=description,
-                metadata_only=op_name in _UNINITIALIZED_OUTPUT_OPS,
-            )
+            if adapter.compare is not None:
+                adapter.compare(
+                    ref_out,
+                    _to_device(test_out, torch.device("cpu")),
+                    case_name=method_name,
+                    description=description,
+                )
+            else:
+                _assert_close(
+                    self,
+                    _to_device(ref_out, torch.device("cpu")),
+                    _to_device(test_out, torch.device("cpu")),
+                    atol=atol,
+                    rtol=rtol,
+                    case_name=method_name,
+                    description=description,
+                    metadata_only=op_name in _UNINITIALIZED_OUTPUT_OPS,
+                )
             ran = True
         finally:
             fallbacks = set()
