@@ -202,6 +202,42 @@ from .work_division import (
 from . import config
 
 
+class ResidencyGatedPrice(sympy.Function):
+    """``ResidencyGatedPrice(is_lx, price)``: ``(1 - is_lx) * price``, a
+    charge paid only while an arg stays in HBM, whose ``price`` is a function of
+    one op's core-division split symbols alone.
+
+    Written out as algebra, that product of a residency literal and a nested
+    Piecewise over the op's splits and core count (``_read_burst_excess_ns``)
+    lowered to a literal per branch condition plus a product variable per
+    branch: on a GPT-2 prefill graph about 10k of the solver's 19k variables,
+    with an LP relaxation weak enough that CP-SAT stopped FEASIBLE at its 30 s
+    limit where it had proven OPTIMAL in about 10 s without the term. As one
+    function node the term is opaque to the rewrite passes, and the CP-SAT
+    printer tabulates ``price`` over the op's candidate divisions and charges
+    each priced level through a single literal, exactly
+    ``division in level and not is_lx``
+    (``_SympyExprToCpSat._lower_gated_prices``): the same objective with a
+    tight relaxation. ``lambdify`` evaluates the node through :meth:`_imp_`, and
+    ``eval`` folds it once ``is_lx`` is 1 or both arguments are numeric.
+    """
+
+    is_real = True
+
+    @classmethod
+    def eval(cls, is_lx, price):
+        if is_lx.is_Number:
+            if is_lx == 1:
+                return sympy.S.Zero
+            if price.is_Number:
+                return (1 - is_lx) * price
+        return None
+
+    @staticmethod
+    def _imp_(is_lx, price):
+        return (1 - is_lx) * price
+
+
 @dataclasses.dataclass
 class ArgTraffic:
     """Traffic for one tensor argument of an op."""
@@ -278,6 +314,12 @@ class ArgTraffic:
     # Matmul inputs only: this read's proven footprint per invocation, used by
     # the loop-request law. None leaves the general burst estimate in charge.
     read_tile_elems: int | None = None
+    # A batched matmul operand's run inside ONE batch element, which the kernel
+    # loads one at a time (``dump_cost_model._read_run_bytes(per_batch=True)``):
+    # a cache-position-first value cache [S, H, D] is one run across all heads
+    # but D elements per head. None for a matmul with no batch dim, where the
+    # run is ``read_run_bytes``, or when not provable.
+    batch_run_bytes: object = None
 
     @property
     def is_graph_boundary(self) -> bool:
@@ -787,6 +829,47 @@ class CostParams:
     # 16-core projection on an older SDK ran about 15% faster than it predicts;
     # below 16 cores it is unmeasured. See ``_partitioned_operand_read_excess``.
     mm_partitioned_read_gbps_per_core: float = 150.0 / 32
+    # REUSED matmul operands (every element feeds several multiply-accumulates:
+    # a GEMM weight reused by its rows, a decode GQA value cache reused by the
+    # group's query rows), which _partitioned_operand_read_excess leaves at the
+    # shared peak. Each core streams its own slice, bytes * replication / cores,
+    # one DMA request per contiguous run (at most the burst cap), and at few
+    # cores that stream, not the bus, bounds the read:
+    #     t = slice / mm_stream_gbps_per_core + requests * ns_per_request
+    # where a request costs mm_stream_unicast_ns_per_request when the core
+    # reads its slice alone, and mm_stream_multicast_ns_per_request when one
+    # broadcast load serves every core that shares the slice (replication > 1,
+    # a split the operand does not index, e.g. a GEMM's M split sharing its
+    # weight). The run is the per-batch-element run for a batched matmul
+    # (ArgTraffic.batch_run_bytes). Fitted to profiler kernel time, 2 runs per
+    # cell, of x[M, K] @ w[K, N] for M in {8, 64, 512} x K = N in
+    # {768, 2048, 4096} and decode P@V bmms (8 KV heads x 2 or 8 queries,
+    # S 512 / 2048, cache-position-first value cache), each pinned to 10-20
+    # divisions (90 cells whose weight split is M-only or that are P@V):
+    # long runs stream at about 55 GB/s per core multicast and 65-80 GB/s
+    # unicast (granite-embedding-125m's 64 x 768 x 768 projection on an 8-way
+    # M split: 25.0 us measured, 25.5 us predicted, 12.3 us before); the cache
+    # layout's 256-byte head rows at 10 / 25 GB/s (Qwen3-0.6B decode P@V on a
+    # 2-way query split: 104.1 us measured, 103.7 us predicted). Charged in
+    # single-pass bundles only, after compute overlap, as the excess over what
+    # the read already pays (its shared-peak bytes, cohort penalty and
+    # short-burst excess). 0 disables.
+    mm_stream_gbps_per_core: float = 80.0
+    mm_stream_unicast_ns_per_request: float = 7.0
+    mm_stream_multicast_ns_per_request: float = 22.0
+    # Smallest operand, in bytes, the stream bound applies to. The fits read 1 MiB
+    # and larger operands; a decode GEMM's few-row activation (32 KiB at 8 x 2048)
+    # otherwise charged its requests (~0.7 us) and decided a near tie between
+    # an 8-row GEMM's 2 x 16 and 32 x 1 splits the wrong way (58.4 / 62.1 us).
+    mm_stream_min_bytes: int = 1 << 18
+    # Most multiply-accumulates per operand element for which a short run is
+    # priced as such; a more reused operand is priced as if read in full bursts.
+    # The 256-byte head rows of a cache-position-first K/V cache were measured
+    # slow at decode reuse (2 and 8 query rows: the 10 / 25 GB/s above), but
+    # charging them in prefill attention (reuse 64 in gpt2, 2048 in
+    # granite-4.1-8b) moved both to head/query splits that made the prefill
+    # 14% and 1.5% slower on device. Long-run GEMM weights are unaffected.
+    mm_stream_short_run_max_reuse: int = 8
     # DEFAULT-LAYOUT BMM slow compute rate (cat 4). A batched matmul whose BOTH rank-3
     # operands carry the COMPILER-DEFAULT [0,1,2] device tile order -- the batch dim B
     # sits just inside the stick (device pos -2) -- runs the systolic array at a much
@@ -954,6 +1037,20 @@ class CostParams:
     # the large 1-to-many-core gain, not the smaller measured 4-vs-16 ranking.
     # The shared bus remains capped at bw_peak_gbps; 0 disables this correction.
     store_gbps_per_core: float = 30.0
+    # Rate, in GB/s per core, at which a pointwise op's own HBM reads and writes
+    # run when its division leaves it on too few cores to reach bw_peak_gbps.
+    # Under co-optimization the per-core-count reduction factor (red_bw_cores_g)
+    # is not symbolic, so nothing else prices a pointwise op's core count: in a
+    # Granite GQA Lq 1024 scan an 8 MiB output pass picked 1 core or 32 at equal
+    # cost and measured 0.36-0.45 ms slower on 1 core; this rate charges its
+    # 12 MiB of traffic 0.34 ms. Same rate as store_gbps_per_core; 0 disables.
+    pointwise_gbps_per_core: float = 30.0
+    # Smallest arg, in bytes, the low-core pointwise rate applies to. Measured
+    # on that 12 MiB pass only; smaller args keep a division-invariant price.
+    # Charging every size let the ns-scale excess of a few-stick tensor decide
+    # its division: (68,) and (196,) dtype round trips then took a multi-core
+    # split of a partial stick and returned wrong values.
+    pointwise_core_min_bytes: int = 1 << 20
     # Rate of each REPEATED pass a loop makes over a fixed-address, non-resident
     # input of a non-matmul op (``loop_factor > 1``): an online-softmax scan's
     # output, max and sum carries when they are not LX-resident. Forced SDPA
@@ -1566,6 +1663,98 @@ def _owned_total(charges) -> float:
         else:
             total += value
     return total + sum(external.values())
+
+
+def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
+    """Extra time when too few cores stream a reused matmul operand.
+
+    The complement of ``_partitioned_operand_read_excess`` (``matmul_macs >
+    elems``). Each core reads ``slice = bytes * replication / cores`` of the
+    operand in one DMA request per contiguous run, capped at the burst
+    (``transport_dma_max_burst_words`` sticks)::
+
+        t = slice / mm_stream_gbps_per_core + slice / run * ns_per_request
+
+    A request costs ``mm_stream_multicast_ns_per_request`` when a split the
+    operand does not index (``replication > 1``) shares the slice among cores
+    through one broadcast load, else ``mm_stream_unicast_ns_per_request``. The
+    run of a batched matmul is one batch element's (``batch_run_bytes``); an
+    unproven run counts as a full burst, and so does the run of an operand
+    reused more than ``mm_stream_short_run_max_reuse`` times. Only the excess
+    over what the read already pays -- its bytes at the shared peak, the cohort
+    penalty (``_shared_operand_read_excess``) and its short-burst excess
+    (``_read_burst_arg_excess``) -- is added, after compute overlap, so
+    divisions whose slices are small cost nothing extra. A replicated operand
+    that is not a shared load keeps ``_replicated_operand_reads``. Single-pass
+    bundles only (``_is_single_pass``), and operands of at least
+    ``mm_stream_min_bytes``. With symbolic splits each read is one
+    :class:`ResidencyGatedPrice` over the op's splits.
+    """
+    gbps = p.mm_stream_gbps_per_core
+    unicast = p.mm_stream_unicast_ns_per_request
+    multicast = p.mm_stream_multicast_ns_per_request
+    burst = p.transport_dma_word_bytes * p.transport_dma_max_burst_words
+    if gbps <= 0 or burst <= 0 or not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    for op in ops:
+        if not op.is_matmul:
+            continue
+        for arg in op.args:
+            if (
+                arg.role != "input"
+                or _is_sym(op.matmul_macs, arg.elems)
+                or not op.matmul_macs > arg.elems > 0
+            ):
+                continue
+            replication = sympy.sympify(arg.replication)
+            if not arg.broadcast and replication.is_number and replication != 1:
+                continue
+            nbytes = arg.elems * op.dtype_bytes
+            if nbytes < p.mm_stream_min_bytes:
+                continue
+            per_core = nbytes * replication / op.cores
+            run = arg.batch_run_bytes
+            if run is None:
+                run = arg.read_run_bytes
+            if op.matmul_macs > p.mm_stream_short_run_max_reuse * arg.elems:
+                # Short runs were measured slow at decode reuse only (see
+                # mm_stream_short_run_max_reuse); price full bursts above it.
+                run = None
+            # One request per run, and at least one per full burst.
+            requests = per_core / burst
+            if run is not None:
+                requests = sympy.Max(
+                    requests, sympy.piecewise_fold(per_core / sympy.sympify(run))
+                )
+
+            def stream(ns_per_request):
+                return per_core / gbps + requests * ns_per_request
+
+            # Past the cohort limit, _shared_operand_read_excess already charges
+            # part of the sharing; only the stream time beyond it is added.
+            cohort = (
+                nbytes * (_matmul_multicast_penalty(replication) - 1) / p.bw_peak_gbps
+            )
+            if replication.is_number:
+                if replication > 1:
+                    t = stream(multicast) - cohort
+                else:
+                    t = stream(unicast)
+            else:
+                shared = stream(multicast) - cohort if arg.broadcast else 0
+                t = sympy.Piecewise(
+                    (stream(unicast), sympy.Eq(replication, 1)), (shared, True)
+                )
+            bursts = _read_burst_arg_excess(op, arg, p)
+            price = t - nbytes / p.bw_peak_gbps - (0 if bursts is None else bursts)
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            price = sympy.sympify(price)
+            if price.free_symbols:
+                total += ResidencyGatedPrice(is_lx, sympy.Max(0, price))
+            else:
+                total += (1 - is_lx) * max(0.0, float(price))
+    return total
 
 
 def _loop_reread_bytes(ops: list) -> float:
@@ -2206,6 +2395,56 @@ def _dma_request_law_available(
     return True
 
 
+def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
+    """Extra HBM time of a pointwise op whose cores cannot saturate the bus.
+
+    The base model charges every non-resident byte at the shared peak whatever
+    the op's division. A pointwise op on ``cores`` cores moves its own reads and
+    writes at most at ``cores * pointwise_gbps_per_core``; only the excess over
+    the peak charge is added, after compute overlap, so divisions with enough
+    cores (5 or more at the defaults) are unaffected, and so are args smaller
+    than ``pointwise_core_min_bytes``. Matmuls, reductions, indirect stores
+    and plain copies keep their own core-count terms; a one-input arithmetic
+    op pays this as well as its request-law read. With
+    symbolic cores each arg is one :class:`ResidencyGatedPrice` over the op's
+    splits.
+    """
+    rate, peak = p.pointwise_gbps_per_core, p.bw_peak_gbps
+    if rate <= 0 or rate >= peak:
+        return 0.0
+    total = 0.0
+    for op in ops:
+        if op.is_matmul or op.is_reduction or op.is_indirect_store:
+            continue
+        # A copy keeps the transport term. A one-input arithmetic op is priced
+        # by the same request law (transport_compute_read), which charges short
+        # runs only, not the per-core byte rate this term adds.
+        if transport_dma_cost_available(op, p) and not op.transport_compute_read:
+            continue
+        cores = op.cores
+        symbolic = isinstance(cores, sympy.Basic) and bool(cores.free_symbols)
+        if symbolic:
+            per_byte = sympy.Max(0, 1 / (cores * rate) - sympy.Float(1 / peak))
+        else:
+            per_byte = max(0.0, 1.0 / (max(1, int(cores)) * rate) - 1.0 / peak)
+            if per_byte == 0:
+                continue
+        for arg in op.args:
+            if arg.role == "input" and arg.broadcast:
+                continue
+            nbytes = arg.elems * (arg.loop_factor or 1) * op.dtype_bytes
+            if _is_sym(nbytes) or nbytes < p.pointwise_core_min_bytes:
+                continue
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            if arg.role == "output" and arg.is_graph_boundary:
+                is_lx = 0  # the clone-out still writes it
+            if symbolic:
+                total += ResidencyGatedPrice(is_lx, nbytes * per_byte)
+            else:
+                total += (1 - is_lx) * nbytes * per_byte
+    return total
+
+
 def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
     """Whether transport geometry and calibration support this cost term.
 
@@ -2457,89 +2696,70 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
     An HBM->LX read is issued in bursts of up to ``transport_dma_max_burst_words``
     sticks, each ending at the core's contiguous run (``read_run_bytes``): a
     split on an inner axis or a stride gap shortens it. Burst 32 reaches the
-    shared byte rate; burst 1 issues one request per stick. Uses the transport
-    term's calibrated aggregate ``transport_dma_ns_per_request``, and charges
-    only the time by which requests exceed the byte charge. Transport ops keep
-    ``_transport_dma_excess_ns``; replicated per-core loads keep
+    shared byte rate; burst 1 issues one request per stick. Priced by the
+    transport request law (``_dma_request_excess_ns``) as a compute read, which
+    charges only the time by which requests exceed the byte charge. A core
+    count the table was not calibrated at (3, 6, 12, 24 cores of a 12-head
+    split) takes the rate of the largest calibrated count below it
+    (``_transport_rate_cores``): pricing those counts at zero made them the
+    cheapest short-burst reads, and gpt2's decode P@V took a 12-way head split
+    (one stick per run) that runs 40 us against 14 us on device. Transport ops
+    keep ``_transport_dma_excess_ns``; replicated per-core loads keep
     ``_replicated_operand_reads``. Proven looped-matmul geometry uses
     ``_loop_operand_request_excess`` instead, which composes requests with
     delivery and counts shared inputs once. An unproven run adds nothing.
     """
+    total = 0.0
+    for op in ops:
+        if transport_dma_cost_available(op, p):
+            continue
+        for arg in op.args:
+            excess = _read_burst_arg_excess(op, arg, p)
+            if excess is None:
+                continue
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            lf = getattr(arg, "loop_factor", 1) or 1
+            if isinstance(excess, sympy.Basic) and excess.free_symbols:
+                # One node per read, not the algebraic product: see
+                # ResidencyGatedPrice for what the expanded form cost CP-SAT.
+                total += lf * ResidencyGatedPrice(is_lx, excess)
+            else:
+                total += (1 - is_lx) * lf * excess
+    return total
+
+
+def _read_burst_arg_excess(op, arg, p: "CostParams"):
+    """``_read_burst_excess_ns`` of one input read of ``op`` while it is in
+    HBM, before residency and loop factor; None when the read is not priced."""
     rates = p.transport_dma_ns_per_request
     if (
         not rates
         or p.transport_dma_word_bytes <= 0
         or p.transport_dma_max_burst_words <= 0
     ):
-        return 0.0
-    total = 0.0
-    for op in ops:
-        if transport_dma_cost_available(op, p):
-            continue
-        for arg in op.args:
-            # The loop-request path already composes this read's request cost
-            # with its delivery estimate and de-duplicates shared inputs.
-            if operand_request_cost_available(op, arg, p):
-                continue
-            run = getattr(arg, "read_run_bytes", None)
-            if arg.role != "input" or run is None:
-                continue
-            replication = sympy.sympify(arg.replication)
-            if not arg.broadcast and replication.is_number and replication != 1:
-                continue
-            payload = arg.elems * op.dtype_bytes
-            if payload <= 0:
-                continue
-            requests = sympy.piecewise_fold(payload / sympy.sympify(run))
-            min_requests = math.ceil(
-                payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
-            )
-            max_requests = math.ceil(payload / p.transport_dma_word_bytes)
-            byte_time = payload / p.bw_peak_gbps
-
-            def at_most(value, limit):
-                coefficient, split = value.as_coeff_Mul()
-                if split.is_Symbol and coefficient > 0:
-                    return sympy.Le(split, sympy.floor(limit / coefficient))
-                return sympy.Le(value, limit)
-
-            def for_run(value):
-                branches = []
-                for cores, ns in rates.items():
-                    if ns <= 0:
-                        continue
-                    floor = max(0, min_requests * ns - byte_time)
-                    cap = max(floor, max_requests * ns - byte_time)
-                    if not isinstance(value, sympy.Basic) or not value.free_symbols:
-                        v = min(max(float(value), min_requests), max_requests)
-                        priced = max(floor, v * ns - byte_time)
-                    elif floor == cap:
-                        priced = floor
-                    else:
-                        threshold = math.floor((floor + byte_time) / ns)
-                        priced = sympy.Piecewise(
-                            (floor, at_most(value, threshold)),
-                            (value * ns - byte_time, at_most(value, max_requests)),
-                            (cap, True),
-                        )
-                    branches.append((priced, sympy.Eq(op.cores, cores)))
-                return sympy.Piecewise(*branches, (0, True))
-
-            if isinstance(requests, sympy.Piecewise):
-                excess = sympy.Piecewise(
-                    *((for_run(value), condition) for value, condition in requests.args)
-                )
-            else:
-                excess = for_run(requests)
-            if not arg.broadcast and replication != 1:
-                # The solver can choose an unreplicated read. Charge its bursts
-                # just as the concrete model does; only replicated per-core
-                # loads are already covered by _replicated_operand_reads.
-                excess = sympy.Piecewise((excess, sympy.Eq(replication, 1)), (0, True))
-            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
-            lf = getattr(arg, "loop_factor", 1) or 1
-            total += (1 - is_lx) * lf * excess
-    return total
+        return None
+    # The loop-request path already composes this read's request cost with its
+    # delivery estimate and de-duplicates shared inputs.
+    if operand_request_cost_available(op, arg, p):
+        return None
+    run = getattr(arg, "read_run_bytes", None)
+    if arg.role != "input" or run is None:
+        return None
+    replication = sympy.sympify(arg.replication)
+    if not arg.broadcast and replication.is_number and replication != 1:
+        return None
+    payload = arg.elems * op.dtype_bytes
+    if payload <= 0:
+        return None
+    excess = _dma_request_excess_ns(
+        payload, run, op.cores, True, p, byte_time=payload / p.bw_peak_gbps
+    )
+    if not arg.broadcast and replication != 1:
+        # The solver can choose an unreplicated read. Charge its bursts
+        # just as the concrete model does; only replicated per-core
+        # loads are already covered by _replicated_operand_reads.
+        excess = sympy.Piecewise((excess, sympy.Eq(replication, 1)), (0, True))
+    return excess
 
 
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
@@ -2770,6 +2990,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + transport_dma_ns
         + _loop_repeated_read_excess_ns(ops, p)
         + _read_burst_excess_ns(ops, p)
+        + _pointwise_core_excess_ns(ops, p)
+        + _reused_operand_stream_excess_ns(ops, p)
     )
     # Looped matmul operand reads: the request law's part beyond the loop-delivery
     # estimate, serialized like the transport term above (the same law).
@@ -3077,6 +3299,21 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             f"     loop-repeated reads: +{reread_extra / 1000:.2f} us "
             f"({p.loop_reread_gbps:g} GB/s per repeated pass; after compute overlap)"
+        )
+    reused_extra = _reused_operand_stream_excess_ns(ops, p)
+    if reused_extra:
+        lines.append(
+            f"     reused matmul operand streaming: +{float(reused_extra) / 1000:.2f} us "
+            f"({p.mm_stream_gbps_per_core:g} GB/s per core + "
+            f"{p.mm_stream_unicast_ns_per_request:g} / "
+            f"{p.mm_stream_multicast_ns_per_request:g} ns per run unicast / multicast;"
+            " after compute overlap)"
+        )
+    low_core_extra = _pointwise_core_excess_ns(ops, p)
+    if low_core_extra:
+        lines.append(
+            f"     low-core pointwise traffic: +{float(low_core_extra) / 1000:.2f} us "
+            f"({p.pointwise_gbps_per_core:g} GB/s per core; after compute overlap)"
         )
     restickify_extra = _transport_dma_excess_ns(ops, p)
     if restickify_extra:

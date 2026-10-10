@@ -27,7 +27,7 @@ test_suite_config:
             - LxPlanning.*::test_unfold_2d_dim_neg_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_2d_square_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_3d_dim0_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_unfold_3d_dim1_lx_planning_pointwise
+            - LxPlanning.*::test_unfold_3d_dim1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_3d_dim2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_4d_batch_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unfold_4d_cnn_lx_planning_(pointwise|reduction)

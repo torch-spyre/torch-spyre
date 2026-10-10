@@ -136,6 +136,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     _check_in_place_relationships,
 )
 from torch_spyre._inductor import config
+from torch_spyre._inductor.cost_model import ResidencyGatedPrice
 
 __all__ = ["CpSatLayoutSolver"]
 
@@ -645,15 +646,133 @@ class _SympyExprToCpSat(Printer):
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
+        # (buffer, residency symbol, price table) -> the symbol standing for
+        # that ResidencyGatedPrice's linear form, so equal reads share it.
+        self._gated_names: dict = {}
         super().__init__()
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
+        cost_expr = self._lower_gated_prices(cost_expr)
         cost_expr = self._rewrite(cost_expr)
         logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
         return self._print(cost_expr)
+
+    def _lower_gated_prices(self, cost_expr: sympy.Expr) -> sympy.Expr:
+        """Replace every :class:`ResidencyGatedPrice` node by a symbol bound to
+        its exact linear form over the division literals of the op that prices
+        it (:meth:`_gated_price_expr`). Runs before the rewrite passes, which never
+        see the price. A node whose price is not a table over one buffer's
+        candidate divisions, or whose residency is neither a constant nor a
+        solver literal, falls back to its algebraic form."""
+        nodes = cost_expr.atoms(ResidencyGatedPrice)
+        if not nodes:
+            return cost_expr
+        # Tabulate first, then create the literals in a fixed order: ``atoms``
+        # is a set, and its iteration order (string hashing) would otherwise
+        # reorder the model's variables from one process to the next.
+        tables = []
+        lowered = {}
+        for node in nodes:
+            is_lx, price = node.args
+            key = self._gated_key(is_lx, price)
+            if key is None:
+                lowered[node] = (1 - is_lx) * price
+            else:
+                tables.append((key, node))
+        for key, node in sorted(tables, key=lambda item: item[0][0]):
+            lowered[node] = self._gated_symbol(*key[1])
+        return cost_expr.xreplace(lowered)
+
+    def _division_table(self, price: sympy.Expr):
+        """``(wrapper, [price under each candidate division])`` when every
+        free symbol of ``price`` is a split of the same division-choosing
+        buffer, else None. Candidates sharing those splits share an evaluation."""
+        symbols = sorted(price.free_symbols, key=lambda s: s.name)
+        if not symbols or any(s.name not in self._buffer_map for s in symbols):
+            return None
+        owners = {id(self._buffer_map[s.name][0]) for s in symbols}
+        if len(owners) != 1:
+            return None
+        wrapper = self._buffer_map[symbols[0].name][0]
+        if not isinstance(wrapper, _CoreDivisionBufferWithCpVars):
+            return None
+        raws = [self._buffer_map[s.name][1] for s in symbols]
+        # lambdify, not xreplace: a burst price is a nested Piecewise of a
+        # few hundred nodes, and substituting it once per candidate took
+        # about as long as the rest of the conversion.
+        evaluate = sympy.lambdify(symbols, price, modules="math")
+        values: list[float] = []
+        memo: dict = {}
+        for point in zip(*raws):
+            value = memo.get(point)
+            if value is None:
+                try:
+                    value = float(evaluate(*map(int, point)))
+                except (TypeError, ValueError, ArithmeticError):
+                    return None
+                if not math.isfinite(value):
+                    return None
+                memo[point] = value
+            values.append(value)
+        return wrapper, values
+
+    def _gated_key(self, is_lx, price):
+        """``(sort key, (wrapper, residency literal, values, is_lx name))`` for
+        a tabulatable ``ResidencyGatedPrice``, else None."""
+        table = self._division_table(price)
+        if table is None:
+            return None
+        wrapper, values = table
+        if is_lx.is_Number and is_lx == 0:
+            resident, name = None, ""
+        elif is_lx.is_Symbol and is_lx.name in self._sym_map:
+            resident, name = self._sym_map[is_lx.name], is_lx.name
+        else:
+            return None
+        return (wrapper.name, name, tuple(values)), (wrapper, resident, values, name)
+
+    def _gated_symbol(self, wrapper, resident, values, name) -> sympy.Symbol:
+        """The symbol bound to one tabulated ``(1 - is_lx) * price``; equal
+        tables over the same buffer and residency share it."""
+        key = (wrapper.name, name, tuple(values))
+        symbol = self._gated_names.get(key)
+        if symbol is None:
+            symbol = f"_gated_price_{len(self._gated_names)}"
+            self._sym_map[symbol] = self._gated_price_expr(wrapper, resident, values)
+            self._gated_names[key] = symbol
+        return sympy.Symbol(symbol)
+
+    def _gated_price_expr(self, wrapper, resident, values):
+        """``(1 - resident) * values[division]`` as an exact linear expression.
+
+        The minimum of ``values`` is charged on ``1 - resident``; every higher
+        level through one literal reified as ``division in level and not
+        resident`` (or the level's division literals alone when the source is
+        never resident). The literals of a level sum to at most 1 since a
+        buffer takes exactly one division, so the expression equals the
+        product for every assignment, and its LP relaxation is that product's
+        convex hull rather than a chain of reified branch conditions."""
+        base = min(values)
+        levels: dict[float, list[int]] = {}
+        for index, value in enumerate(values):
+            if value > base:
+                levels.setdefault(value - base, []).append(index)
+        expr = base if resident is None else base * (1 - resident)
+        for extra, indices in levels.items():
+            chosen = sum(wrapper.division_is(i) for i in indices)
+            if resident is None:
+                expr += extra * chosen
+                continue
+            charged = self._model.new_bool_var(f"gated_{wrapper.name}_{self._count}")
+            self._count += 1
+            self._model.add(charged <= chosen)
+            self._model.add(charged + resident <= 1)
+            self._model.add(charged + resident >= chosen)
+            expr += extra * charged
+        return expr
 
     def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
         """The symbolic rewrites that bring ``cost_expr`` into the form the

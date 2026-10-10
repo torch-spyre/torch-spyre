@@ -38,8 +38,10 @@ import sympy
 
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
+    CostParams,
     OpFeatures,
     _loop_reread_bytes,
+    _pointwise_core_excess_ns,
     op_from_dict,
     predict_by_bundle,
     predict_ops,
@@ -189,14 +191,21 @@ class DiscriminationTest(TestCase):
 
     def test_only_matmul_and_reduction_buffers_separate(self):
         # cost_model reads ``cores`` only under ``is_matmul`` or ``is_reduction``,
-        # so a pointwise op's cost is division-invariant by construction.
-        # Asserting the split matches that expectation keeps the fixture honest
-        # about *why* it separates.
+        # and for a pointwise op only through the low-core traffic term
+        # (``_pointwise_core_excess_ns``, args of pointwise_core_min_bytes or
+        # more), so a pointwise op's cost without that term is division-invariant
+        # by construction. Asserting the split matches that expectation keeps the
+        # fixture honest about *why* it separates.
         for gname, bname, b in _entries():
             feats = [op_from_dict(f) for f in b["features"] if f is not None]
             if not feats:
                 continue
-            costs = {round(predict_ops([f]), 6) for f in feats}
+            costs = {
+                round(
+                    predict_ops([f]) - _pointwise_core_excess_ns([f], CostParams()), 6
+                )
+                for f in feats
+            }
             if len(costs) > 1:
                 self.assertTrue(
                     any(f.is_matmul or f.is_reduction for f in feats),

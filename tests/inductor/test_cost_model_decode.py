@@ -576,7 +576,7 @@ def test_operand_geometry_preserves_the_single_pass_read_estimate(monkeypatch, t
     )
     # The operand-specific proof can find a different run than the general one.
     monkeypatch.setattr(dcm, "_operand_read_geometry", lambda *_: (128, 4096))
-    monkeypatch.setattr(dcm, "_read_run_bytes", lambda *_: 256)
+    monkeypatch.setattr(dcm, "_read_run_bytes", lambda *_, **__: 256)
     read = _read(_features(monkeypatch, op, {d0: 64, d1: 64, d2: 64}), "arg0")
     expected = (128, 4096) if trips == 8 else (256, None)
     assert (read.read_run_bytes, read.read_tile_elems) == expected

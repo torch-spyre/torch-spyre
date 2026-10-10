@@ -755,13 +755,38 @@ def _operand_read_geometry(op, dep, work_slices, candidate_work_slices=None):
         return None, None
 
 
-def _read_run_bytes(op, read, work_slices=None):
+def _batch_symbols(op, rw, it_space) -> set:
+    """Iteration symbols of a batched matmul's batch dims: written, and read by
+    both operands. A plain matmul has none (M, N and K each miss one of the
+    three), and so does a 3d-2d projection, whose weight has no batch dim."""
+    reads = [dep for dep in rw.reads if _dep_index(dep) is not None]
+    if len(reads) != 2 or len(rw.writes) != 1:
+        return set()
+    write = next(iter(rw.writes))
+    indexed = [set(_dep_index(dep).free_symbols) for dep in reads]
+    return {
+        symbol
+        for symbol, size in it_space.items()
+        if symbol in write.index.free_symbols
+        and all(symbol in symbols for symbols in indexed)
+        and sympy.sympify(size).is_Integer
+        and int(size) > 1
+    }
+
+
+def _read_run_bytes(op, read, work_slices=None, per_batch=False):
     """Bytes in one core's contiguous device run of ``read``, else None.
 
     The burst a core's DMA can issue for this operand: the run ends at the
     innermost split axis or a physical stride gap. Same geometry as
     ``_transport_read_geometry``, for any single read of any op, so the burst
     pricing reaches matmul operands and pointwise inputs too.
+
+    ``per_batch`` measures the run inside one batch element of a batched
+    matmul (``_batch_symbols``), which the kernel loads one at a time: every
+    batch dim counts as split down to one element. A value cache stored
+    cache-position-first, ``[S, H, D]``, is one contiguous run across all
+    heads, but each head's ``[S, D]`` operand is ``S`` runs of ``D`` elements.
     """
     try:
         from torch._inductor.virtualized import V
@@ -774,6 +799,11 @@ def _read_run_bytes(op, read, work_slices=None):
         it_space = iteration_space_from_op(op)
         coords = device_coordinates(src, read, None, op=op)
         slices = _work_slices(op, write.index, read.index, it_space, work_slices)
+        if per_batch:
+            batch = _batch_symbols(op, rw, it_space)
+            if not batch:
+                return None
+            slices = {**slices, **{symbol: it_space[symbol] for symbol in batch}}
         run = _contiguous_device_run(
             coords, src.device_size, it_space, slices, stick_planes=True
         )
@@ -1538,6 +1568,11 @@ def extract_op_features(
                     else _read_run_bytes(op, dep, work_slices)
                 ),
                 read_tile_elems=operand_geometry[1],
+                batch_run_bytes=(
+                    _read_run_bytes(op, dep, work_slices, per_batch=True)
+                    if is_matmul
+                    else None
+                ),
             )
         )
 

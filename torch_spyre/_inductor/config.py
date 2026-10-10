@@ -335,10 +335,13 @@ allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") =
 # budget without an incumbent raises SolveError, and scratchpad_planning falls
 # back to greedy placement (correct, but co-optimization is lost for that
 # graph). Raise it if large graphs are falling back; 0 disables the limit.
-# The default matches the budget CpSatLayoutSolver hard-coded before this knob
-# existed, so exposing it does not change how long any solve is allowed to run.
+# The default was 30 s (the budget CpSatLayoutSolver hard-coded before this knob
+# existed). Some prefill graphs (OLMoE-1B-7B, gpt2) need about 30-35 s to prove
+# their optimum under the short-burst read pricing, and a FEASIBLE answer at the
+# limit can be a measurably slower plan on device, so 60 s leaves headroom.
+# Solves that finish sooner are unaffected.
 cpsat_time_limit_seconds: float = float(
-    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
