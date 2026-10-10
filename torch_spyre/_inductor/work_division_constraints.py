@@ -148,7 +148,7 @@ def collect_work_division_constraints(
         keep_by_index_pinned_search_space_vars,
         keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
-        multi_reduction_k_split_blocked,
+        plain_reduction_k_split_domains,
     ):
         result = constraint(ctx)
 
@@ -1021,37 +1021,25 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 )
 
 
-def multi_reduction_k_split_blocked(
+def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Block K-splits for plain scalar reductions with more than one reduction variable.
+    """Keep plain reductions on one core along every reduction axis.
 
-    The backend rejects plain reduction kernels where more than one reduction
-    variable is present, even if only one is split across cores ("More than one
-    reduction dim is split across cores: not currently supported").  Example:
-    ``flatten(0,1)`` on ``(2,3,4)`` followed by ``sum(dim=0)`` produces an
-    iteration space where both ``d0`` and ``d1`` are reduction variables
-    (neither appears in the output coords).  ``work_distribution_pass`` splits
-    one of them across cores (satisfying ``_one_reduction_split_at_most``), but
-    the backend still rejects it.
+    Even a single reduction variable cannot safely be split across cores in
+    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
+    encoder block outputs.
+    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
+    it does not establish a cross-core combine for arbitrary work divisions.
+    Keep this restriction until those divisions have a validated combine path.
 
-    Note: ``_one_reduction_split_at_most`` in ``WorkDivisionContext`` prevents
-    splitting *two* reduction vars simultaneously, but it still allows splitting
-    one.  This constraint is the load-bearing guard: when there are 2+
-    reduction vars, it blocks splitting *any* of them.
-
-    Single-dim plain reductions are left unconstrained because WSR's
-    ``_insert_combine_op`` already handles cross-core accumulation for them.
-
-    Structured ops (matmul, topk, pool, conv, depthwise conv) have dedicated
-    backend support for multi-dim iteration spaces; they are excluded via
-    ``_STRUCTURED_REDUCTION_TYPES``.
+    Structured reductions have their own backend combine or blocking rules.
+    Output axes remain available for parallelism, and reduction-range coarse
+    tiling is still handled separately by WSR.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
-        return ConstraintResult()
-    if len(ctx.reduction_vars) <= 1:
         return ConstraintResult()
     return ConstraintResult(
         allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
