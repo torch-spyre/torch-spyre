@@ -1977,7 +1977,8 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
         original = CoOptimizingAllocator._division_map
 
         def capture(allocator, graph, **kwargs):
-            divisions = original(allocator, graph, **kwargs)
+            division_map = original(allocator, graph, **kwargs)
+            divisions = division_map.divisions
             offset_writes = [
                 i
                 for i, op in enumerate(graph.operations)
@@ -1993,7 +1994,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
                         if _is_matmul_op(op)
                     )
                 )
-            return divisions
+            return division_map
 
         with (
             patch.object(CoOptimizingAllocator, "_division_map", capture),
