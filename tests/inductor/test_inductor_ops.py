@@ -1369,6 +1369,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # A pointwise op over y.expand_as(x), where y has a size-1 last dim, is its
+        # own FX node and so is realized at x's size. Its consumer pairs it with
+        # x, which needs no restickify.
+        ("test_expand_size1_pointwise", "test_expand_size1_pointwise_cpu"): {
+            "ops_dict": {
+                "abs": lambda x, y: x + y.expand_as(x).abs(),
+                "add_then_gt": lambda x, y: x > y.expand_as(x) + 1,
+                # Both operands of the inner add are expanded.
+                "add_two_expanded": lambda x, y: x
+                - (y.expand_as(x) + (y - 3).expand_as(x)),
+            },
+            # Small integers keep the op exact in float16; y is shifted so it differs
+            # from x.
+            "param_sets": {
+                f"{name}_{_dtype_name(dtype)}": (
+                    _cached_randint(x_shape, dtype),
+                    _cached_randint(y_shape, dtype) - 200,
+                )
+                for name, x_shape, y_shape in [
+                    ("3x5x128", (3, 5, 128), (3, 5, 1)),
+                    ("3x5x100_unaligned", (3, 5, 100), (3, 5, 1)),
+                    ("4d_mask", (1, 1, 8, 64), (1, 1, 8, 1)),
+                    # Controls: the size-1 last dim is not expanded.
+                    ("3x5x1_unexpanded", (3, 5, 1), (3, 5, 1)),
+                    ("100x1_unexpanded", (100, 1), (100, 1)),
+                    ("3x5x1_non_stick_dim_expanded", (3, 5, 1), (3, 1, 1)),
+                ]
+                for dtype in [torch.float16, torch.float32]
+            },
+        },
         ("test_sub_broadcast", "test_binary_op_cpu"): {
             "ops_dict": {"sub": torch.sub},
             "param_sets": {
@@ -7483,6 +7513,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return a @ b
 
         self.compare_with_cpu(fn, a, b)
+
+    def test_expand_size1_pointwise_cpu(self, op, x, y):
+        # A restickify here means the expanded operand kept its
+        # one-element-per-stick layout.
+        with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
+            self.compare_with_cpu(
+                op, x, y, atol=0.005, rtol=0.005, cpu_compile=False, run_eager=False
+            )
+        self.assertFalse(
+            any("op_spec: ReStickifyOpHBM," in message for message in logs.output),
+            "compiled with a restickify",
+        )
 
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
