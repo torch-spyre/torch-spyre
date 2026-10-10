@@ -23,7 +23,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
-import torch
 from torch._inductor.ir import (
     TensorBox,
     Buffer,
@@ -1297,18 +1296,9 @@ class ScratchpadAllocator:
         target = getattr(getattr(op, "origin_node", None), "target", None)
         if target is None:
             return []
-        reads = [dep.name for dep in op.get_read_writes().reads]
-        # ``tags`` is an OpOverload attribute; some origin targets (e.g. builtin
-        # functions behind int64 fallbacks) don't have it. Treat a tag-less
-        # target as not-pointwise rather than crashing. The joint-division path
-        # reaches this for ops the residency checks bar on the greedy path.
-        if torch.Tag.pointwise in getattr(target, "tags", ()):
-            # If the op is tagged as pointwise by pytorch upstream
-            # allow all inputs. Does not work for all ops
-            return reads
-        if hasattr(op, "data"):
-            return get_op_pointwise_inputs(op.data)
-        return []
+        # A pointwise ATen target can consume a transposed/broadcast view after
+        # lowering. Its tag does not prove element-for-element storage reuse.
+        return get_op_pointwise_inputs(op)
 
     def _restickify_barrier(
         self,
@@ -3349,17 +3339,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         gated per buffer (``_residency_by_buf``) and by the solver, so ineligible
         ops still participate as producers/consumers in the match.
 
-        Exception: ops data-connected to a sliced in-place mutation (a constant-
-        offset write, e.g. ``x[:, 32:96] = ...``) are pinned to their upstream
-        (fixed) division. Re-slicing any op fused into the offset write's SDSC
-        makes the deeptools scheduler reject it (``DtException: "There must be at
-        least one valid candidate"``), the root cause of the
-        ``slice_stick_mutation_*`` failures. Keeping the fixed division there
-        matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization when that division also satisfies hard
-        work-division constraints. Otherwise LX planning raises ``Unsupported``
-        rather than committing an illegal division. See
-        ``utils.ops_in_offset_mutation_component``.
+        Constant-offset writes, their storage aliases and their forward
+        dependency closure keep their committed division. This protects offset
+        address arithmetic even in HBM, where residency edges do not constrain
+        division choices. Upstream producers remain free to optimize. See
+        ``utils.ops_in_offset_mutation_component``. As with every fixed pin,
+        an illegal committed division raises ``Unsupported`` rather than
+        bypassing hard work-division constraints.
 
         Whatever the path, every candidate returned is within the ``sencores`` budget
         -- asserted here because nothing downstream re-checks it (issue #4387).
@@ -3409,7 +3395,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
             elif op.name in offset_mutation_ops:
-                reason = "offset mutation component"
+                reason = "offset mutation forward closure"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
             elif op.name in layout_group_reason:

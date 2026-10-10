@@ -328,17 +328,14 @@ layout_solver: Literal[
 # unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
 allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
 
-# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
-# lexicographic and re-solves the same model up to three times (residency, then
-# parallelism, then division balance), so this bounds each phase, not the pass.
-# It is a compile-time guard, not a correctness one: a solve that runs out of
-# budget without an incumbent raises SolveError, and scratchpad_planning falls
-# back to greedy placement (correct, but co-optimization is lost for that
-# graph). Raise it if large graphs are falling back; 0 disables the limit.
-# The default matches the budget CpSatLayoutSolver hard-coded before this knob
-# existed, so exposing it does not change how long any solve is allowed to run.
+# Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
+# objective or to each phase of the fallback lexicographic objective, not the
+# whole compilation. A timeout can return a feasible plan without proving
+# optimality; without an incumbent it raises SolveError and scratchpad_planning
+# falls back to greedy placement. Override for difficult graphs; 0 disables
+# the limit.
 cpsat_time_limit_seconds: float = float(
-    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch

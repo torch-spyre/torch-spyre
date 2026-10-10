@@ -15,20 +15,16 @@
 
 import math
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ExternKernel,
     Operation,
-    IRNode,
     Pointwise,
 )
-from torch._inductor.virtualized import V
-from torch._inductor.ops_handler import WrapperHandler
 from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
-import sympy
 
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -484,66 +480,52 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 def ops_in_offset_mutation_component(
     graph: GraphLowering,
 ) -> set[str]:
-    """Names of ops data-connected to a sliced in-place mutation that writes at
-    a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
+    """Pin the forward dependency closure of constant-offset mutation storage.
 
-    Such a mutation and everything fused with it land in one SDSC. The offset
-    write's codegen assumes the target buffer keeps the slicing the eager path
-    chose; if the co-optimizing allocator re-slices any op in that fused kernel
-    (a different core division), the deeptools scheduler can no longer place the
-    offset write and aborts the compile (``DtException: "There must be at least
-    one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``). This is the root
-    cause of the ``slice_stick_mutation_*`` co-optimizing-allocator failures --
-    the division change, *not* LX residency (the abort reproduces with pinning
-    fully disabled).
+    Re-slicing an offset write or its downstream users can make its address
+    arithmetic unschedulable or produce wrong results, including when all
+    involved buffers are in HBM. ``cd_parent_matches`` only constrains LX
+    residency, so adding mutation edges there cannot replace this guard.
 
-    The caller pins every op in this set to its upstream (fixed) division, so
-    the offset-write SDSC keeps the schedulable slicing the greedy /
-    placement-only path uses. Fusion boundaries are unknown at planning time, so
-    the SDSC is over-approximated by the undirected data-dependency component
-    containing the offset write: producer chain (the value written), the
-    mutation target it aliases, and the consumers of that target. Over-approxi-
-    mation only forgoes a division optimization (correct, never a new failure --
-    a fixed division is exactly what greedy uses).
+    Follow reads from buffer to consumer, and MutationLayout links in both
+    directions: an update and its target share storage. This also follows
+    copy-backs and zero-offset writes reached through arbitrarily long reader
+    chains. There is no hop limit. A reached writer brings its target and all
+    of that target's readers into the closure, regardless of graph order.
 
-    Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
-    offsets (coarse tiling) are not offset writes, so no component is seeded and
-    coarse tiling is not constrained.
+    Do not follow ordinary reads backwards to their producers: the solver's
+    residency gate already protects reads from independently re-sliced
+    producers. In particular, padding an FFN input must not pin the upstream
+    attention block (issue #4990). Downstream ops are conservatively pinned;
+    this is a dependency boundary, not an exact address-dependence analysis.
+
+    Symbolic coarse-tile offsets do not seed the walk; see
+    :func:`_writes_at_constant_offset`.
     """
-    # Undirected adjacency over buffer names (op.name == its output buffer,
-    # Inductor convention). Edges: producer<->operand (read deps) and a
-    # MutationLayout op <-> its aliased target buffer.
-    adj: dict[str, set[str]] = {}
+    seeds = [op.name for op in graph.operations if _writes_at_constant_offset(op)]
+    if not seeds:
+        return set()
 
-    def link(a: str, b: str) -> None:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    seeds: list[str] = []
+    successors: dict[str, set[str]] = {}
+    op_names = {op.name for op in graph.operations}
     for op in graph.operations:
         for dep in op_read_writes(op).reads:
-            name = getattr(dep, "name", None)
-            if name:
-                link(op.name, name)
+            successors.setdefault(dep.name, set()).add(op.name)
         layout = getattr(op, "layout", None)
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            try:
-                link(op.name, layout.target.get_name())
-            except (AttributeError, TypeError):
-                pass
-        if _writes_at_constant_offset(op):
-            seeds.append(op.name)
+            target = layout.target.get_name()
+            successors.setdefault(op.name, set()).add(target)
+            successors.setdefault(target, set()).add(op.name)
 
-    op_names = {op.name for op in graph.operations}
-    component: set[str] = set()
+    reached: set[str] = set()
     stack = list(seeds)
     while stack:
-        node = stack.pop()
-        if node in component:
+        name = stack.pop()
+        if name in reached:
             continue
-        component.add(node)
-        stack.extend(adj.get(node, ()))
-    return component & op_names
+        reached.add(name)
+        stack.extend(successors.get(name, ()))
+    return reached & op_names
 
 
 def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
@@ -711,40 +693,29 @@ def get_ncores_for_buffers(
     return result, mismatch_reasons_cache, accepted_views
 
 
-class _GetLoadStoreIndices(WrapperHandler):
-    def __init__(self, inner):
-        super().__init__(inner)
-        self._load_map = {}
-        self._store_map = {}
+def get_op_pointwise_inputs(op: Operation) -> list[str]:
+    """Inputs whose every read addresses the pointwise output's storage index.
 
-    def load(self, name: str, index: sympy.Expr):
-        self._load_map[name] = index
-        return super().load(name, index)
-
-    def store(self, name: str, index: sympy.Expr, value: Any, mode: Any = None):
-        self._store_map[name] = index
-        return super().store(name, index, value, mode)
-
-
-def get_load_and_store_indices(
-    pointwise: Pointwise,
-) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr]]:
-    handler = _GetLoadStoreIndices(V.MockHandler())
-    index = [sympy.Symbol(f"index{i}") for i in range(len(pointwise.ranges))]
-    with V.set_ops_handler(handler):
-        pointwise.inner_fn(index)
-    return handler._load_map, handler._store_map
-
-
-def get_op_pointwise_inputs(node: IRNode) -> list[str]:
-    if not isinstance(node, Pointwise):
+    Trace the ComputedBuffer, not Pointwise.inner_fn: the latter returns a
+    value without emitting a store, so comparing against its stores is vacuous.
+    Keep every read of each input; one transposed or offset read bars reuse even
+    when another read of that same buffer matches the output.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return []
-    loads, stores = get_load_and_store_indices(node)
-
+    rw = op_read_writes(op)
+    writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+    if len(writes) != 1:
+        return []
+    invalid = {
+        dep.name
+        for dep in rw.reads
+        if not isinstance(dep, MemoryDep) or dep.index != writes[0].index
+    }
     return [
-        inp
-        for inp, load_index in loads.items()
-        if all(store_index == load_index for store_index in stores.values())
+        name
+        for name in dict.fromkeys(dep.name for dep in rw.reads)
+        if name not in invalid
     ]
 
 
