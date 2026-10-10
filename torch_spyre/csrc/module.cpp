@@ -433,9 +433,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device") = -1);
 
   // Memory copy function
+  // Lets go of the GIL while it runs, so other Python threads (for example
+  // the threaded weight upload in model_utils) can run at the same time. Most
+  // of the time goes to turning the host data into the device format.
+  // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false);
+        py::arg("dst"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,

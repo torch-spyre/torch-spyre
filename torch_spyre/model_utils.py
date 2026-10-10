@@ -71,7 +71,11 @@ Usage::
     model.to("spyre")
 """
 
+import functools
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, NamedTuple
 
 import torch
 from torch import nn
@@ -81,13 +85,25 @@ from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
     copy_tensor,
+    current_device,
     get_device_dtype,
+    get_stream_from_pool,
+    set_current_stream,
+    set_device,
     spyre_empty_with_layout,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("model_utils")
+
+# Most of the time of a weight upload is spent on the host, turning the data
+# into the device format. copy_tensor lets go of the GIL while it works, so
+# load_model_to_spyre can upload several tensors at the same time from a few
+# threads. TORCH_SPYRE_UPLOAD_THREADS sets the number of threads; 1 uploads
+# one tensor at a time, as before.
+_UPLOAD_THREADS_ENV = "TORCH_SPYRE_UPLOAD_THREADS"
+_MAX_DEFAULT_UPLOAD_THREADS = 8
 
 
 def _ensure_spyre_runtime() -> None:
@@ -377,25 +393,32 @@ def _module_overrides_apply(module: nn.Module) -> bool:
     return getattr(apply, "__func__", apply) is not nn.Module._apply
 
 
+class _Upload(NamedTuple):
+    """One parameter or buffer to upload, and where to put the result."""
+
+    module: nn.Module
+    name: str
+    # None for a buffer, else the requires_grad of the parameter.
+    requires_grad: bool | None
+    # Uploads the tensor and returns (device tensor, kind for the log counts).
+    run: Callable[[], tuple[torch.Tensor, str]]
+
+
 def _transfer_module(
     module: nn.Module,
     dtype: torch.dtype | None,
-    counts: dict[str, int],
+    uploads: list[_Upload],
     prefix: str = "",
     use_fp8_weights: bool = False,
 ) -> None:
-    """Recursively move ``module``'s params/buffers to Spyre, honoring ``_apply``.
+    """Recursively list ``module``'s params/buffers to move to Spyre.
 
     Mirrors ``nn.Module._apply``'s virtual recursion: a submodule that overrides
-    ``_apply`` is delegated to and pruned from the walk. Normal modules get the
-    optimal ``dim_order=[1, 0]`` layout for 2D ``nn.Linear`` weights, the
-    gather-optimal indirect-access layout for 2D ``nn.Embedding`` tables, and
-    the default layout for everything else. When ``use_fp8_weights=True``,
-    ``torch.float8_e4m3fn`` Linear weights are loaded with KERNEL layout and
-    ``ElementArrangement.QFP8WT`` for direct use with ``_scaled_mm``.
-    Tensors already on Spyre are skipped (idempotent). ``counts`` accumulates
-    transferred-tensor tallies for logging; ``prefix`` is the module's dotted
-    path (as in ``named_modules``) for logs.
+    ``_apply`` is delegated to and pruned from the walk; its tensors are moved
+    right away, one at a time. For all other modules, each parameter and buffer
+    is added to ``uploads`` in walk order; ``_run_uploads`` moves them.
+    Tensors already on Spyre are skipped (idempotent). ``prefix`` is the
+    module's dotted path (as in ``named_modules``) for logs.
     """
     if _module_overrides_apply(module):
         module._apply(
@@ -409,77 +432,168 @@ def _transfer_module(
 
     for child_name, child in module.named_children():
         child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-        _transfer_module(child, dtype, counts, child_prefix, use_fp8_weights)
+        _transfer_module(child, dtype, uploads, child_prefix, use_fp8_weights)
 
     is_linear = isinstance(module, nn.Linear)
     is_embedding = isinstance(module, nn.Embedding)
     for name, param in list(module._parameters.items()):
         if param is None or param.device.type == DEVICE_NAME:
             continue
-        p = param.data
-        # Priority order:
-        #   1. FP8 pre-quantized Linear weight  -> KERNEL 2D-stick layout (QFP8WT)
-        #   2. FP16/BF16 2D Linear weight       -> dim_order=[1, 0] matmul layout
-        #   3. 2D Embedding table               -> gather indirect-access layout
-        #   4. Everything else                  -> default layout
-        dev = None
-        if (
-            use_fp8_weights
-            and is_linear
-            and name == "weight"
-            and p.ndim == 2
-            and p.dtype == torch.float8_e4m3fn
-        ):
-            logger.debug(
-                "  %s.%s: shape=%s dtype=%s -> Spyre FP8 KERNEL layout (2D stick) [transposed to K,N]",
-                prefix,
-                name,
-                list(p.shape),
-                p.dtype,
-            )
-            # nn.Linear stores weight as [out_features, in_features] = [N, K].
-            # The fp8_linear_kernel expects [K, N] on Spyre (see _kernel_weight_splits).
-            # Pass p.t() directly — no .contiguous() needed since the QFP8WT DMA
-            # path ignores the CPU tensor's actual strides (see _dma_to_spyre_fp8_kernel).
-            dev = _dma_to_spyre_fp8_kernel(p.t())
-            counts["fp8_kernel"] += 1
-        elif is_linear and name == "weight" and p.ndim == 2:
-            logger.debug(
-                "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
-                prefix,
-                name,
-                list(p.shape),
-            )
-            dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
-            counts["linear"] += 1
-        elif is_embedding and name == "weight" and p.ndim == 2:
-            dev = _dma_to_spyre_indirect_access(p, target_dtype=dtype)
-            # dev is None if the hidden dim doesn't tile into sticks; the helper
-            # has already warned, so fall through to the default layout below.
-            if dev is not None:
-                logger.debug(
-                    "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
-                    prefix,
-                    name,
-                    list(p.shape),
-                )
-                counts["embedding"] += 1
-        if dev is None:
-            logger.debug(
-                "  %s.%s: shape=%s -> Spyre default layout",
-                prefix,
-                name,
-                list(p.shape),
-            )
-            dev = _dma_to_spyre_default(p, target_dtype=dtype)
-            counts["other"] += 1
-        module._parameters[name] = nn.Parameter(dev, requires_grad=param.requires_grad)
+        run = functools.partial(
+            _upload_parameter,
+            param.data,
+            name,
+            is_linear,
+            is_embedding,
+            dtype,
+            prefix,
+            use_fp8_weights,
+        )
+        uploads.append(_Upload(module, name, param.requires_grad, run))
 
     for name, buf in list(module._buffers.items()):
         if buf is None or buf.device.type == DEVICE_NAME:
             continue
-        module._buffers[name] = _dma_to_spyre_default(buf, target_dtype=dtype)
-        counts["buffer"] += 1
+        run = functools.partial(_upload_buffer, buf, dtype)
+        uploads.append(_Upload(module, name, None, run))
+
+
+def _upload_parameter(
+    p: torch.Tensor,
+    name: str,
+    is_linear: bool,
+    is_embedding: bool,
+    dtype: torch.dtype | None,
+    prefix: str,
+    use_fp8_weights: bool,
+) -> tuple[torch.Tensor, str]:
+    """Upload one parameter in its best layout; return (device tensor, kind).
+
+    Normal modules get the optimal ``dim_order=[1, 0]`` layout for 2D
+    ``nn.Linear`` weights, the gather-optimal indirect-access layout for 2D
+    ``nn.Embedding`` tables, and the default layout for everything else. When
+    ``use_fp8_weights=True``, ``torch.float8_e4m3fn`` Linear weights are loaded
+    with KERNEL layout and ``ElementArrangement.QFP8WT`` for direct use with
+    ``_scaled_mm``.
+    """
+    # Priority order:
+    #   1. FP8 pre-quantized Linear weight  -> KERNEL 2D-stick layout (QFP8WT)
+    #   2. FP16/BF16 2D Linear weight       -> dim_order=[1, 0] matmul layout
+    #   3. 2D Embedding table               -> gather indirect-access layout
+    #   4. Everything else                  -> default layout
+    if (
+        use_fp8_weights
+        and is_linear
+        and name == "weight"
+        and p.ndim == 2
+        and p.dtype == torch.float8_e4m3fn
+    ):
+        logger.debug(
+            "  %s.%s: shape=%s dtype=%s -> Spyre FP8 KERNEL layout (2D stick) [transposed to K,N]",
+            prefix,
+            name,
+            list(p.shape),
+            p.dtype,
+        )
+        # nn.Linear stores weight as [out_features, in_features] = [N, K].
+        # The fp8_linear_kernel expects [K, N] on Spyre (see _kernel_weight_splits).
+        # Pass p.t() directly — no .contiguous() needed since the QFP8WT DMA
+        # path ignores the CPU tensor's actual strides (see _dma_to_spyre_fp8_kernel).
+        return _dma_to_spyre_fp8_kernel(p.t()), "fp8_kernel"
+    if is_linear and name == "weight" and p.ndim == 2:
+        logger.debug(
+            "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
+            prefix,
+            name,
+            list(p.shape),
+        )
+        return _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype), "linear"
+    if is_embedding and name == "weight" and p.ndim == 2:
+        dev = _dma_to_spyre_indirect_access(p, target_dtype=dtype)
+        # dev is None if the hidden dim doesn't tile into sticks; the helper
+        # has already warned, so fall through to the default layout below.
+        if dev is not None:
+            logger.debug(
+                "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
+                prefix,
+                name,
+                list(p.shape),
+            )
+            return dev, "embedding"
+    logger.debug(
+        "  %s.%s: shape=%s -> Spyre default layout",
+        prefix,
+        name,
+        list(p.shape),
+    )
+    return _dma_to_spyre_default(p, target_dtype=dtype), "other"
+
+
+def _upload_buffer(
+    buf: torch.Tensor, dtype: torch.dtype | None
+) -> tuple[torch.Tensor, str]:
+    return _dma_to_spyre_default(buf, target_dtype=dtype), "buffer"
+
+
+def _cpu_count() -> int:
+    """Number of CPUs this process can use, including a cgroup CPU limit."""
+    count = len(os.sched_getaffinity(0))
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            count = min(count, max(1, int(quota) // int(period)))
+    except (OSError, ValueError):
+        pass
+    return count
+
+
+def _upload_threads() -> int:
+    """Threads for the upload: TORCH_SPYRE_UPLOAD_THREADS, else min(8, CPUs)."""
+    value = os.environ.get(_UPLOAD_THREADS_ENV)
+    if value:
+        return max(1, int(value))
+    return min(_MAX_DEFAULT_UPLOAD_THREADS, _cpu_count())
+
+
+def _start_upload_thread(device_index: int) -> None:
+    """Set up one upload thread: same device as the caller, its own stream.
+
+    Device and current stream are per thread. With its own stream, each stream
+    gets work from only one thread.
+    """
+    set_device(device_index)
+    device = torch.device(DEVICE_NAME, device_index)
+    set_current_stream(get_stream_from_pool(device, 0))
+
+
+def _run_uploads(uploads: list[_Upload], counts: dict[str, int]) -> None:
+    """Run the uploads, then put the results into the modules in walk order.
+
+    Each upload writes to its own new device tensor, so uploads can run in any
+    order. The modules are only changed after all uploads are done, on this
+    thread.
+    """
+    threads = min(_upload_threads(), len(uploads))
+    if threads > 1:
+        with ThreadPoolExecutor(
+            max_workers=threads,
+            thread_name_prefix="spyre-upload",
+            initializer=_start_upload_thread,
+            initargs=(current_device(),),
+        ) as pool:
+            results = list(pool.map(lambda upload: upload.run(), uploads))
+    else:
+        results = [upload.run() for upload in uploads]
+
+    for upload, (dev, kind) in zip(uploads, results):
+        counts[kind] += 1
+        if upload.requires_grad is None:
+            upload.module._buffers[upload.name] = dev
+        else:
+            upload.module._parameters[upload.name] = nn.Parameter(
+                dev, requires_grad=upload.requires_grad
+            )
 
 
 def load_model_to_spyre(
@@ -509,6 +623,11 @@ def load_model_to_spyre(
     Submodules that override ``_apply`` are honored, matching ``nn.Module.to``
     semantics.  Idempotent: parameters already on Spyre are skipped.
 
+    The uploads run on ``TORCH_SPYRE_UPLOAD_THREADS`` threads (default:
+    min(8, CPUs this process can use)); ``1`` uploads one tensor at a time.
+    Tensors of submodules that override ``_apply`` are always moved one at a
+    time, by that ``_apply``.
+
     Args:
         model: Model to transfer to Spyre device.
         dtype: Target dtype for non-FP8 weight conversion (optional). If
@@ -524,7 +643,9 @@ def load_model_to_spyre(
     _ensure_spyre_runtime()
 
     counts = {"linear": 0, "fp8_kernel": 0, "embedding": 0, "other": 0, "buffer": 0}
-    _transfer_module(model, dtype, counts, use_fp8_weights=use_fp8_weights)
+    uploads: list[_Upload] = []
+    _transfer_module(model, dtype, uploads, use_fp8_weights=use_fp8_weights)
+    _run_uploads(uploads, counts)
     logger.info(
         "load_model_to_spyre: %d Linear weights (dim_order=[1,0]), "
         "%d FP8 KERNEL weights, "
