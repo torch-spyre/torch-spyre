@@ -1,0 +1,238 @@
+name: Claude PR Review (on-hardware)
+run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
+
+# ---------------------------------------------------------------------------
+# On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner
+# with an accelerator; /claude-review-static uses a card-less one -- it must
+# run on the self-hosted fleet for model connectivity, but needs no accelerator.
+# ---------------------------------------------------------------------------
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write   # post the review back to the PR
+  issues: write          # PR-level (issue) comments
+  actions: read
+  # NB: no id-token grant. We run the `claude` CLI directly instead of
+  # claude-code-action, so there is no OIDC->Anthropic app-token exchange
+  # (that path also demanded the Claude GitHub App). No model or telemetry
+  # traffic reaches api.anthropic.com: model calls go to the configured proxy,
+  # non-essential traffic is disabled, and GitHub auth uses the job's own
+  # github.token. The one Anthropic contact is CLI bootstrap -- the install
+  # step fetches the installer and binary from claude.ai.
+
+jobs:
+  review:
+    # A comment on a PR (not a plain issue), starting with a trigger command,
+    # from a commenter that clears a cheap author_association pre-filter.
+    # author_association is NOT proof of write access -- COLLABORATOR also covers
+    # read/triage collaborators -- so it only avoids spinning the runner for
+    # obvious non-members here; the authoritative write-access check is the
+    # "Verify commenter has write access" step below, which asks the API.
+    #
+    # No trailing delimiter after the command: a comment with notes on later
+    # lines has CRLF (not a space) after it, and GHA literals can't encode it.
+    # Static and hardware reviews must not block each other. Hardware reviews are
+    # still serialized per PR so a cancelled run cannot corrupt the Spyre cache.
+    # Job-level concurrency means only runs that pass the if: take a slot, so
+    # non-review comments cannot displace a pending review.
+    concurrency:
+      group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number
+        }}
+      cancel-in-progress: false
+
+    # The static review still runs on the self-hosted fleet (required for model
+    # connectivity) but on the card-less pool (spyre_pf_x0), so it never
+    # contends for an accelerator.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/claude-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ${{ fromJSON(startsWith(github.event.comment.body, '/claude-review-static') && '["x86_64","spyre_pf_x0","linux","image_torch_spyre"]' || '["x86_64","spyre_pf_x1","linux","image_torch_spyre"]')
+      }}
+    timeout-minutes: 60
+    env:
+      REVIEW_MODE: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}
+      # Mirror the test runners
+      CI: ''
+
+    steps:
+      # Reject comments that start with /claude-review but are not exactly one
+      # of the two supported commands (e.g. /claude-reviewer, /claude-review-statc).
+      # The first token is the command; anything after whitespace is ignored.
+      - name: Validate trigger command
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          cmd="${BODY%%[[:space:]]*}"
+          case "$cmd" in
+            /claude-review|/claude-review-static) ;;
+            *) echo "::error::Unknown command '${cmd}'; expected /claude-review or /claude-review-static." ; exit 1 ;;
+          esac
+
+      # Authoritative access gate (see the if: comment). curl, not gh.
+      # Rejects anything below write.
+      - name: Verify commenter has write access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          perm="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/collaborators/${ACTOR}/permission" \
+            | grep -oP '"permission":\s*"\K[^"]+')"
+          echo "Commenter ${ACTOR} has permission: ${perm:-<none>}"
+          case "${perm}" in
+            admin|write) echo "Authorized." ;;
+            *) echo "::error::${ACTOR} lacks write access (${perm:-none}); refusing review." ; exit 1 ;;
+          esac
+
+      # Ack that the run was picked up. curl, not gh;
+      # best-effort so a failed reaction never blocks the review.
+      - name: Acknowledge trigger comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d '{"content":"eyes"}' \
+            || echo "::warning::Could not add :eyes: reaction to the trigger comment"
+
+      # Checks out the default branch (prompt files). The agent uses
+      # gh pr checkout to fetch the PR code itself when needed.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Claude Code CLI
+        env:
+          DISABLE_AUTOUPDATER: '1'
+        run: |
+          # The image's ~/.local is not writable by this arbitrary CI uid, and
+          # the native installer hardcodes $HOME/.local/{bin,share,state} (it
+          # does not honour XDG). Point HOME at a job-writable dir so both the
+          # install and the runtime state the binary writes land there. The
+          # launcher path is exported to PATH for the review step, which sets
+          # the same HOME. RUNNER_TEMP persists for the whole job.
+          export HOME="${RUNNER_TEMP}/claude-home"
+          mkdir -p "$HOME"
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # gh is required by /code-review to pull diff and post comments.
+      # Installed under the same RUNNER_TEMP home as claude so both binaries
+      # follow the same path rule. Version is pinned and verified against the
+      # release checksum file so the binary is stable across runs.
+      - name: Install GitHub CLI
+        run: |
+          export HOME="${RUNNER_TEMP}/claude-home"
+          ver=2.102.0
+          tarball="gh_${ver}_linux_amd64.tar.gz"
+          base="https://github.com/cli/cli/releases/download/v${ver}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSL "${base}/gh_${ver}_checksums.txt" | grep " ${tarball}\$" | sha256sum -c -
+          tar -xzf "$tarball"
+          install -D -m 0755 "gh_${ver}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
+
+      - name: Claude review
+        id: claude
+        env:
+          # ALL model traffic goes to the configured proxy -- never
+          # api.anthropic.com. AUTH_TOKEN is sent as `Authorization: Bearer`.
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          # Kill every incidental call to Anthropic infrastructure. The
+          # umbrella var covers telemetry + error reporting; the auto-updater
+          # is a separate switch.
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+          DISABLE_AUTOUPDATER: '1'
+          API_TIMEOUT_MS: '1200000'
+          GH_TOKEN: ${{ github.token }}
+          SPYRE_KB_MCP_URL: ${{ secrets.SPYRE_KB_MCP_URL }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          : "${ANTHROPIC_BASE_URL:?ANTHROPIC_BASE_URL secret is not set}"
+          : "${ANTHROPIC_AUTH_TOKEN:?ANTHROPIC_AUTH_TOKEN secret is not set}"
+
+          # Device env is only needed for the hardware review. Source it from
+          # the real home before switching HOME below.
+          if [ "$REVIEW_MODE" = "hardware" ]; then
+            source "$HOME/.bashrc"
+            source /etc/profile.d/ibm-aiu-setup.sh
+            set +u
+          fi
+
+          # claude was installed under this HOME (the image's ~/.local is
+          # read-only for this uid); set it so the CLI is found and can write
+          # its runtime state. gh authenticates via GH_TOKEN.
+          export HOME="${RUNNER_TEMP}/claude-home"
+          # Allow git operations on the image's install root (owned by senuser,
+          # job runs as a different uid).
+          git config --global --add safe.directory /home/senuser/torch-spyre
+
+
+          # Build the MCP config from the secret URL in-shell so the URL stays
+          # masked (never interpolated into the rendered workflow).
+          mcp_config="{\"mcpServers\":{\"spyre-knowledgebase\":{\"type\":\"http\",\"url\":\"${SPYRE_KB_MCP_URL}\"}}}"
+
+          # CANNED prompt from a committed file -- NOT the comment body. Any
+          # text a maintainer types after either trigger is ignored.
+          if [ "$REVIEW_MODE" = "static" ]; then
+            prompt_file=.github/claude-review-static-prompt.txt
+          else
+            prompt_file=.github/claude-review-prompt.txt
+          fi
+          prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/g" "$prompt_file")"
+
+          # This CLI build does NOT provide a github_inline_comment MCP server,
+          # so /code-review --comment posts through the gh CLI fallback.
+          # --strict-mcp-config blocks any stray .mcp.json from loading.
+          #
+          # Bash is allowed broadly (not a per-subcommand allowlist) on purpose.
+          # In headless -p mode --allowedTools does not prompt: a non-matching
+          # command is auto-DENIED, and the model reports that as "requires
+          # approval". The /code-review gh fallback builds its inline-comment
+          # `gh api` call differently run to run -- when it pipes the JSON body
+          # (cat/echo | gh api ...) the leading token is not `gh`, so a
+          # Bash(gh api:*) rule misses and posting silently fails. A narrow list
+          # also buys no real containment here: on-hardware verification needs
+          # Bash(python3:*), and `python3 -c ...` is already arbitrary code
+          # execution. The trust boundary is the maintainer write-access gate +
+          # network controls, not the tool list.
+          #
+          # The agent posts its own PR-level summary comment (see the prompt);
+          # the completion signal is the outcome reaction in the next step.
+          claude -p "$prompt" \
+            --model 'claude-opus-5-5[1m]' \
+            --max-turns 100 \
+            --mcp-config "$mcp_config" \
+            --strict-mcp-config \
+            --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
+            --output-format text
+
+      # React on the trigger comment with the outcome: :+1: on success, :-1:
+      # otherwise. GitHub has no check/X reaction, so this is the closest
+      # pass/fail pair. always() so a timeout or error still signals -- this is
+      # the only completion signal when the agent dies before posting a summary.
+      - name: React with review outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEW_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          if [ "$REVIEW_OUTCOME" = "success" ]; then reaction="+1"; else reaction="-1"; fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d "{\"content\":\"${reaction}\"}" \
+            || echo "::warning::Could not add the outcome reaction to the trigger comment"

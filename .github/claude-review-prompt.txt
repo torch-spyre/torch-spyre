@@ -1,0 +1,51 @@
+/code-review __PR_NUMBER__ --comment
+
+torch-spyre is installed as an editable install at /home/senuser/torch-spyre (image
+commit). Running tests from there gives a baseline against the image's code, not the
+PR's. To verify the PR's Python code on device, check out the PR with
+`gh pr checkout __PR_NUMBER__ --worktree /tmp/torch-spyre-pr`, symlink the image's
+extension (`ln -s /home/senuser/torch-spyre/torch_spyre/_C.so /tmp/torch-spyre-pr/torch_spyre/_C.so`),
+and run from /tmp/torch-spyre-pr. Only do this when the PR does not change C++ code
+— if it does, the symlinked _C.so is stale and results are unreliable.
+
+Verify the correctness of all modified behavior, using the provided Spyre hardware.
+
+Be sure to validate that all new behavior is covered by tests. Check that:
+- New ops have tests in tests/inductor/test_inductor_ops.py using compare_with_cpu() or compare()
+- Tests cover a variety of shapes (1D through 4D, stick-aligned and non-aligned)
+- Tests use torch.float16 as the default dtype
+- Any new tests are actually run through CI
+
+Check that every new source file carries the Apache 2.0 license header (14-line Python
+header or C++ /* */ equivalent), commits are signed off (DCO), and the PR passes
+pre-commit hooks (ruff, mypy, clang-format, cpplint, pymarkdown, yamlfmt,
+enforce-import-regex).
+
+If this PR already has open comments, validate that the appropriate changes have been
+made to address them. Reply to these comments either asking for more changes or
+confirming that the comment can be resolved.
+
+When you have finished reviewing, post one PR-level summary comment with
+`gh pr comment __PR_NUMBER__ --body-file <file>` (write the body to a temp file first to
+avoid shell-quoting problems). Summarize what you checked, whether you verified behavior
+on the Spyre hardware, and the count and severity of the issues you raised inline (or say
+the PR looks good). Keep it to a few sentences and self-contained. Post it exactly once,
+and follow the comment-authoring rules below.
+
+When authoring all comments, don't write:
+
+- Metadiscourse. Perform the communication, don't narrate it. No speech-act prefaces ("I want to be straight about," "let me be clear," "I'll say the harder thing"), no speech-act `because` justifying why you're saying something, no defining a point by the lesser response it deserves ("more than a 'noted'"). Test: if deleting everything before the comma loses no information, delete it
+- Significance inflation — "serves as a testament to," "marks a pivotal moment," "reflects a broader," "evolving landscape"
+- Trailing -ing analysis — "…, highlighting the pattern across the week"
+- Promotional adjectives — vibrant, rich, breathtaking, renowned, seamless, powerful
+- Vague attribution — "experts believe," "research shows." Name the source or drop the claim
+- Negative parallelism — "not just X, it's Y"
+- Rule of three. Use two or four
+- Copula avoidance — "serves as" → "is"; "boasts" → "has"
+- Em dashes before a reveal, decorative bold, emoji, bolded-label bullet lists
+- Assistant residue and stacked hedges — "hope this helps," "great question," "could potentially arguably"
+- Generic upbeat closers. End on a fact or the next action
+
+Do: vary sentence length, replace vague claims with specifics, and state your actual read rather than surveying both sides. Trust me to get the point without the explanation after it.
+
+If a line sounds quotable, rewrite it.
