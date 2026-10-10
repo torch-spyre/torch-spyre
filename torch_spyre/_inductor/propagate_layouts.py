@@ -33,12 +33,14 @@ from torch._inductor.ir import (
     MutableBox,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
+    NoneLayout,
     ReinterpretView,
     Operation,
     Pointwise,
     Reduction,
     StorageBox,
     TensorBox,
+    _CollectiveKernel,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -71,13 +73,11 @@ from .constants import (
     STAGGERED_EAS,
 )
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
     FixedTiledLayout,
+    BroadcastKernel,
+    SpyreCollectiveKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
-    BroadcastAsyncFallback,
-    WaitWorkFallback,
 )
 from .pass_utils import (
     compute_restickify_target_layout,
@@ -2924,6 +2924,23 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
+        elif isinstance(op, _CollectiveKernel):
+            # Must precede the FallbackKernel branch (_CollectiveKernel is one).
+            # In-place collectives and waits have NoneLayout and own no buffer:
+            # their inputs keep their layouts.  Out-of-place collectives own
+            # their output buffer.
+            if isinstance(op.layout, NoneLayout):
+                pass
+            elif isinstance(op, BroadcastKernel):
+                # Same shape as the input; broadcast_run allocates it alike.
+                input_buf = V.graph.get_buffer(op.inputs[0].get_name())
+                op.layouts = list(input_buf.layouts)
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op, SpyreCollectiveKernel):
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
+            else:
+                logger.warning(f"unhandled collective type {type(op)}")
         elif isinstance(op, FallbackKernel):
             # FallbackKernel.create in PyTorch produces three cases:
             #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
@@ -2958,21 +2975,6 @@ def propagate_spyre_tensor_layouts(
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
 
-        elif isinstance(
-            op,
-            (
-                BroadcastAsyncFallback,
-                WaitWorkFallback,
-                AllReduceAsyncFallback,
-            ),
-        ):
-            input_name = op.inputs[0].get_name()
-            input_buf = V.graph.get_buffer(input_name)
-            op.layouts = list(input_buf.layouts)
-            op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, AllGatherAsyncFallback):
-            op.layouts = [generic_layout(op)]
-            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

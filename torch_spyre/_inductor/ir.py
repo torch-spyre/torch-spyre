@@ -507,278 +507,176 @@ def _compute_device_num_elems(layout: "FixedLayout") -> int:
     return int(V.graph.sizevars.guarding_hint_or_throw(numel))
 
 
-class BroadcastAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
+def _emit_plan_once(wrapper: PythonWrapperCodegen, plan_line: str) -> None:
+    """Emit *plan_line* into the wrapper header exactly once per wrapper instance.
 
-    This starts the broadcast operation asynchronously and returns immediately,
-    allowing computation to proceed while communication is in progress.
+    Each collective codegen method needs to write a plan call (e.g.
+    ``allreduce_plan(...)``) into the module-level header so it runs once at
+    graph load rather than on every forward pass.  Using ``wrapper._emitted_plans``
+    (a set attached to the wrapper object) ensures deduplication even when
+    multiple coalesced tensors share the same shape and would otherwise emit
+    identical plan lines.
+
+    Attaching state to the wrapper is fragile if Inductor ever reuses or clones
+    wrapper objects, but it mirrors the existing pattern established by the
+    broadcast/allgather/allreduce fallbacks.  Centralising the guard here means
+    only this one place needs updating if the approach changes.
     """
+    if not hasattr(wrapper, "_emitted_plans"):
+        wrapper._emitted_plans = set()
+    if plan_line not in wrapper._emitted_plans:
+        wrapper.header.writeline(plan_line)
+        wrapper._emitted_plans.add(plan_line)
+
+
+class SpyreCollectiveKernel(ir._CollectiveKernel):
+    """Base IR node for Spyre collectives built on upstream ``_CollectiveKernel``.
+
+    Nodes are created through the upstream factories, so the dependency model
+    matches stock Inductor:
+
+    * ``create_inplace`` (all_reduce): ``NoneLayout`` node plus a
+      ``MutationOutput`` on each input; the lowering returns the input.
+    * ``create_out_of_place`` (broadcast, all_gather, reduce_scatter): the
+      node is the output buffer.
+
+    ``op_overload`` is the ``_c10d_functional`` op, whose Meta impl drives
+    ``process_kernel``; ``constant_args`` are its non-tensor args in schema
+    order.  Codegen is Spyre-specific: a ``*_plan`` call emitted once in the
+    wrapper header (runs at graph load) and a ``*_run`` call in the body.
+    """
+
+    plan_prefix: str = ""
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        raise NotImplementedError
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        raise NotImplementedError
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
         """Emit plan call in header (compile-time) and run call in body (runtime)."""
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
-        src_rank, group_name = self.constant_args
-        output_name = self.get_name()
-
         input_layout = input_tensor.get_layout()
         dtype_code = _dtype_to_int(input_layout.dtype)
         num_elems = _compute_device_num_elems(input_layout)
 
-        # Emit plan call in header (module-level, runs once at graph load)
-        plan_var = f"_bcast_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.broadcast_plan("
-            f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
+        plan_var = f"_{self.plan_prefix}_plan_{self.get_name()}"
+        _emit_plan_once(
+            wrapper, f"{plan_var} = {self._plan_call(num_elems, dtype_code)}"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body (per-invocation)
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.broadcast_run("
-            f"{input_name}, {plan_var}, {src_rank})"
-        )
+        run_call = self._run_call(input_name, plan_var)
+        if isinstance(self.layout, ir.NoneLayout):
+            # In-place: the result aliases the input, nothing to bind.
+            wrapper.writeline(run_call)
+        else:
+            wrapper.writeline(f"{self.get_name()} = {run_call}")
 
         logger.debug(
-            "Codegen broadcast plan+run: %s -> %s (src=%s, group='%s')",
+            "Codegen %s plan+run: %s -> %s %s",
+            self.plan_prefix,
             input_name,
-            output_name,
-            src_rank,
-            group_name,
+            self.get_name(),
+            self.constant_args,
         )
 
-    def should_allocate(self) -> bool:
-        return True
 
-    def get_mutation_names(self) -> Sequence[str]:
-        return []
+class BroadcastKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.broadcast``.
 
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
+    ``broadcast_run`` copies the input into a fresh output and broadcasts into
+    it, so the output is this node's own buffer.
+    """
 
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        src_rank: int,
-        group_name: str,
-    ) -> None:
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (src_rank, group_name),
-            python_kernel_name="torch.ops.spyre.broadcast_run",
-            op_overload=op_overload,
+    plan_prefix = "bcast"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        src_rank, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.broadcast_plan("
+            f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
         )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        src_rank, _ = self.constant_args
+        return f"torch.ops.spyre.broadcast_run({input_name}, {plan_var}, {src_rank})"
 
 
-class AllGatherAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.all_gather_async.
+class AllGatherKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.all_gather_into_tensor``.
 
-    Starts the all_gather operation asynchronously and returns immediately.
     Output tensor has shape[0] = input.shape[0] * group_size.
     """
 
-    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        """Emit plan call in header (compile-time) and run call in body (runtime)."""
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
+    plan_prefix = "ag"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
         group_size, group_name = self.constant_args
-        output_name = self.get_name()
-
-        input_layout = input_tensor.get_layout()
-        dtype_code = _dtype_to_int(input_layout.dtype)
-        num_elems = _compute_device_num_elems(input_layout)
-
-        # Emit plan call in header (module-level, runs once at graph load)
-        plan_var = f"_ag_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.allgather_plan("
+        return (
+            f"torch.ops.spyre.allgather_plan("
             f"{num_elems}, {dtype_code}, {group_size}, '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body (per-invocation)
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.allgather_run("
-            f"{input_name}, {plan_var}, {group_size})"
-        )
-
-        logger.debug(
-            "Codegen allgather plan+run: %s -> %s (group_size=%s, group='%s')",
-            input_name,
-            output_name,
-            group_size,
-            group_name,
-        )
-
-    def should_allocate(self) -> bool:
-        return False
-
-    def get_mutation_names(self) -> Sequence[str]:
-        return []
-
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
-
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        group_size: int,
-        group_name: str,
-    ) -> None:
-        in_layout = x.get_layout()
-        out_size = list(in_layout.size)
-        out_size[0] = out_size[0] * group_size
-        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
-        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (group_size, group_name),
-            python_kernel_name="torch.ops.spyre.allgather_run",
-            op_overload=op_overload,
-        )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        group_size, _ = self.constant_args
+        return f"torch.ops.spyre.allgather_run({input_name}, {plan_var}, {group_size})"
 
 
-class AllReduceAsyncFallback(ir.ExternKernel):
-    """IR node for spyre.all_reduce_async.
+class ReduceScatterKernel(SpyreCollectiveKernel):
+    """Out-of-place ``_c10d_functional.reduce_scatter_tensor``.
 
-    Emits an asynchronous in-place all_reduce that must be paired with a
-    subsequent wait_work call to synchronize. Used by both the functional
-    (_c10d_functional.all_reduce) and in-place (_c10d_functional.all_reduce_)
-    lowerings — the generated code is identical since the Spyre runtime always
-    operates in-place.
+    Output tensor has shape[0] = input.shape[0] // group_size.
     """
 
-    def codegen(self, wrapper):
-        """Emit plan call in header (compile-time) and run call in body (runtime)."""
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
+    plan_prefix = "rs"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
+        reduce_op, group_size, group_name = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        _, group_size, _ = self.constant_args
+        return (
+            f"torch.ops.spyre.reducescatter_run({input_name}, {plan_var}, {group_size})"
+        )
+
+
+class AllReduceKernel(SpyreCollectiveKernel):
+    """In-place ``_c10d_functional.all_reduce_``.
+
+    Created with ``create_inplace``; the functional ``all_reduce`` lowering
+    clones its input first, as upstream does.
+    """
+
+    plan_prefix = "ar"
+
+    def _plan_call(self, num_elems: int, dtype_code: int) -> str:
         reduce_op, group_name = self.constant_args
-        output_name = self.get_name()
-
-        input_layout = input_tensor.get_layout()
-        dtype_code = _dtype_to_int(input_layout.dtype)
-        num_elems = _compute_device_num_elems(input_layout)
-
-        # Emit plan call in header
-        plan_var = f"_ar_plan_{output_name}"
-        plan_line = (
-            f"{plan_var} = torch.ops.spyre.allreduce_plan("
+        return (
+            f"torch.ops.spyre.allreduce_plan("
             f"{num_elems}, {dtype_code}, '{reduce_op}', '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
 
-        # Emit run call in body
-        wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
-        )
-
-    def should_allocate(self):
-        return False
-
-    def get_mutation_names(self):
-        return [self.inputs[0].get_name()]
-
-    def get_unbacked_symbol_defs(self):
-        return OrderedSet()
-
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-        reduce_op: str,
-        group_name: str,
-    ) -> None:
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (reduce_op, group_name),
-            python_kernel_name="torch.ops.spyre.allreduce_run",
-            op_overload=op_overload,
-        )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+    def _run_call(self, input_name: str, plan_var: str) -> str:
+        return f"torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
 
 
-class WaitWorkFallback(ir.ExternKernel):
-    """IR node for spyre.wait_work — emits a runtime call to synchronize async operation.
+class WaitKernel(ir._WaitKernel):
+    """``_c10d_functional.wait_tensor`` — blocks until the collective completes.
 
-    This blocks until the async broadcast operation completes and returns the
-    same in-place-mutated buffer. No allocation is needed (should_allocate() =
-    False) because the result lives in the input tensor's buffer.
+    Created with ``create_wait``: a ``NoneLayout`` node that mutates its input,
+    so later readers of the collective's result are ordered after the wait.
+    ``wait_work`` looks up the pending work by the tensor's storage, which is
+    the tensor the run call produced (or mutated).
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        input_tensor = self.inputs[0]
-        input_name = input_tensor.codegen_reference()
-
-        # Generate the wait call
-        output_name = self.get_name()
-        generated_code = f"{output_name} = torch.ops.spyre.wait_work({input_name})"
-
-        logger.debug("Codegen wait_work: %s -> %s", input_name, output_name)
-
-        wrapper.writeline(generated_code)
-
-    def should_allocate(self) -> bool:
-        return False
-
-    def get_mutation_names(self) -> Sequence[str]:
-        return [self.inputs[0].get_name()]
-
-    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
-        return OrderedSet()
-
-    def __init__(
-        self,
-        op_overload: torch._ops.OpOverload,
-        x: IRNode,
-    ) -> None:
-        # Wait returns the same tensor (pass-through)
-        x_device = x.get_device()
-        x_dtype = x.get_dtype()
-        x_size = x.get_size()
-        x_stride = x.get_stride()
-        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
-        super().__init__(
-            None,
-            layout,
-            [x],
-            (),  # No constant args
-            python_kernel_name="torch.ops.spyre.wait_work",
-            op_overload=op_overload,
-        )
-        self.name = V.graph.register_buffer(self)
-        V.graph.register_operation(self)
+        input_name = self.inputs[0].codegen_reference()
+        logger.debug("Codegen wait_work: %s", input_name)
+        wrapper.writeline(f"torch.ops.spyre.wait_work({input_name})")
