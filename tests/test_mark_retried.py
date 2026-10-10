@@ -22,7 +22,11 @@ from xml.etree import ElementTree
 
 import regex as re
 
-HELPER = Path(__file__).resolve().parent / "oot_framework" / "utils" / "mark_retried.py"
+TESTS = Path(__file__).resolve().parent
+HELPER = (
+    TESTS.parent
+    / "extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py"
+)
 _spec = importlib.util.spec_from_file_location("mark_retried", HELPER)
 assert _spec is not None and _spec.loader is not None
 mark_retried = importlib.util.module_from_spec(_spec)
@@ -51,7 +55,7 @@ def _props(path):
 
 def test_every_testcase_is_marked_and_existing_properties_kept(tmp_path):
     path = _write(tmp_path)
-    assert mark_retried.mark(str(path), "stall") == 2
+    assert mark_retried.mark(str(path), "stall") == (2, 0, 0)
     props = _props(path)
     assert props["test_a"] == [("tag", "testtype__unit"), ("result.retried", "stall")]
     assert props["test_b"] == [("result.retried", "stall")]
@@ -69,6 +73,100 @@ def test_retries_nest_innermost_first_and_repeat_once(tmp_path):
     assert dict(_props(path)["test_b"])["result.retried"] == "signal,stall,pod"
 
 
+def test_a_failure_the_retry_replaced_is_recorded_on_that_case(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a'><failure message='mismatch'>trace</failure></testcase>"
+        "<testcase classname='c' name='test_b'><error>setup fault</error></testcase>"
+        "<testcase classname='c' name='test_gone'><failure message='m'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (2, 2, 1)
+    props = {name: dict(p) for name, p in _props(path).items()}
+    assert props["test_a"] == {
+        "tag": "testtype__unit",
+        "result.retried": "pod",
+        "result.prior_status": "failed",
+        "result.prior_message": "mismatch",
+    }
+    assert props["test_b"]["result.prior_status"] == "error"
+    assert props["test_b"]["result.prior_message"] == "setup fault"
+
+
+def test_a_case_that_passed_before_the_retry_gets_no_prior_status(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a'/>"
+        "<testcase classname='c' name='test_b'><skipped message='s'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (2, 0, 0)
+    assert "result.prior_status" not in path.read_text()
+
+
+def test_a_long_prior_message_is_truncated(tmp_path):
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        f"<testcase classname='c' name='test_a'><failure message='{'x' * 5000}'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    mark_retried.mark(str(path), "pod", str(replaced))
+    message = dict(_props(path)["test_a"])["result.prior_message"]
+    assert len(message) == mark_retried.PRIOR_MESSAGE_MAX
+
+
+def test_a_case_the_retry_did_not_report_is_carried_over_with_its_failure(tmp_path):
+    path = tmp_path / "report.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest' tests='1' failures='0'>"
+        "<testcase classname='c' name='test_a'/></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a'/>"
+        "<testcase classname='c' name='test_gone'><failure message='m'/></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (1, 0, 1)
+    suite = ElementTree.parse(path).getroot().find("testsuite")
+    assert (suite.get("tests"), suite.get("failures")) == ("2", "1")
+    gone = suite.find("testcase[@name='test_gone']")
+    assert gone.find("failure") is not None
+    assert dict(_props(path)["test_gone"]) == {"result.not_rerun": "pod"}
+
+
+def test_a_prior_mark_on_the_replaced_report_carries_forward(tmp_path):
+    # An earlier retry already hid test_a's first failure; this retry replaces that report.
+    path = _write(tmp_path)
+    replaced = tmp_path / "replaced.xml"
+    replaced.write_text(
+        "<testsuites><testsuite name='pytest'><testcase classname='c' name='test_a'>"
+        "<properties><property name='result.retried' value='pod'/>"
+        "<property name='result.prior_status' value='error'/>"
+        "<property name='result.prior_message' value='card fault'/></properties>"
+        "</testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert mark_retried.mark(str(path), "pod", str(replaced)) == (2, 1, 0)
+    props = dict(_props(path)["test_a"])
+    assert (props["result.prior_status"], props["result.prior_message"]) == (
+        "error",
+        "card fault",
+    )
+
+
 def test_an_unknown_kind_is_refused(tmp_path):
     path = _write(tmp_path)
     run = subprocess.run(
@@ -81,8 +179,11 @@ def test_an_unknown_kind_is_refused(tmp_path):
 
 
 def test_every_signal_retry_in_run_test_marks_its_xml():
-    # The serial and the multi-card --parallel paths each re-run a signalled file with -n1.
-    script = (HELPER.parents[1] / "run_test.sh").read_text(encoding="utf-8")
-    retries = len(re.findall(r"_xdist_args=\(\"-n1\"", script))
+    # The serial and the multi-card --parallel paths each re-run a signalled file
+    # under xdist (one worker, via _XDIST_ISOLATION_ARGS).
+    script = (TESTS / "oot_framework" / "run_test.sh").read_text(encoding="utf-8")
+    retries = len(
+        re.findall(re.escape('_xdist_args=("${_XDIST_ISOLATION_ARGS[@]}"'), script)
+    )
     assert retries >= 2
     assert script.count('mark_retried.py" signal') == retries

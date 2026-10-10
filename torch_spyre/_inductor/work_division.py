@@ -19,10 +19,11 @@ import itertools
 import sympy
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
+from typing import Optional, TYPE_CHECKING
 
 from sympy import Expr, Integer, Symbol, divisors
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -53,6 +54,7 @@ from .ir import (
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    PerCoreView,
     SchedNodeArg,
     compute_granularity,
     compute_max_size,
@@ -61,17 +63,26 @@ from .pass_utils import (
     finite_upper_or_none,
     get_mem_deps_from_rw,
     input_layout_for_operation,
+    invert_per_core_view,
     iteration_space_from_op,
     commit_iteration_space_ownership,
+    op_out_coords,
     op_read_writes,
+    _per_core_view_from_prep,
+    _prepare_per_core_view,
+    tile_ownership_view,
 )
 from .propagate_hints import get_op_hints
+from .scratchpad.plan_solver import CoreDivision, TileAxis, TileSpec
 from .work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
     collect_work_division_constraints,
     has_qfp8wt_tensor,
 )
+
+if TYPE_CHECKING:
+    from .wsr.enumerate_tilings import TilingSpace
 
 logger = get_inductor_logger("work_division")
 
@@ -939,10 +950,40 @@ class WorkDivisionContext:
 
 
 def work_division_context_for_op(
-    op: ComputedBuffer, max_cores: int | None = None
-) -> WorkDivisionContext:
-    """Build the context for ``op``, doing the candidate-invariant work once."""
+    op: ComputedBuffer,
+    max_cores: int | None = None,
+    tiling: "TileSpec | None" = None,
+) -> "WorkDivisionContext | None":
+    """Build the context for ``op``, doing the candidate-invariant work once.
+
+    When ``tiling`` is a non-empty :class:`~.scratchpad.plan_solver.TileSpec`
+    the context describes the *per-tile* frame: each tiled dim's iteration
+    extent is divided by its tile count, so factor domains and per-core spans
+    are the tiled op's, not the whole op's. A division is only meaningful
+    relative to a tiling -- the legal set moves with it -- so the two are
+    chosen together.
+
+    Returns ``None`` -- and only ever -- when ``tiling`` is one
+    :func:`~.wsr.tile_prediction.predict_frame` cannot predict onto ``op``,
+    which is also the tiling ``coarse_tiling`` could not lower. Such a spec has
+    no per-tile frame, so it has no legal divisions either; the caller drops
+    it. An untiled call never returns ``None``.
+
+    The divided iteration space is read off ``predict_frame`` rather than
+    recomputed. That is the single gate: ``_predict_iter_space`` resolves every
+    axis unguarded and is only sound behind ``_rejection_reason``, so calling
+    it directly would raise ``IndexError``/``KeyError`` on a spec the predictor
+    rejects by value, and would silently disagree with the frame the allocator
+    prices the same candidate on.
+    """
     it_space = iteration_space_from_op(op)
+    if tiling is not None and not tiling.is_untiled:
+        from .wsr.tile_prediction import predict_frame
+
+        frame = predict_frame(op, tiling)
+        if frame is None:
+            return None
+        it_space = frame.iter_space
     input_tds, output_td = collect_tensor_deps(
         op,
         _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
@@ -987,6 +1028,7 @@ def work_division_context_for_op(
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
+    tiling: "TileSpec | None" = None,
 ) -> list[dict[Symbol, int]]:
     """Every split (``dict[Symbol, int]``, as :func:`apply_splits` takes) that
     :meth:`WorkDivisionContext.is_legal` admits under ``max_cores``, drawn from
@@ -994,10 +1036,16 @@ def enumerate_work_division_candidates(
     leaves its dim unsplit. Both halves are the context's, leaving only
     the cross product here; a caller that would rather propose one split at a
     time uses the context directly.
+
+    Empty for a ``tiling`` that has no per-tile frame (see
+    :func:`work_division_context_for_op`) -- an unpredictable spec has no legal
+    division, so it drops out of the menu here rather than downstream.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
-    ctx = work_division_context_for_op(op, max_cores)
+    ctx = work_division_context_for_op(op, max_cores, tiling)
+    if ctx is None:
+        return []
     axes = ctx.axes
     return [
         splits
@@ -1022,7 +1070,643 @@ def work_division_splits_are_legal(
         return True
 
     ctx = work_division_context_for_op(op)
+    assert ctx is not None  # untiled: never rejected
     return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
+
+
+# Per-candidate core-division machinery: the questions a solver asks of
+# ``enumerate_work_division_candidates`` and a pair table, one candidate at a time.
+
+
+# The inert default every untiled division carries. Frozen, so one instance
+# serves as a shared default argument.
+UNTILED = TileSpec()
+
+
+def _reduction_syms(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> frozenset[sympy.Symbol]:
+    """Get reduction symbols for an operation."""
+    rw = op_read_writes(op)
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None:
+        return frozenset()
+    return frozenset(s for s in splits if write.index.coeff(s) == 0)
+
+
+def _core_division(
+    op: Operation,
+    splits: dict[sympy.Symbol, int],
+    tiling: "TileSpec | None" = None,
+    tile_splits: tuple[tuple[sympy.Symbol, int], ...] = (),
+) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation.
+
+    ``tiling`` is the coarse tiling the candidate was enumerated under, carried
+    onto the division so the pair travels together, and ``tile_splits`` is
+    that tiling resolved to ``op``'s loop symbols. Output/reduction
+    classification asks only whether a symbol *appears* in the write index,
+    which a tiling rescales but never eliminates, so it is tiling-invariant and
+    the same test serves both frames.
+    """
+    sparse = {s: v for s, v in splits.items() if v > 1}
+    return CoreDivision(
+        splits=sparse,
+        reduction_syms=_reduction_syms(op, sparse),
+        tiling=tiling if tiling is not None else TileSpec(),
+        tile_splits=tile_splits,
+    )
+
+
+def _view_for_div(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    division: CoreDivision,
+    prep_cache: dict,
+):
+    """One candidate division's per-core view of ``buf_name``, through
+    ``prep_cache`` (see :func:`_prep_for`).
+
+    This is core ownership only, on the untiled buffer whatever the division's
+    tiling; how the tiling owns the buffer is :func:`_tile_view_for_div`.
+    """
+    splits = division.splits
+    syms = _reduction_syms(op, splits)
+    return _per_core_view_from_prep(
+        _prep_for(op, dep, buf_name, prep_cache),
+        splits,
+        {k: v for k, v in splits.items() if k in syms},
+    )
+
+
+def _prep_for(op: Operation, dep: MemoryDep, buf_name: str, prep_cache: dict):
+    """The candidate-invariant (sympy-heavy) view prep for one ``(op, dep,
+    buf_name)``. Keyed by op name too: a producer's write-dep and a consumer's
+    read-dep on the same buffer can be equal ``MemoryDep``s."""
+    key = (op.get_name(), dep, buf_name)
+    if key not in prep_cache:
+        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+    return prep_cache[key]
+
+
+@dataclasses.dataclass
+class OpSplitSpace:
+    """One op's legal core divisions as a space to move in, not a list.
+
+    Everything :func:`enumerate_work_division_candidates` needs, asked one
+    candidate at a time: which axes there are, what factors each admits, and
+    whether a proposed split map is legal. The enumerated menu is the cross
+    product over exactly these answers, so a division this space admits is one
+    the menu would have carried -- generation changes when a candidate is
+    materialized, not which candidates exist.
+
+    Which axes are *output* axes and which are *reduction* axes is a property
+    of the op's write index rather than of a candidate, so it is derived once
+    here and :meth:`division` classifies without touching sympy again.
+
+    **The coarse tiling rides on the same candidate**, and is the one part of
+    the space the menu does not carry. Tiling rewrites index expressions and
+    ``splits_by_index_coeff`` keys the output splits by each symbol's
+    coefficient in the write index, so a :class:`CoreDivision` carried across
+    tilings is uninterpretable rather than merely illegal -- the two have to be
+    chosen together. That makes the space two-level and ragged: each tiling
+    is judged in its own per-tile frame (:func:`work_division_context_for_op`
+    with that tiling), as the CP-SAT menu is. A tile level cuts its axis's
+    extent, so the core splits that still divide it exactly are narrower; it
+    cuts the per-core span too, so ``MAX_SPAN_BYTES`` may admit a split map the
+    untiled op cannot take.
+
+    So the per-axis domains are nested -- a divisor of the per-tile extent
+    divides the whole one, and the committed span floors bind both -- and
+    :attr:`factor_domains`, the untiled ones, are the widest: the view inverse
+    searching them misses nothing. The joint verdict is not nested. A split
+    map legal under a tiling can be illegal untiled, where the untiled op
+    overflows the span cap at that map, so falling back from a tiled config to
+    its untiled twin has to check the twin.
+    """
+
+    op: Operation
+    context: WorkDivisionContext
+    # Axes whose factor slices the op's output (the rest are reduction axes).
+    output_axes: frozenset
+    # Per axis, the legal factors *untiled* -- the widest domain, which a tiling
+    # can only narrow (:meth:`factor_domain`). What the view inverse searches
+    # over, and what a recolor anchor redraws from.
+    factor_domains: dict[sympy.Symbol, list[int]]
+    # The coarse tilings this op may take, or ``None`` when tilings are not this
+    # caller's to choose -- which pins every division here to untiled, and is
+    # what every engine but the SA co-optimizer gets.
+    tiling: Optional["TilingSpace"] = None
+    # Per tiling, the context of its per-tile frame, or ``None`` where it has
+    # none. Built on first use: a search visits few of an op's tilings.
+    _contexts: dict[TileSpec, Optional[WorkDivisionContext]] = dataclasses.field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    @property
+    def axes(self) -> list[sympy.Symbol]:
+        return self.context.axes
+
+    def splits(self, division: CoreDivision) -> dict[sympy.Symbol, int]:
+        """``division`` as a complete factor per axis -- what this space moves
+        in, where a :class:`CoreDivision` keeps only the factors above 1."""
+        return {axis: int(division.splits.get(axis, 1)) for axis in self.axes}
+
+    def division(
+        self, splits: dict[sympy.Symbol, int], tiling: TileSpec = UNTILED
+    ) -> CoreDivision:
+        """``splits`` and ``tiling`` as one :class:`CoreDivision`, without
+        re-deriving the roles per call. Owes the same answer as
+        :func:`_core_division`, which ``test_work_division.py`` pins over the
+        candidate corpus."""
+        sparse = {axis: int(factor) for axis, factor in splits.items() if factor > 1}
+        return CoreDivision(
+            splits=sparse,
+            reduction_syms=frozenset(
+                axis for axis in sparse if axis not in self.output_axes
+            ),
+            tiling=tiling,
+        )
+
+    def _context(self, tiling: TileSpec) -> Optional[WorkDivisionContext]:
+        """The context ``tiling``'s divisions are judged in."""
+        if tiling.is_untiled:
+            return self.context
+        if tiling not in self._contexts:
+            try:
+                context = work_division_context_for_op(
+                    self.op, self.context.max_cores, tiling
+                )
+            except Unsupported:
+                context = None
+            self._contexts[tiling] = context
+        return self._contexts[tiling]
+
+    def factor_domain(
+        self, axis: sympy.Symbol, tiling: TileSpec = UNTILED
+    ) -> list[int]:
+        """The legal factors for ``axis`` in ``tiling``'s per-tile frame; empty
+        for a tiling with none."""
+        context = self._context(tiling)
+        return [] if context is None else context.factor_domain(axis)
+
+    def admits_tiling(self, tiling: TileSpec) -> bool:
+        """Whether this op may take ``tiling`` at all, splits aside: on offer,
+        with a per-tile frame. Untiled is the only answer for a space built
+        without a tiling half."""
+        if self.tiling is None:
+            return tiling.is_untiled
+        return self.tiling.admits(tiling) and self._context(tiling) is not None
+
+    def admits(
+        self, splits: dict[sympy.Symbol, int], tiling: TileSpec = UNTILED
+    ) -> bool:
+        """Whether this op may take ``splits`` under ``tiling``: the tiling on
+        offer, and the splits legal in its per-tile frame."""
+        context = self._context(tiling) if self.admits_tiling(tiling) else None
+        return context is not None and context.is_legal(splits)
+
+    def tiling_options(self, tiling: TileSpec) -> list[TileSpec]:
+        """The tilings one level-edit from ``tiling`` -- add or remove a level,
+        change a level's count. Empty for a space with no tiling half, which is
+        what keeps such a search's trajectory identical to one that never knew
+        about tilings."""
+        return [] if self.tiling is None else self.tiling.neighbours(tiling)
+
+    def neighbours(self, division: CoreDivision) -> list[CoreDivision]:
+        """The divisions one step from ``division``: for each axis, every other
+        factor its domain admits at this tiling, then every tiling one level
+        away at these splits.
+
+        This is the move alphabet a generating search proposes from. One *step*
+        is one axis's factor or one tile level, never both: the two are chosen
+        jointly but moved on separately, which is what keeps the walk local in a
+        ragged space. Ordered by axis then by factor, then by the tiling space's
+        own order.
+
+        The tiling options are *concatenated*, not weighted, so a caller drawing
+        uniformly over this list gives them a share that follows its length: up
+        to ``|tileable dims| x |counts|`` entries against ~7 per axis, which
+        from the untiled state is most of the mass. That is an implicit retune
+        of the flip move relative to the weights #4233 measured, and it is
+        stated rather than tuned while nothing applies a chosen tiling. It also
+        makes ``|N(x)|`` vary much more with state, which an uncorrected
+        Metropolis test reads as a bias towards states with more neighbours.
+        """
+        current = self.splits(division)
+        tiling = division.tiling
+        out = []
+        for axis in self.axes:
+            for factor in self.factor_domain(axis, tiling):
+                if factor == current[axis]:
+                    continue
+                candidate = {**current, axis: factor}
+                if self.admits(candidate, tiling):
+                    out.append(self.division(candidate, tiling))
+        for spec in self.tiling_options(tiling):
+            if self.admits(current, spec):
+                out.append(self.division(current, spec))
+        return out
+
+
+def _axis_by_host_dim(
+    op: ComputedBuffer, axes: Sequence[sympy.Symbol]
+) -> dict[int, sympy.Symbol]:
+    """Output host dim -> the iteration axis it cuts, for each dim the
+    lowering's ``try_resolve_tile_axis_loop_vars`` resolves to one of
+    ``axes``. A level's ``count`` plays no part in that resolution."""
+    # Local import: ``scratchpad.coarse_tiling`` imports the allocator, which
+    # imports this module.
+    from .scratchpad.coarse_tiling import try_resolve_tile_axis_loop_vars
+
+    resolved: dict[int, sympy.Symbol] = {}
+    for host_dim in range(len(op_out_coords(op))):
+        loop_vars, _ = try_resolve_tile_axis_loop_vars(
+            op, TileSpec((TileAxis(host_dim, 1),))
+        )
+        if loop_vars is not None and loop_vars[0] in axes:
+            resolved[host_dim] = loop_vars[0]
+    return resolved
+
+
+def build_op_split_space(
+    op: Operation,
+    max_cores: int,
+    tiling: Optional["TilingSpace"] = None,
+) -> Optional[OpSplitSpace]:
+    """The :class:`OpSplitSpace` for ``op``, or ``None`` when it has no
+    enumerable one.
+
+    The gate is ``_enumerate_core_divisions``': an op that is not a pointwise or
+    reduction ``ComputedBuffer``, or whose context cannot be derived, keeps its
+    committed division instead -- so exactly the ops the menu path leaves with a
+    single candidate are the ops generation has nothing to offer.
+
+    ``tiling`` is the op's :class:`TilingSpace` when the caller wants coarse
+    tilings chosen here, and ``None`` when it does not -- the second is the
+    default, since only a search that generates divisions can use one and the
+    enumerated menu carries no tilings to begin with.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        op.data, (Pointwise, Reduction)
+    ):
+        return None
+    try:
+        context = work_division_context_for_op(op, max_cores)
+    except Unsupported:
+        return None
+    rw = op_read_writes(op)
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None or context is None:
+        return None
+    axes = context.axes
+    if tiling is not None:
+        # Offer only the dims the lowering resolves to one of the axes.
+        axis_by_host_dim = _axis_by_host_dim(op, axes)
+        tiling = dataclasses.replace(
+            tiling,
+            output_counts={
+                d: c for d, c in tiling.output_counts.items() if d in axis_by_host_dim
+            },
+        )
+    return OpSplitSpace(
+        op=op,
+        context=context,
+        output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
+        factor_domains={axis: context.factor_domain(axis) for axis in axes},
+        tiling=tiling,
+    )
+
+
+_WHOLE_VIEW = PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=1)
+
+
+def _tile_view_for_div(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    division: CoreDivision,
+    prep_cache: dict,
+) -> Optional[PerCoreView]:
+    """How ``division``'s coarse tiling owns ``buf_name``, tile by tile.
+
+    The whole-buffer view when untiled, and ``None`` when the tiling cannot be
+    represented. Kept apart from the per-core view so it is built once per
+    tiling rather than once per division: comparing the two separately is the
+    same test as comparing ownership per (tile, core), since a tile owns a slice
+    of each tiled dim and a core a slice of that tile.
+    """
+    if not division.tile_splits:
+        return _WHOLE_VIEW
+    key = ("tile", op.get_name(), dep, buf_name, division.tile_splits)
+    if key not in prep_cache:
+        prep_cache[key] = tile_ownership_view(
+            _prep_for(op, dep, buf_name, prep_cache), division.tile_splits
+        )
+    return prep_cache[key]
+
+
+@dataclasses.dataclass
+class ResidencyEdge:
+    """One producer-buffer -> consumer edge, with its residency policy applied.
+
+    Owns both halves of "can these two candidates share a residency": the
+    *geometry* -- the same per-core slicing of the buffer, compared in the
+    buffer's own device-dim frame, on the same total core count -- and the
+    *policy* filters that decide a candidate can host a readable residency at
+    all. Built once per edge by :func:`build_residency_edge`, which returns
+    ``None`` for an edge excluded outright, so a caller that generates
+    candidates instead of enumerating them cannot apply the geometry and forget
+    the filters.
+
+    A producer rejected for LX is excluded outright. Otherwise, check each
+    producer-consumer edge independently. A broadcasting clone may read its
+    input from HBM and still keep its completed output in LX for a matching
+    consumer. Candidate-specific checks are in :meth:`parent_view` and
+    :meth:`consumer_view`.
+
+    ``read_deps`` holds every read the consumer makes of the buffer. One
+    residency serves them all, so a candidate has to own the buffer the same
+    way through each. ``a + a.permute(1, 0, 2)`` reads ``a`` once in step and
+    once transposed: a division that splits dim 0 or dim 1 slices ``a`` along
+    one of them for the first read and the other for the second, so it has no
+    pair. One that splits only dim 2, which both reads walk alike, or does not
+    split at all, still does.
+    """
+
+    buf_name: str
+    parent_op: Operation
+    consumer_op: Operation
+    write_dep: MemoryDep
+    read_deps: tuple[MemoryDep, ...]
+    prep_cache: dict
+
+    def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """The producer's write-view under ``division``, or ``None`` when that
+        candidate cannot host a readable residency: a partial-reduction write
+        (output not final) or an unrepresentable slicing. Matching compares
+        the complete per-core views, including all split dimensions."""
+        view, partial, repr_ok = _view_for_div(
+            self.parent_op, self.write_dep, self.buf_name, division, self.prep_cache
+        )
+        if not repr_ok or partial:
+            return None
+        return view
+
+    def _common_read_view(
+        self, view_of: Callable[[MemoryDep], Optional[PerCoreView]]
+    ) -> Optional[PerCoreView]:
+        """The view every read of the buffer has under ``view_of``, or ``None``
+        when some read has none or two reads own the buffer differently."""
+        first, *rest = (view_of(dep) for dep in self.read_deps)
+        if first is None:
+            return None
+        if any(view is None or not first.same_partition(view) for view in rest):
+            return None
+        return first
+
+    def consumer_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """The consumer's read-view under ``division``, or ``None`` when its
+        slicing of the buffer is unrepresentable -- we never pin on a slicing
+        we cannot verify -- or differs from one read of the buffer to another."""
+
+        def core_view(dep: MemoryDep) -> Optional[PerCoreView]:
+            view, _partial, repr_ok = _view_for_div(
+                self.consumer_op, dep, self.buf_name, division, self.prep_cache
+            )
+            return view if repr_ok else None
+
+        return self._common_read_view(core_view)
+
+    def consumer_tile_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """How the consumer's reads walk the buffer tile by tile under
+        ``division``, or ``None`` when that cannot be represented or differs
+        from one read to another (see :func:`_tile_view_for_div`)."""
+        return self._common_read_view(
+            lambda dep: _tile_view_for_div(
+                self.consumer_op, dep, self.buf_name, division, self.prep_cache
+            )
+        )
+
+    @staticmethod
+    def _cores_used(division: CoreDivision) -> int:
+        return math.prod(division.splits.values())
+
+    def compatible(
+        self,
+        parent_splits: dict[sympy.Symbol, int],
+        consumer_splits: dict[sympy.Symbol, int],
+    ) -> bool:
+        """Whether the two candidates induce the same per-core slicing of the
+        buffer on the same total core count. Equal views alone are not enough:
+        a producer on N and a consumer on M > N cores can share a slicing while
+        the consumer's extra (broadcast-axis) cores hold no copy and would read
+        stale LX.
+
+        Blind to the tiling on either side, because a per-core view is a
+        function of the splits alone. That is *not* the whole residency
+        question once tiling is on: a consumer in another tiling group reads
+        the producer's whole output, not its per-tile scratch, and needs a
+        companion buffer that nothing here accounts for. Pricing that is a
+        separate step; this stays the slicing predicate it has always been.
+
+        :meth:`match_pairs` answers this over two menus and caches each side's
+        view across the cross product; this is the single-pair form, for a
+        caller holding one untiled candidate per side rather than a list.
+        """
+        parent = CoreDivision(splits=parent_splits)
+        consumer = CoreDivision(splits=consumer_splits)
+        if self._cores_used(parent) != self._cores_used(consumer):
+            return False
+        parent_view = self.parent_view(parent)
+        consumer_view = self.consumer_view(consumer)
+        return (
+            parent_view is not None
+            and consumer_view is not None
+            and parent_view.same_partition(consumer_view)
+        )
+
+    def consumer_division_for(
+        self, parent_division: CoreDivision, consumer_space: OpSplitSpace
+    ) -> Optional[CoreDivision]:
+        """The consumer division that reads this buffer exactly the way
+        ``parent_division`` writes it, or ``None`` if the consumer cannot read
+        it that way at all.
+
+        What a search propagating a division across this edge asks instead of
+        scanning the consumer's menu for a compatible entry. The inverse
+        proposes and :meth:`compatible` confirms -- on this side that is a
+        tautology, since the inverse only returns a division whose read-view is
+        the target, but it is the same call the other direction needs and it
+        keeps the policy filters in one place.
+        """
+        target = self.parent_view(parent_division)
+        if target is None:
+            return None
+        # Inverted through one read; :meth:`_inverse` holds each candidate to
+        # the others.
+        return self._inverse(
+            self.consumer_op, self.read_deps[0], target, consumer_space, parent_division
+        )
+
+    def parent_division_for(
+        self, consumer_division: CoreDivision, parent_space: OpSplitSpace
+    ) -> Optional[CoreDivision]:
+        """The producer division that writes this buffer the way
+        ``consumer_division`` reads it, or ``None``.
+
+        The mirror of :meth:`consumer_division_for`, for a search flooding
+        upward. This is the side with write-side policy to apply -- a
+        partial-reduction or multi-dim-split-matmul division inverts cleanly and
+        still cannot host a residency -- so :meth:`_inverse` applies it inside
+        the search rather than on the answer.
+        """
+        target = self.consumer_view(consumer_division)
+        if target is None:
+            return None
+        return self._inverse(
+            self.parent_op, self.write_dep, target, parent_space, consumer_division
+        )
+
+    def _inverse(
+        self,
+        op: Operation,
+        dep: MemoryDep,
+        target: PerCoreView,
+        space: OpSplitSpace,
+        other: CoreDivision,
+    ) -> Optional[CoreDivision]:
+        """Invert ``target`` on ``op``'s side of this edge, then confirm the
+        pair through :meth:`compatible`.
+
+        Everything that can reject a candidate rides along inside the inversion,
+        so a geometrically valid one the policy turns down backtracks to the
+        next rather than losing the edge. That is ``space.admits`` at the tiling
+        this attempt carries and, on the producer's side, :meth:`parent_view` --
+        a partial-reduction write or a multi-dim-split matmul output is
+        invisible to the geometry, and the first solution the geometry offers is
+        regularly one of those (two symbols on one device dim, where meeting
+        ``target.num_cores`` forces a reduction factor above 1 under one
+        placement and not under the next). On the consumer's side it is
+        :meth:`consumer_view`: the inversion sees only ``dep``, and two symbols
+        that walk one device dim of it can slice another read of the buffer
+        differently. Applying either to the answer instead cost the edge
+        outright, and ``_ViewRelation`` memoizes that ``None`` for the whole
+        solve. The trailing :meth:`compatible` is then a confirmation of the
+        pair rather than a filter on this side's candidates.
+
+        The tiling is *carried across*, where this side can take it: a coarse
+        tiling group is a run of consecutive ops sharing one ``TileSpec``
+        (``derive_tiling_groups``), so propagating it along the residency
+        relation is what forms a group at all -- flooding a region and leaving
+        every op in it a different tiling would produce no group. It is only an
+        attempt, though: the tiling narrows this side's split domains, so if it
+        costs the edge the untiled inverse is taken instead. Losing a tiling
+        level is a worse plan; losing the edge is a worse *state*.
+        """
+        prep = _prep_for(op, dep, self.buf_name, self.prep_cache)
+        is_parent_side = op is self.parent_op
+        wanted = other.tiling if space.admits_tiling(other.tiling) else UNTILED
+        attempts = (wanted,) if wanted.is_untiled else (wanted, UNTILED)
+        for tiling in attempts:
+
+            def accept(splits: dict) -> bool:
+                if not space.admits(splits, tiling):
+                    return False
+                candidate = space.division(splits)
+                if is_parent_side:
+                    return self.parent_view(candidate) is not None
+                return self.consumer_view(candidate) is not None
+
+            splits = invert_per_core_view(
+                prep, target, space.factor_domains, accept=accept
+            )
+            if splits is None:
+                continue
+            division = space.division(splits, tiling)
+            parent, consumer = (
+                (division.splits, other.splits)
+                if is_parent_side
+                else (other.splits, division.splits)
+            )
+            if self.compatible(parent, consumer):
+                return division
+        return None
+
+    def match_pairs(
+        self,
+        parent_divisions: Sequence[CoreDivision],
+        consumer_divisions: Sequence[CoreDivision],
+    ) -> list[tuple[int, int]]:
+        """Compatible ``(parent index, consumer index)`` pairs, with each side's
+        view computed once per candidate rather than once per pair.
+
+        A pair must agree on core ownership and on tile ownership: the consumer
+        of a tiled producer reads it one tile at a time, so tile ``t`` has to
+        touch the same slice on both sides (see :func:`_tile_view_for_div`).
+        Two untiled divisions have equal, whole-buffer tile views."""
+        parent_views = [self.parent_view(cd) for cd in parent_divisions]
+        consumer_views = [self.consumer_view(cd) for cd in consumer_divisions]
+        parent_tiles = [
+            _tile_view_for_div(
+                self.parent_op, self.write_dep, self.buf_name, cd, self.prep_cache
+            )
+            for cd in parent_divisions
+        ]
+        consumer_tiles = [self.consumer_tile_view(cd) for cd in consumer_divisions]
+        return [
+            (i, j)
+            for i, (parent_view, parent_tile) in enumerate(
+                zip(parent_views, parent_tiles)
+            )
+            if parent_view is not None and parent_tile is not None
+            for j, (consumer_view, consumer_tile) in enumerate(
+                zip(consumer_views, consumer_tiles)
+            )
+            if consumer_view is not None
+            and consumer_tile is not None
+            and parent_view.same_partition(consumer_view)
+            and parent_tile.same_partition(consumer_tile)
+            and self._cores_used(parent_divisions[i])
+            == self._cores_used(consumer_divisions[j])
+        ]
+
+
+def build_residency_edge(
+    buf_name: str,
+    parent_op: Operation,
+    consumer_op: Operation,
+    consumer_reads: Iterable[Dep],
+    residency_reason: Optional[str],
+    prep_cache: dict,
+) -> Optional[ResidencyEdge]:
+    """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
+    when the edge can never host a residency."""
+    if residency_reason is not None:
+        return None
+    write_dep = next(
+        (
+            w
+            for w in op_read_writes(parent_op).writes
+            if w.name == buf_name and isinstance(w, MemoryDep)
+        ),
+        None,
+    )
+
+    read_deps = tuple(
+        r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)
+    )
+    if write_dep is None or not read_deps:
+        return None
+    return ResidencyEdge(
+        buf_name=buf_name,
+        parent_op=parent_op,
+        consumer_op=consumer_op,
+        write_dep=write_dep,
+        read_deps=read_deps,
+        prep_cache=prep_cache,
+    )
 
 
 def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:

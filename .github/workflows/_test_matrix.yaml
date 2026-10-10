@@ -238,7 +238,13 @@ jobs:
       # runs' case rows in, so a delta run reports its whole tier rather than only the part
       # it executed. Empty ([] or "") whenever the delta is off or the lookup fails.
       covered_runs: ${{ steps.filter.outputs.covered_runs }}
+      # Scopes failed-suite descriptors to this call; artifacts are run-scoped and nightly calls this workflow twice.
+      call_id: ${{ steps.call_id.outputs.call_id }}
     steps:
+      - name: Generate per-call id
+        id: call_id
+        run: echo "call_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')" >> "$GITHUB_OUTPUT"
+
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -403,6 +409,20 @@ jobs:
           name: run-id
           path: run-id.txt
           retention-days: 14
+
+      # The tier the ingest records and hashes into run_id. Only the integration-tests run-name
+      # carries it; every other caller's display_title is a PR title or commit subject.
+      - name: Record suite tier for the ingest
+        env:
+          RESOLVED_TEST_TYPE: ${{ steps.filter.outputs.resolved_test_type }}
+        run: printf '%s' "${RESOLVED_TEST_TYPE}" > test-type.txt
+      - name: Upload suite tier
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-type
+          path: test-type.txt
+          retention-days: 14
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # Job 0a: derive THIS LEG'S artifact identity
@@ -730,11 +750,13 @@ jobs:
       # attempt in the name, collect_failed_suites on a later attempt reads a
       # stale descriptor from a prior attempt and retries a suite that already
       # passed. See retention-days:1 below -- it does not help within 24h.
+      # The name also carries generate_matrix's call_id, because the same run
+      # can hold descriptors from another call of this workflow (see call_id).
       - name: Upload failed-suite descriptor
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: failed-suite-${{ github.run_attempt }}-${{ strategy.job-index }}
+          name: failed-suite-${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
           if-no-files-found: error
           retention-days: 1
@@ -1304,12 +1326,12 @@ jobs:
           ${{ toJSON(matrix.suite) }}
           JSONEOF
 
-      # github.run_attempt in the name: see the single-card upload above.
+      # call_id and github.run_attempt in the name: see the single-card upload above.
       - name: Upload failed-suite descriptor
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: failed-suite-multi-${{ github.run_attempt }}-${{ strategy.job-index }}
+          name: failed-suite-multi-${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
           if-no-files-found: error
           retention-days: 1
@@ -1319,7 +1341,7 @@ jobs:
   # ---------------------------------------------------------------------------
   collect_failed_suites:
     name: Collect suites for pod-level retry
-    needs: [test, test_multi_spyre]
+    needs: [generate_matrix, test, test_multi_spyre]
     if: always()
     runs-on: ubuntu-latest
     outputs:
@@ -1344,17 +1366,20 @@ jobs:
           # a wrapped array, and let python3 slurp the stream into one array.
           # Same idiom as push-to-clickhouse.yaml.
           #
-          # startswith("failed-suite-<attempt>-"): the artifacts endpoint is
-          # run-scoped, not attempt-scoped, and returns descriptors from every
-          # attempt of this run (a re-run keeps the prior attempt's artifacts
-          # until they expire). Selecting only the current attempt's descriptors
-          # stops a re-run from retrying a suite that failed on an earlier
-          # attempt but passed on this one. The upload steps stamp
-          # github.run_attempt into the name for exactly this filter.
-          ATTEMPT="${{ github.run_attempt }}"
+          # startswith("failed-suite-<call_id>-<attempt>-"): the artifacts
+          # endpoint is run-scoped, not call- or attempt-scoped. It returns
+          # descriptors from every call of this reusable workflow in the run
+          # (runtests_nightly.yaml calls it twice) and from every attempt (a
+          # re-run keeps the prior attempt's artifacts until they expire).
+          # Selecting only this call's, current attempt's descriptors stops a
+          # call from retrying another call's suites (with its own, wrong
+          # config_root and flags) and a re-run from retrying a suite that
+          # failed on an earlier attempt but passed on this one. The upload
+          # steps stamp both into the name for exactly this filter.
+          PREFIX="${{ needs.generate_matrix.outputs.call_id }}-${{ github.run_attempt }}-"
           ARTIFACTS=$(gh api --paginate \
             "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"failed-suite-${ATTEMPT}-\") or startswith(\"failed-suite-multi-${ATTEMPT}-\")) | {id: .id, name: .name}" \
+            --jq ".artifacts[] | select(.name | startswith(\"failed-suite-${PREFIX}\") or startswith(\"failed-suite-multi-${PREFIX}\")) | {id: .id, name: .name}" \
             | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
@@ -1385,14 +1410,14 @@ jobs:
                       suites.append(json.load(f))
               return suites
 
-          # Names are failed-suite-<attempt>-<idx> (single) and
-          # failed-suite-multi-<attempt>-<idx> (multi); the --jq select above
-          # already scoped the download to this attempt. The single glob starts
-          # with a digit class so it matches "failed-suite-3-*" but never the
-          # "failed-suite-multi-*" descriptors (which start with a letter).
-          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-          multi = load(f"failed_suites/failed-suite-multi-{attempt}-*/suite.json")
-          single = load(f"failed_suites/failed-suite-{attempt}-[0-9]*/suite.json")
+          # Names are failed-suite-<call_id>-<attempt>-<idx> (single) and
+          # failed-suite-multi-<call_id>-<attempt>-<idx> (multi); the --jq
+          # select above already scoped the download to this call and attempt.
+          # The single glob spells out the call_id, so it never matches the
+          # "failed-suite-multi-*" descriptors.
+          prefix = "${{ needs.generate_matrix.outputs.call_id }}-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          multi = load(f"failed_suites/failed-suite-multi-{prefix}-*/suite.json")
+          single = load(f"failed_suites/failed-suite-{prefix}-*/suite.json")
 
           print(f"Single-card suites to retry: {[s.get('name') for s in single]}")
           print(f"Multi-card suites to retry : {[s.get('name') for s in multi]}")
@@ -1484,11 +1509,20 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
+      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
+      - name: Download the first attempt's JUnit XML report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ runner.temp }}/replaced-report
+
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         id: run_tests
         uses: ./.github/actions/run-test-suite
         with:
           retried: pod
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
           config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
@@ -1593,10 +1627,19 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
+      # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
+      - name: Download the first attempt's JUnit XML report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ runner.temp }}/replaced-report
+
       - name: Run ${{ matrix.suite.name }} tests (pod-level retry)
         uses: ./.github/actions/run-test-suite
         with:
           retried: pod
+          replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}

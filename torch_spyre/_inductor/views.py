@@ -359,9 +359,7 @@ def compute_coordinates(
         # not leak a modular residual onto the stick coordinate (see
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
-        handled = not offset.free_symbols and _decompose_constant_offset(
-            offset, size, stride, coordinates
-        )
+        handled = _decompose_constant_offset(offset, size, stride, coordinates)
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
@@ -389,9 +387,6 @@ def compute_coordinates(
         if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
             continue
 
-        # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
-
         if var in repeat_info:
             info = repeat_info[var]
             if info["kind"] == "mod":
@@ -408,9 +403,8 @@ def compute_coordinates(
                     )
             continue
 
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        step = term.xreplace({var: 1})
-        limit = term.xreplace({var: range_val})
+        # isolate current var
+        term = index.xreplace({v: 0 for v in vars - {var}})
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -418,6 +412,10 @@ def compute_coordinates(
                 f"variable {var} (range {range_val}) appears in multiple Mod "
                 f"expressions {mods_with_var} and cannot be mapped to coordinates."
             )
+
+        # compute index({var=1}) and index({var=var_ranges[var]})
+        step = term.xreplace({var: 1})
+        limit = term.xreplace({var: range_val})
 
         add_term(var=var, step=step, limit=limit)
 
@@ -673,10 +671,12 @@ def normalize_coordinates(
         #   so divide it by ``num`` -- leaving it inflates the dim, and with it
         #   every outer stride (issue #4050: output row l read input row 2*l).
         #   With several terms the split loop already sized it in iterations.
-        # - a residual constant offset below the stride (``2*d1 + 1``) selects
-        #   the position inside the gap.  Like any other constant offset on a
-        #   non-stick dim it needs a variable to hang off, so mint a synthetic
-        #   size-1 variable the same way the elided-dimension case above does.
+        # - the gap dim is a non-stick dim of size > 1 whose coordinate is the
+        #   constant residual offset below the stride (``1`` for ``2*d1 + 1``,
+        #   ``0`` for ``2*d1``).  Like the elided-dimension case above, it needs
+        #   a synthetic size-1 variable to hang off even when the offset is 0:
+        #   a variable-free gap dim is misaddressed by the backend, which then
+        #   reads a tiled ``[sticks, rows, 64]`` source in row-major order.
         #
         # The stick dim (last coordinate) is left alone: within-stick strides
         # are not representable and are rejected downstream.
@@ -691,21 +691,18 @@ def normalize_coordinates(
                         f"{dim_size} in steps of {stride}, which does not divide it"
                     )
                 inner.dim_size //= stride
-            if residual_offset == 0:
-                terms.append(Term(None, None, None, None, stride))
-            else:
-                var = synthetic_var_fn()
-                var_ranges[var] = 1
-                terms.append(
-                    Term(
-                        sympy.S.One,
-                        sympy.S.One,
-                        var,
-                        sympy.S.One,
-                        stride,
-                        residual_offset,
-                    )
+            var = synthetic_var_fn()
+            var_ranges[var] = 1
+            terms.append(
+                Term(
+                    sympy.S.One,
+                    sympy.S.One,
+                    var,
+                    sympy.S.One,
+                    stride,
+                    residual_offset,
                 )
+            )
         elif residual_offset != 0:
             # Only a within-stick stride can get here (``2*d + 1`` on the stick
             # dim); there is no gap dim to place the residual in.

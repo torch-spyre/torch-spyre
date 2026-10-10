@@ -13,10 +13,20 @@
 # limitations under the License.
 
 import io
+import itertools
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+)
 
 import regex
 import torch
@@ -454,7 +464,7 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     size_syms = {
         s
         for s in (index.free_symbols - loop_vars)
-        if not is_indirect(s.name) and s not in unbacked_syms
+        if s not in unbacked_syms and not is_indirect(s.name)
     }
     if not size_syms:
         return index
@@ -2354,11 +2364,12 @@ def is_sparse_stl(stl) -> bool:
     """
     dev_stride = 1
     sparse = False
+    elems_per_stick = stl.elems_per_stick()
     for dev_size, host_stride in zip(
         reversed(stl.device_size), reversed(stl.stride_map)
     ):
         if dev_size != 1:
-            if dev_stride % stl.elems_per_stick() != 0:
+            if dev_stride % elems_per_stick != 0:
                 if host_stride > 0:
                     return False
                 else:
@@ -2367,25 +2378,6 @@ def is_sparse_stl(stl) -> bool:
                 break
             dev_stride *= dev_size
     return sparse
-
-
-def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
-    """Return True if current_node's FX origin is spyre::compact."""
-    try:
-        if isinstance(current_node, ComputedBuffer):
-            buf = current_node
-        elif isinstance(current_node, SchedulerNode):
-            buf = current_node.node
-        else:
-            return False
-        data = buf.data
-        origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.compact.default
-            for n in origins
-        )
-    except Exception:
-        return False
 
 
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
@@ -2432,7 +2424,6 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
-    require_exact: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2447,18 +2438,13 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
 
-    require_exact: when true, stick compatibility is insufficient; the input
-    must physically match ``out_stl``.  Fixed-layout consumers use this for
-    cases where the backend representation depends on the complete outer
-    layout, not only on the stick variable (for example a flat-M projection).
     """
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
-    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
-    if idc is None or out_idc is None:
-        # One of the layouts has a stick expression the backend cannot
+    if idc is None:
+        # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
         # candidate can never be a feasible restickify source/target.
         #
@@ -2467,6 +2453,10 @@ def compute_restickify_needed(
         # search maps it to INF cost and discards the candidate — see
         # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
         # preferable to aborting the whole pass when another candidate is valid.
+        return True, None
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
+    if idc is None or out_idc is None:
+        # Same as above
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
@@ -2486,11 +2476,10 @@ def compute_restickify_needed(
         and bool(stick_syms)
         and len(outer_axes_with_stick_var) > 1
     )
-    factorized_layout_mismatch = is_factorized and in_stl != out_stl
-    exact_layout_mismatch = require_exact and in_stl != out_stl
+    layouts_differ = in_stl != out_stl
+    factorized_layout_mismatch = is_factorized and layouts_differ
     if (
         not factorized_layout_mismatch
-        and not exact_layout_mismatch
         and in_stick_offset_free
         and stick_compatible([idc, out_idc])
     ):
@@ -2506,12 +2495,14 @@ def compute_restickify_needed(
     if in_stl.device_dtype != DataFormats.SEN169_FP16:
         return True, None
 
-    if factorized_layout_mismatch or exact_layout_mismatch:
-        # A factorized input places the contraction variable on outer axes AND
-        # the stick, while an exact-layout edge has a consumer whose backend
-        # representation depends on the complete physical ordering.  In both
-        # cases stick_compatible would incorrectly accept the input.  out_stl is
-        # the concrete fixed-layout target selected by the consumer.
+    if factorized_layout_mismatch:
+        # The input layout places the contraction variable on outer axes AND the
+        # stick (factorized layout). The backend would see two contraction dims
+        # even though the var is on the stick — stick_compatible would incorrectly
+        # accept it. out_stl is the canonical collapsed target from
+        # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
+        # always passes [req_stl] as the target list, so the beam search only
+        # queries this function with that canonical result.
         return True, out_stl
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
     target_stick = out_idc[-1]
@@ -3247,26 +3238,34 @@ class PerCoreView:
 
     work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
+    split_product: int
     num_cores: int | None = None
 
-    def same_partition(self, other: object) -> bool:
+    def __init__(
+        self,
+        work_slice_dims: tuple[tuple[int, int], ...],
+        core_to_slot: tuple[tuple[int, Expr], ...],
+        num_cores: int | None = None,
+        *,
+        split_product: int = 0,  # dummy arg to absorb automatically copied args
+    ):
+        object.__setattr__(self, "work_slice_dims", work_slice_dims)
+        object.__setattr__(self, "core_to_slot", core_to_slot)
+        object.__setattr__(
+            self, "split_product", math.prod(split for _, split in work_slice_dims)
+        )
+        object.__setattr__(self, "num_cores", num_cores)
+
+    def same_partition(self, other: "PerCoreView") -> bool:
         """Whether both views assign every physical core the same buffer slice."""
-
-        if not isinstance(other, PerCoreView):
-            return False
-
-        def cores(view: PerCoreView) -> int:
-            if view.num_cores is not None:
-                return view.num_cores
-            return math.prod(split for _, split in view.work_slice_dims)
 
         return same_owner_maps(
             dict(self.work_slice_dims),
             dict(self.core_to_slot),
-            cores(self),
+            self.num_cores if self.num_cores is not None else self.split_product,
             dict(other.work_slice_dims),
             dict(other.core_to_slot),
-            cores(other),
+            other.num_cores if other.num_cores is not None else other.split_product,
         )
 
 
@@ -3474,7 +3473,6 @@ def _per_core_view_from_prep(
     if prep is None:
         return unrepresentable
     per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
-    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
 
     # Step 2: keep splits that actually slice this buffer, keyed by their host
     # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
@@ -3748,7 +3746,200 @@ def _per_core_view_from_prep(
         core_to_slot=tuple(pruned_core_to_slot),
         num_cores=num_cores,
     )
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
     return (view, has_partial_reduction, True)
+
+
+def tile_ownership_view(
+    prep: Optional[_ViewPrep],
+    tile_splits: Sequence[tuple[sympy.Symbol, int]],
+) -> Optional[PerCoreView]:
+    """How each coarse tile of an op owns the buffer ``prep`` describes.
+
+    A coarse tiling splits a loop in time the way a core division splits it in
+    space, so tile ``t`` is an owner just as core ``c`` is, and the ordinary
+    view machinery describes it: the view assigns each tile id its slice of the
+    untiled buffer. A consumer sharing its producer's loop nest reads the
+    producer one tile at a time, so the two must agree on this view -- and,
+    within a tile, on their per-core views too.
+
+    ``tile_splits`` lists the tiling's levels as ``(symbol, trip count)``,
+    outermost first; the innermost level varies fastest in the tile id, as the
+    loop nest runs. ``None`` when the slicing cannot be represented, or a level
+    names a symbol outside the op's iteration space or tiles one twice.
+
+    Like any per-core view it compares partitions, not extents: a reader that
+    covers only part of a dim looks like one that covers all of it. A caller
+    must rule such reads out (``buffer_not_read_in_full``) before trusting a
+    match.
+    """
+    if prep is None:
+        return None
+    iter_symbols = tuple(prep.iter_space)
+    tile_syms = [sym for sym, _ in tile_splits]
+    if len(set(tile_syms)) != len(tile_syms) or not set(tile_syms) <= set(iter_symbols):
+        return None
+    counts = dict(tile_splits)
+    tiles = math.prod(counts.values())
+    # core_to_slice_mapping varies its first dim fastest; the innermost level
+    # must, so the levels go in reversed.
+    order = tuple(reversed(tile_syms)) + tuple(
+        sym for sym in iter_symbols if sym not in counts
+    )
+    slots = core_to_slice_mapping(
+        order, tuple(counts.get(sym, 1) for sym in order), tiles
+    )
+    splits = {sym: counts.get(sym, 1) for sym in iter_symbols}
+    view, _partial, representable = _per_core_view_from_prep(
+        prep, splits, ownership=TensorWorkDivision(splits, slots, num_cores=tiles)
+    )
+    if not representable:
+        return None
+    if not view.work_slice_dims:
+        # No tiled loop indexes this buffer, so every tile reads all of it --
+        # the same ownership as no tiling at all, whatever the tile count.
+        return PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=1)
+    return view
+
+
+def _view_placement(prep: _ViewPrep, host_stride: int) -> Optional[tuple[int, int]]:
+    """The ``(device dim, factor multiplier)`` a symbol at ``host_stride`` takes.
+
+    The three placement rules of :func:`_per_core_view_from_prep` step 3, read
+    as a query rather than applied: the direct stride lookup, the stickified-axis
+    rule that forces the outer-stick dim, and the multi-stick rescue. The
+    multiplier is 1 except on the rescue, where a split of ``s`` is *reported* as
+    ``s * k``. ``None`` where the forward map would give up.
+    """
+    dev_dim = prep.device_stride_to_dim.get(host_stride)
+    if host_stride == prep.stick_host_stride:
+        dev_dim = prep.num_stick_dim
+    if dev_dim is not None:
+        return (dev_dim, 1)
+    if (
+        prep.num_stick_stride > 0
+        and prep.num_stick_dim is not None
+        and host_stride % prep.num_stick_stride == 0
+    ):
+        k = host_stride // prep.num_stick_stride
+        if k > 1:
+            return (prep.num_stick_dim, k)
+    return None
+
+
+def invert_per_core_view(
+    prep: Optional[_ViewPrep],
+    target: PerCoreView,
+    domains: Mapping[Symbol, Sequence[int]],
+    *,
+    accept: Optional[Callable[[dict], bool]] = None,
+    max_probes: int = 256,
+) -> Optional[dict[Symbol, int]]:
+    """A split map over ``prep``'s iteration space whose view of this buffer is
+    ``target``, or ``None`` if this op cannot read the buffer that way.
+
+    The inverse of :func:`_per_core_view_from_prep`, and the way a caller that
+    *generates* core divisions propagates one across a producer/consumer edge:
+    compute the producer's view once, then construct the consumer division that
+    slices the buffer identically, instead of scanning an enumerated menu for it.
+
+    ``domains`` gives each iteration symbol its legal split factors; ``accept``
+    is an optional caller-side filter (legality that the geometry does not know
+    about) applied inside the search, so a rejected candidate backtracks to the
+    next one rather than losing the edge.
+
+    Split factors of the symbols that *slice* this buffer are determined rather
+    than searched -- one per target device dim -- but two kinds of symbol are
+    invisible to a view and so have to be enumerated:
+
+    * ``dep_coeff == 0`` -- the axis does not touch this buffer at all
+      (canonically a reduction axis), yet its split still shifts every slot
+      expression, since :func:`core_to_slice_mapping` runs over the whole
+      iteration space;
+    * a symbol *shadowed* at the same host stride by a placed one, which
+      ``splits_by_stride`` drops from the geometry, leaving its split
+      unobservable here.
+
+    Several symbols can serve one device dim after a reshape, so the placements
+    are ordered canonically by ``(host stride, name)`` and *all* of them are
+    tried. Every candidate is confirmed by calling the forward map, so an
+    answer is exact by construction and a wrong guess can only ever be a miss.
+
+    ``max_probes`` bounds the *expensive* part: a candidate is counted before
+    ``accept`` sees it, so both the caller's filter and the forward-map
+    confirmation are covered. It does not bound candidate *enumeration*, which is
+    ``prod(placements per device dim) x prod(|domain| + 1 per hidden symbol)``
+    and is cut down only by the ``target.num_cores`` filter -- absent when
+    ``num_cores`` is ``None``, which no ``ResidencyEdge`` target is, since every
+    one of those comes from the forward map.
+    """
+    if prep is None:
+        return None
+    syms = list(prep.iter_space)
+    want = dict(target.work_slice_dims)
+
+    options_by_dim: dict[int, list[tuple]] = {dim: [] for dim in want}
+    for sym in syms:
+        host_stride = prep.dep_coeff.get(sym, 0)
+        if host_stride == 0:
+            continue
+        placement = _view_placement(prep, host_stride)
+        if placement is None:
+            continue
+        dev_dim, k = placement
+        if dev_dim not in want or want[dev_dim] % k:
+            continue
+        split = want[dev_dim] // k
+        if split in domains.get(sym, ()):
+            options_by_dim[dev_dim].append((host_stride, str(sym), sym, split))
+    for dim in want:
+        if not options_by_dim[dim]:
+            return None
+        options_by_dim[dim].sort()
+
+    dims = sorted(want)
+    probes = 0
+    for choice in itertools.product(*(options_by_dim[d] for d in dims)):
+        placed = {sym: split for _h, _name, sym, split in choice}
+        if len(placed) != len(choice):  # one symbol cannot serve two device dims
+            continue
+        placed_strides = {prep.dep_coeff[sym] for sym in placed}
+        # Everything else stays unsplit: a symbol that slices this buffer on a
+        # stride of its own would show up in the view as a device dim ``target``
+        # does not have.
+        candidate = {sym: 1 for sym in syms}
+        candidate.update(placed)
+        hidden = [
+            sym
+            for sym in syms
+            if sym not in placed
+            and (
+                prep.dep_coeff.get(sym, 0) == 0 or prep.dep_coeff[sym] in placed_strides
+            )
+        ]
+        hidden_domains = [sorted(set(domains.get(sym, ())) | {1}) for sym in hidden]
+        for combo in itertools.product(*hidden_domains):
+            candidate.update(zip(hidden, combo))
+            if (
+                target.num_cores is not None
+                and math.prod(candidate.values()) != target.num_cores
+            ):
+                continue
+            probes += 1
+            if probes > max_probes:
+                logger.debug(
+                    "view inversion gave up after %d probes on target %s",
+                    max_probes,
+                    target,
+                )
+                return None
+            if accept is not None and not accept(dict(candidate)):
+                continue
+            # No ``reduction_splits``: they set only the partial flag.
+            view, _partial, representable = _per_core_view_from_prep(prep, candidate)
+            if representable and view.same_partition(target):
+                return dict(candidate)
+    return None
 
 
 def _per_core_view_on_buf(

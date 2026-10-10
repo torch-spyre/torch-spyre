@@ -18,6 +18,23 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
+
+def _backend_loop_unroll_from_env() -> bool:
+    value = os.environ.get("SPYRE_BACKEND_LOOP_UNROLL", "1")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes"):
+        return True
+    if normalized in ("0", "false", "no"):
+        return False
+    raise ValueError(
+        f"SPYRE_BACKEND_LOOP_UNROLL must be 1/true/yes or 0/false/no, got {value!r}"
+    )
+
+
+# Controls dbo-opt's SDSC-bundle loop unrolling, not the direct KTIR path.
+# Resolve at import like the other options; config.patch can override it.
+backend_loop_unroll: bool = _backend_loop_unroll_from_env()
+
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
@@ -78,6 +95,13 @@ def pool_allocated_by_frontend() -> bool:
 # decomposition remains the default path and the fallback for cases the direct
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
+
+# Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+# buffer in addition to its input buffers. Off by default until the
+# interaction with downstream span limits is fully validated.
+ndo_matmul_output_reorder: bool = (
+    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
+)
 
 # For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
 # spatial dims (i/j) across cores. A strided conv's output coordinates do not
@@ -195,6 +219,17 @@ timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
 # keep the events in memory and write nothing, which is what a caller reading
 # timing_recorder.RECORDER directly wants.
 timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
+
+# Measurement mode: run a compile through backend-input generation and stop
+# before the backend compiler.  The frontend runs in full; every per-kernel
+# backend invocation is skipped, so the compile produces no runnable
+# kernel and calling one raises.  Never enable this to run a model -- it exists
+# so a frontend measurement does not have to pay for the backend.
+frontend_only: bool = os.getenv("TORCH_SPYRE_FRONTEND_ONLY", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
@@ -321,6 +356,13 @@ native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower()
     "true",
     "yes",
 )
+
+# Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
+# tiling for each op alongside its core division, and apply the tilings it
+# selects. Off by default, and inert unless the joint CP-SAT co-opt path is
+# active (co_optimizing_lx_planning and layout_solver == "cpsat"). Ops a
+# spyre_hint or for_each_tile loop already tiles keep that tiling.
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True

@@ -156,6 +156,104 @@ def test_residency_dtype_and_unknown_geometry():
     )
 
 
+def _activation(cores, run, elems=512 * 704, trips=128):
+    """A one-input, one-output arithmetic op reading ``run`` contiguous bytes per core."""
+    return cm.OpFeatures(
+        name="gelu",
+        is_reduction=False,
+        out_elems=elems,
+        cores=cores,
+        dtype_bytes=2,
+        loop_trip=trips,
+        transport_read_run_bytes=run,
+        transport_tile_elems=elems,
+        transport_compute_read=True,
+        args=[
+            cm.ArgTraffic("in", "input", False, elems, loop_factor=trips),
+            cm.ArgTraffic("out", "output", True, elems, loop_factor=trips),
+        ],
+    )
+
+
+def test_compute_read_prices_a_stick_split_at_an_uncalibrated_count():
+    """An activation over [512 rows, 11 stick planes] reads HBM once.
+
+    Eight row-slices read 90 KB runs; splitting the stick axis 11 ways (2 x 11 = 22
+    cores) shrinks the run to one 128 B stick. Both choices used to cost the same:
+    the law skipped arithmetic ops, and 22 is not a calibrated copy count.
+    """
+    p = cm.CostParams()
+    elems, trips = 512 * 704, 128
+    rows8, sticks22 = _activation(8, 90112), _activation(22, 128)
+    assert cm.transport_dma_cost_available(sticks22, p)
+    assert cm._transport_dma_excess_ns([rows8], p) == 0
+    payload = elems * 2
+    per_trip = (payload / 128) * p.transport_dma_ns_per_request[16]
+    per_trip -= payload / p.bw_peak_gbps
+    assert float(cm._transport_dma_excess_ns([sticks22], p)) == pytest.approx(
+        per_trip * trips
+    )
+    # A plain copy never runs at an uncalibrated count, so it stays unpriced there.
+    copy = replace(sticks22, transport_compute_read=False)
+    assert not cm.transport_dma_cost_available(copy, p)
+    assert cm._transport_dma_excess_ns([copy], p) == 0
+    # The solver sees the same choice through the symbolic core count.
+    cores = sympy.Symbol("cores", integer=True, positive=True)
+    expr = cm._transport_dma_excess_ns([replace(sticks22, cores=cores)], p)
+    assert float(expr.subs(cores, 22)) == pytest.approx(per_trip * trips)
+    assert expr.subs(cores, 16) == expr.subs(cores, 22)
+    assert 0 < expr.subs(cores, 32) < expr.subs(cores, 22)
+
+
+@pytest.mark.parametrize("cores", [16, 22])
+def test_arithmetic_transport_replaces_the_general_read_burst_charge(cores):
+    """The request estimate has one owner after enabling arithmetic transport."""
+    p = cm.CostParams()
+    op = _activation(cores, 128)
+    op = replace(op, args=[replace(op.args[0], read_run_bytes=128), op.args[1]])
+    payload = op.transport_tile_elems * op.dtype_bytes
+    expected = op.loop_trip * (
+        payload / 128 * p.transport_dma_ns_per_request[16] - payload / p.bw_peak_gbps
+    )
+    assert cm._transport_dma_excess_ns([op], p) == pytest.approx(expected)
+    assert cm._read_burst_excess_ns([op], p) == 0
+
+    # Without transport geometry, the general burst path retains its calibrated
+    # counts only. The arithmetic extension at 22 cores is an explicit assumption.
+    general = replace(op, transport_read_run_bytes=None, transport_tile_elems=None)
+    assert cm._transport_dma_excess_ns([general], p) == 0
+    assert cm._read_burst_excess_ns([general], p) == pytest.approx(
+        expected if cores == 16 else 0
+    )
+
+
+def test_a_mixed_bundle_prices_only_the_arithmetic_read_at_an_uncalibrated_count():
+    """One bundle holding a plain copy, an arithmetic op and a matmul. At 22 cores the
+    copy is unpriced (no copy was calibrated there) and the matmul has no source-run
+    geometry, so only the arithmetic op contributes; at a calibrated count the copy
+    is priced too and the bundle is the sum of its members."""
+    p = cm.CostParams()
+    gelu = _activation(22, 128)
+    copy = replace(gelu, name="copy", transport_compute_read=False)
+    matmul = replace(
+        gelu,
+        name="mm",
+        is_matmul=True,
+        transport_read_run_bytes=None,
+        transport_tile_elems=None,
+        transport_compute_read=False,
+    )
+    alone = cm._transport_dma_excess_ns([gelu], p)
+    assert alone > 0
+    assert cm._transport_dma_excess_ns([copy, gelu, matmul], p) == alone
+    gelu16, copy16 = replace(gelu, cores=16), replace(copy, cores=16)
+    both = cm._transport_dma_excess_ns([copy16, gelu16, matmul], p)
+    assert both == cm._transport_dma_excess_ns(
+        [copy16], p
+    ) + cm._transport_dma_excess_ns([gelu16], p)
+    assert cm._transport_dma_excess_ns([copy16], p) > 0
+
+
 def test_staging_copy_keeps_the_source_request_cost():
     p = cm.CostParams()
     direct = replace(restickify(8, 2), hbm_pattern="")
@@ -473,7 +571,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
     allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    ordinary = allocator._enumerate_core_divisions(consumer, config.sencores)
+    ordinary, _ = allocator._enumerate_core_divisions(consumer, config.sencores)
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.

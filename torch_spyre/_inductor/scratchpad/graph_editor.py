@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
+from torch.fx import Node
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -30,6 +33,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
+    IRNode,
     TensorBox,
     StorageBox,
     ReinterpretView,
@@ -40,8 +44,23 @@ from torch._inductor.ir import (
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.ir import AllReduceAsyncFallback, FixedTiledLayout
 from torch_spyre._inductor.pass_utils import origin_in_graph
+
+# Collectives whose codegen reads exactly one tensor operand, ``inputs[0]``, and
+# only through ``codegen_reference``/``get_layout``: repointing that operand at
+# an addressing-equivalent copy is the complete rewrite.  all_gather and
+# broadcast share that shape but have no test reading a loop carry yet.
+_REWRITABLE_COLLECTIVES = (AllReduceAsyncFallback,)
+
+
+def unwrapped_buffer_name(node: Any) -> str | None:
+    """The name of the buffer under ``node``'s wrappers, or None if unwrappable."""
+    while not isinstance(node, Buffer):
+        node = getattr(node, "data", None)
+        if node is None:
+            return None
+    return node.get_name()
 
 
 class GraphEditor:
@@ -127,8 +146,30 @@ class GraphEditor:
         input: bool,
         private: bool = False,
         lx_view: PerCoreView | None = None,
+        after_fx: Node | None = None,
+        lower_anchor: Operation | None = None,
+        lower_before: Operation | None = None,
     ) -> ComputedBuffer:
-        """Insert a clone; private clones rewire only ``buffer_users``."""
+        """Insert a clone; private clones rewire only ``buffer_users``.
+
+        ``after_fx`` and ``lower_anchor`` relocate the clone to run after
+        ``lower_anchor`` in the lowered operation order (and after ``after_fx``
+        in the FX graph) instead of after the producer.  They exist for the
+        post-loop drain of a resident loop carry, whose value only becomes
+        final after the whole counted loop: the drain must be inserted after the
+        loop's last member, not after the pre-loop initializer.  Both default
+        to ``None``, which keeps every existing caller byte-identical.
+
+        ``lower_before`` is the mirror image for an input clone: it places the
+        lowered clone immediately before ``lower_before`` (the entry of the
+        counted loop its consumers run in) instead of before its first
+        consumer, so a loop-invariant copy runs once rather than every trip.
+        The FX node already sits right after the input placeholder, so only the
+        lowered order moves.
+        """
+        assert lower_anchor is None or lower_before is None, (
+            "a clone has one position: lower_anchor and lower_before exclude each other"
+        )
         if input and lx_view is None:
             raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
@@ -165,7 +206,16 @@ class GraphEditor:
                 )
                 anchors.append(anchor)
             old_users = list(dict.fromkeys(anchors))
-        self.fx_graph.inserting_after(buf_fx)
+        if after_fx is not None:
+            # Post-loop drain: place the FX clone after the whole-loop anchor
+            # (the retained while_loop HOP node) while still reading only
+            # ``buf_fx``, so the loop's carried input is untouched and no cycle
+            # is possible.  The anchor must live in this lowering's graph; the
+            # allocator's plan already re-checked that before committing.
+            assert after_fx.graph is self.fx_graph, (
+                f"FX drain anchor {after_fx} is not in the current lowering graph"
+            )
+        self.fx_graph.inserting_after(after_fx if after_fx is not None else buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
         )
@@ -268,9 +318,21 @@ class GraphEditor:
                     )
 
         self.lowering.operations.remove(new_com_buf)
-        self.lowering.operations.insert(
-            self.lowering.operations.index(buffer_users[0]), new_com_buf
-        )
+        if lower_anchor is not None:
+            # Post-loop drain: insert after the loop's last member (an
+            # Operation object, not a saved index -- earlier clones in the same
+            # push only insert before/after existing ops, so the identity
+            # survives and a stale index cannot).
+            self.lowering.operations.insert(
+                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            )
+        else:
+            # A hoisted input clone goes before its consumers' loop entry; any
+            # other clone goes before its first consumer, as before.
+            before = lower_before if lower_before is not None else buffer_users[0]
+            self.lowering.operations.insert(
+                self.lowering.operations.index(before), new_com_buf
+            )
 
         return new_com_buf
 
@@ -312,9 +374,78 @@ class GraphEditor:
 
             inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
 
-        So instead we just allow ops that wrap a Pointwise or Reduction.
+        So instead we just allow ops that wrap a Pointwise or Reduction.  The
+        one exception is :meth:`replace_collective_operand`, where that swap is
+        the complete rewrite because the collective's codegen reads only
+        ``inputs[0]``.
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
+
+    @staticmethod
+    def collective_operand_name(op: Operation) -> str | None:
+        """The buffer a rewritable collective's operand names, or ``None``.
+
+        ``None`` when ``op`` is not one of ``_REWRITABLE_COLLECTIVES`` or a
+        ``ReinterpretView`` sits on its operand chain: the view would have to be
+        rebuilt around the new storage, and the view object may be shared with
+        another op, so such a consumer is not rewritten.
+        """
+        if not isinstance(op, _REWRITABLE_COLLECTIVES) or len(op.inputs) != 1:
+            return None
+        node = op.inputs[0]
+        while not isinstance(node, Buffer):
+            if not isinstance(node, TensorBox | StorageBox):
+                return None
+            node = node.data
+        return node.get_name()
+
+    def replace_collective_operand(
+        self, op: Operation, old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Make a rewritable collective read (and, for all_reduce, mutate) ``new``.
+
+        The operand's ``TensorBox``/``StorageBox`` wrappers are rebuilt around
+        ``new`` rather than edited, so no IR object shared with another op
+        changes. ``new`` must be addressing-equivalent to ``old_name`` (same
+        layout): the collective's plan is sized from the operand's layout.
+        """
+        if self.collective_operand_name(op) != old_name:
+            raise ValueError(
+                f"{op.get_name()} is not a rewritable collective reading {old_name}"
+            )
+        wrappers = []
+        node = op.inputs[0]
+        while not isinstance(node, Buffer):
+            wrappers.append(type(node))
+            node = node.data
+        old_layout, new_layout = node.get_layout(), new.get_layout()
+        if (
+            old_layout.dtype != new_layout.dtype
+            or list(old_layout.size) != list(new_layout.size)
+            or list(old_layout.stride) != list(new_layout.stride)
+            or old_layout.offset != new_layout.offset
+            or getattr(old_layout, "device_layout", None)
+            != getattr(new_layout, "device_layout", None)
+        ):
+            raise ValueError(
+                f"{new.get_name()} is not addressing-equivalent to {old_name}"
+            )
+        replacement: IRNode = new
+        for wrapper in reversed(wrappers):
+            replacement = wrapper(replacement)
+        op.inputs = [replacement]
+        invalidate_op_read_writes(op)
+        op.get_free_symbol_uses.clear_cache(op)
+
+        new_name = new.get_name()
+        op_name = op.get_name()
+        kept: list[IRNode] = []
+        moved: list[IRNode] = []
+        for user in self.lowering.name_to_users.get(old_name, []):
+            is_op = unwrapped_buffer_name(user) == op_name
+            (moved if is_op else kept).append(user)
+        self.lowering.name_to_users[old_name] = kept
+        self.lowering.name_to_users[new_name].extend(moved)
 
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str

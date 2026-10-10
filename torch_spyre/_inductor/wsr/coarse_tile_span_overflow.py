@@ -248,11 +248,15 @@ def _dims_to_hints(
     for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
         if is_reduction:
             reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-            if host_dim >= len(reduction_ranges):
+            # host_dim counts the non-size-1 reduction dims (the squeezed
+            # frame _supports_reduction_range_tiling documents), while the
+            # applier divides the reduction_ranges entry that dim sits at.
+            not_one = [i for i, r in enumerate(reduction_ranges) if r != 1]
+            if host_dim >= len(not_one):
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    f"host_dim={host_dim} is out of bounds for reduction ranges "
-                    f"{reduction_ranges}."
+                    f"host_dim={host_dim} is out of bounds for the {len(not_one)} "
+                    f"non-size-1 dims of reduction ranges {reduction_ranges}."
                 )
             # _bmm_k_symbol resolves the single reduction-only symbol for BMM K
             # and, since span_overflow_hint_analysis widened its gate, for a
@@ -267,11 +271,11 @@ def _dims_to_hints(
                 reduction_pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
             except (StopIteration, AttributeError, TypeError, ValueError):
                 reduction_pos = None
-            if reduction_pos != host_dim:
+            if reduction_pos != not_one[host_dim]:
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
                     f"reduction loop variable {loop_var} maps to reduction range "
-                    f"position {reduction_pos}, expected {host_dim}."
+                    f"position {reduction_pos}, expected {not_one[host_dim]}."
                 )
             coord = loop_var
         else:

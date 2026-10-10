@@ -541,8 +541,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
     // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
     // per-stream FIFO like every other op; overlap with device compute comes
     // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
-    // its barrier. The inline synchronize() it triggers only drains S_prep, so
-    // it never blocks device compute on S_dev.
+    // its barrier.
     role_ = StreamRole::Prep;
 
     // Create the host compute handle at construction time.
@@ -553,6 +552,15 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
+
+  /**
+   * @brief Resolve a symbolic_args payload to a vector of HostComputeArgs.
+   *
+   * NOTE: kDimension is not yet implemented; only kAddress is supported.
+   */
+  static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
+      const std::vector<at::Tensor>& tensors,
+      const std::vector<SymbolicArg>& symbolic_args);
 
  private:
   size_t correction_size_;  ///< byte count of the correction blob

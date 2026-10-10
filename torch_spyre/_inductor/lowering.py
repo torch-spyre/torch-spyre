@@ -41,6 +41,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
     DEVICE_NAME,
+    DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -149,17 +150,21 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    An overload is eligible if it appears in either ``lowering.decompositions``
+    (the Spyre+Inductor merged table) *or* ``torch._decomp.get_decompositions``
+    (the raw upstream table that ``make_fallback``'s CI guard checks directly).
+    Checking both tables closes the gap where an overload is present in the
+    global post-autograd table (e.g. via ``_refs`` registrations) but absent
+    from Inductor's decomposition table — which is what caused the CI guard to
+    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
     """
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
             if (
                 overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+                or bool(torch._decomp.get_decompositions([overload]))
+            ) and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -1116,13 +1121,19 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    if min is None and max is None:
+        raise Unsupported("clamp requires at least one bound")
+    # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
+    # encoding is finite. FP32 has IEEE infinities, so preserve those too.
+    dtype = x.get_dtype()
+    limit = float("inf") if dtype == torch.float32 else DLFLOAT16_MAX
     if min is None:
-        min = torch.finfo(torch.float16).min
+        min = -limit
     if max is None:
-        max = torch.finfo(torch.float16).max
+        max = limit
     pw = Pointwise.create(
         device=x.get_device(),
-        dtype=x.get_dtype(),
+        dtype=dtype,
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
             x.make_loader()(index), min, max
         ),
@@ -1423,37 +1434,6 @@ def lower_restickify(x):
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=base.get_size(),
-        origin_node=V.get_current_node(),
-        traceback=x.get_traceback(),
-    )
-
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.compact)
-def lower_compact(x):
-    # Just emit a pointwise op here. At this point we only know that
-    # 1) the host output layout should be the same as the host input layout
-    # 2) the device output layout should be the default for the host layout
-    # 3) we don't know the device input layout
-    #
-    # Later, during Opspec generation we have the input device layout and
-    # there we can decide to emit an identity or restickify and slice.
-
-    # Here we don't unwrap because we need to know what dimensions
-    # Pytorch is reasoning on.
-    x.realize()
-    loader = x.make_loader()
-
-    def inner_fn(index):
-        return loader(index)
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
@@ -1925,6 +1905,9 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if not skip_cast:
+        # Spliced loop bodies no longer have FX bindings for splitting this cast.
+        converted_condition.realize()
 
     result = lowering.where(converted_condition, converted_self, converted_other)
 
