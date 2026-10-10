@@ -25,6 +25,17 @@ test_suite_config:
             # once a fused LX consumer pins the layout. Fine standalone (free
             # output layout); the standalone test_conv2d case validates the fix.
             - LxPlanning.*::test_conv2d_1x6x128_patch16_bias_lx_planning_(pointwise|reduction)
+            # Grouped conv2d (groups != 1) lowers via conv2d_via_bmm_decomp's
+            # im2col + batched-matmul path. Under the LX-planning wrap the fused
+            # pointwise/reduction consumer pins the conv output, and
+            # propagate_layouts finds no supported output layout for that fused
+            # op over the grouped-conv result ("buf<N> (aten.add.Tensor): no
+            # supported output layout found ..."). Same test-only pinning root
+            # as the patch-embed case above; production never pins conv output
+            # ("convolution" is in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE). Correct in
+            # the default config -- the standalone
+            # test_conv2d_1x16x32_ksize3_groups2 case validates the numerics.
+            - LxPlanning.*::test_conv2d_1x16x32_ksize3_groups2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
@@ -39,7 +50,7 @@ test_suite_config:
             # (backend follow-up on PR #3284).
           mode: xfail
         - names:
-            - LxPlanning.*::test_(all_dim|all_full|any_dim|any_full|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_(all_dim|all_full|any_dim|any_full|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|conv3d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)
           mode: mandatory_success
           tags:
             - ops__inductor-reduction
