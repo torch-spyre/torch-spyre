@@ -35,7 +35,8 @@ entry names its artifact by the four hash inputs plus kind and ref:
      "tags": [{"artifact": {...}, "tag": "...", "tag_family": "...", "ref": "", "props": {}}],
      "results": [{"artifact": {...}, "run_id": "<uuid>", "test_type": "unit", "state": "passed",
                   "arch": "", "result_kind": "", "duration_s": 0.0, "props": {}}]}
-with "artifact" = {"component", "artifact_name", "id12", "arch", "kind", "ref"}.
+with "artifact" = {"component", "artifact_name", "id12", "arch", "kind", "ref"}, plus an optional
+"content_digest" (the registry digest of an image whose ref is a tag) for its artifact_refs row.
 
 A release manifest is JSON:
     {"name": "<release name>", "date": "YYYY-MM-DD", "family": "<tag family of name>",
@@ -119,7 +120,15 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
 # The keys each batch entry may carry. An unknown key is refused: a misspelled one would
 # otherwise leave its column defaulted, and the row would land looking valid.
 BATCH_KEYS = {
-    "artifact": {"component", "artifact_name", "id12", "arch", "kind", "ref"},
+    "artifact": {
+        "component",
+        "artifact_name",
+        "id12",
+        "arch",
+        "kind",
+        "ref",
+        "content_digest",
+    },
     # An entry names its artifact by `artifact` (the hash inputs, authoritative) or by `spec`
     # (any resolver spec, resolved with the rest of the options).
     "artifacts": {
@@ -178,6 +187,7 @@ def batch_identity(a: dict) -> ArtifactIdentity:
         arch=DerivedId.arch(a.get("arch", "")),
         kind=a.get("kind") or "image",
         ref=a.get("ref", ""),
+        content_digest=a.get("content_digest", ""),
     )
 
 
