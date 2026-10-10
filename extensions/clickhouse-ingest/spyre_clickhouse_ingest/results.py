@@ -671,11 +671,174 @@ def _bench_entries(records: list) -> list:
 
 
 # quality / regression_eligible come from a spyre-dashboard migration.
-# Omit rather than ALTER ADD when they have not been applied.
-_BENCHMARK_RUN_OPTIONAL_COLUMNS = ("run_type", "quality", "regression_eligible")
+# Soft-omit rather than ALTER ADD when they have not been applied (forward runs).
+_BENCHMARK_RUN_OPTIONAL_COLUMNS = (
+    "run_type",
+    "quality",
+    "regression_eligible",
+)
+
+# Backfill scalars for Spyre View Run Evidence. When a run carries these, they
+# are REQUIRED — soft-omitting then inserting would source_file-dedup a later
+# retry and permanently lose the metadata. Check before insert; fail until present.
+_BENCHMARK_RUN_BACKFILL_COLUMNS = (
+    "is_backfill",
+    "historical_measurement_timestamp",
+    "replay_timestamp",
+)
+
+
+class BackfillSchemaIncomplete(RuntimeError):
+    """benchmark_runs is missing columns required for a deliberate backfill insert."""
+
+
+def parse_historical_measurement(value: str) -> datetime:
+    """Parse YYYY-MM-DD as UTC midnight. Rejects unpadded dates (e.g. 2026-9-6)."""
+    raw = (value or "").strip()
+    if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    y, m, d = raw.split("-")
+    if not (y.isdigit() and m.isdigit() and d.isdigit()):
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    if len(y) != 4 or len(m) != 2 or len(d) != 2:
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    try:
+        return datetime(int(y), int(m), int(d), tzinfo=UTC)
+    except ValueError as e:
+        raise ValueError(
+            f"historical measurement must be YYYY-MM-DD, got {value!r}"
+        ) from e
+
+
+def parse_replay_timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 / ClickHouse-friendly timestamp to aware UTC datetime.
+
+    Rejects date-only values (e.g. ``2026-10-07``): fromisoformat would accept
+    them as midnight, which is not a real replay wall-clock. Require a time
+    component (``T`` or a space before HH:MM).
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f"replay timestamp must be non-empty ISO-8601, got {value!r}")
+    # Date-only YYYY-MM-DD — fromisoformat accepts it as 00:00:00; refuse.
+    if "T" not in raw and " " not in raw:
+        raise ValueError(
+            f"replay timestamp must include a time component (not date-only), got {value!r}"
+        )
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(f"replay timestamp must be ISO-8601, got {value!r}") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _require_nonblank_cli(name: str, value) -> str | None:
+    """None = option omitted; non-None must strip to a non-empty value or raise.
+
+    Distinguishes omitted (forward nightly) from ``--flag ' '`` / ``--flag ''``,
+    which must fail before connect so source_file dedup cannot lock out a retry.
+    """
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if not stripped:
+        raise ValueError(
+            f"{name} was supplied blank (whitespace/empty); "
+            f"omit the flag for a forward run, or pass a real value"
+        )
+    return stripped
+
+
+def build_backfill_meta(
+    *,
+    is_backfill: bool = False,
+    historical_measurement=None,
+    replay_timestamp=None,
+) -> dict:
+    """Parse CLI backfill args once. Empty dict = forward nightly (no scalars).
+
+    ``None`` means the option was omitted. A supplied blank (``''`` / ``' '``)
+    raises ValueError before any ClickHouse connect or XML write. Does not touch
+    created_at — historical day lives only in historical_measurement_timestamp.
+    """
+    hist = _require_nonblank_cli("--historical-measurement", historical_measurement)
+    replay = _require_nonblank_cli("--replay-timestamp", replay_timestamp)
+    if not is_backfill and hist is None and replay is None:
+        return {}
+    meta: dict = {}
+    if is_backfill or hist is not None or replay is not None:
+        # Timestamps without the flag still mark the row; drawer needs the bit.
+        meta["is_backfill"] = 1
+    if is_backfill and hist is None:
+        print(
+            "  [warn] --is-backfill without --historical-measurement — "
+            "drawer Historical measurement will be empty",
+            file=sys.stderr,
+        )
+    if hist is not None:
+        meta["historical_measurement_timestamp"] = parse_historical_measurement(hist)
+    if replay is not None:
+        meta["replay_timestamp"] = parse_replay_timestamp(replay)
+    return meta
+
+
+def apply_backfill_meta(run_meta: dict, meta: dict) -> None:
+    """Merge pre-parsed backfill scalars onto a benchmark/kernel run_meta."""
+    if meta:
+        run_meta.update(meta)
+
+
+def apply_backfill_args(
+    run_meta: dict,
+    *,
+    is_backfill: bool = False,
+    historical_measurement=None,
+    replay_timestamp=None,
+) -> None:
+    """Parse + attach backfill scalars (test helper; main uses build_backfill_meta)."""
+    apply_backfill_meta(
+        run_meta,
+        build_backfill_meta(
+            is_backfill=is_backfill,
+            historical_measurement=historical_measurement,
+            replay_timestamp=replay_timestamp,
+        ),
+    )
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
+
+
+def _run_meta_wants_backfill(run_meta: dict) -> bool:
+    return any(k in run_meta for k in _BENCHMARK_RUN_BACKFILL_COLUMNS)
+
+
+def require_backfill_columns(client, run_meta: dict) -> None:
+    """Raise BackfillSchemaIncomplete if run_meta needs columns the table lacks.
+
+    Must run before insert so a missing-migration attempt does not write a row
+    that source_file-dedup would block on retry after the schema migration.
+    """
+    if not _run_meta_wants_backfill(run_meta):
+        return
+    absent = _absent_columns(client, "benchmark_runs", _BENCHMARK_RUN_BACKFILL_COLUMNS)
+    if absent:
+        raise BackfillSchemaIncomplete(
+            "benchmark_runs missing backfill columns "
+            f"{', '.join(sorted(absent))} — apply the dashboard migration "
+            "before retrying; not inserting so source_file stays free"
+        )
 
 
 def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
+    # Refuse to soft-drop backfill scalars: that would lock out a corrected retry.
+    require_backfill_columns(client, run_meta)
+
     quality, eligible = classify_run_quality(run_meta.get("version_info"))
     values = {
         "run_id": run_id,
@@ -690,6 +853,16 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
         "quality": quality,
         "regression_eligible": eligible,
     }
+    # Backfill scalars only when the caller set them — forward nightly omit so
+    # CH defaults (0 / NULL) keep the drawer Unavailable.
+    if "is_backfill" in run_meta:
+        values["is_backfill"] = int(run_meta["is_backfill"])
+    if "historical_measurement_timestamp" in run_meta:
+        values["historical_measurement_timestamp"] = _naive_utc(
+            run_meta["historical_measurement_timestamp"]
+        )
+    if "replay_timestamp" in run_meta:
+        values["replay_timestamp"] = _naive_utc(run_meta["replay_timestamp"])
     columns = list(values)
     absent = _absent_columns(client, "benchmark_runs", _BENCHMARK_RUN_OPTIONAL_COLUMNS)
     if absent:
@@ -1514,6 +1687,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
         "all recorded; by default that is a warning and the cases still land",
     )
+    # Backfill/replay — deliberate replays only. Forward nightlies leave these unset so
+    # Run Evidence shows Unavailable. Never rewrite created_at.
+    parser.add_argument(
+        "--is-backfill",
+        action="store_true",
+        help="Mark this ingest as a deliberate historical replay (Is backfill).",
+    )
+    parser.add_argument(
+        "--historical-measurement",
+        default=None,
+        help="UTC calendar day YYYY-MM-DD being filled (Historical measurement). "
+        "Not created_at. Omit on forward nightlies; blank/whitespace is rejected.",
+    )
+    parser.add_argument(
+        "--replay-timestamp",
+        default=None,
+        help="Wall-clock ISO-8601 UTC when the replay/ingest ran (Replay timestamp). "
+        "Must include a time (e.g. 2026-10-07T15:30:00Z); date-only is rejected. "
+        "Omit on forward nightlies; blank/whitespace is rejected.",
+    )
     # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
     # behaving exactly as before -- this script runs from inside a BAKED image, so old images
     # and new ones coexist for as long as it takes every product image to be rebuilt.
@@ -1550,6 +1743,19 @@ def main(argv=None):
     args.write_v1 = args.schema in ("v1", "both")
     args.write_v2 = args.schema in ("v2", "both")
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+
+    # Validate backfill CLI once before any connect / XML write. Invalid values must
+    # fail even when the dir has only test-result XML, and must not let a preceding
+    # junit file commit first.
+    try:
+        backfill_meta = build_backfill_meta(
+            is_backfill=args.is_backfill,
+            historical_measurement=args.historical_measurement,
+            replay_timestamp=args.replay_timestamp,
+        )
+    except ValueError as e:
+        print(f"  [error] backfill args: {e}", file=sys.stderr)
+        sys.exit(2)
 
     if args.xml_file:
         xml_files = [Path(args.xml_file)]
@@ -1592,6 +1798,15 @@ def main(argv=None):
     # was going to write. Both columns have been live on prod for months, and the v2 tables
     # have neither and need neither. Schema changes belong in the DDL, not in the writer;
     # _absent_columns() below already degrades gracefully if a column really is missing.
+
+    # Deliberate backfill must not soft-drop columns then insert: source_file dedup would
+    # block a post-migration retry. Fail before any XML write when columns are absent.
+    if backfill_meta and args.write_v1:
+        try:
+            require_backfill_columns(client, backfill_meta)
+        except BackfillSchemaIncomplete as e:
+            print(f"  [error] {e}", file=sys.stderr)
+            sys.exit(2)
 
     total_cases = 0
     total_benchmarks = 0
@@ -1641,6 +1856,7 @@ def main(argv=None):
             )
             if run_meta is None:
                 continue
+            apply_backfill_meta(run_meta, backfill_meta)
 
             # v1-table read, so it only applies when v1 is being written. The v2 path has its
             # own dedup (benchmarks_already_ingested) against its own table.
@@ -1710,6 +1926,7 @@ def main(argv=None):
             )
             if run_meta is None:
                 continue
+            apply_backfill_meta(run_meta, backfill_meta)
 
             # A perf run uploads report.xml alongside the spyre/cpu kernel-report
             # XMLs. Those kernel reports are benchmark XMLs (classname carries
