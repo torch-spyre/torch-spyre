@@ -131,18 +131,19 @@ jobs:
 
       # gh is required by /code-review to pull diff and post comments.
       # Installed under the same RUNNER_TEMP home as claude so both binaries
-      # follow the same path rule.
+      # follow the same path rule. Version is pinned and verified against the
+      # release checksum file so the binary is stable across runs.
       - name: Install GitHub CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           export HOME="${RUNNER_TEMP}/claude-home"
-          ver="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/cli/cli/releases/latest \
-            | grep -oP '"tag_name":\s*"v\K[^"]+')"
-          curl -fsSL "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_amd64.tar.gz" \
-            | tar -xz -C /tmp
-          install -m 0755 "/tmp/gh_${ver}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
+          ver=2.102.0
+          tarball="gh_${ver}_linux_amd64.tar.gz"
+          base="https://github.com/cli/cli/releases/download/v${ver}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSL "${base}/gh_${ver}_checksums.txt" | grep " ${tarball}\$" | sha256sum -c -
+          tar -xzf "$tarball"
+          install -D -m 0755 "gh_${ver}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
 
       - name: Claude review
         id: claude

@@ -1,5 +1,12 @@
 /code-review __PR_NUMBER__ --comment
 
+torch-spyre is installed as an editable install at /home/senuser/torch-spyre, built
+from the image commit. You can check out the PR's Python code there with:
+  git -C /home/senuser/torch-spyre fetch origin refs/pull/__PR_NUMBER__/head
+  git -C /home/senuser/torch-spyre checkout FETCH_HEAD
+This makes imports pick up the PR code while leaving _C.so unchanged. C++ changes
+cannot be verified without a rebuild.
+
 Verify the correctness of all modified behavior, using the provided Spyre hardware.
 
 Be sure to validate that all new behavior is covered by tests. Check that:
