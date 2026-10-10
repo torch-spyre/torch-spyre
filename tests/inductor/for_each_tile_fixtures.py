@@ -233,6 +233,42 @@ def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def nested_split_m_then_k_hinted_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """nested_split_m_then_k_fn, with a spyre_hint inside the INNER for_each_tile's body.
+
+    Regression fixture for cyang49's PR #5057 review: the inner scan's combine-fn
+    subgraph is reached only through the outer scan's own combine-fn subgraph, not
+    visible to a root-level-only walk. By the time the outer scan's combine-fn is
+    snapshotted, Inductor has already decomposed the inner scan into its own
+    while_loop (verified empirically), so the inner hint's recovery is actually
+    carried by that inner for_each_tile's own collect/recover cycle running before
+    the outer one -- not by any recursion into the outer scan's snapshot. This
+    fixture pins that the hint still survives end to end regardless.
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+
+        def inner_body(acc, inner_ops):
+            x_inner_tile, y_inner_tile = inner_ops
+            with spyre_hint(work_div={"K": 2}):
+                return acc + x_inner_tile @ y_inner_tile, None
+
+        m_tile = x_tile.shape[0]
+        final, _ = for_each_tile(
+            inner_body,
+            (x_tile, y_whole),
+            dims=(-1, 0),
+            tile_size=64,
+            init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+        )
+        return None, final
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
 def nested_two_inner_loops_shared_init_fn(
     X: torch.Tensor, Y: torch.Tensor
 ) -> torch.Tensor:
@@ -1230,6 +1266,64 @@ def paged_gather_kv_reference(
     for p in PAGE_ORDER:
         acc = acc + (qf @ kf[p].transpose(0, 1)) @ vf[p]
     return acc
+
+
+def paged_gather_kv_one_hinted_fn(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    table: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Two sibling paged_gather_kv_fn-shaped scans; only the second carries a
+    spyre_hint on its K/V-page gather and matmuls, like spyre-inference's real
+    page_attn_head_major_prefill_kernel block_body (K/V gather + Q@K^T, P@V).
+
+    Regression fixture for recover_spyre_hints's scan<->while_loop_body
+    positional pairing (torch-spyre PR #5057 / cyang49's review): the first
+    scan is deliberately unhinted so collect_spyre_hints must still snapshot
+    it (as an empty entry) -- otherwise the second scan's hinted body would
+    shift out of alignment against `body_nodes` in
+    _recover_hop_subgraph_hints and lose its hint.
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    def plain_body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        k_page = k_all.index_select(0, page_idx).squeeze(0)
+        v_page = v_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ k_page.transpose(0, 1)
+        return acc + scores @ v_page, None
+
+    def hinted_body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        matmul_split = {"Lq": 4}
+        with spyre_hint(named_dims=["Pool", "Hs"], work_div=matmul_split):
+            k_page = k_all.index_select(0, page_idx).squeeze(0)
+            v_page = v_all.index_select(0, page_idx).squeeze(0)
+        with spyre_hint(named_dims=["Lq", "Pool"], work_div=matmul_split):
+            scores = q_whole @ k_page.transpose(0, 1)
+        with spyre_hint(named_dims=["Lq", "Hs"], work_div=matmul_split):
+            out_tile = scores @ v_page
+        return acc + out_tile, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    a, _ = for_each_tile(
+        plain_body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    b, _ = for_each_tile(
+        hinted_body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return a + b
 
 
 # Half of PAGE_LQ (32): like NESTED_SOFTMAX_OUTER_TILE_SIZE above, chosen so

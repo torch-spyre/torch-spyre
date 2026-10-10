@@ -5015,5 +5015,216 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
         self.assertTrue(readers)
 
 
+class TestRecoverSpyreHints(unittest.TestCase):
+    """collect_spyre_hints/recover_spyre_hints: scan<->while_loop_body hint
+    recovery through decompose_scan_to_while_loop's retrace.
+    """
+
+    def test_one_unhinted_scan_does_not_block_the_other(self):
+        """Two sibling for_each_tile scans (paged_gather_kv_fn's K/V-page
+        gather + Q@K^T, P@V shape, matching spyre-inference's real
+        page_attn_head_major_prefill_kernel block_body); only the second
+        carries a spyre_hint.
+
+        Pins cyang49's PR #5057 review blocker: collect_spyre_hints used to
+        skip snapshotting a scan with no hint, which desynced the positional
+        pairing recover_spyre_hints relies on against `body_nodes` (always
+        one entry per scan) -- so the one unhinted sibling scan here used to
+        make recovery skip the *other*, hinted scan's body too, not just its
+        own. collect_spyre_hints must snapshot every scan unconditionally for
+        this pairing to hold.
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import (
+            paged_gather_kv_inputs,
+            paged_gather_kv_one_hinted_fn,
+        )
+
+        k_pages, v_pages, table, q = paged_gather_kv_inputs()
+        k_pages = k_pages.to(DEVICE_NAME)
+        v_pages = v_pages.to(DEVICE_NAME)
+        table = table.to(DEVICE_NAME)
+        q = q.to(DEVICE_NAME)
+
+        _out, gm = capture_post_grad_while_loop(
+            paged_gather_kv_one_hinted_fn, (k_pages, v_pages, table, q)
+        )
+
+        body_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "get_attr" and "while_loop_body_graph" in n.target
+        ]
+        self.assertEqual(len(body_nodes), 2, "expected one body per scan site")
+
+        # body_nodes is in graph.nodes ENCOUNTER order, which is what positional
+        # pairing promises -- not the numeric name suffix (verified: the first-
+        # encountered body here is actually named "..._0_1", the second
+        # "..._0_0", scrambled relative to call order). The fixture's first
+        # for_each_tile call (plain_body) is unhinted, its second (hinted_body)
+        # carries the hint, so the FIRST body in this list must be the unhinted
+        # one and the SECOND must be the hinted one -- asserted in that order,
+        # not sorted, so a hint landing on the wrong body would fail this test
+        # instead of passing by coincidence (cyang49's review suggestion).
+        unhinted_body, hinted_body_node = body_nodes
+
+        def hinted_nodes_of(body_node):
+            sub_gm = getattr(gm, body_node.target)
+            return [
+                n
+                for n in sub_gm.graph.nodes
+                if n.op == "call_function" and n.meta.get("custom")
+            ]
+
+        self.assertEqual(
+            hinted_nodes_of(unhinted_body),
+            [],
+            f"{unhinted_body.target} is the unhinted sibling scan's body and "
+            "must recover no hints",
+        )
+
+        hinted_nodes = hinted_nodes_of(hinted_body_node)
+        self.assertEqual(
+            len(hinted_nodes),
+            3 + 4,
+            f"{hinted_body_node.target} is the hinted scan's body: expected "
+            "the gather+squeeze pair x2, the transpose+mm pair, and the final "
+            "mm to all recover their hint",
+        )
+        # Verify actual hint CONTENT, not just a count: hinted_body_fn's three
+        # spyre_hint(...) blocks each get their own hint id (_hint_0/1/2), and
+        # the gather/squeeze pair's work_div must specifically be {"Lq": 4} --
+        # a hint recovered from the wrong snapshot entry could still produce
+        # the right count with the wrong content.
+        gather_squeeze = [
+            n for n in hinted_nodes if n.target in (torch.ops.aten.index.Tensor,)
+        ]
+        self.assertTrue(gather_squeeze, "expected at least one recovered gather")
+        for n in gather_squeeze:
+            self.assertEqual(
+                n.meta["custom"].get("_hint_0", {}).get("work_div"),
+                {"Lq": 4},
+                f"{n.target} recovered the wrong hint content",
+            )
+
+    def test_nested_scan_hint_recovers(self):
+        """A spyre_hint inside a nested for_each_tile's INNER body still survives
+        to the final compiled graph.
+
+        Pins cyang49's PR #5057 review inference that nested scan subgraphs might
+        not be discovered recursively (collect_spyre_hints/_scan_combine_subgraphs
+        only walk a graph's own direct call_function nodes, not into a reached
+        subgraph). Verified empirically (see _scan_combine_subgraphs's docstring):
+        by the time the outer scan's combine-fn is snapshotted, the inner scan
+        has already decomposed into its own while_loop, so there is no pending
+        inner *scan* subgraph for a root-level-only walk to miss -- the inner
+        for_each_tile's own collect/recover cycle (running before the outer one)
+        is what actually carries this hint through. This test pins the
+        end-to-end outcome rather than the internal mechanism, so it still catches
+        a regression if a future torch version changes that ordering.
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import M, K, N, nested_split_m_then_k_hinted_fn
+
+        X = torch.randn(M, K, dtype=torch.float16, device=DEVICE_NAME)
+        Y = torch.randn(K, N, dtype=torch.float16, device=DEVICE_NAME)
+
+        _out, gm = capture_post_grad_while_loop(nested_split_m_then_k_hinted_fn, (X, Y))
+
+        def find_hinted_nodes(graph_module):
+            found = []
+            for node in graph_module.graph.nodes:
+                if node.op == "call_function" and node.meta.get("custom"):
+                    found.append(node)
+                if node.op == "get_attr":
+                    target = getattr(graph_module, node.target, None)
+                    if isinstance(target, torch.fx.GraphModule):
+                        found.extend(find_hinted_nodes(target))
+            return found
+
+        hinted_nodes = find_hinted_nodes(gm)
+        self.assertEqual(
+            len(hinted_nodes),
+            2,
+            "expected the inner for_each_tile's acc + x @ y to recover its "
+            "hint on both aten.mm.default and aten.add.Tensor, at any "
+            "nesting depth",
+        )
+        for n in hinted_nodes:
+            self.assertEqual(
+                n.meta["custom"].get("_hint_0", {}).get("work_div"),
+                {"K": 2},
+                f"{n.target} recovered the wrong hint content",
+            )
+
+    def test_non_scan_hop_subgraph_is_not_collected(self):
+        """A torch.cond branch alongside a scan must not be snapshotted as if it
+        were a scan combine-fn.
+
+        Pins cyang49's PR #5057 review blocker: the old _is_hop_subgraph_getattr
+        matched "any get_attr whose target is a GraphModule", not specifically a
+        scan's combine_fn -- so a torch.cond branch (or any other HOP subgraph)
+        still present in the graph at collection time would inflate
+        collect_spyre_hints's snapshot count past what
+        _recover_hop_subgraph_hints's while_loop_body_graph-only count could ever
+        match, abandoning recovery for every scan in the graph, not just the
+        unrelated cond. Exercised directly against a hand-built FX graph (no
+        compile needed) since there is no existing fixture combining
+        for_each_tile with a torch.cond left in the graph at collection time.
+        """
+        from torch_spyre._inductor.propagate_hints import _scan_combine_subgraphs
+
+        root = torch.nn.Module()
+
+        scan_sub_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        sg = scan_sub_gm.graph
+        carry = sg.placeholder("carry")
+        x = sg.placeholder("x")
+        add = sg.call_function(torch.ops.aten.add.Tensor, (carry, x))
+        sg.output((add, None))
+        scan_sub_gm.recompile()
+
+        cond_sub_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_sub_gm.graph
+        p = cg.placeholder("x")
+        neg = cg.call_function(torch.ops.aten.neg.default, (p,))
+        cg.output(neg)
+        cond_sub_gm.recompile()
+
+        root.scan_combine_graph_0 = scan_sub_gm
+        root.cond_true_graph_0 = cond_sub_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        pred = graph.placeholder("pred")
+        scan_combine_attr = graph.get_attr("scan_combine_graph_0")
+        graph.call_function(
+            torch.ops.higher_order.scan,
+            (scan_combine_attr, [init], [xs], []),
+        )
+        cond_true_attr = graph.get_attr("cond_true_graph_0")
+        cond_false_attr = graph.get_attr("cond_true_graph_0")
+        graph.call_function(
+            torch.ops.higher_order.cond,
+            (pred, cond_true_attr, cond_false_attr, [init]),
+        )
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        found = _scan_combine_subgraphs(gm.graph)
+        self.assertEqual(
+            found,
+            [scan_sub_gm],
+            "expected only the scan's combine_fn, not the cond branch sharing "
+            "the graph",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
