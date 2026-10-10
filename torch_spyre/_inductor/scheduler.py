@@ -762,9 +762,15 @@ class SuperDSCScheduling(BaseScheduling):
             with buf.indent():
                 buf.splice(f"{src_code}")
             if method == "sdsc" and kernel._kernel_uses_hbm_pool():
-                buf.writeline(f", pool_size={kernel.pool_size})")
-            else:
-                buf.writeline(")")
+                buf.writeline(f", pool_size={kernel.pool_size}")
+            # Per-argument host shape/dtype for the launch spec. Passed through
+            # the generated wrapper so it survives a wrapper-cache replay in a
+            # later process, where V.graph no longer exists. Emitted outside
+            # src_code, which is the cache-key and dedup input.
+            launch_args = kernel.launch_args()
+            if launch_args:
+                buf.writeline(f", launch_args={launch_args!r}")
+            buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
             metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
