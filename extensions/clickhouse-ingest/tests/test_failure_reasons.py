@@ -162,3 +162,12 @@ def test_the_reason_vocabulary_matches_the_ddl_check_and_the_bundle_schema():
     assert set(re.findall(r"'([a-z_]+)'", check.group(1))) == FAILURE_REASON_VALUES
     perf = json.loads(BUNDLE_SCHEMA.read_text())["properties"]["perf"]["properties"]
     assert set(perf["failure_reason"]["enum"]) == FAILURE_REASON_VALUES
+
+
+def test_first_failure_names_a_capability_case_and_skips_one_that_names_nothing():
+    acc: dict = {}
+    _first_failure(acc, [{"status": "failed", "properties": []}])
+    assert "first_failure" not in acc
+    op = [("capability.test_type", "model_ops"), ("capability.name", "aten.mm")]
+    _first_failure(acc, [{"status": "error", "properties": op, "fail_message": "boom"}])
+    assert acc["first_failure"] == "aten.mm: boom"

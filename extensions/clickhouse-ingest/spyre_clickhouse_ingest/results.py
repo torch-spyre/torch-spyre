@@ -1286,15 +1286,20 @@ def _leg_failure(state: str, acc: dict, result_props: dict) -> dict:
 
 
 def _first_failure(acc: dict, cases: list) -> None:
-    """Remember the leg's first failing case, as `name: first message line`."""
+    """Remember the leg's first failing case, as `name: first message line`; a capability case
+    is named by its capability.name. Nothing is stored for a case that names nothing."""
     if acc.get("first_failure"):
         return
     for case in cases:
-        if case.get("status") in ("failed", "error"):
-            line = (case.get("fail_message") or "").strip().splitlines()
-            acc["first_failure"] = case.get("name", "") + (
-                f": {line[0]}" if line else ""
-            )
+        if case.get("status") not in ("failed", "error"):
+            continue
+        name = case.get("name") or dict(case.get("properties") or []).get(
+            "capability.name", ""
+        )
+        line = (case.get("fail_message") or "").strip().splitlines()
+        text = name + (f": {line[0]}" if line else "")
+        if text:
+            acc["first_failure"] = text
             return
 
 
@@ -1327,7 +1332,6 @@ def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
         acc["total"] += 1
         acc["failed"] += case.get("status") in ("failed", "error")
         acc["duration_s"] += float(case.get("duration_s", 0) or 0)
-        _first_failure(acc, [case])
 
 
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
