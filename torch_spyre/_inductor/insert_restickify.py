@@ -29,7 +29,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import concretize_index, patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -122,15 +122,44 @@ class InputEdgeSwapHandler(WrapperHandler):
         )
         self._seen: dict = defaultdict(int)
 
+    def _match_concretized(self, name, dep_index, planned):
+        """Match ``dep_index`` against the plan with size symbols concretized.
+
+        With dynamic=True the plan records a read index with symbolic strides
+        (``d0*s21 + d2``) while the live load can carry the concrete stride
+        (``64*d0 + d2``). An exact match then fails, the load silently keeps
+        the un-restickified buffer, and the restickify is dropped as unread.
+        Returns the planned index that matched (so occurrence counting stays
+        keyed on the plan's form) and its swaps, or ``dep_index`` and ``[]``.
+        """
+        # The canonical d* loop symbols; any other symbol is a size symbol.
+        loop_vars = set(self._index_replacements.values())
+        concrete = concretize_index(dep_index, loop_vars)
+        for expected_index, _, _ in planned:
+            if concretize_index(expected_index, loop_vars) == concrete:
+                return expected_index, [
+                    (occurrence, new_name)
+                    for planned_index, occurrence, new_name in planned
+                    if planned_index == expected_index
+                ]
+        logger.debug(
+            "restickify swap skipped for load %s[%s]; planned indices: %s",
+            name,
+            dep_index,
+            [planned_index for planned_index, _, _ in planned],
+        )
+        return dep_index, []
+
     def load(self, name, index):
         dep_index = sympy.sympify(index).xreplace(self._index_replacements)
+        planned = self._swaps_by_name.get(name, ())
         matching = [
             (occurrence, new_name)
-            for expected_index, occurrence, new_name in self._swaps_by_name.get(
-                name, ()
-            )
+            for expected_index, occurrence, new_name in planned
             if expected_index == dep_index
         ]
+        if not matching and planned:
+            dep_index, matching = self._match_concretized(name, dep_index, planned)
         if not matching:
             return super().load(self._name_map.get(name, name), index)
         signature = (name, dep_index)

@@ -1632,6 +1632,124 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Inputs repeat a few small integers so every row has ties (exercising
+        # stability) and fp16 holds every value exactly.
+        ("test_sort", "test_sort_cpu"): {
+            "param_sets": {
+                "2d_dim0_asc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    0,
+                    False,
+                ),
+                "2d_dim0_desc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    0,
+                    True,
+                ),
+                "2d_ties_dim0_asc": (
+                    (torch.arange(64 * 8) % 5).reshape(64, 8).to(torch.float16),
+                    0,
+                    False,
+                ),
+                "2d_ties_dim0_desc": (
+                    (torch.arange(128 * 64) % 7).reshape(128, 64).to(torch.float16),
+                    0,
+                    True,
+                ),
+                "2d_dim0_fp32": (
+                    unique_randn_along_dim((32, 64), dim=0, dtype=torch.float32),
+                    0,
+                    False,
+                ),
+                "3d_ties_dim1": (
+                    (torch.arange(2 * 16 * 64) % 3).reshape(2, 16, 64).half(),
+                    1,
+                    False,
+                ),
+                "4d_ties_dim2_desc": (
+                    (torch.arange(2 * 4 * 8 * 64) % 3).reshape(2, 4, 8, 64).half(),
+                    2,
+                    True,
+                ),
+                "2d_size1_dim0": (
+                    unique_randn_along_dim((1, 64), dim=1),
+                    0,
+                    False,
+                ),
+                # Last (stick) dim, widths that are not a whole number of
+                # sticks: the stable flip pads to a full stick.
+                "2d_ties_last_dim_w60": (
+                    (torch.arange(16 * 60) * 7 % 5).reshape(16, 60).half(),
+                    1,
+                    False,
+                ),
+                "2d_ties_last_dim_w7_desc": (
+                    (torch.arange(16 * 7) * 7 % 5).reshape(16, 7).half(),
+                    1,
+                    True,
+                ),
+                "2d_ties_last_dim_w100": (
+                    (torch.arange(16 * 100) * 7 % 5).reshape(16, 100).half(),
+                    1,
+                    False,
+                ),
+                # Sort-dim sizes topk can't split across cores: padded to the
+                # next size that can (67 -> 68, 127 -> 128, 35 -> 36).
+                "2d_ties_unsplittable_n67_dim0": (
+                    (torch.arange(67 * 16) * 7 % 5).reshape(67, 16).half(),
+                    0,
+                    False,
+                ),
+                "2d_ties_unsplittable_n127_last_dim_desc": (
+                    (torch.arange(16 * 127) * 7 % 5).reshape(16, 127).half(),
+                    1,
+                    True,
+                ),
+                "2d_ties_unsplittable_n35_dim0_desc": (
+                    (torch.arange(35 * 16) * 7 % 5).reshape(35, 16).half(),
+                    0,
+                    True,
+                ),
+            },
+        },
+        ("test_sort_unstable", "test_sort_unstable_cpu"): {
+            "param_sets": {
+                "2d_dim0_asc": (unique_randn_along_dim((8, 64), dim=0), 0, False),
+                "2d_dim0_desc": (unique_randn_along_dim((96, 64), dim=0), 0, True),
+                "2d_ties_dim0": (
+                    (torch.arange(64 * 8) % 5).reshape(64, 8).to(torch.float16),
+                    0,
+                    False,
+                ),
+                "3d_ties_dim1_desc": (
+                    (torch.arange(2 * 16 * 64) % 3).reshape(2, 16, 64).half(),
+                    1,
+                    True,
+                ),
+            },
+        },
+        # Stable sort along the stick dim fails on main: Inductor fuses flip's
+        # gather, neg and topk into one kernel that DeepTools rejects ("There
+        # must be at least one valid candidate"). It passes with #4975.
+        ("test_sort_stick_dim", "test_sort_stick_dim_cpu"): {
+            "param_sets": {
+                "2d_dim1_asc": (
+                    torch.arange(8 * 64, dtype=torch.float16).reshape(8, 64),
+                    1,
+                    False,
+                ),
+                "2d_ties_dim1_desc": (
+                    (torch.arange(8 * 64) % 5).reshape(8, 64).to(torch.float16),
+                    1,
+                    True,
+                ),
+                "1d_ties": (
+                    (torch.arange(64) % 4).to(torch.float16),
+                    0,
+                    False,
+                ),
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -1899,6 +2017,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
                 "2d_size1_dim_0": ([0], cached_randn((1, 256))),
                 "2d_no_dims": ([], cached_randn((67, 256))),
+                # Stick-dim widths that are not a whole number of sticks are
+                # left-padded to a full stick, flipped, and narrowed back.
+                "2d_dim_1_unaligned": ([1], cached_randn((16, 60))),
+                "2d_dim_neg1_unaligned_narrow": ([-1], cached_randn((16, 7))),
+                "2d_dim_1_unaligned_two_sticks": ([1], cached_randn((16, 100))),
+                "3d_dim_2_unaligned": ([2], cached_randn((2, 8, 60))),
                 # Stick-dim reversals are unsupported and, rather than raising,
                 # fault the card, so they cannot run as xfails.
                 "2d_dim_1_stick": ([1], cached_randn((67, 256))),
@@ -7880,6 +8004,127 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_sort_cpu(self, x, dim: int, descending: bool):
+        # Indices are compared too: the decomposition is always stable, so
+        # they must match CPU's stable sort exactly, ties included.
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
+        )
+
+    def test_sort_unstable_cpu(self, x, dim: int, descending: bool):
+        # Without stable=True ties may come out in any order, so only the
+        # values must match CPU; the indices must still pick those values.
+        values, indices = _compile_and_run(
+            lambda x: torch.sort(x, dim=dim, descending=descending), [x], "spyre"
+        )
+        expected = torch.sort(x, dim=dim, descending=descending).values
+        torch.testing.assert_close(values.cpu(), expected)
+        torch.testing.assert_close(x.gather(dim, indices.cpu()), expected)
+
+    def test_sort_dynamic(self):
+        # The unstable path needs no flip, so it compiles with dynamic=True. dim
+        # and descending are literals: dynamic=True would turn closure ints into
+        # SymInts.
+        cases = [
+            ((8, 64), 0, lambda x: torch.sort(x, dim=0)),
+            ((16, 64), 0, lambda x: torch.sort(x, dim=0, descending=True)),
+            ((2, 16, 64), 1, lambda x: torch.sort(x, dim=1, stable=False)),
+            # Along the stick dim: neg feeds topk through a restickify.
+            ((8, 64), 1, lambda x: torch.sort(x, dim=1)),
+        ]
+        for shape, dim, fn in cases:
+            with self.subTest(shape=shape, dim=dim):
+                x = unique_randn_along_dim(shape, dim=dim)
+                torch._dynamo.reset()
+                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
+                expected_values, expected_indices = fn(x)
+                torch.testing.assert_close(values.cpu(), expected_values)
+                torch.testing.assert_close(indices.cpu(), expected_indices)
+
+    def test_sort_stable_dynamic(self):
+        # The stable path flips the input (a gather) and maps indices back with
+        # amax, since a symbolic n can't be a pointwise constant. Inputs repeat
+        # small integers so ties check the stable order. dim and descending are
+        # literals: dynamic=True would turn closure ints into SymInts.
+        cases = [
+            ((16, 64), lambda x: torch.sort(x, dim=0, stable=True)),
+            ((16, 64), lambda x: torch.sort(x, dim=0, descending=True, stable=True)),
+            ((2, 16, 64), lambda x: torch.sort(x, dim=1, stable=True)),
+        ]
+        for shape, fn in cases:
+            with self.subTest(shape=shape):
+                x = (torch.arange(math.prod(shape)) * 7 % 5).reshape(shape).half()
+                torch._dynamo.reset()
+                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
+                expected_values, expected_indices = fn(x)
+                torch.testing.assert_close(values.cpu(), expected_values)
+                torch.testing.assert_close(indices.cpu(), expected_indices)
+
+    def test_sort_unsplittable_with_inf(self):
+        # The pad for an unsplittable sort dim is -inf in topk's key space and
+        # sits at the front, so it loses every tie with a real +-inf element.
+        for dim in (0, 1):
+            with self.subTest(dim=dim):
+                shape = (67, 16) if dim == 0 else (16, 67)
+                x = (torch.arange(67 * 16) * 7 % 5).reshape(shape).half()
+                x.narrow(dim, 0, 2).fill_(float("inf"))
+                x.narrow(dim, 5, 2).fill_(float("-inf"))
+                self.compare_with_cpu(
+                    lambda x, dim=dim: torch.sort(x, dim=dim, stable=True), x
+                )
+
+    def test_sort_int64_rejected(self):
+        # topkvalue/topkindex only bind fp16/fp32, so compile must raise.
+        x = (torch.arange(64 * 8) % 5).reshape(64, 8)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.sort(x, dim=0, stable=True),
+                [x],
+                "spyre",
+            )
+
+    @unittest.skip("fused flip->topk kernel along the stick dim needs #4975")
+    def test_sort_stick_dim_cpu(self, x, dim: int, descending: bool):
+        self.compare_with_cpu(
+            lambda x: torch.sort(x, dim=dim, descending=descending, stable=True), x
+        )
+
+    def test_topk_dynamic_k_split(self):
+        # k > TOPK_MAX_K_PER_CORE (4) must split the k dim across cores. Under
+        # dynamic=True the output's symbolic stride used to be taken for a
+        # scatter row, pinning that dim unsplit ("conflicting legal split
+        # domains"). k and dim are literals: dynamic=True would turn closure
+        # ints into SymInts, which tests a symbolic k rather than a symbolic
+        # shape.
+        cases = [
+            ((8, 64), 0, lambda x: torch.topk(x, 8, dim=0)),
+            ((16, 64), 0, lambda x: torch.topk(x, 8, dim=0)),
+            ((8, 8), 0, lambda x: torch.topk(x, 8, dim=0)),
+            ((128, 64), 0, lambda x: torch.topk(x, 128, dim=0)),
+        ]
+        for shape, dim, fn in cases:
+            with self.subTest(shape=shape, dim=dim):
+                x = unique_randn_along_dim(shape, dim=dim)
+                torch._dynamo.reset()
+                values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
+                expected_values, expected_indices = fn(x)
+                torch.testing.assert_close(values.cpu(), expected_values)
+                torch.testing.assert_close(indices.cpu().long(), expected_indices)
+
+    def test_topk_dynamic_restickified_producer(self):
+        # A computed producer (neg) feeding topk along the stick dim needs a
+        # restickify. Under dynamic=True the planned read index kept the
+        # symbolic stride while the live load used the concrete one, so the
+        # swap was skipped and topk read the stick-dim buffer
+        # (OpSpecValidationError).
+        x = unique_randn_along_dim((8, 64), dim=1)
+        torch._dynamo.reset()
+        fn = lambda x: torch.topk(-x, 4, dim=1)  # noqa: E731
+        values, indices = torch.compile(fn, dynamic=True)(x.to("spyre"))
+        expected_values, expected_indices = fn(x)
+        torch.testing.assert_close(values.cpu(), expected_values)
+        torch.testing.assert_close(indices.cpu().long(), expected_indices)
+
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
 
@@ -8255,6 +8500,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # descending index (see spyre_flip); the arange building that index
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
+
+    def test_flip_unaligned_multi_dim_rejected(self):
+        # A padded (unaligned) stick-dim flip combined with another dim's
+        # gather faults the card, so it must raise before any kernel runs.
+        x = cached_randn((16, 60))
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(lambda x: torch.flip(x, [0, 1]), [x], "spyre")
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)

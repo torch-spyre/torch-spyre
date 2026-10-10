@@ -33,8 +33,9 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
+from torch.fx.experimental.symbolic_shapes import guard_int
 
-from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN, TOPK_MAX_K_PER_CORE
 from .errors import Unsupported
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
@@ -1832,6 +1833,91 @@ def spyre_topk(
     )
 
 
+def _topk_k_splits(k: int) -> bool:
+    """Whether topk can split ``k`` results evenly across the cores.
+
+    Mirrors ``topk_split_domains``: some core count up to ``config.sencores``
+    must divide ``k`` with at most ``TOPK_MAX_K_PER_CORE`` results per core.
+    """
+    return any(
+        k % cores == 0 and k // cores <= TOPK_MAX_K_PER_CORE
+        for cores in range(1, config.sencores + 1)
+    )
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.default, torch.ops.aten.sort.stable]
+)
+def spyre_sort(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sort`` as a full-length topk (k = size of ``dim``).
+
+    topk only returns the largest elements, so an ascending sort runs it on
+    ``-input`` and negates the values back. Among equal keys topk emits the
+    highest index first. That order is allowed unless ``stable=True``; then
+    the input is flipped along ``dim`` beforehand, so the highest flipped
+    index is the lowest original one (the stable order), and ``(n - 1) - i``
+    maps a flipped index back. With dynamic shapes ``n`` is symbolic, which a
+    Spyre pointwise op cannot take as a constant; the flipped indices are a
+    permutation of ``0 .. n-1``, so their ``amax`` along ``dim`` is ``n - 1``.
+    """
+    if input.numel() == 0:
+        # Nothing to reorder, and topk rejects zero-size tensors.
+        return input.clone(), torch.empty_like(input, dtype=torch.int64)
+    if input.dim() == 0:
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    dim = dim % input.dim()
+    n = input.size(dim)
+    if n == 1:
+        # A single-element sort is the identity; skip the reduction entirely.
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    if not input.dtype.is_floating_point:
+        # topkvalue/topkindex (and neg) only bind fp16/fp32 in DeepTools.
+        raise Unsupported(f"sort on a non-floating-point input: {input.dtype}")
+    key = torch.flip(input, [dim]) if stable else input
+    if not descending:
+        key = -key
+    # topk needs k = n to split evenly across cores. When it can't (e.g. a
+    # prime n > 32), front-pad the key with -inf up to the next k that can.
+    # Among equal keys topk emits the highest index first, so a pad comes out
+    # after any real element it ties with: the pads are always the last
+    # k - n results, even when the input holds infinities.
+    k, pad = n, 0
+    if isinstance(n, int) and not _topk_k_splits(n):
+        k = next(
+            (
+                m
+                for m in range(n, config.sencores * TOPK_MAX_K_PER_CORE + 1)
+                if _topk_k_splits(m)
+            ),
+            n,
+        )
+        pad = k - n
+    if pad:
+        key = torch.constant_pad_nd(
+            key, [0, 0] * (input.dim() - 1 - dim) + [pad, 0], float("-inf")
+        )
+    values = torch.ops.spyre.topkvalue(key, k, dim)
+    if not descending:
+        values = -values
+    # topkindex yields the index in the input dtype; every index is exact there
+    # because topk caps n far below fp16's 2048 integer limit.
+    indices = torch.ops.spyre.topkindex(key, k, dim)
+    if pad:
+        values = values.narrow(dim, 0, n)
+        indices = indices.narrow(dim, 0, n) - pad
+    if stable and isinstance(n, torch.SymInt):
+        indices = torch.amax(indices, dim, keepdim=True) - indices
+    elif stable:
+        indices = (n - 1) - indices
+    return values, indices.to(torch.int64)
+
+
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
@@ -3479,6 +3565,8 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 
     out = input
     reversed_any = False
+    # Dims that actually get reversed; size-0/1 dims are skipped below.
+    reversed_dims = [d for d in dims if input.dim() > 0 and input.size(d) > 1]
     for dim in dims:
         # A 0-d tensor accepts flip(0) and is its own reversal; ``size(0)``
         # would raise on it, so skip before asking.
@@ -3487,8 +3575,33 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
             # A dim of size 0 or 1 is its own reversal; index_select would
             # still work, but skipping avoids an empty/degenerate gather.
             continue
-        index = torch.arange(size - 1, -1, -1, device=out.device, dtype=torch.int32)
+        # Along the last (stick) dim the gather's output is restickified, and a
+        # width that is not a whole number of sticks cannot be padded in place
+        # (insert_restickify_padding: "sliced output"). Left-pad to a full
+        # stick, flip, and keep the first ``size`` elements: that part starts
+        # at offset 0, so it stays stick-aligned.
+        pad = 0
+        if dim % out.dim() == out.dim() - 1:
+            # With dynamic shapes the pad would be symbolic, which the
+            # constant_pad_nd lowering can't take; guarding on it only fixes
+            # size % stick, so other sizes keep sharing the graph.
+            pad = guard_int(-size % get_elem_in_stick(out.dtype))
+        if pad and len(reversed_dims) > 1:
+            # A padded last-dim flip after another dim's gather compiles to a
+            # kernel chain that triggers a device ComputeHardwareError.
+            raise Unsupported(
+                "flip of several dims when the last dim is not a whole number "
+                f"of sticks (last dim size {size})"
+            )
+        if pad:
+            out = torch.constant_pad_nd(out, [pad, 0])
+        index = torch.arange(
+            size + pad - 1, -1, -1, device=out.device, dtype=torch.int32
+        )
         out = torch.index_select(out, dim, index)
+        if pad:
+            # aten.flip returns a contiguous tensor; narrow alone is a view.
+            out = out.narrow(dim, 0, size).contiguous()
         reversed_any = True
     # aten.flip always returns a fresh tensor; clone so the no-op case does
     # not alias its input.

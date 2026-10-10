@@ -54,6 +54,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.symbol import SymT, symbol_is_type
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -872,11 +873,17 @@ def _build_indirect_store_subs(
     write_dep = writes[0]
 
     # Extract scatter index symbols (symbols in write_dep.index not in loop
-    # ranges and not a WhileLoop-splice per-iteration loop_var).
+    # ranges, not a WhileLoop-splice per-iteration loop_var, and not a
+    # dynamic-shape size symbol). With dynamic=True a write's strides carry
+    # size symbols such as ``s0``; they are not loop vars either, so without
+    # this exclusion any op with a symbolic stride (e.g. topk) is taken for a
+    # scatter and its dims are pinned unsplit by indirect_access_split_domains.
     all_write_syms = write_dep.index.free_symbols
     loop_syms = set(write_dep.ranges.keys())
     loop_syms |= set(loop_var_ranges_from_dim_hints(op))
-    scatter_index_syms = all_write_syms - loop_syms
+    scatter_index_syms = {
+        s for s in all_write_syms - loop_syms if not symbol_is_type(s, SymT.SIZE)
+    }
 
     if not scatter_index_syms:
         # No scatter symbols found.
@@ -1049,7 +1056,8 @@ class _IndirectIndexFinder:
                     "chained indirect indexing is not supported"
                 )
             self._pending_indirect_index_buf = index_var.name
-            self._pending_indirect_index_size = int(size)
+            # With dynamic=True the gathered dim's size is a symbol (e.g. s21).
+            self._pending_indirect_index_size = concretize_expr(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
@@ -1099,7 +1107,13 @@ def _build_indirect_load_subs(
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
-        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        # Size symbols (dynamic=True strides such as s21) are not loop vars
+        # either, but they are not gather indices.
+        indirect_syms = [
+            s
+            for s in d.index.free_symbols
+            if s not in d.ranges and not symbol_is_type(s, SymT.SIZE)
+        ]
         if len(indirect_syms) > 1:
             raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
         for sym in indirect_syms:

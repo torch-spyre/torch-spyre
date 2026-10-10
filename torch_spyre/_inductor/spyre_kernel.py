@@ -454,7 +454,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
-            self.kernel.indirect_sizes[sym] = int(size)
+            self.kernel.indirect_sizes[sym] = concretize_expr(size)
             return sym
         return sympy_index_symbol(str(index_var))
 
