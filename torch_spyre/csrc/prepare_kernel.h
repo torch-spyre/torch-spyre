@@ -150,6 +150,8 @@ class JobPlanBuilder {
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
   std::vector<flex::CompositeAddress> job_allocation_;
+  /// dynamic allocation size
+  size_t dynamic_size_ = 0;
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
 
