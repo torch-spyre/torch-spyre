@@ -345,19 +345,6 @@ cpsat_time_limit_seconds: float = float(
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
-# Use the C++ (native) permutation-layout packer accelerator, which both
-# simulated-annealing solvers drive (the layout-only one and the joint
-# co-optimizer). The native and Python packers are behaviourally identical
-# (verified bit-for-bit); the native one is faster. Set
-# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
-# to force the pure-Python packer. A missing native class is a stale or
-# incomplete build, not a supported mode, and raises rather than falling back.
-native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 # Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
 # selects. Off by default, and inert unless the joint CP-SAT co-opt path is

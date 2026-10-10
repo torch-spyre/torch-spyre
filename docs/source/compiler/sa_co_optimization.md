@@ -30,7 +30,7 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 ## The search
 
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
-`PermutationBasedLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
+`NativePermutationLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
 identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
