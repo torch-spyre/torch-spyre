@@ -151,11 +151,14 @@ Every new op requires two levels of validation:
 
 2. **Unit tests** — add compiled-path and (if applicable) eager-path tests.
    See the `write-spyre-op-test` skill for details. At minimum:
-   - **Compiled-path test** in `tests/_inductor/test_inductor_ops.py` using
+   - **Compiled-path test** in `tests/inductor/test_inductor_ops.py` using
      `compare_with_cpu()` or `compare()`
    - **Shape variety:** 1D through 4D, stick-aligned (multiples of 64) and
      non-aligned sizes
    - **Default dtype:** `torch.float16`
+   - **Cases that do not work yet** are recorded as expectations (`expect_raise`,
+     strict `expect_fail`), each with an open issue; see "Test Invariants" in
+     `CLAUDE.md`
 
 ---
 
@@ -169,4 +172,4 @@ Every new op requires two levels of validation:
 | SuperDSC | `codegen/compute_ops.py` or `codegen/data_ops.py` |
 | Constants | `constants.py` |
 | Fallback | `fallbacks.py` |
-| Tests | `test_inductor_ops.py` (compiled), `test_ops.py` (eager) |
+| Tests | `test_inductor_ops.py` (compiled), `tests/test_spyre.py` (eager) |

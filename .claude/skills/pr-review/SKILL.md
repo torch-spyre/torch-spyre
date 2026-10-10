@@ -106,6 +106,28 @@ Ensure tests cover the affected path(s).
 - Tests use `ParameterizedTestMeta` for parameterized cases
 - Building-block tests for module-level changes
 
+**Test expectations** (the "Test Invariants" section of `CLAUDE.md`). For any PR that
+adds, changes or removes an `xfail`, `skip`, `expect_*` key or `pytest.raises` in a test:
+
+- No `pytest.xfail(...)` in a test body or helper, and no `try`/`except` that turns an
+  error into an xfail or skip. Use a marker, a `PARAMS` key or `strict_xfail`
+  (**BLOCKER**: the test then cannot XPASS).
+- An xfail is strict, and has `raises=` where the author writes the marker
+  (`@pytest.mark.xfail`, `strict_xfail`). `expect_fail` is a `{case: reason}` mapping
+  that cites the issue. `expect_fail_unstable` needs a reason and an issue and must be
+  an outcome that really varies.
+- A stable rejection or missing feature is an assertion (`expect_raise`, or
+  `pytest.raises(match=...)` with `@expects_raise`), with a `TODO` if it is a missing
+  feature. A failure that kills the process is a `skip`, not an xfail.
+- Every xfail/skip reason describes the failure today and cites an **open** issue
+  (check it with `gh issue view`). A PR that fixes a bug removes its xfail.
+- Inputs are sound: no repeated scatter indices, no mutation of a shared
+  `cached_randn` tensor, a tolerance that is justified.
+- New or renamed tests are still selected by a shard config
+  (`make check-all-configs`).
+- Evidence that comes only from a local run is called out in the PR description; ask
+  for a CI run if it decides an xfail.
+
 ### 7. Work Division
 
 For changes to `torch_spyre/_inductor/work_division.py` or related code:

@@ -37,6 +37,24 @@ Quick reference for reviewing torch-spyre pull requests.
 - [ ] `ParameterizedTestMeta` for parameterized tests
 - [ ] `torch.manual_seed(0xAFFE)` set at class level
 
+## Test Expectations
+
+For a PR that touches `xfail`, `skip`, `expect_*` or `pytest.raises` in tests
+(see "Test Invariants" in `CLAUDE.md`):
+
+- [ ] No `pytest.xfail(...)` in a body or helper, no `try`/`except` that turns an
+  error into an xfail or skip (**BLOCKER**)
+- [ ] xfail is strict, with `raises=` where the marker is written by hand;
+  `expect_fail` is a `{case: reason}` mapping; `expect_fail_unstable` has a reason and
+  an issue
+- [ ] Stable rejections use `expect_raise` / `pytest.raises(match=...)` +
+  `@expects_raise`; process-killing failures are `skip`
+- [ ] Each reason describes the failure today and cites an open issue
+- [ ] A bug fix removes its xfail in the same PR
+- [ ] No repeated scatter indices, no mutation of shared `cached_randn` tensors
+- [ ] `make check-all-configs` passes for new or renamed tests
+- [ ] Evidence from a local-only run is called out
+
 ## Path Impact
 
 - [ ] Eager path changes have `tests/test_spyre.py` or

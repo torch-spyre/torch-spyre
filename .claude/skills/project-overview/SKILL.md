@@ -215,7 +215,7 @@ Key external deps: `torch~=2.13.0`, `sendnn`, `flex`, `dbo-opt` (deeptools)
 
 ```bash
 python3 -m pytest tests/                  # All tests
-python3 -m pytest tests/test_ops.py       # Eager ops
+python3 -m pytest tests/test_spyre.py     # Eager ops
 python3 -m pytest tests/inductor/        # Compiled ops
 python3 -m pytest tests/tensor/           # Layout tests
 ```
