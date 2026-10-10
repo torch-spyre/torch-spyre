@@ -21,6 +21,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,6 +100,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
+    this->valid_elements[{0, 1}] = 1;
     return;
   }
 
@@ -108,7 +110,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   int32_t stick_dim = dim_order[host_rank - 1];
   int64_t stick_size = sparse ? 1 : this->elems_per_stick();
 
-  // Compute device extent: stick dims split into stick count and stick size
   auto compute_extent = [&](int32_t host_dim) -> int64_t {
     if (host_dim == -1) return 1;
     if (host_dim == stick_dim) {
@@ -117,8 +118,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     return host_size[host_dim];
   };
 
-  // Device layout (generic stick):
-  // [dim_order[1],...,dim_order[-1], dim_order[0], dim_order[-1]]
   this->device_size.resize(dev_rank);
   for (int i = 1; i < host_rank; ++i) {
     this->device_size[i - 1] = compute_extent(dim_order[i]);
@@ -139,14 +138,24 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                  host_strides[host_dim] * host_size[host_dim]);
   };
 
-  // Process the trailing within-stick dimension first (finest granularity).
-  update_stride(stick_dim, host_rank);
+  std::map<int32_t, std::vector<int64_t>> groups;
+  auto update_valid_elements = [&](int32_t host_dim, int dev_idx) {
+    groups[host_dim].push_back(static_cast<int64_t>(dev_idx));
+  };
 
-  // Remaining device dimensions in back-to-front order.
+  update_stride(stick_dim, host_rank);
+  update_valid_elements(stick_dim, host_rank);
+
   for (int i = host_rank - 1; i >= 0; --i) {
     int32_t host_dim = dim_order[i];
     int dev_idx = (i == 0) ? (host_rank - 1) : (i - 1);
     update_stride(host_dim, dev_idx);
+    update_valid_elements(host_dim, dev_idx);
+  }
+
+  for (auto& [h, key] : groups) {
+    std::sort(key.begin(), key.end());
+    this->valid_elements[key] = (sparse && h == stick_dim) ? 1 : host_size[h];
   }
 }
 
@@ -173,6 +182,20 @@ std::string SpyreTensorLayout::toString() const {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
+  ss << ", valid_elements={";
+  bool first = true;
+  for (const auto& [dims, size] : this->valid_elements) {
+    if (!first) ss << ", ";
+    first = false;
+    ss << "(";
+    for (size_t i = 0; i < dims.size(); i++) {
+      ss << dims[i];
+      if (i + 1 < dims.size()) ss << ", ";
+    }
+    if (dims.size() == 1) ss << ",";
+    ss << "): " << size;
+  }
+  ss << "}";
   ss << ")";
   return ss.str();
 }

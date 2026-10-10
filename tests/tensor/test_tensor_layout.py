@@ -161,7 +161,7 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16)",
+            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={(0, 2): 256, (1,): 512})",
         )
 
     def test_device_alloc(self):
@@ -196,12 +196,26 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(len(s), 2)
 
     def test_stl_pickleable(self):
-        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
-        self.assertEqual(stl, pickle.loads(pickle.dumps(stl)))
+        stl = SpyreTensorLayout(
+            [512, 256],
+            [256, 1],
+            torch.float16,
+            [1, 0],
+        )
+        loaded = pickle.loads(pickle.dumps(stl))
+        self.assertEqual(stl, loaded)
+        self.assertEqual(stl.valid_elements, loaded.valid_elements)
 
     def test_stl_copyable(self):
-        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
-        self.assertEqual(stl, copy.deepcopy(stl))
+        stl = SpyreTensorLayout(
+            [512, 256],
+            [256, 1],
+            torch.float16,
+            [1, 0],
+        )
+        copied = copy.deepcopy(stl)
+        self.assertEqual(stl, copied)
+        self.assertEqual(stl.valid_elements, copied.valid_elements)
 
     def test_to_spyre_layout(self):
         x = torch.rand([512, 256], dtype=torch.float16)
@@ -816,6 +830,56 @@ class TestSpyreTensorLayout(TestCase):
             [1, 4, 64], [-1, 0, 1], fp16, ElementArrangement.STANDARD
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
+
+
+@instantiate_parametrized_tests
+class TestComputeValidElements(TestCase):
+    @parametrize(
+        "host_size,host_strides,expected",
+        [
+            ([1], [1], {(0, 1): 1}),
+            ([64], [1], {(0, 1): 64}),
+            ([42], [1], {(0, 1): 42}),
+            ([100], [1], {(0, 1): 100}),
+            ([7, 100], [100, 1], {(0, 2): 100, (1,): 7}),
+            ([7, 100], [101, 1], {(0, 2): 100, (1,): 7}),
+            ([7, 100], [200, 1], {(0, 2): 100, (1,): 7}),
+            ([8, 16, 64], [1024, 64, 1], {(2,): 8, (0,): 16, (1, 3): 64}),
+            ([5, 10, 42], [420, 42, 1], {(2,): 5, (0,): 10, (1, 3): 42}),
+            ([5, 10, 42], [500, 50, 1], {(2,): 5, (0,): 10, (1, 3): 42}),
+            ([10, 1, 64], [64, 64, 1], {(2,): 10, (1, 3): 64, (0,): 1}),
+            ([1, 64], [64, 1], {(1,): 1, (0, 2): 64}),
+            ([64, 1], [1, 1], {(1,): 64, (0, 2): 1}),
+            ([1, 7, 64], [448, 64, 1], {(2,): 1, (0,): 7, (1, 3): 64}),
+            ([7, 1, 64], [64, 64, 1], {(2,): 7, (0,): 1, (1, 3): 64}),
+            ([7, 64, 1], [64, 1, 1], {(2,): 7, (0,): 64, (1, 3): 1}),
+            ([1, 1, 64], [64, 64, 1], {(0,): 1, (2,): 1, (1, 3): 64}),
+            ([1, 1, 1], [1, 1, 1], {(1, 3): 1, (0,): 1, (2,): 1}),
+            ([7, 100], [0, 1], {(0, 2): 100, (1,): 7}),
+            ([16, 256], [256, 1], {(1,): 16, (0, 2): 256}),
+            ([6, 8, 64], [512, 64, 1], {(1, 3): 64, (0,): 8, (2,): 6}),
+            (
+                [8, 16, 32, 64],
+                [32768, 2048, 64, 1],
+                {(2, 4): 64, (0,): 16, (1,): 32, (3,): 8},
+            ),
+            ([10, 12, 42], [504, 42, 1], {(1, 3): 42, (0,): 12, (2,): 10}),
+            ([10, 12, 42], [600, 50, 1], {(1, 3): 42, (0,): 12, (2,): 10}),
+            ([8, 64], [64, 1], {(1,): 8, (0, 2): 64}),
+            ([4, 8, 64], [512, 64, 1], {(2,): 4, (0,): 8, (1, 3): 64}),
+            ([3, 5, 128], [640, 128, 1], {(1, 3): 128, (0,): 5, (2,): 3}),
+            (
+                [2, 4, 8, 64],
+                [2048, 512, 64, 1],
+                {(3,): 2, (0,): 4, (1,): 8, (2, 4): 64},
+            ),
+        ],
+    )
+    def test_compute_valid_elements(self, host_size, host_strides, expected):
+        stl = SpyreTensorLayout(
+            host_size, host_strides, torch.float16, list(range(len(host_size)))
+        )
+        self.assertEqual(stl.valid_elements, expected)
 
 
 if __name__ == "__main__":

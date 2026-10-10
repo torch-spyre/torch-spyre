@@ -21,8 +21,10 @@
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "spyre_storage_impl.h"
@@ -31,7 +33,6 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -92,6 +93,13 @@ class SpyreTensorLayout {
 
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
+  /**
+   * Maps groups of device dimensions to their valid (non-padded) element
+   * count. This field maps disjoint ordered lists of device dimensions to
+   * sizes.
+   */
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
@@ -124,15 +132,49 @@ class SpyreTensorLayout {
    * or the expert programmer. It enables complete control over the
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
+   *
+   * When valid_elements is omitted, it defaults to
+   * compute_valid_elements(device_size), which conservatively treats every
+   * device element as valid. This is incorrect for padded tensors and should
+   * not be relied upon until the caller supplies accurate valid_elements.
+   *
+   * @deprecated Use the overload that takes valid_elements as a required
+   * parameter (before element_arrangement) to ensure accurate padding
+   * information is always provided.
+   */
+  [[deprecated(
+      "Pass valid_elements explicitly using the "
+      "SpyreTensorLayout(device_size, stride_map, device_dtype, valid_elements"
+      "[, element_arrangement]) overload.")]]
+  SpyreTensorLayout(
+      std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
+      DataFormats device_dtype,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD,
+      std::map<std::vector<int64_t>, int64_t> valid_elements = {})
+      : device_size(device_size),
+        stride_map(stride_map),
+        device_dtype(device_dtype),
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
+    validate_shape();
+  }
+
+  /**
+   * Construct a SpyreTensorLayout with the specified device_size, stride_map,
+   * and valid_elements. Unlike the overload above, valid_elements is required
+   * here, so callers must supply accurate padding information rather than
+   * relying on the conservative compute_valid_elements(device_size) default.
    */
   SpyreTensorLayout(
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
       DataFormats device_dtype,
+      std::map<std::vector<int64_t>, int64_t> valid_elements,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD)
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {
+        element_arrangement(element_arrangement),
+        valid_elements(std::move(valid_elements)) {
     validate_shape();
   }
 
@@ -192,6 +234,8 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
+    // Include valid_elements (and update std::hash) after deprecated
+    // constructor call sites have migrated to the valid_elements overload.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
