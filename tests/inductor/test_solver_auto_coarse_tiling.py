@@ -564,7 +564,7 @@ class AutomatedCoarseTilingTests(
 
         The ``auto``/``explicit_auto`` combos were ``@expected_unimplemented``
         while the solver-driven tile search was unbuilt, and briefly
-        ``@expected_lx_ownership_gap`` while _commit_divisions dropped the
+        ``@expected_lx_ownership_gap`` while commit_divisions dropped the
         division the solve had chosen for each ``coarse_tile_copy_*``. Both
         markers retired themselves the moment those modes passed (each fails a
         clean run), so only the ortools skip for the cpsat solver remains.

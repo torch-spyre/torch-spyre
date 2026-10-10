@@ -2001,9 +2001,6 @@ def compute_layouts(
             )
         return _layernormnorm_layout(op, output, output_dep, args)
 
-    if aten_op == spyreop.compact.default:
-        return _compact_layout(op, output, output_dep, args)
-
     if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,

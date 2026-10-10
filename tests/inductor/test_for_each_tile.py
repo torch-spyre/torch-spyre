@@ -100,8 +100,11 @@ Run:
 import contextlib
 import itertools
 import os
+import sys
 import unittest
+import warnings
 from typing import NamedTuple
+from unittest import mock
 
 import torch
 from torch._inductor.utils import run_and_get_code
@@ -1183,6 +1186,130 @@ class TestScanInputAliasing(unittest.TestCase):
                 torch._dynamo.reset()
                 with self.assertRaisesRegex(Exception, "(?i)aliasing"):
                     self._compile(fn)(self.x, self.kv)
+
+
+# The package re-exports the `for_each_tile` function under the submodule's name, so
+# the module itself is only reachable through `sys.modules`.
+_FET_MODULE = "torch_spyre._inductor.wsr.for_each_tile"
+_RAII_PYTHONS = (3, 12) <= sys.version_info[:2] < (3, 14)
+
+
+class TestScanCRecursionBudget(unittest.TestCase):
+    """The nested `scan` compile's C-recursion budget (#4973).
+
+    Raised on s390x only (CPython caps C recursion at 800 there, 10000 elsewhere),
+    never lowered, and always restored.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.m = sys.modules[_FET_MODULE]
+        saved = torch._dynamo.get_recursion_limit()
+        self.addCleanup(torch._dynamo.set_recursion_limit, saved)
+        if saved != -1:
+            torch._dynamo.set_recursion_limit(-1)
+        self.x = torch.randn(4, 8)
+
+    def _run_eager(self):
+        """A reduction loop run outside Dynamo, so `scan` compiles its own body."""
+        final, _ = self.m.for_each_tile(
+            lambda c, t: (c + t[0].sum(0), None),
+            (self.x,),
+            dims=0,
+            tile_size=1,
+            init=torch.zeros(8),
+        )
+        return final
+
+    def _spy_set_limit(self):
+        return mock.patch.object(
+            torch._dynamo,
+            "set_recursion_limit",
+            wraps=torch._dynamo.set_recursion_limit,
+        )
+
+    def _target(self):
+        return self.m._scan_c_recursion_target("s390x", sys.version_info[:2])
+
+    def test_eager_no_runtime_warning(self):
+        """Dynamo warns when a new C limit is below the remaining budget."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+
+    def test_target_gating(self):
+        target = self.m._scan_c_recursion_target
+        for machine in ("x86_64", "aarch64", "ppc64le", "AMD64", "arm64"):
+            for py in ((3, 11), (3, 12), (3, 13), (3, 14)):
+                with self.subTest(machine=machine, py=py):
+                    self.assertIsNone(target(machine, py))
+        for py in ((3, 11), (3, 14), (3, 15)):
+            with self.subTest(machine="s390x", py=py):
+                self.assertIsNone(target("s390x", py))
+        for py in ((3, 12), (3, 13)):
+            with self.subTest(machine="s390x", py=py):
+                # Above CPython's s390x default, or it would lower the budget.
+                self.assertGreater(
+                    target("s390x", py), self.m._S390X_CPYTHON_C_RECURSION_LIMIT
+                )
+
+    def test_non_s390x_never_touches_limit(self):
+        with (
+            mock.patch("platform.machine", return_value="x86_64"),
+            mock.patch.object(
+                torch._dynamo,
+                "get_recursion_limit",
+                wraps=torch._dynamo.get_recursion_limit,
+            ) as get_spy,
+            self._spy_set_limit() as spy,
+        ):
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+        get_spy.assert_not_called()
+        spy.assert_not_called()
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored(self):
+        target = self._target()
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+        ):
+            # Off s390x the target is below the host's remaining budget and warns.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            # Compare args, not mock.call objects: PyTorch's TestCase.assertEqual
+            # (used under the OOT wrapper) compares those tuples element-wise.
+            self.assertEqual([c.args for c in spy.call_args_list], [(target,), (-1,)])
+            self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+            # A caller's limit at or above the target is left alone.
+            torch._dynamo.set_recursion_limit(target + 1)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            spy.assert_not_called()
+            self.assertEqual(torch._dynamo.get_recursion_limit(), target + 1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored_when_body_raises(self):
+        target = self._target()
+        seen = []
+
+        def failing_scan(*args, **kwargs):
+            seen.append(torch._dynamo.get_recursion_limit())
+            raise ValueError("boom")
+
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+            mock.patch.object(self.m, "scan", side_effect=failing_scan),
+        ):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self.assertRaisesRegex(ValueError, "boom"):
+                self._run_eager()
+        self.assertEqual(seen, [target])
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
 
 
 if __name__ == "__main__":

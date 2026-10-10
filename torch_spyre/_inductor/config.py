@@ -96,6 +96,13 @@ def pool_allocated_by_frontend() -> bool:
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
+# Extend the phase-2 matmul perf reorder (NDO) to the matmul's own output
+# buffer in addition to its input buffers. Off by default until the
+# interaction with downstream span limits is fully validated.
+ndo_matmul_output_reorder: bool = (
+    os.environ.get("SPYRE_NDO_MATMUL_OUTPUT_REORDER", "0") == "1"
+)
+
 # For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
 # spatial dims (i/j) across cores. A strided conv's output coordinates do not
 # map to a contiguous input span per core, so a spatial split shuffles the
@@ -113,11 +120,10 @@ disable_conv2d_spatial_split: bool = (
 # stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
 ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 
-# Settings for device execution over the KTIR path. What is required is checked
-# upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
-# which names anything missing.
-
-# A .mlir declaring the target device, passed to the backend compiler.
+# A .mlir declaring the target device for the KTIR path, passed to the backend
+# compiler as ``--device``. An override, not a prerequisite: left unset the flag
+# is omitted and dbo-opt falls back to its own default, so
+# ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
 # Enable certified LX ownership changes: movement, exact fused-axis views,

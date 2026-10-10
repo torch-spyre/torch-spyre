@@ -181,8 +181,6 @@ def _copy_canonical_tests(
 
 INHERITED_TEST_ATTRIBUTES = [
     "is_dtype_supported",
-    "_get_core_reduction_invalid_dim_cases",
-    "_get_single_dim_reduction_invalid_dim_cases",
 ]
 
 POINTWISE_TEST_FAILURES = []

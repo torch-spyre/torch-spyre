@@ -2380,25 +2380,6 @@ def is_sparse_stl(stl) -> bool:
     return sparse
 
 
-def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
-    """Return True if current_node's FX origin is spyre::compact."""
-    try:
-        if isinstance(current_node, ComputedBuffer):
-            buf = current_node
-        elif isinstance(current_node, SchedulerNode):
-            buf = current_node.node
-        else:
-            return False
-        data = buf.data
-        origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.compact.default
-            for n in origins
-        )
-    except Exception:
-        return False
-
-
 def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]:
     """Returns STL to transform the input into the canonical representation the output.
 

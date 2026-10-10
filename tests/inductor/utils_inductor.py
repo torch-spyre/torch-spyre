@@ -49,6 +49,15 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
+def strict_xfail(request, raises, reason):
+    """Mark the running test as a strict xfail that must fail with ``raises``.
+
+    Unlike ``pytest.xfail`` this runs the body, so the test XPASSes (and fails,
+    being strict) once the gap is fixed, and any other failure still fails.
+    """
+    request.applymarker(pytest.mark.xfail(raises=raises, strict=True, reason=reason))
+
+
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
@@ -514,6 +523,19 @@ def _check_expect_fail_unstable(prefix, cases):
             )
 
 
+def expects_raise(test):
+    """Tag a test that asserts a rejection of the op under test.
+
+    test_inductor_ops_lx_planning.py does not copy a tagged test: the rejection
+    happens in the op under test, before the second op the LX suite appends is
+    built and before any LX planning, so the copy would only repeat the base test.
+    Generated ``expect_raise`` cases are tagged automatically; use this on a
+    hand-written test that wraps its body in ``pytest.raises``.
+    """
+    test._expects_raise = True
+    return test
+
+
 def _expect_raise_test(test, fragment):
     """Wrap a generated test so it passes only if it raises with ``fragment``."""
 
@@ -522,9 +544,7 @@ def _expect_raise_test(test, fragment):
         with pytest.raises(Exception, match=fragment):
             test(self)
 
-    # Marks the test for test_inductor_ops_lx_planning.py, which does not wrap it.
-    raising._expects_raise = True
-    return raising
+    return expects_raise(raising)
 
 
 class ParameterizedTestMeta(type):

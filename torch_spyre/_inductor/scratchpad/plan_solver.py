@@ -109,6 +109,8 @@ class LifetimeBoundBuffer:
     # The physical per-core ownership accepted by the residency judge. Placement
     # writes this beside the LX address; it must never derive another view.
     lx_view: Optional["PerCoreView"] = field(default=None, repr=False, compare=False)
+    # Written by the solver: why it left the buffer out of LX, when it says.
+    spill_reason: Optional[str] = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         # Not also asserted non-empty: buffers are sometimes registered before
@@ -919,7 +921,6 @@ class MemoryPlanSolver(ABC):
         ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
-        self.spill_reasons: dict[str, str] = {}
 
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
@@ -932,26 +933,26 @@ class MemoryPlanSolver(ABC):
         return None
 
     def record_exclusions(self) -> dict[str, str]:
-        """Compute, store, and return the ``name -> reason`` map of every buffer
-        in :attr:`buffers` barred from LX residency.
+        """Compute and return the ``name -> reason`` map of every buffer in
+        :attr:`buffers` barred from LX residency.
 
         This is the piece a solver that keeps barred buffers in its model (e.g.
         CP-SAT, which pins them non-resident rather than dropping them) needs on
         its own; :meth:`partition` layers the placeable/excluded split on top.
-        The returned map is also stored in :attr:`spill_reasons`.
+        Each reason is also written to its buffer's ``spill_reason``.
         """
-        self.spill_reasons = {
-            buffer.name: reason
-            for buffer in self.buffers
-            if (reason := self.excluded(buffer)) is not None
-        }
-        return self.spill_reasons
+        reasons: dict[str, str] = {}
+        for buffer in self.buffers:
+            buffer.spill_reason = self.excluded(buffer)
+            if buffer.spill_reason is not None:
+                reasons[buffer.name] = buffer.spill_reason
+        return reasons
 
     def partition(
         self,
     ) -> tuple[list["LifetimeBoundBuffer"], list["LifetimeBoundBuffer"]]:
         """Split :attr:`buffers` into ``(placeable, excluded)``, recording every
-        exclusion in :attr:`spill_reasons` via :meth:`record_exclusions`.
+        exclusion on its buffer via :meth:`record_exclusions`.
         """
         excluded_reasons = self.record_exclusions()
         placeable = [b for b in self.buffers if b.name not in excluded_reasons]

@@ -16,7 +16,7 @@ import torch
 import math
 import pytest
 
-from utils_inductor import cached_randn, compare_with_cpu
+from utils_inductor import cached_randn, compare_with_cpu, strict_xfail
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -114,11 +114,6 @@ class TestTensorScalarCoreArithmetic:
         """
         ``clone()`` then ``add_(1)``, ``mul_(2)``, ``div_(0.5)`` (in-place scalar chain).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: 'RuntimeError: In-device copy (.clone()) not implemented'"
-            )
 
         def inplace_ops(x):
             y = x.clone()
@@ -167,20 +162,18 @@ class TestSdpaScalarHyperparameters:
     # Small shapes (B,H,S,D) keep memory down and reduce backend-specific FP16 overflow issues.
     _MASK_SMALL = dict(b=1, h=2, s=32, d=16)
 
-    def test_sdpa_masked_fill_scalar_constant_finite_neg_fp16(self, execution_mode):
+    def test_sdpa_masked_fill_scalar_constant_finite_neg_fp16(
+        self, request, execution_mode
+    ):
         """
         Causal SDPA: ``masked_fill`` with a negative **Python float** ``-1.0e4`` (in-range for FP16).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
+        strict_xfail(
+            request,
+            torch._inductor.exc.InductorError,
+            "insert_restickify_padding asserts len(syms) == 1 for the transpose "
+            "fused into the matmul (#4671)",
+        )
         b, h, s, d = (
             self._MASK_SMALL["b"],
             self._MASK_SMALL["h"],
@@ -212,20 +205,18 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_masked_fill_zero_dim_tensor_scalar_fp16(self, execution_mode):
+    def test_sdpa_masked_fill_zero_dim_tensor_scalar_fp16(
+        self, request, execution_mode
+    ):
         """
         Causal mask with fill = **0-D tensor** ``torch.tensor(-1.0e4, dtype=float16)`` (tensor “scalar”).
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
+        strict_xfail(
+            request,
+            torch._inductor.exc.InductorError,
+            "insert_restickify_padding asserts len(syms) == 1 for the transpose "
+            "fused into the matmul (#4671)",
+        )
         b, h, s, d = (
             self._MASK_SMALL["b"],
             self._MASK_SMALL["h"],
@@ -261,11 +252,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_dropout_scalar_p(self, execution_mode):
         """SDPA with ``dropout(attn, p=0.1, training=False)`` — scalar dropout probability."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def attention_with_dropout(q, k, v):
             d_k = q.size(-1)
@@ -291,11 +277,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_score_temperature_divisor_scalar(self, execution_mode):
         """SDPA: divide logits by ``(sqrt(d_k) * temperature)`` with scalar ``temperature=2.0``."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def temperature_attention(q, k, v):
             d_k = q.size(-1)
@@ -326,11 +307,6 @@ class TestSdpaScalarHyperparameters:
         This is *not* a full GQA/MQA implementation (no explicit KV repeat); it exercises
         broadcast matmul + scalar ``1/sqrt(d_k)`` on Spyre.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1558
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: In-device copy not implemented (required for MQA operations)"
-            )
 
         def sdpa_broadcast_kv(q, k, v):
             d_k = q.size(-1)
@@ -357,18 +333,16 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_local_window_mask_scalar(self, execution_mode):
+    def test_sdpa_local_window_mask_scalar(self, request, execution_mode):
         """SDPA: local window via ``masked_fill(..., -inf)``; ``window_size=32`` sets mask support."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1482
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Spyre backend does not support type conversion yet during copy."
-            )
+        # The mask is built with ``mask[i, start:end] = False`` on a device bool
+        # tensor. Eager has no lowering for the resulting spyre.copy_from_dNd;
+        # compiled fails with "Cannot resolve target for 'index_expr'" (#4502).
+        strict_xfail(
+            request,
+            torch._inductor.exc.InductorError,
+            "slice assignment into a device bool tensor (#4502)",
+        )
 
         def local_attention(q, k, v):
             d_k = q.size(-1)
@@ -401,11 +375,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_cross_sequence_length(self, execution_mode):
         """SDPA with Q seq len ≠ KV seq len (scalar ``1/sqrt(d_k)`` scaling only)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def cross_attention(q, k, v):
             d_k = q.size(-1)
@@ -429,11 +398,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_self_attention_single_tensor(self, execution_mode):
         """SDPA: Q, K, V all from one tensor ``x`` (scalar ``1/sqrt(d_k)``)."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def self_attention(x):
             # Self attention: Q, K, V all from same source
@@ -452,17 +416,13 @@ class TestSdpaScalarHyperparameters:
             run_eager=(execution_mode == "eager"),
         )
 
-    def test_sdpa_causal_triu_mask_neg_inf(self, execution_mode):
+    def test_sdpa_causal_triu_mask_neg_inf(self, request, execution_mode):
         """SDPA: causal mask via ``triu`` + ``masked_fill(..., -inf)``."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
         if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
+            strict_xfail(
+                request,
+                NotImplementedError,
+                "aten::masked_fill_.Scalar has no Spyre kernel (#4356)",
             )
 
         def causal_attention(q, k, v):
@@ -494,11 +454,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_additive_score_bias_scalar(self, execution_mode):
         """SDPA: add scalar ``0.1`` to all attention logits before softmax."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
 
         def attention_with_bias(q, k, v):
             d_k = q.size(-1)

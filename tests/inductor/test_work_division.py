@@ -50,6 +50,7 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
@@ -451,6 +452,44 @@ def _make_context(
         reduction_vars=list(reduction_vars),
         committed_splits=committed_splits or {},
     )
+
+
+class TestPlainReductionKSplitDomains(unittest.TestCase):
+    def test_plain_reductions_pin_single_and_multiple_reduction_axes(self):
+        m, k, r = (_isym(name) for name in ("m", "k", "r"))
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        # Layer norm's exx2 reduction regressed in fused encoder blocks when
+        # its single reduction axis was allowed to split across cores.
+        for kind in ("sum", "max", "min", "mean", "prod", "exx2"):
+            for axes in ((k,), (k, r)):
+                with self.subTest(kind=kind, axes=axes):
+                    op = _computed_buffer(
+                        (128,), name="plain_reduce", reduction_type=kind
+                    )
+                    context = _make_context(op, output, reduction_vars=axes)
+                    result = collect_work_division_constraints(context)
+                    self.assertEqual(
+                        result.allowed_splits,
+                        {axis: frozenset({1}) for axis in axes},
+                    )
+                    # A committed span split must be rejected, not used to
+                    # silently re-enable an unsafe partial reduction.
+                    context.committed_splits = {k: 2}
+                    with self.assertRaisesRegex(Unsupported, "memory-span"):
+                        collect_work_division_constraints(context)
+
+    def test_structured_reductions_keep_their_own_combine_rules(self):
+        m, k = _isym("m"), _isym("k")
+        output = _tensor_dep("structured_reduce", (128,), (m,))
+        for kind in (BATCH_MATMUL_OP, "topkvalue", "topkindex", CONV2D_FWD_OP):
+            with self.subTest(kind=kind):
+                op = _computed_buffer(
+                    (128,), name="structured_reduce", reduction_type=kind
+                )
+                result = work_division_constraints.plain_reduction_k_split_domains(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                self.assertEqual(result.allowed_splits, {})
 
 
 class TestAlignedOwnershipSplitDomains(unittest.TestCase):
@@ -1101,7 +1140,7 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
 
 
 class TestMatmulRowOrderSplitDomains(unittest.TestCase):
-    def test_flattened_staggered_rows_keep_producer_order(self):
+    def test_flattened_staggered_rows_allow_backend_reordering(self):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         rows, n, k = (_isym(name) for name in ("rows", "n", "k"))
@@ -1127,7 +1166,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         )
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
-            frozenset({2, 4, 8}),
+            frozenset({1, 2, 4, 8}),
         )
         # Matching physical row order must not ban a one-core matmul.
         ctx.output_td = TensorDep(
@@ -1139,7 +1178,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
             frozenset({1, 2, 4, 8}),
         )
         ctx.output_td = output
-        # A non-matmul with the same accesses is outside this guard.
+        # Non-matmuls retain the same contiguous-ownership split domain.
         ctx.op = _computed_buffer((8, 64))
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
@@ -2571,7 +2610,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             solver = allocator.layout_planning(built, allocator.size)
             solved = {b.name: b for b in solver.plan_layout()}
-            # _commit_divisions would record the committed ownership here.
+            # commit_divisions would record the committed ownership here.
             for op in graph.operations:
                 op.iteration_space_ownership = object()
             allocator._push_allocation(graph, list(solved.values()), [])
@@ -3057,7 +3096,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             self.assertRaisesRegex(Unsupported, "chosen split violates hard domain"),
         ):
-            allocator._commit_divisions(graph, allocation)
+            allocator_module.commit_divisions(graph, allocation)
 
     def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)

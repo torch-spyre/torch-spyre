@@ -189,6 +189,43 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
 
 
+def _eq_fact(rel):
+    """``(lhs, number)`` for ``Eq``/``Ne`` with a numeric side, else None."""
+    lhs, rhs = rel.args
+    if isinstance(rhs, sympy.Number):
+        return lhs, rhs
+    if isinstance(lhs, sympy.Number):
+        return rhs, lhs
+    return None
+
+
+def _simplify_eq_conjunction(expr):
+    """Cheap stand-in for ``sympy.simplify`` on a conjunction: resolve its
+    ``Eq(x, c)`` terms against each other and against ``Ne(x, c')`` terms,
+    e.g. ``And(Eq(x, 2), Ne(x, 4)) -> Eq(x, 2)`` and
+    ``And(Eq(x, 2), Eq(x, 4)) -> false``. Anything else is kept as is."""
+    if not isinstance(expr, sympy.And):
+        return expr
+    eqs: dict = {}
+    for arg in expr.args:
+        if isinstance(arg, sympy.Eq) and (fact := _eq_fact(arg)) is not None:
+            lhs, val = fact
+            if eqs.setdefault(lhs, val) != val:
+                return sympy.false
+    if not eqs:
+        return expr
+    kept = []
+    for arg in expr.args:
+        if isinstance(arg, sympy.Ne) and (fact := _eq_fact(arg)) is not None:
+            lhs, val = fact
+            if lhs in eqs:
+                if eqs[lhs] == val:
+                    return sympy.false
+                continue  # implied by Eq(lhs, eqs[lhs])
+        kept.append(arg)
+    return sympy.And(*kept)
+
+
 @dataclass
 class _LifetimeBufferWithCpVars(Generic[_BufT]):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
@@ -574,6 +611,25 @@ def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
     return expr.func(*args)
 
 
+class memoize_method:
+    """Descriptor that memoizes a method separately for each instance.
+
+    The cache lives in the instance ``__dict__``, so it is freed with the
+    instance and never shared between instances.
+    """
+
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        bound_cache = cache(self.func.__get__(instance, owner))
+        # Shadow the descriptor so later lookups hit the cached method directly.
+        instance.__dict__[self.func.__name__] = bound_cache
+        return bound_cache
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
@@ -927,6 +983,11 @@ class _SympyExprToCpSat(Printer):
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
+        if any(arg.is_boolean for arg in ints):
+            product = self._print_gated_product(ints, name)
+            self._sym_map[name] = product
+            return self._print_multiply_two(math.prod(nonints), product)
+
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
         # than enumerating all 2**len(ints) vertices, fold the bounds
@@ -953,6 +1014,34 @@ class _SympyExprToCpSat(Printer):
         self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
         return self._print_multiply_two(math.prod(nonints), product)
+
+    def _print_gated_product(self, ints, name):
+        """A product with boolean factors as the product of the others, gated
+        by each boolean: a variable equal to it while the booleans hold and 0
+        otherwise, two linear constraints enforced on the literal (as in
+        ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
+        the solver can only propagate through bounds."""
+        gates = [arg for arg in ints if arg.is_boolean]
+        rest = [arg for arg in ints if not arg.is_boolean]
+        if not rest:
+            value, gates = gates[0], gates[1:]
+        elif len(rest) == 1:
+            value = rest[0]
+        else:
+            value = self._print_multiply(rest)
+        if len(gates) == 1:
+            gate = gates[0]
+        else:
+            gate = self._model.new_bool_var(f"{name}_gate")
+            self._model.add_bool_and(gates).only_enforce_if(gate)
+            self._model.add_bool_or([g.Not() for g in gates]).only_enforce_if(
+                gate.Not()
+            )
+        lb, ub = self._affine_bounds(value)
+        gated = self._model.new_int_var(min(0, int(lb)), max(0, int(ub)), name)
+        self._model.add(gated == value).only_enforce_if(gate)
+        self._model.add(gated == 0).only_enforce_if(gate.Not())
+        return gated
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
@@ -1028,6 +1117,7 @@ class _SympyExprToCpSat(Printer):
             return self._print_multiply_two(base, base)
         return self._print(expr.base) ** self._print(expr.exp)
 
+    @memoize_method
     def _print_condition(self, cond):
         if not isinstance(cond, sympy.core.relational.Relational):
             return self._print(cond)
@@ -1039,6 +1129,7 @@ class _SympyExprToCpSat(Printer):
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
         return var
 
+    @memoize_method
     def _print_And(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
         and_var = self._model.new_bool_var(f"and_{self._count}")
@@ -1047,6 +1138,7 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
         return and_var
 
+    @memoize_method
     def _print_Or(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
         or_var = self._model.new_bool_var(f"or_{self._count}")
@@ -1055,26 +1147,26 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
         return or_var
 
+    @memoize_method
     def _print_Piecewise(self, expr):
         args = expr.args
         assert args[-1][1] == sympy.true
         result = 0
-        not_prev = []
+        none_prev = sympy.true  # no earlier condition held
         for val, cond in args:
-            if cond == sympy.true:
-                lits = not_prev
-            else:
-                cond_var = self._print_condition(cond)
-                lits = [cond_var, *not_prev]
-                not_prev = [*not_prev, cond_var.Not()]
-            piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
-            self._count += 1
-            self._model.AddBoolAnd(lits).OnlyEnforceIf(piecewise_var)
-            self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(
-                piecewise_var.Not()
-            )
+            lit = _simplify_eq_conjunction(sympy.And(none_prev, cond))
+            if lit == sympy.false:
+                continue
+            if lit == sympy.true:
+                result += self._print(val)
+                break
+            piecewise_var = self._print_condition(lit)
             result += self._print_multiply_two(piecewise_var, self._print(val))
+            none_prev = sympy.And(none_prev, sympy.Not(cond))
         return result
+
+    def _print_Not(self, expr):
+        return self._print_condition(expr.args[0]).Not()
 
     def _print_Relational(self, expr):
         return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
@@ -1298,13 +1390,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         working = {b.name: self._wrap(model, b) for b in buffers}
 
         solved = self._run(model, working, forced_reasons, cost_expr=cost_expr)
-        # Surface a drop cause for every spilled buffer: the pre-solve forced
-        # reason when we have one, otherwise the solver chose to spill it.
-        self.spill_reasons = {
-            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL)
-            for name, sb in solved.items()
-            if sb.address is None
-        }
 
         # Copy the solved results back onto the caller's buffers. Offsets come
         # back in alignment units (the solver works in aligned units), so scale
@@ -1312,6 +1397,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for b in buffers:
             sb = solved[b.name]
             b.address = None if sb.address is None else sb.address * self.alignment
+            # Surface a drop cause for every spilled buffer: the pre-solve forced
+            # reason when we have one, otherwise the solver chose to spill it.
+            b.spill_reason = (
+                forced_reasons.get(b.name, _SOLVER_CHOSE_SPILL)
+                if sb.address is None
+                else None
+            )
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
                 b.chosen_relayouts = {

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import regex as re
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 from .apply_schema import SCHEMA_DIR, SchemaApplier, SchemaDrift
 
@@ -97,6 +98,17 @@ class Sandbox:
             "artifact_id",
         ),
         ("artifact_results", "{runs}", "run_id"),
+        ("artifact_subscriptions", "1", "subscription_id"),
+        (
+            "artifact_dispatches",
+            "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",
+            "dispatch_id",
+        ),
+        (
+            "dispatch_requests",
+            "requested_at >= now() - INTERVAL {days} DAY",
+            "request_id",
+        ),
         ("hw_failure_diagnostics", "{runs}", "run_id"),
         ("jenkins_agents", "ts >= now() - INTERVAL {days} DAY", "(node, ts)"),
         # By time, not {runs}: a run that failed before publishing has no run_id to be picked by.
@@ -212,7 +224,13 @@ class Sandbox:
             if table not in local:
                 continue
             mine = cls.columns(client, f"{db}.{table}")
-            theirs = set(cls.columns(client, cls.src(table)))
+            try:
+                theirs = set(cls.columns(client, cls.src(table)))
+            except DatabaseError as err:
+                # A table this schema adds before prod has it: nothing to copy yet.
+                if "There is no table" not in str(err):
+                    raise
+                continue
             cols = ", ".join(f"`{c}`" for c in mine if c in theirs)
             client.command(
                 f"INSERT INTO {db}.{table} ({cols}) SELECT {cols} FROM {cls.src(table)} "
