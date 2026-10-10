@@ -1297,6 +1297,38 @@ class _ScatterScenarios:
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
 
+    def test_index_put_view_non_stick_aligned_inner_dim(self):
+        """index_put_ on a tensor viewed through a non-stick-aligned inner dim.
+
+        Regression test for torch-spyre#4443: a [8, 32, 32] fp16 tensor viewed
+        as [8, 1024] has an inner dim of 32 -- exactly half a stick (64 for
+        fp16).  The pre-view strides produce a stick expression ``Mod(d1, 32)``
+        instead of the required ``Mod(var, 64)``.
+
+        A rank-changing view before index_put_ cannot be supported by the
+        alt-stl relayout mechanism (which only handles same-rank slice-offset
+        writes).  The compiler must raise Unsupported cleanly -- surfaced here
+        as CRASHED -- rather than crashing with an AssertionError deep in
+        insert_post_mutation_restickify or enforce_indirect_access_layout.
+        """
+        x = torch.zeros(8, 32, 32, dtype=torch.float16)
+        slots = torch.arange(4, dtype=torch.int32)
+        values = torch.ones(4, 1024, dtype=torch.float16)
+
+        def kernel(x, slots, values):
+            x = x.view(8, 1024)
+            x.index_put_((slots,), values, accumulate=False)
+            return x
+
+        result = self.check(
+            kernel,
+            x.to("spyre"),
+            slots.to("spyre"),
+            values.to("spyre"),
+            expect=CRASHED,
+        )
+        self.assertIn("rank-changing view", str(result.exc))
+
 
 # Op-behaviour scenarios run once at the default 32 cores. They classify / lower
 # / run each op and do not depend on the core count, so sweeping them across every
