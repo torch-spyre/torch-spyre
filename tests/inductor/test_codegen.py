@@ -28,6 +28,10 @@ from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
+    SymbolicArg,
+    SymbolicArgKind,
+    _resolve_symbolic_args,
+    ElementArrangement,
 )
 from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.compute_ops import (
@@ -275,6 +279,73 @@ class TestSpyreConfig(InductorTestCase):
             args_str = line[line.index("(") + 1 : line.rindex(")")]
             args = [a.strip() for a in args_str.split(",")]
             self.assertEqual(len(args), len(set(args)), f"Duplicate args: {line}")
+
+    def test_symbolic_address_call_emits_canonical_symbolic_args_payload(self):
+        """The runner builds one SymbolicArg(kAddress) per backend symbol in
+        canonical inputSym_ order using generate_bundle()'s returned symbol_kinds.
+
+        Captures the actual payload passed to launch_jobplan and resolves it so
+        that any ordering bug in the runner is caught, not just bugs in
+        resolveSymbolicArgs itself.  Also verifies that a reversed payload
+        produces a different address vector, proving the ordering contract is
+        load-bearing.
+        """
+
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+        b = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+
+        captured = {}
+
+        def _capture_launch(job_plan, args, symbolic_args=()):
+            captured["args"] = list(args)
+            captured["symbolic_args"] = list(symbolic_args)
+
+        with config.patch({"bundle_symbolic_args": True}):
+            comp_fn = torch.compile(fn)
+            with patch(
+                "torch_spyre.execution.kernel_runner.launch_jobplan",
+                side_effect=_capture_launch,
+            ):
+                comp_fn(a, b)
+
+        self.assertIn("symbolic_args", captured, "launch_jobplan was not called")
+        tensors = captured["args"]
+        symbolic_args = captured["symbolic_args"]
+
+        # Resolve the real payload the runner built.
+        resolved = _resolve_symbolic_args(tensors, symbolic_args)
+
+        # Ground-truth per slot: tensor_id for each position in the deduped
+        # call_args list (0 → a, 1 → b, 2 → out).
+        addr = [
+            _resolve_symbolic_args(
+                tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=i)]
+            )[0]
+            for i in range(len(tensors))
+        ]
+        self.assertEqual(
+            resolved,
+            [addr[sa.tensor_id] for sa in symbolic_args],
+            "resolved addresses do not match expected per-tensor order",
+        )
+
+        # Forward-vs-reversed differential: wrong slot order must produce a
+        # different address vector, proving the ordering contract is exercised.
+        payload_reversed = list(reversed(symbolic_args))
+        resolved_rev = _resolve_symbolic_args(tensors, payload_reversed)
+        self.assertNotEqual(
+            resolved,
+            resolved_rev,
+            "canonical and reversed payloads resolved identically -- "
+            "all tensors share an address so ordering is not exercised",
+        )
+        self.assertEqual(
+            resolved_rev,
+            [addr[sa.tensor_id] for sa in payload_reversed],
+        )
 
 
 class TestResolveSdscSize(InductorTestCase):
@@ -922,6 +993,32 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         )
 
 
+class TestClipConstants(InductorTestCase):
+    def test_unbounded_limits_use_device_format(self):
+        for data_format, limit, expected in (
+            (DataFormats.SEN169_FP16, 8573157376.0, (0xFFFE, 0x7FFE)),
+            (
+                DataFormats.IEEE_FP32,
+                float("inf"),
+                (0xFF800000, 0x7F800000),
+            ),
+        ):
+            with self.subTest(data_format=data_format):
+                info = generate_constant_info(
+                    data_format, {"clipMin": -limit, "clipMax": limit}, 1
+                )
+                self.assertEqual(
+                    [entry["data_"]["data_"]["[0, 0, 0]"] for entry in info.values()],
+                    [[str(value)] for value in expected],
+                )
+                self.assertTrue(
+                    all(
+                        entry["dataFormat_"] == data_format.name
+                        for entry in info.values()
+                    )
+                )
+
+
 class TestMaskingConstId(InductorTestCase):
     """maskingConstId_ must resolve to the samv-maskvalue constant.
 
@@ -955,3 +1052,61 @@ class TestMaskingConstId(InductorTestCase):
             self.assertEqual(
                 self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
             )
+
+
+class TestConversionPaddingAcrossStickWidths(InductorTestCase):
+    """Padding of a dim is measured from its extent before any arg padded it.
+
+    In an fp32 <-> fp16 conversion both args pad the same stick dim, each by its
+    own stick width, so the extent of a size-1 stick goes 1 -> 32 -> 64 when the
+    fp32 arg pads first. The OpSpecs mirror what x.to(dtype) compiles to on
+    (64, 1).
+    """
+
+    def _conversion_spec(self, op, src, dst, src_ea, dst_ea) -> OpSpec:
+        row = sympy.Symbol("c0")
+        iteration_space = {row: (sympy.Integer(64), 1)}
+        return OpSpec(
+            op=op,
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=is_input,
+                    arg_index=arg_index,
+                    device_dtype=dtype,
+                    device_size=[1, 64, dtype.elems_per_stick()],
+                    device_coordinates=[sympy.S.Zero, row, sympy.S.Zero],
+                    allocation={"hbm": address},
+                    element_arrangement=ea,
+                )
+                for arg_index, (is_input, dtype, ea, address) in enumerate(
+                    [(True, src, src_ea, 0), (False, dst, dst_ea, 0x100000)]
+                )
+            ],
+            op_info={},
+        )
+
+    def test_padding_counts_every_arg_increment(self):
+        fp32, fp16 = DataFormats.IEEE_FP32, DataFormats.SEN169_FP16
+        cases = {
+            "fp32todl16": (
+                fp32,
+                fp16,
+                ElementArrangement.STANDARD,
+                ElementArrangement.FP32_TO_DL16,
+            ),
+            "dl16tofp32": (
+                fp16,
+                fp32,
+                ElementArrangement.STANDARD,
+                ElementArrangement.DL16_TO_FP32,
+            ),
+        }
+        for op, args in cases.items():
+            with self.subTest(op=op):
+                sdsc_spec, _ = parse_op_spec(self._conversion_spec(op, *args))
+                (stick,) = sdsc_spec.padding
+                self.assertEqual(sdsc_spec.iteration_space[stick], 64)
+                self.assertEqual(sdsc_spec.padding[stick], 63)

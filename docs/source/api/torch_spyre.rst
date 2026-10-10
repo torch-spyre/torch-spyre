@@ -2,7 +2,7 @@ torch\_spyre
 ============
 
 When the ``torch_spyre`` package is installed, PyTorch picks it up
-through the ``torch.backends`` autoload entry point — no explicit
+through the ``torch.backends`` autoload entry point; no explicit
 ``import torch_spyre`` is needed. The Spyre backend registers itself
 on first use of ``torch`` and the public API is available under
 ``torch.spyre``, mirroring the ``torch.cuda`` surface.
@@ -339,7 +339,7 @@ FFDC (First Failure Data Capture)
        root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
-       ``tempfile.gettempdir()`` — typically ``/tmp`` on Linux, or
+       ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
        ``$TMPDIR`` when that is set. Falls back to
        ``<tempdir>/torch-spyre-ffdc`` if that root cannot be resolved.
    :type output_dir: str, optional
@@ -407,7 +407,7 @@ transpose. For ``nn.Embedding`` layers, tables get a gather-optimal
 "indirect access" layout (vocab dim outermost) because they are read as a
 gather rather than a matmul.
 
-.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
+.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None, use_fp8_weights=False)
 
    Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
    weights use a dimension-swapped layout (``dim_order=[1, 0]``);
@@ -416,11 +416,22 @@ gather rather than a matmul.
    use the default layout. Idempotent: parameters already on Spyre are
    skipped.
 
+   When *use_fp8_weights* is ``True``, ``nn.Linear`` weights that are already
+   ``torch.float8_e4m3fn`` are loaded directly into KERNEL layout with 2D stick
+   ``[2, 64]`` and ``ElementArrangement.QFP8WT``, bypassing any runtime
+   quantization step. Non-FP8 parameters are transferred with their normal
+   optimal layouts regardless of this flag.
+
    :param model: The model to transfer.
    :type model: torch.nn.Module
-   :param dtype: Target dtype on Spyre (default: the parameter's existing
-       dtype).
+   :param dtype: Target dtype for non-FP8 weight conversion (default: the
+       parameter's existing dtype). Ignored for FP8 weights when
+       *use_fp8_weights* is ``True``.
    :type dtype: torch.dtype or None
+   :param use_fp8_weights: If ``True``, ``torch.float8_e4m3fn`` Linear weights
+       are loaded with KERNEL layout and ``QFP8WT`` arrangement. Use this for
+       pre-quantized FP8 model checkpoints.
+   :type use_fp8_weights: bool
    :returns: The model with all parameters on Spyre.
    :rtype: torch.nn.Module
 
@@ -432,6 +443,33 @@ gather rather than a matmul.
 
       model = MyModel()
       load_model_to_spyre(model)
+      compiled = torch.compile(model)
+
+.. function:: torch_spyre.model_utils.load_fp8_model_to_spyre(model)
+
+   Convenience wrapper around :func:`load_model_to_spyre` for models whose
+   ``nn.Linear`` weights are already quantized to ``torch.float8_e4m3fn``.
+   Each FP8 weight is DMA'd directly into KERNEL layout with 2D stick ``[2, 64]``
+   and ``ElementArrangement.QFP8WT``, so ``_scaled_mm`` can consume it without
+   any runtime quantization overhead.
+
+   Non-FP8 parameters (biases, layer norms, embeddings) are transferred with
+   their normal optimal layouts.
+
+   :param model: The pre-quantized FP8 model to transfer.
+   :type model: torch.nn.Module
+   :returns: The model with all parameters on Spyre.
+   :rtype: torch.nn.Module
+
+   Example:
+
+   .. code-block:: python
+
+      from transformers import AutoModelForCausalLM
+      from torch_spyre.model_utils import load_fp8_model_to_spyre
+
+      model = AutoModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-8b-instruct-fp8")
+      model = load_fp8_model_to_spyre(model)
       compiled = torch.compile(model)
 
 .. function:: torch_spyre.model_utils.patch_module_to_for_spyre()
@@ -643,6 +681,12 @@ Environment Variables
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
+   * - ``SPYRE_HAZARD_TRACKER``
+     - Split the program-correction triple across the ``S_prep`` and
+       ``S_dev`` streams and let flex insert the cross-stream H2D-to-compute
+       edge, overlapping the two stages. Off by default, which keeps the
+       single-stream FIFO ordering. On values match flex's grammar exactly:
+       ``1``, ``true``, ``t``, ``yes``, ``y``
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
@@ -694,6 +738,13 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
+   * - ``SPYRE_BACKEND_LOOP_UNROLL``
+     - Enable SDSC-bundle backend loop unrolling (default ``1``). Set ``0``
+       to preserve counted device loops; this requires autopilot. Set before
+       importing torch-spyre. Accepts case-insensitive ``1``/``true``/``yes``
+       and ``0``/``false``/``no``; invalid values raise an error. The resolved
+       boolean is part of the kernel cache key. See
+       :doc:`/compiler/working_set_reduction` for Python configuration.
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -701,10 +752,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``TORCHINDUCTOR_COMPILE_THREADS``
-     - Number of Inductor compile workers. Independent backend kernels compile in
-       parallel when this is greater than ``1``; a value of ``1`` executes
-       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
@@ -731,6 +778,10 @@ Environment Variables
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
        ``rec.<pid>.json``. Empty writes nothing (default empty)
+   * - ``TORCH_SPYRE_FRONTEND_ONLY``
+     - Measurement mode: run a compile through backend-input generation and
+       stop before the backend compiler. Produces no runnable kernel --
+       calling one raises (default ``0``)
    * - ``SPYRE_DUMP_COST``
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
@@ -800,7 +851,17 @@ Environment Variables
        stderr (default empty)
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
-       invocations (default ``0``; set ``1`` to enable)
+       invocations (default ``0``; set ``1`` to enable). When enabled,
+       ``LIB_VERSION_FILE`` must point at the compiler version file, which
+       supplies the compiler version for the cache key. If it is unset, the
+       cache key cannot be computed: torch-spyre logs a warning and compiles
+       that kernel without caching instead of failing. Set
+       ``SPYRE_KERNEL_CACHE=0`` to run without caching when no version file is
+       available
+   * - ``LIB_VERSION_FILE``
+     - Path to the compiler version file read to form the kernel-cache key.
+       Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
+       that kernel is compiled without caching and a warning is logged
    * - ``SPYRE_NUM_CPUS``
      - Override the CPU count CP-SAT uses to size its search worker pool.
        When unset the count is derived from the cgroup v2 quota, then
@@ -821,6 +882,10 @@ Environment Variables
    * - ``FLEX_DEVICE``
      - Select the underlying flex runtime mode (``PF``, ``VF``, or
        ``MOCK``)
+   * - ``LOCAL_RANK``
+     - Per-process rank set by torchrun. Seeds the logical Spyre device
+       index when ``set_device()`` has not been called (0 when unset;
+       invalid or out-of-range values raise)
 
 **Internal:**
 
@@ -845,3 +910,7 @@ Environment Variables
      - Verbose PyTorch Inductor logging
    * - ``TORCH_COMPILE_DEBUG=1``
      - Dump Inductor debug artifacts
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent backend kernels
+       compile in parallel when this is greater than ``1``; a value of
+       ``1`` executes compilation inline

@@ -365,6 +365,85 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
+    @pytest.mark.parametrize("num_corrections", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "following_step", ["ComputeOnDevice", "DataTransfer", None]
+    )
+    def test_prepare_host_compute_sequence(self, num_corrections, following_step):
+        """Multiple correction blobs must prepare before the device compute."""
+        job_exec_plan = []
+        for i in range(num_corrections):
+            job_exec_plan.extend(
+                [
+                    {
+                        "command": "ComputeOnHost",
+                        "properties": {
+                            "ohandle": f"correction{i}",
+                            "size": "256",
+                            "ishape": ["0"],
+                            "ihandle": "",
+                            "hcm": {"vdci": {}, "senConstants": []},
+                        },
+                    },
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": f"correction{i}",
+                            "dev_ptr": str(120259084288 + i * 256),
+                            "size": "256",
+                        },
+                    },
+                ]
+            )
+
+        if following_step == "ComputeOnDevice":
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+        elif following_step == "DataTransfer":
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "result",
+                        "dev_ptr": "120259084288",
+                        "size": "256",
+                    },
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            if following_step != "ComputeOnDevice":
+                error = (
+                    "Incomplete step sequence"
+                    if following_step is None
+                    else f"Step ordering violation at step {num_corrections}:"
+                )
+                with pytest.raises(RuntimeError, match=error):
+                    torch_spyre._C.prepare_kernel(spyrecode_dir)
+                return
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            assert job_plan.num_steps() == num_corrections + 1
+            assert [job_plan.get_step_type(i) for i in range(job_plan.num_steps())] == [
+                "HostCompute"
+            ] * num_corrections + ["Compute"]
+            assert [
+                job_plan.get_step_stream_role(i) for i in range(job_plan.num_steps())
+            ] == ["Prep"] * num_corrections + ["Dev"]
+            assert all(
+                job_plan.get_step_pipeline_barrier(i)
+                for i in range(job_plan.num_steps())
+            )
+
     def test_prepare_emits_bare_split_triple(self):
         """prepare emits the bare split triple, independent of the flag.
 
@@ -387,18 +466,27 @@ class TestPrepareKernel:
             # gone), so nothing here depends on the program-region count.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Verify JobPlan was created
-            assert job_plan is not None
-            assert isinstance(job_plan, torch_spyre._C.JobPlan)
-
             # Verify it has 2 steps (HostCompute-with-H2D merged, Compute)
             # The adjacent DataTransfer H2D is collapsed into the HostCompute step
             # by translateComputeOnHostWithH2D
             assert job_plan.num_steps() == 2
-
-            # Verify the step types
-            assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "Compute"
+            assert [job_plan.get_step_type(i) for i in range(2)] == [
+                "HostCompute",
+                "Compute",
+            ]
+            # Roles are assigned by step type in the ctors, so the bare triple
+            # already carries the split roles -- the split is real.
+            assert [job_plan.get_step_stream_role(i) for i in range(2)] == [
+                "Prep",
+                "Dev",
+            ]
+            # pipeline_barrier stays True on EVERY step of the bare split:
+            # overlap comes only from the S_prep/S_dev split + flex's dynamic
+            # cross-stream events, never from relaxing a barrier.
+            assert [job_plan.get_step_pipeline_barrier(i) for i in range(2)] == [
+                True,
+                True,
+            ]
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
@@ -725,13 +813,7 @@ class TestPrepareKernel:
                 self._prepare_with_symbolic_args(spyrecode_dir, symbolic_args=True)
 
     def test_pipeline_barrier_dma_steps_default_true(self):
-        """H2D (merged into HostCompute) and D2H steps carry pipeline_barrier correctly.
-
-        Tthe correction H2D is owned by the HostCompute step; The plan no longer contains
-        a separate H2D step at index 1.  We instead verify that the merged HostCompute
-        step carries pipeline_barrier=False (overlap-eligible) and the Compute step at
-        index 1 carries True.
-        """
+        """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
@@ -742,8 +824,8 @@ class TestPrepareKernel:
             assert job_plan.num_steps() == 2
             assert job_plan.get_step_type(0) == "HostCompute"
             assert job_plan.get_step_type(1) == "Compute"
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute (merged) must be overlap-eligible: pipeline_barrier=False"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute (merged) must must carry pipeline_barrier=True by default"
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "Compute step must carry pipeline_barrier=True by default"
@@ -794,10 +876,11 @@ class TestPrepareKernel:
             assert job_plan.get_step_type(0) == "HostCompute"
             assert job_plan.get_step_type(1) == "Compute"
 
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute step must carry pipeline_barrier=False to preserve "
-                "host/device overlap (produce runs while prior device compute "
-                "is still in flight)"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute step must carry pipeline_barrier=True: it is a "
+                "consumer of the correction H2D's seg-7 write (RAW hazard); "
+                "Compute must wait for H2D. Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "Compute step must carry pipeline_barrier=True: it is a "

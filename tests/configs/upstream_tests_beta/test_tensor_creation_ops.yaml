@@ -11,21 +11,16 @@ test_suite_config:
         - names:
             - TestAsArray::test_copy_list
             - TestAsArray::test_unsupported_alias
-            - TestRandomTensorCreation::test_normal_std_error
             - TestTensorCreation::test_arange_device_vs_cpu
             - TestTensorCreation::test_as_strided_neg
-            - TestTensorCreation::test_cat_mem_overlap
             - TestTensorCreation::test_cat_stack_cross_devices
             - TestTensorCreation::test_empty_strided
             - TestTensorCreation::test_empty_tensor_props
-            - TestTensorCreation::test_linlogspace_mem_overlap
-            - TestTensorCreation::test_new_empty_strided
             - TestTensorCreation::test_offset_scalar_cast
             - TestTensorCreation::test_simple_scalar_cast
             - TestTensorCreation::test_storage_filename
             - TestTensorCreation::test_strided_mismatched_stride_shape
             - TestTensorCreation::test_torch_complex_floating_dtype_error
-            - TestTensorCreation::test_torch_complex_out_dtype_error
             - TestTensorCreation::test_unpack_double
             - TestTensorCreation::test_vander
             - TestTensorCreation::test_zeros_dtype_layout_device_match
@@ -297,6 +292,19 @@ test_suite_config:
             - TestTensorCreation::test_tensor_factory_type_inference
             - TestTensorCreation::test_tensor_from_non_writable_numpy
           mode: skip  # does not engage the torch-spyre layer
+        # Upstream regression: these tests now fail on the Spyre backend.
+        # test_cat_mem_overlap and test_linlogspace_mem_overlap hit NotImplementedError
+        # for aten::cat.out / aten::linspace.out via fake-tensor validation; test_new_empty_strided
+        # requires torch.float64, which the Spyre backend does not support; test_normal_std_error
+        # requires aten::normal.float_Tensor; test_torch_complex_out_dtype_error requires
+        # aten::complex.out. None of these ops are implemented for the 'spyre' backend.
+        - names:
+            - TestRandomTensorCreation::test_normal_std_error
+            - TestTensorCreation::test_cat_mem_overlap
+            - TestTensorCreation::test_linlogspace_mem_overlap
+            - TestTensorCreation::test_new_empty_strided
+            - TestTensorCreation::test_torch_complex_out_dtype_error
+          mode: skip  # skip: NotImplementedError / unsupported dtype on upstream PyTorch bump
 
   global:
     supported_dtypes:

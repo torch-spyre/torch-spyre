@@ -2,14 +2,16 @@
 -- (and hf_/si_ mirrors). Rationale for every decision: docs/clickhouse_v2_functional_tests_schema.md
 --
 -- Bag-column convention, uniform with 20-artifacts.sql: `props` = Map, open-ended, never in a
--- key; `tags` = Array, a SET, and IN the identity hash (sort before hashing).
+-- key; `tags` = Array, a SET. test_cases.tags are the identity tags (hashed); run-context tags
+-- (identity.RUN_CONTEXT_TAG_NAMESPACES: arch, tier, cadence) live on test_case_runs.tags instead.
 
 CREATE TABLE IF NOT EXISTS test_cases
 (
     ts           DateTime DEFAULT now(),
 
-    -- uuid5 over (component, classname, name, sorted(tags)) -- derived, so one test reconciles
-    -- across runs; re-tagging mints a new id, so trend queries group on the plain triple, never test_case_id.
+    -- uuid5 over (component, classname, name, sorted(identity tags)) -- derived, so one test
+    -- reconciles across runs, arches and tiers; re-tagging mints a new id, so trend queries group
+    -- on the plain triple, never test_case_id.
     test_case_id UUID,
 
     component    LowCardinality(String),
@@ -82,7 +84,9 @@ CREATE TABLE IF NOT EXISTS run_case_counters
     skipped     UInt64,
     -- Split from failed/passed: an xfail is an expected failure.
     xfail       UInt64,
-    xpass       UInt64
+    xpass       UInt64,
+    -- Of `passed`: an earlier attempt failed (retry, rerun or pytest-rerunfailures) and was replaced.
+    recovered   UInt64
 )
 ENGINE = SummingMergeTree()
 ORDER BY (run_id, component);
@@ -97,8 +101,11 @@ SELECT
     countIf(status = 'error')      AS errors,
     countIf(status = 'skipped')    AS skipped,
     countIf(status = 'xfail')      AS xfail,
-    countIf(status = 'xpass')      AS xpass
+    countIf(status = 'xpass')      AS xpass,
+    countIf(status = 'passed' AND (props['result.prior_status'] IN ('failed', 'error')
+            OR toUInt32OrZero(props['result.reruns']) > 0)) AS recovered
 FROM test_case_runs
 GROUP BY run_id, component;
 
--- The MV fires on INSERT only; migrations/002 backfills rows written before it existed.
+-- The MV fires on INSERT only; migrations/002 backfills rows written before it existed. Every
+-- INSERT into run_case_counters names its columns, so adding one never breaks an older insert.

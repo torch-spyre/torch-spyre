@@ -234,7 +234,11 @@ def _strip_debug_handles(obj):
 
 
 def compute_specs_hash(
-    specs: Sequence, kernel_name: str = "", pool_size: int = 0
+    specs: Sequence,
+    kernel_name: str = "",
+    pool_size: int = 0,
+    *,
+    backend_loop_unroll: bool | None = None,
 ) -> str:
     """Compute a cache key from OpSpec objects without any disk I/O.
 
@@ -252,11 +256,15 @@ def compute_specs_hash(
                      ``sdscbundle.device_mem_allocate`` in bundle.mlir.
                      Must be included so that kernels that differ only in
                      their pool size get different cache keys.
+        backend_loop_unroll: Resolved setting passed to the backend compiler.
+                             Defaults to the active Spyre config.
     """
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor import config as _spyre_config
 
+    if backend_loop_unroll is None:
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
     use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list = list(specs)
@@ -383,6 +391,7 @@ def compute_specs_hash(
     content_parts.append(
         f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
     )
+    content_parts.append(f"loop_unroll:{int(backend_loop_unroll)}".encode())
 
     content = b"||".join(content_parts)
     extra = "||".join(
@@ -485,15 +494,52 @@ def load_symbol_kinds(cached_dir: str) -> list[SymbolKind]:
         return [SymbolKind(**kind) for kind in json.load(f)]
 
 
-def allocate_compile_dir(cache_key: str) -> str:
+# Cache dirs are named by hash alone; this records which kernels map to one.
+_KERNEL_NAME_FILE = "kernel_name.txt"
+
+
+def record_kernel_name(kernel_dir: str, kernel_name: str) -> None:
+    """Append kernel_name to <kernel_dir>/kernel_name.txt unless already listed.
+
+    Never raises: failing to record a name must not fail a compile.
+
+    The read-check-append is not atomic across processes, so two processes
+    recording the same name concurrently can each append it and produce a
+    duplicate line. This is harmless — the file is a debugging aid, not part
+    of the cache key — so no locking is used.
+    """
+    if not kernel_name:
+        return
+    # A newline would corrupt the one-name-per-line format.
+    name = kernel_name.strip()
+    if not name or "\n" in name or "\r" in name:
+        return
+    marker = os.path.join(kernel_dir, _KERNEL_NAME_FILE)
+    try:
+        try:
+            with open(marker) as f:
+                if name in f.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(marker, "a") as f:
+            f.write(f"{name}\n")
+    except OSError as e:
+        logger.debug("Could not record kernel name %s in %s: %s", name, kernel_dir, e)
+
+
+def allocate_compile_dir(cache_key: str, *, kernel_name: str = "") -> str:
     """Reserve a unique temp directory inside the cache root for compilation.
 
     Placing it inside the cache root (not /tmp) ensures the subsequent rename
     in commit_compile_dir is atomic on POSIX.
+
+    ``kernel_name``, when given, is recorded in kernel_name.txt.
     """
     cache_root = get_cache_root_dir()
     tmp_dir = os.path.join(cache_root, f"{cache_key}.tmp.{uuid.uuid4().hex}")
     os.makedirs(tmp_dir, exist_ok=True)
+    record_kernel_name(tmp_dir, kernel_name)
     return tmp_dir
 
 
@@ -507,7 +553,10 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     cached_dir = os.path.join(cache_root, cache_key)
 
     if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy.
+        # Another process/thread won the race — discard our copy, but first
+        # merge our recorded kernel names into the winner's file so no name
+        # is lost.
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
         return cached_dir
@@ -516,10 +565,26 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
     except OSError:
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
 
     return cached_dir
+
+
+def _merge_kernel_names(tmp_dir: str, cached_dir: str) -> None:
+    """Record the names listed in tmp_dir's marker into cached_dir's marker.
+
+    Called when a race loser discards tmp_dir, so a name only that process
+    recorded is not lost. Never raises.
+    """
+    try:
+        with open(os.path.join(tmp_dir, _KERNEL_NAME_FILE)) as f:
+            names = f.read().splitlines()
+    except OSError:
+        return
+    for name in names:
+        record_kernel_name(cached_dir, name)
 
 
 def _move_to_failed_dir(compile_dir: str) -> None:

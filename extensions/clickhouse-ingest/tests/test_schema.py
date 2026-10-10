@@ -77,6 +77,8 @@ def test_column_order_matches_the_ddl():
         "duration_s",
         "fail_message",
         "props",
+        "tags",
+        "measurements",
     ]
     assert list(BENCHMARKS.columns) == [
         "benchmark_id",
@@ -173,6 +175,8 @@ def test_every_ddl_allowed_status_is_accepted(status):
             "duration_s": 1.0,
             "fail_message": "",
             "props": {},
+            "tags": [],
+            "measurements": {},
         }
     )
     assert row[3] == status
@@ -189,6 +193,8 @@ def test_status_outside_the_ddl_check_is_refused_before_the_server_sees_it():
                 "duration_s": 1.0,
                 "fail_message": "",
                 "props": {},
+                "tags": [],
+                "measurements": {},
             }
         )
 
@@ -210,6 +216,8 @@ def test_insert_passes_column_names_and_ordered_rows():
                 "duration_s": 0.5,
                 "fail_message": "",
                 "props": {"source_file": "a.xml"},
+                "tags": [],
+                "measurements": {},
             }
         ],
     )
@@ -217,7 +225,9 @@ def test_insert_passes_column_names_and_ordered_rows():
     table, rows, cols, _db = c.inserts[0]
     assert table == "test_case_runs"
     assert cols == list(TEST_CASE_RUNS.columns)
-    assert rows == [["r", "t", "c", "passed", 0.5, "", {"source_file": "a.xml"}]]
+    assert rows == [
+        ["r", "t", "c", "passed", 0.5, "", {"source_file": "a.xml"}, [], {}]
+    ]
 
 
 def test_insert_of_nothing_does_not_call_the_client():
@@ -317,9 +327,9 @@ def test_fact_tables_declare_no_identity_and_dimensions_do():
 
 
 def test_registry_covers_exactly_the_v2_tables():
-    # The functional/benchmark four, the artifact four, and the capability two. Pinned as an
-    # exact set so adding a table to the DDL without modelling it here (or vice versa) fails
-    # rather than drifting.
+    # The functional/benchmark four, the artifact four, the capability two, pipeline_runs,
+    # ci_run_timings and the dispatch three. Pinned as an exact set so adding a table to the DDL
+    # without modelling it here (or vice versa) fails rather than drifting.
     assert set(TABLES) == {
         "test_cases",
         "test_case_runs",
@@ -331,6 +341,11 @@ def test_registry_covers_exactly_the_v2_tables():
         "artifact_results",
         "capabilities",
         "capability_runs",
+        "pipeline_runs",
+        "ci_run_timings",
+        "artifact_subscriptions",
+        "dispatch_requests",
+        "artifact_dispatches",
     }
 
 
@@ -348,10 +363,12 @@ def test_props_carries_the_source_file_discriminator():
             "duration_s": 0.1,
             "fail_message": "",
             "props": {"source_file": "junit__shard_3.xml"},
+            "tags": [],
+            "measurements": {},
         }
     )
-    assert row[-1] == {"source_file": "junit__shard_3.xml"}
-    assert TEST_CASE_RUNS.columns[-1] == "props"
+    assert row[-3] == {"source_file": "junit__shard_3.xml"}
+    assert TEST_CASE_RUNS.columns[-3] == "props"
 
 
 def test_props_may_be_empty_when_no_source_file_is_known():
@@ -364,9 +381,11 @@ def test_props_may_be_empty_when_no_source_file_is_known():
             "duration_s": 0.1,
             "fail_message": "",
             "props": {},
+            "tags": [],
+            "measurements": {},
         }
     )
-    assert row[-1] == {}
+    assert row[-3] == {}
 
 
 # ── the db qualifier: one client, two generations ────────────────────────────────────────
@@ -613,3 +632,39 @@ def test_artifact_refs_rejects_an_unknown_method():
 def test_dep_entry_parsing(entry, component, id12):
     assert dep_component(entry) == component
     assert dep_id12(entry) == id12
+
+
+# ── the writer's tag split ───────────────────────────────────────────────────────────────
+
+
+def test_one_test_on_two_arches_is_one_identity_with_per_run_context():
+    from spyre_clickhouse_ingest import insert_test_results
+
+    def case(arch, tier, latency):
+        tags = [f"platform__{arch}", f"testtype__{tier}", "op__torch_mul"]
+        props = [("tag", t) for t in tags] + [
+            ("metric.latency_ms", str(latency)),
+            ("metric.bad", "n/a"),
+            ("metric.", "7"),  # no metric name: not a measurement
+            ("result.backend", "spyre"),
+            ("single_input_index", "3"),
+        ]
+        return {
+            "classname": "T",
+            "name": "test_x",
+            "status": "passed",
+            "properties": props,
+        }
+
+    c = FakeClient()
+    insert_test_results(c, "", "torch-spyre", "r1", [case("x86_64", "unit", 41.5)])
+    insert_test_results(c, "", "torch-spyre", "r2", [case("ppc64le", "svt", 50)])
+    idents = [i for i in c.inserts if i[0] == "test_cases"]
+    runs = [dict(zip(i[2], i[1][0])) for i in c.inserts if i[0] == "test_case_runs"]
+    assert {i[1][0][0] for i in idents} == {runs[0]["test_case_id"]}
+    assert runs[0]["test_case_id"] == runs[1]["test_case_id"]
+    assert idents[0][1][0][-1] == ["op__torch_mul"]
+    assert runs[0]["tags"] == ["platform__x86_64", "testtype__unit"]
+    assert runs[1]["tags"] == ["platform__ppc64le", "testtype__svt"]
+    assert runs[0]["measurements"] == {"latency_ms": 41.5}
+    assert runs[1]["props"] == {"result.backend": "spyre", "ran_in": "r2"}

@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+
 import numpy as np
 import pytest
 import torch
 import torch._dynamo as dynamo
 
-from utils_inductor import DEVICE, cached_randn, compare_with_cpu
+from utils_inductor import DEVICE, cached_randn, compare_with_cpu, strict_xfail
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -29,6 +31,17 @@ def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
         run_compile=(execution_mode == "compiled"),
         run_eager=(execution_mode == "eager"),
     )
+
+
+# The backend rejects FP64 when a tensor is moved to the device, in both modes.
+_DOUBLE_REJECTED = "does not support dtype Double"
+
+
+def _rejecting_double(condition):
+    """``pytest.raises`` for the FP64 rejection if ``condition``, else a no-op."""
+    if condition:
+        return pytest.raises(Exception, match=_DOUBLE_REJECTED)
+    return contextlib.nullcontext()
 
 
 def _run_spyre(execution_mode, fn, *args):
@@ -67,16 +80,12 @@ class TestDatatypeScalarOperations:
         """
         Test tensor-scalar multiplication with mixed precision types.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-        if tensor_dtype == torch.float64:
-            pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
         # PT 2.12 promotes Tensor × np.float64 to FP64 in the compiled output
-        # rather than constant-folding to FP32, causing a segfault in the
-        # generated Spyre kernel. Xfail until the FP64-scalar handling is fixed.
+        # rather than constant-folding to FP32; the layout code then divides by
+        # zero (SIGFPE) instead of rejecting FP64 as eager mode does.
         if execution_mode == "compiled" and scalar_type is np.float64:
-            pytest.xfail(
-                reason="Spyre backend does not support FP64 scalar promotion under "
-                "torch.compile (PT 2.12). See issue #1228."
+            pytest.skip(
+                reason="SIGFPE in SpyreTensorLayout::init for an FP64 scalar (#5335)"
             )
 
         def mixed_mul(x):
@@ -90,7 +99,8 @@ class TestDatatypeScalarOperations:
             dtype=tensor_dtype,
             differentiation=f"mixed_precision_{tensor_dtype}_{scalar_type}",
         )
-        _compare_modes(execution_mode, mixed_mul, x, atol=atol, rtol=rtol)
+        with _rejecting_double(tensor_dtype == torch.float64):
+            _compare_modes(execution_mode, mixed_mul, x, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize(
         "tensor_dtype,scalar_dtype",
@@ -105,14 +115,6 @@ class TestDatatypeScalarOperations:
         """
         Test FP16 scalar with FP16/FP32 tensors.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-        if execution_mode == "eager" and tensor_dtype == torch.float32:
-            pytest.xfail(reason="to_dtype on float32 (IEEE_FP32) not supported")
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def fp16_scalar_mul(x):
             scalar = torch.tensor(0.125, dtype=scalar_dtype, device=x.device)
@@ -134,12 +136,14 @@ class TestDatatypeScalarOperations:
             (np.uint8, 2),
         ],
     )
-    def test_integer_scalar_types(self, execution_mode, dtype, value):
+    def test_integer_scalar_types(self, request, execution_mode, dtype, value):
         """Test integer scalars with FP32 tensor."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
         if execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
+            strict_xfail(
+                request,
+                NotImplementedError,
+                "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
+                "tensor (the same error as #5070)",
             )
 
         def int_mul(x):
@@ -151,11 +155,6 @@ class TestDatatypeScalarOperations:
     @pytest.mark.parametrize("bool_val", [True, False])
     def test_bool_scalar(self, execution_mode, bool_val):
         """Test Boolean scalars."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        if not bool_val:
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
-            )
 
         def bool_mul(x):
             return x * bool_val
@@ -171,12 +170,20 @@ class TestDatatypeScalarOperations:
             (np.float64, 1e-3, 1e-2),
         ],
     )
-    def test_numpy_float_scalar_types(self, execution_mode, np_dtype, atol, rtol):
+    def test_numpy_float_scalar_types(
+        self, request, execution_mode, np_dtype, atol, rtol
+    ):
         """Test NumPy float scalars."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
+        if execution_mode == "compiled" and np_dtype is np.float64:
+            pytest.skip(
+                reason="SIGFPE in SpyreTensorLayout::init for an FP64 scalar (#5335)"
+            )
         if execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor creation fails - IndexError on empty args during layout propagation."
+            strict_xfail(
+                request,
+                torch._inductor.exc.InductorError,
+                "the scalar constant becomes a 0-D CPU buffer in the compiled "
+                "graph (related to #1598)",
             )
 
         def np_float_mul(x):
@@ -195,26 +202,20 @@ class TestDatatypeScalarOperations:
         ],
     )
     def test_torch_scalar_tensor_types(
-        self, execution_mode, torch_dtype, scalar_val, atol, rtol
+        self, request, execution_mode, torch_dtype, scalar_val, atol, rtol
     ):
         """Test 0-D torch scalar tensors with various dtypes."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-        if torch_dtype is None and execution_mode == "eager":
-            pytest.xfail(
-                reason="Mixed-dtype tensors (float32 * float16) sharing stick variable not supported"
-            )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-        elif torch_dtype == torch.float64:
-            pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
         # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
-        elif torch_dtype == torch.int32:
+        if torch_dtype == torch.int32:
             pytest.skip(
                 reason="Spyre backend does not support int32/int16 dtype - causes Signal Abort in data format converter"
             )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif torch_dtype in (None, torch.float16) and execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor mul fails - IndexError on empty args during layout propagation."
+        if torch_dtype is None:
+            strict_xfail(
+                request,
+                AssertionError,
+                "an FP32 0-D device tensor times an FP16 tensor returns FP32; the CPU "
+                "returns FP16, since a 0-D tensor does not promote within a category",
             )
 
         def torch_scalar_mul(x):
@@ -225,7 +226,8 @@ class TestDatatypeScalarOperations:
             return x * scalar
 
         x = cached_randn((128, 64), differentiation=f"torch_scalar_{torch_dtype}")
-        _compare_modes(execution_mode, torch_scalar_mul, x, atol=atol, rtol=rtol)
+        with _rejecting_double(torch_dtype == torch.float64):
+            _compare_modes(execution_mode, torch_scalar_mul, x, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize(
         "tensor_dtype,scalar_type,scalar_value,atol,rtol,test_name",
@@ -238,6 +240,7 @@ class TestDatatypeScalarOperations:
     )
     def test_type_promotion_operations(
         self,
+        request,
         execution_mode,
         tensor_dtype,
         scalar_type,
@@ -249,13 +252,12 @@ class TestDatatypeScalarOperations:
         """
         Test various type promotion scenarios.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-        if tensor_dtype == torch.float64:
-            pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
-        elif tensor_dtype == torch.float32 and execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor mul fails - IndexError on empty args during layout propagation."
+        if tensor_dtype == torch.float32 and execution_mode == "compiled":
+            strict_xfail(
+                request,
+                NotImplementedError,
+                "an integer scalar constant calls spyre::to_dtype_cpu on a CPU "
+                "tensor (the same error as #5070)",
             )
 
         def type_promo_op(x):
@@ -264,12 +266,16 @@ class TestDatatypeScalarOperations:
         x = cached_randn(
             (128, 64), dtype=tensor_dtype, differentiation=f"type_promo_{test_name}"
         )
-        _compare_modes(execution_mode, type_promo_op, x, atol=atol, rtol=rtol)
+        with _rejecting_double(tensor_dtype == torch.float64):
+            _compare_modes(execution_mode, type_promo_op, x, atol=atol, rtol=rtol)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-    @pytest.mark.xfail(reason="Spyre backend does not support dtype Double(FP64)")
     def test_mixed_dtype_chain_fp64_fp32_fp16(self, execution_mode):
-        """Test mixed dtype chain: FP64 → FP32 → FP16."""
+        """FP64 → FP32 → FP16 chain: the FP64 input is rejected.
+
+        Both modes fail when the FP64 tensor is moved to the device, before
+        ``torch.compile`` runs, so they pin the same check.
+        """
 
         def mixed_chain(x):
             x_fp32 = x.to(torch.float32)
@@ -277,7 +283,8 @@ class TestDatatypeScalarOperations:
             return x_scaled.to(torch.float16)
 
         x = cached_randn((128, 64), dtype=torch.float64)
-        _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
+        with pytest.raises(Exception, match="does not support dtype Double"):
+            _compare_modes(execution_mode, mixed_chain, x, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize(
         "dtype,scalar_value,atol,rtol",
@@ -293,9 +300,6 @@ class TestDatatypeScalarOperations:
         """
         Test subnormal scalar values with different dtypes.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
-        if dtype == torch.float64:
-            pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
 
         def subnormal_mul(x):
             return x * scalar_value
@@ -303,7 +307,8 @@ class TestDatatypeScalarOperations:
         x = cached_randn(
             (100, 100), dtype=dtype, differentiation=f"subnormal_{dtype}_{scalar_value}"
         )
-        _compare_modes(execution_mode, subnormal_mul, x, atol=atol, rtol=rtol)
+        with _rejecting_double(dtype == torch.float64):
+            _compare_modes(execution_mode, subnormal_mul, x, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize(
         "dtype,zero_val",
@@ -314,12 +319,20 @@ class TestDatatypeScalarOperations:
             (np.float64, -0.0),
         ],
     )
-    def test_zero_scalar_different_dtypes(self, execution_mode, dtype, zero_val):
+    def test_zero_scalar_different_dtypes(
+        self, request, execution_mode, dtype, zero_val
+    ):
         """Test positive and negative zero scalars."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1334
+        if execution_mode == "compiled" and dtype is np.float64:
+            pytest.skip(
+                reason="SIGFPE in SpyreTensorLayout::init for an FP64 scalar (#5335)"
+            )
         if execution_mode == "compiled":
-            pytest.xfail(
-                reason="Constant tensor mul fails - IndexError on empty args during layout propagation."
+            strict_xfail(
+                request,
+                torch._inductor.exc.InductorError,
+                "the scalar constant becomes a 0-D CPU buffer in the compiled "
+                "graph (related to #1598)",
             )
 
         def zero_mul(x):
@@ -520,7 +533,7 @@ class TestNegativeScalarOperations:
         ],
     )
     def test_non_finite_scalar_inputs(
-        self, execution_mode, special_value, expected_behavior, use_abs
+        self, request, execution_mode, special_value, expected_behavior, use_abs
     ):
         """
         Test non-finite scalar values (NaN, Inf, -Inf).
@@ -532,13 +545,18 @@ class TestNegativeScalarOperations:
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1219
         elif expected_behavior == "all_inf_nonzero":
-            pytest.xfail(
-                reason="backend does not support aten::index operations required for NaN validation"
+            strict_xfail(
+                request,
+                NotImplementedError,
+                "the test indexes the device result with a mask, which needs "
+                "aten::index.Tensor_out (#1219)",
             )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1639
         elif expected_behavior == "all_neg_inf":
-            pytest.xfail(
-                reason="backend does not support dtype conversion in comparison operations"
+            strict_xfail(
+                request,
+                AssertionError,
+                "multiplying by an infinite scalar returns NaN for some elements "
+                "instead of -inf",
             )
 
         def special_mul(x):
@@ -569,14 +587,7 @@ class TestNegativeScalarOperations:
         "dtype",
         [
             pytest.param(torch.float32, id="fp32"),
-            pytest.param(
-                torch.float16,
-                id="fp16",
-                marks=pytest.mark.xfail(
-                    reason="float16 device NaN converts to -inf on the way to "
-                    "the host, so the NaN is not observable there"
-                ),
-            ),
+            pytest.param(torch.float16, id="fp16"),
         ],
     )
     def test_negative_power_nan_result(self, execution_mode, dtype):
@@ -604,20 +615,22 @@ class TestNegativeScalarOperations:
         ],
     )
     def test_fp16_overflow_underflow(
-        self, execution_mode, dtype, scalar, expected_behavior
+        self, request, execution_mode, dtype, scalar, expected_behavior
     ):
         """
         Test FP16 overflow and underflow scenarios.
         """
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-        if expected_behavior == "underflow_close_to_input":
-            pytest.xfail(
-                reason="Mixed-dtype tensors sharing stick variable not supported"
+        if expected_behavior == "overflow_to_inf":
+            strict_xfail(
+                request,
+                AssertionError,
+                "x * 1e10 in FP16 returns [inf, nan, nan], not all inf",
             )
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1639
-        if expected_behavior in ["overflow_to_inf", "overflow_or_large"]:
-            pytest.xfail(
-                reason="backend does not support dtype conversion in comparison operations"
+        elif expected_behavior == "overflow_or_large" and execution_mode == "compiled":
+            strict_xfail(
+                request,
+                torch._inductor.exc.InductorError,
+                "Cannot resolve target for 'index_expr' (#4502)",
             )
 
         if expected_behavior == "underflow_close_to_input":
@@ -635,7 +648,8 @@ class TestNegativeScalarOperations:
         if expected_behavior == "overflow_to_inf":
             assert torch.isinf(result).all()
         elif expected_behavior == "underflow_close_to_input":
-            assert torch.allclose(result, x, atol=1e-3)
+            # Compared on the host: torch.allclose has no Spyre kernel for it.
+            assert torch.allclose(result.cpu(), x.cpu(), atol=1e-3)
         elif expected_behavior == "overflow_or_large":
             assert torch.isinf(result).any() or result.abs().max() > 60000
 
@@ -721,8 +735,9 @@ class TestNegativeScalarOperations:
         def grad_mul(x):
             return x * 0.125
 
-        x = cached_randn((10, 10))
-        x.requires_grad = True
+        # cached_randn returns one shared tensor per argument tuple; a copy keeps
+        # requires_grad off every later test that asks for the same shape.
+        x = cached_randn((10, 10)).clone().requires_grad_()
         result = _run_spyre(execution_mode, grad_mul, x)
         assert result.shape == x.shape
         assert result.requires_grad
@@ -774,38 +789,34 @@ class TestNegativeScalarOperations:
         assert not torch.isnan(result).any()
 
     def test_nested_compile_scalar(self, execution_mode):
-        """Nested torch.compile scalar path; xfail if backend lacks nested-compile support."""
+        """Nested torch.compile scalar path."""
 
         def nested_compile_op(x):
             return x * 0.125
 
         x = cached_randn((10, 10))
-        try:
-            if execution_mode == "compiled":
-                compiled_once = torch.compile(nested_compile_op)
-                compiled_twice = torch.compile(compiled_once)
-                result = compiled_twice(x.to(DEVICE))
-            else:
-                result = _run_spyre(execution_mode, nested_compile_op, x)
+        if execution_mode == "compiled":
+            compiled_once = torch.compile(nested_compile_op)
+            compiled_twice = torch.compile(compiled_once)
+            result = compiled_twice(x.to(DEVICE))
+        else:
+            result = _run_spyre(execution_mode, nested_compile_op, x)
 
-            expected = nested_compile_op(x)
-            torch.testing.assert_close(result.cpu(), expected, atol=1e-3, rtol=1e-3)
-        except (
-            RuntimeError,
-            AttributeError,
-            torch._dynamo.exc.TorchRuntimeError,
-        ) as err:
-            pytest.xfail(reason=f"Nested compile unsupported on Spyre path: {err}")
+        expected = nested_compile_op(x)
+        torch.testing.assert_close(result.cpu(), expected, atol=1e-3, rtol=1e-3)
 
-    def test_cpu_scalar_tensor_with_spyre_tensor(self, execution_mode):
+    def test_cpu_scalar_tensor_with_spyre_tensor(self, request, execution_mode):
         """CPU scalar tensor x Spyre tensor should compute successfully: a single
         non-write 0-dim CPU tensor is exempt from the device-mismatch check
         (mirrors TensorIterator's ``allow_cpu_scalars_``; see
         ``test_cross_device_scalar_op_allowed`` in ``tests/test_spyre.py``)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1598
         if execution_mode == "compiled":
-            pytest.xfail(
-                reason="IndexError: list index out of range due to device_tensor_layout"
+            strict_xfail(
+                request,
+                torch._inductor.exc.InductorError,
+                "the 0-D CPU tensor becomes a CPU-layout buffer in the compiled "
+                "graph (#1598)",
             )
 
         def cpu_scalar_spyre_tensor(x):

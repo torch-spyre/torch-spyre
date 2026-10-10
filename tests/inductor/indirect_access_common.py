@@ -36,14 +36,12 @@ computeOp routing. bundle_jsons_from_captured lets a test that only captured
 op specs move on to that same SDSC validation without recompiling.
 
 run_e2e drives the real backend (no mocking), mirroring the standalone
-gather.py script: it compiles and runs on device, then reports an *expected
-failure* (pytest.xfail) when the values diverge from the CPU reference or the
-backend aborts -- because the backend does not yet implement indirect access
-correctly. The xfail is raised after the capture-path stage checks run, so those
-stay strict; when the backend is fixed and results match, no xfail is raised and
-the test passes (xpass alerts you if a hard-coded expectation goes stale). For
-expect_close=True ops a mismatch/failure is instead a hard error. Only gather
-reaches this path today; the name is generic so scatter can reuse it later.
+gather.py script: it compiles and runs on device and asserts the result matches
+the CPU reference. A backend failure or a value mismatch fails the test. A known
+backend gap is pinned explicitly, after the capture-path stage checks (which stay
+strict): ``expect_backend_error`` asserts the compile raises with that message,
+and ``expect_close=False`` asserts the values diverge. Either pin fails the day
+the gap is fixed, which is the cue to drop it. Gather and scatter both use it.
 """
 
 import contextlib
@@ -53,7 +51,6 @@ import json
 import math
 import os
 import tempfile
-from subprocess import CalledProcessError
 from unittest.mock import patch
 
 import pytest
@@ -402,7 +399,8 @@ def run_e2e(
     *dev_args,
     atol: float = 0.01,
     rtol: float = 0.01,
-    expect_close: bool | None = None,
+    expect_close: bool = True,
+    expect_backend_error: str | None = None,
 ):
     """Compile and run an indirect-access kernel end-to-end on the real Spyre
     backend and validate the device result against the CPU reference.
@@ -413,38 +411,24 @@ def run_e2e(
     device tensors the kernel is invoked with; the CPU reference is computed
     from their host copies.
 
-    Today only gather kernels reach the indirect path -- the name is
-    deliberately generic so scatter (and other indirect ops) can reuse it once
-    the backend supports them.
-
     The CPU reference is computed first; if *that* raises it is a problem with
     the test itself (e.g. an out-of-bounds index) and is allowed to propagate.
 
-    The device compile/run is best-effort: the backend does not yet support
-    every indirect-access pattern and aborts (SIGABRT in the backend) on some
-    of them. A backend failure -- and likewise a value divergence -- is reported
-    as an *expected failure* (pytest.xfail) rather than warned or hard-failed, so
-    "always run e2e" surfaces known backend gaps as xfail (and flips to xpass the
-    day the backend is fixed) without turning the suite red. Because xfail is
-    raised imperatively *after* the capture-path stage checks have run, those
-    checks stay strict. (For `expect_close=True` ops, which must work, a failure
-    or divergence is a hard assertion/raise instead.)
+    A backend failure raises, and a value mismatch fails the assertion.  Two
+    keywords pin a known backend gap instead; both fail once the gap is fixed,
+    so the pin has to be removed then:
+
+      * `expect_backend_error` -- a regex; assert that the backend compile/run
+        fails with ``BackendCompilerFailed`` whose message matches it;
+      * `expect_close=False` -- assert the backend runs but its values diverge
+        from the CPU reference.
 
     Result validation:
       * the output is checked for the correct shape and dtype;
       * the values are compared against the golden CPU reference and the
-        max-abs-diff recorded;
-      * `expect_close` controls the value assertion:
-          - `True`  -> assert the result matches (use for ops that must be
-                         correct, e.g. a supported direct op or CPU fallback);
-          - `False` -> assert the result diverges (pin a known-bad path);
-          - `None`  -> xfail on divergence (the default for on-device indirect
-                         gather, which the backend does not yet implement
-                         correctly). When it is fixed and results match, no xfail
-                         is raised and the test simply passes.
+        max-abs-diff recorded, within `atol`/`rtol`.
 
-    Returns an `E2EResult` when the result matched (or expect_close handled it);
-    on divergence/backend failure it raises pytest.xfail and does not return.
+    Returns an `E2EResult`; with `expect_backend_error` its `result` is None.
     """
     reference = kernel(
         *[a.cpu() if isinstance(a, torch.Tensor) else a for a in dev_args]
@@ -452,17 +436,13 @@ def run_e2e(
 
     # Recompile from scratch so the run exercises a fresh bundle.
     torch._dynamo.reset()
-    try:
-        result = torch.compile(kernel)(*dev_args).cpu()
-    except (BackendCompilerFailed, CalledProcessError) as exc:
-        if expect_close:
-            raise  # a must-work op failing to compile/run is a real regression
-        pytest.xfail(
-            "e2e backend compile/run failed "
-            f"({type(getattr(exc, '__cause__', None) or exc).__name__}); the "
-            "Spyre backend does not yet support this indirect-access pattern. "
-            "The capture-path stages still validated the bundle."
+    if expect_backend_error is not None:
+        with pytest.raises(BackendCompilerFailed, match=expect_backend_error):
+            torch.compile(kernel)(*dev_args)
+        return E2EResult(
+            result=None, reference=reference, max_abs_diff=math.inf, close=False
         )
+    result = torch.compile(kernel)(*dev_args).cpu()
 
     test.assertEqual(
         result.shape, reference.shape, "e2e run produced the wrong output shape"
@@ -473,20 +453,12 @@ def run_e2e(
 
     diff = torch.abs(reference.float() - result.float()).amax().item()
     close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
-
-    if expect_close is True:
+    if expect_close:
         test.assertTrue(
             close, f"e2e result must match the CPU reference (max abs diff {diff:.4g})"
         )
-    elif expect_close is False:
+    else:
         test.assertFalse(close, "e2e result unexpectedly matched the CPU reference")
-    elif not close:
-        pytest.xfail(
-            "e2e result diverges from the CPU reference "
-            f"(max abs diff {diff:.4g}); the Spyre backend does not yet "
-            "implement indirect access correctly. The pipeline compiled and "
-            "ran end-to-end."
-        )
     return E2EResult(result=result, reference=reference, max_abs_diff=diff, close=close)
 
 
@@ -794,16 +766,17 @@ class IndirectAccessTestCase(InductorTestCase):
         expect,
         op=None,
         detected=None,
-        expect_close=None,
+        expect_close=True,
+        expect_backend_error=None,
         sdsc=True,
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
-        Shared by the gather and scatter op-family tests. Currently only the
-        capture-path stages run; the e2e leg (real backend compiler +
-        on-device launch via run_e2e) is wired up but disabled until e2e
-        support lands. Pass expect_close=True for ops whose result must match
-        the CPU reference (e.g. a supported direct op) once e2e is enabled.
+        Shared by the gather and scatter op-family tests. The e2e leg (real
+        backend compiler + on-device launch via run_e2e) must match the CPU
+        reference. To pin a known backend gap pass ``expect_close=False``
+        (values diverge) or ``expect_backend_error`` (a regex the compile
+        failure must match); the stage checks above stay strict either way.
 
         `sdsc=False` skips assert_indirect_sdsc_fields (still classifies the
         op spec + runs e2e). Needed for a bundle that is simultaneously a gather
@@ -817,7 +790,13 @@ class IndirectAccessTestCase(InductorTestCase):
         r = self.check(
             kernel, *dev_args, expect=expect, op=op, detected=detected, sdsc=sdsc
         )
-        run_e2e(self, kernel, *dev_args, expect_close=expect_close)
+        run_e2e(
+            self,
+            kernel,
+            *dev_args,
+            expect_close=expect_close,
+            expect_backend_error=expect_backend_error,
+        )
         return r
 
     # -- SDSC indirect-access field validation ---------------------------

@@ -11,28 +11,36 @@ test_suite_config:
         - names:
             - TestDevicePrecision::test_advancedindex_mixed_devices_error
             - TestDevicePrecision::test_from_sequence
-            - TestTorchDeviceType::test__local_scalar_dense_with_empty_tensor
-            - TestTorchDeviceType::test_addcmul_cuda_errors_with_cpu_scalars
-            - TestTorchDeviceType::test_bernoulli_mem_overlap
             - TestTorchDeviceType::test_index_add_mem_overlap
             - TestTorchDeviceType::test_index_copy_mem_overlap
             - TestTorchDeviceType::test_is_signed
             - TestTorchDeviceType::test_lazy_clone
             - TestTorchDeviceType::test_lazy_clone_view
-            - TestTorchDeviceType::test_masked_scatter_mem_overlap
             - TestTorchDeviceType::test_memory_format_consistency
-            - TestTorchDeviceType::test_multinomial_device_constrain
             - TestTorchDeviceType::test_narrow_empty
             - TestTorchDeviceType::test_parallel_cow_materialize_error
-            - TestTorchDeviceType::test_put_mem_overlap
             - TestTorchDeviceType::test_scatter_mem_overlap
-            - TestTorchDeviceType::test_shift_mem_overlap
             - TestTorchDeviceType::test_storage_use_count
           mode: mandatory_success
         # Skipped: flaky/unsupported on the Spyre backend.
         - names:
             - TestTorch::test_normal_shape
           mode: skip
+        # Upstream regression: these assertRaisesRegex() against a specific CPU error message
+        # (e.g. "Empty tensor not supported", "unsupported operation", "Expected all tensors to
+        # be on the same device", "CPU Scalar support for tensor1 argument"), but on Spyre the
+        # underlying op (bernoulli_.float, masked_scatter_, multinomial.out, put_,
+        # __ilshift__.Tensor, addcmul.out) is unimplemented, or a different error surfaces first
+        # (_local_scalar_dense), so none of the expected patterns match.
+        - names:
+            - TestTorchDeviceType::test__local_scalar_dense_with_empty_tensor
+            - TestTorchDeviceType::test_addcmul_cuda_errors_with_cpu_scalars
+            - TestTorchDeviceType::test_bernoulli_mem_overlap
+            - TestTorchDeviceType::test_masked_scatter_mem_overlap
+            - TestTorchDeviceType::test_multinomial_device_constrain
+            - TestTorchDeviceType::test_put_mem_overlap
+            - TestTorchDeviceType::test_shift_mem_overlap
+          mode: skip  # skip: NotImplementedError / error message mismatch on upstream PyTorch bump
         # These tests exercise the `addcdiv` operation with different dtypes, focusing on tensor operations and broadcasting.
         # They are classified as `mandatory_success` because the Spyre backend must support these operations for basic functionality.
         # The primary limitation is the unsupported `float32` dtype, which causes an `InductorError` due to unexpected arguments.

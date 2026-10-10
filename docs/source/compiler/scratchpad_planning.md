@@ -15,9 +15,9 @@ variable.
 
 Co-optimization with work distribution is on by default.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=0` to opt
-out) enlarges each op's set of candidate splits — pointwise
+out) enlarges each op's set of candidate splits (pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
-transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
+transfer, a shared batch-major `B/M` tiling for matmuls and reductions),
 then searches the cross-product for the assignment that minimizes HBM
 traffic. Every candidate, including work division's seed, must satisfy hard
 work-division constraints; generated alternatives also pass stick validation.
@@ -145,9 +145,11 @@ split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
 validate_ops
 optimize_restickify_locations
+reorder_nonstick_dims                 # reorder matmul non-stick dims for work division
 finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
+reorder_nonstick_dims_mutation        # execute deferred reorders after insert_restickify
 insert_post_mutation_restickify
 insert_restickify_padding
 dedup_and_promote_constants
@@ -292,7 +294,7 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    HBM input that is read more than once *and* fits on LX. The clone output
    becomes a fresh LX-eligible buffer.
 2. **Buffer analysis.** `_generate_buffers` produces one
-   `LifetimeBoundBuffer` per buffer — *including* the ones that may not
+   `LifetimeBoundBuffer` per buffer, *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
    (in `allocator.py`) decides eligibility and the verdict rides along as
    `residency_reason` (see
@@ -311,8 +313,8 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 
 ### Declarative exclusion
 
-Eligibility is decided in exactly one place — `ScratchpadAllocator._residency_reasons`
-in `allocator.py` — and carried
+Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
+in `allocator.py`, and carried
 to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
 
@@ -326,7 +328,7 @@ simulated annealing, CP-SAT) routes its exclusions through it.
 
 **Where a check belongs.** Precomputable from the graph ⇒ it lives in
 `_residency_reasons` as a reason string. Depends on the solver's free variables ⇒
-it stays a constraint in the solver — today that is only CP-SAT's per-edge
+it stays a constraint in the solver: today that is only CP-SAT's per-edge
 slicing match over the division variables and its in-place merge gate.
 Capacity is the exception that belongs to neither allocator: it is solver
 state, so it lives on `MemoryPlanSolver.excluded` alongside the tag.
@@ -347,7 +349,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
 | `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
 | `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
-| `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only** — the joint solver *chooses* the division, so its slicing gate decides instead) |
+| `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only**: the joint solver *chooses* the division, so its slicing gate decides instead) |
 | `no consumer reads it from LX` | residency would save nothing |
 | `lx back gap` | `backGap` is supported for HBM but not LX |
 
@@ -363,17 +365,17 @@ each buffer and is the gate for whether a buffer is even eligible.
 
 - **Sizing is writer-authoritative.** The op that *writes* a buffer
   determines how the data is physically spread across cores, so the
-  divisor is the writer's core count — not the maximum over all users. A
+  divisor is the writer's core count, not the maximum over all users. A
   reader on more cores only touches its own (smaller) slice of that
   residency. (Earlier code used `max()` over users, which under-sized a
-  buffer whose writer ran on fewer cores than a consumer — e.g. a 1-core
-  producer feeding a 32-core matmul — and wrongly pinned an over-large
+  buffer whose writer ran on fewer cores than a consumer (e.g. a 1-core
+  producer feeding a 32-core matmul) and wrongly pinned an over-large
   buffer to a single core's LX.) Graph inputs have no in-graph writer and
   fall back to the readers' (matching) count.
 - **Mismatch detection compares per-core views.** Two ops agree on a
   buffer only if their `PerCoreView` (`_per_core_view_on_buf` in
-  `pass_utils.py`) — which device dim each core's slice occupies, and the
-  core→slice mapping — matches. A genuine single-core "owns the whole
+  `pass_utils.py`), which device dim each core's slice occupies, and the
+  core→slice mapping, matches. A genuine single-core "owns the whole
   buffer" access is encoded distinctly from a multi-core broadcast that
   also touches the whole buffer, so the two never compare equal by
   accident. A writer/reader core-count disagreement, a partial-sum
@@ -445,8 +447,8 @@ Once a deeptools dependency clears, first-fit is the expected default.
 ### CpSatLayoutSolver
 
 `config.layout_solver = "cpsat"` selects an OR-Tools CP-SAT solver that
-models placement as a global 2D no-overlap — each resident buffer is an
-optional `[lifetime] × [address, address + size)` rectangle — and
+models placement as a global 2D no-overlap (each resident buffer is an
+optional `[lifetime] × [address, address + size)` rectangle) and
 minimizes total HBM transfer traffic, so a buffer that would be re-read by
 *N* consumers costs `N × size` when spilled. In-place reuse is encoded by
 shortening a parent's lifetime by the single handoff tick, letting the
@@ -478,7 +480,7 @@ algorithm and the tunable schedule parameters.
 
 Note this is placement-only. With `co_optimizing_lx_planning` the same config
 value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
-the core divisions and the placement jointly — see
+the core divisions and the placement jointly. See
 [Joint core-division + LX placement](sa_co_optimization.md).
 
 ## Co-optimization with work-distribution
@@ -525,13 +527,13 @@ shared pool (below). Adopting a neighbouring matmul's tiling makes the
 op's per-core view match the matmul's, so the shared buffer pins to LX
 *and* the op runs at the matmul's high-utilization shape.
 
-**Matmul splits are not overridden onto a single dim — but neighbours'
+**Matmul splits are not overridden onto a single dim, but neighbours'
 tilings and a batch-major split are offered.** Concentrating a balanced
 `M/4×N/8` split onto one dim (`M/32`) pins the matmul output and the
 surrounding chain to LX but is a poor matmul shape: on `mlp-linear-kn.t`
 (SENCORES=32) it regressed kernel time ~2.5× as process-engine
 utilization fell from 66% to 33%. So the rule remains **prioritize compute
-utilization for compute-bound ops** — the seed split is never flipped onto
+utilization for compute-bound ops**: the seed split is never flipped onto
 one dim. Instead, `_check_and_add_matmul_option` offers each matmul its
 seed plus (a) every *other* matmul's split transferred into this op's
 coordinates by axis role (so two matmuls whose work-division splits
@@ -541,12 +543,12 @@ preserved.
 
 **Batch-major `B/M` tiling reconciles attention.** Two attention matmuls
 (`Q·Kᵀ` and `scores·V`) contract different axes, so neither can adopt the
-other's `N`/`K` tiling — but both keep the batch (`B`) and `M` output
+other's `N`/`K` tiling, but both keep the batch (`B`) and `M` output
 axes. `_factored_bm_splits` emits a single full-core `B/b · M/m` split
 (largest batch factor that fits, from `(8, 4, 2)` with `m = ncores / b`),
 valid for both matmuls and divisible into both stick-count extents. This
 shared tiling is also offered to the **softmax reductions** (`max`/`sum`)
-in their own output coordinates via `_reduction_bm_axes` — reductions are
+in their own output coordinates via `_reduction_bm_axes`. Reductions are
 otherwise left on their seed, but offering them the `B/M` split lets the
 whole softmax chain between the two matmuls reconcile to one tiling. On
 `mha_4h` (SENCORES=32) this converges both matmuls and the entire
@@ -594,6 +596,51 @@ The same gate applies to `layout_solver` values of `"greedy"`, `"bestfit"`,
 or `"firstfit"` combined with `co_optimizing_lx_planning`, since none of
 those solvers is core-division-capable either.
 
+#### Solver-driven coarse tiling
+
+`config.auto_coarse_tiling` (env var `AUTO_COARSE_TILING=1`, off by
+default) lets the joint CP-SAT solve choose a coarse tiling for each op
+along with its core division. It has no effect with any other solver.
+
+- **Candidates.** An op is offered the output-axis tilings
+  `enumerate_tile_options` finds: never the stick dim, never a reduction
+  axis, never an axis one of its reads repeats along (the repeated dim of
+  `x.repeat`, whose tiles would have to wrap back over `x`), and none that
+  leave a per-core read over the read-distance limit.
+  Ops a `spyre_hint` or `for_each_tile` loop already tiles, every op inside
+  a `for_each_tile` region, restickifies and mutations are offered only the
+  untiled option. Each tiling gets its own division menu, enumerated on the
+  per-tile frame.
+- **Matching.** A producer/consumer pair of divisions is compatible when
+  the two agree on core ownership and on tile ownership of the buffer they
+  share, both taken on the untiled buffer: tile `t` must touch the same
+  slice on both sides. `TileSpec` equality is not the test. `host_dim` is
+  positional in each op's own output, so equal specs can tile different
+  dims of a shared buffer (a permuted or reducing consumer), and unequal
+  specs the same one. A consumer that reads the buffer more than once has to
+  agree through every read: `a + a.permute(1, 0, 2)` pairs with `a` only
+  under a division or tiling on a dim both reads walk alike. A buffer that
+  may not live in LX gets no compatible pairs, one that some reader takes
+  only in part included: tiling exists to keep buffers in LX, so its
+  producer and consumer never share a nest.
+- **Loop groups.** Consecutive ops that run the same loop nest (the same
+  trip count at each level) share a loop group. The solve requires every
+  producer/consumer edge inside a group to be a compatible pair.
+  `CoarseTilingPass` checks each such edge again and starts a new group at a
+  consumer that does not read its producer tile by tile, which then reads the
+  producer's full buffer; a plan from this solve never has one.
+- **Objective.** The cost expression is not used, since it has no term for
+  tile size or loop-group boundaries. The solve ranks plans
+  lexicographically: LX residency, then *cuts* (tiled ops whose value must
+  be copied out of their nest, for a consumer outside it or as a graph
+  output), then parallelism, division shape and, last, the fewest tiles.
+- **Materialize and re-plan.** When the solve picks any tiling,
+  `CoarseTilingPass` applies it and the allocation is solved again over the
+  tiled graph with no tilings offered; that second plan is the one
+  committed. A `SolveError` from the first solve falls back to greedy
+  placement over the untouched graph, and one from the second solve over
+  the tiled graph.
+
 ### Joint SA co-optimization
 
 Setting `layout_solver = "simulated_annealing"` together with
@@ -606,9 +653,9 @@ layout permutation as one joint state and scores it with the cost model. See
 
 LX data corruption (clobbering) can happen when two conditions hold together: (1) two
 *separate* `torch.compile`s each plan their own LX addresses independently, with no shared view
-of what the other has pinned; and (2) one runs nested inside the other — a `FallbackKernel`'s
+of what the other has pinned; and (2) one runs nested inside the other, a `FallbackKernel`'s
 eager body launching a second, separately-compiled Spyre program (via a nested `torch.compile`,
-or any eager op compiled standalone through `ops/eager.py`) — while the outer graph still needs
+or any eager op compiled standalone through `ops/eager.py`), while the outer graph still needs
 a buffer it already has LX-resident. The inner compile has no knowledge of that buffer and may
 reuse its address for its own scratch:
 
@@ -617,7 +664,7 @@ op0 (write r -> LX)  ...  FallbackKernel (opaque)  ...  op1 (read r <- LX)
 ```
 
 An earlier fix (PR3683) closed this by refusing LX residency outright to any buffer live
-across such a call (`_extern_kernel_in_live_range` in `allocator.py`) — correct, but every
+across such a call (`_extern_kernel_in_live_range` in `allocator.py`), correct, but every
 access to that buffer then pays a full HBM round trip, not just the one crossing: cost scales
 as `(1 + read_count)·size/BW`, growing with reuse.
 
@@ -635,7 +682,7 @@ Not every `FallbackKernel` needs bracketing. A cheap classification skips it ent
 op is a confirmed CPU-only fallback (`ops/fallbacks.py`'s shared, once-verified `_fallback`
 body) or explicitly opted out via `mark_lx_safe(op)` for an op whose author has confirmed that
 no intermediate buffers will ever write into LX. Otherwise, the buffer-lifetime check above
-is the load-bearing gate — classifying op behavior by namespace or registry proved unreliable
+is the load-bearing gate. Classifying op behavior by namespace or registry proved unreliable
 in general, since `ops/eager.py` compiles plenty of aten ops (`mm`, `add`, `softmax`,
 `embedding`, …) standalone, and any of them can appear as the risky call.
 
@@ -645,8 +692,8 @@ Measured on an 8-layer, 512×512 fp16 repro (`read_count = 1` per bracketed buff
 | Configuration | Correctness | `kernel_ms` | HBM crossings for `r` |
 |---|---|---|---|
 | No fix | ❌ (`diff > 0`) | 0.313 | 0 (fully LX, but corrupted) |
-| Context switching (default) | ✅ | 0.386–0.388 | 2 — fixed dump + restore |
-| PR3683 guard alone | ✅ | 0.395–0.396 | 2 — this buffer's own write + read, both via HBM |
+| Context switching (default) | ✅ | 0.386 to 0.388 | 2: fixed dump + restore |
+| PR3683 guard alone | ✅ | 0.395 to 0.396 | 2: this buffer's own write + read, both via HBM |
 
 These costs are equal in bytes moved at `read_count = 1`, yet the guard still measures
 consistently slower: HBM reads/writes actually happen in small chunks, so an op processing data

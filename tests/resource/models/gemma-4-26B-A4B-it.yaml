@@ -1437,21 +1437,21 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 1024, 256]
           stride: [4194304, 262144, 256, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 1024, 256]
           stride: [4194304, 262144, 256, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation
@@ -3604,21 +3604,21 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 24, 512]
           stride: [16777216, 1048576, 512, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 24, 512]
           stride: [16777216, 1048576, 512, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation
@@ -6573,21 +6573,21 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 1024, 256]
           stride: [4194304, 262144, 256, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 1024, 256]
           stride: [4194304, 262144, 256, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation
@@ -8142,21 +8142,21 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 2048, 512]
           stride: [16777216, 1048576, 512, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 16, 2048, 512]
           stride: [16777216, 1048576, 512, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation

@@ -51,18 +51,57 @@ class TestSWATiling(unittest.TestCase):
             lx_budget_bytes=lx_budget_bytes,
         )
 
-    def test_gemma4_prefill_uses_geometry_costs(self):
+    def test_gemma4_prefill_scans_the_window_in_one_block(self):
+        # Gemma 4 sliding layers at S=2048: one 1088-row block measured
+        # 16.1 ms, against 49.2 ms for the former five 256-row blocks.
         config = self._select()
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.num_kv_blocks, 5)
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 1088)
+        self.assertEqual(config.num_kv_blocks, 1)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(config.work_div, {"q_block": 16})
-        self.assertEqual(config.kv_bytes_per_core, 256 * 4096)
+        self.assertEqual(config.kv_bytes_per_core, 1088 * 4096)
+        self.assertEqual(
+            config.reason, "fewest K/V blocks whose resident floor fits LX"
+        )
+
+    def test_long_query_block_takes_fewest_blocks_whose_floor_fits(self):
+        # A 512-row query block cannot hold a 4096-row score pair in LX.
+        # Four 1024-row blocks measured 1.80 ms; 2048- and 4096-row blocks,
+        # which spill scores, measured 4.0 and 12.6 ms.
+        config = self._select(q_block=512, buffer_width=4096)
+
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.kv_block_size, 1024)
+        self.assertEqual(config.num_kv_blocks, 4)
+
+    def test_granite_window_scans_in_one_block(self):
+        # Granite SWA (H32/Hkv8/D128, window 2048) at S=4096: one 2112-row
+        # block measured 63.8 ms; 256-row blocks 97.5 ms and five 448-row
+        # blocks 125.7 ms.
+        config = self._select(num_heads=32, head_dim=128, buffer_width=2112)
+
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 2112)
+        self.assertEqual(config.num_kv_blocks, 1)
+
+    def test_unpadded_odd_block_count_is_not_selected(self):
+        # Three 704-row blocks cover 2112 exactly, so the K/V loop would slice
+        # the cache view, whose strides an odd tile count does not divide.
+        config = self._select(
+            num_heads=16,
+            num_kvheads=2,
+            q_block=512,
+            buffer_width=2112,
+            head_dim=512,
+        )
+
+        self.assertEqual(config.kv_block_size, 448)
+        self.assertEqual(config.num_kv_blocks, 5)
 
     def test_repeated_bmm_tiles_are_stick_aligned(self):
-        config = self._select(head_dim=64)
+        config = self._select(head_dim=128, num_heads=32, q_block=512)
 
         self.assertEqual(config.kv_block_size, 576)
         self.assertEqual(config.num_kv_blocks, 2)
@@ -79,7 +118,7 @@ class TestSWATiling(unittest.TestCase):
         self.assertIsNone(config.work_div)
         self.assertIn("fewest DSC executes", config.reason)
 
-    def test_gemma3_prefill_uses_streaming_target(self):
+    def test_gemma3_prefill_keeps_one_block(self):
         config = self._select(
             num_heads=8,
             num_kvheads=4,
@@ -116,7 +155,7 @@ class TestSWATiling(unittest.TestCase):
             head_dim=128,
         )
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.strategy, "work_divided")
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
@@ -148,17 +187,17 @@ class TestSWATiling(unittest.TestCase):
     def test_work_division_scales_with_available_cores(self):
         config = self._select(num_cores=16)
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 1088)
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
     def test_wider_cache_uses_the_same_geometry_model(self):
         config = self._select(buffer_width=4096)
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.num_kv_blocks, 16)
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 4096)
+        self.assertEqual(config.num_kv_blocks, 1)
         self.assertEqual(config.num_head_tiles, 1)
 
     def test_long_query_block_keeps_coarse_fallback(self):

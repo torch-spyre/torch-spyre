@@ -15,18 +15,22 @@
 # Owner(s): ["module: stream"]
 
 """
-Tests for the device-error-state skip mechanism.
+Tests for the device-error-state mechanism.
 
 - TestStreamErrorBindings: unit-tests the typed _C.SpyreStreamError /
   _C.SpyreDeviceState enums and the associated query functions.
-- TestDeviceErrorSkipIntegration: calls the conftest hook directly to verify
-  skip behaviour without spawning subprocesses.
+- TestDeviceFaultSetup: calls the setup hook and _is_device_fault directly.
+- TestDeviceFaultSession: runs the real hooks in a child pytest session, pinning
+  report outcomes, the xfail interplay and the exit code end to end.
 
 Usage: ``python test_device_error_skip.py`` or ``pytest test_device_error_skip.py``
 """
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -45,6 +49,8 @@ assert _spec is not None and _spec.loader is not None, (
 _tests_conftest = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tests_conftest)  # type: ignore[union-attr]
 pytest_runtest_setup = _tests_conftest.pytest_runtest_setup
+SpyreDeviceFault = _tests_conftest.SpyreDeviceFault
+_is_device_fault = _tests_conftest._is_device_fault
 
 
 class TestStreamErrorBindings(TestCase):
@@ -151,10 +157,9 @@ class TestStreamErrorBindings(TestCase):
         )
 
 
-class TestDeviceErrorSkipIntegration(TestCase):
+class TestDeviceFaultSetup(TestCase):
     """
-    Calls pytest_runtest_setup() directly with a mock item to verify the
-    skip hook.
+    Calls pytest_runtest_setup() and _is_device_fault() directly with mocks.
     """
 
     def _make_item(self, keywords=()):
@@ -163,14 +168,13 @@ class TestDeviceErrorSkipIntegration(TestCase):
         item.keywords = set(keywords)
         return item
 
-    def test_healthy_device_does_not_skip(self):
-        """When device state is Ok the hook must not skip."""
+    def test_healthy_device_proceeds(self):
+        """When device state is Ok the hook must let the test run."""
         with patch.object(_C, "get_device_state", return_value=_C.SpyreDeviceState.Ok):
-            # Should complete without raising pytest.skip.Exception
             pytest_runtest_setup(self._make_item())
 
-    def test_not_initialized_does_not_skip(self):
-        """When device state is NotInitialized the hook must not skip (proceed)."""
+    def test_not_initialized_proceeds(self):
+        """When device state is NotInitialized the hook must let the test run."""
         with patch.object(
             _C,
             "get_device_state",
@@ -178,37 +182,235 @@ class TestDeviceErrorSkipIntegration(TestCase):
         ):
             pytest_runtest_setup(self._make_item())
 
-    def test_faulted_device_skips(self):
-        """When device state is StreamError every hook call must skip."""
+    def test_faulted_device_errors_instead_of_skipping(self):
+        """When device state is StreamError every hook call must error, never skip."""
         with patch.object(
             _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
         ):
             for _ in range(3):
-                with self.assertRaises(pytest.skip.Exception):
+                with self.assertRaises(SpyreDeviceFault):
                     pytest_runtest_setup(self._make_item())
 
-    def test_skip_message_contains_device_is_in_error_state(self):
-        """The skip reason must contain 'Device is in error state'."""
+    def test_fault_message_names_the_state(self):
+        """The error must say the device is in error state and name StreamError."""
         with patch.object(
             _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
         ):
-            with self.assertRaises(pytest.skip.Exception) as ctx:
+            with self.assertRaises(SpyreDeviceFault) as ctx:
                 pytest_runtest_setup(self._make_item())
         self.assertIn("Device is in error state", str(ctx.exception))
-
-    def test_skip_message_contains_error_class_name(self):
-        """The skip reason must name the error class (e.g. 'StreamError')."""
-        with patch.object(
-            _C, "get_device_state", return_value=_C.SpyreDeviceState.StreamError
-        ):
-            with self.assertRaises(pytest.skip.Exception) as ctx:
-                pytest_runtest_setup(self._make_item())
         self.assertIn("StreamError", str(ctx.exception))
 
     def test_import_error_does_not_block_test(self):
         """If torch_spyre._C is not importable the hook must silently pass."""
         with patch.dict(sys.modules, {"torch_spyre._C": None}):
             pytest_runtest_setup(self._make_item())
+
+    def test_broken_state_query_does_not_block_test(self):
+        """A _C that raises (not just a missing one) must not escape into pytest."""
+        with patch.object(_C, "get_device_state", side_effect=RuntimeError("boom")):
+            pytest_runtest_setup(self._make_item())
+
+    def _excinfo(self, exc):
+        try:
+            raise exc
+        except type(exc):
+            return pytest.ExceptionInfo.from_current()
+
+    def test_ras_hardware_error_is_a_device_fault(self):
+        """A RAS hardware error must never be absorbed by an xfail."""
+        ras = RuntimeError(_RAS)
+        self.assertTrue(_is_device_fault(self._excinfo(ras)))
+
+    def test_text_mentioning_a_ras_error_is_not_a_device_fault(self):
+        """Only the runtime's own record counts, not an assertion quoting it."""
+        quoted = AssertionError(f"expected no fault, got {_RAS}")
+        self.assertFalse(_is_device_fault(self._excinfo(quoted)))
+        self.assertFalse(_is_device_fault(self._excinfo(RuntimeError(f"saw {_RAS}"))))
+
+    def test_ordinary_failure_is_not_a_device_fault(self):
+        """An unsupported-op error stays eligible for xfail."""
+        self.assertFalse(
+            _is_device_fault(self._excinfo(RuntimeError("Unsupported: flip")))
+        )
+
+
+_RAS = (
+    '{"action":"information","category":"hardware","code":"0x7b1b",'
+    '"name":"RAS::RUNTIMESCHEDULER::ComputeHardwareError"}'
+)
+
+# The real conftest hooks in a child pytest session, with get_device_state() driven by the
+# tests themselves. Appends (not prepends) this dir so a stubbed path can shadow it.
+_SESSION_CONFTEST = f"""
+import importlib.util, sys
+sys.path.append({str(_CONFTEST_PATH.parent)!r})
+# torch first: importing torch_spyre first makes torch's backend autoload re-enter it half-initialized.
+import torch
+from torch_spyre import _C
+STATE = {{"s": _C.SpyreDeviceState.Ok}}
+_C.get_device_state = lambda: STATE["s"]
+_spec = importlib.util.spec_from_file_location("real_conftest", {str(_CONFTEST_PATH)!r})
+_real = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_real)
+pytest_runtest_setup = _real.pytest_runtest_setup
+pytest_runtest_makereport = _real.pytest_runtest_makereport
+pytest_sessionfinish = _real.pytest_sessionfinish
+"""
+
+_SESSION_TESTS = f"""
+import unittest, pytest
+from torch_spyre import _C
+from conftest import STATE
+RAS = {_RAS!r}
+
+@pytest.mark.xfail(reason="unsupported op")
+def test_a_ordinary_xfail():
+    raise RuntimeError("Unsupported: flip")
+
+@pytest.mark.xfail(reason="unsupported op")
+def test_b_ras_under_pytest_xfail():
+    raise RuntimeError(RAS)
+
+@pytest.mark.xfail(reason="unsupported op", strict=True)
+def test_c_ras_under_strict_xfail():
+    raise RuntimeError(RAS)
+
+class TestD(unittest.TestCase):
+    def test_d_ras_under_oot_xfail(self):
+        raise RuntimeError(RAS)
+    test_d_ras_under_oot_xfail.pytestmark = [pytest.mark.xfail(reason="oot")]
+
+@pytest.mark.xfail(reason="expected to fail")
+def test_e_xpass_while_the_device_faults():
+    STATE["s"] = _C.SpyreDeviceState.StreamError
+
+def test_f_after_the_fault():
+    pass
+"""
+
+_XPASS_TESTS = """
+import unittest, pytest
+
+@pytest.mark.xfail(reason="fixed since", strict=True)
+def test_a_strict_xpass():
+    pass
+
+class TestB(unittest.TestCase):
+    def test_b_oot_strict_xpass(self):
+        pass
+    test_b_oot_strict_xpass.pytestmark = [pytest.mark.xfail(reason="oot", strict=True)]
+
+@pytest.mark.xfail(reason="may pass")
+def test_c_non_strict_xpass():
+    pass
+
+@pytest.mark.xfail(reason="unsupported op", strict=True)
+def test_d_strict_xfail_that_fails():
+    raise RuntimeError("Unsupported: flip")
+
+class TestE(unittest.TestCase):
+    def test_e_oot_xfail_that_fails(self):
+        raise RuntimeError("Unsupported: flip")
+    test_e_oot_xfail_that_fails.pytestmark = [pytest.mark.xfail(reason="oot", strict=True)]
+"""
+
+_LAST_TEST_FAULTS = """
+import pytest
+from torch_spyre import _C
+from conftest import STATE
+
+@pytest.fixture(scope="session", autouse=True)
+def fault_after_the_last_report():
+    yield
+    STATE["s"] = _C.SpyreDeviceState.StreamError
+
+def test_only():
+    pass
+"""
+
+
+class TestDeviceFaultSession(TestCase):
+    """Runs the real hooks inside pytest: xfail rewrites, report outcomes and exit code."""
+
+    def _run(self, tests):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "conftest.py").write_text(_SESSION_CONFTEST)
+            Path(d, "test_session.py").write_text(tests)
+            xml = Path(d, "out.xml")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-p",
+                    "no:cacheprovider",
+                    "-rA",
+                    "--import-mode=append",
+                    f"--junit-xml={xml}",
+                    d,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=d,
+            )
+            if not xml.exists():
+                self.fail(
+                    f"child pytest exited {proc.returncode} without writing "
+                    f"{xml.name}\n--- stdout ---\n{proc.stdout[-4000:]}"
+                    f"\n--- stderr ---\n{proc.stderr[-4000:]}"
+                )
+            outcomes = {}
+            for case in ET.parse(xml).getroot().iter("testcase"):
+                kinds = [
+                    c.tag for c in case if c.tag in ("failure", "error", "skipped")
+                ]
+                outcomes[case.get("name")] = (kinds[0] if kinds else "passed", case)
+        return proc, outcomes
+
+    def test_faults_fail_the_session_and_never_read_as_xfail(self):
+        proc, outcomes = self._run(_SESSION_TESTS)
+        status = {name: kind for name, (kind, _) in outcomes.items()}
+        self.assertEqual(
+            status,
+            {
+                "test_a_ordinary_xfail": "skipped",  # a genuine XFAIL
+                "test_b_ras_under_pytest_xfail": "failure",
+                "test_c_ras_under_strict_xfail": "failure",
+                "test_d_ras_under_oot_xfail": "failure",
+                "test_e_xpass_while_the_device_faults": "failure",
+                "test_f_after_the_fault": "error",
+            },
+            proc.stdout,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        # The XPASS carried no exception, so its failure needs a readable message.
+        _, xpass = outcomes["test_e_xpass_while_the_device_faults"]
+        self.assertIn("StreamError", xpass.find("failure").get("message", ""))
+
+    def test_strict_xpass_fails_and_genuine_xfail_does_not(self):
+        proc, outcomes = self._run(_XPASS_TESTS)
+        status = {name: kind for name, (kind, _) in outcomes.items()}
+        self.assertEqual(
+            status,
+            {
+                "test_a_strict_xpass": "failure",
+                "test_b_oot_strict_xpass": "failure",
+                "test_c_non_strict_xpass": "passed",  # strict=False allows an XPASS
+                "test_d_strict_xfail_that_fails": "skipped",  # a genuine XFAIL
+                "test_e_oot_xfail_that_fails": "skipped",  # a genuine OOT XFAIL
+            },
+            proc.stdout,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        for name in ("test_a_strict_xpass", "test_b_oot_strict_xpass"):
+            _, case = outcomes[name]
+            self.assertIn("XPASS", case.find("failure").get("message", ""))
+
+    def test_fault_after_the_last_test_fails_the_session(self):
+        proc, outcomes = self._run(_LAST_TEST_FAULTS)
+        self.assertEqual(outcomes["test_only"][0], "passed")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

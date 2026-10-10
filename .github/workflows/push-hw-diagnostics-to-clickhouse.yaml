@@ -61,15 +61,39 @@ jobs:
             .github/actions
           sparse-checkout-cone-mode: false
 
-      # tier is a run_id hash input, so it must be push-to-clickhouse.yaml's "Extract suite tier"
+      # tier is a run_id hash input, so it must be push-to-clickhouse.yaml's "Resolve suite tier"
       # rule verbatim or these rows never join that run's cases. Empty there means the case
       # ingest wrote no v2 rows, so the workflow name keeps these rows writable.
-      - name: Extract suite tier from display title
+      - name: Recover suite tier
+        id: test-type
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          artifact-name: test-type
+          label: Suite tier
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve suite tier
         id: extract-tier
+        env:
+          TIER_ARTIFACT: ${{ steps.test-type.outputs.value }}
         run: |
-          TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          TIER=""
+          if [ "${TRIGGERING_DISPLAY_TITLE}" = "${TRIGGERING_WORKFLOW}" ]; then
+            TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/^[a-z_-]* (\([a-z_-]*\))$/\1/p')
+          fi
+          TIER="${TIER:-${TIER_ARTIFACT}}"
           echo "Resolved tier: ${TIER:-<none>, using ${TRIGGERING_WORKFLOW}}"
           echo "tier=${TIER:-${TRIGGERING_WORKFLOW}}" >> "${GITHUB_OUTPUT}"
+
+      # The orchestrator's uuid, as push-to-clickhouse.yaml recovers it: without it these rows
+      # hash their own run_id and never join the run's cases or its artifact verdict.
+      - name: Recover threaded run_id
+        id: threaded-run-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Recover this leg's artifact_id
         id: leg-artifact-id
@@ -87,6 +111,7 @@ jobs:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          threaded-run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}

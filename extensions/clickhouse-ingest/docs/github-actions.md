@@ -6,7 +6,7 @@
 **torch-spyre**, **spyre-inference**, and **hf-adapters** — install it in CI
 and drive it from GitHub Actions. Rather than each repo carrying its own
 checkout+venv+install+parse+ingest sequence, the actual implementation lives
-once, as **six composite actions in `torch-spyre/.github/actions/`**, callable
+once, as **seven composite actions in `torch-spyre/.github/actions/`**, callable
 from any repo as:
 
 ```yaml
@@ -19,7 +19,7 @@ itself to a clean no-op when `clickhouse-host` is empty — a caller with no
 ClickHouse secrets configured (or a fork, or a dev sandbox) simply skips the
 ingest rather than failing the run.
 
-- [The six composite actions](#the-six-composite-actions)
+- [The seven composite actions](#the-seven-composite-actions)
 - [Who calls what](#who-calls-what)
 - [torch-spyre's own workflows](#torch-spyres-own-workflows)
 - [spyre-inference's own workflows](#spyre-inferences-own-workflows)
@@ -28,7 +28,7 @@ ingest rather than failing the run.
 
 ---
 
-## The six composite actions
+## The seven composite actions
 
 ### `setup-clickhouse-ingest` — foundation
 
@@ -52,7 +52,7 @@ Output: `root` — the directory holding both trees for this call.
 
 ### `ingest-xml-to-clickhouse`
 
-JUnit + benchmark XML to ClickHouse, via `ingest_xml.py`. The only ingest
+JUnit + benchmark XML to ClickHouse, via `python -m spyre_clickhouse_ingest results`. The only ingest
 implementation for the schema-v2 functional/benchmark tables; every repo's
 XML pipeline ends here.
 
@@ -61,6 +61,7 @@ XML pipeline ends here.
 | `xml-dir` | Directory to glob for `*.xml`, non-recursive. Empty skips the whole action. |
 | `run-id` / `gha-run-id` | Threaded orchestrator uuid (joins `artifact_results`) vs. the numeric GHA dedup key. |
 | `artifact-id` | From `derive-gha-artifact-id`. Set, it also writes the `artifacts` row + verdict; empty writes neither. |
+| `artifact` / `tag-family` / `tag` / `tag-date` | Name the artifact the run tested by any spec (`image:`, `id:`, `gha:`, ...), and how to tag it; the same options as [`v2-artifact`](#v2-artifact). |
 | `component` / `platform` / `trigger-type` | Hash inputs and tier label stamped on v2 rows — `component` is the value that keeps hf-adapters' and torch-spyre's `test_cases` from colliding on an identically-named test. |
 | `schema` | `v1` (default) / `v2` / `both` — the migration-window switch. |
 | `clickhouse-*` | Connection; empty `clickhouse-host` is a clean no-op. |
@@ -88,16 +89,16 @@ Currently called by torch-spyre and spyre-inference only — see
 ### `ingest-model-ops-to-clickhouse`
 
 Downloads model-ops job logs, parses them for operation-support variants
-(`parse_model_ops_logs.py`), and inserts them (`ingest_model_ops.py`) as
-`capabilities`/`capability_runs` rows with `test_type="model_ops"`. Filters
-strictly on the job-name prefix `model-ops /`, not a `Spyre` substring match
-— a regression-matrix job also carries that word and would otherwise land as
-a fake model-ops suite.
+(`parse_model_ops_logs.py`), and inserts them (`ingest_model_ops.py`) into the
+v1 `model_ops_*` tables only. Filters strictly on the job-name prefix
+`model-ops /`, not a `Spyre` substring match — a regression-matrix job also
+carries that word and would otherwise land as a fake model-ops suite. The v2
+`capabilities`/`capability_runs` verdicts come from the suites' JUnit
+`capability.*` properties instead, through `ingest-xml-to-clickhouse`.
 
 | Key input | Purpose |
 |---|---|
 | `gha-run-id` (required) | Nightly run to analyse. |
-| `schema` | `v1` / `v2` / `both`. |
 
 Outputs: `json-file`, `log-file`, `has-variant-data` — the ingest step is
 skipped whenever parsing found zero variants, so an in-progress or
@@ -114,6 +115,35 @@ reimplementing the classification.
 |---|---|
 | `payload-json` (required) | The dispatch's `client_payload`, as JSON text. |
 | `stage` / `progress` | Pipeline point (`torch_build`, `running_tests`, ...) and lifecycle state (`in_progress` / `completed` / `rejected`). |
+
+### `v2-artifact`
+
+Names an artifact by spec and returns its one `spyre_v2` `artifact_id`
+(`python -m spyre_clickhouse_ingest artifacts ensure`): the existing record when
+there is one, else the derived identity, recorded and tagged.
+
+```yaml
+- id: art
+  uses: torch-spyre/torch-spyre/.github/actions/v2-artifact@main
+  with:
+    artifact: image:icr.io/<repo>@sha256:<list digest>
+    arch: s390x
+    tag-family: nightly-supply-chain
+    clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+    # clickhouse-port / -user / -pass / -db-v2, registry-* for image specs
+- run: echo "${{ steps.art.outputs.artifact-id }}"
+```
+
+| Key input | Purpose |
+|---|---|
+| `artifact`, `arch` | The spec and its arch (`multi` keeps a manifest list). |
+| `tag-family`, `tag`, `tag-date` | How it is tagged; see the top-level README's tag families. |
+| `lookup`, `registry` | `auto` / `off` / `only` (must already be recorded); `auto` / `off`. |
+| `origin`, `source`, `identity-dep`, `context-dep`, `prop`, `tag-prop`, `run-url` | Recorded fields of a new record (multi-valued inputs one per line). |
+| `dry-run`, `strict` | Print what would be written; fail the job on an error (by default an error annotation and empty outputs). |
+
+Outputs: `artifact-id`, `tag`, `tag-family`, `source` (`given`, `existing`,
+`label` or `derived`) and `json` (the full `artifacts ensure` result).
 
 ### `derive-gha-artifact-id`
 
@@ -179,9 +209,9 @@ action (it isn't log-driven), but it dual-writes through the exact same
 
 | Workflow | Triggers | Calls |
 |---|---|---|
-| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `model-ops-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
+| `push-to-clickhouse.yaml` | `workflow_run` of `model-module-tests`, `upstream-pytorch-tests`, `tests`, `integration-tests`; manual dispatch | `ingest-xml-to-clickhouse` (v1 direct write + v2 via the action, once per populated arch: x86_64/ppc64le/s390x) |
 | `push-hw-diagnostics-to-clickhouse.yaml` | same `workflow_run` set | `ingest-hw-diagnostics-to-clickhouse` |
-| `push-model-ops-logs-to-clickhouse.yaml` | model-ops nightly run completion | `ingest-model-ops-to-clickhouse` |
+| `push-model-ops-logs-to-clickhouse.yaml` | model-ops nightly run completion | `ingest-model-ops-to-clickhouse` (v1 only) |
 | `push-pytorch-dispatch-to-clickhouse.yaml` | `repository_dispatch` from pytorch/pytorch's CRCR relay | `ingest-pytorch-dispatch-to-clickhouse` |
 
 `derive-gha-artifact-id` runs earlier, inside the test-execution workflow
