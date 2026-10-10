@@ -268,6 +268,16 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
+  m.def("_correction_cache_stats", [] {
+    const auto stats = spyre::getCorrectionCacheStats();
+    py::dict result;
+    result["hits"] = stats.hits;
+    result["misses"] = stats.misses;
+    result["evictions"] = stats.evictions;
+    result["entries"] = stats.entries;
+    result["bytes"] = stats.bytes;
+    return result;
+  });
   m.def("encode_constant", &spyre::encodeConstant);
 
   // Initialize logging bindings

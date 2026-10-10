@@ -22,9 +22,12 @@
 #include <cstdint>
 #include <flex/flex.hpp>
 #include <iostream>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -252,6 +255,33 @@ struct SymbolicArg {
  * Carries runtime data available at LaunchKernel time that was not available
  * during PrepareKernel.
  */
+/**
+ * @brief Bounded LRU of program correction blobs for one HostCompute step.
+ *
+ * Enabled by TORCH_SPYRE_CORRECTION_CACHE=1, see JobPlanStepHostCompute.
+ */
+class CorrectionCache {
+ public:
+  std::shared_ptr<HostBuffer> find(const std::string& key);
+  void insert(const std::string& key, std::shared_ptr<HostBuffer> blob);
+
+ private:
+  using Entry = std::pair<std::string, std::shared_ptr<HostBuffer>>;
+  std::mutex mu_;
+  std::list<Entry> lru_;
+  std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+};
+
+struct CorrectionCacheStats {
+  uint64_t hits;
+  uint64_t misses;
+  uint64_t evictions;
+  uint64_t entries;
+  uint64_t bytes;
+};
+
+CorrectionCacheStats getCorrectionCacheStats();
+
 struct LaunchContext {
   /**
    * @brief at::Tensor list of inputs and outputs
@@ -563,6 +593,11 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       const std::vector<SymbolicArg>& symbolic_args);
 
  private:
+  void launchCorrection(void* data, size_t size,
+                        std::shared_ptr<void> keep_alive,
+                        const SpyreStream& stream) const;
+
+  mutable CorrectionCache correction_cache_;
   size_t correction_size_;  ///< byte count of the correction blob
   flex::CompositeAddress device_address_;  ///< device destination for H2D
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
