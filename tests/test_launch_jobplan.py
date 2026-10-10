@@ -116,6 +116,110 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
 
+    def test_zero_symbol_host_compute_executes(self):
+        """Zero-symbol HostCompute (ishape=["0"]) executes without raising.
+
+        The existing test_invalid_hcm_metadata_surfaces_on_synchronize covers
+        the error path: broken HCM + ishape=["0"] raises at launch_jobplan time.
+        This test covers the success path: a valid minimal HCM with ishape=["0"]
+        must traverse the full construct() -> flex::createHostComputeParams path
+        and complete cleanly.
+
+        ComputeOnDevice is intentionally omitted from the plan — the plan parser
+        does not require it, and a HostCompute + H2D plan is self-contained.
+        This avoids executing a mock binary on hardware (which would fault the
+        device) while still calling launch_jobplan and driving the real
+        host-compute execution path through flex.
+
+        The HCM is minimal but valid: a single SYMBOL_SUBSTITUTE dci with
+        output_shape_=[0] produces zero output bytes, so the senConstants
+        payload is empty and the bounds check always passes. No symbols are
+        needed because the zero-symbol branch skips address resolution entirely.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hcm = {
+                "vdci": {
+                    "dsName_": "zero_symbol",
+                    "isMarker_": 0,
+                    "data_conversion_info_group_": [
+                        {
+                            "key": [],
+                            "dci": {
+                                "dsName_": "zero_symbol",
+                                "isHostToSen_": 1,
+                                "dataformat_src_": 8,
+                                "dataformat_dst_": 8,
+                                "dcOpName_": 6,
+                                "pre_expand_dcsi_": [],
+                                "pre_input_shape_": [],
+                                "dcsi_": [],
+                                "input_shape_": [],
+                                "output_shape_": [0],
+                                "post_slice_dcsi_": [],
+                                "post_output_shape_": [],
+                                "input_dimwise_ea_": [],
+                                "output_dimwise_ea_": [],
+                                "useSpi_": 0,
+                                "usePca_": 0,
+                                "usePadVal_": 0,
+                                "inputPadVal_": 0,
+                                "useWli_": 0,
+                                "dmdi_": {"perTensorInfo": []},
+                                "ssi_": {
+                                    "value_and_locs_": [],
+                                    "inputSym_": [],
+                                    "unSubstitutedFlitStartOffset_": 0,
+                                },
+                            },
+                        }
+                    ],
+                    "group_tags_": [],
+                    "inputSym_": [],
+                    "dciIdxSym_": [],
+                    "variableDefs_": [],
+                },
+                # Two senConstants required by processComputeOnHostCommand
+                # (payload + trailer). Both empty: sizeInBytes() == 0,
+                # so ConstExec copies nothing and no bytes are written.
+                "senConstants": [{"senconst_": ""}, {"senconst_": ""}],
+            }
+            # HostCompute + H2D only — ComputeOnDevice intentionally omitted
+            # so no mock binary is executed on hardware.
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnHost",
+                    "properties": {
+                        "ohandle": "output_buffer",
+                        "size": "1024",
+                        "ishape": ["0"],
+                        "ihandle": "",
+                        "hcm": hcm,
+                    },
+                },
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "false",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                },
+            ]
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            stream = torch.Stream("spyre")
+
+            # launch_jobplan must complete without raising: the zero-symbol
+            # HostCompute step runs synchronously via flex::createHostComputeParams,
+            # then the H2D is enqueued. No device compute is executed.
+            with stream:
+                torch_spyre._C.launch_jobplan(job_plan, [])
+
+
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
     """Build a JobPlan with a single D2H DataTransfer step from dev_ptr.
 
