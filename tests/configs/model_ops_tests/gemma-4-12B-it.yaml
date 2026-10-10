@@ -103,7 +103,7 @@ test_suite_config:
                   tags:
                     - constant
                     - torch.eq.1
-                - name: torch.or_
+                - name: torch.bitwise_or
                   sample_inputs_func:
                     args:
                       - tensor:
@@ -121,7 +121,7 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1024
                     in forward, code: multimodal_mask = image_mask | video_mask | audio_mask'
                   tags:
-                    - torch.or_.1
+                    - torch.bitwise_or.1
                 - name: torch.clone
                   sample_inputs_func:
                     args:
@@ -2849,7 +2849,7 @@ test_suite_config:
                   tags:
                     - constant
                     - torch.eq.2
-                - name: torch.or_
+                - name: torch.bitwise_or
                   sample_inputs_func:
                     args:
                       - tensor:
@@ -2867,7 +2867,7 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1024
                     in forward, code: multimodal_mask = image_mask | video_mask | audio_mask'
                   tags:
-                    - torch.or_.2
+                    - torch.bitwise_or.2
                 - name: torch.clone
                   sample_inputs_func:
                     args:
