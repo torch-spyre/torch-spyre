@@ -1,5 +1,7 @@
 /code-review __PR_NUMBER__ --comment
 
+Use `gh pr checkout __PR_NUMBER__` to read the PR's source files.
+
 Perform a static review of the code and tests. Do not attempt Spyre hardware
 verification or require a Spyre device. Clearly report that hardware validation was
 not performed when it would be relevant to the review.

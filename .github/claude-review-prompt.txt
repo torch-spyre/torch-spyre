@@ -1,12 +1,12 @@
 /code-review __PR_NUMBER__ --comment
 
 torch-spyre is installed as an editable install at /home/senuser/torch-spyre (image
-commit). Tests can be run against this version from that directory. To run the PR's
-Python code against the device, check out the PR elsewhere (e.g. with
-`gh pr checkout __PR_NUMBER__ -d /tmp/torch-spyre-pr`), symlink the image's
+commit). Running tests from there gives a baseline against the image's code, not the
+PR's. To verify the PR's Python code on device, check out the PR with
+`gh pr checkout __PR_NUMBER__ --worktree /tmp/torch-spyre-pr`, symlink the image's
 extension (`ln -s /home/senuser/torch-spyre/torch_spyre/_C.so /tmp/torch-spyre-pr/torch_spyre/_C.so`),
-and run from /tmp/torch-spyre-pr. This only makes sense when the PR does not change
-any C++ code — if it does, the symlinked _C.so is stale and results are unreliable.
+and run from /tmp/torch-spyre-pr. Only do this when the PR does not change C++ code
+— if it does, the symlinked _C.so is stale and results are unreliable.
 
 Verify the correctness of all modified behavior, using the provided Spyre hardware.
 

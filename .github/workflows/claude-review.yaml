@@ -11,19 +11,11 @@ on:
     types: [created]
   # Temporary pull_request trigger for testing only -- remove before merging.
   # With issue_comment as the sole trigger: the concurrency group is correct
-  # (github.event.issue.number is the PR number), the job if: filters out
-  # non-PR and non-review comments so workflow-level concurrency is fine, the
-  # checkout gets the default branch (prompt files, not PR code), and the agent
-  # uses gh pr checkout to fetch the PR code itself when needed.
+  # (github.event.issue.number is the PR number), the checkout gets the default
+  # branch (prompt files, not PR code), and the agent uses gh pr checkout to
+  # fetch the PR code itself when needed.
   pull_request:
     types: [opened, synchronize, reopened]
-
-concurrency:
-  # Static and hardware reviews must not block each other. Hardware reviews are
-  # still serialized per PR so a cancelled run cannot corrupt the Spyre cache.
-  group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number ||
-    github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -49,6 +41,15 @@ jobs:
     #
     # No trailing delimiter after the command: a comment with notes on later
     # lines has CRLF (not a space) after it, and GHA literals can't encode it.
+    # Static and hardware reviews must not block each other. Hardware reviews are
+    # still serialized per PR so a cancelled run cannot corrupt the Spyre cache.
+    # Job-level concurrency means only runs that pass the if: take a slot, so
+    # non-review comments cannot displace a pending review.
+    concurrency:
+      group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number
+        || github.event.pull_request.number }} # TODO: remove || github.event.pull_request.number when pull_request trigger is dropped
+      cancel-in-progress: false
+
     # TODO: restore this if: before merging (commented out for testing)
     # if: >-
     #   github.event.issue.pull_request &&
