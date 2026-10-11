@@ -38,6 +38,27 @@ TEST_TYPE_VALUES = (
     | CAPABILITY_TYPE_VALUES
 )
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
+# artifact_result_reasons.failure_reason, and props['failure_reason'] on a non-passing verdict:
+# spyre-frameworks' diagnose_failure.py categories plus the outcomes a log cannot show.
+FAILURE_REASON_VALUES = frozenset(
+    {
+        "test_failure",
+        "build_error",
+        "infra_disk",
+        "infra_network",
+        "infra_auth",
+        "infra_capacity",
+        "infra_hardware",
+        "infra_timeout",
+        "infra_env",
+        "superseded",
+        "aborted",
+        "dependency_failed",
+        "pipeline_error",
+        "ingest_error",
+        "unknown",
+    }
+)
 # capability_runs.status: not_implemented is unsupported, not a skipped test; undetermined is a
 # test that broke before giving a verdict.
 CAPABILITY_STATUS_VALUES = frozenset(
@@ -489,6 +510,48 @@ class ArtifactResults(Table):
     Row = ArtifactResultRow
 
 
+class ArtifactResultReasonRow(TypedDict):
+    artifact_id: str
+    run_id: str
+    result_kind: str
+    test_type: str
+    failure_reason: str
+    failure_subreason: str
+    failure_detail: str
+    failure_log_url: str
+    failure_wait_s: int
+    confidence: int
+    source: str
+    props: dict[str, str]
+
+
+class ArtifactResultReasons(Table):
+    """Why a verdict did not pass, written after the verdict itself; one row per source."""
+
+    name = "artifact_result_reasons"
+    columns = (
+        "artifact_id",
+        "run_id",
+        "result_kind",
+        "test_type",
+        "failure_reason",
+        "failure_subreason",
+        "failure_detail",
+        "failure_log_url",
+        "failure_wait_s",
+        "confidence",
+        "source",
+        "props",
+    )
+    required = ("source",)
+    enums = (
+        ("result_kind", RESULT_KIND_VALUES),
+        ("test_type", TEST_TYPE_VALUES),
+        ("failure_reason", FAILURE_REASON_VALUES),
+    )
+    Row = ArtifactResultReasonRow
+
+
 class PipelineRuns(Table):
     """One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.
 
@@ -745,6 +808,7 @@ ARTIFACTS = Artifacts
 ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
+ARTIFACT_RESULT_REASONS = ArtifactResultReasons
 PIPELINE_RUNS = PipelineRuns
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
@@ -762,6 +826,7 @@ TABLES = {
         ArtifactRefs,
         ArtifactTags,
         ArtifactResults,
+        ArtifactResultReasons,
         Capabilities,
         CapabilityRuns,
         PipelineRuns,

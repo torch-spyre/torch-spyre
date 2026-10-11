@@ -11,13 +11,13 @@ Applying them in filename order works from an empty database.
 | file | declares | depends on |
 |---|---|---|
 | `10-functional-tests.sql` | `test_cases`, `test_case_runs` | — |
-| `20-artifacts.sql` | `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` | — |
+| `20-artifacts.sql` | `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results`, `artifact_result_reasons` | — |
 | `25-artifact-dispatch.sql` | `artifact_subscriptions`, `dispatch_requests`, `artifact_dispatches` | — |
 | `30-benchmarks.sql` | `benchmarks`, `benchmark_runs` | — |
 | `40-jenkins-agents.sql` | `jenkins_agents` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
-| `50-artifact-views.sql` | 6 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
+| `50-artifact-views.sql` | 8 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
 | `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
 | `53-pipeline-views.sql` | `v_pipeline_runs`, `v_pipeline_run_outcomes`, `v_pipeline_gate_daily` | 47 |
