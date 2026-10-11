@@ -318,31 +318,48 @@ jobs:
           export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
           python3 <<'PYEOF'
           import json, os, subprocess, sys, time
+          from pathlib import Path
+
+          ATTEMPTS = 5
           artifacts = json.loads(os.environ['ARTIFACTS'])
           # TRIGGERING_REPO, not GITHUB_REPOSITORY: on a called workflow the latter is the
           # CALLER, and the artifacts live in the repo whose run produced them.
           repo  = os.environ['TRIGGERING_REPO']
+
+          def fetch(a, zip_path):
+              """Download, test and unzip one artifact; retried whole, since a truncated zip only
+              fails at unzip. The -t pass keeps a bad zip from half-extracting into the shared dir."""
+              for attempt in range(1, ATTEMPTS + 1):
+                  for cmd in (
+                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
+                      ["unzip", "-tq", str(zip_path)],
+                      ["unzip", "-q", "-o", str(zip_path), "-d", "xml_artifacts/"],
+                  ):
+                      result = subprocess.run(cmd, capture_output=True)
+                      if result.returncode != 0:
+                          err = (result.stderr or result.stdout[-500:]).decode(errors="replace").strip()
+                          print(f"[retry] {a['name']}: {' '.join(cmd[:2])} attempt {attempt}/{ATTEMPTS} "
+                                f"exited {result.returncode}: {err}")
+                          break
+                      if cmd[0] == "gh":
+                          zip_path.write_bytes(result.stdout)
+                  else:
+                      return True
+                  if attempt < ATTEMPTS:
+                      time.sleep(2 ** attempt)
+              return False
+
+          failed = []
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
-              # A run has ~175 artifacts; one transient API error must not drop the whole ingest.
-              for attempt in range(1, 6):
-                  result = subprocess.run([
-                      "gh", "api",
-                      f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                  ], env={**os.environ}, capture_output=True)
-                  if result.returncode == 0:
-                      break
-                  print(f"[retry] attempt {attempt} failed: {result.stderr.decode(errors='replace').strip()}",
-                        file=sys.stderr)
-                  if attempt == 5:
-                      sys.exit(1)
-                  time.sleep(2 ** attempt)
-              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
-                  f.write(result.stdout)
-              subprocess.run([
-                  "unzip", "-o", f"xml_artifacts/{a['name']}.zip",
-                  "-d", "xml_artifacts/"
-              ], check=True)
+              if not fetch(a, Path("xml_artifacts") / f"{a['name']}.zip"):
+                  print(f"::warning::Skipping artifact {a['name']} (id={a['id']}): "
+                        f"download/unzip failed {ATTEMPTS} times; its results are not ingested.")
+                  failed.append(a["name"])
+          print(f"Fetched {len(artifacts) - len(failed)}/{len(artifacts)} artifact(s).")
+          if artifacts and len(failed) == len(artifacts):
+              print("::error::No artifact could be downloaded.")
+              sys.exit(1)
           PYEOF
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
