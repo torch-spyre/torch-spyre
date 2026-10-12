@@ -390,32 +390,7 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
     torch.testing.assert_close(out.cpu(), fn(hx, hw), rtol=2e-2, atol=2e-2)
 
 
-def _prices_replicated_reads() -> bool:
-    """Whether the cost model charges a replicated matmul operand per replica core
-    (#4454). Without it the demoted bmm's re-read of a broadcast operand is priced
-    once at the shared peak, ~312 ns here against a ~208 ns shuffle after the
-    overlap discount, so the solver correctly declines the wrong comparison."""
-    import dataclasses
-
-    from torch_spyre._inductor.cost_model import ArgTraffic
-
-    return "replication" in {f.name for f in dataclasses.fields(ArgTraffic)}
-
-
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "gather",
-        pytest.param(
-            "broadcast",
-            marks=pytest.mark.xfail(
-                not _prices_replicated_reads(),
-                strict=True,
-                reason="broadcast admission needs #4454's replicated-read pricing",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("kind", ["gather", "broadcast"])
 def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     """#3440's grouped fixtures decided by the solver instead of the greedy
     collector (see ``relayout_fixtures.grouped_relayout_graph``). Hints pin both
@@ -606,14 +581,6 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
     )
 
 
-@pytest.mark.skip(
-    reason="co-opt+cpsat crashes on any coarse-tiled graph before relayout "
-    "is even considered (symbolic relationals in coarse_underfill_eff and "
-    "the LX-spill derate reached by tiled ops; #3810 review finding). "
-    "Unskip when the substrate handles symbolic coarse-tile features; the "
-    "gate itself is covered by unit tests in "
-    "test_solver_relayout_candidates.py."
-)
 def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     """A coarse-tiled graph must enumerate NO relayout candidates.
 

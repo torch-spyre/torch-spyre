@@ -381,6 +381,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -410,6 +411,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
