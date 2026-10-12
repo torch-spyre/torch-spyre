@@ -35,11 +35,28 @@ so a parallel sweep would measure contention. Sharding a tier across machines is
 `--tier NAME` keeps the points that list that tier; a point with no `tiers` runs in every
 tier.
 
-| Tier | Meant to answer |
-|---|---|
-| `pr` | did a change break a compile, or move it grossly |
-| `nightly` | the scaling series at moderate sizes |
-| `weekly` | everything: long sequences, depth 8, the A/B arms |
+| Tier | Points | One compile each | At `--samples 3` | Meant to answer |
+|---|--:|--:|--:|---|
+| `pr` | 7 | 3.8 min | 15 min | did a change break a compile, or move it grossly |
+| `nightly` | 26 | 17.4 min | 70 min | the scaling series at moderate sizes |
+| `weekly` | 50 | 47.7 min | 191 min | everything: long sequences, depth 8, the A/B arms |
+
+Measured on one card, 2026-10-12, by running `--tier weekly --samples 0` and adding up
+the per-point times the driver prints. `--samples 3` is four compiles per point, since
+the warmup is discarded. Re-measure after a rebase rather than trusting these: the cost
+sits in the passes, and the passes change.
+
+**`weekly` does not fit one job.** 191 minutes is past the 120-minute ceiling on the
+one-card runners, so it has to shard. Shard by family, which is both the natural seam and
+where the cost is concentrated: `elementwise_chain` is 15 minutes of the 48 on its own
+(`ops=1024` alone is 11), `granite_layer` another 14 across 11 points, and the remaining
+eight families 19 between them. Sharding across machines is sound because the device is
+exclusive per *process*, not per plan.
+
+The most expensive single point is a probe, not a model: 1024 chained pointwise
+operations cost 11 minutes, about 0.6 s of frontend per operation, which is the same
+order as `granite_layer` at depth 8. That is the sweep's central observation so far --
+compile cost tracks operation count far more than it tracks tensor size.
 
 ### A/B arms
 
