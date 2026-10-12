@@ -289,6 +289,32 @@ def test_f_after_the_fault():
     pass
 """
 
+_XPASS_TESTS = """
+import unittest, pytest
+
+@pytest.mark.xfail(reason="fixed since", strict=True)
+def test_a_strict_xpass():
+    pass
+
+class TestB(unittest.TestCase):
+    def test_b_oot_strict_xpass(self):
+        pass
+    test_b_oot_strict_xpass.pytestmark = [pytest.mark.xfail(reason="oot", strict=True)]
+
+@pytest.mark.xfail(reason="may pass")
+def test_c_non_strict_xpass():
+    pass
+
+@pytest.mark.xfail(reason="unsupported op", strict=True)
+def test_d_strict_xfail_that_fails():
+    raise RuntimeError("Unsupported: flip")
+
+class TestE(unittest.TestCase):
+    def test_e_oot_xfail_that_fails(self):
+        raise RuntimeError("Unsupported: flip")
+    test_e_oot_xfail_that_fails.pytestmark = [pytest.mark.xfail(reason="oot", strict=True)]
+"""
+
 _LAST_TEST_FAULTS = """
 import pytest
 from torch_spyre import _C
@@ -361,6 +387,25 @@ class TestDeviceFaultSession(TestCase):
         # The XPASS carried no exception, so its failure needs a readable message.
         _, xpass = outcomes["test_e_xpass_while_the_device_faults"]
         self.assertIn("StreamError", xpass.find("failure").get("message", ""))
+
+    def test_strict_xpass_fails_and_genuine_xfail_does_not(self):
+        proc, outcomes = self._run(_XPASS_TESTS)
+        status = {name: kind for name, (kind, _) in outcomes.items()}
+        self.assertEqual(
+            status,
+            {
+                "test_a_strict_xpass": "failure",
+                "test_b_oot_strict_xpass": "failure",
+                "test_c_non_strict_xpass": "passed",  # strict=False allows an XPASS
+                "test_d_strict_xfail_that_fails": "skipped",  # a genuine XFAIL
+                "test_e_oot_xfail_that_fails": "skipped",  # a genuine OOT XFAIL
+            },
+            proc.stdout,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        for name in ("test_a_strict_xpass", "test_b_oot_strict_xpass"):
+            _, case = outcomes[name]
+            self.assertIn("XPASS", case.find("failure").get("message", ""))
 
     def test_fault_after_the_last_test_fails_the_session(self):
         proc, outcomes = self._run(_LAST_TEST_FAULTS)

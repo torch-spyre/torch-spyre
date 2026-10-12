@@ -701,10 +701,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self, cost_expr: Optional[sympy.Expr] = None
     ) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
-        ``address`` back to each buffer; populate ``spill_reasons``. Returns the
+        ``address`` / ``spill_reason`` back to each buffer. Returns the
         solver's own buffers. Single-use: construct a fresh solver per set.
         """
-        self.spill_reasons = {}
         n = len(self._bufs)
         if n == 0:
             return list(self._bufs)
@@ -1461,8 +1460,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             addr = self.packer.addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])
             b.address = addr
-            if addr is None:
-                self.spill_reasons[b.name] = b.residency_reason or _SOLVER_CHOSE_SPILL
+            spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
+            b.spill_reason = spilled if addr is None else None
 
     def _menu_position(self, idx: int, config: DivisionConfig) -> int:
         """The position in buffer ``idx``'s ``core_divisions`` that names

@@ -64,6 +64,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
+| `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
 
 ## Naming an artifact (simple -> advanced)
 
@@ -144,6 +145,33 @@ A family's `spellings` are other prefixes a registry uses for it: `cicd-tech-pre
 as `ci-cd-tech-preview-vN`, with the raw spelling in the tag prop `registry_tag`, so one tech
 preview is one tag.
 
+## Dispatching on artifact events
+
+A subscription (`artifact_subscriptions`, schema in `schema/25-artifact-dispatch.sql`) names the
+events that trigger a target -- an artifact tagged, recorded or promoted, or a verdict recorded --
+with filters, conditions on the artifact's verdicts, exclusions, rate limits and coalescing.
+`v_artifact_subscribers` gives each (event, subscription) a `reason` (`''` = it fires). The
+spyre-frameworks job `Spyre/monitoring/artifact-dispatch` (`pipelines/ops/artifact-dispatch/`,
+whose README documents every field) triggers the targets and records each dispatch.
+
+```bash
+# What a subscription would do with the last 14 days of events, and why the rest would not fire.
+# Read-only: the dispatcher's own decision, rate limits and coalescing included.
+python -m spyre_clickhouse_ingest dispatch preview --subscription stf-torchspyre-s390x-tech-preview --days 14
+
+# Who one artifact triggers.
+python -m spyre_clickhouse_ingest dispatch preview --artifact id:<uuid> [--json]
+
+# Ask the dispatcher to run a subscription on one artifact (vars/v2Dispatch.groovy calls this).
+# Refused when the subscription's filters do not fit the artifact; a disabled one still runs.
+python -m spyre_clickhouse_ingest dispatch request --subscription <id> --artifact id:<uuid> \
+  --param TEST_CADENCE=nightly --requested-by user --requester <login> --reason "rerun" [--dry-run]
+```
+
+`request` prints the request and the `dispatch_id` its outcome will be recorded under in
+`artifact_dispatches`; the dispatcher picks it up within one 5-minute run. A request skips the
+subscription's conditions, exclusions, rate limits and coalescing.
+
 ## Moving off ingest_xml.py
 
 `.github/scripts/ingest_xml.py` only forwards to `python -m spyre_clickhouse_ingest results`
@@ -159,8 +187,9 @@ grep -rn 'scripts/ingest_xml\.py' --include='*.y*ml' --include='Jenkinsfile*' --
 
 `test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
 and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`),
-and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`), and `ci_run_timings`
-(DDL: `schema/48-ci-run-timings.sql`).
+and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`), `ci_run_timings`
+(DDL: `schema/48-ci-run-timings.sql`), and `artifact_subscriptions`, `dispatch_requests`,
+`artifact_dispatches` (DDL: `schema/25-artifact-dispatch.sql`).
 The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
 
 The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned

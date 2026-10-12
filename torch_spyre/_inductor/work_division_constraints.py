@@ -140,7 +140,6 @@ def collect_work_division_constraints(
         coarse_tile_local_dim_split_domains,
         direct_read_source_stick_split_domains,
         aligned_ownership_split_domains,
-        plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
@@ -149,6 +148,7 @@ def collect_work_division_constraints(
         keep_by_index_pinned_search_space_vars,
         keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
+        plain_reduction_k_split_domains,
     ):
         result = constraint(ctx)
 
@@ -457,24 +457,6 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     return ConstraintResult(blocked=set(window_dims))
 
 
-# These ops have dedicated cross-core hardware/codegen combine support
-# (matmul: PSUM accumulation; topk/keep_by_index/pool/conv: dedicated
-# combine codegen), so a K-split across cores is safe. Plain elementwise
-# reductions like sum/max/min/xor_sum/any are deliberately absent: they use
-# coarse_tile.py's own outer-loop accumulate path (_insert_combine_op)
-# instead, which is a different mechanism and does not enable a cross-core
-# K-split -- their absence here is not an oversight to "fix" by adding them.
-_K_SPLIT_COMBINE_SUPPORTED = {
-    BATCH_MATMUL_OP,
-    BATCH_MATMUL_FP8_OP,
-    "topkvalue",
-    "topkindex",
-    KEEP_BY_INDEX_OP,
-    *POOL_OPS,
-    CONV2D_FWD_OP,
-    DEPTHWISE_CONV2D_OP,
-}
-
 # Generated scratch-copy ops (coarse_tile.py's _insert_all_read_copy_ops /
 # _insert_reduce_copy_op) inherit their tiled dims from the sizing op they
 # copy for, but their own write is per-tile scratch reused in place and
@@ -709,32 +691,6 @@ def coarse_tile_local_dim_split_domains(
                 pin(n_output_dims + pos, reduction_ranges, raw_base=n_output_dims)
 
     return ConstraintResult(allowed_splits=allowed_splits)
-
-
-def plain_reduction_k_split_domains(
-    ctx: WorkDivConstraintContext,
-) -> ConstraintResult:
-    """Forbid K-splits for reductions with no cross-core combine step.
-
-    Splitting a reduction dim across cores leaves each core holding a partial
-    result (e.g. a partial max over its own slice of the reduction range).
-    Matmul has PSUM hardware to combine those partial sums, and topk/
-    keep_by_index/pool/conv have their own dedicated combine or blocking
-    rules above. Every other reduction type (max, min, sum, prod, mean,
-    absmax, ...) has no combine step wired up anywhere in codegen: the
-    partial result is written out and never reduced further, silently
-    producing a wrong answer (issue: B+H coarse-tiled flash-attention amax,
-    where freeing up core budget let the generic work-division search reach
-    for a K-split on a plain `max` reduction). Restrict those to split=1
-    until a real combine mechanism exists for them.
-    """
-    if not isinstance(ctx.op.data, Reduction):
-        return ConstraintResult()
-    if ctx.op.data.reduction_type in _K_SPLIT_COMBINE_SUPPORTED:
-        return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
 
 
 def restickify_padding_blocked_vars(
@@ -1050,6 +1006,44 @@ def keep_by_index_search_adjacent_blocked_vars(
         if v != search_axis and write_index.coeff(v) == enclosing_coeff
     }
     return ConstraintResult(blocked=blocked)
+
+
+_STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
+    {
+        BATCH_MATMUL_OP,
+        BATCH_MATMUL_FP8_OP,
+        CONV2D_FWD_OP,
+        DEPTHWISE_CONV2D_OP,
+        KEEP_BY_INDEX_OP,
+        *TOPK_OPS,
+        *POOL_OPS,
+    }
+)
+
+
+def plain_reduction_k_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep plain reductions on one core along every reduction axis.
+
+    Even a single reduction variable cannot safely be split across cores in
+    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
+    encoder block outputs.
+    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
+    it does not establish a cross-core combine for arbitrary work divisions.
+    Keep this restriction until those divisions have a validated combine path.
+
+    Structured reductions have their own backend combine or blocking rules.
+    Output axes remain available for parallelism, and reduction-range coarse
+    tiling is still handled separately by WSR.
+    """
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
+        return ConstraintResult()
+    return ConstraintResult(
+        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+    )
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
