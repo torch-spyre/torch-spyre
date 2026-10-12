@@ -135,12 +135,21 @@ def find_series(points: list[dict[str, Any]]) -> list[Series]:
                 axis,
                 tuple(sorted(fixed.items())),
             )
-            medians = {
-                name: statistics.median(values)
+            lows = {
+                name: min(values)
                 for name, values in point.get("measurements", {}).items()
                 if values
             }
-            grouped.setdefault(key, {})[value] = medians
+            at_value = grouped.setdefault(key, {})
+            if value in at_value:
+                # Two rows files covering the same series, so one build's points would
+                # vanish and two builds would be fitted as one curve.
+                raise SystemExit(
+                    f"duplicate point: {point.get('workload')} at {axis}={value} "
+                    "appears twice. Fit one rows file at a time, or summarize the "
+                    "runs together so they become one point with more samples."
+                )
+            at_value[value] = lows
 
     series = []
     for (workload, arm, axis, fixed_items), samples in grouped.items():
