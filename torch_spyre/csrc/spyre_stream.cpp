@@ -257,11 +257,15 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::H2D));
   RECORD_FUNCTION("launch::H2D", {});
   resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::D2H));
   RECORD_FUNCTION("launch::D2H", {});
   resolveRuntimeHandle()->launchOperation(params);
 }
