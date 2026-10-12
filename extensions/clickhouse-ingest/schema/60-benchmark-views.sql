@@ -54,7 +54,7 @@ LEFT JOIN (
            argMax(arch, (ts, audit_timestamp))        AS arch,
            argMax(test_type, (ts, audit_timestamp))   AS test_type,
            argMax(state, (ts, audit_timestamp))       AS state
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'performance'
     GROUP BY run_id
 ) AS ar USING (run_id);
@@ -175,7 +175,7 @@ INNER JOIN
            argMax(artifact_id, (ts, audit_timestamp))      AS artifact_id,
            argMax(arch, (ts, audit_timestamp))             AS arch,
            argMax(props['run_url'], (ts, audit_timestamp)) AS run_url
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'performance'
     GROUP BY run_id
 ) AS ar USING (run_id)

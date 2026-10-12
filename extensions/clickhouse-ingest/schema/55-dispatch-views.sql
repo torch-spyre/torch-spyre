@@ -10,7 +10,7 @@ SELECT
     argMax(r.state, r.ts)             AS state,
     argMax(r.arch, r.ts)              AS arch,
     min(r.ts)                         AS ts
-FROM artifact_results AS r
+FROM v_artifact_results_published AS r
 WHERE r.state != 'running'
 GROUP BY r.artifact_id, r.run_id, r.test_type;
 

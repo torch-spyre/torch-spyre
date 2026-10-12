@@ -35,7 +35,7 @@ FROM
         -- state='running' excluded: a crashed run's stale row would count as covered.
         SELECT toDate(ts) AS day, if(arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', arch) AS arch,
                run_id, 1 AS in_results, 0 AS in_cases, test_type != 'smoke' AS non_smoke
-        FROM artifact_results
+        FROM v_artifact_results_published
         WHERE state != 'running'
         UNION ALL
         SELECT toDate(min(ts)) AS day, '' AS arch, run_id, 0 AS in_results, 1 AS in_cases,

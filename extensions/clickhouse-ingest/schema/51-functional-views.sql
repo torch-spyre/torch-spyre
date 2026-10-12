@@ -70,7 +70,7 @@ INNER JOIN
     -- One tier per run: artifact_results holds a row per build/reuse of a leg, and a perf leg
     -- can share a functional leg's run_id.
     SELECT run_id, argMax(test_type, ts) AS tier
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'functional'
     GROUP BY run_id
 ) AS leg ON leg.run_id = cr.run_id
@@ -97,7 +97,7 @@ FROM
     INNER JOIN
     (
         SELECT run_id, argMax(test_type, ts) AS tier
-        FROM artifact_results
+        FROM v_artifact_results_published
         WHERE result_kind = 'functional'
         GROUP BY run_id
     ) AS leg ON leg.run_id = cr.run_id
