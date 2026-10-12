@@ -492,6 +492,99 @@ def test_relayout_into_a_matmul_x_operand(monkeypatch):
     torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
+def test_relayout_past_the_fitted_split_fires(monkeypatch):
+    """The RMSNorm geometry on a hinted pointwise pair: neg hinted {R: 32}
+    (16 whole rows per core, as a row-split norm needs) feeds relu hinted
+    {R: 4, H: 8}. Logical [512, 4096] fp16 lays out as [64 sticks, 512 rows,
+    64], so the pair's governing split is 32 (a run of 16 * 64 elements) and
+    each destination gathers its 128 rows from 8 sources, inside the shuffle
+    budget. The split is past the relayout law's fitted range [2, 8]: the
+    solver is offered the pair at the clamped law and fires it on economics
+    alone (~2.6 us shuffle vs a 4 MB HBM write and re-read). Read-only spies."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.dump_cost_model import governing_run_split
+
+    observed = _Observed(monkeypatch, force=False)
+    recorded = observed.plans
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 32}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(512, 4096, dtype=torch.float16)
+    for name, size in (("R", 512), ("H", 4096)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "H"])
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = recorded
+    assert plan.num_cores == 32
+    assert governing_run_split(
+        plan.source_view, plan.destination_view, [64, 512, 64]
+    ) == (1024, 32)
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_row_split_norm_reaches_its_projection_through_lx(monkeypatch):
+    """An RMSNorm in the Hugging Face form (fp32 statistics, fp16 output) runs
+    row-split on 32 cores, since its mean needs whole rows on a core, and feeds
+    a projection that wants a different view of the same rows. The only LX
+    route between them is a shuffle whose governing split (32) is past the
+    relayout law's fitted range [2, 8]. The solver is offered it at the
+    clamped law and takes it on economics alone, instead of writing the 4 MB
+    norm output to HBM and reading it back. Read-only spies, no forcing."""
+    from torch_spyre._inductor.dump_cost_model import governing_run_split
+
+    observed = _Observed(monkeypatch, force=False)
+    device_dims: dict[str, list[int]] = {}
+    observed_materialize = alloc_mod.materialize_lx_relayouts
+
+    def record_device_dims(graph, plans):
+        for p in plans:
+            layout = graph.get_buffer(p.source_name).layout.device_layout
+            device_dims[p.source_name] = [int(s) for s in layout.device_size]
+        return observed_materialize(graph, plans)
+
+    monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", record_device_dims)
+
+    def fn(x, g, w):
+        h = x.float()
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-5)
+        return (g * h.to(x.dtype)) @ w
+
+    torch.manual_seed(0)
+    hx = torch.randn(1, 512, 4096, dtype=torch.float16)
+    hg = (1.0 + 0.1 * torch.randn(4096)).to(torch.float16)
+    hw = (0.02 * torch.randn(4096, 1024)).to(torch.float16)
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(
+            hx.to("spyre"), hg.to("spyre"), hw.to("spyre")
+        )
+
+    governing = [
+        governing_run_split(
+            p.source_view, p.destination_view, device_dims[p.source_name]
+        )
+        for p in observed.plans
+    ]
+    assert any(split > 8 for _run, split in governing), (
+        f"no relayout past the fitted split fired; governing (run, split): {governing}"
+    )
+    observed.assert_emitted_in_lx(expected_plans=len(observed.plans))
+    h = hx.float()
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-5)
+    ref = (hg.float() * h.to(torch.float16).float()) @ hw.float()
+    # fp16 K=4096 accumulation on device vs an fp32 reference.
+    torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=1e-1)
+
+
 def test_two_relayout_edges_into_one_consumer(monkeypatch):
     """add(neg(a), abs(b)) with both edges forced: two destination rectangles
     at the consumer's tick, and two clones inserted before one consumer."""

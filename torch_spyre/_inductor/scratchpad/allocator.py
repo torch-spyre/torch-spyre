@@ -4467,8 +4467,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         :class:`RelayoutCandidate` records priced by the fitted relayout law. The division-independent edge gates (single non-indirect
         write, activation source, pointwise-or-matmul consumer, ...) mirror
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
-        compatibility, projectable ownership on both frames, the law's fitted
-        split range) live in ``solver_relayout_pair_cost``. Gated on
+        compatibility, projectable ownership on both frames) and the price
+        live in ``solver_relayout_pair_cost``. Gated on
         ``lx_solver_relayout()`` (the solver kind decides relayouts).
         """
         if not lx_solver_relayout() or config.ktir_emitter:
