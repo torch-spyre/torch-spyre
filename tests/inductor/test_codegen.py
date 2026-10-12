@@ -39,6 +39,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    core_idx_to_slice_offset,
     generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
@@ -581,6 +582,72 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestOverlappingWindowCoreOffsets(InductorTestCase):
+    def test_unfold_window_split(self):
+        """Core slices address x.unfold(1, 4, 2).sum(0) at the full window stride."""
+        position, feature, window, batch = sympy.symbols("c0:4")
+        for window_splits in (1, 2, 4):
+            with self.subTest(window_splits=window_splits):
+                iteration_space = {
+                    position: (sympy.Integer(7), 7),
+                    feature: (sympy.Integer(6), 1),
+                    window: (sympy.Integer(4), window_splits),
+                    batch: (sympy.Integer(8), 1),
+                }
+                spec = OpSpec(
+                    op="sum",
+                    is_reduction=True,
+                    iteration_space=iteration_space,
+                    core_id_to_work_slice=derive_operation_mapping(iteration_space),
+                    args=[
+                        TensorArg(
+                            is_input=True,
+                            arg_index=0,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            # The step is two rows; the window reads four.
+                            device_size=[1, 8, 2, 8, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                position,
+                                window,
+                                batch,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 0},
+                        ),
+                        TensorArg(
+                            is_input=False,
+                            arg_index=1,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            device_size=[1, 1, 4, 7, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                sympy.S.Zero,
+                                window,
+                                position,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 1},
+                        ),
+                    ],
+                    op_info={},
+                )
+                sdsc, mapping = parse_op_spec(spec)
+                for pos in range(7):
+                    for part in range(window_splits):
+                        slices = {str(dim): 0 for dim in sdsc.work_slices}
+                        slices[str(mapping[position])] = pos
+                        slices[str(mapping[window])] = part
+                        # One physical row spans eight batches of 64 elements.
+                        expected = (2 * pos + part * (4 // window_splits)) * 8 * 64
+                        self.assertEqual(
+                            core_idx_to_slice_offset(
+                                sdsc.args[0], slices, sdsc.work_slices
+                            ),
+                            expected,
+                        )
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
