@@ -22,7 +22,6 @@ import collections
 import math
 from unittest.mock import patch
 
-import pytest
 import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep
@@ -952,19 +951,14 @@ def test_permute_mul_equal_dims_distinct_names():
 
 
 def test_reshape_split_untracked_dim_tolerated():
-    """Reshape that splits an _untracked_ intermediate dim is tolerated, not raised.
+    """Reshape that splits an _untracked_ intermediate dim is tolerated.
 
     Mirrors a k/v projection reshaped into heads: an *unannotated* input produces
     an intermediate whose dims carry only _untracked_ placeholder names (no
     meaningful name to preserve).  A view then splits that dim into two loop
     vars, hitting the len(loop_vars) > len(names) branch in
-    compute_input_named_dims.  Because the split name is only _untracked_, the
-    pass assigns fresh untracked names per loop var and keeps going instead of
-    aborting like test_reshape_1d_to_2d_exp (which splits a *real* named dim).
-
-    Contrast with test_reshape_1d_to_2d_exp: that splits the meaningful name "A"
-    and raises "reshape split a named dim"; here nothing meaningful is split, so
-    compilation succeeds and the output dims are all _untracked_.
+    compute_input_named_dims.  Fresh untracked names are assigned per loop var
+    and the pass continues.
 
     x is left unannotated (no tensor_dims entry) so its consuming op is assigned
     _untracked_ names; y anchors a valid named_dims declaration for the run.
@@ -995,10 +989,17 @@ def test_reshape_split_untracked_dim_tolerated():
 
 
 def test_reshape_1d_to_2d_exp():
-    """1-D tensor [4096] annotated ['A'] -> reshape(64,64) raises Unsupported.
+    """1-D tensor [4096] annotated ['A'] -> reshape(64,64) assigns _untracked_ dims.
 
-    A single named dim split by reshape cannot be propagated accurately.
-    No expected_dim_hints: compilation raises before assign_dim_hints runs.
+    Previously this raised ``Unsupported("reshape split a named dim")``.  The
+    fix extends the _untracked_ fallback to *all* reshape-split dims (not just
+    those already _untracked_): the compiler uses shape-based heuristics for
+    work partitioning, so losing the symbolic name degrades hint quality but
+    does not affect correctness.
+
+    After the reshape both output dims are 64, so each loop var is assigned
+    ``_untracked_64``.  Compilation must succeed and the exp op's propagated
+    dims must be all ``_untracked_``.
     """
     _A = 4096
     x = torch.randn(_A, dtype=torch.float16, device=DEVICE)
@@ -1006,13 +1007,15 @@ def test_reshape_1d_to_2d_exp():
     def fn(x):
         return x.reshape(64, 64).exp()
 
-    with pytest.raises(Exception, match="reshape split a named dim"):
-        _run_and_capture(
-            fn,
-            [x],
-            named_dims={"A": _A},
-            tensor_dims={x: ["A"]},
-        )
+    result = _run_and_capture(
+        fn,
+        [x],
+        named_dims={"A": _A},
+        tensor_dims={x: ["A"]},
+    )
+    assert all(n.startswith("_untracked_") for n in result.propagated_dims), (
+        f"expected all _untracked_ dims after reshape-split, got: {result.propagated_dims}"
+    )
 
 
 def test_constant_indexed_dim_is_consumed_without_mapping():

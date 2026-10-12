@@ -36,11 +36,6 @@ along the vocab/leading dim), so they get a gather-optimal "indirect
 access" layout -- vocab dim outermost, hidden dim split into sticks --
 rather than the matmul or default layout.
 
-Pre-quantized FP8 ``nn.Linear`` weights (``torch.float8_e4m3fn``) can be
-loaded directly into a KERNEL layout with 2D stick ``[2, 64]`` and
-``ElementArrangement.QFP8WT``, bypassing any runtime ``qfp8wt`` quantization
-step and feeding ``_scaled_mm`` directly.
-
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
 
@@ -478,8 +473,28 @@ def _transfer_module(
     for name, buf in list(module._buffers.items()):
         if buf is None or buf.device.type == DEVICE_NAME:
             continue
-        module._buffers[name] = _dma_to_spyre_default(buf, target_dtype=dtype)
-        counts["buffer"] += 1
+        dev = None
+        # FP8Linear (and similar custom modules) store the quantized weight as
+        # a buffer via register_buffer, not as an nn.Parameter.  is_linear is
+        # False for these modules, so detect the FP8 weight purely by name +
+        # dtype + shape and route it to QFP8WT KERNEL layout.
+        # The weight is already in [in, out] orientation (transposed by
+        # FP8Linear.from_fp8_checkpoint before we get here).
+        if (
+            use_fp8_weights
+            and name == "weight"
+            and buf.ndim == 2
+            and buf.dtype == torch.float8_e4m3fn
+        ):
+            dev = _dma_to_spyre_fp8_kernel(buf)
+            counts["fp8_kernel"] += 1
+        if dev is None:
+            # Do not cast FP8 buffers to the target dtype — DCI rejects
+            # fp8_143 → bfloat16/float16 conversions.  Keep E4M3 dtype as-is.
+            buf_dtype = dtype if buf.dtype != torch.float8_e4m3fn else None
+            dev = _dma_to_spyre_default(buf, target_dtype=buf_dtype)
+            counts["buffer"] += 1
+        module._buffers[name] = dev
 
 
 def load_model_to_spyre(
