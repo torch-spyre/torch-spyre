@@ -182,6 +182,21 @@ def _swiglu(h: torch.Tensor, gate, up, down) -> torch.Tensor:
     return (h @ up * F.silu(h @ gate)) @ down
 
 
+def _causal_mask(S: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """The finite broadcast mask shape the GQA tests and the captured graphs use.
+
+    Finite rather than ``-inf``: ``test_building_blocks.py`` uses ``finfo.min / 2`` so
+    a fully masked row cannot produce a NaN. Shape ``[1, 1, S, S]``, broadcast over
+    batch and heads.
+    """
+    positions = torch.arange(S)
+    return torch.where(
+        positions.view(1, 1, 1, S) <= positions.view(1, 1, S, 1),
+        torch.tensor(0.0, dtype=dtype),
+        torch.tensor(torch.finfo(dtype).min / 2, dtype=dtype),
+    ).to(DEVICE_NAME)
+
+
 def build_transformer_block(
     *,
     B: int = 1,
@@ -190,12 +205,18 @@ def build_transformer_block(
     heads: int = 32,
     intermediate: int = 14336,
 ) -> Workload:
-    """Pre-norm decoder block at Llama-3.1-8B's dimensions.
+    """Pre-norm decoder block with multi-head attention.
 
-    Hidden 4096, 32 heads of 128 and intermediate 14336, as captured in
-    ``tests/resource/models/Meta-Llama-3.1-8B-Instruct.yaml``. Shapes stay 4-D through
-    attention: a 3-D query makes the SDPA decomposition index a missing dimension, and
-    projecting a 2-D activation hits #3193.
+    Hidden 4096, 32 heads of 128, intermediate 14336. Those widths are
+    Llama-3.1-8B's, but the attention is NOT: this projects k and v at full ``[E, E]``
+    where Llama-3.1-8B is grouped-query (``k_proj`` is ``[1024, 4096]`` in
+    ``tests/resource/models/Meta-Llama-3.1-8B-Instruct.yaml``, eight key/value heads).
+    ``granite_layer`` is the grouped-query family; this one is kept, unchanged, as the
+    multi-head shape and as the continuity point for baselines already taken against
+    it. Renaming or reshaping it would end those series.
+
+    Shapes stay 4-D through attention: a 3-D query makes the SDPA decomposition index
+    a missing dimension, and projecting a 2-D activation hits #3193.
     """
     head_dim = _head_dim(E, heads)
     torch.manual_seed(0)
@@ -218,19 +239,23 @@ def build_transformer_block(
 
 
 def build_control_flow(
-    *, M: int = 8, K: int = 12, N: int = 6, tile: int = 2
+    *, M: int = 256, K: int = 256, N: int = 64, tile: int = 64
 ) -> Workload:
     """A ``for_each_tile`` map over M, lowered through the scan HOP.
 
-    From ``for_each_tile_fixtures.py::split_m_fn``. The loop body is the graph, so no
-    parameter grows it: this family is for coverage. It is the only control flow the
-    backend handles; ``torch.cond`` has no lowering and carry-mode split-K is an
-    expected failure (#4460).
+    Defaults track ``for_each_tile_fixtures.py``: ``M, K, N = 256, 256, 64`` with
+    ``tile_size=64``, which is what ``split_m_fn`` uses now. The loop body is the
+    graph, so no parameter grows it -- this family is coverage of whether the frontend
+    handles a scan HOP at all, not a scaling curve.
+
+    ``torch.cond`` still has no lowering. Carry-mode split-K is no longer an expected
+    failure: #4460 is closed and ``test_for_each_tile_e2e.py`` runs it, so a carry-mode
+    family is now a reasonable addition.
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
-    # fp16, cast before the transfer: the backend has no fp32 batchmatmul, and
-    # test_for_each_tile_e2e.py notes that casting after the transfer produces garbage.
+    # fp16 is this builder's choice, not the fixture's: the fixture builds fp32 and the
+    # e2e test moves it to the device itself.
     torch.manual_seed(0)
     X = _randn(M, K)
     Y = _randn(K, N)
@@ -291,14 +316,22 @@ def build_granite_layer(
     shapes += [(E, intermediate), (E, intermediate), (intermediate, E)]
     weights = [tuple(_randn(*shape) for shape in shapes) for _ in range(layers)]
 
-    def stack(x, weights):
+    def stack(x, mask, weights):
         for norm1, norm2, wq, wk, wv, wo, gate, up, down in weights:
             h = _rms_norm(x, norm1, GRANITE_RMS_EPS)
             q = _split_heads(h @ wq, B, S, heads, head_dim, "H")
             k = _split_heads(h @ wk, B, S, kv_heads, head_dim, "Hkv")
             v = _split_heads(h @ wv, B, S, kv_heads, head_dim, "Hkv")
             merged = _attention(
-                q, k, v, B, S, E, scale=GRANITE_ATTENTION_MULTIPLIER, enable_gqa=True
+                q,
+                k,
+                v,
+                B,
+                S,
+                E,
+                attn_mask=mask,
+                scale=GRANITE_ATTENTION_MULTIPLIER,
+                enable_gqa=True,
             )
             x = x + GRANITE_RESIDUAL_MULTIPLIER * (merged @ wo)
             h = _rms_norm(x, norm2, GRANITE_RMS_EPS)
@@ -306,7 +339,7 @@ def build_granite_layer(
             x = x + GRANITE_RESIDUAL_MULTIPLIER * mlp_out
         return x
 
-    return Workload(fn=stack, args=(x, weights))
+    return Workload(fn=stack, args=(x, _causal_mask(S), weights))
 
 
 def build_granite_lm_head(
@@ -344,11 +377,16 @@ def build_granite_lm_head(
 def build_granite_embedding(
     *, S: int = 512, E: int = GRANITE_E, vocab: int = GRANITE_VOCAB
 ) -> Workload:
-    """Granite's token embedding, as ``index_select``: ``embedding`` has no lowering.
+    """Granite's token embedding, written as the ``index_select`` it amounts to.
 
     From ``test_indirect_access_gather.py::test_index_select``, with its int32 index.
-    The only indirect access in the sweep. Its numerics are an expected failure, which
-    a frontend-only compile never reaches.
+    ``torch.embedding`` now reaches a gather OpSpec too -- ``test_embedding`` expects
+    one -- so this could move to it; ``index_select`` is kept because that test also
+    says the op falls back to CPU, and a fallback would stop measuring a Spyre compile.
+
+    The only indirect access in the sweep, so the one point that reaches
+    ``enforce_indirect_access_layout`` at all. Its numerics are an expected failure,
+    which a frontend-only compile never reaches.
     """
     torch.manual_seed(0)
     table = _randn(vocab, E)
@@ -395,7 +433,16 @@ def build_elementwise_chain(
 
 
 def build_fanout(*, consumers: int = 8, rows: int = 256, cols: int = 1024) -> Workload:
-    """One buffer read by ``consumers`` operations, the lookup axis behind #4113."""
+    """One buffer read by ``consumers`` operations.
+
+    The axis is the consumer count, which is what a users lookup or a dependency walk
+    scales on, and nothing else in the sweep moves it with the producer held still.
+
+    Not a reproduction of #4113: that reverse index is built only when a duplicate
+    constant needs redirecting (``dedup_constants.py``), and this graph has no
+    duplicate constants, so it never reaches that code. ``dup_constants`` is the family
+    that does.
+    """
     torch.manual_seed(0)
     x = _randn(rows, cols)
 

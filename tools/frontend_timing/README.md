@@ -39,7 +39,7 @@ tier.
 |---|---|
 | `pr` | did a change break a compile, or move it grossly |
 | `nightly` | the scaling series at moderate sizes |
-| `weekly` | everything: long sequences, depth 8, the A/B arms, the backend share |
+| `weekly` | everything: long sequences, depth 8, the A/B arms |
 
 ### A/B arms
 
@@ -48,6 +48,17 @@ configurations against one tree. The plan ships three: `SPYRE_LX_PLANNER_RELAYOU
 `SENCORES=1` and the unbounded relayout enumeration. An arm is part of a point's identity
 (record filename, row name and a separate `arm` field), so it is never averaged into its
 own control.
+
+### Records are never reused
+
+A sweep refuses a `--out` that already holds records. The recorder puts the pid in each
+filename, so nothing is ever replaced: a second sweep into the same directory leaves both
+runs' samples side by side and the summarizer averages them into one point. `--append`
+allows it deliberately. The summarizer independently refuses records that disagree on
+`git_sha`, torch version or Spyre config, which is the same mistake seen from the other
+end; `--allow-mixed` overrides that.
+
+The default destination persists between runs for exactly this reason, and is gitignored.
 
 ## Where records go
 
@@ -60,7 +71,11 @@ First hit wins: `--out`, then `$SPYRE_FRONTEND_TIMING_RECORDS`, then `records/` 
   fresh process gets a cache that never held the graph. Each child gets a fresh directory
   and `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`.
 - **A discarded warmup**, written to `warmup/`, which the summarizer does not read.
-- **Median across samples**: pod wall time has a long tail.
+- **The minimum across samples**, not the median. Co-tenant interference on a shared
+  pod only ever makes a compile slower -- measured at 11% typical and 63% worst spread
+  across three samples of one point -- so the fastest sample is the least contaminated
+  one, and the long tail a median would resist is exactly what should be discarded. The
+  rows file still carries every sample, so a median stays recoverable.
 - **No backend** (`TORCH_SPYRE_FRONTEND_ONLY=1`) unless `--with-backend`. A frontend-only
   compile produces no runnable kernel, which is why the driver never calls the compiled
   function twice.
@@ -100,24 +115,39 @@ One grammar, because these names become warehouse map keys:
 | Name | Meaning |
 |---|---|
 | `total_ms` | the whole `stage:compile_fx:spyre_compile` region |
-| `backend_ms` | every `:backend_compile` event inside it |
+| `backend_ms` | the `stage:SpyreAsyncCompile:backend_compile` events inside it; absent when the backend was skipped |
 | `frontend_ms` | `total - backend`, subtracted **within each sample** |
-| `graph_operations`, `graph_nodes` | largest pre-scheduling graph, and largest FX graph |
-| `stage.<Owner>.<what>_ms` | one stage region |
-| `pass.<Pipeline>.<pass>_ms` | one pass |
-| `counter.<name>` | an analysis-call count, summed over every pass in the compile |
+| `graph_operations`, `graph_nodes` | pre-scheduling operations, and FX nodes entering the pre-grad pipeline |
+| `stage.<Owner>.<what>_ms` | one stage region, inclusive |
+| `pass.<Pipeline>.<pass>_ms` | one pass, inclusive |
+| `<region>_self_ms` | the same region's self time: inclusive minus its direct children |
+| `counter.<name>` | a count from pass metadata, summed over the compile |
+| `counter.<Owner>.<what>.<name>` | a count from one stage region's metadata |
 | `peak_rss_kb` | the compiling process's peak RSS (Linux reports KB) |
-| `compile_wall_ms` | wall time around the compile, outside the recorder |
+| `compile_wall_ms` | wall time around the whole compiled call, which is strictly more than `total_ms` |
 | `kernels_skipped` | kernels the frontend-only mode declined to compile |
 
-Counters are summed per compile to keep the name set small; per-pass counts stay in the
-raw records. Any number a pass puts in its event `meta` that is not a graph size becomes
+`backend_ms` is matched exactly, never by trailing segment: upstream has a
+`dynamo_timed` phase of its own called `backend_compile` -- the call into Inductor --
+which *encloses* the Spyre compile region, so a suffix match totals the whole Inductor
+compile as backend time and drives every frontend figure negative.
+
+Both time series are recorded because neither answers the other's question. Inclusive is
+what the frontend subtraction needs and what shows the nesting; it also sums to more than
+the compile, so ranking regions by it puts every ancestor of the hot pass near the top.
+Self time is what ranks cost, and the `--passes` table orders by it.
+
+Pass counts are summed per compile under their bare key, to keep the name set small;
+per-pass counts stay in the raw records. Stage counts are keyed by their region instead,
+because two regions can carry the same key for different things -- the scratchpad records
+`buffers` on more than one -- and summing those would report a number that is neither.
+Any number a pass puts in its event `meta` that is not a graph size becomes
 a counter, with no change needed here.
 
 ## The rows file
 
 `--json` writes one object per point, with `measurements` mapping each metric to its
-**per-sample values**, not a median. That mirrors `benchmark_runs.measurements`
+**per-sample values**, not a summary. That mirrors `benchmark_runs.measurements`
 (`Map(LowCardinality(String), Array(Float64))`), so variance stays recomputable
 downstream. A metric only some samples carry gets a shorter array, never a padded zero.
 
@@ -158,4 +188,11 @@ not accept, if a point has no `tiers`, or if a registered family is never swept.
 - **A full model in one graph.** Embedding, layers, norm and head are measured
   separately.
 - **`GraphLowering.run` and `GraphLowering.codegen`**, and Dynamo versus AOTAutograd, are
-  not timed separately, so that time lands in `stage:compile_fx:spyre_compile` self time.
+  not timed separately, so that time lands in `stage:compile_fx:spyre_compile` self time
+  -- which the `_self_ms` series now reports.
+- **The backend share.** No plan point enables the backend; `--with-backend` is a
+  whole-sweep flag, so measuring that share means a separate run.
+- **A scaling curve in `S`.** Sequence length barely moves compile time, and `S=1` takes
+  the decomposition's decode branch, so the `S` points span a decode/prefill switch. They
+  are coverage of two paths, not one power law -- `scaling.py` will fit them and should be
+  expected to call that fit unreliable.
