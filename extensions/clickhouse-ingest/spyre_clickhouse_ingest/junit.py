@@ -15,6 +15,7 @@
 """JUnit XML helpers and CI run-coordinate resolution shared by every ingest."""
 
 import uuid
+from collections import Counter
 
 
 class JUnitXml:
@@ -49,6 +50,27 @@ class JUnitXml:
             if c["_is_bare"]:
                 c["status"] = "xpass"
                 promoted += 1
+
+    @staticmethod
+    def error_case_names(cases, origin: str) -> list[str]:
+        """The name each (classname, name, status) is recorded under. pytest leaves a collection
+        error nameless and names an xdist worker crash only pytest::internal, so these get
+        `collection[<origin>]` / `internal[<origin>]`, numbered `#2`.. when one repeats: each is
+        its own error, not a re-run, and an empty name derives no test_case_id at all."""
+        seen: Counter = Counter()
+        names = []
+        for classname, name, status in cases:
+            if status == "error" and not (name or "").strip():
+                name = f"collection[{origin}]"
+            elif status == "error" and (classname, name) == ("pytest", "internal"):
+                name = f"internal[{origin}]"
+            else:
+                names.append(name)
+                continue
+            seen[(classname, name)] += 1
+            n = seen[(classname, name)]
+            names.append(name if n == 1 else f"{name}#{n}")
+        return names
 
 
 class RunCoordinates:
@@ -94,6 +116,7 @@ class RunCoordinates:
 # Function API, kept so installed consumers import one definition, not a copy.
 extract_properties = JUnitXml.extract_properties
 promote_xpass = JUnitXml.promote_xpass
+error_case_names = JUnitXml.error_case_names
 _threaded_run_id = RunCoordinates.threaded_run_id
 _runner_run_id = RunCoordinates.runner_run_id
 source_and_external_run_id = RunCoordinates.source_and_external

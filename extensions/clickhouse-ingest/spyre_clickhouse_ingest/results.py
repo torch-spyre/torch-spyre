@@ -47,6 +47,7 @@ from pathlib import Path
 # Aliased to `schema_model` so the call sites below read unchanged.
 from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
+    error_case_names,
     extract_properties,
     get_client,
     insert_artifact_result,
@@ -949,10 +950,18 @@ def parse_test_xml(xml_path: Path):
 
     # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
     # and the earlier attempts are kept only as its result.reruns count.
+    testcases = suite.findall(".//testcase")
+    names = error_case_names(
+        (
+            (tc.get("classname", ""), tc.get("name", ""), classify_testcase(tc)[0])
+            for tc in testcases
+        ),
+        xml_path.stem,
+    )
     by_key: dict = {}
     seen: Counter = Counter()
-    for tc in suite.findall(".//testcase"):
-        key = (tc.get("classname", ""), tc.get("name", ""))
+    for tc, name in zip(testcases, names):
+        key = (tc.get("classname", ""), name)
         by_key[key] = tc
         seen[key] += 1
     raw_cases = []
@@ -961,14 +970,12 @@ def parse_test_xml(xml_path: Path):
         properties = extract_properties(tc)
         if seen[key] > 1:
             properties = [*properties, ("result.reruns", str(seen[key] - 1))]
-        op_name, dtype, platform = extract_op_dtype_platform(
-            tc.get("name", ""), properties
-        )
+        op_name, dtype, platform = extract_op_dtype_platform(key[1], properties)
         raw_cases.append(
             {
                 "case_id": str(uuid.uuid4()),
-                "classname": tc.get("classname", ""),
-                "name": tc.get("name", ""),
+                "classname": key[0],
+                "name": key[1],
                 "op_name": op_name,
                 "dtype": dtype,
                 "platform": platform,
