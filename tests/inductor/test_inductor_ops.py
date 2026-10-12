@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 
+from torch._inductor.exc import InductorError
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -465,6 +466,34 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
 ]
 
+# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
+# host, and the result is wrong on 27-88% of its elements. The values on the device
+# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
+# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
+# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
+# converting the result back on the device restores the input exactly, which shows
+# the values are right; the other four cannot be checked that way, because the
+# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
+# the partial-stick limit (4x68).
+_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
+_STAGGERED_READBACK_UNCHECKED = (
+    "readback of the staggered cast result is wrong, probably #4393 "
+    "(the values cannot be checked on the device for this shape)"
+)
+_STAGGERED_READBACK_UNCHECKED_CASES = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in ("4x32", "4x68")
+}
+TO_DTYPE_OP_EXPECT_FAIL = {
+    case: (
+        _STAGGERED_READBACK_UNCHECKED
+        if case in _STAGGERED_READBACK_UNCHECKED_CASES
+        else _STAGGERED_READBACK
+    )
+    for case in TO_DTYPE_OP_EXPECT_FAIL
+}
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -547,12 +576,15 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
 # These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
-# the xfail-marked tests, each has passed in some of them). The bfloat16 case is the
-# sibling of the float16 one. Cause not investigated (see #5285), so they are
-# non-strict xfails.
+# the xfail-marked tests, each has passed in some of them), so they are non-strict
+# xfails. They fail on a single core as well, with the signature of the lost second
+# stick of a pair below (#5361), so splitting a dim across cores (#5285) does not
+# explain them; #5285 tracks the intermittency.
 _ROUND_TRIP_IMPLICIT_UNSTABLE = {
-    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
-    "bfloat16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+    "float16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
+    "bfloat16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
 }
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
@@ -561,6 +593,50 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
     and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
 ]
+
+# The round trips left in the three lists above return the right number of elements
+# with about half of them zero (#5361). The upcast value is staggered, so an fp16
+# stick is spread over a pair of fp32 sticks, in interleaved groups of four
+# elements; when the stick dim does not fill whole pairs, the pair's second stick is
+# missing. It happens in two ways:
+# - 4x16 and 4x63: the second stick is not allocated, so it fails on one core too;
+# - 4x68: it is allocated, but work division leaves it to no core, so it passes
+#   with SENCORES=1.
+_PAIR_SECOND_STICK_LOST = (
+    "the staggered fp32 value lacks the second stick of a stick pair, so half the "
+    "elements come back as zero (#5361)"
+)
+_PAIR_SECOND_STICK_UNSPLIT = (
+    "work division leaves the second stick of a stick pair to no core; correct "
+    "with SENCORES=1 (#5361)"
+)
+_ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
+    "4x16": _PAIR_SECOND_STICK_LOST,
+    "4x63": _PAIR_SECOND_STICK_LOST,
+    "4x68": _PAIR_SECOND_STICK_UNSPLIT,
+}
+
+
+def _round_trip_pair_reasons(cases):
+    """``{case: reason}`` for round trips that lose the second stick of a pair.
+
+    A case whose shape has no reason raises KeyError: a new failing shape has to
+    be looked at before it is given one.
+    """
+    return {
+        case: _ROUND_TRIP_PAIR_REASON_BY_SHAPE[case.rsplit("_", 1)[1]] for case in cases
+    }
+
+
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
@@ -4828,11 +4904,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
+            # Both cases pass on CI's deeptools and fail on other builds, so they are
+            # non-strict: a pass is reported, not an error.
             # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
+            # some builds do.
+            # #5358: dbo-opt intermittently fails program verification for the fp32
+            # reduction over the 256-wide last dim on deeptools main.
             "expect_fail_unstable": {
                 "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
             },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
@@ -5219,6 +5299,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5467,6 +5554,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -8016,9 +8110,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend hits an internal lowering bug for "
-            "torch.nansum (stable error signature: InductorError: IndexError: "
-            "list index out of range)"
+            "torch.nansum (stable error signature: InductorError: RuntimeError: "
+            "Failed to import the generated kernel, a SyntaxError)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_nansum_all_dims_known_xfail(self):
@@ -8035,9 +8130,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.std yet (stable "
-            "error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "error signature: InductorError: KeyError: 'No FX node for buf...', "
+            "the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_std_dim0_known_xfail(self):
@@ -8049,9 +8145,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.var yet (stable "
-            "error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "error signature: InductorError: KeyError: 'No FX node for buf...', "
+            "the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_var_dim0_known_xfail(self):
@@ -8063,9 +8160,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.std_mean yet "
-            "(stable error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_std_mean_dim0_known_xfail(self):
@@ -8077,9 +8175,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.var_mean yet "
-            "(stable error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "(stable error signature: InductorError: NotImplementedError: "
+            "Pointwise)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_var_mean_dim0_known_xfail(self):
@@ -8133,9 +8232,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.quantile yet "
-            "(stable error signature: InductorError: Unsupported: unexpected "
-            "argument PointwiseOp(op='to_dtype', ...) to mul)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_quantile_q050_dim0_known_xfail(self):
@@ -8149,9 +8249,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.nanquantile yet "
-            "(stable error signature: InductorError: IndexError: list index "
-            "out of range)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_nanquantile_q050_dim0_known_xfail(self):

@@ -320,6 +320,7 @@ _PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
                 shape,
                 marks=pytest.mark.xfail(
                     strict=True,
+                    raises=AssertionError,
                     reason="TODO: size work division for an upcast value by whole "
                     "stick pairs, so the last pair's second stick is processed",
                 ),

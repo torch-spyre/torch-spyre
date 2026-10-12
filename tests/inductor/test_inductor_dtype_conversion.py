@@ -929,15 +929,17 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"D2H fp32→fp16 value mismatch: got {result}, expected {expected}",
         )
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2852 — cross-dtype copy_() fp32→fp16: aten.copy.default has no STL "
-            "candidate for IEEE_FP32→SEN169_FP16; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2852"
-        )
+            "the copy compiles (#2852 is fixed), but the fp16 result is staggered and "
+            "its readback is permuted: converting it back on the device restores the "
+            "values (#4393)"
+        ),
     )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
-        """Compiled copy_() from fp32 into fp16 Spyre tensor — missing cross-format layout candidate."""
+        """Compiled copy_() from fp32 into fp16 Spyre tensor."""
         src_fp32 = cached_randn(
             (4, 64), dtype=torch.float32, differentiation="cop02_src"
         )
@@ -960,15 +962,17 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.skip(
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
         reason=(
-            "SKIP #2205 #1482 — .float() on Spyre tensor produces DL16_TO_FP32 "
-            "arrangement; direct .cpu() gives wrong values; .half() may also fail; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2205"
+            ".float() on a Spyre tensor gives a staggered (DL16_TO_FP32) result whose "
+            "readback is permuted (#4393), and the eager .half() of it is also wrong, "
+            "though the compiled .half() of the same tensor is right; see also #2205"
         ),
     )
     def test_float_half_methods_on_spyre_tensor(self):
-        """.float() and .half() shortcut methods on Spyre tensors, SKIP #2205."""
+        """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)
         x_spyre = x_cpu.to("spyre")
         x_float = x_spyre.float()
