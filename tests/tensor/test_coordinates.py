@@ -1067,8 +1067,9 @@ class TestFlatDenseProjectionLayout(TestCase):
             x, y, output, out_dep, contraction, M, N
         )
         self.assertIsNotNone(result)
-        self.assertEqual(list(result.device_size[:2]), [M, K])
-        self.assertEqual(list(result.stride_map[:2]), [K, 1])
+        # SpyreTensorLayout stickifies [M, K] to [K//64, M, 64].
+        self.assertEqual(list(result.device_size), [K // 64, M, 64])
+        self.assertEqual(list(result.stride_map), [64, K, 1])
 
         # A strided (non-contiguous) x must be rejected.
         strided_x = PropArg(
