@@ -54,6 +54,7 @@ def resolve_out_dir(explicit: str | None) -> str:
 #: Plan keys that configure the sweep; every other key is a builder keyword.
 RESERVED_PLAN_KEYS = frozenset({"workload", "tiers", "env", "comment"})
 
+
 @dataclass
 class Point:
     """One sweep point: what to build, with what, under what environment."""

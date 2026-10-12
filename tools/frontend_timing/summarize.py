@@ -102,9 +102,7 @@ class Record:
         return any(e["name"] == BACKEND_EVENT for e in self.events)
 
     def backend_ns(self) -> int:
-        return sum(
-            e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT
-        )
+        return sum(e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT)
 
     def graph_operations(self) -> int | None:
         """Largest pre-scheduling graph compiled; None, not 0, if there was none."""

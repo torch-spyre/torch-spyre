@@ -404,9 +404,7 @@ class TestDriverLoop:
         fake, launches = self._fake_child([0])
         monkeypatch.setattr(run_sweep, "_run_child", fake)
         run_sweep.run_point(run_sweep.Point("mlp"), str(tmp_path), 1, True, 60)
-        destinations = [
-            launch["env"]["TORCH_SPYRE_TIMING_OUT"] for launch in launches
-        ]
+        destinations = [launch["env"]["TORCH_SPYRE_TIMING_OUT"] for launch in launches]
         assert os.path.dirname(destinations[0]) == str(tmp_path / "warmup")
         assert os.path.dirname(destinations[1]) == str(tmp_path)
 
@@ -425,9 +423,7 @@ class TestMainGuards:
         (out / "mlp-run1.1234.json").write_text("{}")
         monkeypatch.setattr(run_sweep, "_run_child", self_fail)
         with pytest.raises(SystemExit) as caught:
-            run_sweep.main(
-                ["--workload", "mlp", "--out", str(out), "--samples", "1"]
-            )
+            run_sweep.main(["--workload", "mlp", "--out", str(out), "--samples", "1"])
         # Records are never replaced, so a second sweep here is summarized with the
         # first -- two builds averaged into one point.
         assert "already holds" in str(caught.value)
@@ -467,12 +463,10 @@ class TestMainGuards:
         fake, _ = TestDriverLoop._fake_child([1])
         monkeypatch.setattr(run_sweep, "_run_child", fake)
         out = tmp_path / "fresh"
-        assert (
-            run_sweep.main(
-                ["--workload", "mlp", "--out", str(out), "--samples", "1"]
-            )
-            == 1
+        exit_code = run_sweep.main(
+            ["--workload", "mlp", "--out", str(out), "--samples", "1"]
         )
+        assert exit_code == 1
 
 
 def self_fail(argv, env, timeout_s):
