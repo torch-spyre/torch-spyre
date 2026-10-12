@@ -352,7 +352,7 @@ def compute_coordinates(
                 coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
-    offset = index.xreplace({v: 0 for v in vars})
+    offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
