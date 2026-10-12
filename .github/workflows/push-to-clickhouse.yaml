@@ -147,7 +147,8 @@ jobs:
       - x86_64
       - linux
       - image_ingest
-    timeout-minutes: 15
+    # PyPI/GitHub downloads from torch-cicd pods can be slow enough to blow a tighter budget.
+    timeout-minutes: 30
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
       github.event_name == 'workflow_dispatch' ||

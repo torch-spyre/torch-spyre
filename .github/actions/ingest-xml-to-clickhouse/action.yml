@@ -129,6 +129,13 @@ inputs:
       newer sparse-checkout. Empty = workspace, then sparse-checkout.
     required: false
     default: ''
+  venv:
+    description: >
+      Existing venv that already has spyre-clickhouse-ingest and its deps installed, e.g. the
+      caller's own ingest venv. Set, the action reuses it instead of locating the library and
+      building its own. Empty = build .venv in the workspace.
+    required: false
+    default: ''
   clickhouse-host:
     description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
     required: false
@@ -178,6 +185,7 @@ runs:
       env:
         CH_HOST: ${{ inputs.clickhouse-host }}
         XML_DIR: ${{ inputs.xml-dir }}
+        VENV: ${{ inputs.venv }}
       run: |
         if [ -z "${CH_HOST}" ]; then
           echo "::notice::ClickHouse host not configured — skipping ingest."
@@ -187,13 +195,14 @@ runs:
           echo "configured=false" >> "$GITHUB_OUTPUT"
         else
           echo "configured=true" >> "$GITHUB_OUTPUT"
+          echo "install=$([ -z "${VENV}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
         fi
 
     # $GITHUB_WORKSPACE (the job's checkout of this ref) before torch-spyre-dir, so a prebaked
     # tree cannot hide a newer library; a sparse-checkout when neither has one.
     - name: Locate the ingest library (on disk)
       id: locate
-      if: steps.gate.outputs.configured == 'true'
+      if: steps.gate.outputs.install == 'true'
       shell: bash
       env:
         TS_DIR: ${{ inputs.torch-spyre-dir }}
@@ -214,7 +223,7 @@ runs:
     # repository this checks out the CALLING repo, and without path it overwrites the
     # caller's workspace (its XML included).
     - name: Checkout the ingest library (fallback)
-      if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
+      if: steps.gate.outputs.install == 'true' && steps.locate.outputs.need-checkout == 'true'
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         repository: ${{ inputs.script-repo }}
@@ -224,12 +233,12 @@ runs:
         sparse-checkout-cone-mode: false
 
     - name: Set the ingest library path (fallback)
-      if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
+      if: steps.gate.outputs.install == 'true' && steps.locate.outputs.need-checkout == 'true'
       shell: bash
       run: echo "CHLIB=${GITHUB_WORKSPACE}/.ingest-src/extensions/clickhouse-ingest" >> "$GITHUB_ENV"
 
     - name: Install uv
-      if: steps.gate.outputs.configured == 'true'
+      if: steps.gate.outputs.install == 'true'
       uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       with:
         # latest-known, not "latest": it resolves to the newest uv whose checksum is
@@ -240,7 +249,7 @@ runs:
         version: latest-known
 
     - name: Setup venv and dependencies
-      if: steps.gate.outputs.configured == 'true'
+      if: steps.gate.outputs.install == 'true'
       shell: bash
       run: |
         # Create the ingest venv in the workspace, NOT the baked shared venv, so
@@ -274,8 +283,9 @@ runs:
         REPOSITORY_IN: ${{ inputs.repository }}
         CI_EVENT_IN: ${{ inputs.ci-event }}
         RUN_ATTEMPT_IN: ${{ inputs.run-attempt }}
+        VENV: ${{ inputs.venv || '.venv' }}
       run: |
-        source .venv/bin/activate
+        source "${VENV}/bin/activate"
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
