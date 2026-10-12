@@ -56,6 +56,7 @@ def make_lx_planning_class(cls):
         (torch_spyre._inductor.config, "lx_planning", True),
         (torch_spyre._inductor.config, "allow_all_ops_in_lx_planning", True),
         (torch_spyre._inductor.config, "sencores", 32),
+        (torch_spyre._inductor.config, "co_optimizing_lx_planning", True),
     )
 
 
