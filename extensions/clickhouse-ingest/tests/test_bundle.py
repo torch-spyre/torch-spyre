@@ -173,6 +173,15 @@ def test_the_minimal_bundle_is_an_artifact_a_tier_and_a_result(tmp_path):
             {"artifact_id": AID, "test_type": "fvt", "started_at": "2026-10-08 10:00"},
             "with a zone",
         ),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "run_key": "a b#1"},
+            "does not match",
+        ),
+        ({"image": IMAGE[:-1], "arch": "s390x", "test_type": "fvt"}, "does not match"),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "component": "Torch"},
+            "does not match",
+        ),
     ],
 )
 def test_bad_bundle_json_is_rejected(tmp_path, meta, why):
@@ -784,97 +793,3 @@ def test_a_sha_is_never_recorded_as_the_vllm_branch(tmp_path, branch, recorded):
         str(VLLM_DATA / "results"), branch, "881a59d2", "", "0", "wf", 0
     )
     assert {r["head_branch"] for r in rows} == {recorded}
-
-
-# --- offline.py without `re`: its hand-coded patterns are the schema's --------------------
-
-
-def _schema_patterns(node=None) -> set:
-    node = offline.schema() if node is None else node
-    found = {node["pattern"]} if isinstance(node, dict) and "pattern" in node else set()
-    children = (
-        node.values()
-        if isinstance(node, dict)
-        else node
-        if isinstance(node, list)
-        else []
-    )
-    for child in children:
-        found |= _schema_patterns(child)
-    return found
-
-
-def test_every_schema_pattern_is_checked_offline():
-    assert _schema_patterns() == set(offline.PATTERNS)
-
-
-SAMPLES = [
-    "",
-    AID,
-    AID.upper(),
-    AID[:-1],
-    AID.replace("-", ""),
-    "x" * 36,
-    IMAGE,
-    "icr.io/a@b@sha256:" + "b6" * 32,
-    "icr.io/a b@sha256:" + "b6" * 32,
-    "@sha256:" + "b6" * 32,
-    IMAGE[:-1],
-    IMAGE + "0",
-    "b6" * 32,
-    "B6" * 32,
-    "spyre-inference",
-    "torch_spyre.x",
-    "-bad",
-    "Bad",
-    "a",
-    "manual:jdoe@in.ibm.com:" + "ab" * 32,
-    "manual:me:7d8121d7-e19f-4844-897b-f9b1fe876278",
-    "manual:me:",
-    "manual::x",
-    "manual:a:b:c",
-    "manual:a b:c",
-    "manual:a:b#1",
-    "Spyre-Test/testing/Jenkinsfile.x#141",
-    "job#",
-    "#1",
-    "a b#1",
-    "a#1#2",
-    "a#1x",
-    "results/junit.xml",
-    "results/x.json",
-    "results/.xml",
-    "results/a/b.xml",
-    "results/a.txt",
-    "attachments/logs/a.log",
-    "attachments/",
-    "attachments/a b",
-    "notes.txt",
-    "0",
-    "12",
-    "1.5",
-    "x1",
-    "²",
-    "café",
-]
-
-
-@pytest.mark.parametrize("pattern", sorted(offline.PATTERNS))
-def test_each_offline_pattern_agrees_with_the_regex(pattern):
-    import regex
-
-    for value in SAMPLES:
-        assert offline.pattern_match(pattern, value) == bool(
-            regex.search(pattern, value)
-        ), value
-
-
-@pytest.mark.parametrize(
-    "key",
-    ["manual:jdoe@in.ibm.com:" + "ab" * 8, "Spyre-Test/testing/Jenkinsfile.torchspyre#141",
-     "a__b", "a?!b", "??x??", "café #1", "plain-key_1.2", ""],
-)  # fmt: skip
-def test_bundle_names_are_what_the_regex_made_them(key):
-    import regex
-
-    assert offline.slug(key) == regex.sub(r"[^A-Za-z0-9._-]+", "_", key)

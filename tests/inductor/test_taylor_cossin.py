@@ -126,9 +126,11 @@ map" at N = 16, 32, 65, 80, 96, 129, 160, 224.  The rule is the pairing, not
 "multiple of 64" -- N=48 passes, N=96 does not.  A bare
 ``(x.float() * 2.0).to(torch.float16)`` fails identically with no cos/sin in the
 graph, while pure fp16 pointwise ops are bit-exact, so this is the backend cast
-and not the decomposition.  ``test_low_precision_odd_stick_count_xfail`` pins it
-so the day #2818 is fixed shows up as an XPASS.  All model head dims (64, 128,
-256) are even-stick and unaffected.
+and not the decomposition.  #2818 has since been closed by rejecting such a cast
+(#3809: "cannot rescale device layout"), and ``test_low_precision_odd_stick_count_rejected``
+pins that rejection.  Some odd-count shapes still come back wrong without
+an error (#5361).  All model head dims (64, 128, 256) are even-stick and
+unaffected.
 
 Note: fp32 itself can only represent values near 128000 with spacing ~0.008,
 which is larger than π; a linspace sweep at |x|_max=128000 is meaningless in
@@ -547,31 +549,26 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("dtype, tol", _UPCAST_DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
-@pytest.mark.xfail(
-    reason="#2818: fp32->fp16/bf16 cast is wrong when ceil(size[-1]/32) is odd",
-    strict=False,  # some odd-stick shapes raise, others return wrong values
-)
-def test_low_precision_odd_stick_count_xfail(op_name, dtype, tol):
-    """Pin the #2818 exposure of the fp32 upcast at an odd fp32-stick count.
+def test_low_precision_odd_stick_count_rejected(op_name, dtype):
+    """The fp32 upcast at an odd fp32-stick count is rejected, not computed wrongly.
 
-    (2, 3, 32) spans ceil(32/32) == 1 fp32 stick along the innermost dim, an odd
-    count, so the closing fp32 -> fp16/bf16 cast lands in #2818 and over half the
-    elements come back with values that are not in the correct result at all.  A
-    bare ``(x.float() * 2.0).to(dtype)`` on this shape is wrong by the same amount
-    with no cos/sin in the graph, so the defect is the backend cast; this test
-    exists to make the fix visible as an XPASS rather than to blame cos/sin.
+    (2, 3, 32) spans an odd number of fp32 sticks, so the closing fp32 ->
+    fp16/bf16 cast cannot rescale the device layout to whole fp16 sticks, and the
+    compiler says so ("cannot rescale device layout", #3809).  A bare
+    ``(x.float() * 2.0).to(dtype)`` on this shape is rejected the same way with no
+    cos/sin in the graph, so this is the backend cast and not the decomposition.
+    If the cast is ever supported this stops raising and has to become a positive
+    test.
 
     Every shape in ``_SPYRE_SHAPES`` has an even fp32-stick count, which is why
     the rest of the suite cannot see this.
     """
     op = getattr(torch, op_name)
     x = torch.linspace(-3.0, 3.0, 192, dtype=dtype).reshape(2, 3, 32)
-    held = x.to("spyre").cpu()  # 1-6-9 fp16 round-trip, as elsewhere
-    out = _compile_on_spyre(op, x)
-    ref = op(held.double()).to(dtype)
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+    with pytest.raises(Exception, match="cannot rescale device layout"):
+        _compile_on_spyre(op, x)
 
 
 def test_cos_sin_non_contiguous():

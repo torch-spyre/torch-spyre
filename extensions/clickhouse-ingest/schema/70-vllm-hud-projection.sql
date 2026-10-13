@@ -196,7 +196,8 @@ WHERE tupleElement(benchmark, 'name') != 'sccache_stats';
 -- `release`) are left out: they move to each new build, so they have no place in a trend.
 --
 -- Refreshed rather than insert-fed: a tag lands after the run that measured its artifact. Real
--- tables, not views, for the same PREWHERE reason as above.
+-- tables, not views, for the same PREWHERE reason as above. A rebuild of the projection must
+-- TRUNCATE them, since each refresh appends only (row, tag) pairs the target lacks.
 CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3_by_tag
 (
     run_id         UUID,
@@ -238,7 +239,8 @@ ENGINE = MergeTree()
 ORDER BY (timestamp, head_branch, head_sha, workflow_id, job_id);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS oss_ci_benchmark_v3_by_tag_mv
-REFRESH EVERY 15 MINUTE TO oss_ci_benchmark_v3_by_tag AS
+-- APPEND: the server cannot EXCHANGE TABLES (renameat2), which a full refresh needs.
+REFRESH EVERY 15 MINUTE APPEND TO oss_ci_benchmark_v3_by_tag AS
 SELECT
     o.run_id, o.timestamp, o.schema_version, o.name, o.repo,
     t.tag_family                                                    AS head_branch,
@@ -257,7 +259,10 @@ INNER JOIN
     UNION DISTINCT
     SELECT run_id, artifact_id, artifact_id12, image, artifact_id12 AS tag, 'artifact' AS tag_family
     FROM v_benchmark_run_artifacts
-) AS t ON t.run_id = o.run_id;
+) AS t ON t.run_id = o.run_id
+WHERE sipHash128(o.run_id, o.benchmark, o.model, tupleElement(o.metric, 'name'), t.tag_family, t.tag)
+    NOT IN (SELECT sipHash128(run_id, benchmark, model, tupleElement(metric, 'name'), tag_family, tag)
+            FROM oss_ci_benchmark_v3_by_tag);
 
 CREATE TABLE IF NOT EXISTS oss_ci_benchmark_metadata_by_tag
 (
@@ -279,9 +284,7 @@ ENGINE = MergeTree()
 ORDER BY (repo, benchmark_name, benchmark_dtype, benchmark_mode, model_name, model_backend,
           device, arch, metric_name, head_branch, workflow_id, timestamp);
 
--- A refresh swaps its target whole, which fires no insert-triggered MV, so this one refreshes too.
 CREATE MATERIALIZED VIEW IF NOT EXISTS oss_ci_benchmark_metadata_by_tag_mv
-REFRESH EVERY 15 MINUTE DEPENDS ON oss_ci_benchmark_v3_by_tag_mv
 TO oss_ci_benchmark_metadata_by_tag AS
 SELECT DISTINCT
     repo,

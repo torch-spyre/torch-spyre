@@ -465,7 +465,7 @@ After all changes:
 5. **Run tests:**
    ```bash
    cd $TORCH_SPYRE_DIR
-   python -m pytest tests/_inductor/test_inductor_ops.py -v
+   python -m pytest tests/inductor/test_inductor_ops.py -v
    ```
 
 ---

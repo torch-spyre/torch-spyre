@@ -23,7 +23,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
-import torch
 from torch._inductor.ir import (
     TensorBox,
     Buffer,
@@ -125,7 +124,7 @@ from torch_spyre._inductor.constants import (
 )
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_info import (
     CarriedReductionRecord,
     LoopCarryRecord,
@@ -831,7 +830,7 @@ class ScratchpadAllocator:
         solver, allocation = self._materialize_selection(graph, solver, allocation)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
         self._post_solve(graph, allocation, accepted_lx_relayouts)
-        reasons = self._get_spill_reasons(solver, allocation)
+        reasons = self._get_spill_reasons(allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
@@ -891,8 +890,7 @@ class ScratchpadAllocator:
 
         Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
         commits, so an override that mutates the graph and re-plans hands back
-        the second solve's pair -- ``_get_spill_reasons`` must be asked about the
-        solver that produced the allocation it is passed.
+        the second solve's pair.
 
         Base: a placement-only solve selects nothing to materialize, so the first
         solve stands.
@@ -940,25 +938,22 @@ class ScratchpadAllocator:
         """Hook run after the solve and the relayout finalization, before
         reasons/push. Base: nothing to commit."""
 
-    def _get_spill_reasons(
-        self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
-    ) -> dict:
+    def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
         """Get spill reasons for every buffer that did not land in LX.
 
-        The solver's own :attr:`spill_reasons` is authoritative -- it carries the
-        declared verdict (``residency_reason``) or its capacity check. Anything
-        spilled without a reason there simply did not fit once the higher-value
-        buffers were placed.
+        The ``spill_reason`` the solver left on a buffer is authoritative -- it
+        carries the declared verdict (``residency_reason``) or its capacity
+        check. Anything spilled without one simply did not fit once the
+        higher-value buffers were placed.
         """
-        solver_reasons = dict(solver.spill_reasons)
+        reasons: dict[str, str] = {}
         for b in allocation:
             if b.address is None:
-                solver_reasons[b.name] = solver_reasons.get(
-                    b.name,
+                reasons[b.name] = b.spill_reason or (
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
-                    f" size={b.size // 1024} KB)",
+                    f" size={b.size // 1024} KB)"
                 )
-        return solver_reasons
+        return reasons
 
     def _get_op_name(self, op: Any) -> str:
         return op_short_name(op)
@@ -1297,18 +1292,9 @@ class ScratchpadAllocator:
         target = getattr(getattr(op, "origin_node", None), "target", None)
         if target is None:
             return []
-        reads = [dep.name for dep in op.get_read_writes().reads]
-        # ``tags`` is an OpOverload attribute; some origin targets (e.g. builtin
-        # functions behind int64 fallbacks) don't have it. Treat a tag-less
-        # target as not-pointwise rather than crashing. The joint-division path
-        # reaches this for ops the residency checks bar on the greedy path.
-        if torch.Tag.pointwise in getattr(target, "tags", ()):
-            # If the op is tagged as pointwise by pytorch upstream
-            # allow all inputs. Does not work for all ops
-            return reads
-        if hasattr(op, "data"):
-            return get_op_pointwise_inputs(op.data)
-        return []
+        # A pointwise ATen target can consume a transposed/broadcast view after
+        # lowering. Its tag does not prove element-for-element storage reuse.
+        return get_op_pointwise_inputs(op)
 
     def _restickify_barrier(
         self,
@@ -2487,7 +2473,7 @@ def _check_and_add_matmul_options(
     parsed = _matmul_axis_parse(op)
     options = {_candidate_key(seed): seed}
     for source in matmul_roles:
-        candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+        candidate = dict.fromkeys(iteration_space_from_op(op), 1)
         for role, (sym, extent, _factor) in parsed.items():
             factor = source.get(role, 1)
             candidate[sym] = factor if factor > 1 and extent % factor == 0 else 1
@@ -2690,6 +2676,127 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     index = len(groups)
     groups[view] = index
     return index
+
+
+def commit_divisions(
+    graph: GraphLowering,
+    allocation: Sequence[CoreDivisionBuffer],
+) -> None:
+    """Commit the solver's chosen symbol-keyed division for every buffer.
+
+    The solver optimizes a core division for all buffers, not just resident
+    ones: a resident producer and its consumers are pinned by
+    ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
+    slicing (so those commits are mutually consistent), while a spilled
+    buffer is free of that gate -- its accesses round-trip through HBM,
+    which re-slices on load -- so it takes its most parallel candidate.
+    Committing the spilled buffers' divisions too lets the joint solve
+    optimize work division across the whole graph, not only the LX-resident
+    region.
+    """
+    op_by_name = {op.name: op for op in graph.operations}
+    for buf in allocation:
+        op = op_by_name.get(buf.name)
+        if op is None or buf.chosen_division is None:
+            continue
+        cd = buf.core_divisions[buf.chosen_division]
+        if not hasattr(op, "iteration_space_ownership"):
+            # The guard (#4062) means "only refine a division the
+            # work-division pass established", and its real subjects are the
+            # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
+            # they carry no iteration space to own, and the solver leaves
+            # their splits empty, so both tests below skip them.
+            #
+            # An op ``CoarseTilingPass`` synthesises is a different case. It
+            # is created *after* the work-division pass, so it was never
+            # offered ownership -- not deliberately denied it -- yet the
+            # joint solve still enumerates candidates for it, gates it
+            # through ``cd_parent_matches`` against its producer, and picks
+            # a division consistent with that producer's. Skipping it here
+            # drops a decision the solve made: the copy stays undivided
+            # while its producer commits divided, and ``_post_solve``'s
+            # ownership check then rejects a pair the solver never made
+            # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
+            # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
+            # Mint ownership for it so the choice lands.
+            if not isinstance(op, ComputedBuffer) or not cd.splits:
+                continue
+        if not _split_option_is_legal(op, cd.splits):
+            raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+        commit_iteration_space_ownership(op, cd.splits)
+
+
+def commit_lx_views(
+    graph: GraphLowering,
+    allocation: Sequence[LifetimeBoundBuffer],
+    accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+    drained_readers: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Set ``lx_view``, the per-core view LX holds it under, on every resident
+    buffer of ``allocation``."""
+    # A solver-fired relayout source stays resident under ITS committed view
+    # while the consumer it feeds will read the shuffled copy under another.
+    # The judge runs on the pre-materialization graph, where that consumer
+    # still reads the source directly, so it reports the pair as a
+    # mismatch and withholds a view. The plan carries the source view the
+    # enumeration priced and the solver committed, so it is authoritative
+    # here - the same precedence the fixed-division allocator gives
+    # ``plan.source_view`` when it builds its buffers.
+    source_views = {
+        plan.source_name: plan.source_view for plan in accepted_lx_relayouts
+    }
+    # Likewise a drained carry's collective still reads the carry here; the
+    # push repoints it at the drain, so it does not constrain the carry.
+    _, reasons, views = get_ncores_for_buffers(graph, drained_readers=drained_readers)
+    for buffer in allocation:
+        # A relayout copy is not a graph buffer: materialize_lx_relayouts
+        # creates its destination, carrying the plan's view.
+        if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
+            continue
+        view = source_views.get(buffer.name) or views.get(buffer.name)
+        if view is None:
+            reason = reasons.get(buffer.name, "physical ownership was not accepted")
+            raise Unsupported(f"{buffer.name}: {reason}")
+        buffer.lx_view = view
+
+
+def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> None:
+    """Dump what the joint solve actually decided, per buffer.
+
+    The solve's own output is otherwise invisible: the spill log reports
+    residency but not the chosen division or tiling, and nothing reports
+    whether that choice survived ``commit_divisions`` -- which silently
+    skips any op lacking ``iteration_space_ownership``, i.e. every op
+    synthesised after the work-division pass ran. Pairing this against the
+    emitted ``OpSpec`` work slices is how a decided-but-discarded division
+    shows up.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    op_by_name = {op.name: op for op in graph.operations}
+    for buf in allocation:
+        divisions = getattr(buf, "core_divisions", None) or []
+        chosen = getattr(buf, "chosen_division", None)
+        cd = divisions[chosen] if chosen is not None and divisions else None
+        op = op_by_name.get(buf.name)
+        info = getattr(op, "loop_info", None)
+        group = getattr(info, "loop_group_id", None)
+        propagation = getattr(info, "propagation", None)
+        logger.debug(
+            "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+            "size=%s committed=%s",
+            buf.name,
+            group if group is not None else "-",
+            getattr(propagation, "kind", "-"),
+            getattr(info, "loop_count", "-"),
+            cd.label if cd is not None else "-",
+            cd.tiling.label if cd is not None else "-",
+            buf.address,
+            buf.size,
+            "yes"
+            if getattr(op, "iteration_space_ownership", None) is not None
+            else "NO(skipped)",
+        )
 
 
 class _DivisionMap(NamedTuple):
@@ -3121,74 +3228,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
-        self._commit_divisions(graph, allocation)
-        # A solver-fired relayout source stays resident under ITS committed view
-        # while the consumer it feeds will read the shuffled copy under another.
-        # The judge runs on the pre-materialization graph, where that consumer
-        # still reads the source directly, so it reports the pair as a
-        # mismatch and withholds a view. The plan carries the source view the
-        # enumeration priced and the solver committed, so it is authoritative
-        # here - the same precedence the fixed-division allocator gives
-        # ``plan.source_view`` when it builds its buffers.
-        source_views = {
-            plan.source_name: plan.source_view for plan in accepted_lx_relayouts
-        }
-        # Likewise a drained carry's collective still reads the carry here; the
-        # push repoints it at the drain, so it does not constrain the carry.
-        _, reasons, views = get_ncores_for_buffers(
-            graph, drained_readers=_drained_collectives(self._validated_drain_plans)
+        commit_divisions(graph, allocation)
+        commit_lx_views(
+            graph,
+            allocation,
+            accepted_lx_relayouts,
+            drained_readers=_drained_collectives(self._validated_drain_plans),
         )
-        for buffer in allocation:
-            # A relayout copy is not a graph buffer: materialize_lx_relayouts
-            # creates its destination, carrying the plan's view.
-            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
-                continue
-            view = source_views.get(buffer.name) or views.get(buffer.name)
-            if view is None:
-                reason = reasons.get(buffer.name, "physical ownership was not accepted")
-                raise Unsupported(f"{buffer.name}: {reason}")
-            buffer.lx_view = view
-        self._log_solver_decisions(graph, allocation)
-
-    def _log_solver_decisions(
-        self, graph: GraphLowering, allocation: Sequence[Any]
-    ) -> None:
-        """Dump what the joint solve actually decided, per buffer.
-
-        The solve's own output is otherwise invisible: the spill log reports
-        residency but not the chosen division or tiling, and nothing reports
-        whether that choice survived ``_commit_divisions`` -- which silently
-        skips any op lacking ``iteration_space_ownership``, i.e. every op
-        synthesised after the work-division pass ran. Pairing this against the
-        emitted ``OpSpec`` work slices is how a decided-but-discarded division
-        shows up.
-        """
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            divisions = getattr(buf, "core_divisions", None) or []
-            chosen = getattr(buf, "chosen_division", None)
-            cd = divisions[chosen] if chosen is not None and divisions else None
-            op = op_by_name.get(buf.name)
-            info = getattr(op, "loop_info", None)
-            group = getattr(info, "loop_group_id", None)
-            propagation = getattr(info, "propagation", None)
-            logger.debug(
-                "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
-                "size=%s committed=%s",
-                buf.name,
-                group if group is not None else "-",
-                getattr(propagation, "kind", "-"),
-                getattr(info, "loop_count", "-"),
-                cd.label if cd is not None else "-",
-                cd.tiling.label if cd is not None else "-",
-                buf.address,
-                buf.size,
-                "yes"
-                if getattr(op, "iteration_space_ownership", None) is not None
-                else "NO(skipped)",
-            )
+        log_solver_decisions(graph, allocation)
 
     def _materialize_selection(
         self,
@@ -3265,16 +3312,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 choices[op.get_operation_name()] = cd.tiling
         return choices
 
-    def _get_spill_reasons(
-        self,
-        solver: MemoryPlanSolver,
-        allocation: Sequence[LifetimeBoundBuffer],
-    ) -> dict:
+    def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
-        # allocators. Both CoreDivisionLayoutSolver implementations expose it.
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        return solver.spill_reasons
+        # allocators.
+        return {
+            b.name: b.spill_reason for b in allocation if b.spill_reason is not None
+        }
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
@@ -3288,17 +3332,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         gated per buffer (``_residency_by_buf``) and by the solver, so ineligible
         ops still participate as producers/consumers in the match.
 
-        Exception: ops data-connected to a sliced in-place mutation (a constant-
-        offset write, e.g. ``x[:, 32:96] = ...``) are pinned to their upstream
-        (fixed) division. Re-slicing any op fused into the offset write's SDSC
-        makes the deeptools scheduler reject it (``DtException: "There must be at
-        least one valid candidate"``), the root cause of the
-        ``slice_stick_mutation_*`` failures. Keeping the fixed division there
-        matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization when that division also satisfies hard
-        work-division constraints. Otherwise LX planning raises ``Unsupported``
-        rather than committing an illegal division. See
-        ``utils.ops_in_offset_mutation_component``.
+        Constant-offset writes, their storage aliases and their forward
+        dependency closure keep their committed division. This protects offset
+        address arithmetic even in HBM, where residency edges do not constrain
+        division choices. Upstream producers remain free to optimize. See
+        ``utils.ops_in_offset_mutation_component``. As with every fixed pin,
+        an illegal committed division raises ``Unsupported`` rather than
+        bypassing hard work-division constraints.
 
         Whatever the path, every candidate returned is within the ``sencores`` budget
         -- asserted here because nothing downstream re-checks it (issue #4387).
@@ -3348,7 +3388,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
             elif op.name in offset_mutation_ops:
-                reason = "offset mutation component"
+                reason = "offset mutation forward closure"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
             elif op.name in layout_group_reason:
@@ -3564,54 +3604,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # solve can never choose a tiling that reintroduces the very span
         # violation coarse tiling exists to prevent, and abort when none fit.
         return _drop_read_distance_violations(op, options, max_cores)
-
-    def _commit_divisions(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-    ) -> None:
-        """Commit the solver's chosen symbol-keyed division for every buffer.
-
-        The solver optimizes a core division for all buffers, not just resident
-        ones: a resident producer and its consumers are pinned by
-        ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
-        slicing (so those commits are mutually consistent), while a spilled
-        buffer is free of that gate -- its accesses round-trip through HBM,
-        which re-slices on load -- so it takes its most parallel candidate.
-        Committing the spilled buffers' divisions too lets the joint solve
-        optimize work division across the whole graph, not only the LX-resident
-        region.
-        """
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            op = op_by_name.get(buf.name)
-            if op is None or buf.chosen_division is None:
-                continue
-            cd = buf.core_divisions[buf.chosen_division]
-            if not hasattr(op, "iteration_space_ownership"):
-                # The guard (#4062) means "only refine a division the
-                # work-division pass established", and its real subjects are the
-                # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
-                # they carry no iteration space to own, and the solver leaves
-                # their splits empty, so both tests below skip them.
-                #
-                # An op ``CoarseTilingPass`` synthesises is a different case. It
-                # is created *after* the work-division pass, so it was never
-                # offered ownership -- not deliberately denied it -- yet the
-                # joint solve still enumerates candidates for it, gates it
-                # through ``cd_parent_matches`` against its producer, and picks
-                # a division consistent with that producer's. Skipping it here
-                # drops a decision the solve made: the copy stays undivided
-                # while its producer commits divided, and ``_post_solve``'s
-                # ownership check then rejects a pair the solver never made
-                # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
-                # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
-                # Mint ownership for it so the choice lands.
-                if not isinstance(op, ComputedBuffer) or not cd.splits:
-                    continue
-            if not _split_option_is_legal(op, cd.splits):
-                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commit_iteration_space_ownership(op, cd.splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -4720,7 +4712,11 @@ def _make_cpsat_solver(
 
         return CpSatLayoutSolver(buffers, size)
     except ImportError as exc:
-        logger.warning(
+        # Once per process: this factory runs for every allocation, so a missing
+        # ortools otherwise repeats the same warning millions of times.
+        warn_once(
+            logger,
+            "cpsat_unavailable",
             "cpsat layout solver unavailable (%s); falling back to the "
             "default greedy allocator.",
             exc,

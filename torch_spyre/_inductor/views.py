@@ -352,7 +352,7 @@ def compute_coordinates(
                 coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
-    offset = index.xreplace({v: 0 for v in vars})
+    offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
@@ -610,7 +610,7 @@ def normalize_coordinates(
                 )
 
             # extract term for each var
-            term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
+            term = expr.xreplace(dict.fromkeys(vars - {var}, 0)) - offset
             dim_terms.append(Term.from_coordinate(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)

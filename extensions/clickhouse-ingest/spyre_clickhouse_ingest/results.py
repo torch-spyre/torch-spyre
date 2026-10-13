@@ -47,6 +47,7 @@ from pathlib import Path
 # Aliased to `schema_model` so the call sites below read unchanged.
 from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
+    error_case_names,
     extract_properties,
     get_client,
     insert_artifact_result,
@@ -949,10 +950,18 @@ def parse_test_xml(xml_path: Path):
 
     # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
     # and the earlier attempts are kept only as its result.reruns count.
+    testcases = suite.findall(".//testcase")
+    names = error_case_names(
+        (
+            (tc.get("classname", ""), tc.get("name", ""), classify_testcase(tc)[0])
+            for tc in testcases
+        ),
+        xml_path.stem,
+    )
     by_key: dict = {}
     seen: Counter = Counter()
-    for tc in suite.findall(".//testcase"):
-        key = (tc.get("classname", ""), tc.get("name", ""))
+    for tc, name in zip(testcases, names):
+        key = (tc.get("classname", ""), name)
         by_key[key] = tc
         seen[key] += 1
     raw_cases = []
@@ -961,14 +970,12 @@ def parse_test_xml(xml_path: Path):
         properties = extract_properties(tc)
         if seen[key] > 1:
             properties = [*properties, ("result.reruns", str(seen[key] - 1))]
-        op_name, dtype, platform = extract_op_dtype_platform(
-            tc.get("name", ""), properties
-        )
+        op_name, dtype, platform = extract_op_dtype_platform(key[1], properties)
         raw_cases.append(
             {
                 "case_id": str(uuid.uuid4()),
-                "classname": tc.get("classname", ""),
-                "name": tc.get("name", ""),
+                "classname": key[0],
+                "name": key[1],
                 "op_name": op_name,
                 "dtype": dtype,
                 "platform": platform,
@@ -1262,6 +1269,47 @@ def _leg_state(failed: int, total: int) -> str:
     return "failed" if failed > 0 else "passed"
 
 
+def _leg_failure(state: str, acc: dict, result_props: dict) -> dict:
+    """The failure_* props the cases themselves explain, ranked as a default (confidence 1) so a
+    later collector's reason still wins. Any caller-given failure_* replaces all of them."""
+    if any(k.startswith("failure_") for k in result_props):
+        return {}
+    if state == "failed":
+        first = acc.get("first_failure", "")
+        return {
+            "failure_reason": "test_failure",
+            "failure_detail": f"{acc['failed']} of {acc['total']} failed"
+            + (f": {first}" if first else ""),
+            "failure_confidence": "1",
+        }
+    if state == "error":
+        return {
+            "failure_reason": "ingest_error",
+            "failure_subreason": "no_cases",
+            "failure_detail": "the leg reported no test cases",
+            "failure_confidence": "1",
+        }
+    return {}
+
+
+def _first_failure(acc: dict, cases: list) -> None:
+    """Remember the leg's first failing case, as `name: first message line`; a capability case
+    is named by its capability.name. Nothing is stored for a case that names nothing."""
+    if acc.get("first_failure"):
+        return
+    for case in cases:
+        if case.get("status") not in ("failed", "error"):
+            continue
+        name = case.get("name") or dict(case.get("properties") or []).get(
+            "capability.name", ""
+        )
+        line = (case.get("fail_message") or "").strip().splitlines()
+        text = name + (f": {line[0]}" if line else "")
+        if text:
+            acc["first_failure"] = text
+            return
+
+
 def _opt(args, name: str):
     """An optional flag's value; '' when the caller built `args` without it (tests do)."""
     return getattr(args, name, "") or ""
@@ -1413,7 +1461,12 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
             state=state,
             arch=args.arch,
             duration_s=acc["duration_s"],
-            props={**result_props, "run_url": run_url, "source": source},
+            props={
+                **_leg_failure(state, acc, result_props),
+                **result_props,
+                "run_url": run_url,
+                "source": source,
+            },
             attempt=getattr(args, "run_attempt", 0),
         ):
             print(
@@ -1917,6 +1970,7 @@ def main(argv=None):
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _first_failure(_acc, cases)
                         _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
