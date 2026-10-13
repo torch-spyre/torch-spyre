@@ -6548,13 +6548,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
                 ),
                 # C == 1 (single-channel depthwise), strided.  The activation's
-                # channel axis is size 1, so its device stick is degenerate and
-                # its stick coordinate collapses to the constant 0.  A constant
-                # cannot identify an output dim (matching_dim requires exactly one
-                # free symbol), so the out-channel scan in
-                # _depthwise_conv_layouts finds no candidate and the op used to
-                # raise "no supported output layout" even though the canonical
-                # layout is representable.  Guards the canonical-order fallback.
+                # channel axis is size 1, so its device stick is degenerate (stick
+                # stride -1) and its stick coordinate collapses to the constant 0.
+                # Covers layout propagation when no output dim can be matched to
+                # the stick from the activation's coordinates.
                 "8x1_ksize3_stride2": (
                     cached_randn((8, 1, 128, 128)),
                     cached_randn((1, 1, 3, 3)),
@@ -6740,7 +6737,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_dwise_conv1d", "test_dwise_conv1d_cpu"): {
-            "expect_fail": ["8x64_ksize3_pad1"],
+            # Non-zero padding is rejected on the direct depthwise path, as for
+            # test_dwise_conv2d (a depthwise conv1d lowers through the same
+            # spyre.conv2d).
+            "expect_raise": {
+                "8x64_ksize3_pad1": "Depthwise conv2d currently only supports zero padding"
+            },
             "param_sets": {
                 "1x64_ksize3": (
                     cached_randn((1, 64, 32)),
@@ -6762,8 +6764,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 1, 8, 64], [3, 1, 1, 64]],
                     [[1, -1, 8192, 128], [1, -1, 3, 3]],
                 ),
-                # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
-                # the expect_fail note above.  The layouts are inherited from the
+                # Same shape/layouts as 8x64_ksize3, padding=1: rejected, see
+                # the expect_raise note above.  The layouts are inherited from the
                 # zero-padding case, which passes with them.
                 "8x64_ksize3_pad1": (
                     cached_randn((8, 64, 128)),
@@ -6850,9 +6852,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Params are standard NCHW (x, weight[C_out,C_in,kH,kW], bias, stride);
         # the test builds the channel-last device tensors and toggles the flag.
         ("test_conv2d_direct", "test_conv2d_direct_base"): {
-            ## strides 2 and above have numerical errors when the images are 1-d,
-            ## so xfailing related tests until the issue gets fixed
-            "expect_fail": ["1x64x13x1_k3x1_s2", "1x64x17x1_k3x1_s2"],
             "param_sets": {
                 # 2x2 kernel, zero padding -- smallest direct-lowered window.
                 "1x64x8x8_k2": (
@@ -6929,7 +6928,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (2, 2),
                 ),
-                "1x64x13x1_k3x1_s2": (
+                "1x64x1x13_k1x3_s2": (
                     cached_randn((1, 64, 1, 13)),
                     cached_randn((64, 64, 1, 3)),
                     None,
@@ -6941,7 +6940,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (2, 2),
                 ),
-                "1x64x17x1_k3x1_s2": (
+                "1x64x1x17_k1x3_s2": (
                     cached_randn((1, 64, 1, 17)),
                     cached_randn((64, 64, 1, 3)),
                     None,
@@ -10240,6 +10239,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 x, weight, bias, stride=stride, padding=padding, groups=groups
             )
 
+        # Reference accumulated in fp32, as in test_conv2d_cpu: CPU fp16
+        # torch.conv1d is lossy on the 1x6x128_patch16_bias case (fp16 vs fp32
+        # max|d| ~= 40), while the device matches fp32 (max|d| ~= 0.08, 0/512
+        # over atol). For the small-K cases fp32 and fp16 agree.
+        bias_f = bias.float() if bias is not None else None
+        ref = torch.conv1d(
+            x.float(),
+            weight.float(),
+            bias_f,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+        )
+
         self.compare_with_cpu(
             fn,
             x,
@@ -10250,6 +10263,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+            dlfloat16_reference=ref,
         )
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
