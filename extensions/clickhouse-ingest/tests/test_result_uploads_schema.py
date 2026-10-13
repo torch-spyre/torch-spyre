@@ -145,3 +145,47 @@ def test_a_retracted_upload_leaves_the_benchmark_coverage_and_case_views():
         "1,1"
     ]
     assert one("SELECT sum(runs) FROM v_case_trend") == ["1"]
+
+
+def test_a_retracted_upload_leaves_the_capability_views():
+    session = pytest.importorskip("chdb.session")
+
+    s = session.Session()
+    for name in (
+        "20-artifacts.sql",
+        "46-capabilities.sql",
+        "49-result-uploads.sql",
+        "61-capability-views.sql",
+    ):
+        for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
+            s.query(stmt)
+    upload = _upload(format="junit", result_kind="capability", test_type="model_ops")
+    for state in ("published", "retracted"):
+        s.query(
+            "INSERT INTO result_uploads FORMAT JSONEachRow\n"
+            + json.dumps({**upload, "state": state})
+        )
+    cap = "ca9a0000-0000-5000-8000-000000000001"
+    s.query(
+        "INSERT INTO capabilities (capability_id, component, test_type, subject, name) "
+        f"VALUES ('{cap}', 'torch-spyre', 'model_ops', 'some-model', 'torch.add')"
+    )
+    for rid in (RUN, CI_RUN):
+        s.query(
+            "INSERT INTO capability_runs (run_id, capability_id, component, test_type, arch, status, backend) "
+            f"VALUES ('{rid}', '{cap}', 'torch-spyre', 'model_ops', 'x86_64', 'passed', 'spyre')"
+        )
+    got = (
+        s.query("SELECT DISTINCT toString(run_id) FROM v_capability_results", "CSV")
+        .data()
+        .split()
+    )
+    assert got == [f'"{CI_RUN}"']
+    got = (
+        s.query(
+            "SELECT DISTINCT toString(run_id) FROM v_capability_run_counters", "CSV"
+        )
+        .data()
+        .split()
+    )
+    assert got == [f'"{CI_RUN}"']
