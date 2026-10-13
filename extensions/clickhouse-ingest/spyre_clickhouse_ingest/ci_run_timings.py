@@ -52,6 +52,8 @@ BATCH_KEYS = {
         "preset",
         "build_mode",
         "trigger_pr",
+        "repo",
+        "pr_number",
         "pr_components",
         "sha",
         "base_ref",
@@ -172,6 +174,10 @@ def entry_state(entry: str, e: Mapping[str, Any]) -> str:
 def _run_fields(run: Mapping[str, Any]) -> dict[str, Any]:
     trigger_pr = _text(run.get("trigger_pr"))
     repo, pr_number = split_trigger_pr(trigger_pr)
+    # A non-PR run can still name them: a main push gives the pushed repo and the PR it merged.
+    repo = repo or _text(run.get("repo"))
+    pr_given = _text(run.get("pr_number"))
+    pr_number = pr_number or (int(pr_given) if pr_given.isdigit() else 0)
     return {
         "run_key": _text(run["run_key"]),
         **{k: _text(run.get(k)) for k in RUN_TEXT},

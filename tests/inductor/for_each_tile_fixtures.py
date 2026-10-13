@@ -1366,3 +1366,170 @@ def consumed_row_fn(table: torch.Tensor) -> torch.Tensor:
     acc0 = torch.zeros_like(table[0])
     final, _ = for_each_tile(body, (table,), dims=(0,), tile_size=1, init=acc0)
     return final
+
+
+# ---------------------------------------------------------------------------
+# Graph-shape fixtures: for_each_tile bodies that interact with other passes
+# (restickify, views, broadcast, outside consumers, E-tiled matmul, carried
+# reductions).  Each *_fn returns the compiled result; each *_reference
+# computes the CPU expectation from the same fp16 operands.
+# ---------------------------------------------------------------------------
+
+
+def shaped_randn(*shape: int, seed: int = 0) -> torch.Tensor:
+    """Deterministic fp16 CPU tensor, independent of global RNG state."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(*shape, generator=gen).to(torch.float16)
+
+
+def add_3d_tiled_fn(
+    A: torch.Tensor, B: torch.Tensor, dim: int, tile_size: int
+) -> torch.Tensor:
+    """Map mode: tile a plain 3-D add along ``dim`` (outer or middle)."""
+
+    def body(_, ops):
+        a_tile, b_tile = ops
+        return None, a_tile + b_tile
+
+    _, out = for_each_tile(
+        body, (A, B), dims=(dim, dim), tile_size=tile_size, out_dim=dim
+    )
+    return out
+
+
+def restickify_add_fn(A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """a.t() + x, tiled on the result's dim 0 (= a's dim 1): a restickify per tile."""
+
+    def body(_, ops):
+        a_tile, x_tile = ops
+        return None, a_tile.t() + x_tile
+
+    _, out = for_each_tile(body, (A, X), dims=(1, 0), tile_size=64, out_dim=0)
+    return out
+
+
+def restickify_transpose12_fn(A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """a.transpose(1, 2) + x, tiled on the result's dim 1 (= a's dim 2)."""
+
+    def body(_, ops):
+        a_tile, x_tile = ops
+        return None, a_tile.transpose(1, 2) + x_tile
+
+    _, out = for_each_tile(body, (A, X), dims=(2, 1), tile_size=32, out_dim=1)
+    return out
+
+
+def restickify_matmul_xt_y_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x.t() @ y, tiled on the result's M (= x's dim 1); y is invariant."""
+
+    def body(_, ops):
+        x_tile, y_whole = ops
+        return None, x_tile.t() @ y_whole
+
+    _, out = for_each_tile(body, (X, Y), dims=(1, None), tile_size=64, out_dim=0)
+    return out
+
+
+def outside_consumer_fn(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+) -> torch.Tensor:
+    """A tiled add whose full result is consumed by ops AFTER the loop."""
+
+    def body(_, ops):
+        a_tile, b_tile = ops
+        return None, a_tile + b_tile
+
+    _, z = for_each_tile(body, (A, B), dims=(0, 0), tile_size=64, out_dim=0)
+    return z * 2.0 + C
+
+
+def view_transpose_head_tiled_fn(
+    X: torch.Tensor, Y: torch.Tensor, heads: int, head_dim: int
+) -> torch.Tensor:
+    """x.view(B, S, H, D).transpose(1, 2) * y, tiled over H (two heads per tile)."""
+    batch, seq, _ = X.shape
+    x_bhsd = X.view(batch, seq, heads, head_dim).transpose(1, 2)
+
+    def body(_, ops):
+        x_tile, y_tile = ops
+        return None, x_tile * y_tile
+
+    _, out = for_each_tile(body, (x_bhsd, Y), dims=(1, 1), tile_size=2, out_dim=1)
+    return out
+
+
+def view_transpose_head_tiled_reference(
+    X: torch.Tensor, Y: torch.Tensor, heads: int, head_dim: int
+) -> torch.Tensor:
+    batch, seq, _ = X.shape
+    return X.view(batch, seq, heads, head_dim).transpose(1, 2) * Y
+
+
+def unsqueeze_broadcast_tiled_fn(
+    A: torch.Tensor, B: torch.Tensor, tile_b: bool
+) -> torch.Tensor:
+    """a.unsqueeze(0) * b: tile b's leading dim (a invariant) or the shared dim 1."""
+    a_unsq = A.unsqueeze(0)
+
+    def body(_, ops):
+        a_op, b_tile = ops
+        return None, a_op * b_tile
+
+    if tile_b:
+        _, out = for_each_tile(
+            body, (a_unsq, B), dims=(None, 0), tile_size=2, out_dim=0
+        )
+    else:
+        _, out = for_each_tile(body, (a_unsq, B), dims=(1, 1), tile_size=64, out_dim=1)
+    return out
+
+
+def unsqueeze_broadcast_reference(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    return A.unsqueeze(0) * B
+
+
+def moe_tile_experts_fn(X: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    """[1, T, H] @ [E, H, F] -> [E, T, F], one expert's weights per trip."""
+
+    def body(_, ops):
+        x_whole, w_tile = ops
+        return None, x_whole @ w_tile
+
+    _, out = for_each_tile(body, (X, W), dims=(None, 0), tile_size=1, out_dim=0)
+    return out
+
+
+def carried_reduction_fn(
+    values: torch.Tensor, combine: Callable, init_value: float
+) -> torch.Tensor:
+    """Reduce ``values`` over its dim 0 one slab per trip, through a carry."""
+
+    def body(acc, ops):
+        (slab,) = ops
+        return combine(acc, slab), None
+
+    init = torch.full(
+        values.shape[1:], init_value, device=values.device, dtype=values.dtype
+    )
+    final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
+    return final
+
+
+def nested_restickify_add_fn(A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """a.t() + x tiled at two levels: the outer loop tiles the result's rows
+    (a's dim 1), the inner loop its columns (a's dim 0); a restickify per tile."""
+
+    def outer_body(_, outer_ops):
+        a_cols, x_rows = outer_ops
+
+        def inner_body(_, inner_ops):
+            a_blk, x_blk = inner_ops
+            return None, a_blk.t() + x_blk
+
+        _, row_out = for_each_tile(
+            inner_body, (a_cols, x_rows), dims=(0, 1), tile_size=128, out_dim=1
+        )
+        return None, row_out
+
+    _, out = for_each_tile(outer_body, (A, X), dims=(1, 0), tile_size=64, out_dim=0)
+    return out

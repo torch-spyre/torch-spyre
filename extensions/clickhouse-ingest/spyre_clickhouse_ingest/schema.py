@@ -38,6 +38,27 @@ TEST_TYPE_VALUES = (
     | CAPABILITY_TYPE_VALUES
 )
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
+# artifact_result_reasons.failure_reason, and props['failure_reason'] on a non-passing verdict:
+# spyre-frameworks' diagnose_failure.py categories plus the outcomes a log cannot show.
+FAILURE_REASON_VALUES = frozenset(
+    {
+        "test_failure",
+        "build_error",
+        "infra_disk",
+        "infra_network",
+        "infra_auth",
+        "infra_capacity",
+        "infra_hardware",
+        "infra_timeout",
+        "infra_env",
+        "superseded",
+        "aborted",
+        "dependency_failed",
+        "pipeline_error",
+        "ingest_error",
+        "unknown",
+    }
+)
 # capability_runs.status: not_implemented is unsupported, not a skipped test; undetermined is a
 # test that broke before giving a verdict.
 CAPABILITY_STATUS_VALUES = frozenset(
@@ -61,6 +82,13 @@ TIMING_STATE_VALUES = {
 TIMING_EXECUTOR_VALUES = frozenset(
     {"gha-ephemeral", "gha-standing", "jenkins-local", "jenkins-job", ""}
 )
+TARGET_TYPE_VALUES = frozenset({"jenkins", "gha_dispatch", "webhook"})
+EVENT_TYPE_VALUES = frozenset(
+    {"artifact.tagged", "artifact.recorded", "artifact.promoted", "results.recorded"}
+)
+DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
+REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
@@ -482,6 +510,48 @@ class ArtifactResults(Table):
     Row = ArtifactResultRow
 
 
+class ArtifactResultReasonRow(TypedDict):
+    artifact_id: str
+    run_id: str
+    result_kind: str
+    test_type: str
+    failure_reason: str
+    failure_subreason: str
+    failure_detail: str
+    failure_log_url: str
+    failure_wait_s: int
+    confidence: int
+    source: str
+    props: dict[str, str]
+
+
+class ArtifactResultReasons(Table):
+    """Why a verdict did not pass, written after the verdict itself; one row per source."""
+
+    name = "artifact_result_reasons"
+    columns = (
+        "artifact_id",
+        "run_id",
+        "result_kind",
+        "test_type",
+        "failure_reason",
+        "failure_subreason",
+        "failure_detail",
+        "failure_log_url",
+        "failure_wait_s",
+        "confidence",
+        "source",
+        "props",
+    )
+    required = ("source",)
+    enums = (
+        ("result_kind", RESULT_KIND_VALUES),
+        ("test_type", TEST_TYPE_VALUES),
+        ("failure_reason", FAILURE_REASON_VALUES),
+    )
+    Row = ArtifactResultReasonRow
+
+
 class PipelineRuns(Table):
     """One CI execution (Jenkins build or GHA run attempt / job), upserted start -> end.
 
@@ -630,6 +700,103 @@ class CiRunTimings(Table):
         return ordered
 
 
+class ArtifactSubscriptions(Table):
+    """Who an artifact triggers; one row per version, the newest updated_at wins."""
+
+    name = "artifact_subscriptions"
+    columns = (
+        "subscription_id",
+        "updated_at",
+        "enabled",
+        "event_types",
+        "tag_family",
+        "tag_pattern",
+        "tag_props",
+        "exclude_families",
+        "exclude_tag_patterns",
+        "result_test_types",
+        "result_states",
+        "component",
+        "arch",
+        "kind",
+        "artifact_name",
+        "not_before",
+        "require",
+        "unless_exists",
+        "max_per_hour",
+        "max_per_day",
+        "coalesce_minutes",
+        "target_type",
+        "target",
+        "params",
+        "payload_fields",
+        "credential_id",
+        "owner",
+        "notes",
+        "props",
+    )
+    required = ("subscription_id", "target")
+    enums = (("target_type", TARGET_TYPE_VALUES),)
+
+
+class DispatchRequests(Table):
+    """A person's or pipeline's "run this subscription against this artifact"."""
+
+    name = "dispatch_requests"
+    columns = (
+        "request_id",
+        "requested_at",
+        "subscription_id",
+        "artifact_id",
+        "tag",
+        "requested_by",
+        "requester",
+        "params",
+        "reason",
+        "props",
+    )
+    required = ("request_id", "subscription_id", "artifact_id")
+    enums = (("requested_by", REQUESTED_BY_VALUES),)
+
+
+class ArtifactDispatches(Table):
+    """One dispatch, upserted on every state change; written only by the dispatcher."""
+
+    name = "artifact_dispatches"
+    columns = (
+        "dispatch_id",
+        "updated_at",
+        "subscription_id",
+        "artifact_id",
+        "event_type",
+        "event_key",
+        "tag",
+        "event_ts",
+        "requested_by",
+        "requester",
+        "request_id",
+        "requested_at",
+        "state",
+        "target_type",
+        "target",
+        "params",
+        "payload",
+        "target_url",
+        "build_url",
+        "error",
+        "attempts",
+        "next_attempt_at",
+        "dispatcher_url",
+        "props",
+    )
+    required = ("dispatch_id", "subscription_id", "artifact_id")
+    enums = (
+        ("requested_by", DISPATCHED_BY_VALUES),
+        ("state", DISPATCH_STATE_VALUES),
+        ("target_type", TARGET_TYPE_VALUES | {""}),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -641,8 +808,12 @@ ARTIFACTS = Artifacts
 ARTIFACT_REFS = ArtifactRefs
 ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
+ARTIFACT_RESULT_REASONS = ArtifactResultReasons
 PIPELINE_RUNS = PipelineRuns
 CI_RUN_TIMINGS = CiRunTimings
+ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+DISPATCH_REQUESTS = DispatchRequests
+ARTIFACT_DISPATCHES = ArtifactDispatches
 
 TABLES = {
     t.name: t
@@ -655,10 +826,14 @@ TABLES = {
         ArtifactRefs,
         ArtifactTags,
         ArtifactResults,
+        ArtifactResultReasons,
         Capabilities,
         CapabilityRuns,
         PipelineRuns,
         CiRunTimings,
+        ArtifactSubscriptions,
+        DispatchRequests,
+        ArtifactDispatches,
     )
 }
 

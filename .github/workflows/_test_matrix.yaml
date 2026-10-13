@@ -410,6 +410,20 @@ jobs:
           path: run-id.txt
           retention-days: 14
 
+      # The tier the ingest records and hashes into run_id. Only the integration-tests run-name
+      # carries it; every other caller's display_title is a PR title or commit subject.
+      - name: Record suite tier for the ingest
+        env:
+          RESOLVED_TEST_TYPE: ${{ steps.filter.outputs.resolved_test_type }}
+        run: printf '%s' "${RESOLVED_TEST_TYPE}" > test-type.txt
+      - name: Upload suite tier
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-type
+          path: test-type.txt
+          retention-days: 14
+          overwrite: true
+
   # ---------------------------------------------------------------------------
   # Job 0a: derive THIS LEG'S artifact identity
   #

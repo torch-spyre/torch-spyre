@@ -79,6 +79,7 @@ from .insert_restickify import (
     RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
+from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
@@ -494,7 +495,10 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                             )
 
     # Phase 2: performance transforms (matmul perf reorder).
-    seen_p2: set[str] = set()
+    # For each matmul op, reorder its non-graph-input input buffers so they
+    # read a wider contiguous region.  Optionally (SPYRE_NDO_MATMUL_OUTPUT_REORDER)
+    # also reorder the matmul's own output buffer with the same heuristic.
+    already_reordered: set[str] = set()
     for op in reversed(graph.operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -505,18 +509,21 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             and op.data.reduction_type in MATMUL_REDUCTION_OPS
         ):
             continue
-        for dep in op.get_read_writes().reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            if dep.name in graph_inputs:
-                continue
-            buf = V.graph.get_buffer(dep.name)
-            if not isinstance(buf, ComputedBuffer):
-                continue
+        input_bufs = [
+            V.graph.get_buffer(dep.name)
+            for dep in op.get_read_writes().reads
+            if isinstance(dep, MemoryDep)
+            and dep.name not in graph_inputs
+            and isinstance(V.graph.get_buffer(dep.name), ComputedBuffer)
+        ]
+        bufs_to_reorder = list(input_bufs)
+        if config.ndo_matmul_output_reorder:
+            bufs_to_reorder.append(op)
+        for buf in bufs_to_reorder:
             name = buf.get_name()
-            if name in seen_p2:
+            if name in already_reordered:
                 continue
-            seen_p2.add(name)
+            already_reordered.add(name)
             pinned = pinned_dims.get(name, set())
             reordered_stl = _try_matmul_perf_reorder(buf, pinned)
             if reordered_stl is not None:

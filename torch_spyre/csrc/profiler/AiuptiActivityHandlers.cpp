@@ -90,6 +90,21 @@ inline std::string handleToHexString(ze_handle_type handle) {
   return fmt::format("0x{:016x}", reinterpret_cast<uintptr_t>(handle));
 }
 
+// Raw device timestamps TS1..TS5 as a compact JSON array.
+template <class activity_type>
+inline std::string cyclesTsJson(const activity_type* activity) {
+  return fmt::format("[{},{},{},{},{}]", activity->cycles_ts1,
+                     activity->cycles_ts2, activity->cycles_ts3,
+                     activity->cycles_ts4, activity->cycles_ts5);
+}
+
+template <class activity_type>
+inline bool hasCyclesTs(const activity_type* activity) {
+  return activity->cycles_ts1 != 0 || activity->cycles_ts2 != 0 ||
+         activity->cycles_ts3 != 0 || activity->cycles_ts4 != 0 ||
+         activity->cycles_ts5 != 0;
+}
+
 inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
   switch (cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INVALID:
@@ -254,6 +269,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsBenchAllreduce";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
       return "aiuSubmitToHardware";
+    case AIUPTI_RUNTIME_TRACE_CBID_FLEX_ROUNDTRIP:
+      return "flexRoundTrip";
     case AIUPTI_RUNTIME_TRACE_CBID_AIU_ROUNDTRIP:
       return "aiuRoundtrip";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
@@ -364,6 +381,9 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                                    nlohmann::json(*ids).dump());
     }
   }
+  // Compute records always carry counters, so emit unconditionally: an
+  // all-zero array here signals a counter failure rather than absence.
+  kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
 
@@ -478,6 +498,14 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  // AIUpti_ActivityMemcpy does not say whether the record came from a
+  // command buffer (real counters) or a standalone flex MEMCPY (always 0;
+  // today flex reports every DMA this way), so omit the key when all slots
+  // are 0. Gate on record kind instead once libaiupti marks which records
+  // carry counters.
+  if (hasCyclesTs(activity)) {
+    memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  }
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,

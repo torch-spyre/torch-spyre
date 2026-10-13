@@ -197,9 +197,24 @@ row-identity uuid5s, though it hosts its own `v2_artifact_id()` used as a CLI
 helper to stamp an image label, not to write ClickHouse rows.
 
 No `capabilities`/`capability_runs` table exists in
-`pipelines/clickhouse/*.sql` — that table pair is torch-spyre/GHA-side only
-(see [classes.md](classes.md#schemapy)); Jenkins does not currently write
-capability rows.
+`pipelines/clickhouse/*.sql` (see [classes.md](classes.md#schemapy)). A
+Jenkins test leg reaches `capability_runs` only through the product ingest
+that `pushJUnitXml` runs, which routes JUnit `capability.*` properties there.
+
+### The v2 steps: `v2Artifact`, `v2Results`
+
+Pipelines outside the orchestrator (supply chain, tech preview, release,
+SVT/FVT) record in `spyre_v2` through two steps over this package's CLI:
+
+| Step | Runs | Returns |
+|---|---|---|
+| `v2Artifact(spec:, arch:, tagFamily:, ...)` | `artifacts ensure` | the resolution as a Map (`artifact_id`, `source`, `tag`, ...) |
+| `v2Results(xmlDir:, component:, arch:, triggerType:, artifact:, ...)` | `results --schema v2 --strict` | true when the verdicts were recorded |
+
+Both are best-effort by default (a WARN, then `[:]` / false) and fail the
+build with `strict: true`; both skip when the folder sets no v2 database.
+Every option, the hand-off to SVT/FVT and the verification queries are in
+spyre-frameworks' `docs/v2-artifact-recording.md`.
 
 ### ci_run_timings
 

@@ -118,6 +118,28 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
+loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
+`1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).
+Invalid values raise an error.
+
+Python callers can override the resolved setting during compilation:
+
+```python
+from torch_spyre._inductor import config
+
+with config.patch(backend_loop_unroll=False):
+    result = compiled_model(inputs)  # First call triggers compilation.
+```
+
+The resolved boolean is included in the kernel cache key and passed explicitly
+to each compile worker as `dbo-opt --enable-loop-unroll=0` or `1`. Equivalent
+environment spellings share a cache key; changing the effective setting cannot
+reuse an artifact compiled with the other setting. This controls the SDSC-bundle
+frontend only, not the direct `--from-ktir` path or every loop optimization.
+Preserving device loops requires autopilot; Deeptools rejects disabling unrolling
+with `DT_OPT=autopilot=0`.
+
 For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable
 softmax over its complete K/V range. Only a scan over multiple K/V blocks
@@ -127,12 +149,12 @@ The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
 a plan only if its resident floor fits in LX: the two co-live score tiles
 (the QK^T output and its exponentials), plus the scaled query, output carry,
 and per-block P@V for a multi-block scan. A spilled score costs far more than
-its HBM bytes, so such plans are rejected rather than priced. It also rejects
-plans the compiler cannot build: more than two nested maps, or more than 1024
-unrolled tile iterations (the backend unrolls every loop). If those limits
-leave no plan whose floor fits, it takes the buildable plan that spills the
-fewest score tiles; coarse tiling remains only for shapes with no buildable
-plan. Overflow above the floor is not charged: across the measured plans it
+its HBM bytes, so such plans are rejected rather than priced. The selector also
+limits compilation to two nested maps and 1024 tile iterations, guarding against
+excessive default loop unrolling. If those limits leave no plan whose floor fits,
+it takes the buildable plan that spills the fewest score tiles; coarse tiling
+remains only for shapes with no buildable plan. Overflow above the floor is not
+charged: across the measured plans it
 had no measurable cost. The admitted plans are ranked by predicted device time
 from four measured terms: a fixed cost per outer map tile, an extra cost per
 tile when the plan splits query rows, the query-shaped carry each K/V scan

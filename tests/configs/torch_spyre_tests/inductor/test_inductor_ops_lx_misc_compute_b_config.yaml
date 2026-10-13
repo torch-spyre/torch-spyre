@@ -44,10 +44,6 @@ test_suite_config:
             - LxPlanning.*::test_uniform_custom_range_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_core_reduction_invalid_dims_api.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_core_reduction_invalid_dims_spyre.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_single_dim_reduction_invalid_dims_api.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_single_dim_reduction_invalid_dims_spyre.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success

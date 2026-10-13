@@ -80,7 +80,7 @@ on:
       test_type:
         description: >-
           Suite subset to run: smoke | unit | integration | regression |
-          trunk | suite_<group> | <label>. These tier names ARE the
+          trunk | model_ops | suite_<group> | <label>. These tier names ARE the
           test_suite_config.labels vocabulary directly (no alias layer).
           Default: integration (configs whose test_suite_config.labels cover
           the device-layer surfaces flex and deeptools exercise most
@@ -195,7 +195,9 @@ jobs:
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
-      test_type: ${{ inputs.test_type || 'integration' }}
+      # model_ops: the model-ops capability suites, selected as model-ops-tests selects them.
+      test_type: ${{ inputs.test_type == 'model_ops' && 'trunk' || inputs.test_type || 'integration' }}
+      config_dir: ${{ inputs.test_type == 'model_ops' && 'model_ops_tests' || '' }}
       prebaked_image: ${{ inputs.prebaked_image }}
     # ClickHouse connection for the perf job's inline benchmark ingest. Passed
     # explicitly (not `secrets: inherit`) so only what _test_matrix declares is

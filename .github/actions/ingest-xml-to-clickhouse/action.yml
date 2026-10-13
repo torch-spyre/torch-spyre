@@ -82,6 +82,14 @@ inputs:
     description: PR number associated with the rows (empty on non-PR runs).
     required: false
     default: ''
+  ci-event:
+    description: >
+      Event of the run that built the leg's artifact (push | pull_request | schedule | ...): a
+      push to main tags it <repo>@<sha12> (main), a scheduled run of main also nightly-<day>
+      (nightly), a pull request <repo>#<pr> and <repo>#<pr>@<sha12> (pr). Empty tags nothing
+      beyond the tag inputs.
+    required: false
+    default: ''
   trigger-type:
     description: Suite tier (e.g. perf | regression | integration | smoke).
     required: false
@@ -264,6 +272,7 @@ runs:
         TAGS_IN: ${{ inputs.tag }}
         TAG_DATE_IN: ${{ inputs.tag-date }}
         REPOSITORY_IN: ${{ inputs.repository }}
+        CI_EVENT_IN: ${{ inputs.ci-event }}
         RUN_ATTEMPT_IN: ${{ inputs.run-attempt }}
       run: |
         source .venv/bin/activate
@@ -280,6 +289,7 @@ runs:
         [ -n "${COMPONENT_IN}" ] && ARGS+=(--component "${COMPONENT_IN}")
         [ -n "${RUN_ATTEMPT_IN}" ] && ARGS+=(--run-attempt "${RUN_ATTEMPT_IN}")
         [ -n "${REPOSITORY_IN}" ] && ARGS+=(--repository "${REPOSITORY_IN}")
+        [ -n "${CI_EVENT_IN}" ] && ARGS+=(--ci-event "${CI_EVENT_IN}")
         [ -n "${ARTIFACT_IN}" ] && ARGS+=(--artifact "${ARTIFACT_IN}")
         [ -n "${ARTIFACT_ID_IN}" ] && [ -z "${ARTIFACT_IN}" ] && ARGS+=(--artifact-id "${ARTIFACT_ID_IN}")
         [ -n "${TAG_FAMILY_IN}" ] && ARGS+=(--tag-family "${TAG_FAMILY_IN}")

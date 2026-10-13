@@ -844,6 +844,18 @@ def test_a_batch_artifact_writes_what_insert_artifact_wrote():
     assert new.tables == old.tables
 
 
+def test_a_batch_image_named_by_tag_records_its_digest_and_keeps_its_id():
+    fields = {"component": "torch-spyre", "artifact_name": "torch-spyre-dev", "id12": "9e" * 6,
+              "arch": "amd64", "ref": f"{IMAGE}:amd64-dev-{'9e' * 6}"}  # fmt: skip
+    client = FakeClient()
+    batch = {"artifacts": [{"artifact": {**fields, "content_digest": LEAF}}]}
+    assert artifacts.write_batch(client, "db", batch)["artifacts"] == 1
+    (art,) = client.tables[ARTIFACTS.name]
+    (ref,) = client.tables[ARTIFACT_REFS.name]
+    assert (ref["ref"], ref["content_digest"]) == (fields["ref"], LEAF)
+    assert art["artifact_id"] == artifacts.batch_identity(fields).artifact_id
+
+
 def test_a_batch_spec_entry_is_resolved_then_recorded():
     batch = {
         "artifacts": [
