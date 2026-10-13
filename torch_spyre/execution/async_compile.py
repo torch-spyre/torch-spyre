@@ -73,13 +73,10 @@ _COMPILE_TIMEOUT_S = 60.0
 def _check_ktir_device_prerequisites() -> None:
     """Raise unless the environment can compile emitted KTIR for the device.
 
-    Names everything missing at once, so a first run does not turn one
-    misconfiguration into a sequence of unrelated-looking failures.
+    ``ktir_device_mlir`` is deliberately not a prerequisite: dbo-opt defaults
+    ``--device`` on its own, so leaving it unset is a valid configuration.
     """
     missing = []
-
-    if not _spyre_config.ktir_device_mlir:
-        missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
 
     if shutil.which("dbo-opt") is None:
         missing.append("put dbo-opt on PATH")
@@ -211,7 +208,10 @@ def _compile_to_dir(
 
 
 def _run_backend_compiler(
-    kernel_name: str, compile_dir: str, env: dict[str, str]
+    kernel_name: str,
+    compile_dir: str,
+    env: dict[str, str],
+    backend_loop_unroll: bool,
 ) -> str:
     """Compile one materialized bundle with dbo-opt and return its directory.
 
@@ -222,6 +222,8 @@ def _run_backend_compiler(
 
     ``env`` is the parent's os.environ snapshot, so PATH reaches the worker and
     the dbo-opt lookup below resolves the same binary the parent would.
+    ``backend_loop_unroll`` is the resolved parent config used for the cache key;
+    workers must not re-read it from their own config or environment.
     """
     _check_backend_compiler_on_path()
 
@@ -232,6 +234,9 @@ def _run_backend_compiler(
     # than given a bundle-path spelling of its own.
     if _spyre_config.ktir_device_mlir:
         cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    # Always pass the resolved value, including the default, so compilation
+    # matches the cache key instead of depending on dbo-opt's own default.
+    cmd.append(f"--enable-loop-unroll={int(backend_loop_unroll)}")
     cmd += [
         f"--export-dir={compile_dir}",
         "-kEmitSpyreCode",
@@ -408,7 +413,11 @@ class SpyreAsyncCompile(AsyncCompile):
         )
 
     def _submit_backend_compile(
-        self, kernel_name: str, compile_dir: str
+        self,
+        kernel_name: str,
+        compile_dir: str,
+        *,
+        backend_loop_unroll: bool | None = None,
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
         # Everything before this call is frontend work and _run_backend_compiler
@@ -418,6 +427,8 @@ class SpyreAsyncCompile(AsyncCompile):
         assert not _spyre_config.frontend_only, (
             "frontend-only must stop before the backend is submitted"
         )
+        if backend_loop_unroll is None:
+            backend_loop_unroll = _spyre_config.backend_loop_unroll
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -429,10 +440,13 @@ class SpyreAsyncCompile(AsyncCompile):
                     kernel_name,
                     compile_dir,
                     dict(os.environ),
+                    backend_loop_unroll,
                 )
 
         with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
-            _run_backend_compiler(kernel_name, compile_dir, dict(os.environ))
+            _run_backend_compiler(
+                kernel_name, compile_dir, dict(os.environ), backend_loop_unroll
+            )
         return None
 
     def _compile_future(
@@ -494,6 +508,9 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
+        # Keep cache identity and the worker's compiler argument on the same
+        # config snapshot, including overrides made with config.patch.
+        backend_loop_unroll = _spyre_config.backend_loop_unroll
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
@@ -511,7 +528,10 @@ class SpyreAsyncCompile(AsyncCompile):
             # (only the kernel_name.txt marker is touched).
             try:
                 cache_key = compute_specs_hash(
-                    specs, kernel_name=kernel_name, pool_size=pool_size
+                    specs,
+                    kernel_name=kernel_name,
+                    pool_size=pool_size,
+                    backend_loop_unroll=backend_loop_unroll,
                 )
             except RuntimeError as e:
                 logger.warning(
@@ -548,7 +568,11 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_name, compile_dir, specs, pool_size
                     )
                     save_symbol_kinds(compile_dir, symbol_kinds)
-                    task = self._submit_backend_compile(kernel_name, compile_dir)
+                    task = self._submit_backend_compile(
+                        kernel_name,
+                        compile_dir,
+                        backend_loop_unroll=backend_loop_unroll,
+                    )
                     if task is not None:
                         return self._compile_future(
                             task,
@@ -576,7 +600,9 @@ class SpyreAsyncCompile(AsyncCompile):
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         if _spyre_config.frontend_only:
             return _skip_backend(kernel_name, output_dir, "dbo-opt")
-        task = self._submit_backend_compile(kernel_name, output_dir)
+        task = self._submit_backend_compile(
+            kernel_name, output_dir, backend_loop_unroll=backend_loop_unroll
+        )
         if task is not None:
             return self._compile_future(
                 task,
@@ -666,10 +692,14 @@ class SpyreAsyncCompile(AsyncCompile):
         # idempotent read of config plus one PATH lookup.
         _check_ktir_device_prerequisites()
 
-        cmd = [
-            "dbo-opt",
-            "--from-ktir",
-            f"--device={_spyre_config.ktir_device_mlir}",
+        # --device is omitted rather than defaulted here: unset, dbo-opt takes
+        # sys-arch-spec/KTDFArchGraphDevice/spyre_dd2_basic.mlir from under
+        # DEEPTOOLS_PATH, so passing a path would only duplicate that knowledge
+        # in a second place for it to drift from.
+        cmd = ["dbo-opt", "--from-ktir"]
+        if _spyre_config.ktir_device_mlir:
+            cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+        cmd += [
             f"--export-dir={output_dir}",
             "--kEmitSpyreCode",
             ktir_path,

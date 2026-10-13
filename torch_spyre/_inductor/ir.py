@@ -120,6 +120,8 @@ def _resize_device_layout(
     old_host_size: list[int],
     new_host_size: list[int],
     stick_host_dim: int | None = None,
+    old_host_stride: list[int] | None = None,
+    new_host_stride: list[int] | None = None,
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
@@ -175,6 +177,15 @@ def _resize_device_layout(
     #3116) without relying on the ambiguous size-elimination + contiguous-stride
     tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
 
+    ``old_host_stride`` / ``new_host_stride`` (optional, given together): the
+    buffer's own host strides before and after the resize.  The ``stride_map``
+    entry of a non-stick device dim is the host stride of the host dim it
+    walks, so the real strides name that host dim exactly.  Without them the
+    contiguous strides of the two sizes stand in, and they name the wrong one
+    for a buffer written in a permuted order: of two host dims of equal size
+    the tiebreak then picks the other, and the resize shrinks the wrong device
+    dim.
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
@@ -220,8 +231,12 @@ def _resize_device_layout(
             if expected_tc not in orig_ds[:-1]:
                 stick_host_dim = None
 
-    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
-    new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
+    assert (old_host_stride is None) == (new_host_stride is None)
+    if old_host_stride is None or new_host_stride is None:
+        old_host_stride = FlexibleLayout.contiguous_strides(old_host_size)
+        new_host_stride = FlexibleLayout.contiguous_strides(new_host_size)
+    old_hs = [int(s) for s in old_host_stride]
+    new_hs = [int(s) for s in new_host_stride]
 
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)

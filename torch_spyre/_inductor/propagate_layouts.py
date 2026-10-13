@@ -334,6 +334,38 @@ def _candidate_output_stls(
     return stls
 
 
+def _compatible_output_stick_exprs(
+    stick_expr: sympy.Expr, out_coords, dep: MemoryDep
+) -> list[sympy.Expr]:
+    """Output stick expressions one input can feed without a restickify.
+
+    ``stick_expr`` is the input's device stick coordinate, ``dep`` its load and
+    ``out_coords`` the output's host coordinates. The result starts with
+    ``stick_expr`` itself, the preserved layout.
+
+    A stick of constant 0 is a size-1 stick, which says nothing about where the
+    output's stick goes. For such an input, the coordinate of each output dim it
+    is expanded along is added, e.g. ``d2`` for ``y`` ``[3, 5, 1]`` read through
+    ``y.expand(3, 5, 128)``, or both ``d1`` and ``d2`` for ``[3, 1, 1]`` expanded
+    to ``[3, 64, 128]``. Every lane of a stick on such a dim needs the same input
+    element, which the op broadcasts, so ``stick_compatible`` accepts the pair.
+
+    The consumer picks among the returned sticks, e.g. a full-size operand on the
+    expanded last dim or a transposed one on another expanded dim; the size-1
+    stick stays for a consumer with a size-1 last dim.
+    """
+    if stick_expr != 0:
+        return [stick_expr]
+    in_syms = dep.index.free_symbols
+    # An expanded dim is indexed by a variable the input's load lacks, so the
+    # input's element does not vary along it. A dim the input does index is left
+    # out: a stick there would gather elements from several input sticks.
+    expanded_dim_coords = [
+        coord for coord in out_coords if coord.is_symbol and coord not in in_syms
+    ]
+    return [stick_expr, *expanded_dim_coords]
+
+
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     """Reject fixed-layout ops when any input has a stick expression with a constant offset.
 
@@ -733,13 +765,21 @@ def _single_arg_op_layout(
     if in_device_coords is None:
         return []
     stick_expr = in_device_coords[-1]
+    stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
 
     # Try to preserve input layout, fall back to scanning all output dims
-    out_stl = _output_stl_from_stick_expr(
-        stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-    )
-    if out_stl is not None:
-        return [out_stl]
+    output_stls = [
+        out_stl
+        for expr in stick_exprs
+        for out_stl in [
+            _output_stl_from_stick_expr(
+                expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+            )
+        ]
+        if out_stl is not None
+    ]
+    if output_stls:
+        return output_stls
     return _candidate_output_stls(
         out_coords,
         output_dep,
@@ -1185,102 +1225,6 @@ def find_stick_compatible_input_layout(
     )
 
 
-def _flat_dense_projection_x_layout(
-    x: PropArg,
-    y: PropArg,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    reduction_var: sympy.Symbol,
-    m_size: int,
-    n_size: int,
-) -> SpyreTensorLayout | None:
-    """Return a canonical flat-M layout for a logically 2-D dense projection.
-
-    A fused attention producer can retain a higher-rank contiguous host view
-    such as ``[B, L, H, D]`` even though the projection reads it as the logical
-    matrix ``[B*L, H*D]``.  Preserving those physical outer axes makes the
-    backend encode the shared-weight projection as a BMM, which is much slower
-    than the equivalent flat MM.  Collapse only when the complete access is
-    provably one dense row-major 2-D matrix and the weight is shared (rank 2).
-
-    Genuine BMMs retain a rank-3 output and/or a batched weight and therefore do
-    not enter this path.
-    """
-
-    if (
-        m_size <= 1
-        or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
-        or len(y.layout.size) != 2
-        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
-        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
-    ):
-        return None
-
-    x_size = [concretize_expr(size) for size in x.layout.size]
-    x_stride = [concretize_expr(stride) for stride in x.layout.stride]
-    y_size = [concretize_expr(size) for size in y.layout.size]
-    out_size = [concretize_expr(size) for size in output.size]
-    out_stride = [concretize_expr(stride) for stride in output.stride]
-
-    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
-        expected = 1
-        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
-            if dim_size != 1 and dim_stride != expected:
-                return False
-            expected *= dim_size
-        return True
-
-    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
-        out_size, out_stride
-    ):
-        return None
-
-    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
-    row_vars = active_x_vars - {reduction_var}
-    if reduction_var not in active_x_vars or len(row_vars) != 1:
-        return None
-    (row_var,) = row_vars
-
-    row_size = concretize_expr(x.dep.ranges[row_var])
-    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
-    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
-    generated_vars = active_out_vars - {row_var}
-    if row_var not in active_out_vars or len(generated_vars) != 1:
-        return None
-    (generated_var,) = generated_vars
-    generated_size = concretize_expr(output_dep.ranges[generated_var])
-
-    if (
-        row_size != m_size
-        or generated_size != n_size
-        or math.prod(x_size) != row_size * reduction_size
-        or math.prod(y_size) != reduction_size * generated_size
-        or math.prod(out_size) != m_size * n_size
-        or row_var in y.dep.index.free_symbols
-        or {reduction_var, generated_var}
-        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
-    ):
-        return None
-
-    expected_index = reduction_size * row_var + reduction_var
-    expected_output_index = generated_size * row_var + generated_var
-    if (
-        sympy.simplify(x.dep.index - expected_index) != 0
-        or sympy.simplify(output_dep.index - expected_output_index) != 0
-    ):
-        return None
-
-    return SpyreTensorLayout(
-        [row_size, reduction_size],
-        [reduction_size, 1],
-        x.layout.dtype,
-        [0, 1],
-        ElementArrangement.STANDARD,
-    )
-
-
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1355,7 +1299,6 @@ def _matmul_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
-    exact_input_indices: set[int] = set()
 
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
@@ -1415,14 +1358,6 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
-    if data.reduction_type == BATCH_MATMUL_OP:
-        flat_x_stl = _flat_dense_projection_x_layout(
-            x, y, output, output_dep, reduction_var, m_size, n_size
-        )
-        if flat_x_stl is not None:
-            x_req_stl = flat_x_stl
-            exact_input_indices.add(0)
-
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
@@ -1440,7 +1375,6 @@ def _matmul_layouts(
         [x_req_stl, y_req_stl],
         op,
         output_dep,
-        exact_input_indices=exact_input_indices,
     )
     return [out_stl]
 
@@ -1686,13 +1620,18 @@ def _multi_arg_pointwise_layouts(
         output_ea = ElementArrangement.STANDARD
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     stick_exprs = {
-        dc[-1]
+        stick
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
         for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
+        for stick in _compatible_output_stick_exprs(dc[-1], out_coords, arg.dep)
     }
 
     # Bool physical format resolution: see resolve_output_formats's docstring.
@@ -1705,10 +1644,6 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [
-        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
-    ]
-    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -2106,9 +2041,6 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         return _layernormnorm_layout(op, output, output_dep, args)
-
-    if aten_op == spyreop.compact.default:
-        return _compact_layout(op, output, output_dep, args)
 
     if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of

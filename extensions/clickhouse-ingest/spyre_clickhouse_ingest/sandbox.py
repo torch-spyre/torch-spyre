@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import regex as re
+from clickhouse_connect.driver.exceptions import DatabaseError
 
 from .apply_schema import SCHEMA_DIR, SchemaApplier, SchemaDrift
 
@@ -97,6 +98,18 @@ class Sandbox:
             "artifact_id",
         ),
         ("artifact_results", "{runs}", "run_id"),
+        ("artifact_result_reasons", "{runs}", "run_id"),
+        ("artifact_subscriptions", "1", "subscription_id"),
+        (
+            "artifact_dispatches",
+            "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",
+            "dispatch_id",
+        ),
+        (
+            "dispatch_requests",
+            "requested_at >= now() - INTERVAL {days} DAY",
+            "request_id",
+        ),
         ("hw_failure_diagnostics", "{runs}", "run_id"),
         ("jenkins_agents", "ts >= now() - INTERVAL {days} DAY", "(node, ts)"),
         # By time, not {runs}: a run that failed before publishing has no run_id to be picked by.
@@ -105,6 +118,11 @@ class Sandbox:
             "pipeline_run_legs",
             "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
             "(run_key, arch, component, image, kind)",
+        ),
+        (
+            "ci_run_timings",
+            "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
+            "(run_key, entry, component, artifact_name, arch, leg, attempt)",
         ),
     )
 
@@ -176,7 +194,9 @@ class Sandbox:
 
     @staticmethod
     def columns(client, table_expr: str) -> list:
-        return [r[0] for r in client.query(f"DESCRIBE TABLE {table_expr}").result_rows]
+        """The insertable columns: a MATERIALIZED or ALIAS one refuses an explicit insert."""
+        rows = client.query(f"DESCRIBE TABLE {table_expr}").result_rows
+        return [r[0] for r in rows if r[2] not in ("MATERIALIZED", "ALIAS")]
 
     @classmethod
     def seed(cls, client, db: str, f: SeedFilter) -> list:
@@ -205,7 +225,13 @@ class Sandbox:
             if table not in local:
                 continue
             mine = cls.columns(client, f"{db}.{table}")
-            theirs = set(cls.columns(client, cls.src(table)))
+            try:
+                theirs = set(cls.columns(client, cls.src(table)))
+            except DatabaseError as err:
+                # A table this schema adds before prod has it: nothing to copy yet.
+                if "There is no table" not in str(err):
+                    raise
+                continue
             cols = ", ".join(f"`{c}`" for c in mine if c in theirs)
             client.command(
                 f"INSERT INTO {db}.{table} ({cols}) SELECT {cols} FROM {cls.src(table)} "

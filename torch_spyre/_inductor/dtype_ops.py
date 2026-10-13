@@ -135,12 +135,12 @@ class DtypeOpTable:
     ]
 
     _TYPECAST_OPS_TABLE = {
-        **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
-        **{pair: DL16TOFP32_OP for pair in _FP16_TO_FP32_DTYPES},
-        **{pair: FP32TODL16_OP for pair in _FP32_TO_FP16_DTYPES},
-        **{pair: FP8TODL16_OP for pair in _FP8_TO_FP16_DTYPES},
-        **{pair: FP32TOINT32_OP for pair in _FP32_TO_INT32_DTYPES},
-        **{pair: INT32TOFP32_OP for pair in _INT32_TO_FP32_DTYPES},
+        **dict.fromkeys(_IDENTITY_DTYPES, IDENTITY_OP),
+        **dict.fromkeys(_FP16_TO_FP32_DTYPES, DL16TOFP32_OP),
+        **dict.fromkeys(_FP32_TO_FP16_DTYPES, FP32TODL16_OP),
+        **dict.fromkeys(_FP8_TO_FP16_DTYPES, FP8TODL16_OP),
+        **dict.fromkeys(_FP32_TO_INT32_DTYPES, FP32TOINT32_OP),
+        **dict.fromkeys(_INT32_TO_FP32_DTYPES, INT32TOFP32_OP),
     }
 
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())

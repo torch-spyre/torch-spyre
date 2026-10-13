@@ -480,6 +480,17 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(
             )
             assert all(isinstance(handle_id, str) for handle_id in debug_handles)
             assert debug_handles == list(descriptor.debug_handle_ids)
+            # Raw 32-bit device timestamps TS1..TS5. Raw ordering is not
+            # asserted: the counter wraps and unfilled slots read 0.
+            cycles_ts = args.get("cycles_ts")
+            assert isinstance(cycles_ts, list), (
+                "args.cycles_ts must be a JSON array, not a quoted string"
+            )
+            assert len(cycles_ts) == 5
+            assert all(
+                isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts
+            )
+            assert any(cycles_ts), "all-zero kernel cycles_ts: counters failed"
 
     def lineage(handle):
         yield handle
@@ -576,6 +587,22 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, (
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
+
+    # Memcpy events carry cycles_ts only when the record has counters; flex
+    # currently reports every DMA without them, so today the key is absent.
+    # Either way, an emitted array must be valid and never all zero.
+    for e in h2d_events + d2h_events:
+        cycles_ts = e.get("args", {}).get("cycles_ts")
+        if cycles_ts is None:
+            continue
+        assert isinstance(cycles_ts, list), (
+            "args.cycles_ts must be a JSON array, not a quoted string"
+        )
+        assert len(cycles_ts) == 5
+        assert all(isinstance(ts, int) and 0 <= ts <= 0xFFFFFFFF for ts in cycles_ts)
+        assert any(cycles_ts), "memcpy cycles_ts emitted with all slots zero"
+    for e in memset_events:
+        assert "cycles_ts" not in e.get("args", {}), "memset never carries cycles_ts"
 
 
 @pytest.mark.requires_spyre_profiler

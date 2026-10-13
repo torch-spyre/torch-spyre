@@ -23,6 +23,8 @@ lays each step's result tile back into a full-size output along one axis.
 
 import contextlib
 import enum
+import platform
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
@@ -89,6 +91,56 @@ class TileSpec:
 
 
 DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
+
+
+# CPython 3.12/3.13 C recursion cap on s390x (10000 on x86).
+_S390X_CPYTHON_C_RECURSION_LIMIT = 800
+
+# CPython 3.12/3.13 cap C recursion at 800 on s390x (10000 on x86). Outside Dynamo
+# (eager, or an AOT decomposition inside an outer compile), `scan` re-enters
+# `torch.compile` once, which inlines each nested level at ~180 C levels, so a deep nest
+# exceeds 800 on s390x. Dynamo's C-recursion RAII resets the remaining budget to
+# this value at each frame it compiles. Must be > 800. See torch-spyre#4973.
+# Measured on s390x (py3.12): worst nest needs 1076, 1200 is the smallest passing
+# value; 1800 = 1.5 x 1200.
+_S390X_SCAN_C_RECURSION_LIMIT = 1800
+
+
+def _scan_c_recursion_target(machine: str, py: tuple[int, int]) -> int | None:
+    """Return the C-recursion budget for the nested `scan` compile.
+
+    Args:
+        machine: `platform.machine()` of the host.
+        py: `(major, minor)` of the running interpreter.
+
+    Returns:
+        The budget to install, or None where it must stay untouched: off s390x it
+        would lower the platform default (and warn), and outside 3.12/3.13 Dynamo's
+        C-recursion RAII does not exist.
+    """
+    if machine != "s390x" or not (3, 12) <= py < (3, 14):
+        return None
+    return _S390X_SCAN_C_RECURSION_LIMIT
+
+
+@contextlib.contextmanager
+def _fresh_c_recursion_budget():
+    """Give the nested `scan` compile its own C-recursion budget on s390x."""
+    target = _scan_c_recursion_target(platform.machine(), sys.version_info[:2])
+    if target is None:
+        yield
+        return
+    previous = torch._dynamo.get_recursion_limit()  # -1 when unset
+    if previous >= target:
+        yield
+        return
+    # `c_recursion_limit` is a process-global C static: compiles running on other
+    # threads see this value until it is restored.
+    torch._dynamo.set_recursion_limit(target)
+    try:
+        yield
+    finally:
+        torch._dynamo.set_recursion_limit(previous)  # -1 restores "unset"
 
 
 def _tile_size_vector(shape, dim: int, extent: int) -> tuple[int, ...]:
@@ -363,12 +415,10 @@ def for_each_tile(
     # currently only accepts Tensor, int, SymInt.
     # Note: This is currently a shortcoming of `scan`,
     # but shouldn't be any concern for Spyre.
-    ctx = (
-        contextlib.nullcontext()
-        if torch.compiler.is_dynamo_compiling()
-        else torch._dynamo.config.patch(specialize_float=True)
-    )
-    with ctx:
+    with contextlib.ExitStack() as ctx:
+        if not torch.compiler.is_dynamo_compiling():
+            ctx.enter_context(torch._dynamo.config.patch(specialize_float=True))
+            ctx.enter_context(_fresh_c_recursion_budget())
         final_carry, ys = scan(combine_fn, scan_init, xs, dim=0, reverse=reverse)
 
     if count_mode:
