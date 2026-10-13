@@ -29,6 +29,7 @@ from collections.abc import Callable
 import torch
 from torch._inductor.utils import run_and_get_code
 
+from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.wsr import for_each_tile
 
 
@@ -1533,3 +1534,45 @@ def nested_restickify_add_fn(A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
 
     _, out = for_each_tile(outer_body, (A, X), dims=(1, 0), tile_size=64, out_dim=0)
     return out
+
+
+def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
+    """values[E, T, H].sum(0), one expert slab per trip, through a loop carry.
+
+    ``row_split`` is a ``work_div`` on the output row dim ``T``; ``values`` must
+    be named ``["E", "T", "H"]`` for the hint to resolve.  The carry's initial
+    value is built by the same function, so the solver, not the caller, has to
+    give it the update's split.
+    """
+
+    def body(acc, ops):
+        (slab,) = ops
+        return acc + slab.sum(0), None
+
+    init = torch.zeros(values.shape[1:], dtype=values.dtype, device=values.device)
+    with spyre_hint(work_div={"T": row_split}):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
+    return final
+
+
+def carried_routed_expert_sum_fn(
+    values: torch.Tensor, routing: torch.Tensor, row_split: int
+) -> torch.Tensor:
+    """sum over E of values * route, with route a permuted, contiguous copy.
+
+    ``routing`` is [T, E, 1]; the per-expert route slab [1, T, 1] is tiled with
+    ``values`` along E, so the tiled operand is itself the output of an
+    earlier relayout.
+    """
+    route = routing.permute(1, 0, 2).contiguous().clone()
+
+    def body(acc, ops):
+        slab, route_slab = ops
+        return acc + (slab * route_slab).sum(0), None
+
+    init = torch.zeros(values.shape[1:], dtype=values.dtype, device=values.device)
+    with spyre_hint(work_div={"T": row_split}):
+        final, _ = for_each_tile(
+            body, (values, route), dims=(0, 0), tile_size=1, init=init
+        )
+    return final
