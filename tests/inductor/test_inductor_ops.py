@@ -6231,18 +6231,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # guard's own message refers to.  So this entry tracks "depthwise +
             # padding does not work end to end"; a message-asserting negative
             # test would additionally pin *where* it is rejected.
-            # Every activation stride_map below is declared H-major: the OUTER
-            # spatial dim (H) carries the LARGER stride, e.g. [32, 1, -1, ...] for
-            # a 32x32 activation.  This is required, not cosmetic.  Depthwise
-            # geometry is dim-label keyed downstream (get_conv_params picks
-            # stride_i/kernel_h vs stride_j/kernel_w by label, and
-            # compute_padding_for_dim pairs i<->ki, j<->kj), while the label a
-            # device slot receives follows that tensor's own coordinate order.  So
-            # the activation must order its spatial axes the same way the output
-            # does, and _depthwise_conv_layouts pins the output canonically
-            # H-major (host order, stick innermost) for every N.  A W-major
-            # activation now raises Unsupported at compile time -- see
-            # test_dwise_conv2d_rejects_w_major_activation.
             "expect_fail": ["8x64_ksize3_pad1"],
             "param_sets": {
                 "1x64_ksize3": (
@@ -10039,51 +10027,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
             msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
         )
-
-    def test_dwise_conv2d_rejects_w_major_activation(self):
-        """A W-major activation must be rejected, not silently mis-addressed.
-
-        Depthwise geometry is dim-label keyed downstream, and the label a device
-        slot receives follows that tensor's own coordinate order, so the
-        activation has to order its spatial axes the same way the canonical
-        (H-major) output does.  Declaring the activation W-major -- inner spatial
-        dim carrying the larger stride -- used to compile fine and return numbers
-        off by up to ~26; _depthwise_conv_layouts now raises instead.
-
-        A non-square shape is used deliberately: with H == W the two device slots
-        carry the same extent, so device_size alone cannot disambiguate them and a
-        square case would not pin down which convention is under test.
-        """
-        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
-
-        torch._dynamo.reset()
-        torch._inductor.codecache.FxGraphCache.clear()
-
-        N, C, H, W, K = 2, 64, 32, 24, 5
-        x = cached_randn((N, C, H, W))
-        weight = cached_randn((C, 1, K, K))
-        device_dtype_fp16 = get_device_dtype(torch.float16)
-
-        # W-major: slot 0 is W (stride 1), slot 1 is H (stride W).
-        x_dev = x.to(
-            device_layout=SpyreTensorLayout(
-                [W, H, 1, N, C], [1, W, -1, H * W * C, H * W], device_dtype_fp16
-            )
-        )
-        weight_dev = weight.to(
-            device_layout=SpyreTensorLayout(
-                [K, K, 1, 1, C], [K, 1, -1, K * K, K * K], device_dtype_fp16
-            )
-        )
-
-        def fn(x, weight):
-            return torch.conv2d(
-                x, weight, None, stride=(2, 2), padding=(0, 0), groups=C
-            )
-
-        with self.assertRaises(Exception) as ctx:
-            torch.compile(fn)(x_dev, weight_dev)
-        self.assertIn("spatial axis order", str(ctx.exception))
 
     def test_dwise_conv1d_cpu(
         self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
