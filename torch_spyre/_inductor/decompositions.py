@@ -3733,9 +3733,11 @@ def spyre_prod_dim_int(
 ) -> torch.Tensor:
     # All dtypes route through spyre.prod_dim_int.  For int64, lower_prod_dim
     # uses with_int64_fallback which converts the input to fp32 via one CPU
-    # round-trip before the hardware reduction.  Stick-dim reductions fail
-    # until ReStickifyOpHBM supports fp32 (issue #2544); those cases are
-    # expect_fail in test_prod_cpu.
+    # round-trip before the hardware reduction.  Stick-dim reductions fail at
+    # compile time (NotImplementedError "no mechanism to resolve stick
+    # incompatibility") until ReStickifyOpHBM supports fp32 (issue #2544; the
+    # CPU fallback is to be removed by issue #5126).  Those cases are
+    # expect_fail in test_prod_cpu; remove the entries when the issues land.
     return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
 

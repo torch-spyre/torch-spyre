@@ -1934,6 +1934,9 @@ def lower_where(condition, self, other):
     broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
+    # Keep the explicit scale-and-realize for alpha != 1. Delegating to
+    # lowering.add(x, y, alpha=alpha) fails for fractional alpha (test_add_alpha,
+    # alpha=0.5) with InductorError "No FX node for buf1" from split_multi_ops.
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -1957,6 +1960,10 @@ def lower_mul(x, y):
     return lowering.mul(x, y)
 
 
+# NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
+# with_int64_fallback, so unlike add/mul it is inexact above 2**24. The planned
+# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int32/int64
+# sub reuses the native addi32toi32 / muli32toi32 path.
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
@@ -2361,21 +2368,6 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
-
-
-# convert_input_to_bool=True guarantees operands are cast to 0/1 before the
-# backend sees them.  On 0/1 values maximum(a, b) == a OR b, so the hardware
-# maximum op correctly implements logical OR.  This mirrors logical_and, which
-# uses mul (product of 0/1 values) for the same reason.
-@register_spyre_lowering(
-    torch.ops.aten.logical_or.default,
-    type_promotion_kind=None,
-    convert_input_to_bool=True,
-    override_return_dtype=torch.bool,
-    broadcast=True,
-)
-def lower_logical_or(x, y):
-    return lowering.logical_or(x, y)
 
 
 @register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)

@@ -1157,6 +1157,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # Large-value int64 add/mul (physically IEEE_INT32 on device):
         # same _FIRST_INT32_BEYOND_FP32 boundary proof for the int64 native path.
+        # test_binary_op compares integer results exactly (atol=0, rtol=0), so
+        # an fp32 round-trip (e.g. 2**24 + 1 + 1) fails these cases.
         (
             "test_native_int64_large_values",
             "test_binary_op",
@@ -6994,7 +6996,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             # Reducing along the stick dimension requires ReStickifyOpHBM to
-            # support fp32, which is not yet implemented (issue #2544).
+            # support fp32, which is not yet implemented (issue #2544). Today
+            # these fail at compile time with InductorError: NotImplementedError
+            # "no mechanism to resolve stick incompatibility".
+            # TODO(#2544, #5126): remove these expect_fail entries once the
+            # fp32 restickify / int64 CPU-fallback removal land.
             "expect_fail": [
                 "int64_dim1",
                 "int64_dim1_keepdim",
@@ -7416,7 +7422,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_bool_add(self):
         # torch.add(bool, bool) is routed to logical_or by upstream Inductor
         # (override_fn_when_input_bool="logical_or" on aten.add), so this
-        # exercises the lower_logical_or path indirectly.
+        # exercises SpyreOpFuncs.logical_or indirectly.
         dtype = torch.bool
         x = torch.randint(0, 2, (2, 64), dtype=dtype)
         x_spyre = x.to("spyre")
@@ -7471,7 +7477,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             tiny_value_mask = torch.abs(b) < FP16_EPS
             b[tiny_value_mask] = FP16_EPS
 
-        self.compare_with_cpu(op, a, b)
+        # Integer (and bool) results must match exactly. With the default
+        # atol/rtol of 0.1 an fp32 round-trip error of a few units on values
+        # near 2**24 would still pass, so the native addi32toi32/muli32toi32
+        # path would not be distinguishable from the lossy one. Only do this
+        # when both operands are integral: a float operand keeps the tolerance.
+        all_integral = all(
+            isinstance(t, torch.Tensor)
+            and not (t.dtype.is_floating_point or t.dtype.is_complex)
+            for t in (a, b)
+        )
+        if all_integral:
+            self.compare_with_cpu(op, a, b, atol=0, rtol=0)
+        else:
+            self.compare_with_cpu(op, a, b)
 
     def test_storage_offset_placeholder(self, op, slicer, base):
         # slicer runs after .to("spyre") and before compile, so the
