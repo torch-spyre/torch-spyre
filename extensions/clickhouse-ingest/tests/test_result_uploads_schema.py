@@ -92,3 +92,56 @@ def test_rows_must_be_linked_and_the_view_names_the_uploader():
         "SELECT toString(run_id) FROM v_artifact_results_published", "CSV"
     ).data()
     assert left.split() == [f'"{CI_RUN}"']
+
+
+def test_a_retracted_upload_leaves_the_benchmark_coverage_and_case_views():
+    session = pytest.importorskip("chdb.session")
+
+    s = session.Session()
+    for name in (
+        "10-functional-tests.sql",
+        "20-artifacts.sql",
+        "30-benchmarks.sql",
+        "49-result-uploads.sql",
+        "50-artifact-views.sql",
+        "51-functional-views.sql",
+        "52-cross-views.sql",
+        "60-benchmark-views.sql",
+    ):
+        for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
+            s.query(stmt)
+    for state in ("published", "retracted"):
+        s.query(
+            "INSERT INTO result_uploads FORMAT JSONEachRow\n"
+            + json.dumps(_upload(state=state))
+        )
+    bench, case = (
+        "8f6a2f53-0d5b-5d1e-9a51-6c3a0f3c0b11",
+        "c0de0000-0000-5000-8000-000000000001",
+    )
+    s.query(
+        f"INSERT INTO benchmarks (benchmark_id, component, name) VALUES ('{bench}', 'torch-spyre', 'matmul')"
+    )
+    s.query(
+        f"INSERT INTO test_cases (test_case_id, component, classname, name) VALUES ('{case}', 'torch-spyre', 'T', 't')"
+    )
+    for rid in (RUN, CI_RUN):
+        s.query(
+            "INSERT INTO benchmark_runs (run_id, benchmark_id, component, backend, measurements) "
+            f"VALUES ('{rid}', '{bench}', 'torch-spyre', 'sendnn', map('kernel_ms', [1.0]))"
+        )
+        s.query(
+            "INSERT INTO test_case_runs (run_id, test_case_id, component, status) "
+            f"VALUES ('{rid}', '{case}', 'torch-spyre', 'passed')"
+        )
+
+    def one(sql):
+        return s.query(sql, "CSV").data().split()
+
+    assert one(
+        "SELECT DISTINCT toString(run_id) FROM v_benchmark_results_enriched"
+    ) == [f'"{CI_RUN}"']
+    assert one("SELECT sum(runs), sum(runs_missing_result) FROM v_run_coverage") == [
+        "1,1"
+    ]
+    assert one("SELECT sum(runs) FROM v_case_trend") == ["1"]

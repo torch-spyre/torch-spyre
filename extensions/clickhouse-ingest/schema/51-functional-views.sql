@@ -43,6 +43,7 @@ SELECT
 FROM test_case_runs AS cr
 INNER JOIN test_cases AS c
         ON c.test_case_id = cr.test_case_id AND c.component = cr.component
+WHERE cr.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted')
 GROUP BY component, classname, name, day;
 
 -- Per-tier counters for one run. The tier is the one its leg was dispatched for

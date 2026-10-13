@@ -41,6 +41,7 @@ FROM
         SELECT toDate(min(ts)) AS day, '' AS arch, run_id, 0 AS in_results, 1 AS in_cases,
                0 AS non_smoke
         FROM test_case_runs
+        WHERE run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted')
         GROUP BY run_id
     )
     GROUP BY run_id

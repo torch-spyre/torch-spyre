@@ -57,7 +57,9 @@ LEFT JOIN (
     FROM v_artifact_results_published
     WHERE result_kind = 'performance'
     GROUP BY run_id
-) AS ar USING (run_id);
+) AS ar USING (run_id)
+-- The LEFT JOIN above keeps a retracted upload's rows (with a nil artifact), so drop its run here.
+WHERE r.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted');
 
 -- The wide projection the dashboard's METRIC_LABELS dict expects: Map keys become named
 -- columns. Every metric is NULL when absent, never 0 (Map's zero-default), since a dashboard
