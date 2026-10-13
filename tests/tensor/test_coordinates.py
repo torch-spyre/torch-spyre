@@ -36,6 +36,7 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
 )
+from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
@@ -1019,6 +1020,147 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+
+class TestFlatDenseProjectionLayout(TestCase):
+    """Unit tests for _flat_dense_projection_x_layout in nonstick_dim_order."""
+
+    def test_flat_dense_projection_layout(self):
+        """A contiguous BLHD view read as [B*L, H*D] gets a canonical flat-M STL."""
+        B, seq, heads, head_dim = 4, 512, 12, 64
+        M, K, N = B * seq, heads * head_dim, 768
+
+        m, generated, contraction = sympy.symbols(
+            "m generated contraction", integer=True, nonnegative=True
+        )
+        ranges = (M, N, K)
+        x_dep = MemoryDep("x", K * m + contraction, (m, generated, contraction), ranges)
+        y_dep = MemoryDep(
+            "y", K * generated + contraction, (m, generated, contraction), ranges
+        )
+        out_dep = MemoryDep(
+            "out", N * m + generated, (m, generated, contraction), ranges
+        )
+
+        x_host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [B, seq, heads, head_dim],
+            [seq * K, K, head_dim, 1],
+        )
+        y_host = FixedLayout(torch.device("cpu"), torch.float16, [K, N], [N, 1])
+        output = FixedLayout(torch.device("cpu"), torch.float16, [M, N], [N, 1])
+        source = SpyreTensorLayout(
+            [seq, heads, 1, B, 64],
+            [K, head_dim, head_dim, seq * K, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [heads, K, 64],
+            [head_dim * N, 1, K],
+            get_device_dtype(torch.float16),
+        )
+        x = PropArg(x_dep, x_host, [source])
+        y = PropArg(y_dep, y_host, [weight])
+
+        result = _flat_dense_projection_x_layout(
+            x, y, output, out_dep, contraction, M, N
+        )
+        self.assertIsNotNone(result)
+        # SpyreTensorLayout stickifies [M, K] to [K//64, M, 64].
+        self.assertEqual(list(result.device_size), [K // 64, M, 64])
+        self.assertEqual(list(result.stride_map), [64, K, 1])
+
+        # A strided (non-contiguous) x must be rejected.
+        strided_x = PropArg(
+            x_dep,
+            FixedLayout(
+                torch.device("cpu"),
+                torch.float16,
+                [B, seq, heads, head_dim],
+                [seq * K * 2, K * 2, head_dim, 1],
+            ),
+            [source],
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                strided_x, y, output, out_dep, contraction, M, N
+            )
+        )
+
+        # FP32 must be rejected.
+        fp32_source = SpyreTensorLayout(
+            [seq, heads, 1, B, 32],
+            [K, head_dim, head_dim, seq * K, 1],
+            get_device_dtype(torch.float32),
+        )
+        fp32_x = PropArg(
+            x_dep,
+            FixedLayout(
+                torch.device("cpu"),
+                torch.float32,
+                [B, seq, heads, head_dim],
+                [seq * K, K, head_dim, 1],
+            ),
+            [fp32_source],
+        )
+        self.assertIsNone(
+            _flat_dense_projection_x_layout(
+                fp32_x, y, output, out_dep, contraction, M, N
+            )
+        )
+
+    def test_flat_dense_projection_rejects_true_bmm(self):
+        """A rank-3 output and per-batch weight are not collapsed (genuine BMM)."""
+        batch, m_sym, generated, contraction = sympy.symbols(
+            "batch m generated contraction", integer=True, nonnegative=True
+        )
+        B, M, N, K = 4, 512, 768, 768
+        ranges = (B, M, N, K)
+        x_dep = MemoryDep(
+            "x",
+            M * K * batch + K * m_sym + contraction,
+            (batch, m_sym, generated, contraction),
+            ranges,
+        )
+        y_dep = MemoryDep(
+            "y",
+            K * N * batch + N * contraction + generated,
+            (batch, m_sym, generated, contraction),
+            ranges,
+        )
+        out_dep = MemoryDep(
+            "out",
+            M * N * batch + N * m_sym + generated,
+            (batch, m_sym, generated, contraction),
+            ranges,
+        )
+        x_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, K], [M * K, K, 1]
+        )
+        y_host = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, K, N], [K * N, N, 1]
+        )
+        output = FixedLayout(
+            torch.device("cpu"), torch.float16, [B, M, N], [M * N, N, 1]
+        )
+        source = SpyreTensorLayout(
+            [12, M, B, 64],
+            [64, K, M * K, 1],
+            get_device_dtype(torch.float16),
+        )
+        weight = SpyreTensorLayout(
+            [12, K, B, 64],
+            [64, N, K * N, 1],
+            get_device_dtype(torch.float16),
+        )
+        x = PropArg(x_dep, x_host, [source])
+        y = PropArg(y_dep, y_host, [weight])
+
+        result = _flat_dense_projection_x_layout(
+            x, y, output, out_dep, contraction, M, N
+        )
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
