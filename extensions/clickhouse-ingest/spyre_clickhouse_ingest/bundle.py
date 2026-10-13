@@ -249,13 +249,15 @@ def write_vllm(client, db, root, meta, aid, rid, props) -> int:
     rows = vllm_rows(root, meta)
     if not rows:
         raise BundleError("no vLLM metric extracted from results/")
+    perf = meta.get("perf", {})
     try:
         n = vllm.write_benchmarks(client, db, rows, rid)
         insert_artifact_result(
             client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
-            state=meta.get("perf", {}).get("state", "passed"), arch=meta["arch"],
+            state=perf.get("state", "passed"), arch=meta["arch"],
             result_kind="performance", duration_s=vllm.duration_s(rows),
             props={**{k: v for k, v in props.items() if v},
+                   **{k: v for k, v in perf.items() if k.startswith("failure_")},
                    "run_url": meta.get("run_url") or props.get("bundle_url", "")},
         )  # fmt: skip
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup

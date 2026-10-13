@@ -74,6 +74,24 @@ runs:
         # warning-as-error workaround, CMAKE_PREFIX_PATH) so that rebuild
         # succeeds too.
         export CXX="$(command -v c++)"
+
+        # That rebuild makes this step compile PyTorch as well as torch-spyre,
+        # so it needs the same parallelism cap: ninja/cpp_extension size
+        # themselves off os.cpu_count() (the NODE's 192 cores), not this pod's
+        # 9.375-core quota, and ~192 concurrent link jobs OOM-kill the pod at
+        # its memory limit (exit 137). This is the step that died in all three
+        # attempts of issue #5384. Same probe as build-torch-spyre-wheel (#3207).
+        MAX_JOBS="$(nproc)"
+        if [[ -f /sys/fs/cgroup/cpu.max ]]; then
+          read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+          if [[ "$cpu_quota" != "max" ]]; then
+            MAX_JOBS=$(( cpu_quota / cpu_period ))
+            [[ "$MAX_JOBS" -lt 1 ]] && MAX_JOBS=1
+          fi
+        fi
+        export MAX_JOBS
+        echo "MAX_JOBS $MAX_JOBS"
+
         CMAKE_PREFIX_PATH="${TORCH_SPYRE_DIR}/.venv" \
         USE_CUDA=0 \
         CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \

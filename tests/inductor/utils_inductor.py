@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 import copy
 import functools
@@ -503,13 +503,42 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
+def _generated_names(cases):
+    """The case names one PARAMS item can be addressed by: ``case`` or ``op_case``."""
+    ops = cases.get("ops_dict") or {}
+    return set(cases["param_sets"]) | {
+        f"{op}_{case}" for op in ops for case in cases["param_sets"]
+    }
+
+
+def _check_expect_fail(prefix, cases):
+    """Validate ``expect_fail``: a list of cases, or a ``{case: reason}`` mapping.
+
+    An entry that names no generated test marks nothing, so it would go on looking
+    like a known failure after the case is renamed or removed.
+    """
+    expect_fail = cases.get("expect_fail", [])
+    generated = _generated_names(cases)
+    unmatched = [key for key in expect_fail if key not in generated]
+    assert not unmatched, f"{prefix}: expect_fail entries {unmatched} match no test"
+    if isinstance(expect_fail, Mapping):
+        for key, reason in expect_fail.items():
+            assert isinstance(reason, str) and reason.strip(), (
+                f"{prefix}: expect_fail entry {key!r} needs a non-empty reason"
+            )
+
+
+def _expect_fail_reason(expect_fail, key):
+    """The xfail reason for ``key``: its own reason when ``expect_fail`` is a mapping."""
+    if isinstance(expect_fail, Mapping):
+        return f"Expected fail for {key}: {expect_fail[key]}"
+    return f"Expected fail for {key}"
+
+
 def _check_expect_fail_unstable(prefix, cases):
     """Validate the ``expect_fail_unstable`` entries of one PARAMS item."""
     entries = cases.get("expect_fail_unstable", {})
-    ops = cases.get("ops_dict") or {}
-    generated = set(cases["param_sets"]) | {
-        f"{op}_{case}" for op in ops for case in cases["param_sets"]
-    }
+    generated = _generated_names(cases)
     for key, reason in entries.items():
         assert reason and reason.strip(), (
             f"{prefix}: expect_fail_unstable entry {key!r} needs a reason"
@@ -559,7 +588,10 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            # [case, ...] or {case or "<op>_<case>": reason}: a strict xfail. Use the
+            # mapping to say why, e.g. to cite the issue.
             expect_fail = cases.get("expect_fail", [])
+            _check_expect_fail(test_name_prefix, cases)
             # {case or "<op>_<case>": reason}: a non-strict xfail, for a case that
             # fails but is known to pass on some runs. A strict xfail that passes
             # fails the run, which would make such a case a flaky failure.
@@ -668,7 +700,8 @@ class ParameterizedTestMeta(type):
                             elif test_case in expect_fail or op_case_match:
                                 marked = op_case if op_case_match else test_case
                                 namespace[test_name] = pytest.mark.xfail(
-                                    reason=f"Expected fail for {marked}", strict=True
+                                    reason=_expect_fail_reason(expect_fail, marked),
+                                    strict=True,
                                 )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
@@ -706,7 +739,8 @@ class ParameterizedTestMeta(type):
                         )
                     elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
-                            reason=f"Expected fail for {test_case}", strict=True
+                            reason=_expect_fail_reason(expect_fail, test_case),
+                            strict=True,
                         )(namespace[test_name])
                     elif test_case in expect_fail_unstable:
                         namespace[test_name] = pytest.mark.xfail(

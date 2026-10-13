@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="all_tests" errors="3" failures="0" skipped="0" tests="4" time="30.0" timestamp="2026-10-10T20:01:26">
+<testcase classname="pytest" name="internal" time="0.000"><error message="internal error">def worker_internal_error(self, node: WorkerController, formatted_error: str) -&gt; None:
+E   RuntimeError: RAS::VFIO::DeviceOpenFail: failed to open /dev/vfio/29</error></testcase>
+<testcase classname="pytest" name="internal" time="0.000"><error message="internal error">def worker_internal_error(self, node: WorkerController, formatted_error: str) -&gt; None:
+E   RuntimeError: RAS::VFIO::DeviceOpenFail: failed to open /dev/vfio/29</error></testcase>
+<testcase classname="pytest" name="internal" time="0.000"><error message="internal error">def worker_internal_error(self, node: WorkerController, formatted_error: str) -&gt; None:
+E   RuntimeError: RAS::VFIO::DeviceOpenFail: failed to open /dev/vfio/29</error></testcase>
+<testcase classname="tests.ops.test_add" name="test_add_float16" time="0.200"/>
+</testsuite></testsuites>

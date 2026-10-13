@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch._inductor.utils import run_and_get_code
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor import spyre_hint  # noqa: F401
@@ -867,27 +867,24 @@ class TestBuildingBlocks(unittest.TestCase):
         compare_with_cpu(fn, x, y, z, run_eager=False)
 
     def test_mixed_plain_and_loop_bundle_codegen(self):
-        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear."""
-        from torch_spyre._inductor import spyre_hint as sh
-
+        """Plain op + for_each_tile op fuse into one bundle; LoopSpec must appear."""
         T, D = 128, 64
         x_cpu = torch.randn(T, D, dtype=torch.float16)
-
-        # Named dims must be set on the device tensor so propagation can map
-        # the hint's "T" name to the loop variable at compile time.
         x_dev = x_cpu.to("spyre")
-        _pnd.declare_tensor_dim("T", T)
-        _pnd.declare_tensor_dim("D", D)
-        _pnd.name_tensor_dims(x_dev, ["T", "D"])
+
+        def tiled_neg(y):
+            def body(_, ops):
+                (y_tile,) = ops
+                return None, torch.neg(y_tile)
+
+            return for_each_tile(body, (y,), dims=(0,), tile_size=T // 2, out_dim=0)[1]
 
         def fn(x):
-            # abs is a plain SchedulerNode; neg inside the hint becomes a
+            # abs is a plain SchedulerNode; neg inside the loop becomes a
             # CountedLoopSchedulerNode.  The two must fuse into one bundle.
-            y = torch.abs(x)
-            with sh(num_tiles_per_dim={"T": 2}):
-                return torch.neg(y)
+            return tiled_neg(torch.abs(x))
 
-        cfn = torch.compile(fn)
+        cfn = torch.compile(fn, fullgraph=True)
         spyre_result, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         self.assertIn(
@@ -896,28 +893,25 @@ class TestBuildingBlocks(unittest.TestCase):
             "CountedLoopSchedulerNode must produce a LoopSpec in the bundle",
         )
 
-        cpu_result = fn(x_cpu)
+        cpu_result = torch.neg(torch.abs(x_cpu))
         torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=1e-3, rtol=1e-3)
 
     def test_tiled_symbol_trip_counts_populated_via_compile(self):
         """OpSpec.tiled_symbol_trip_counts reflects each tiled symbol's own
         loop trip count after a real coarse-tiled compilation.
         """
-        from torch_spyre._inductor import spyre_kernel, spyre_hint as sh
+        from torch_spyre._inductor import spyre_kernel
 
         T, D = 128, 64
         x_cpu = torch.randn(T, D, dtype=torch.float16)
-
-        # Named dims must be set on the device tensor so propagation can map
-        # the hint's "T" name to the loop variable at compile time.
         x_dev = x_cpu.to("spyre")
-        _pnd.declare_tensor_dim("T", T)
-        _pnd.declare_tensor_dim("D", D)
-        _pnd.name_tensor_dims(x_dev, ["T", "D"])
 
         def fn(x):
-            with sh(num_tiles_per_dim={"T": 2}):
-                return x + x
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, x_tile + x_tile
+
+            return for_each_tile(body, (x,), dims=(0,), tile_size=T // 2, out_dim=0)[1]
 
         captured_op_specs = []
         original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
@@ -932,7 +926,7 @@ class TestBuildingBlocks(unittest.TestCase):
             "create_op_spec",
             _capturing_create_op_spec,
         ):
-            compiled = torch.compile(fn)
+            compiled = torch.compile(fn, fullgraph=True)
             compiled(x_dev)
 
         tiled_specs = [s for s in captured_op_specs if s.tiled_symbols]

@@ -186,6 +186,40 @@
             "passed",
             "failed"
           ]
+        },
+        "failure_reason": {
+          "description": "why a failed perf leg failed: schema.FAILURE_REASON_VALUES",
+          "enum": [
+            "aborted",
+            "build_error",
+            "dependency_failed",
+            "infra_auth",
+            "infra_capacity",
+            "infra_disk",
+            "infra_env",
+            "infra_hardware",
+            "infra_network",
+            "infra_timeout",
+            "ingest_error",
+            "pipeline_error",
+            "superseded",
+            "test_failure",
+            "unknown"
+          ]
+        },
+        "failure_subreason": {
+          "type": "string"
+        },
+        "failure_detail": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "failure_log_url": {
+          "type": "string"
+        },
+        "failure_wait_s": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
         }
       }
     }
