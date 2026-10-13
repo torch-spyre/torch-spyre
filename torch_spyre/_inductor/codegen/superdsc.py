@@ -1596,7 +1596,11 @@ def _create_sdsc_tensors(
                 # dims that actually carry a window entry are suppressed; a pool's
                 # other dims (mb/out) keep the normal backGap.
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
-                if not _is_conv(op_spec.op) and not _pool_window_dim and dev_dim_size > it_dim_size:
+                if (
+                    not _is_conv(op_spec.op)
+                    and not _pool_window_dim
+                    and dev_dim_size > it_dim_size
+                ):
                     backGap[dim] = dev_dim_size - it_dim_size
                 # Overlapping views can iterate beyond an aligned physical
                 # axis (e.g. unfold's window is wider than its step). Core
