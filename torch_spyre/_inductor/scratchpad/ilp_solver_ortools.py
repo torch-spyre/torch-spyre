@@ -913,7 +913,7 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp == 0.25:
+            if expr.exp.is_Number and math.isclose(expr.exp, 0.25):
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
                 # pinned to return 1 at x=1, generated using tools/approximate-power.py.
                 # since we check that the base is a _split_ symbol, it is an integer in the
