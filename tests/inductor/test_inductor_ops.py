@@ -7044,6 +7044,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 64, 3)),
                     None,
                     2,
+                ),
+            },
+        },
         # Conv3D with a unit temporal (depth) kernel, folded to a batched
         # Conv2d by conv2d_via_bmm_decomp (input.dim()==5 branch): each depth
         # slice is convolved independently with the same [C_out,C_in,kH,kW]
@@ -10334,6 +10337,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(
                 fn,
                 x_nwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
     def _run_conv3d_via_conv2d(self, x, weight, bias, stride, direct_flag):
         # Shared body for the conv3d-via-conv2d cases. A Conv3D with a unit
         # temporal (depth) kernel is folded to a batched Conv2d by

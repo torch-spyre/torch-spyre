@@ -3162,9 +3162,9 @@ def _is_direct_conv_supported(
     """
     # A rank-3 (conv1d) weight is [C_out, C_in_per_group, K_w], so shape[-2] is
     # the input-channel count, not a kernel height. For conv1d, kH is always 1
-    kH = 1 if weight.dim() == 3 else weight.shape[-2]
-    kW = weight.shape[-1]
-    C_in = input.shape[1]
+    kH = 1 if len(weight_shape) == 3 else weight_shape[-2]
+    kW = weight_shape[-1]
+    C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
         not transposed
@@ -3173,8 +3173,8 @@ def _is_direct_conv_supported(
         and all(d == 1 for d in dilation)
         and groups == 1
         # Expand acceptable dim count to include 3 to support conv1d
-        and input.dim() in (3, 4)
-        and input.dtype == torch.float16
+        and len(input_shape) in (3, 4)
+        and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
         and kH <= _CONV_MAX_KERNEL
@@ -3264,7 +3264,7 @@ def conv2d_via_bmm_decomp(
     #
     # NOTE: this first call passes the *original* input shape, so for a
     # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
-    # supported gates on len(input_shape) == 4. The direct deferral for a
+    # supported gates on len(input_shape) in (3, 4). The direct deferral for a
     # temporal-1 Conv3D is decided later, by the *second* call below on the
     # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
     if _will_lower_conv2d_direct(
