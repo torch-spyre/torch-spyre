@@ -397,6 +397,14 @@ Within 15 minutes the relay moves the bundle to `v2-results/processed/<key>/...`
 `3` incomplete, and prints one JSON line on stdout. With `--dry-run` it runs every check on a
 read-only connection and writes nothing.
 
+### Retracted uploads and the HUD
+
+A retracted dashboard upload leaves every v2 view, which reads `v_artifact_results_published`.
+It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_benchmark_v3`, and in
+`oss_ci_benchmark_v3_by_tag` when it was retracted after a 15-minute refresh appended them. Its
+branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
+a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
+
 ## What is deliberately NOT here
 
 - **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share
