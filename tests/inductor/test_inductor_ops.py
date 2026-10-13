@@ -8531,11 +8531,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @expects_raise
     def test_count_nonzero_float_dim0_rejected(self):
-        # The compiled backend has no int32 sum, which count_nonzero needs.
-        # TODO: a missing feature, not a design limit. When int32 sum is
-        # implemented this stops raising, and the test has to become a positive one.
+        # count_nonzero sums x != 0 as an integer. The bool -> int conversion inside
+        # the reduction body nests two ops, which the reduction codegen does not take
+        # as an argument, and the compiled backend has no int32 sum either.
+        # TODO: a missing feature, not a design limit. When both are implemented
+        # this stops raising, and the test has to become a positive one.
         x = cached_randn((67, 256))
-        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
             self.compare_with_cpu(
                 lambda x: torch.count_nonzero(x, dim=0),
                 x,
@@ -8544,7 +8546,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @expects_raise
     def test_count_nonzero_bool_dim0_rejected(self):
-        # The compiled backend has no int32 sum, which count_nonzero needs.
+        # count_nonzero sums the bool as an integer. The bool -> int conversion inside
+        # the reduction body nests two ops, which the reduction codegen does not take
+        # as an argument, and the compiled backend has no int32 sum either.
         # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
@@ -8556,7 +8560,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.bool,
         )
-        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
             self.compare_with_cpu(
                 lambda x: torch.count_nonzero(x, dim=0),
                 x,
@@ -8573,7 +8577,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @expects_raise
     def test_nanmean_all_dims_rejected(self):
-        # nanmean sums the non-NaN values, and the backend has no int32 sum.
+        # nanmean counts the non-NaN values as an integer sum. The bool -> int
+        # conversion inside the reduction body nests two ops, which the reduction
+        # codegen does not take as an argument, and the backend has no int32 sum
+        # either.
         # TODO: a missing feature (see test_count_nonzero_float_dim0_rejected).
         x = torch.tensor(
             [
@@ -8583,7 +8590,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ],
             dtype=torch.float32,
         )
-        with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
+        with pytest.raises(Exception, match=r"unexpected argument PointwiseOp"):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
     # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
@@ -10348,34 +10355,73 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = cached_randn((64,), dtype=torch.float32)
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
     def test_bool_host_to_fp32_cpu(self):
-        # Literal repro from issue #1482: a host-created bool tensor (always
-        # physically SEN169_FP16 on device) converted to fp32.
+        # Literal repro from issue #1482: a host bool converted to fp32 and read
+        # back directly, as a staggered float32 like any float16 source's.
         def fn(x):
             return x.to(dtype=torch.float32)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
+    @expects_raise
     def test_bool_host_reshaped_to_fp32_cpu(self):
-        # Same as test_bool_host_to_fp32_cpu, but through a reshape view first.
+        # Same as test_bool_host_to_fp32_cpu, but through a reshape view first,
+        # which leaves 8 elements on the stick dim.
+        # TODO: convert a stick-unaligned float16 tensor to float32 (#3999); then
+        # this reads back like test_bool_host_to_fp32_cpu.
         def fn(x):
             return x.reshape(8, 8).to(dtype=torch.float32)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
-        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+        with pytest.raises(Exception, match="no supported output layout"):
+            self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_to_fp32_consumed_cpu(self):
+        # A host bool is float16-format like a computed one: its float32 is
+        # staggered, and converting the result back to float16 in-graph restores
+        # the order.
+        def fn(x):
+            return (x.to(dtype=torch.float32) * 3).to(torch.float16)
+
+        x = (torch.arange(4 * 128) % 3 == 0).reshape(4, 128)
+        self.compare_with_cpu(
+            fn, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
 
     def test_bool_host_to_fp16_cpu(self):
-        # Host-created bool tensors are DMA-copied (always physically
-        # SEN169_FP16 on device, same as test_bool_host_to_fp32_cpu above).
-        # Unlike the fp32 case, converting to float16 resolves via
-        # IDENTITY_OP -- a pure byte copy, no value computation -- so there's
-        # no output-ordering convention for a DMA copy to mismatch against.
+        # A host bool is float16-format on device, so converting it to float16
+        # is an identity byte copy.
         def fn(x):
             return x.to(dtype=torch.float16)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def _assert_bool_to_int_on_device(self, fn, *args):
+        """Compare fn exactly with CPU for int32 and int64, asserting fp32toint32 ran."""
+        for dst in (torch.int32, torch.int64):
+            with self.subTest(dst=dst):
+                with self.assertLogs(
+                    "spyre.inductor.spyre_kernel", level="DEBUG"
+                ) as logs:
+                    self.compare_with_cpu(
+                        functools.partial(fn, dst=dst),
+                        *args,
+                        atol=0.0,
+                        rtol=0.0,
+                        cpu_compile=False,
+                        run_eager=False,
+                    )
+                self.assertTrue(
+                    any("op_spec: fp32toint32," in m for m in logs.output),
+                    f"Expected an fp32toint32 op_spec, got: {logs.output}",
+                )
 
     def test_float32_to_int_truncates_cpu(self):
         # A cast to an integer truncates, including a negative value with a
@@ -10476,6 +10522,60 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cast(x.to(utils_inductor.DEVICE)).cpu(),
             torch.tensor(expected, dtype=torch.int32),
         )
+
+    def test_bool_fp32_src_to_int_cpu(self):
+        # A float32-format bool converts through float32 by an identity, so the
+        # integer result keeps the standard order and reads back directly.
+        def fn(x, y, dst):
+            return (x > y).to(dtype=dst)
+
+        x = (torch.arange(64) % 7).to(torch.float32)
+        y = (torch.arange(64) % 5).to(torch.float32)
+        self._assert_bool_to_int_on_device(fn, x, y)
+
+    def test_bool_fp16_src_to_int_cpu(self):
+        # A float16-format bool converts through float32 by DL16TOFP32, so the
+        # integer result is staggered; converting it back to float16 restores
+        # the order before the readback.
+        def fn(x, y, dst):
+            return (x > y).to(dtype=dst).to(torch.float32).to(torch.float16)
+
+        x = (torch.arange(128) % 7).to(torch.float16)
+        y = (torch.arange(128) % 5).to(torch.float16)
+        self._assert_bool_to_int_on_device(fn, x, y)
+
+    def test_bool_fp16_src_to_int_consumed_cpu(self):
+        # The DL16TOFP32 result is staggered, and so is the integer cast of it;
+        # converting back to float16 restores the order, so the comparison
+        # measures the values rather than the readback.
+        def fn(x, dst):
+            return (x > 2).to(dtype=dst).to(torch.float32).to(torch.float16)
+
+        x = (torch.arange(128) % 7).to(torch.float16)
+        self._assert_bool_to_int_on_device(fn, x)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
+    def test_bool_fp16_src_to_int64_readback_known_xfail(self):
+        def fn(x):
+            return (x > 2).to(dtype=torch.int64)
+
+        x = (torch.arange(128) % 7).to(torch.float16)
+        self.compare_with_cpu(
+            fn, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
+
+    def test_bool_host_to_int_cpu(self):
+        # A host bool is float16-format, so its integer result is staggered like
+        # a float16 compare's; converting it back to float16 restores the order.
+        def fn(x, dst):
+            return x.to(dtype=dst).to(torch.float32).to(torch.float16)
+
+        x = (torch.arange(4 * 128) % 3 == 0).reshape(4, 128)
+        self._assert_bool_to_int_on_device(fn, x)
 
     def test_bool_staggered_ea_src_to_fp16_cpu(self):
         # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA

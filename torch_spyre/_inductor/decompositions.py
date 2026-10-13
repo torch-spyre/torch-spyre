@@ -3861,12 +3861,13 @@ def spyre_masked_scatter(
         "masked_scatter: source is too short -- it has fewer rows than the "
         "number of selected (True) mask rows.",
     )
-    # Row i reads source row (prefix-count of selected rows - 1). Unselected
-    # rows would get -1, so multiply by the mask to send them to row 0 instead
-    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
-    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    # Row i reads source row (prefix-count of selected rows - 1). An unselected
+    # row reads the last selected row before it, or -1 before the first one;
+    # clamping to 0 keeps every index in bounds, and the where discards what the
+    # unselected rows read. Done in fp32: Spyre has no usable int `clip`, int32
+    # sub/mul are unsupported, and fp16 loses large indices.
     pos = mask_row.cumsum(0).to(torch.float32) - 1.0
-    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    row_idx = pos.clamp(min=0.0).to(torch.int64)
     # The gather stays 2D (its args are indirect, so the pointwise dim_order
     # projection skips them), but the `where` must stay at `self`'s rank:
     # that projection computes `rank_diff = len(output) - len(arg)` and only

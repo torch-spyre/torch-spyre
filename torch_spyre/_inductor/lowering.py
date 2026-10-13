@@ -1807,25 +1807,17 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
+    # No bool format has an op to an integer, but float32 has one, and a bool's
+    # 0/1 values convert exactly through it.
+    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
-
-    # DMA-copied bool InputBuffers have a different HBM element ordering than
-    # computation-kernel outputs, so a stick-reordering typecast (e.g.
-    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
-    # Fall back to CPU for host bools whose conversion reorders sticks; an
-    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
-    # use the native path. Peel through views (reshape/expand) too, since a
-    # viewed host bool is still backed by the same DMA-copied InputBuffer.
-    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
-        dst_dtype
-    ):
-        if isinstance(_peel_through_views(x), ir.InputBuffer):
-            op = torch.ops.spyre.to_dtype_cpu.default
-            return eager_fallback(op, x, dst_dtype)
 
     if (
         src_dtype == torch.float32
@@ -1921,7 +1913,7 @@ def lower_where(condition, self, other):
     #
     # Behaviour per value dtype:
     #   fp16/bf16:  host bool skips cast; computed bool and others cast normally
-    #   fp32:       condition cast to fp32 (aligns sticks; host bool via CPU fallback)
+    #   fp32:       condition cast to fp32 (aligns sticks)
     #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
     #   int64:      CPU fallback for int→fp32; cast back to int64 after
 
@@ -2112,9 +2104,9 @@ def _cmp_operand_dtype(tensors):
     Unifying the dtype does not make every mixed pair run on device, and the
     three outcomes are worth keeping straight:
 
-    * fp16 <-> fp32 goes through dl16tofp32 / fp32todl16, which are
-      STICK-REORDERING conversions (see _STICK_REORDERING_OPS in dtype_ops.py):
-      the converted operand ends up with a staggered element arrangement. That is
+    * fp16 <-> fp32 goes through dl16tofp32 / fp32todl16, which change the
+      elements per stick: the converted operand ends up with a staggered element
+      arrangement. That is
       legal on device and is NOT refused here -- propagate_layouts.py allows a
       staggered operand to combine with a STANDARD one that broadcasts at the
       stick dim, and rejects the rest. Both branches still fail overall, but for
