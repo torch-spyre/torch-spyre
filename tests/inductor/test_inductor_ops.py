@@ -1568,8 +1568,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "abs": lambda x, y: x + y.expand_as(x).abs(),
                 "add_then_gt": lambda x, y: x > y.expand_as(x) + 1,
                 # Both operands of the inner add are expanded.
-                "add_two_expanded": lambda x, y: x
-                - (y.expand_as(x) + (y - 3).expand_as(x)),
+                "add_two_expanded": lambda x, y: (
+                    x - (y.expand_as(x) + (y - 3).expand_as(x))
+                ),
             },
             # Small integers keep the op exact in float16; y is shifted so it differs
             # from x.
@@ -10609,14 +10610,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_restickify_int64_unsupported(self):
         """The same, for INT64: there is no feasible layout without a restickify.
 
-        The device computes the int64 add in IEEE_FP32 (the message lists IEEE_FP32
-        for the converted operands), so the fragment pins that dtype, as above.
+        int64 is stored as IEEE_INT32 on device and now uses the native
+        addi32toi32 path, so the error message names IEEE_INT32 for the
+        operands (not IEEE_FP32 as in the fp32 case above).
         """
         x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         # Transpose creates layout incompatibility that triggers restickify
         with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_INT32"
         ):
             self.compare_with_cpu(
                 lambda x, y: x.t() + y,

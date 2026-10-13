@@ -2495,8 +2495,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
 
-    # Indirect operations place the index tensor first; dispatch from the
-    # original value-tensor format rather than the relabeled SDSC format.
+    # Indirect operations place the index tensor first.
     value_arg_index = 1 if indirect_access_indices else 0
     opfunc = (
         "shuffle"
