@@ -60,6 +60,7 @@ import torch
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.constants import RESTICKIFY_OP
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
@@ -91,6 +92,11 @@ from for_each_tile_fixtures import (
     add_tiled_reference,
     batched_online_softmax_fn,
     carried_reduction_fn,
+    matmul_x_yt_nested_fn,
+    matmul_x_yt_tile_m_fn,
+    matmul_x_yt_tile_n_fn,
+    matmul_xt_y_nested_fn,
+    matmul_xt_y_tile_n_fn,
     moe_tile_experts_fn,
     nested_restickify_add_fn,
     outside_consumer_fn,
@@ -1188,7 +1194,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     ATOL = 0.1
     RTOL = 0.1
 
-    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None):
+    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None, ops=()):
         import regex as re
         from torch._inductor.utils import run_and_get_code
 
@@ -1197,6 +1203,8 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         src = "\n".join(code)
         counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
         self.assertIn("LoopSpec(", src)
+        for op in ops:
+            self.assertIn(f"op='{op}'", src, f"expected {op} in:\n{src}")
         expected = trips if isinstance(trips, list) else [trips]
         self.assertEqual(
             sorted(counts), sorted(expected), f"unexpected loop trip counts in:\n{src}"
@@ -1236,6 +1244,52 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
         ref = a.float().t() + x.float()
         self._check(nested_restickify_add_fn, (a, x), ref, trips=[2, 2])
+
+    def test_matmul_x_yt_tiled_on_m(self):
+        """x @ y.t() (the nn.Linear weight pattern): a weight restickify per trip."""
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_m_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
+
+    def test_matmul_xt_y_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_xt_y_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
 
     def test_outside_consumer_after_loop(self):
         a, b, c = (shaped_randn(256, 128, seed=s) for s in range(3))
