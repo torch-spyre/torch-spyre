@@ -83,6 +83,7 @@ _EXPORTS = {
     "junit": (
         "JUnitXml",
         "RunCoordinates",
+        "error_case_names",
         "extract_properties",
         "promote_xpass",
         "source_and_external_run_id",
@@ -171,6 +172,7 @@ __all__ = [
     "drop_older_case_attempts",
     "ensure",
     "ensure_artifact",
+    "error_case_names",
     "extract_properties",
     "filter_suite_records",
     "get_client",

@@ -67,6 +67,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
 )
 
 from for_each_tile_fixtures import (
+    add_3d_tiled_fn,
     B,
     COLS,
     ROWS,
@@ -89,6 +90,18 @@ from for_each_tile_fixtures import (
     add_tiled_fn,
     add_tiled_reference,
     batched_online_softmax_fn,
+    carried_reduction_fn,
+    moe_tile_experts_fn,
+    nested_restickify_add_fn,
+    outside_consumer_fn,
+    restickify_add_fn,
+    restickify_matmul_xt_y_fn,
+    restickify_transpose12_fn,
+    shaped_randn,
+    unsqueeze_broadcast_reference,
+    unsqueeze_broadcast_tiled_fn,
+    view_transpose_head_tiled_fn,
+    view_transpose_head_tiled_reference,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
     nested_online_softmax_fn,
@@ -1159,6 +1172,213 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
         compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
         with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
             compiled(pool, ids, init)
+
+
+class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
+    """for_each_tile bodies that exercise passes beyond plain tiling.
+
+    Ported from the retired hint-driven coarse-tile e2e suite: each case
+    keeps the scenario (restickify inside a tile, a view feeding a tiled head
+    dim, an outside consumer, expert-tiled matmul, carried reductions) and
+    drops the hint plumbing.  Every test asserts the loop really formed (a
+    ``LoopSpec`` with the expected trip count in the generated source) and
+    that numerics match CPU, so a silently-untiled compile cannot pass.
+    """
+
+    ATOL = 0.1
+    RTOL = 0.1
+
+    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None):
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        out, code = run_and_get_code(compiled, *[t.to(DEVICE_NAME) for t in inputs])
+        src = "\n".join(code)
+        counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
+        self.assertIn("LoopSpec(", src)
+        expected = trips if isinstance(trips, list) else [trips]
+        self.assertEqual(
+            sorted(counts), sorted(expected), f"unexpected loop trip counts in:\n{src}"
+        )
+        torch.testing.assert_close(
+            out.cpu().float(),
+            ref.float(),
+            atol=self.ATOL if atol is None else atol,
+            rtol=self.RTOL if rtol is None else rtol,
+        )
+
+    def test_add_3d_tiled_outer_dim(self):
+        a, b = shaped_randn(4, 256, 128), shaped_randn(4, 256, 128, seed=1)
+        fn = lambda a, b: add_3d_tiled_fn(a, b, 0, 2)  # noqa: E731
+        self._check(fn, (a, b), a.float() + b.float(), trips=2)
+
+    def test_add_3d_tiled_middle_dim(self):
+        a, b = shaped_randn(4, 256, 128), shaped_randn(4, 256, 128, seed=1)
+        fn = lambda a, b: add_3d_tiled_fn(a, b, 1, 64)  # noqa: E731
+        self._check(fn, (a, b), a.float() + b.float(), trips=4)
+
+    def test_restickify_add_tiled(self):
+        a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
+        self._check(restickify_add_fn, (a, x), a.float().t() + x.float(), trips=2)
+
+    def test_restickify_transpose12_tiled(self):
+        a, x = shaped_randn(8, 128, 64), shaped_randn(8, 64, 128, seed=1)
+        ref = a.float().transpose(1, 2) + x.float()
+        self._check(restickify_transpose12_fn, (a, x), ref, trips=2)
+
+    def test_restickify_matmul_xt_y_tiled(self):
+        x, y = shaped_randn(256, 128), shaped_randn(256, 128, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(restickify_matmul_xt_y_fn, (x, y), ref, trips=2, atol=0.5)
+
+    def test_restickify_add_nested_tiles(self):
+        a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
+        ref = a.float().t() + x.float()
+        self._check(nested_restickify_add_fn, (a, x), ref, trips=[2, 2])
+
+    def test_outside_consumer_after_loop(self):
+        a, b, c = (shaped_randn(256, 128, seed=s) for s in range(3))
+        ref = (a.float() + b.float()) * 2.0 + c.float()
+        self._check(outside_consumer_fn, (a, b, c), ref, trips=4)
+
+    def test_view_transpose_head_tiled(self):
+        heads, head_dim = 4, 64
+        x = shaped_randn(1, 128, heads * head_dim)
+        y = shaped_randn(1, heads, 128, head_dim, seed=1)
+        fn = lambda x, y: view_transpose_head_tiled_fn(x, y, heads, head_dim)  # noqa: E731
+        ref = view_transpose_head_tiled_reference(x.float(), y.float(), heads, head_dim)
+        self._check(fn, (x, y), ref, trips=2)
+
+    def test_unsqueeze_broadcast_tiled_leading_dim(self):
+        a, b = shaped_randn(256, 128), shaped_randn(4, 256, 128, seed=1)
+        fn = lambda a, b: unsqueeze_broadcast_tiled_fn(a, b, True)  # noqa: E731
+        ref = unsqueeze_broadcast_reference(a.float(), b.float())
+        self._check(fn, (a, b), ref, trips=2)
+
+    def test_unsqueeze_broadcast_tiled_shared_dim(self):
+        a, b = shaped_randn(256, 128), shaped_randn(4, 256, 128, seed=1)
+        fn = lambda a, b: unsqueeze_broadcast_tiled_fn(a, b, False)  # noqa: E731
+        ref = unsqueeze_broadcast_reference(a.float(), b.float())
+        self._check(fn, (a, b), ref, trips=4)
+
+    def test_moe_matmul_tiled_over_experts(self):
+        experts, tokens, hidden, ffn = 4, 64, 128, 64
+        x = shaped_randn(1, tokens, hidden)
+        w = shaped_randn(experts, hidden, ffn, seed=1) * 0.1
+        self._check(
+            moe_tile_experts_fn, (x, w), x.float() @ w.float(), trips=4, atol=0.5
+        )
+
+    def test_moe_matmul_tiled_over_128_experts(self):
+        """128 trips: the last experts' slabs sit far from the first's.
+
+        Scaled identities make every expert's output distinct and exact in
+        fp16 (scales 1..128), so an all-zero result, a stale slab, or every
+        trip reading expert 0 cannot pass.
+        """
+        experts, tokens, hidden, ffn = 128, 64, 64, 64
+        x = torch.eye(tokens, hidden, dtype=torch.float16).unsqueeze(0)
+        w = torch.stack(
+            [
+                torch.eye(hidden, ffn, dtype=torch.float16) * scale
+                for scale in range(1, experts + 1)
+            ]
+        )
+        ref = x.float() @ w.float()
+        self._check(moe_tile_experts_fn, (x, w), ref, trips=experts, atol=0, rtol=0)
+
+    def test_moe_matmul_distinguishes_experts_exactly(self):
+        """Each trip reads its own weight slab, not expert zero or stale HBM."""
+        experts, tokens, hidden, ffn = 3, 64, 64, 64
+        x = torch.eye(tokens, hidden, dtype=torch.float16).unsqueeze(0)
+        w = torch.stack(
+            [
+                torch.eye(hidden, ffn, dtype=torch.float16) * scale
+                for scale in range(1, experts + 1)
+            ]
+        )
+        ref = x.float() @ w.float()
+        self._check(moe_tile_experts_fn, (x, w), ref, trips=experts, atol=0, rtol=0)
+
+    def test_moe_matmul_reads_expert_weights_directly(self):
+        """The activation stays fixed while weights advance without staging."""
+        import ast
+
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        experts, tokens, hidden, ffn = 3, 64, 64, 64
+        x = shaped_randn(1, tokens, hidden).to(DEVICE_NAME)
+        w = shaped_randn(experts, hidden, ffn, seed=1).to(DEVICE_NAME)
+
+        compiled = torch.compile(
+            moe_tile_experts_fn, backend="inductor", fullgraph=True
+        )
+        _, code = run_and_get_code(compiled, x, w)
+        src = "\n".join(code)
+
+        tensor_args = []
+        for node in ast.walk(ast.parse(src)):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TensorArg"
+            ):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            size_node = keywords.get("device_size")
+            if not isinstance(size_node, ast.List):
+                continue
+            size = [ast.literal_eval(elt) for elt in size_node.elts]
+            advance_node = keywords.get("device_tile_advance_expr")
+            advance = (
+                ast.literal_eval(advance_node.args[0])
+                if isinstance(advance_node, ast.Call) and advance_node.args
+                else None
+            )
+            tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
+
+        # Only the expert weights advance; every other input read is fixed.
+        weight_size = [1, hidden, experts, ffn]
+        weight_reads = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size == weight_size
+        ]
+        self.assertEqual(len(weight_reads), 1)
+        self.assertIsInstance(weight_reads[0], str)
+        other_advances = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size != weight_size
+        ]
+        self.assertEqual(other_advances, [None] * len(other_advances))
+        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        self.assertIsNotNone(weight_step)
+        # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
+        # per stick is one H*F = 4096-element expert slab.
+        self.assertEqual(int(weight_step.group(1)) * 64, hidden * ffn)
+        self.assertNotIn("read_copy", src)
+
+    def test_carried_sum_over_tiled_dim(self):
+        v = shaped_randn(4, 64, 64)
+        fn = lambda v: carried_reduction_fn(v, lambda acc, s: acc + s.sum(0), 0.0)  # noqa: E731
+        self._check(fn, (v,), v.float().sum(0), trips=4, atol=0.2)
+
+    def test_carried_max_over_tiled_dim(self):
+        v = shaped_randn(4, 64, 64)
+        fn = lambda v: carried_reduction_fn(  # noqa: E731
+            v, lambda acc, s: torch.maximum(acc, s.amax(0)), -65504.0
+        )
+        self._check(fn, (v,), v.float().amax(0), trips=4)
+
+    def test_carried_min_over_tiled_dim(self):
+        v = shaped_randn(4, 64, 64)
+        fn = lambda v: carried_reduction_fn(  # noqa: E731
+            v, lambda acc, s: torch.minimum(acc, s.amin(0)), 65504.0
+        )
+        self._check(fn, (v,), v.float().amin(0), trips=4)
 
 
 if __name__ == "__main__":

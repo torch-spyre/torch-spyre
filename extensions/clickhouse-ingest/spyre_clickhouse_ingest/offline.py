@@ -56,7 +56,9 @@ FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
 MANUAL_PREFIX = "manual:"
 # kind -> the extension of its results/ files.
-KINDS = {"junit": ".xml", "vllm": ".json"}
+KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt"}
+# kinds whose test_type is always perf
+PERF_KINDS = ("vllm", "sendnn")
 VLLM_COMPONENT = "spyre-inference"
 RUN_MODES = ("latency", "throughput", "serve")
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
@@ -282,6 +284,25 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
             raise BundleError(f"{p}: its name's {clash} differ from perf {clash}")
 
 
+def check_sendnn(root: Path, meta: dict, results: list) -> None:
+    """Each results/*.txt is a perf-suite report_sendnn.txt: sections with a sendnn column."""
+    if meta["test_type"] != "perf":
+        raise BundleError("a sendnn bundle is test_type perf")
+    for p in results:
+        lines = [
+            line.split() for line in (root / p).read_text(errors="replace").splitlines()
+        ]
+        sections = sum(
+            1 for t in lines if t[:1] == ["Op:"] or t[:2] == ["Granite", "Config:"]
+        )
+        if not sections or not any(
+            t[:1] == ["Metric"] and "sendnn" in t for t in lines
+        ):
+            raise BundleError(
+                f"{p}: not a report_sendnn.txt (no Op:/Granite Config: sections with a sendnn column)"
+            )
+
+
 def check(root: Path) -> dict:
     """Validate the bundle at `root` offline; returns bundle.json with test_type filled in."""
     path = root / BUNDLE_FILE
@@ -307,7 +328,7 @@ def check(root: Path) -> dict:
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
     kind = meta.get("kind", "junit")
-    meta["test_type"] = meta.get("test_type") or ("perf" if kind == "vllm" else "")
+    meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
     if not meta["test_type"]:
         errors.append("test_type is required (the tier: unit, regression, fvt, ...)")
     if kind == "vllm" and (meta["test_type"], meta.get("component", VLLM_COMPONENT)) != (
@@ -359,6 +380,8 @@ def check(root: Path) -> dict:
         raise BundleError(f"no results/*{ext}: the bundle records nothing")
     if kind == "vllm":
         check_vllm(root, meta, results)
+    elif kind == "sendnn":
+        check_sendnn(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -442,8 +465,12 @@ def _arch(value: str) -> str:
 
 def write(args) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
-    kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else "junit"
-    if kind == "vllm":
+    kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
+    if kind == "sendnn":
+        if not args.sendnn_report:
+            raise BundleError("--kind sendnn needs --sendnn-report <report_sendnn.txt>")
+        results, extra = [Path(args.sendnn_report)], []
+    elif kind == "vllm":
         if not args.vllm_results_dir:
             raise BundleError("--kind vllm needs --vllm-results-dir")
         src = Path(args.vllm_results_dir)
@@ -462,7 +489,7 @@ def write(args) -> Path:
         "artifact_id": (args.artifact_id or "").strip(),
         "artifact": (args.artifact or "").strip(),
     }
-    meta = {"schema_version": SCHEMA_VERSION, **({"kind": kind} if kind == "vllm" else {}),
+    meta = {"schema_version": SCHEMA_VERSION, **({"kind": kind} if kind != "junit" else {}),
             **normalized(named), "arch": _arch(args.arch)}  # fmt: skip
     for key, value in (
         ("component", args.component), ("test_type", args.trigger_type),
@@ -699,6 +726,11 @@ def add_offline_options(parser) -> None:
     g.add_argument(
         "--vllm-results-dir", default="", help="vLLM bench *.json (implies --kind vllm)"
     )
+    g.add_argument(
+        "--sendnn-report",
+        default="",
+        help="--kind sendnn: the perf suite's report_sendnn.txt",
+    )
     g.add_argument("--perf", action="append", type=_pair, default=[],
                    help="vllm run context k=v: model, tensor_parallel, input_len, output_len, cards, "
                    "head_sha, head_branch, state")  # fmt: skip
@@ -720,6 +752,8 @@ def add_offline_options(parser) -> None:
         default="",
         help="--from-bundle: where it is kept; the run_url default",
     )
+    g.add_argument("--bundle-prop", action="append", type=_pair, default=[],
+                   help="--from-bundle: k=v added to the verdict's props (the source keys win)")  # fmt: skip
     g.add_argument("--trusted-job-prefix", action="append", default=[],
                    help="--from-bundle: accept a Jenkins run key only from these jobs")  # fmt: skip
     g.add_argument(
