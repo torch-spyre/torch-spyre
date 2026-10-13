@@ -117,12 +117,17 @@ import torch
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
+
+    _CP_MODEL_IMPORT_ERROR = ""
 else:
+    # Why ortools failed to import: often a missing dependency of it, not ortools itself.
+    _CP_MODEL_IMPORT_ERROR = ""
     try:
         from ortools.sat.python import cp_model, cp_model_helper
 
-    except ImportError:  # pragma: no cover - exercised only when ortools is absent
+    except ImportError as exc:  # pragma: no cover - only when ortools is absent
         cp_model = None
+        _CP_MODEL_IMPORT_ERROR = str(exc)
 
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -1474,8 +1479,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     ) -> None:
         if cp_model is None:
             raise ImportError(
-                "The 'cpsat' layout solver requires the 'ortools' package, "
-                "which is not installed. Install it with 'pip install ortools' "
+                "The 'cpsat' layout solver requires the 'ortools' package, which "
+                f"could not be imported ({_CP_MODEL_IMPORT_ERROR or 'not installed'}). "
+                "Install it with 'pip install ortools' "
                 "or select a different layout_solver (e.g. 'greedy')."
             )
         super().__init__(buffers, size, alignment)

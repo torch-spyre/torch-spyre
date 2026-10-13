@@ -8054,7 +8054,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @unittest.skip("topk.ddl does not support sparse input tensors; see #4732")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason=(
+            "topk.ddl (dxp_standalone) does not support sparse input tensors; "
+            "the backend compiler fails (#4732)"
+        ),
+    )
     def test_topk_sparse_input(self):
         # amax over the stick dim produces a sparse output (constant 0 in the
         # rightmost device coord). topk over a surviving dim of that sparse

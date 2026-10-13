@@ -45,6 +45,7 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
@@ -510,23 +511,26 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_do_not_create_work_div_hint(self):
+    def test_for_each_tile_does_not_create_work_div_hint(self):
         M, N = 128, 64
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
-        _declare_tensor_dim("M", M)
-        _declare_tensor_dim("N", N)
-        _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}):
-                return torch.abs(x)
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
+            _, out = for_each_tile(body, (x,), dims=(0,), tile_size=M // 4, out_dim=0)
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self.assertFalse(any("user-hint" in msg for msg in self._logs()))
 
@@ -538,23 +542,32 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_and_work_div_coexist(self):
+    def test_for_each_tile_and_work_div_coexist(self):
         M, N = 128, 128  # N=128 = 2 sticks; work_div={"N": 2} splits into 1 stick/core
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
         _declare_tensor_dim("N", N)
         _name_tensor_dims(x, ["M", "N"])
 
+        def body(_, ops):
+            (x_tile,) = ops
+            return None, torch.abs(x_tile)
+
         def fn(x):
-            with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
-                return torch.abs(x)
+            with spyre_hint(work_div={"N": 2}):
+                _, out = for_each_tile(
+                    body, (x,), dims=(0,), tile_size=M // 4, out_dim=0
+                )
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self._assert_user_hint_logged()
 
@@ -1652,7 +1665,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
 def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     """Keep the chosen E=2 down->route split while changing only its storage.
 
-    The only hint creates the two-expert loop; there is deliberately no work
+    The only loop is the two-expert for_each_tile; there is deliberately no work
     division hint. The cost model chooses T=4, H=4 and reduction=2 in both
     modes. ON gathers four finished H pieces into each reader's row slice;
     OFF retains the HBM boundary. No change to the chooser is required.
@@ -1673,24 +1686,24 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         .contiguous()
     )
     routes = torch.full((experts, tokens, 1), 0.5, dtype=torch.float16)
-    for name, size in (
-        ("E", experts),
-        ("T", tokens),
-        ("F", intermediate),
-        ("H", hidden),
-        ("R", 1),
-    ):
-        _declare_tensor_dim(name, size)
 
     def fn(activations, weights, routes):
-        with spyre_hint(num_tiles_per_dim={"E": experts}):
-            down = torch.bmm(activations, weights)
-            return down * routes
+        def body(_, ops):
+            act_tile, weight_tile, route_tile = ops
+            return None, torch.bmm(act_tile, weight_tile) * route_tile
+
+        _, out = for_each_tile(
+            body, (activations, weights, routes), dims=(0, 0, 0), tile_size=1, out_dim=0
+        )
+        return out
+
+    def reference(activations, weights, routes):
+        return torch.bmm(activations, weights) * routes
 
     device_args = (
-        _name_tensor_dims(activations.to("spyre"), ["E", "T", "F"]),
-        _name_tensor_dims(weights.to("spyre"), ["E", "F", "H"]),
-        _name_tensor_dims(routes.to("spyre"), ["E", "T", "R"]),
+        activations.to("spyre"),
+        weights.to("spyre"),
+        routes.to("spyre"),
     )
     torch._inductor.codecache.FxGraphCache.clear()
     with (
@@ -1698,11 +1711,16 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         _emitted_kernels() as kernels,
     ):
         actual, _ = run_and_get_code(
-            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            torch.compile(
+                fn,
+                dynamic=False,
+                fullgraph=True,
+                options={"epilogue_fusion": False},
+            ),
             *device_args,
         )
     torch.testing.assert_close(
-        actual.cpu(), fn(activations, weights, routes), rtol=0, atol=0
+        actual.cpu(), reference(activations, weights, routes), rtol=0, atol=0
     )
     specs = [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
     bmm_specs = [spec for spec in specs if spec.op == BATCH_MATMUL_OP]

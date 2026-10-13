@@ -584,13 +584,12 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
 def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     """A coarse-tiled graph must enumerate NO relayout candidates.
 
-    Both ops sit in one coarse-tile hint scope, so the producer's buffer is
+    Both ops sit in one for_each_tile body, so the producer's buffer is
     per-tile scratch and the edge lives inside the loop. The fitted law has
     no loop_trip factor and the committed-path planner forbids in-loop
     relayouts; the solver path must decline at enumeration (loop_info gate),
     not merely decline to fire."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
     orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
@@ -618,25 +617,24 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     torch._dynamo.reset()
 
     def fn(t, u):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                z = torch.abs(t) + u
-                return z * 2
+        def body(_, ops):
+            t_tile, u_tile = ops
+            return None, (torch.abs(t_tile) + u_tile) * 2
+
+        return for_each_tile(body, (t, u), dims=(0, 0), tile_size=128, out_dim=0)[1]
 
     torch.manual_seed(0)
     ha = torch.randn(512, 256, dtype=torch.float16)
     hb = torch.randn(512, 256, dtype=torch.float16)
-    for name, size in (("A", 512), ("B", 256)):
-        _pnd.declare_tensor_dim(name, size)
-    a = _pnd.name_tensor_dims(ha.to("spyre"), ["A", "B"])
-    b = _pnd.name_tensor_dims(hb.to("spyre"), ["A", "B"])
+    a = ha.to("spyre")
+    b = hb.to("spyre")
     with config.patch(
         {
             "co_optimizing_lx_planning": True,
             "layout_solver": "cpsat",
         }
     ):
-        out = torch.compile(fn, dynamic=False)(a, b)
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
     assert tables == [], f"coarse-tiled edges were offered relayout: {tables}"
     assert recorded == []

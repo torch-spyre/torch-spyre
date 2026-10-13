@@ -1745,6 +1745,35 @@ class TestSelectAllocator(unittest.TestCase):
             ilp_solver_ortools.cp_model = saved
 
 
+class TestCpsatFallbackWarning(unittest.TestCase):
+    """Without ortools, ``_make_cpsat_solver`` falls back to greedy on every
+    construction but warns only once per process, naming what failed to import."""
+
+    def test_two_constructions_without_ortools_warn_once(self):
+        from torch_spyre._inductor import logging_utils
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        from torch_spyre._inductor.scratchpad.allocator import GreedyLayoutSolver
+
+        logging_utils._warned_once.discard(
+            (allocator_module.logger.name, "cpsat_unavailable")
+        )
+        with (
+            patch.object(ilp_solver_ortools, "cp_model", None),
+            patch.object(
+                ilp_solver_ortools,
+                "_CP_MODEL_IMPORT_ERROR",
+                "No module named 'pandas'",
+            ),
+            self.assertLogs(allocator_module.logger, level="WARNING") as logs,
+        ):
+            solvers = [allocator_module._make_cpsat_solver([], 4096) for _ in range(2)]
+        for solver in solvers:
+            self.assertIsInstance(solver, GreedyLayoutSolver)
+        self.assertEqual(len(logs.records), 1, logs.output)
+        self.assertIn("No module named 'pandas'", logs.output[0])
+
+
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
     defining a legal in-place edge (shared by the normal producer path and the
