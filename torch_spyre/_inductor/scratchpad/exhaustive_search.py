@@ -214,8 +214,9 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         final_solver = self._inner_factory(_make_temp_bufs(), self.limit)
         final_alloc = final_solver.plan_layout()
         addr_by_name = {a.name: a.address for a in final_alloc}
+        reason_by_name = {a.name: a.spill_reason for a in final_alloc}
         for b in buffers_list:
             b.address = addr_by_name.get(b.name)
+            b.spill_reason = reason_by_name.get(b.name)
 
-        self.spill_reasons = dict(final_solver.spill_reasons)
         return buffers_list

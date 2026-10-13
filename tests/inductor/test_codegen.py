@@ -28,6 +28,9 @@ from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
+    SymbolicArg,
+    SymbolicArgKind,
+    _resolve_symbolic_args,
     ElementArrangement,
 )
 from torch_spyre._inductor import config
@@ -36,6 +39,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    core_idx_to_slice_offset,
     generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
@@ -47,6 +51,7 @@ from torch_spyre._inductor.codegen.superdsc import (
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from utils_inductor import mock_backend_compiler
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -276,6 +281,73 @@ class TestSpyreConfig(InductorTestCase):
             args_str = line[line.index("(") + 1 : line.rindex(")")]
             args = [a.strip() for a in args_str.split(",")]
             self.assertEqual(len(args), len(set(args)), f"Duplicate args: {line}")
+
+    def test_symbolic_address_call_emits_canonical_symbolic_args_payload(self):
+        """The runner builds one SymbolicArg(kAddress) per backend symbol in
+        canonical inputSym_ order using generate_bundle()'s returned symbol_kinds.
+
+        Captures the actual payload passed to launch_jobplan and resolves it so
+        that any ordering bug in the runner is caught, not just bugs in
+        resolveSymbolicArgs itself.  Also verifies that a reversed payload
+        produces a different address vector, proving the ordering contract is
+        load-bearing.
+        """
+
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+        b = torch.randn((128, 64), dtype=torch.float16, device="spyre")
+
+        captured = {}
+
+        def _capture_launch(job_plan, args, symbolic_args=()):
+            captured["args"] = list(args)
+            captured["symbolic_args"] = list(symbolic_args)
+
+        with config.patch({"bundle_symbolic_args": True}):
+            comp_fn = torch.compile(fn)
+            with patch(
+                "torch_spyre.execution.kernel_runner.launch_jobplan",
+                side_effect=_capture_launch,
+            ):
+                comp_fn(a, b)
+
+        self.assertIn("symbolic_args", captured, "launch_jobplan was not called")
+        tensors = captured["args"]
+        symbolic_args = captured["symbolic_args"]
+
+        # Resolve the real payload the runner built.
+        resolved = _resolve_symbolic_args(tensors, symbolic_args)
+
+        # Ground-truth per slot: tensor_id for each position in the deduped
+        # call_args list (0 → a, 1 → b, 2 → out).
+        addr = [
+            _resolve_symbolic_args(
+                tensors, [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=i)]
+            )[0]
+            for i in range(len(tensors))
+        ]
+        self.assertEqual(
+            resolved,
+            [addr[sa.tensor_id] for sa in symbolic_args],
+            "resolved addresses do not match expected per-tensor order",
+        )
+
+        # Forward-vs-reversed differential: wrong slot order must produce a
+        # different address vector, proving the ordering contract is exercised.
+        payload_reversed = list(reversed(symbolic_args))
+        resolved_rev = _resolve_symbolic_args(tensors, payload_reversed)
+        self.assertNotEqual(
+            resolved,
+            resolved_rev,
+            "canonical and reversed payloads resolved identically -- "
+            "all tensors share an address so ordering is not exercised",
+        )
+        self.assertEqual(
+            resolved_rev,
+            [addr[sa.tensor_id] for sa in payload_reversed],
+        )
 
 
 class TestResolveSdscSize(InductorTestCase):
@@ -511,6 +583,72 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestOverlappingWindowCoreOffsets(InductorTestCase):
+    def test_unfold_window_split(self):
+        """Core slices address x.unfold(1, 4, 2).sum(0) at the full window stride."""
+        position, feature, window, batch = sympy.symbols("c0:4")
+        for window_splits in (1, 2, 4):
+            with self.subTest(window_splits=window_splits):
+                iteration_space = {
+                    position: (sympy.Integer(7), 7),
+                    feature: (sympy.Integer(6), 1),
+                    window: (sympy.Integer(4), window_splits),
+                    batch: (sympy.Integer(8), 1),
+                }
+                spec = OpSpec(
+                    op="sum",
+                    is_reduction=True,
+                    iteration_space=iteration_space,
+                    core_id_to_work_slice=derive_operation_mapping(iteration_space),
+                    args=[
+                        TensorArg(
+                            is_input=True,
+                            arg_index=0,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            # The step is two rows; the window reads four.
+                            device_size=[1, 8, 2, 8, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                position,
+                                window,
+                                batch,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 0},
+                        ),
+                        TensorArg(
+                            is_input=False,
+                            arg_index=1,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            device_size=[1, 1, 4, 7, 64],
+                            device_coordinates=[
+                                sympy.floor(feature / 64),
+                                sympy.S.Zero,
+                                window,
+                                position,
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 1},
+                        ),
+                    ],
+                    op_info={},
+                )
+                sdsc, mapping = parse_op_spec(spec)
+                for pos in range(7):
+                    for part in range(window_splits):
+                        slices = {str(dim): 0 for dim in sdsc.work_slices}
+                        slices[str(mapping[position])] = pos
+                        slices[str(mapping[window])] = part
+                        # One physical row spans eight batches of 64 elements.
+                        expected = (2 * pos + part * (4 // window_splits)) * 8 * 64
+                        self.assertEqual(
+                            core_idx_to_slice_offset(
+                                sdsc.args[0], slices, sdsc.work_slices
+                            ),
+                            expected,
+                        )
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
@@ -923,6 +1061,32 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         )
 
 
+class TestClipConstants(InductorTestCase):
+    def test_unbounded_limits_use_device_format(self):
+        for data_format, limit, expected in (
+            (DataFormats.SEN169_FP16, 8573157376.0, (0xFFFE, 0x7FFE)),
+            (
+                DataFormats.IEEE_FP32,
+                float("inf"),
+                (0xFF800000, 0x7F800000),
+            ),
+        ):
+            with self.subTest(data_format=data_format):
+                info = generate_constant_info(
+                    data_format, {"clipMin": -limit, "clipMax": limit}, 1
+                )
+                self.assertEqual(
+                    [entry["data_"]["data_"]["[0, 0, 0]"] for entry in info.values()],
+                    [[str(value)] for value in expected],
+                )
+                self.assertTrue(
+                    all(
+                        entry["dataFormat_"] == data_format.name
+                        for entry in info.values()
+                    )
+                )
+
+
 class TestMaskingConstId(InductorTestCase):
     """maskingConstId_ must resolve to the samv-maskvalue constant.
 
@@ -1014,3 +1178,54 @@ class TestConversionPaddingAcrossStickWidths(InductorTestCase):
                 (stick,) = sdsc_spec.padding
                 self.assertEqual(sdsc_spec.iteration_space[stick], 64)
                 self.assertEqual(sdsc_spec.padding[stick], 63)
+
+
+class TestMatmulReuseDims(InductorTestCase):
+    """superdsc reuse-dim handling for a broadcast matmul."""
+
+    def test_unsqueeze_broadcast_matmul_reuse_dim_scale(self):
+        """[1,T,H]@[E,H,F] -> [E,T,F] in a single kernel invocation.
+
+        With nothing tiling E, it is never constant-folded away before SDSC
+        generation, so x's emitted SDSCArgs must carry E as a genuine "reuse
+        dim" (present in w/output, absent from x) with scale == -1, the same
+        way any other op's Step 2 broadcast-dim handling would.  See
+        _matmul_reuse_dims in superdsc.py.
+        """
+        from torch_spyre._inductor.codegen import superdsc
+
+        E, T, H, F = 4, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+
+        def fn(x, w):
+            return torch.matmul(x.unsqueeze(0), w)
+
+        captured = []
+        real_create_sdsc_tensors = superdsc._create_sdsc_tensors
+
+        def _spy(*args, **kwargs):
+            result = real_create_sdsc_tensors(*args, **kwargs)
+            captured.append(result[0])
+            return result
+
+        with (
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            mock_backend_compiler(),
+            patch.object(superdsc, "_create_sdsc_tensors", side_effect=_spy),
+        ):
+            run_and_get_code(torch.compile(fn), x.to("spyre"), w.to("spyre"))
+
+        self.assertTrue(captured, "no SDSC generated")
+        found_reuse_dim = False
+        for sdsc_args_list in captured:
+            x_arg = sdsc_args_list[0]
+            for dim, scale in x_arg.scales.items():
+                if scale == -1 and str(dim) not in ("H",):
+                    found_reuse_dim = True
+        self.assertTrue(
+            found_reuse_dim,
+            "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
+            "the broadcast batch dim E",
+        )

@@ -130,6 +130,32 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+// NOTE: kDimension is not yet implemented; only kAddress is supported.
+std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
+    const std::vector<at::Tensor>& tensors,
+    const std::vector<SymbolicArg>& symbolic_args) {
+  std::vector<flex::HostComputeArg> resolved(symbolic_args.size());
+  for (size_t i = 0; i < symbolic_args.size(); ++i) {
+    const SymbolicArg& arg = symbolic_args[i];
+    TORCH_CHECK(arg.tensor_id >= 0 &&
+                    static_cast<size_t>(arg.tensor_id) < tensors.size(),
+                "symbolic_args tensor_id out of range");
+    switch (arg.kind) {
+      case SymbolicArgKind::kAddress:
+        resolved[i] = get_composite_address(tensors[arg.tensor_id]);
+        break;
+      case SymbolicArgKind::kDimension:
+        TORCH_CHECK(false,
+                    "SymbolicArgKind::kDimension is not yet implemented");
+        break;
+      default:
+        TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
+                    static_cast<int32_t>(arg.kind));
+    }
+  }
+  return resolved;
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   std::vector<flex::HostComputeArg> args;
@@ -138,16 +164,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // the distinction into HostComputeParams directly.
   if (input_buffer_ == nullptr && !(ishape_.size() == 1 && ishape_[0] == 0)) {
     if (!ctx.symbolic_args.empty()) {
-      // Case 3a: typed symbolic args: one HostComputeArg per slot.
-      for (const auto& sym : ctx.symbolic_args) {
-        TORCH_CHECK(sym.tensor_id >= 0 && static_cast<size_t>(sym.tensor_id) <
-                                              ctx.inputs_outputs.size(),
-                    "symbolic_args tensor_id out of range");
-        TORCH_CHECK(sym.kind == SymbolicArgKind::kAddress,
-                    "SymbolicArgKind::kDimension is not yet implemented");
-        args.push_back(
-            get_composite_address(ctx.inputs_outputs[sym.tensor_id]));
-      }
+      // Case 3a: typed symbolic args — delegate to resolveSymbolicArgs.
+      args = resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
     } else {
       // Case 3b: legacy: one Address arg per context tensor in order.
       for (const auto& tensor : ctx.inputs_outputs) {

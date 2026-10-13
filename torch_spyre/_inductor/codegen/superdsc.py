@@ -1577,7 +1577,7 @@ def _create_sdsc_tensors(
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
-                and dev_dim_size > it_dim_size
+                and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
@@ -1596,8 +1596,12 @@ def _create_sdsc_tensors(
                 # dims that actually carry a window entry are suppressed; a pool's
                 # other dims (mb/out) keep the normal backGap.
                 _pool_window_dim = str(dim) in pool_window_spatial_dims
-                if not _is_conv(op_spec.op) and not _pool_window_dim:
+                if not _is_conv(op_spec.op) and not _pool_window_dim and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
+                # Overlapping views can iterate beyond an aligned physical
+                # axis (e.g. unfold's window is wider than its step). Core
+                # offsets divide this span by the work split, so use the
+                # iteration extent even when it exceeds the device extent.
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)

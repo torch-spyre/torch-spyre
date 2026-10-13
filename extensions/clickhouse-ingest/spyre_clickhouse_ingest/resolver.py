@@ -60,7 +60,7 @@ from .registry import (
     tag_families,
     tag_of,
 )
-from .writer import ArtifactWriter
+from .writer import ArtifactWriter, DryRunClient
 
 KINDS = ("image", "rpm", "wheel", "generic")
 LOOKUP_MODES = ("auto", "off", "only")
@@ -793,7 +793,12 @@ def ensure(
         raise ValueError(f"{spec!r} names no artifact on {arch or 'any arch'}")
     if client is None and not dry_run:
         raise ValueError("ensure writes through a client; without one, pass dry_run")
-    sink = _Capture(client) if dry_run else client
+    # A caller's own dry-run client is kept, so its report covers these rows too.
+    sink = (
+        client
+        if not dry_run or isinstance(client, DryRunClient)
+        else DryRunClient(client)
+    )
     identity = r.identity
     ref = (
         r.artifact.partition(":")[2]
@@ -853,26 +858,6 @@ def _write(client, db, r, identity, ref, new_tags, origin, sources, identity_dep
         props={**({"run_url": run_url} if run_url else {}), **(props or {})},
         tags=[(t, f, props_of(t)) for t, f in new_tags],
     )
-
-
-class _Capture:
-    """A dry run's client: reads go to the database (none: nothing recorded), inserts are kept."""
-
-    def __init__(self, client):
-        self.client, self.rows = client, {}
-
-    def query(self, sql, parameters=None):
-        if self.client is not None:
-            return self.client.query(sql, parameters=parameters)
-        return _Rows([(0,)] if "count()" in sql else [])
-
-    def insert(self, table, rows, column_names=None, database=None, **kwargs):
-        self.rows.setdefault(table, []).extend(dict(zip(column_names, r)) for r in rows)
-
-
-class _Rows:
-    def __init__(self, rows):
-        self.result_rows = rows
 
 
 def ensure_artifact(

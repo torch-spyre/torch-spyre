@@ -12,13 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enumerate the coarse tilings an op could take.
+"""The coarse tilings an op could take, as a space and as a list.
 
-A *pure, unconsumed* enumerator for the coarse-tiling optimization.
-Nothing calls it yet -- the solver that prices and chooses among these options
-arrives separately. Its whole contract is to answer "what tilings could this op
-legally take", exhaustively and deterministically, so the solver has a complete
-candidate set to search.
+:class:`TilingSpace` answers "may this op take *this* tiling" one spec at a
+time, and :func:`enumerate_tile_options` is the cross product over it --
+exhaustive and deterministic, so a solver consuming the list has a complete
+candidate set while one that generates specs as it goes gets the same verdicts
+without materializing them. Because the enumeration *is* the cross product, a
+spec the space admits is one the list would have carried, apart from the
+``max_options`` truncation the list applies and the space does not.
+
+Level *order* is canonical, which is what makes that equality hold in both
+directions: an output spec's levels ascend by ``host_dim``, and a spec in any
+other order is refused rather than admitted. Nest order is consequently not a
+decision variable -- no term in the cost model depends on it, so carrying both
+orders would double the state space, split a tiling group on a distinction
+without a difference, and buy nothing. Reintroduce it alongside a term that
+prices it, not before.
 
 "Legally" includes "can be lowered". Every option passes the lowering's own
 resolver, ``scratchpad.coarse_tiling.try_resolve_tile_axis_loop_vars``, before
@@ -46,7 +56,7 @@ extent is the lever that opens divisors.
 Reductions are enumerated here too, but **single-level only**: never nested with
 an output axis and never two reduction dims at once. Those shapes are the ones
 the reduction-tiling path gets wrong today, so the enumerator must not offer
-them.
+them. The space itself is output-only; the list appends the reduction options.
 
 Two deliberate departures from the span-overflow path:
 
@@ -55,6 +65,9 @@ Two deliberate departures from the span-overflow path:
   tiling produces an undersized boundary ``full_buf`` and silently wrong results
   (the stick-dim upscale bug). So this enumerator drops the stick dim entirely
   rather than trusting the stick-alignment predicate the 448 path relies on.
+  It names the stick dim by coordinate identity only, and offers an op it
+  cannot name one for no output tiling: a size-based guess that missed would
+  leave the true stick dim offered and alignment-checked against the guess.
 * **It does not run on span pressure.** ``_candidate_host_dims`` only offers dims
   that relieve an overflowing span; enumerating from it would return the untiled
   option alone for an op under no pressure, and the solver would never tile it.
@@ -64,6 +77,7 @@ Two deliberate departures from the span-overflow path:
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 from collections.abc import Iterable, Sequence
@@ -89,7 +103,6 @@ from .span_overflow_hint_analysis import (
     _layout_has_static_span_metadata,
     _post_tile_stick_alignment_error,
     _split_candidates_for_host_dim,
-    _within_stick_host_dim,
 )
 
 logger = get_inductor_logger("wsr.enumerate_tilings")
@@ -102,25 +115,12 @@ _MAX_TILE_OPTIONS = 64
 
 
 def _output_stick_host_dim(op: ComputedBuffer) -> int | None:
-    """The op's within-stick output host dim, or ``None`` when unresolved.
-
-    Tiling this dim is excluded (see the module docstring): fail closed. Prefer
-    the coordinate-identity resolver ``_stick_host_dim``; fall back to the
-    size-based ``_within_stick_host_dim``.
-    """
+    """The op's within-stick output host dim, or ``None`` when coordinate
+    identity cannot name it (see the module docstring)."""
     layout = op.get_layout()
     if getattr(layout, "device_layout", None) is None:
         return None
-    try:
-        dim = _stick_host_dim(op, layout.device_layout)
-    except (AttributeError, TypeError, ValueError, RuntimeError, KeyError, IndexError):
-        dim = None
-    if dim is None:
-        try:
-            dim = _within_stick_host_dim(layout)
-        except (AttributeError, TypeError, ValueError, IndexError):
-            dim = None
-    return dim
+    return _stick_host_dim(op, layout.device_layout)
 
 
 def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
@@ -277,6 +277,198 @@ def _finalize_options(options: list[TileSpec], max_options: int) -> list[TileSpe
     return result
 
 
+@dataclasses.dataclass
+class TilingSpace:
+    """One op's legal coarse tilings as a space to move in, not a list.
+
+    The output half of :func:`enumerate_tile_options`, asked one spec at a
+    time: which dims are tileable, what counts each admits, and whether a proposed
+    :class:`TileSpec` is legal. The enumeration is the cross product over
+    exactly these answers, so a spec :meth:`admits` accepts is one the list
+    would have carried -- generation changes when an option is materialized,
+    not which options exist. The one asymmetry is deliberate: ``max_options``
+    truncates the list and constrains the space not at all, which is the whole
+    reason a search generates rather than enumerates.
+
+    The domains are the *legal* counts per output dim, ``1`` excluded (a unit
+    split is the untiled option, which every spec omits rather than spells
+    out), already capped at ``max_splits_per_dim``. Empty for a dim that cannot
+    be tiled at all, including the stick host dim, which
+    :func:`build_tiling_space` drops. Output levels only: a reduction level is
+    never admitted.
+    """
+
+    # Most output levels one spec may nest.
+    max_dims: int
+
+    output_counts: dict[int, list[int]]
+
+    @property
+    def output_dims(self) -> list[int]:
+        """Tileable output host dims, ascending -- the order a spec's levels
+        are enumerated and proposed in."""
+        return sorted(self.output_counts)
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the untiled spec is the only one admitted."""
+        return not self.output_counts
+
+    def counts(self, host_dim: int) -> list[int]:
+        """Legal split counts for output ``host_dim``."""
+        return self.output_counts.get(host_dim, [])
+
+    def admits(self, spec: TileSpec) -> bool:
+        """Whether ``op`` may take ``spec``: output levels only, every level's
+        count legal for its dim, no dim tiled twice, the canonical level order,
+        and at most ``max_dims`` levels."""
+        if spec.is_untiled:
+            return True
+        if any(axis.is_reduction for axis in spec.axes):
+            return False
+        if any(axis.count not in self.counts(axis.host_dim) for axis in spec.axes):
+            return False
+        if any(a.host_dim >= b.host_dim for a, b in zip(spec.axes, spec.axes[1:])):
+            return False  # non-canonical level order (module docstring)
+        return spec.depth <= self.max_dims
+
+    def enumerate(self) -> list[TileSpec]:
+        """Every spec this space admits, untiled first: the cross product over
+        ``max_dims``-subsets of the tileable dims."""
+        options: list[TileSpec] = [TileSpec()]
+        per_dim = [(dim, self.output_counts[dim]) for dim in self.output_dims]
+        # Axes are emitted outermost-first in ascending host_dim order:
+        # output_dims is sorted and itertools.combinations preserves it.
+        # TileSpec order is semantic -- levels nest, so a swapped pair is a
+        # different plan with the same per-tile shape -- and only this order is
+        # enumerated. A consumer that reads its producer with two tiled dims
+        # permuted walks the tiles in the swapped order, so it cannot share that
+        # producer's loop nest (the per-(tile, core) match in the solve's pair
+        # table rules it out) and is split from it instead. Mixing an output
+        # axis with a reduction axis in one spec (refused by :meth:`admits`)
+        # would further make the relative nesting semantic -- reduction-outer
+        # partially accumulates every output tile on each pass, reduction-inner
+        # completes each one before moving on.
+        for depth in range(1, min(self.max_dims, len(per_dim)) + 1):
+            for combo in itertools.combinations(per_dim, depth):
+                dims = [dim for dim, _ in combo]
+                for counts in itertools.product(*(counts for _, counts in combo)):
+                    options.append(
+                        TileSpec(
+                            tuple(
+                                TileAxis(host_dim=dim, count=count)
+                                for dim, count in zip(dims, counts)
+                            )
+                        )
+                    )
+        return options
+
+    def neighbours(self, spec: TileSpec) -> list[TileSpec]:
+        """The specs one level-edit away from ``spec``: change a level's count,
+        remove a level, add an output level. Ordered and deduplicated, so a
+        search proposing from this is deterministic; illegal results are dropped
+        by :meth:`admits`.
+
+        There is no reorder move, and an added level lands in *canonical*
+        position rather than innermost: nest order is not a decision variable
+        (see the module docstring), so a swap would be a free, always-accepted
+        step buying no information. Every candidate is canonicalized on the way
+        out, so even a non-canonical ``spec`` handed in from elsewhere has a way
+        back into the space rather than being stranded.
+        """
+        axes = spec.axes
+        out: list[TileSpec] = []
+        for i, axis in enumerate(axes):
+            for count in self.counts(axis.host_dim):
+                if count != axis.count:
+                    level = dataclasses.replace(axis, count=count)
+                    out.append(TileSpec(axes[:i] + (level,) + axes[i + 1 :]))
+        for i in range(len(axes)):
+            out.append(TileSpec(axes[:i] + axes[i + 1 :]))
+        tiled = {axis.host_dim for axis in axes if not axis.is_reduction}
+        for host_dim in self.output_dims:
+            if host_dim in tiled:
+                continue
+            for count in self.output_counts[host_dim]:
+                out.append(TileSpec(axes + (TileAxis(host_dim=host_dim, count=count),)))
+        return [
+            candidate
+            for candidate in dict.fromkeys(canonical_tiling(c) for c in out)
+            if candidate != spec and self.admits(candidate)
+        ]
+
+
+def canonical_tiling(spec: TileSpec) -> TileSpec:
+    """``spec`` with its levels in the order :meth:`TilingSpace.admits` requires
+    -- output axes before reduction axes, each ascending by ``host_dim``."""
+    return TileSpec(
+        tuple(sorted(spec.axes, key=lambda a: (a.is_reduction, a.host_dim)))
+    )
+
+
+def _tileable(op: object) -> bool:
+    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
+    # and has no device layout of its own to size or stick-check a tile
+    # against; prediction refuses to tile it for the same reason.
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.get_layout(), FixedTiledLayout)
+        and not getattr(op, "dim_hints", [])
+    )
+
+
+def _static_extents(op: ComputedBuffer) -> bool:
+    """Whether ``op`` has no symbolic extent. With one, the applier cannot tile
+    it on any axis (:func:`_symbolic_extent_reason`). The resolver refuses its
+    output axes for the same reason; asking once here also covers the reduction
+    axes, which are resolved one dim at a time."""
+    reason = _symbolic_extent_reason(op)
+    if reason is not None:
+        logger.debug("enumerate_tilings: %s", reason)
+    return reason is None
+
+
+def build_tiling_space(
+    op: ComputedBuffer,
+    *,
+    max_dims: int = _MAX_TILE_DIMS,
+    max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
+    readers: Iterable[Operation] = (),
+) -> TilingSpace:
+    """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
+    be coarse-tiled at all, which is not an error -- untiled is always legal.
+    An output dim the lowering's resolver refuses (:func:`_lowering_accepts`)
+    has an empty domain.
+
+    An op that already carries ``dim_hints`` is one of those: the hint pass and
+    the span-overflow pass both leave that marker set, and ``CoarseTilingPass``
+    stamps ``op.dim_hints`` wholesale, so offering such an op a tiling here
+    would silently clobber the group it is already part of. So is an op with a
+    symbolic extent (:func:`_static_extents`).
+
+    ``readers`` are the ops reading ``op``'s output; a unit tile some reader
+    views through another shape is not admitted
+    (:func:`_unit_tile_breaks_a_reader`).
+    """
+    output_counts: dict[int, list[int]] = {}
+    stick_dim = _output_stick_host_dim(op) if _tileable(op) else None
+    if stick_dim is not None and _static_extents(op):
+        n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+        # Only a ComputedBuffer reader is re-indexed by the apply.
+        retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
+        for host_dim in range(n_out):
+            if host_dim == stick_dim:
+                continue  # fail closed on the stick dim (module docstring)
+            counts = [
+                count
+                for count in _output_split_counts(op, host_dim)
+                if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
+            ][:max_splits_per_dim]
+            if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
+                output_counts[host_dim] = counts
+    return TilingSpace(max_dims=max_dims, output_counts=output_counts)
+
+
 def enumerate_tile_options(
     op: ComputedBuffer,
     *,
@@ -292,8 +484,12 @@ def enumerate_tile_options(
     output dims (up to ``max_dims`` dims tiled at once), plus every single-level
     reduction tiling when ``op`` is a Reduction with no size-1 reduction dim and
     ``enable_reduction_tiling`` is set. It never emits a nested output+reduction
-    spec or a multi-reduction spec. Deterministic and unconsumed; the solver
-    prices and chooses among these.
+    spec or a multi-reduction spec. Deterministic; the solver prices and
+    chooses among these.
+
+    A thin consumer of :class:`TilingSpace`, which holds the output predicates
+    (see :func:`build_tiling_space`): this adds the reduction options, then
+    orders, deduplicates and truncates.
 
     Every option lowers: each candidate dim is resolved through
     :func:`try_resolve_tile_axis_loop_vars` before any spec is built from it --
@@ -303,70 +499,14 @@ def enumerate_tile_options(
     reads each axis independently and from its ``host_dim`` and
     ``is_reduction`` alone, never its ``count``: an axis resolves exactly when
     its dim does, and a spec exactly when each of its axes does.
-
-    ``readers`` are the ops reading ``op``'s output; a unit tile some reader
-    views through another shape is not offered (:func:`_unit_tile_breaks_a_reader`).
-
-    An op with a symbolic extent is offered the untiled option alone: the
-    applier cannot tile it on any axis (:func:`_symbolic_extent_reason`). The
-    resolver refuses its output axes for the same reason; asking once here also
-    covers the reduction axes, which are resolved one dim at a time.
     """
-    options: list[TileSpec] = [TileSpec()]
-    if not isinstance(op, ComputedBuffer):
-        return options
-    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
-    # and has no device layout of its own to size or stick-check a tile
-    # against; prediction refuses to tile it for the same reason.
-    if not isinstance(op.get_layout(), FixedTiledLayout):
-        return options
-    symbolic = _symbolic_extent_reason(op)
-    if symbolic is not None:
-        logger.debug("enumerate_tile_options: %s", symbolic)
-        return options
-
-    # --- output-range options -------------------------------------------------
-    stick_dim = _output_stick_host_dim(op)
-    n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
-    # Only a ComputedBuffer reader is re-indexed by the apply.
-    retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
-    per_dim: list[tuple[int, list[int]]] = []
-    for host_dim in range(n_out):
-        if host_dim == stick_dim:
-            continue  # fail closed on the stick dim (module docstring)
-        counts = [
-            count
-            for count in _output_split_counts(op, host_dim)
-            if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
-        ][:max_splits_per_dim]
-        if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
-            per_dim.append((host_dim, counts))
-
-    # Axes are emitted outermost-first in ascending host_dim order: per_dim is
-    # built over range(n_out) and itertools.combinations preserves it. TileSpec
-    # order is semantic -- levels nest, so a swapped pair is a different plan
-    # with the same per-tile shape -- and only this order is offered. A consumer
-    # that reads its producer with two tiled dims permuted walks the tiles in
-    # the swapped order, so it cannot share that producer's loop nest (the
-    # per-(tile, core) match in the solve's pair table rules it out) and is
-    # split from it instead. Mixing an output axis with a reduction axis in one
-    # spec (impossible today: the reduction options below are single-level)
-    # would further make the relative nesting semantic -- reduction-outer
-    # partially accumulates every output tile on each pass, reduction-inner
-    # completes each one before moving on.
-    for k in range(1, min(max_dims, len(per_dim)) + 1):
-        for dims_combo in itertools.combinations(per_dim, k):
-            dim_indices = [d for d, _ in dims_combo]
-            split_lists = [counts for _, counts in dims_combo]
-            for splits in itertools.product(*split_lists):
-                axes = tuple(
-                    TileAxis(host_dim=d, count=s) for d, s in zip(dim_indices, splits)
-                )
-                options.append(TileSpec(axes))
-
-    # --- reduction options: single-level only ---------------------------------
+    options = build_tiling_space(
+        op, max_dims=max_dims, max_splits_per_dim=max_splits_per_dim, readers=readers
+    ).enumerate()
     if (
-        isinstance(op.data, Reduction)
+        _tileable(op)
+        and _static_extents(op)
+        and isinstance(op.data, Reduction)
         and config.enable_reduction_tiling
         # No reduction tilings beside a size-1 reduction dim (module docstring).
         and all(r != 1 for r in op.data.reduction_ranges)
@@ -378,11 +518,10 @@ def enumerate_tile_options(
         except (StopIteration, AssertionError):
             n_red = 0
         for red_pos in range(n_red):
-            for split in _reduction_split_counts(op, red_pos)[:max_splits_per_dim]:
+            for count in _reduction_split_counts(op, red_pos)[:max_splits_per_dim]:
                 options.append(
                     TileSpec(
-                        (TileAxis(host_dim=red_pos, count=split, is_reduction=True),)
+                        (TileAxis(host_dim=red_pos, count=count, is_reduction=True),)
                     )
                 )
-
     return _finalize_options(options, max_options)
