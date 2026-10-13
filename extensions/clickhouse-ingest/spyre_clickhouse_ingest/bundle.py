@@ -280,21 +280,19 @@ def write_sendnn(client, db, root, meta, aid, rid, props) -> int:
     run_props = {"platform": meta["arch"]}
     if meta.get("started_at"):
         run_props["run_utc"] = sendnn.run_utc(meta["started_at"])
+    reports = sorted((root / "results").glob("*.txt"))
+    # Judged on what parses, not on what is written: a retry after a failed verdict insert
+    # writes nothing new, since the benchmark rows are already in.
+    if not any(sendnn.parse(p) for p in reports):
+        raise BundleError("no sendnn metric parsed from results/")
     try:
-        n = sum(
-            sendnn.write(client, db, rid, p, run_props)
-            for p in sorted((root / "results").glob("*.txt"))
-        )
-        if not n:
-            raise BundleError("no sendnn metric parsed from results/")
+        n = sum(sendnn.write(client, db, rid, p, run_props) for p in reports)
         insert_artifact_result(
             client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
             state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
             props={**{k: v for k, v in props.items() if v},
                    "run_url": meta.get("run_url") or props.get("bundle_url", "")},
         )  # fmt: skip
-    except BundleError:
-        raise
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"sendnn write failed: {err!r}", FAILED) from None
     return n

@@ -179,3 +179,42 @@ def test_a_sendnn_bundle_writes_benchmark_runs_and_a_perf_verdict(
         "bundle",
         "dashboard",
     )
+
+
+def test_a_retry_after_a_lost_verdict_completes_the_upload(
+    tmp_path, monkeypatch, capsys
+):
+    from spyre_clickhouse_ingest import client, resolver
+
+    out = _bundle(tmp_path)
+    ch = CapturingClient()
+    real_insert = ch.insert
+
+    def lose_first_verdict(table, rows, **kw):
+        if table == "artifact_results" and not getattr(ch, "lost", False):
+            ch.lost = True
+            raise ConnectionError("verdict insert dropped")
+        real_insert(table, rows, **kw)
+
+    ch.insert = lose_first_verdict
+    monkeypatch.setattr(client.ClickHouse, "connect", lambda **kw: ch)
+    monkeypatch.setattr(client, "tables_present", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda *a, **kw: SimpleNamespace(
+            artifact_id=AID, arch="s390x", component="torch-spyre"
+        ),
+    )
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "spyre_v2")
+    args = ["results", "--from-bundle", str(out), "--strict", "--uploader", "u@ibm.com"]
+    capsys.readouterr()
+    assert cli(args) != 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["status"] == "failed"
+    assert cli(args) == 0
+    report = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert (report["status"], report["benchmark_runs"]) == ("ingested", 0)
+    assert (
+        len(ch.inserted["benchmark_runs"]) == 2
+        and len(ch.inserted["artifact_results"]) == 1
+    )
