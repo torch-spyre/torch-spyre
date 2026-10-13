@@ -8261,6 +8261,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
+    # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
+    # multiple of the 32 elements in an fp32 stick). The front end pads with the fp16
+    # constants (+-65504.0, torch_spyre/_inductor/codegen/superdsc.py:_get_mask_value)
+    # whatever the dtype, and the backend rejects a 32-bit mask value whose two 16-bit
+    # halves differ (0xc77fe000 here). sum and mean pad with 0.0 and work. fp16 is fine.
+    # TODO: a missing feature (#2534): choose the pad value per dtype (0xFF7FFF7F for
+    # max, 0x7F7F7F7F for min). When it lands these have to become positive tests.
+    @expects_raise
+    def test_amax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amax(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_amin_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amin(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_softmax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(
+                lambda x: torch.softmax(x, dim=-1), x, run_eager=False
+            )
+
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend hits an internal lowering bug for "
