@@ -745,14 +745,6 @@ class TestNegativeScalarOperations:
         assert result.shape == x.shape
         assert result.requires_grad
 
-    # Non-strict: the outcome depends on the deeptools build. It passes on deeptools
-    # main and fails on the older build CI uses, with "In-device copy not
-    # implemented" (#1558). Make it a plain test once CI is on main.
-    @pytest.mark.xfail(
-        strict=False,
-        reason="RuntimeError: In-device copy not implemented (#1558); passes on "
-        "deeptools main, fails on the older build",
-    )
     def test_inplace_scalar_operation(self, execution_mode):
         """In-place multiply by scalar."""
 
