@@ -51,6 +51,7 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 """
 
 import functools
+import math
 import unittest
 import warnings
 from unittest.mock import patch
@@ -1340,19 +1341,27 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
             tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
 
         # Only the expert weights advance; every other input read is fixed.
-        weight_size = [1, hidden, experts, ffn]
+        #
+        # A TensorArg's device_size is the compiler's device layout for that
+        # read, and its axis order and padding depend on the shapes (the
+        # weights come out as [1, 64, 3, 64] here but [64, 2, 3, 64] for
+        # ffn=128), so identify the weight read by its element count, which
+        # no layout change affects, rather than by a layout-specific shape.
+        weight_elements = experts * hidden * ffn
+        is_weight = lambda size: math.prod(size) == weight_elements  # noqa: E731
         weight_reads = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size == weight_size
+            if is_input and is_weight(size)
         ]
         self.assertEqual(len(weight_reads), 1)
         self.assertIsInstance(weight_reads[0], str)
         other_advances = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size != weight_size
+            if is_input and not is_weight(size)
         ]
+        self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
         weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
         self.assertIsNotNone(weight_step)

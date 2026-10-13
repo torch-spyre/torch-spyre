@@ -549,11 +549,11 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         _declare_tensor_dim("N", N)
         _name_tensor_dims(x, ["M", "N"])
 
-        def body(_, ops):
-            (x_tile,) = ops
-            return None, torch.abs(x_tile)
-
         def fn(x):
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
             with spyre_hint(work_div={"N": 2}):
                 _, out = for_each_tile(
                     body, (x,), dims=(0,), tile_size=M // 4, out_dim=0

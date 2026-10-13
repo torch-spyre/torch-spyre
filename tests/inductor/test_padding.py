@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import pytest
 import sympy
 import torch
 import torch.fx as fx
@@ -888,17 +889,22 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile gives a silently wrong result (~64% of elements) for "
+            "a matmul with unaligned K=67 and a loop-invariant weight (#5440)"
+        ),
+    )
     def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
         """for_each_tile twin of test_bmm_read_copy_y_unaligned_k_pads.
 
-        KNOWN WRONG ANSWER: x is [E, M, K=67] tiled over E and w is a
-        loop-invariant [K, N]; the compiled result is ~64% wrong (max abs
-        error ~2.7e4) although the same graph with K=64 or without the loop is
-        correct, and the hint-driven twin above passes.  Compiling does not
-        fail, so this is a silent wrong-answer in the for_each_tile path.
-        Only the numeric comparison is expected to raise AssertionError, so a
-        compile error or harness break still fails this test.  When the bug is
-        fixed, the ``assertRaises`` below fails: drop it and compare directly.
+        x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
+        compiled result is ~64% wrong (max abs error ~2.7e4) although the same
+        graph with K=64 or without the loop is correct, and the hint-driven twin
+        above passes.  Compiling does not fail, so this is a silent wrong answer
+        in the for_each_tile path (#5440).
         """
         dtype = torch.float16
         E, M, K, N = 3, 64, 67, 128
@@ -917,10 +923,9 @@ class TestInsertPaddingIR(unittest.TestCase):
             ]
 
         _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
-        with self.assertRaises(AssertionError):
-            torch.testing.assert_close(
-                torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
-            )
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
