@@ -43,8 +43,8 @@ CREATE VIEW IF NOT EXISTS v_result_uploads AS
 SELECT
     upload_id,
     argMax(state, ts)          AS state,
-    argMax(actor, ts)          AS actor,
-    argMin(actor, ts)          AS uploaded_by,
+    argMax(r.actor, ts)        AS actor,
+    argMin(r.actor, ts)        AS uploaded_by,
     argMin(artifact_id, ts)    AS artifact_id,
     argMin(run_id, ts)         AS run_id,
     argMin(format, ts)         AS format,
@@ -58,7 +58,7 @@ SELECT
     argMax(reason, ts)         AS reason,
     min(ts)                    AS uploaded_at,
     max(ts)                    AS updated_at
-FROM result_uploads
+FROM result_uploads AS r  -- qualified: the actor alias would shadow the column
 GROUP BY upload_id;
 
 -- artifact_results minus retracted uploads' runs.
