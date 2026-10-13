@@ -69,10 +69,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    RelayoutCopyBuffer,
     TileAxis,
     TileSpec,
     ceil_div,
 )
+from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -80,6 +82,7 @@ from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+    from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
@@ -100,10 +103,10 @@ def _step_budget(n: int) -> int:
     return min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
 
 
-# Fixed proposal weights over the three move types. Reorder's weight is
-# effectively 0 while every eligible buffer is resident (see
-# :meth:`_applicable_moves`).
-_MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2}
+# Fixed proposal weights over the move types. Reorder's weight is effectively 0
+# while every eligible buffer is resident, and relayout's on a graph with no
+# relayout copy (see :meth:`_applicable_moves`).
+_MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2, "relayout": 0.2}
 
 # Layout-burst length as a fraction of the buffer count. The burst warms ``pi`` to
 # the new footprints before a compound structural move is judged.
@@ -688,8 +691,18 @@ class _ViewRelation(_EdgeRelation):
         return self._up[child.key]
 
 
+# The joint state ``(pi, W)`` as :meth:`SaCoOptimizingSolver._snapshot` takes it:
+# the packer, the division vector, the eligible count, and the relayout copies
+# switched on.
+_Snapshot = tuple[NativePermutationLayoutSolver, list[DivisionConfig], int, set[int]]
+
+
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine.
+
+    Decides LX relayouts: the allocator hands it one ``RelayoutCopyBuffer`` per
+    relayout group, the search switches each on or off, and a consumer reading
+    a resident parent through a resident copy gets ``chosen_relayouts``.
 
     The search is fully determined by the module constants above; there is
     nothing to configure per call.
@@ -719,7 +732,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def decides_lx_relayouts(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def generates_divisions(cls) -> bool:
@@ -760,7 +773,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
-        self._best_snap: tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]
+        self._best_snap: _Snapshot
         # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
         # as a count, not a mask: the two ripple sites already evaluate
         # ``_eligible`` over the buffers a move can change, so they carry the
@@ -939,8 +952,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Ops that could take a split division at all -- the only legal recolor
         # anchors, so recolor stays a coordinated *splitting* move and leaves
         # undividing to atomic flips. Static; what a given step can actually
-        # draw is :meth:`_DivisionSource.anchor`.
-        self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
+        # draw is :meth:`_DivisionSource.anchor`. A relayout copy's one division
+        # is its destination's slicing, not a choice, and it has no edge to
+        # flood along.
+        self._anchor_candidates = [
+            i
+            for i in range(n)
+            if self._sources[i].can_split()
+            and not isinstance(bufs[i], RelayoutCopyBuffer)
+        ]
         self._build_operation_positions()
         # Whether any buffer can carry a tiling at all, so the companion term
         # costs one bool per score where it cannot -- which is every graph with
@@ -963,7 +983,67 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             view_relations,
             len(self._relations) - view_relations,
         )
+        self._build_relayout_topology()
         self._precompute_spill_costs()
+
+    def _build_relayout_topology(self) -> None:
+        """Index the relayout copies (:class:`RelayoutCopyBuffer`) the
+        allocator handed over: each copy's source, each source's copies, and
+        per edge which copy a consumer reads its parent through under which
+        pair of divisions.
+
+        A candidate is keyed by ``(source division, consumer division)`` as
+        menu positions, and the consumer's division fixes the view it reads,
+        so a pair names at most one group: on a given edge the divisions alone
+        decide which copy serves, and the search decides only whether it is
+        resident. A pair naming two copies is an enumeration error.
+        """
+        n = len(self._bufs)
+        # copy idx -> source idx. A copy whose source is not in the solve is
+        # absent and never eligible (the allocator builds none such).
+        self._relayout_source: dict[int, int] = {}
+        # source idx -> its copies.
+        self._relayout_copies_of: list[list[int]] = [[] for _ in range(n)]
+        # copy idx -> the consumers it may serve, in index order.
+        self._relayout_consumers: dict[int, list[int]] = {}
+        # (source idx, consumer idx) -> {(source pos, consumer pos): (copy idx,
+        # the candidate)}.
+        self._relayout_reads: dict[
+            tuple[int, int], dict[tuple[int, int], tuple[int, RelayoutCandidate]]
+        ] = {}
+        for idx, buf in enumerate(self._bufs):
+            if not isinstance(buf, RelayoutCopyBuffer):
+                continue
+            source = self._name_to_idx.get(buf.relayout_parent)
+            if source is None:
+                continue
+            self._relayout_source[idx] = source
+            self._relayout_copies_of[source].append(idx)
+            consumers: set[int] = set()
+            for candidate in buf.candidates:
+                consumer = self._name_to_idx.get(candidate.consumer)
+                if consumer is None:
+                    continue
+                consumers.add(consumer)
+                pairs = self._relayout_reads.setdefault((source, consumer), {})
+                pair = (candidate.source_division, candidate.consumer_division)
+                known = pairs.setdefault(pair, (idx, candidate))
+                assert known[0] == idx, (
+                    f"{candidate.consumer} reads {buf.relayout_parent} under "
+                    f"division pair {pair} through two copies: "
+                    f"{self._bufs[known[0]].name} and {buf.name}"
+                )
+            self._relayout_consumers[idx] = sorted(consumers)
+        # The copies a relayout move draws from, and the ones it has switched
+        # on. All start off, so the seed is the plan without relayouts.
+        self._relayout_copy_list = sorted(self._relayout_source)
+        self._relayout_on: set[int] = set()
+        if self._relayout_source:
+            logger.debug(
+                "%d relayout copies over %d sources",
+                len(self._relayout_source),
+                sum(1 for copies in self._relayout_copies_of if copies),
+            )
 
     def _build_operation_positions(self) -> None:
         """Index the buffers by ``CoreDivisionBuffer.op_position``, both ways.
@@ -1140,7 +1220,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Cache the loop-invariant inputs to :meth:`_score`. A move changes only
         the *per-core* footprint the packer sees, never a buffer's total size, so
         neither the spill costs nor the bandwidth constant can move."""
-        self._spill_costs = [self._spill_cost(b) for b in self._bufs]
+        # A relayout copy left out of LX moves nothing: the shuffle does not fire.
+        self._spill_costs = [
+            0 if isinstance(b, RelayoutCopyBuffer) else self._spill_cost(b)
+            for b in self._bufs
+        ]
         self._hbm_bytes_per_us = utils.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
@@ -1187,15 +1271,140 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # limit`` test, which is division-dependent and is the next gate down.
         if b.residency_reason is not None:
             return False
+        if isinstance(b, RelayoutCopyBuffer):
+            return self._relayout_copy_eligible(idx)
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
         parent = self.chosen[idx]
         if self._read_across_a_tiling_boundary(idx, parent):
             return False
+        # A child the division pair does not match may still read this buffer
+        # from LX, through the relayout copy that pair names.
         return all(
             relation.compatible(parent, self.chosen[c_idx])
+            or self._relayout_copy_can_serve(idx, c_idx)
             for c_idx, relation in self._children[idx]
         )
+
+    # -- relayout copies -----------------------------------------------------
+    #
+    # A RelayoutCopyBuffer is the LX destination of one relayout group, and its
+    # residency is the decision that the shuffle fires; its price is the
+    # RelayoutCharge term the allocator adds to ``cost_expr``. What the copy
+    # cannot carry as data is the coupling: a resident copy needs its source
+    # resident under a priced division, and a resident source a consumer does not
+    # match needs that consumer's copy resident. The division-only half is
+    # eligibility (below), consistent by construction: a copy is eligible only
+    # while its source is, and a source only while every copy it needs could
+    # hold. The placement half is the packer's outcome, so it is enforced after
+    # packing by :meth:`_resident_addresses`.
+
+    def _relayout_read(
+        self, source: int, consumer: int
+    ) -> Optional[tuple[int, RelayoutCandidate]]:
+        """The copy ``consumer`` reads ``source`` through under the current
+        divisions and the candidate that prices it, or ``None`` if the pair of
+        divisions has none -- including a division the menu does not carry,
+        which nothing priced."""
+        pairs = self._relayout_reads.get((source, consumer))
+        if not pairs:
+            return None
+        i = self._known_menu_position(source, self.chosen[source])
+        j = self._known_menu_position(consumer, self.chosen[consumer])
+        if i is None or j is None:
+            return None
+        return pairs.get((i, j))
+
+    def _relayout_copy_admissible(self, copy_idx: int) -> bool:
+        """Whether copy ``copy_idx`` could hold its destination at all, apart
+        from its source and its consumers: switched on by the search (see
+        :meth:`_toggle_relayout`), under the cost objective only, since the
+        memory-only fallback has no price for a shuffle and would take every
+        one as free, and at a per-core span that fits."""
+        if self._score_fn is None or copy_idx not in self._relayout_on:
+            return False
+        if self._bufs[copy_idx].residency_reason is not None:
+            return False
+        return self._per_core_size(copy_idx, self.chosen[copy_idx]) <= self.limit
+
+    def _relayout_copy_can_serve(self, source: int, consumer: int) -> bool:
+        """Whether ``consumer`` could read ``source`` from LX through a copy
+        under the current divisions."""
+        read = self._relayout_read(source, consumer)
+        return read is not None and self._relayout_copy_admissible(read[0])
+
+    def _relayout_copy_serves(self, copy_idx: int) -> bool:
+        """Whether some consumer reads its source through copy ``copy_idx``
+        under the current divisions, i.e. does not match the source and names
+        this copy. A copy no one reads is a shuffle for nothing."""
+        source = self._relayout_source[copy_idx]
+        parent = self.chosen[source]
+        for consumer in self._relayout_consumers[copy_idx]:
+            read = self._relayout_read(source, consumer)
+            if (
+                read is not None
+                and read[0] == copy_idx
+                and not self._relations[(source, consumer)].compatible(
+                    parent, self.chosen[consumer]
+                )
+            ):
+                return True
+        return False
+
+    def _relayout_copy_eligible(self, copy_idx: int) -> bool:
+        """:meth:`_eligible` for a relayout copy: admissible, serving someone,
+        and its source eligible. The last makes the predicate consistent, so
+        when every eligible buffer is placed nothing has to be dropped
+        (:meth:`_all_eligible_resident` stays exact)."""
+        return (
+            self._relayout_copy_admissible(copy_idx)
+            and self._relayout_copy_serves(copy_idx)
+            and self._eligible(self._relayout_source[copy_idx])
+        )
+
+    def _with_relayout_copies(self, affected: set[int]) -> set[int]:
+        """``affected`` plus the relayout copies of every buffer in it: a copy's
+        eligibility follows its source's, and a buffer whose eligibility a move
+        can change is in ``affected`` already."""
+        if not self._relayout_source:
+            return affected
+        return affected.union(
+            *(self._relayout_copies_of[idx] for idx in list(affected))
+        )
+
+    def _resident_addresses(self) -> list[Optional[int]]:
+        """``packer.addresses`` with the relayout coupling the packer cannot see
+        enforced: the addresses of the buffers actually resident.
+
+        Eligibility keeps the coupling over divisions, but under capacity
+        pressure the packer can place one side and spill the other. So, only
+        ever *removing* what it placed: a source some consumer must read
+        through a copy the packer did not place is dropped, then every copy
+        whose source is not resident. That is a fixpoint already -- dropping a
+        source orphans only its own copies, and dropping a copy strands no
+        other source -- and the result does not depend on order. A dropped
+        buffer wastes its LX in this state, which the objective prices; it never
+        reaches the write-back.
+        """
+        addresses = self.packer.addresses
+        if not self._relayout_source:
+            return addresses
+        addresses = list(addresses)
+        for source, copies in enumerate(self._relayout_copies_of):
+            if not copies or addresses[source] is None:
+                continue
+            parent = self.chosen[source]
+            for consumer, relation in self._children[source]:
+                if relation.compatible(parent, self.chosen[consumer]):
+                    continue
+                read = self._relayout_read(source, consumer)
+                if read is None or addresses[read[0]] is None:
+                    addresses[source] = None
+                    break
+        for copy_idx, source in self._relayout_source.items():
+            if addresses[source] is None:
+                addresses[copy_idx] = None
+        return addresses
 
     def _read_across_a_tiling_boundary(self, idx: int, parent: DivisionConfig) -> bool:
         """Whether buffer ``idx`` is read by a coarse-tiled consumer at an
@@ -1419,7 +1628,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if not self._bufs:
             return {}
         ns = 1000.0 / utils.US_FIXED_POINT_SCALE
-        return {"companions": self._companions(self.packer.addresses) * ns}
+        return {"companions": self._companions(self._resident_addresses()) * ns}
 
     def score_ns(self) -> Optional[float]:
         if not self._bufs:
@@ -1428,8 +1637,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
-        time units. A buffer with a packer address is LX-resident (its address is
-        ``None`` iff ineligible or spilled).
+        time units. A buffer with a resident address is LX-resident (its address
+        is ``None`` iff ineligible, spilled, or dropped by the relayout coupling;
+        see :meth:`_resident_addresses`).
 
         Hot path: reads ``packer.addresses`` **once**. The native packer
         materializes a fresh list per ``addresses`` access, so a per-buffer read
@@ -1442,7 +1652,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         Both add :meth:`_companion_bytes` at the HBM rate.
         """
-        addresses = self.packer.addresses
+        addresses = self._resident_addresses()
         companions = self._companions(addresses)
         if self._score_fn is not None:
             resident = frozenset(
@@ -1472,8 +1682,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Change buffer ``idx``'s division to ``config`` and ripple: resize its
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
-        an op's own division and its children's."""
-        affected = sorted({idx} | self._parents_idx[idx])
+        an op's own division and its children's -- plus their relayout copies,
+        whose eligibility follows their source's."""
+        affected = sorted(self._with_relayout_copies({idx} | self._parents_idx[idx]))
         before = sum(self._eligible(x) for x in affected)
         self.chosen[idx] = config
         self.packer.resize(idx, self._per_core_size(idx, config))
@@ -1651,7 +1862,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         affected = set(assignment)
         for op in assignment:
             affected |= self._parents_idx[op]
-        affected_sorted = sorted(affected)
+        affected_sorted = sorted(self._with_relayout_copies(affected))
         before = sum(self._eligible(x) for x in affected_sorted)
         for op, config in assignment.items():
             self.chosen[op] = config
@@ -1663,6 +1874,69 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             after += flag
             self.packer.set_eligible(x, flag)
         self._n_eligible += after - before
+
+    def _toggle_relayout(self, copy_idx: int) -> None:
+        """Switch relayout copy ``copy_idx`` on or off, and ripple.
+
+        Residency cannot decide a shuffle on its own: the packer places every
+        eligible buffer that fits, which is right for a buffer whose residency
+        only saves traffic, and wrong for a copy, whose residency costs its
+        price. Off, the copy is ineligible, and so is its source wherever a
+        consumer reads it only through this copy. On, both may be placed.
+
+        A toggle changes the eligibility of the copy and its source, and the
+        source's decides its other copies' (:meth:`_relayout_copy_eligible`).
+        """
+        affected = sorted(self._with_relayout_copies({self._relayout_source[copy_idx]}))
+        before = sum(self._eligible(x) for x in affected)
+        self._relayout_on ^= {copy_idx}
+        after = 0
+        for x in affected:
+            flag = self._eligible(x)
+            after += flag
+            self.packer.set_eligible(x, flag)
+        self._n_eligible += after - before
+
+    def _relayout(self) -> None:
+        """One relayout move: switch a uniformly drawn copy off, or on together
+        with the divisions it is priced for, then burst.
+
+        Switching a copy on alone rarely pays: a consumer reads through it only
+        under one of its candidates' division pairs, and those are few among the
+        pairs an edge can take, so the move that would make it pay is a second,
+        independent one, and each half on its own is worth nothing to the score.
+        So switching on also draws one of the copy's candidates and moves its
+        source to that source division and every consumer the copy can serve
+        from it to a division priced into this group -- the whole group bought
+        in one step, judged as a unit, as recolor judges a flooded region.
+        """
+        copy_idx = self._rng.choice(self._relayout_copy_list)
+        if copy_idx in self._relayout_on:
+            self._toggle_relayout(copy_idx)
+        else:
+            self._toggle_relayout(copy_idx)
+            self._apply_assignment(self._relayout_assignment(copy_idx))
+        self._burst()
+
+    def _relayout_assignment(self, copy_idx: int) -> dict[int, DivisionConfig]:
+        """The divisions that make copy ``copy_idx`` serve: one of its
+        candidates drawn uniformly, its source at that candidate's division,
+        and each consumer at the first division (in candidate order) priced
+        into this group from that same source division."""
+        copy = cast(RelayoutCopyBuffer, self._bufs[copy_idx])
+        source = self._relayout_source[copy_idx]
+        drawn = self._rng.choice(copy.candidates)
+        assignment = {source: self._menus[source].configs[drawn.source_division]}
+        for candidate in copy.candidates:
+            if candidate.source_division != drawn.source_division:
+                continue
+            consumer = self._name_to_idx.get(candidate.consumer)
+            if consumer is None or consumer in assignment:
+                continue
+            assignment[consumer] = self._menus[consumer].configs[
+                candidate.consumer_division
+            ]
+        return assignment
 
     def _recolor(self) -> None:
         """One region-recolor move: a uniform anchor op (so a region is hit
@@ -1704,30 +1978,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- state snapshots -----------------------------------------------------
 
-    def _snapshot(
-        self,
-    ) -> tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]:
+    def _snapshot(self) -> _Snapshot:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
         division vector, and the eligible count ``W`` implies -- rebuilding that
-        from ``W`` would cost an O(n) pass the restore does not otherwise need."""
-        return (self.packer.copy(), list(self.chosen), self._n_eligible)
+        from ``W`` would cost an O(n) pass the restore does not otherwise need --
+        and the relayout copies switched on, which nothing else can rebuild."""
+        return (
+            self.packer.copy(),
+            list(self.chosen),
+            self._n_eligible,
+            set(self._relayout_on),
+        )
 
-    def _adopt(
-        self, snap: tuple[NativePermutationLayoutSolver, list[DivisionConfig], int]
-    ) -> None:
+    def _adopt(self, snap: _Snapshot) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
         one O(n) packer copy for its snapshot.
         """
-        self.packer, self.chosen, self._n_eligible = snap
+        self.packer, self.chosen, self._n_eligible, self._relayout_on = snap
 
     # -- move selection & execution -----------------------------------------
 
     def _applicable_moves(self) -> list[str]:
         """Move types available this step, in fixed (deterministic) order: reorder
-        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor.
+        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor,
+        relayout a relayout copy and the cost objective that prices it (the
+        memory-only fallback keeps every copy off).
 
         Reorder additionally drops out (its proposal weight becomes 0) once every
         eligible buffer is resident: ``pi`` only decides which eligible buffers
@@ -1740,6 +2018,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             moves.append("flip")
         if self._anchor_candidates:
             moves.append("recolor")
+        if self._relayout_copy_list and self._score_fn is not None:
+            moves.append("relayout")
         return moves
 
     def _choose_move(self) -> str:
@@ -1774,6 +2054,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self._burst()
         elif name == "recolor":
             self._recolor()
+        elif name == "relayout":
+            self._relayout()
         # "none": no applicable move; no-op.
 
     # -- annealing loop ------------------------------------------------------
@@ -1903,7 +2185,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _anneal(self) -> None:
         """One geometric cool over the clamped step budget, at fixed proposal
         weights, publishing the best state seen."""
-        n = len(self._bufs)
+        # Per decision, not per slot: a relayout copy carries no division
+        # decision (which one an edge reads is the divisions' call), and a graph
+        # can carry thousands.
+        n = sum(not isinstance(b, RelayoutCopyBuffer) for b in self._bufs)
         steps = _step_budget(n)
         if steps < _STEPS_PER_BUFFER * n:
             logger.debug(
@@ -1948,7 +2233,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if not self._tilings_are_possible:
             return
         charges: dict[tuple[int, int], int] = {}
-        for run, nbytes in self._companion_charges(self.packer.addresses):
+        for run, nbytes in self._companion_charges(self._resident_addresses()):
             charges[run] = charges.get(run, 0) + nbytes
         tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
         could_tile = [
@@ -1993,13 +2278,37 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         does not carry (a tiled one, once the search chooses tilings) is
         appended. Appending here rather than when the division is proposed keeps
         the menu the search ran against unchanged.
+
+        A consumer reading a resident parent it does not match reads it through
+        the relayout copy its division pair names, which is resident too
+        (:meth:`_resident_addresses`); that read is recorded on the consumer
+        with the copy's address, as ``CpSatLayoutSolver`` records it, for the
+        commit path to materialize.
         """
+        addresses = self._resident_addresses()
         for i, b in enumerate(self._bufs):
-            addr = self.packer.addresses[i]
+            addr = addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])
             b.address = addr
             spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
             b.spill_reason = spilled if addr is None else None
+        for source, copies in enumerate(self._relayout_copies_of):
+            if not copies or addresses[source] is None:
+                continue
+            parent = self.chosen[source]
+            for consumer, relation in self._children[source]:
+                if relation.compatible(parent, self.chosen[consumer]):
+                    continue
+                read = self._relayout_read(source, consumer)
+                assert read is not None and addresses[read[0]] is not None, (
+                    f"{self._bufs[source].name} is resident but "
+                    f"{self._bufs[consumer].name} has no resident copy to read it "
+                    "through"
+                )
+                copy_idx, candidate = read
+                self._bufs[consumer].chosen_relayouts[self._bufs[source].name] = (
+                    ChosenRelayout(candidate, cast(int, addresses[copy_idx]))
+                )
 
     def _known_menu_position(self, idx: int, config: DivisionConfig) -> Optional[int]:
         """The position in buffer ``idx``'s ``core_divisions`` that names

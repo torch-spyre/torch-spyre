@@ -46,10 +46,11 @@ those (`_GeneratedDivisions`); the rest read the enumerated menu (`_MenuDivision
 producer→consumer edge likewise gets an `_EdgeRelation`, which the residency gate and the recolor
 flood ask: computed per candidate off the buffer's geometry where both ends generate
 (`_ViewRelation`, which inverts the per-core view to construct the other end's division), and the
-`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). The one thing still
-keyed by menu position is the `chosen_division` written back; a generated division the menu does
-not carry is appended to it then — which is the path a tiled division always takes, since the
-enumeration carries no tilings.
+`cd_parent_matches` table projected onto choices otherwise (`_TableRelation`). Two things are still
+keyed by menu position: the `chosen_division` written back, and the relayout candidates and their
+prices (see [LX relayouts](#lx-relayouts)). A generated division finds its position by its key; one
+the menu does not carry is unpriced for a relayout, and is appended to the menu at write-back,
+which is the path a tiled division always takes, since the enumeration carries no tilings.
 
 ### The coarse tiling rides on the same candidate
 
@@ -148,6 +149,31 @@ re-read not double-counted (`_COST_PARAMS`), depth reaches the price mainly thro
 A coarse-tiled op reading a buffer produced outside its run reads it at an address that advances
 per tile, which an LX address cannot: `_read_across_a_tiling_boundary` refuses that buffer LX.
 Nothing gives that residency back yet; a tile-local staging copy, placed by the anneal, could.
+
+### LX relayouts
+
+The allocator hands the engine one `RelayoutCopyBuffer` per relayout group, as it does CP-SAT, and the objective carries each copy's `RelayoutCharge` price term.
+A copy is the LX destination of one (source, destination view) shuffle, and its residency is the decision that the shuffle fires.
+A candidate is keyed by the (source, consumer) pair of menu positions, and the consumer's division fixes the view it reads, so on a given edge the divisions alone name the copy that serves it.
+
+The coupling CP-SAT states as constraints splits in two here.
+The half that depends only on divisions is eligibility.
+A source's child gate relaxes from "every child compatible" to "compatible, or a copy serves this pair and could hold it".
+A copy is eligible only while some consumer it can serve does not match its source, and only while its source is eligible, which keeps the predicate consistent, so `_all_eligible_resident` stays exact.
+The half that depends on placement is the packer's outcome: under capacity pressure it can place a source and spill the copy a consumer must read it through, or the reverse.
+`_resident_addresses` enforces it after packing by removing, never adding: a placed source a consumer cannot read is dropped, then every copy whose source is not resident.
+That is already a fixpoint, since dropping a source orphans only its own copies.
+The score, the dump and the write-back all read that resident set, and the write-back records each relayout read in `chosen_relayouts`, as CP-SAT does.
+
+Residency cannot decide a shuffle on its own.
+The packer places every eligible buffer that fits, which is right for a buffer whose residency only saves traffic and wrong for a copy, whose residency costs its price.
+So each copy carries an on/off bit, part of the state and of every snapshot, and every copy starts off, so the seed is the plan without relayouts.
+The `relayout` move draws a copy uniformly.
+It switches a copy that is on off.
+It switches a copy that is off on together with one of its candidates' divisions, for the source and for every consumer the group can serve from it.
+Switching it on alone would pay only when the divisions already sat on one of its few priced pairs, so each half of the change would be worth nothing to the score on its own.
+The memory-only fallback has no price for a shuffle, so under it every copy stays off and the move is not offered.
+A relayout copy carries no division decision, so it buys the search no steps.
 
 ## The apply round
 

@@ -37,6 +37,7 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+import random
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -54,6 +55,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _sibling_pinned_divisions,
 )
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
     FiredRelayoutGroup,
@@ -226,10 +228,19 @@ def _objective(buffers, spill_ns=None) -> sympy.Expr:
     return expr
 
 
-def _solve(buffers, size=64, expr="default", **spill_ns):
+_ENGINES = {"cpsat": CpSatLayoutSolver, "annealer": SaCoOptimizingSolver}
+
+
+@pytest.fixture(params=sorted(_ENGINES))
+def engine(request):
+    """Each engine that decides relayouts, by name."""
+    return request.param
+
+
+def _solve(engine, buffers, size=64, expr="default", **spill_ns):
     if expr == "default":
         expr = _objective(buffers, spill_ns)
-    solver = CpSatLayoutSolver(buffers, size, alignment=1)
+    solver = _ENGINES[engine](buffers, size, alignment=1)
     return {b.name: b for b in solver.plan_layout_and_core_divisions(expr)}
 
 
@@ -257,7 +268,7 @@ def test_relayout_solve_presolves_by_default(monkeypatch, priced):
         return original(solver, model, *args, **kwargs)
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
-    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    result = _solve("cpsat", buffers, expr=_objective(buffers) if priced else None)
     assert parameters and all(parameters)
     assert (_copy(result).address is not None) == priced
 
@@ -292,7 +303,7 @@ def test_relayout_solve_uses_available_parallel_search_workers(
         return original(solver, model, *args, **kwargs)
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
-    _solve(buffers, expr=_objective(buffers))
+    _solve("cpsat", buffers, expr=_objective(buffers))
     assert workers == [expected_workers]
 
 
@@ -589,7 +600,7 @@ def test_group_without_its_source_gets_no_copy():
 
 
 # ---------------------------------------------------------------------------
-# The CP-SAT decision
+# The decision, under every engine that makes it
 # ---------------------------------------------------------------------------
 
 
@@ -599,8 +610,8 @@ def _pc(relayout_cost_ns):
     )
 
 
-def test_relayout_fires_when_cheaper_than_the_spill():
-    r = _solve(_pc(5000.0))
+def test_relayout_fires_when_cheaper_than_the_spill(engine):
+    r = _solve(engine, _pc(5000.0))
     p, c, copy = r["P"], r["C"], _copy(r)
     assert p.address is not None, "P must reside: relayout beats the spill"
     assert copy.address is not None, "the copy IS the decision"
@@ -613,49 +624,49 @@ def test_relayout_fires_when_cheaper_than_the_spill():
     assert _disjoint(copy.address, p.address), "copy overlaps its source"
 
 
-def test_relayout_declines_when_dearer_than_the_spill():
-    r = _solve(_pc(50000.0))
+def test_relayout_declines_when_dearer_than_the_spill(engine):
+    r = _solve(engine, _pc(50000.0))
     assert r["P"].address is None, "spilling is cheaper: P must not reside"
     assert _copy(r).address is None and r["C"].chosen_relayouts == {}
 
 
-def test_capacity_vetoes_a_profitable_relayout():
+def test_capacity_vetoes_a_profitable_relayout(engine):
     # 16-byte LX: P's per-core footprint fills it, so the copy cannot coexist
     # with P at C's tick. The copy stays out no matter how profitable, and P
     # without a serving copy cannot reside (gate: match or served).
-    r = _solve(_pc(5000.0), size=16)
+    r = _solve(engine, _pc(5000.0), size=16)
     assert _copy(r).address is None and r["C"].chosen_relayouts == {}
     assert r["P"].address is None
 
 
-def test_fallback_objective_never_decides_a_relayout():
+def test_fallback_objective_never_decides_a_relayout(engine):
     # Under the HBM-bytes fallback (cost_expr=None) a shuffle is unpriced and
     # would look free; every copy must be pinned out, restoring the old gate:
     # no match pair -> P spilled.
-    r = _solve(_pc(5000.0), expr=None)
+    r = _solve(engine, _pc(5000.0), expr=None)
     assert r["P"].address is None
     assert _copy(r).address is None and r["C"].chosen_relayouts == {}
 
 
-def test_copy_never_resides_without_its_source():
+def test_copy_never_resides_without_its_source(engine):
     # P is barred from LX by the allocator (residency_reason). Its copy has a
     # profitable price and room to spare, but a copy needs its source
     # resident: it must stay out.
     p = _producer([0, 1])
     p.residency_reason = "barred for the test"
     bufs = _with_copies(p, _consumer("C", 1, 2, [_candidate("C", 0, 1.0)]))
-    r = _solve(bufs)
+    r = _solve(engine, bufs)
     assert r["P"].address is None
     assert _copy(r).address is None and r["C"].chosen_relayouts == {}
 
 
-def test_gate_without_a_relayout_table_is_unchanged():
+def test_gate_without_a_relayout_table_is_unchanged(engine):
     # No match pairs and no relayout table: in_buffer is forced off exactly
     # as before (regression guard for the constrain_residency rewrite). No
     # copy exists, so no price term either.
     bufs = _with_copies(_producer([0, 1]), _consumer("C", 1, 2, []))
     assert not any(isinstance(b, RelayoutCopyBuffer) for b in bufs)
-    r = _solve(bufs)
+    r = _solve(engine, bufs)
     assert r["P"].address is None and r["C"].chosen_relayouts == {}
 
 
@@ -673,14 +684,14 @@ def _fanout(relayout_cost_ns, same_view: bool):
     )
 
 
-def test_two_consumers_on_one_view_share_one_copy_and_one_charge():
+def test_two_consumers_on_one_view_share_one_copy_and_one_charge(engine):
     """Fan-out to two consumers wanting the SAME destination view: one copy
     spanning both consumers' ticks, one charge. Spilling costs 20000; the
     shuffle 12000. Charged per edge it would be 24000 and the solver would
     spill; charged per copy it fires."""
     bufs = _fanout(12000.0, same_view=True)
     assert sum(isinstance(b, RelayoutCopyBuffer) for b in bufs) == 1
-    r = _solve(bufs)
+    r = _solve(engine, bufs)
     copy = _copy(r)
     assert r["P"].address is not None, "one shared shuffle beats the spill"
     assert (copy.start_time, copy.end_time) == (1, 3) and copy.address is not None
@@ -690,16 +701,16 @@ def test_two_consumers_on_one_view_share_one_copy_and_one_charge():
     assert _disjoint(copy.address, r["P"].address)
 
 
-def test_two_consumers_on_different_views_get_two_copies():
+def test_two_consumers_on_different_views_get_two_copies(engine):
     """Distinct destination views cannot share: two copies, two charges. At
     12000 each the pair (24000) loses to the 20000 spill, so P is spilled;
     at 8000 each (16000) both fire, each copy alive at its own tick."""
-    r = _solve(_fanout(12000.0, same_view=False))
+    r = _solve(engine, _fanout(12000.0, same_view=False))
     assert r["P"].address is None
     assert _copy(r, 0).address is None and _copy(r, 1).address is None
     assert r["C1"].chosen_relayouts == {} == r["C2"].chosen_relayouts
 
-    r = _solve(_fanout(8000.0, same_view=False))
+    r = _solve(engine, _fanout(8000.0, same_view=False))
     assert r["P"].address is not None
     assert _copy(r, 0).address is not None and _copy(r, 1).address is not None
     assert (
@@ -729,18 +740,18 @@ def _distant(relayout_cost_ns, blocker_size):
     )
 
 
-def test_one_copy_per_group_spans_the_gap_or_the_source_spills():
+def test_one_copy_per_group_spans_the_gap_or_the_source_spills(engine):
     """The model holds ONE copy across a group's consumers and never
     re-shuffles a released view. Holding it through B spills B; the solver
     weighs that against spilling P. Dear B (30000): P spills (20000) and B
     stays. Cheap B (1000): the copy is held, both consumers read it, B
     spills."""
-    r = _solve(_distant(5000.0, blocker_size=40), B=30000.0)
+    r = _solve(engine, _distant(5000.0, blocker_size=40), B=30000.0)
     assert r["P"].address is None and r["B"].address is not None
     assert _copy(r).address is None
     assert r["C1"].chosen_relayouts == {} == r["C2"].chosen_relayouts
 
-    r = _solve(_distant(5000.0, blocker_size=40), B=1000.0)
+    r = _solve(engine, _distant(5000.0, blocker_size=40), B=1000.0)
     copy = _copy(r)
     assert r["P"].address is not None and r["B"].address is None
     assert (copy.start_time, copy.end_time) == (1, 9) and copy.address is not None
@@ -748,7 +759,7 @@ def test_one_copy_per_group_spans_the_gap_or_the_source_spills():
     assert a1.destination_address == a2.destination_address == copy.address
 
 
-def test_copy_spans_a_consumer_outside_the_group():
+def test_copy_spans_a_consumer_outside_the_group(engine):
     """C2 (tick 4) reads P through a free slicing MATCH and offers no relayout
     candidate, so it is not a consumer of the copy at all; C1 (tick 1) and C3
     (tick 7) must relayout. One copy spans over C2 in time and serves both,
@@ -759,7 +770,7 @@ def test_copy_spans_a_consumer_outside_the_group():
         _consumer("C2", 4, 5, [], matches=[(0, 0)]),
         _consumer("C3", 7, 8, [_candidate("C3", 0, 5000.0)]),
     )
-    r = _solve(bufs)
+    r = _solve(engine, bufs)
     copy = _copy(r)
     assert copy.consumers == ("C1", "C3")
     assert r["P"].address is not None and copy.address is not None
@@ -771,7 +782,7 @@ def test_copy_spans_a_consumer_outside_the_group():
     )
 
 
-def test_charge_follows_the_chosen_source_division():
+def test_charge_follows_the_chosen_source_division(engine):
     """P offers two divisions whose shuffles into the same destination view
     price differently (5000 vs 3000 ns). The solver picks the cheaper source
     division, and the RelayoutCharge term charges that price: with the
@@ -780,14 +791,14 @@ def test_charge_follows_the_chosen_source_division():
         _producer([0, 3], divisions=2),
         _consumer("C", 1, 2, [_candidate("C", 0, 5000.0), _candidate("C", 1, 3000.0)]),
     )
-    r = _solve(bufs, P=4000.0)
+    r = _solve(engine, bufs, P=4000.0)
     assert r["P"].address is not None and r["P"].chosen_division == 1
     chosen = r["C"].chosen_relayouts["P"]
     assert chosen.candidate == _candidate("C", 1, 3000.0), "cheaper division wins"
     assert chosen.destination_address == _copy(r).address
 
 
-def test_a_consumer_reads_the_copy_only_under_a_priced_pair():
+def test_a_consumer_reads_the_copy_only_under_a_priced_pair(engine):
     """P has two divisions but only division 0 is priced into C's view, and
     that shuffle (50000) is dearer than the spill. Division 1 is unpriced, so
     the served literal cannot pin it: P must spill rather than read the copy
@@ -796,9 +807,129 @@ def test_a_consumer_reads_the_copy_only_under_a_priced_pair():
         _producer([0, 3], divisions=2),
         _consumer("C", 1, 2, [_candidate("C", 0, 50000.0)]),
     )
-    r = _solve(bufs)
+    r = _solve(engine, bufs)
     assert r["P"].address is None and r["C"].chosen_relayouts == {}
     assert _copy(r).address is None
+
+
+# ---------------------------------------------------------------------------
+# The annealer's half of the coupling
+# ---------------------------------------------------------------------------
+
+
+def _primed_annealer(buffers, size=64, expr="default"):
+    """An annealer primed to its seed state (every copy switched off), so a
+    test can drive the relayout machinery directly."""
+    if expr == "default":
+        expr = _objective(buffers)
+    solver = SaCoOptimizingSolver(buffers, size, alignment=1)
+    solver._score_fn = solver._build_score_fn(expr)
+    solver._rng = random.Random(0)
+    solver._precompute_topology()
+    solver.chosen = solver._seed_configs()
+    solver.packer = solver._build_seed_packer()
+    solver._flippable_ops = solver._flippable()
+    return solver
+
+
+def _index(solver, name) -> int:
+    return [b.name for b in solver._bufs].index(name)
+
+
+def _assert_eligible_count(solver):
+    assert solver._n_eligible == sum(
+        solver._eligible(i) for i in range(len(solver._bufs))
+    ), "the incremental eligible count drifted from a recount"
+
+
+def test_annealer_seeds_with_every_copy_off():
+    """Off, a copy is ineligible, and so is a source only it could serve: the
+    seed is the plan without relayouts, which best-seen never does worse than."""
+    solver = _primed_annealer(_pc(5000.0))
+    copy = _index(solver, relayout_copy_name("P", 0))
+    assert solver._relayout_on == set()
+    assert not solver._eligible(copy) and not solver._eligible(_index(solver, "P"))
+    solver._toggle_relayout(copy)
+    assert solver._eligible(copy) and solver._eligible(_index(solver, "P"))
+    _assert_eligible_count(solver)
+
+
+def test_annealer_drops_a_placed_source_whose_copy_did_not_fit():
+    """The placement half of the coupling. With 16 bytes of LX, P's per-core
+    slice fills it at C's tick, so the packer, placing P first, cannot fit the
+    copy C must read P through. Resident P would be read by C in the wrong
+    layout, so the resident set drops it, and the score and the write-back
+    both see it spilled."""
+    solver = _primed_annealer(_pc(5000.0), size=16)
+    p, copy = _index(solver, "P"), _index(solver, relayout_copy_name("P", 0))
+    solver._toggle_relayout(copy)
+    solver.packer.rotate(list(solver.packer.permutation).index(p), 0)
+    placed = solver.packer.addresses
+    assert placed[p] is not None and placed[copy] is None
+    resident = solver._resident_addresses()
+    assert resident[p] is None and resident[copy] is None
+    solver._write_back()
+    assert solver._bufs[p].address is None
+    assert solver._bufs[_index(solver, "C")].chosen_relayouts == {}
+
+
+def test_annealer_drops_a_placed_copy_whose_source_did_not_fit():
+    """The other direction: packed first, the copy fills the 16 bytes at C's
+    tick, which P is live through, so P is left out. A copy placed without its
+    source is a shuffle from nowhere."""
+    solver = _primed_annealer(_pc(5000.0), size=16)
+    p, copy = _index(solver, "P"), _index(solver, relayout_copy_name("P", 0))
+    solver._toggle_relayout(copy)
+    solver.packer.rotate(list(solver.packer.permutation).index(copy), 0)
+    solver.packer.rotate(
+        list(solver.packer.permutation).index(p), len(solver._bufs) - 1
+    )
+    placed = solver.packer.addresses
+    assert placed[copy] is not None and placed[p] is None
+    assert solver._resident_addresses()[copy] is None
+
+
+def test_annealer_snapshot_carries_the_copies_switched_on():
+    """Nothing else can rebuild which copies are on, so a rejected move must
+    restore it with the rest of the state."""
+    solver = _primed_annealer(_pc(5000.0))
+    copy = _index(solver, relayout_copy_name("P", 0))
+    snap = solver._snapshot()
+    solver._toggle_relayout(copy)
+    assert copy in solver._relayout_on
+    solver._adopt(snap)
+    assert solver._relayout_on == set()
+    _assert_eligible_count(solver)
+
+
+def test_annealer_offers_no_relayout_under_the_fallback_objective():
+    solver = _primed_annealer(_pc(5000.0), expr=None)
+    assert "relayout" not in solver._applicable_moves()
+    copy = _index(solver, relayout_copy_name("P", 0))
+    solver._toggle_relayout(copy)
+    assert not solver._eligible(copy) and not solver._eligible(_index(solver, "P"))
+
+
+def test_annealer_relayout_move_buys_the_group_with_its_divisions():
+    """Switching a copy on alone pays only if the divisions already sit on one
+    of its candidates' pairs. The move sets them too: P is seeded at division 0
+    and only division 1 is priced into C's view, so switching the copy on moves
+    P to division 1 and makes both eligible in one step."""
+    bufs = _with_copies(
+        _producer([0, 3], divisions=2),
+        _consumer("C", 1, 2, [_candidate("C", 1, 3000.0)]),
+    )
+    solver = _primed_annealer(bufs)
+    p, copy = _index(solver, "P"), _index(solver, relayout_copy_name("P", 0))
+    assert solver.chosen[p].menu_index == 0
+    solver._relayout()
+    assert copy in solver._relayout_on
+    assert solver.chosen[p].menu_index == 1
+    assert solver._eligible(copy) and solver._eligible(p)
+    _assert_eligible_count(solver)
+    solver._relayout()  # the only copy, drawn again: switched back off
+    assert solver._relayout_on == set() and not solver._eligible(p)
+    _assert_eligible_count(solver)
 
 
 # ---------------------------------------------------------------------------
