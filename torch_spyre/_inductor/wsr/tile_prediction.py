@@ -216,7 +216,7 @@ def _predict_output_layout(
         new_size = list(cur_size)
         new_size[axis.host_dim] = int(extent)
         try:
-            cur_stride = [
+            new_stride = [
                 int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
             ]
         except Unsupported as exc:
@@ -228,11 +228,13 @@ def _predict_output_layout(
                 cur_size,
                 new_size,
                 stick_host_dim=_stick_host_dim(op, cur_dev),
+                old_host_stride=cur_stride,
+                new_host_stride=new_stride,
             )
         except RuntimeError as exc:
             logger.debug("dropping tiling %s on %s: %s", tiling, op.get_name(), exc)
             return None
-        cur_size = new_size
+        cur_size, cur_stride = new_size, new_stride
     return FixedTiledLayout(
         layout.device, layout.dtype, cur_size, cur_stride, cur_dev, layout.offset
     )

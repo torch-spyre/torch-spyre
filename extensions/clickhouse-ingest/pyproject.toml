@@ -52,4 +52,4 @@ packages = ["spyre_clickhouse_ingest", "spyre_clickhouse_ingest.schema"]
 
 [tool.setuptools.package-data]
 "spyre_clickhouse_ingest.schema" = ["*.sql", "migrations/*.sql"]
-"spyre_clickhouse_ingest" = ["tag_families.yaml"]
+"spyre_clickhouse_ingest" = ["tag_families.yaml", "bundle.schema.json"]

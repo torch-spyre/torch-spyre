@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -29,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include "flex/flex.hpp"
 #include "job_plan.h"
 #include "logging.h"
 #include "module.h"
@@ -257,35 +257,42 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::H2D))
+      << "launchH2D called with params tagged as D2H — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->launchOperationH2D(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::D2H))
+      << "launchD2H called with params tagged as H2D — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->launchOperationD2H(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launchOperationCompute(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
-  resolveRuntimeHandle()->launchOperationHostCallback(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
-void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
-                            DataFormats dtype, bool use_dmai) const {
+void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
-  return resolveRuntimeHandle()->launchHostCompute(params);
+  return resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,

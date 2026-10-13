@@ -197,9 +197,43 @@ row-identity uuid5s, though it hosts its own `v2_artifact_id()` used as a CLI
 helper to stamp an image label, not to write ClickHouse rows.
 
 No `capabilities`/`capability_runs` table exists in
-`pipelines/clickhouse/*.sql` — that table pair is torch-spyre/GHA-side only
-(see [classes.md](classes.md#schemapy)); Jenkins does not currently write
-capability rows.
+`pipelines/clickhouse/*.sql` (see [classes.md](classes.md#schemapy)). A
+Jenkins test leg reaches `capability_runs` only through the product ingest
+that `pushJUnitXml` runs, which routes JUnit `capability.*` properties there.
+
+### The v2 steps: `v2Artifact`, `v2Results`
+
+Pipelines outside the orchestrator (supply chain, tech preview, release,
+SVT/FVT) record in `spyre_v2` through two steps over this package's CLI:
+
+| Step | Runs | Returns |
+|---|---|---|
+| `v2Artifact(spec:, arch:, tagFamily:, ...)` | `artifacts ensure` | the resolution as a Map (`artifact_id`, `source`, `tag`, ...) |
+| `v2Results(xmlDir:, component:, arch:, triggerType:, artifact:, ...)` | `results --schema v2 --strict` | true when the verdicts were recorded |
+
+Both are best-effort by default (a WARN, then `[:]` / false) and fail the
+build with `strict: true`; both skip when the folder sets no v2 database.
+Every option, the hand-off to SVT/FVT and the verification queries are in
+spyre-frameworks' `docs/v2-artifact-recording.md`.
+
+### ci_run_timings
+
+The orchestrator writes where each run's time went once per run, PR-triggered or not, from
+`Jenkinsfile.orchestrator`'s `post{}`: one row per component build and per test leg (a retried
+build or re-dispatched leg is its own `attempt`). It hands one JSON batch to `python -m
+spyre_clickhouse_ingest ci-run-timings write`, which only normalizes timestamps and flattens
+entries; every `*_ms` span is a MATERIALIZED column of the DDL, so a JSONEachRow writer gets the
+same spans. The batch's sources:
+
+| Batch field | Captured by |
+|---|---|
+| `run.comment_at`, `picked_up_at`, `pickup_path` | the `/spyre-test` poller, passed to the orchestrator as `TRIGGER_COMMENT_AT` / `TRIGGER_PICKED_UP_MS` / `TRIGGER_PICKUP_PATH` |
+| `run.pr_queued_at`, `pr_running_at` | `postPrStatusUpdate`, the first time the PR comment shows each state |
+| `run.base_ref` | the trigger PR's `base.ref`, read by `resolve_target.py` when it resolves the PR (`''` for a non-PR run) |
+| `run.pr_components` | the run's Test-With companion PRs, so their components read `is_pr_component` |
+| `builds[]` | `buildOneNode`, from the component-build's start, its agent-and-lock acquisition (`CB_BUILD_NODE_MS`) and its test-stage start (`CB_TEST_START_MS`); `dropped` nodes from the plan's dropped set, `reused` ones from `NODE_ALREADY_BUILT` |
+| `tests[]` | the test-leg join, from the dispatch, the leg's test-stage start and the leg job's end, with the leg's `gating`, `runner_died`, `failure_reason` and `failed_stage` |
+| `tests[].exec` | the executor's phases. `gha-ephemeral` / `gha-standing`: component-build's `GHA_TIMINGS_JSON`, the runner-set deploy (provision) around `run_integration_tests.py`, whose result file carries each GHA run's dispatch, first-job start, last-job completion and `pipeline_runs` key. `jenkins-local` / `jenkins-job`: the `lock(label: SPYRE_CARD_POOL)` request and acquisition (provision), `make test` start and return (exec), and the `SPYRE_CARDS*_CARD_NUMBER` cards |
 
 ---
 

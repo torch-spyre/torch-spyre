@@ -35,7 +35,7 @@ def source(value: str) -> tuple:
     raise argparse.ArgumentTypeError(f"--source wants repo@[ref@]sha, got {value!r}")
 
 
-def _pair(value: str) -> tuple:
+def pair(value: str) -> tuple:
     key, sep, val = value.partition("=")
     if not (sep and key):
         raise argparse.ArgumentTypeError(f"wants key=value, got {value!r}")
@@ -139,7 +139,7 @@ def add_artifact_options(
         "--prop",
         dest="props",
         action="append",
-        type=_pair,
+        type=pair,
         default=[],
         help="artifact prop k=v, repeatable",
     )
@@ -147,7 +147,7 @@ def add_artifact_options(
         "--tag-prop",
         dest="tag_props",
         action="append",
-        type=_pair,
+        type=pair,
         default=[],
         help="tag prop k=v, repeatable",
     )
@@ -156,6 +156,29 @@ def add_artifact_options(
         "--dry-run", action="store_true", help="resolve and report; write nothing"
     )
     return g
+
+
+def ci_tags(
+    event: str, repository: str, branch: str, sha: str, pr_number, day=None
+) -> list:
+    """The (tag, family) pairs an artifact built by this CI event carries, spelled as Jenkins
+    tags its own builds: `<repo>@<sha12>` (main) for a push to main, plus `nightly-<day>`
+    (nightly) for a scheduled run of main; `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (pr) for a
+    pull request; none for any other event."""
+    name, sha12 = (repository or "").rstrip("/").rsplit("/", 1)[-1], (sha or "")[:12]
+    pr = str(pr_number or "").strip()
+    if not (name and len(sha12) == 12):
+        return []
+    if event == "pull_request" and pr not in ("", "0"):
+        return [(f"{name}#{pr}", "pr"), (f"{name}#{pr}@{sha12}", "pr")]
+    if event in ("push", "schedule") and branch == "main":
+        pin = [(f"{name}@{sha12}", "main")]
+        return (
+            pin + [(f"nightly-{day}", "nightly")]
+            if event == "schedule" and day
+            else pin
+        )
+    return []
 
 
 def artifact_spec(args) -> str:

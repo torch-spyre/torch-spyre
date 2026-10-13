@@ -1745,6 +1745,35 @@ class TestSelectAllocator(unittest.TestCase):
             ilp_solver_ortools.cp_model = saved
 
 
+class TestCpsatFallbackWarning(unittest.TestCase):
+    """Without ortools, ``_make_cpsat_solver`` falls back to greedy on every
+    construction but warns only once per process, naming what failed to import."""
+
+    def test_two_constructions_without_ortools_warn_once(self):
+        from torch_spyre._inductor import logging_utils
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        from torch_spyre._inductor.scratchpad.allocator import GreedyLayoutSolver
+
+        logging_utils._warned_once.discard(
+            (allocator_module.logger.name, "cpsat_unavailable")
+        )
+        with (
+            patch.object(ilp_solver_ortools, "cp_model", None),
+            patch.object(
+                ilp_solver_ortools,
+                "_CP_MODEL_IMPORT_ERROR",
+                "No module named 'pandas'",
+            ),
+            self.assertLogs(allocator_module.logger, level="WARNING") as logs,
+        ):
+            solvers = [allocator_module._make_cpsat_solver([], 4096) for _ in range(2)]
+        for solver in solvers:
+            self.assertIsInstance(solver, GreedyLayoutSolver)
+        self.assertEqual(len(logs.records), 1, logs.output)
+        self.assertIn("No module named 'pandas'", logs.output[0])
+
+
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
     defining a legal in-place edge (shared by the normal producer path and the
@@ -1913,6 +1942,103 @@ class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
         )
 
 
+class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
+    def test_deep_reader_chain_and_copy_back(self):
+        """Offset writes stay correct past the old two-reader boundary."""
+
+        def fn(x, value, dst):
+            x[:, 32:96] = value
+            hop1 = x + 1
+            hop2 = hop1 * 0.5
+            hop3 = hop2 + 2
+            dst.copy_(hop3)
+            return dst + torch.amax(dst, dim=-1, keepdim=True), x
+
+        for solver in ("greedy", "cpsat"):
+            if solver == "cpsat" and not _HAS_ORTOOLS:
+                continue
+            with self.subTest(solver=solver):
+                args = (
+                    self.rand_device((128, 256)),
+                    self.rand_device((128, 64)),
+                    self.rand_device((128, 256)),
+                )
+                cpu_args = tuple(t.cpu() for t in args)
+                expected = fn(*cpu_args)
+                with ts_inductor_config.patch(
+                    lx_planning=True,
+                    co_optimizing_lx_planning=True,
+                    layout_solver=solver,
+                    allow_exhaustive_search=True,
+                ):
+                    result = torch.compile(fn, fullgraph=True)(*args)
+                for actual, reference in zip(result, expected):
+                    torch.testing.assert_close(
+                        actual.cpu(), reference, atol=1e-2, rtol=1e-3
+                    )
+                for actual, reference in zip(args, cpu_args):
+                    torch.testing.assert_close(
+                        actual.cpu(), reference, atol=1e-2, rtol=1e-3
+                    )
+                torch.compiler.reset()
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_attention_before_padded_ffn_keeps_division_candidates(self):
+        """The #4990 pad must not pin the upstream attention's divisions."""
+        from torch_spyre._inductor.pass_utils import _is_matmul_op
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.utils import _writes_at_constant_offset
+
+        def fn(q, k, v, gate_up, down):
+            scores = (q @ k.transpose(-1, -2)) * 0.125
+            attention = torch.softmax(scores, dim=-1) @ v
+            rows = attention.reshape(4, 64)
+            padded = torch.nn.functional.pad(rows, (0, 0, 0, 4))
+            ffn = torch.nn.functional.silu(padded @ gate_up) @ down
+            return ffn[:4] + rows
+
+        args = tuple(
+            self.rand_device(shape) * 0.125
+            for shape in ((4, 1, 64), (4, 128, 64), (4, 128, 64), (64, 128), (128, 64))
+        )
+        expected = fn(*(t.cpu() for t in args))
+        captured = []
+        original = CoOptimizingAllocator._division_map
+
+        def capture(allocator, graph, **kwargs):
+            division_map = original(allocator, graph, **kwargs)
+            divisions = division_map.divisions
+            offset_writes = [
+                i
+                for i, op in enumerate(graph.operations)
+                if _writes_at_constant_offset(op)
+            ]
+            if offset_writes:
+                # The two batched matmuls precede the pad. A whole-component
+                # pin would leave every one of these upstream ops a singleton.
+                captured.append(
+                    any(
+                        len(divisions[op.name]) > 1
+                        for op in graph.operations[: min(offset_writes)]
+                        if _is_matmul_op(op)
+                    )
+                )
+            return division_map
+
+        with (
+            patch.object(CoOptimizingAllocator, "_division_map", capture),
+            ts_inductor_config.patch(
+                lx_planning=True,
+                co_optimizing_lx_planning=True,
+                layout_solver="cpsat",
+            ),
+        ):
+            result = torch.compile(fn, fullgraph=True)(*args)
+        self.assertTrue(captured, "the graph must contain an offset mutation")
+        self.assertTrue(all(captured), "upstream attention lost its candidate menu")
+        torch.testing.assert_close(result.cpu(), expected, atol=1e-2, rtol=1e-3)
+
+
 class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     """In-place reuse of boundary-clone buffers in the greedy build path (#3212).
 
@@ -1928,9 +2054,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         check the loop previously omitted (#3212 follow-up).
 
         Invariant guard: an input read at a different index than the output write
-        must never be offered as an in-place parent pre-solver. For pointwise-tagged
-        ops every read is eligible (so this holds trivially), but the assertion locks
-        the property in against a future regression that drops the per-input check."""
+        must never be offered as an in-place parent pre-solver. The assertion locks
+        the shared gate into this path; index-specific eligibility is covered by
+        PointwiseInPlaceInputsTest."""
         from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
@@ -2465,6 +2591,124 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
             "co-opt input clone slot sharing changed the numerical result",
+        )
+
+
+class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
+    """The generation seam on real graphs: the per-candidate machinery the SA
+    co-optimizer asks instead of the enumerated menu and its pair table. The
+    unit tests for these seams (``test_work_division.py``) build their own
+    contexts and preps; what only a real compile can check is that the two
+    answers agree on *live* ops, which is what a generated division rests on."""
+
+    def _captured_buffers(self, fn, x):
+        """The buffer list the co-optimizing allocator built, plus the result.
+
+        The assertions run inside the spy: the split space and the residency
+        edges hold live Inductor IR, which needs the virtualized compile context
+        that ``torch.compile`` tears down on exit."""
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        checked: set[str] = set()
+        orig = CoOptimizingAllocator._build_cd_bound_buffers
+
+        def spy(inner_self, *args, **kwargs):
+            buffers = orig(inner_self, *args, **kwargs)
+            self._check_buffers(buffers, checked)
+            return buffers
+
+        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="simulated_annealing",
+                co_optimizing_lx_planning=True,
+                sencores=32,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+        return checked, result
+
+    def _check_buffers(self, buffers, checked):
+        """Every claim the engine makes about a live buffer, per buffer."""
+        by_name = {b.name: b for b in buffers}
+        for buf in buffers:
+            space = buf.division_space
+            if space is not None:
+                # The menu is exactly what the space admits, which is what makes
+                # a generated division one the enumeration would have carried.
+                for division in buf.core_divisions:
+                    self.assertTrue(
+                        space.admits(space.splits(division)),
+                        f"{buf.name}: menu entry {division.label} not admitted",
+                    )
+                menu = {division.label for division in buf.core_divisions}
+                for neighbour in space.neighbours(buf.core_divisions[0]):
+                    self.assertIn(neighbour.label, menu, buf.name)
+                checked.add("space")
+            # The pair table is a projection of the edges, so the two agree on
+            # every row -- and where both ends generate, so does the inverse
+            # that replaces the row.
+            self.assertEqual(
+                set(buf.residency_edges) - set(buf.cd_parent_matches),
+                set(),
+                buf.name,
+            )
+            for parent, edge in buf.residency_edges.items():
+                pairs = buf.cd_parent_matches[parent]
+                parent_divisions = by_name[parent].core_divisions
+                self.assertEqual(
+                    edge.match_pairs(parent_divisions, buf.core_divisions),
+                    pairs,
+                    f"{buf.name} <- {parent}",
+                )
+                checked.add("edge")
+                parent_space = by_name[parent].division_space
+                if parent_space is None or space is None:
+                    continue
+                for i, parent_division in enumerate(parent_divisions):
+                    constructed = edge.consumer_division_for(parent_division, space)
+                    compatible = [j for ip, j in pairs if ip == i]
+                    if constructed is None:
+                        self.assertFalse(
+                            compatible,
+                            f"{buf.name} <- {parent}: no inverse for candidate "
+                            f"{i}, but the table pairs it with {compatible}",
+                        )
+                        continue
+                    labels = [buf.core_divisions[j].label for j in compatible]
+                    # Identity, not only membership: the two relations may pick
+                    # different compatible entries (see ``_ViewRelation``), but
+                    # a change to which one a flood propagates should be
+                    # deliberate.
+                    self.assertEqual(
+                        constructed.label,
+                        labels[0] if labels else None,
+                        f"{buf.name} <- {parent}: inverse of candidate {i}",
+                    )
+                    checked.add("inverse")
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_generated_divisions_agree_with_the_enumeration_on_a_real_graph(self):
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            a = x + 1.0
+            b = a * 2.0
+            return torch.nn.functional.softmax(b, dim=-1)
+
+        kinds, result = self._captured_buffers(fn, x)
+        # Non-vacuity: all three claims have to have been made on something.
+        self.assertIn("space", kinds, "no buffer got a split space")
+        self.assertIn("edge", kinds, "no buffer got a residency edge")
+        self.assertIn("inverse", kinds, "no edge exercised the view inverse")
+        self.assertTrue(
+            torch.allclose(
+                torch.nn.functional.softmax((x.to("cpu") + 1.0) * 2.0, dim=-1),
+                result,
+                atol=1e-2,
+                rtol=1e-3,
+            ),
+            "generated core divisions changed the numerical result",
         )
 
 

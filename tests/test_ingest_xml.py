@@ -816,6 +816,48 @@ def test_a_capability_verdict_is_filed_under_the_capability_kind(ingest):
     assert (res["test_type"], res["result_kind"]) == ("model_ops", "capability")
 
 
+@pytest.mark.parametrize(
+    ("event", "branch", "pr", "tags"),
+    [
+        ("push", "main", "0", [("torch-spyre@07379f50aaaa", "main")]),
+        (
+            "pull_request",
+            "fix",
+            "5200",
+            [("torch-spyre#5200", "pr"), ("torch-spyre#5200@07379f50aaaa", "pr")],
+        ),
+        ("push", "release-0.5", "0", []),
+        ("workflow_dispatch", "main", "0", []),
+        (
+            "schedule",
+            "main",
+            "0",
+            [("torch-spyre@07379f50aaaa", "main"), ("nightly-2026-10-09", "nightly")],
+        ),
+    ],
+)
+def test_a_gha_delta_is_tagged_as_its_ci_event_built_it(
+    ingest, event, branch, pr, tags
+):
+    from datetime import date
+
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 5, "duration_s": 2.0}}
+    args = _args(
+        ci_event=event,
+        branch=branch,
+        pr_number=pr,
+        sha="07379f50aaaa" + "0" * 28,
+        tag_date=date(2026, 10, 9),
+    )
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    rows = [(t, dict(zip(cols, r))) for t, rs, cols in c.inserts for r in rs]
+    got = [(r["tag"], r["tag_family"]) for t, r in rows if t == "artifact_tags"]
+    assert got == tags
+    assert {r["artifact_id"] for t, r in rows if t == "artifact_tags"} <= {_AID}
+    assert sum(t == "artifact_results" for t, _ in rows) == 1
+
+
 def test_a_named_image_is_registered_tagged_and_judged(ingest):
     # --artifact names what a Jenkins leg ran; the verdict lands on that image, tagged.
     c = _ArtifactClient()
@@ -1104,3 +1146,40 @@ def test_the_deprecated_script_path_forwards_to_the_package():
     assert out.returncode == 0, out.stderr
     assert "spyre_clickhouse_ingest results" in out.stdout
     assert "[deprecated]" in out.stderr
+
+
+def test_capability_legs_only_leaves_the_leg_verdict_to_the_orchestrator(ingest):
+    c = _ArtifactClient()
+    legs = {
+        (_RUN_ID, "regression"): {"failed": 1, "total": 9, "duration_s": 2.0},
+        (_RUN_ID, "model_modules"): {"failed": 0, "total": 4, "duration_s": 1.0},
+    }
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    rows = [
+        dict(zip(cols, r))
+        for t, rs, cols in c.inserts
+        if t == "artifact_results"
+        for r in rs
+    ]
+    assert [(r["test_type"], r["result_kind"]) for r in rows] == [
+        ("model_modules", "capability")
+    ]
+
+
+def test_capability_legs_only_with_no_capability_leg_writes_nothing(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 9, "duration_s": 2.0}}
+    assert ingest._write_artifact_verdicts(
+        c, "db", _args(capability_legs_only=True), legs
+    )
+    assert c.inserts == []
+
+
+def test_capability_legs_only_skips_the_tier_the_orchestrator_already_judges(ingest):
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "model_ops"): {"failed": 0, "total": 4, "duration_s": 1.0}}
+    args = _args(capability_legs_only=True, trigger_type="model_ops")
+    assert ingest._write_artifact_verdicts(c, "db", args, legs)
+    assert c.inserts == []

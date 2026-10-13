@@ -14,6 +14,7 @@
 
 # Owner(s): ["module: cpp"]
 
+import functools
 import os
 import warnings
 from contextlib import contextmanager
@@ -44,14 +45,34 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
+# The add is correct, but int8 and bool go through a CPU fallback for the conversion to
+# float32, which warns, and the helper asserts no warning (#5364).
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
-    reason="Support scalar eager add with to_dtype lowering in Spyre"
+    strict=True,
+    raises=AssertionError,
+    reason="the int8/bool to float32 conversion falls back to the CPU and warns, "
+    "and the test asserts no warning (#5364)",
 )
+
+
+def _expect_raise(match):
+    """Decorator: the test passes only if it raises with a message matching ``match``."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
-    reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
-)
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
+_SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
@@ -74,7 +95,6 @@ class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -90,7 +110,7 @@ class TestSpyre(TestCase):
                 thread_name = file.read().strip()
             all_thread_names.add(thread_name)
 
-        for i in range(torch.spyre._device_daemon.NUM_DEVICES):
+        for i in range(torch.spyre.device_count()):
             self.assertIn(f"pt_autograd_{i}", all_thread_names)
 
     def test_empty_factory(self):
@@ -282,7 +302,7 @@ class TestSpyre(TestCase):
             )
             self._assert_zero_dim_roundtrip(x, x_cpu, dtype)
 
-    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8/bool/int64: Inductor to_dtype in add (#1153).
+    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8/bool: the conversion to float32 warns (#5364).
     # float8: SEN143_FP8 unsupported. float16/float32: pass; ignore known full() CPU fallback warn.
     @parametrize(
         "dtype, scalar_factory, ignored_warning_message",
@@ -325,7 +345,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_RAISES_FP8],
             ),
             subtest(
                 (
@@ -412,7 +432,11 @@ class TestSpyre(TestCase):
         ):
             spyre_t + cpu_t
 
-    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
+    @pytest.mark.xfail(
+        raises=NotImplementedError,
+        reason="data-dependent output not supported (no aten::masked_select)",
+        strict=True,
+    )
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")
