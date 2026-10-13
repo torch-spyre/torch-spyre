@@ -2859,6 +2859,11 @@ def _divide_ranges(
     # get_read_writes() result (pass_utils.op_read_writes) is stale
     # regardless of which capture path (if any) runs below -- invalidate
     # unconditionally rather than only inside the symbol-remap branch.
+    # That disagreement is unreachable when coarse tiling runs
+    # pre-stickification (nothing has populated the memo yet), but the
+    # solver-driven path applies tilings *during* scratchpad planning, after
+    # the first solve has memoized every op -- where it surfaced as
+    # ``coarse_tile_local_dim_split_domains``'s extent assertion.
     invalidate_op_read_writes(op)
 
     symbol_remap = None

@@ -1212,6 +1212,40 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
         )
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "the joint solve needs ortools")
+class TestIntermediateReadTwice(BaseTestScratchpadUsage):
+    """An *intermediate* buffer one consumer reads twice is LX-pinned only under
+    a division that owns it the same way through both reads.
+
+    ``a + a.permute(1, 0, 2)`` reads ``a`` once in step and once transposed. A
+    split of the consumer's dim 0 slices ``a`` along dim 0 for the first read
+    and along dim 1 for the second, so no residency of ``a`` serves both. The
+    match table once looked at the first read alone: the solve pinned ``a``
+    under such a split, and the post-solve ownership check could only raise.
+    """
+
+    def test_twice_read_intermediate_is_correct(self):
+        # Small enough that a fits LX, so the solve wants it resident.
+        x = self.rand_device((64, 64, 128))
+        y = self.rand_device((64, 64, 128))
+
+        def fn(x, y):
+            a = x + y
+            return a + a.permute(1, 0, 2)
+
+        cpu_result = fn(x.to("cpu"), y.to("cpu"))
+
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            co_optimizing_lx_planning=True,
+            layout_solver="cpsat",
+            sencores=32,
+        ):
+            result, _ = self.compile_and_collect_mem_usage(fn, (x, y))
+
+        torch.testing.assert_close(result, cpu_result, atol=0.1, rtol=0.1)
+
+
 class TestLivenessIndicesAreDistinct(BaseTestScratchpadUsage):
     """``calculate_liveness`` records one distinct op index per accessing op.
 

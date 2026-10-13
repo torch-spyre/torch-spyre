@@ -12,6 +12,9 @@
 #   nearest       search registry tags nearest --tag-date first, a tag with more groups (a snap
 #                 build's own timed tag) before one with fewer (its day's aggregate)
 #   prefix        a full --tag starting with "<family>-" belongs to this family
+#   spellings     other prefixes a registry spells the family with; a tag starting with one
+#                 is stored under the family's own prefix, its raw spelling kept as the tag
+#                 prop registry_tag
 #
 # `misc` (required) holds a --tag whose prefix names no family and that was given none; it is
 # warned about, and `results --strict` fails on it. Give such tags a real family instead.
@@ -53,6 +56,7 @@ ci-cd-tech-preview:
   registry_tag: ^(ci-cd|cicd)-tech-preview-v\d+$
   tag: '{registry_tag}'
   prefix: true
+  spellings: [cicd-tech-preview]
 
 # Families with no registry tag of their own: every tag in them is given in full.
 release:

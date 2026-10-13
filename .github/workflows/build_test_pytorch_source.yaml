@@ -270,7 +270,8 @@ jobs:
   # "success" even when tests failed, so the JUnit counts are the only
   # trustworthy signal.
   #
-  # if: always() at the job level so the reporting steps still run even
+  # if: !cancelled() at the job level (not always(), which would ignore a
+  # cancel for up to the 660-min timeout) so the reporting steps still run
   # when `build` failed -- the dispatch/wait step is individually gated on
   # needs.build.result == 'success' so it doesn't attempt to use wheels
   # that were never produced.
@@ -278,7 +279,7 @@ jobs:
   test:
     name: Run upstream-beta test matrix and report results
     needs: build
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on:
       - x86_64
       - spyre_pf_x0

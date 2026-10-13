@@ -130,6 +130,9 @@ fails at load, as does a file with no `misc` family. A `--tag` whose prefix name
 is given no `--tag-family` is filed under `misc`, with a warning naming the tag -- never under
 `release`, which takes only `release-*` tags. `misc` is never matched by prefix or dated; pass the
 real family (`pr`, `main`, `nightly`, ...) instead, or `--tag-family misc` to mean it.
+A family's `spellings` are other prefixes a registry uses for it: `cicd-tech-preview-vN` is stored
+as `ci-cd-tech-preview-vN`, with the raw spelling in the tag prop `registry_tag`, so one tech
+preview is one tag.
 
 ## Moving off ingest_xml.py
 

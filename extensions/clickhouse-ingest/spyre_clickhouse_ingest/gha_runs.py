@@ -26,8 +26,13 @@ from where it left off, back to at most --max-catchup-days. A re-run keeps its r
 so late attempts of older runs need a periodic longer window. Rows replace by (run, attempt).
 
 The token is shared with other jobs, so a poll stops cleanly (flush, notice, exit 0) when the
-rate limit's remaining falls to --reserve of it or --deadline-minutes pass; the next poll
-continues. --wait-for-reset sleeps to the reset instead, for a manual backfill. Needs GITHUB_TOKEN.
+rate limit's remaining falls to --reserve of it. --deadline-minutes is split evenly over the
+repos still to poll, so one busy repo cannot starve the rest; time a repo leaves unused passes
+on. The next poll continues either way. --wait-for-reset sleeps to the reset instead, for a
+manual backfill. A token that expires mid-poll (an App installation token lives an hour)
+stops it the same way. A poll that finished exits 0; one that stopped early exits 3 (deadline
+or token: continue now) or 4 (rate reserve: continue in a later run).
+Needs GITHUB_TOKEN.
 """
 
 import argparse
@@ -50,6 +55,10 @@ API = "https://api.github.com"
 LIST_CAP = 1000
 PAGE = 100
 RETRIES = 6
+# Exit status of a poll that stopped early with more to do: at its deadline or an expired token
+# (a caller may continue at once), or at the rate reserve (wait for a later run). 0 = done.
+EXIT_MORE = 3
+EXIT_BUDGET = 4
 
 # Lane names match the Jenkins trigger_source values, so one gate view covers both systems.
 # pull_request is the PR-validation lane, which Jenkins calls spyre-test.
@@ -260,7 +269,7 @@ def job_row(
 
 
 class Stop(Exception):
-    """The poll must end here, cleanly: the rate budget or the deadline is used up."""
+    """The poll must end here, cleanly: the budget, the deadline or the token is used up."""
 
 
 class GitHub:
@@ -278,8 +287,10 @@ class GitHub:
         self.deadline = deadline
         self.wait_for_reset = wait_for_reset
         self.limit = self.remaining = self.reset = None
+        self.requests, self.first = 0, ""
+        self.authed = self.expired = False
 
-    def get(self, path: str, guard: bool = True, **query: Any) -> dict[str, Any]:
+    def get(self, path: str, **query: Any) -> dict[str, Any]:
         url = f"{API}{path}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
         req = urllib.request.Request(
             url,
@@ -290,13 +301,19 @@ class GitHub:
             },
         )
         for attempt in range(RETRIES):
-            if guard:
-                self._guard()
+            self._guard()
+            self.requests += 1
             try:
                 body, headers = self._fetch(req)
                 self._note(headers)
+                self.authed = True
                 return body
             except urllib.error.HTTPError as err:
+                # An installation token lives an hour, so a long poll outlives it; a 401
+                # before any success is a bad credential and stays an error.
+                if err.code == 401 and self.authed:
+                    self.expired = True
+                    raise Stop("token expired") from err
                 self._note(err.headers)
                 wait = self._backoff(err, attempt)
                 if wait is None:
@@ -326,12 +343,21 @@ class GitHub:
         self.limit = int(headers["X-RateLimit-Limit"])
         self.remaining = int(headers.get("X-RateLimit-Remaining", self.limit))
         self.reset = float(headers.get("X-RateLimit-Reset", 0))
+        self.first = self.first or self.rate()
+
+    def rate(self) -> str:
+        """remaining/limit as the last response reported it; GET /rate_limit lags behind."""
+        return f"{self.remaining}/{self.limit}"
+
+    def exhausted(self) -> bool:
+        """True once a request would dip into the reserve."""
+        return self.limit is not None and self.remaining <= self.reserve * self.limit
 
     def _guard(self) -> None:
         """Stop, or wait for the reset, before a request that would dip into the reserve."""
         if self.deadline is not None and time.time() >= self.deadline:
             raise Stop("deadline reached")
-        if self.limit is None or self.remaining > self.reserve * self.limit:
+        if not self.exhausted():
             return
         if not self.wait_for_reset:
             raise Stop(f"budget reached at {self.remaining} remaining")
@@ -342,20 +368,6 @@ class GitHub:
         if self.deadline is not None and time.time() + seconds > self.deadline:
             raise Stop("deadline reached")
         time.sleep(seconds)
-
-    def rate(self) -> str:
-        """remaining/limit of the core quota; reading it costs no quota."""
-        core = self.get("/rate_limit", guard=False).get("resources", {}).get("core", {})
-        self._note(
-            {
-                "X-RateLimit-Limit": core.get("limit"),
-                "X-RateLimit-Remaining": core.get("remaining"),
-                "X-RateLimit-Reset": core.get("reset", 0),
-            }
-            if core
-            else None
-        )
-        return f"{self.remaining}/{self.limit}"
 
     @staticmethod
     def _backoff(err, attempt: int) -> float | None:
@@ -583,8 +595,11 @@ def main(argv=None) -> None:
         else None,
         wait_for_reset=args.wait_for_reset,
     )
-    print(f"[info] rate limit {gh.rate()} at start", file=sys.stderr)
-    for repo in args.repo:
+    end_all, stopped = gh.deadline, False
+    for i, repo in enumerate(args.repo):
+        # An even share of the time left; what a repo leaves unused passes on.
+        if end_all is not None:
+            gh.deadline = time.time() + (end_all - time.time()) / (len(args.repo) - i)
         start, resumed = window_start(
             now,
             base,
@@ -602,9 +617,18 @@ def main(argv=None) -> None:
             f"[info] {repo}: {attempts} run attempt(s), {rows} row(s)", file=sys.stderr
         )
         if reason:
-            print(f"[notice] {reason}; resume next run", file=sys.stderr)
-            break
-    print(f"[info] rate limit {gh.rate()} at end", file=sys.stderr)
+            stopped = True
+            print(f"[notice] {repo}: {reason}; resume next run", file=sys.stderr)
+            # The budget and the token are shared by every repo; a deadline share is not.
+            if gh.expired or (gh.exhausted() and not gh.wait_for_reset):
+                break
+    print(
+        f"[info] rate limit {gh.first or 'unseen'} at the first response, "
+        f"{gh.rate()} at the last, {gh.requests} request(s)",
+        file=sys.stderr,
+    )
+    if stopped:
+        sys.exit(EXIT_BUDGET if gh.exhausted() and not gh.wait_for_reset else EXIT_MORE)
 
 
 if __name__ == "__main__":

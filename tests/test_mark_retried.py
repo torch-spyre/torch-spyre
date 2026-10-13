@@ -179,8 +179,11 @@ def test_an_unknown_kind_is_refused(tmp_path):
 
 
 def test_every_signal_retry_in_run_test_marks_its_xml():
-    # The serial and the multi-card --parallel paths each re-run a signalled file with -n1.
+    # The serial and the multi-card --parallel paths each re-run a signalled file
+    # under xdist (one worker, via _XDIST_ISOLATION_ARGS).
     script = (TESTS / "oot_framework" / "run_test.sh").read_text(encoding="utf-8")
-    retries = len(re.findall(r"_xdist_args=\(\"-n1\"", script))
+    retries = len(
+        re.findall(re.escape('_xdist_args=("${_XDIST_ISOLATION_ARGS[@]}"'), script)
+    )
     assert retries >= 2
     assert script.count('mark_retried.py" signal') == retries

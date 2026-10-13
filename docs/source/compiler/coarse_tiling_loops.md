@@ -862,13 +862,14 @@ self.passes = [
     # Tensor Layout (Stickification)
     split_multi_ops,
     propagate_spyre_tensor_layouts,
-    reorder_nonstick_dims,
     validate_ops,
     optimize_restickify_locations,
+    reorder_nonstick_dims,
     finalize_layouts,
     insert_restickify,
     validate_no_restickify_on_mutation_targets,
     enforce_indirect_access_layout,
+    reorder_nonstick_dims_mutation,
     insert_post_mutation_restickify,
     insert_restickify_padding,
     #

@@ -72,6 +72,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from .. import config
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates, iteration_space_from_op
 from ..scratchpad.coarse_tiling import (
@@ -314,6 +315,11 @@ def enumerate_tile_options(
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
         return options
+    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
+    # and has no device layout of its own to size or stick-check a tile
+    # against; prediction refuses to tile it for the same reason.
+    if not isinstance(op.get_layout(), FixedTiledLayout):
+        return options
     symbolic = _symbolic_extent_reason(op)
     if symbolic is not None:
         logger.debug("enumerate_tile_options: %s", symbolic)
@@ -336,6 +342,18 @@ def enumerate_tile_options(
         if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
             per_dim.append((host_dim, counts))
 
+    # Axes are emitted outermost-first in ascending host_dim order: per_dim is
+    # built over range(n_out) and itertools.combinations preserves it. TileSpec
+    # order is semantic -- levels nest, so a swapped pair is a different plan
+    # with the same per-tile shape -- and only this order is offered. A consumer
+    # that reads its producer with two tiled dims permuted walks the tiles in
+    # the swapped order, so it cannot share that producer's loop nest (the
+    # per-(tile, core) match in the solve's pair table rules it out) and is
+    # split from it instead. Mixing an output axis with a reduction axis in one
+    # spec (impossible today: the reduction options below are single-level)
+    # would further make the relative nesting semantic -- reduction-outer
+    # partially accumulates every output tile on each pass, reduction-inner
+    # completes each one before moving on.
     for k in range(1, min(max_dims, len(per_dim)) + 1):
         for dims_combo in itertools.combinations(per_dim, k):
             dim_indices = [d for d, _ in dims_combo]

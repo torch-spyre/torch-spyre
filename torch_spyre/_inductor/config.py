@@ -334,6 +334,13 @@ native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower()
     "yes",
 )
 
+# Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
+# tiling for each op alongside its core division, and apply the tilings it
+# selects. Off by default, and inert unless the joint CP-SAT co-opt path is
+# active (co_optimizing_lx_planning and layout_solver == "cpsat"). Ops a
+# spyre_hint or for_each_tile loop already tiles keep that tiling.
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
+
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
 # Enable persistent on-disk caching of compiled Spyre kernels across

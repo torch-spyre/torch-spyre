@@ -63,6 +63,7 @@ class TagFamily:
     dated: bool = False
     nearest: bool = False
     prefix: bool = False
+    spellings: tuple = ()
 
     @staticmethod
     def render(template: str, values: dict) -> str:
@@ -193,6 +194,7 @@ def load_tag_families(path: str = "") -> dict:
             dated=bool(entry.get("dated")),
             nearest=bool(entry.get("nearest")),
             prefix=bool(entry.get("prefix")),
+            spellings=_spellings(where, name, entry.get("spellings")),
         )
     if MISC not in out:
         raise ValueError(
@@ -227,19 +229,34 @@ def family_tag(tag_family: str, registry_tag: str, built=None) -> str:
     return family.from_registry(registry_tag, built) if family else ""
 
 
+def _spellings(where: str, name, value) -> tuple:
+    if value is None:
+        return ()
+    if not (isinstance(value, list) and all(isinstance(v, str) and v for v in value)):
+        raise ValueError(
+            f"{where}: tag family {name!r}: spellings must be a list of prefixes"
+        )
+    return tuple(value)
+
+
+def canonical(tag: str) -> str:
+    """`tag` under its family's own prefix when it starts with one of that family's other
+    spellings (cicd-tech-preview-v4 -> ci-cd-tech-preview-v4); else `tag` unchanged."""
+    for f in tag_families().values():
+        for spelling in f.spellings:
+            if tag.startswith(spelling + "-"):
+                return f.name + tag[len(spelling) :]
+    return tag
+
+
 def family_of(tag: str) -> str:
-    """The family a full v2 tag belongs to: by its prefix, longest first, else the family whose
-    v2 tag is the registry tag itself and whose pattern matches it; '' for none."""
-    families = tag_families().values()
-    names = sorted((f.name for f in families if f.prefix), key=len, reverse=True)
-    by_prefix = next((n for n in names if tag.startswith(n + "-")), "")
-    if by_prefix:
-        return by_prefix
-    return next(
-        (f.name for f in families
-         if f.tag == "{registry_tag}" and f.registry_tag is not None and f.registry_tag.match(tag)),
-        "",
-    )  # fmt: skip
+    """The family a full v2 tag belongs to by its prefix (or another spelling of it), longest
+    first; '' for none."""
+    tag = canonical(tag)
+    names = sorted(
+        (f.name for f in tag_families().values() if f.prefix), key=len, reverse=True
+    )
+    return next((n for n in names if tag.startswith(n + "-")), "")
 
 
 class Registry:

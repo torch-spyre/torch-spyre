@@ -10939,7 +10939,7 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
-    """derive_tiling_groups — consecutive runs of ops sharing a TileSpec."""
+    """derive_tiling_groups — consecutive runs of ops running one loop nest."""
 
     def _graph_of(self, names):
         return _graph([_make_op(_make_pointwise([Integer(64)]), n) for n in names])
@@ -10956,13 +10956,24 @@ class TestDeriveTilingGroups(unittest.TestCase):
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
 
-    def test_spec_change_breaks_the_run(self):
+    def test_nest_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
         s1 = TileSpec((TileAxis(0, 4),))
         s2 = TileSpec((TileAxis(0, 2),))
         groups = derive_tiling_groups(g, {"op0": s1, "op1": s2})
         self.assertEqual([len(ops) for ops, _ in groups], [1, 1])
-        self.assertEqual([spec for _, spec in groups], [s1, s2])
+        self.assertEqual([nest for _, nest in groups], [(4,), (2,)])
+
+    def test_equal_nests_on_different_dims_share_a_run(self):
+        # host_dim is positional in each op's own output, so the run keys on the
+        # loop nest alone; which dims line up is checked per edge at apply.
+        g = self._graph_of(["op0", "op1"])
+        groups = derive_tiling_groups(
+            g,
+            {"op0": TileSpec((TileAxis(0, 4),)), "op1": TileSpec((TileAxis(1, 4),))},
+        )
+        self.assertEqual(self._names(groups), [["op0", "op1"]])
+        self.assertEqual([nest for _, nest in groups], [(4,)])
 
     def test_empty_and_all_untiled_produce_no_groups(self):
         g = self._graph_of(["op0", "op1"])
@@ -11085,13 +11096,14 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         groups_specs = derive_tiling_groups(g, {"op0": spec, "op1": spec})
         self.assertEqual(len(groups_specs), 1)
-        group_ops, group_spec = groups_specs[0]
+        group_ops, nest = groups_specs[0]
         self.assertEqual([o.get_operation_name() for o in group_ops], ["op0", "op1"])
+        self.assertEqual(nest, (4,))
         # One group, base 0 -> hint_ids [0], every op in the group shares it.
         base = _derive_hint_id_base(g)
         self.assertEqual(base, 0)
-        hints0 = tile_spec_to_dim_hints(got0, group_spec, [base])
-        hints1 = tile_spec_to_dim_hints(got1, group_spec, [base])
+        hints0 = tile_spec_to_dim_hints(got0, spec, [base])
+        hints1 = tile_spec_to_dim_hints(got1, spec, [base])
         self.assertEqual(hints0[0].hint_id, hints1[0].hint_id)
         self.assertEqual(hints0[0].split_count, 4)
 

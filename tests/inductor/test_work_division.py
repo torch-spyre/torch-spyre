@@ -2269,15 +2269,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         op.get_name.return_value = name
         return op
 
-    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
+    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
         name = op.get_name()
         if name == "consumer":
-            index = [cd.splits for cd in self.consumer_divs].index(splits)
+            index = [cd.splits for cd in self.consumer_divs].index(division.splits)
             return (self.consumer_views[index], False, True)
         views, partial, repr_ok, _matmul = self.parents.get(
             name, ([self.view_a, self.view_b], [False, False], [True, True], False)
         )
-        index = [cd.splits for cd in self.divisions[name]].index(splits)
+        index = [cd.splits for cd in self.divisions[name]].index(division.splits)
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
@@ -2349,6 +2349,34 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 with self._patches():
                     self.assertEqual(self._table(allocator)["matmul"], [(1, 1)])
 
+    def test_a_producer_read_twice_pairs_only_where_both_reads_match(self):
+        # The consumer reads "plain" a second time through another index, and
+        # that read slices it differently: under consumer index 0 it owns the
+        # buffer on two device dims, and under index 3 the way the first read
+        # does under index 0. A pair has to be true of both reads, which
+        # leaves (1, 1): (0, 0) holds for the first read alone and (0, 3) for
+        # the second alone.
+        y = _isym("y")
+        second = MemoryDep("plain", y, (y,), (8,))
+        self.rw[self.consumer_op].reads.append(second)
+        second_views = [self.view_wide, self.view_b, self.view_a, self.view_a]
+
+        def view_for_div(op, dep, buf_name, division, prep_cache):
+            if dep == second:
+                index = [cd.splits for cd in self.consumer_divs].index(division.splits)
+                return (second_views[index], False, True)
+            return self._view_for_div(op, dep, buf_name, division, prep_cache)
+
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with (
+            self._patches(),
+            patch.object(allocator_module, "_view_for_div", side_effect=view_for_div),
+        ):
+            pairs = self._table(allocator).get("plain", [])
+        self.assertLessEqual(
+            set(pairs), {(1, 1)}, "a pair must hold for every read of the producer"
+        )
+
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         storage_op = self.op_by_name["plain"]
@@ -2367,12 +2395,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             self.assertIsNotNone(edge)
             self.assertEqual(edge.buf_name, storage_op.get_name())
-            self.assertEqual(edge.read_dep.name, storage_op.get_name())
             self.assertEqual(
-                edge.match_pairs(
-                    [cd.splits for cd in self.parent_divs],
-                    [cd.splits for cd in self.consumer_divs],
-                ),
+                [dep.name for dep in edge.read_deps], [storage_op.get_name()]
+            )
+            self.assertEqual(
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
             )
 
@@ -2411,12 +2438,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(set(edges), {"plain"})
             edge = edges["plain"]
             self.assertIs(edge.consumer_op, self.consumer_op)
-            self.assertEqual(edge.read_dep.name, "plain")
+            self.assertEqual([dep.name for dep in edge.read_deps], ["plain"])
             self.assertEqual(
-                edge.match_pairs(
-                    [cd.splits for cd in self.parent_divs],
-                    [cd.splits for cd in self.consumer_divs],
-                ),
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
             )
             # The update's own write is the carry edge, not a read edge.
@@ -2611,12 +2635,12 @@ class TestResidencyEdgeMatching(unittest.TestCase):
     def _compatible(edge, parent_div, consumer_div):
         """Per-pair reimplementation of what ``match_pairs`` computes in
         batch, exercised against the same splits-dict API."""
-        if edge._cores_used(parent_div.splits) != edge._cores_used(consumer_div.splits):
+        if edge._cores_used(parent_div) != edge._cores_used(consumer_div):
             return False
-        parent_view = edge.parent_view(parent_div.splits)
+        parent_view = edge.parent_view(parent_div)
         if parent_view is None:
             return False
-        consumer_view = edge.consumer_view(consumer_div.splits)
+        consumer_view = edge.consumer_view(consumer_div)
         return consumer_view is not None and parent_view.same_partition(consumer_view)
 
     def test_compatible_agrees_with_the_table(self):
@@ -2652,9 +2676,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIsNotNone(edge)
             # Four owners cannot directly serve eight consumer cores.
             self.assertEqual(
-                edge.match_pairs(
-                    [self.parent_divs[0].splits], [self.consumer_divs[2].splits]
-                ),
+                edge.match_pairs([self.parent_divs[0]], [self.consumer_divs[2]]),
                 [],
             )
 
@@ -2690,7 +2712,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                                 "plain", producer, self.consumer_op, reads, None, {}
                             )
                         if memory in reads and memory in writes:
-                            self.assertIs(edge.read_dep, memory)
+                            self.assertEqual(edge.read_deps, (memory,))
                             self.assertIs(edge.write_dep, memory)
                         else:
                             self.assertIsNone(edge)
@@ -2736,8 +2758,8 @@ class TestCloneDivisionMatching(unittest.TestCase):
             writes=[MemoryDep("consumer", x, (x,), (8,))],
         )
 
-    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
-        index = [cd.splits for cd in self.consumer_divs].index(splits)
+    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
+        index = [cd.splits for cd in self.consumer_divs].index(division.splits)
         return (self.views[index], False, True)
 
     def _menu(self):
