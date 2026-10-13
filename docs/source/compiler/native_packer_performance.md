@@ -3,9 +3,9 @@
 **Historical record.** This is the measurement that made the C++
 `NativePermutationLayoutSolver` the default packer for the simulated-annealing
 layout solver, taken 2026-08-12. The Python packer it was compared against, and
-the harness that produced these tables, were both removed in #4173, so the
-comparison can no longer be re-run — the page is kept for the reasoning and the
-shape of the result, not as a benchmark to repeat.
+the harness that produced these tables, were both removed in #4545 (which
+fixes #4173), so the comparison can no longer be re-run — the page is kept for
+the reasoning and the shape of the result, not as a benchmark to repeat.
 
 ## What was being compared
 

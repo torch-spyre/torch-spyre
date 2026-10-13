@@ -12,7 +12,7 @@ which contains the following files.
 
 - **`plan_solver.py`** — the shared `LifetimeBoundBuffer`
   data type, the `MemoryPlanSolver` ABC, and a simple `GreedyLayoutSolver`.
-- **`../../csrc/perm_layout_native.cpp`** — the core, and the only packer that ships. A
+- **`torch_spyre/csrc/perm_layout_native.cpp`** — the core, and the only packer that ships. A
   *permutation* is an allocation order; `NativePermutationLayoutSolver` places each buffer on top of
   the earlier-placed buffers it overlaps in time (with in-place reuse) and re-places under
   `swap`/`rotate`/`resize`/`set_eligible`. Its from-scratch counterpart,

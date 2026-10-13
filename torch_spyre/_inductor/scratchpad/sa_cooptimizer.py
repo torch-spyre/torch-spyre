@@ -1034,7 +1034,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             pi,
             self.limit,
             self.alignment,
-            eligible,
+            eligible=eligible,
         )
 
     # -- scoring (lower is better) -------------------------------------------
