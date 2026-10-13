@@ -121,6 +121,11 @@ _COOLING_SPAN = 1000.0
 # Cause recorded for a buffer the SA engine left out of LX.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
+# What ``sym_division`` binds to for a division its buffer's menu does not carry:
+# outside every table indexed by menu position, which ``RelayoutCharge`` reads as
+# unpriced.
+_UNPRICED = -1
+
 
 def _work_slices(op, division: "CoreDivision") -> dict:
     """Restore a complete symbol-keyed split map from a sparse candidate."""
@@ -826,13 +831,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 1 if name in resident else 0
             )
             # The division's identity, for table terms over candidates (the
-            # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
-            # menu position, not the key, so equal configs need not bind alike: a
-            # generated config has no position at all. Sound only while no such
-            # term reaches the annealer, which ``decides_lx_relayouts()`` ensures
-            # (#4425).
+            # relayout price is one; see RelayoutCopyBuffer.cost_term): the menu
+            # position naming the choice, which a generated config finds by its
+            # key. One the menu does not carry binds outside every table, which
+            # reads as unpriced (RelayoutCharge).
             value_of[buf.sym_division] = lambda chosen, resident, idx=idx: (
-                chosen[idx].menu_index
+                _UNPRICED
+                if (position := self._known_menu_position(idx, chosen[idx])) is None
+                else position
             )
             for key, sym in buf.sym_core_divs.items():
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: chosen[
@@ -1995,14 +2001,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
             b.spill_reason = spilled if addr is None else None
 
-    def _menu_position(self, idx: int, config: DivisionConfig) -> int:
+    def _known_menu_position(self, idx: int, config: DivisionConfig) -> Optional[int]:
         """The position in buffer ``idx``'s ``core_divisions`` that names
-        ``config``'s division, registering it if the menu has no such entry."""
+        ``config``'s division, or ``None`` if the menu carries no such entry.
+        What the allocator indexed anything per division by -- the relayout
+        candidates and their prices among them."""
         if config.menu_index is not None:
             return config.menu_index
         known = self._menus[idx].by_key.get(config.key)
+        return None if known is None else known.menu_index
+
+    def _menu_position(self, idx: int, config: DivisionConfig) -> int:
+        """The position in buffer ``idx``'s ``core_divisions`` that names
+        ``config``'s division, registering it if the menu has no such entry."""
+        known = self._known_menu_position(idx, config)
         if known is not None:
-            return known.menu_index
+            return known
         divisions = self._bufs[idx].core_divisions
         divisions.append(config.division)
         return len(divisions) - 1

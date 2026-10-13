@@ -67,6 +67,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
+    RelayoutCharge,
     TileAxis,
     TileSpec,
     cost_expr_record,
@@ -1320,6 +1321,33 @@ class CostExprScoringTest(TestCase):
             solver._score_fn([tiled], frozenset()),
             utils.to_fixed_us((4 * 10 + 100) / 1000),
         )
+
+    def test_the_division_symbol_binds_a_generated_choice_to_its_menu_position(
+        self,
+    ):
+        # A table term over candidates (the relayout price) is indexed by menu
+        # position. A generated config carries no ``menu_index``, so it must be
+        # resolved by choice; one the menu does not carry (here, any tiled one)
+        # has no position and must read as unpriced, never as some entry.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        prices = [1000 * (position + 1) for position in range(len(_TWO_AXIS_MENU))]
+        cost_expr = RelayoutCharge(1, buf.sym_division, *prices)
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        source = solver._sources[0]
+        on_menu = source.config_for(_axis_div(d0=4, d1=2))
+        self.assertIsNone(on_menu.menu_index)
+        position = [d.label for d in _TWO_AXIS_MENU].index(on_menu.division.label)
+        self.assertEqual(
+            solver._score_fn([on_menu], frozenset()),
+            utils.to_fixed_us(prices[position] / 1000),
+        )
+        tiled = source.config_for(
+            CoreDivision(splits=dict(on_menu.splits), tiling=_TILE_4)
+        )
+        self.assertEqual(solver._score_fn([tiled], frozenset()), 0)
 
     def test_a_space_without_tilings_declares_no_tile_symbol(self):
         # Every engine but this one, and this one with auto_coarse_tiling off.
