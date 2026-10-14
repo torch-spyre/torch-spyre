@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS result_uploads
     CONSTRAINT chk_test_type   CHECK test_type   IN
         ('smoke','unit','integration','regression','trunk','perf',
          'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic',
-         'model_ops','model_modules','model_support')
+         'model_ops','model_modules','model_support','model_serving')
 )
 ENGINE = MergeTree()
 ORDER BY (upload_id, ts);
