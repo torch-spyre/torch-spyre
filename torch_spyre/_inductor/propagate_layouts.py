@@ -1477,10 +1477,34 @@ def _multi_arg_pointwise_layouts(
        4. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+
+    # An index operand read only at lane 0 of each stick takes no part in the
+    # arrangement: a stagger keeps lane 0 in place, so a staggered index read
+    # there yields the same indices as a standard one. An index with such a
+    # candidate keeps only those candidates, as a broadcast operand below keeps
+    # its broadcast ones, so the solver picks one of them.
+    # TODO: lanes 1-3 and 60-63 are also fixed under the fp16 <-> fp32 stagger.
+    def _lane0_candidates(arg) -> list[SpyreTensorLayout]:
+        return [
+            stl
+            for stl in arg.layouts
+            for coords in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
+            if coords is not None and coords[-1] == 0
+        ]
+
+    ea_args = []
+    for arg in args:
+        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
+        if lane0:
+            arg.layouts[:] = lane0
+        else:
+            ea_args.append(arg)
+
     # Determine output ElementArrangement from inputs
     # Collect all unique EAs from input SpyreTensorLayouts
     input_eas = set()
-    for arg in args:
+    for arg in ea_args:
         if arg.layouts:
             # Get EA from first SpyreTensorLayout (all should have same EA for this input)
             input_eas.add(arg.layouts[0].element_arrangement)
@@ -1543,13 +1567,13 @@ def _multi_arg_pointwise_layouts(
 
         std_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts
             and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
         ]
         stag_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
@@ -1619,7 +1643,6 @@ def _multi_arg_pointwise_layouts(
         # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
         output_ea = ElementArrangement.STANDARD
 
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
     in_coords = [
         host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
     ]

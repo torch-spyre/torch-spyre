@@ -21,8 +21,13 @@ import sys
 import warnings
 import pytest
 import unittest
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
+from torch import fx
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
+from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
@@ -43,8 +48,14 @@ import utils_inductor
 from unittest import mock
 from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.dtype_ops import DtypeOpTable, bool_equivalent_dtype
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.split_multi_ops import (
+    _index_syms,
+    _validate_split_supported,
+)
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -395,7 +406,7 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         _cached_fp32_for_int32_cast(shape)
-        if (src, dst) == (torch.float32, torch.int32)
+        if (src, dst) in ((torch.float32, torch.int32), (torch.float32, torch.int64))
         else _cached_to_dtype_input(shape, src),
         dst,
     )
@@ -406,9 +417,15 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, so their conversions have no stick pairs to
-# keep together and are exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+# fp32 and int32 share a stick width, as does int64, which the device stores as
+# int32, so their conversions have no stick pairs to keep together and are exempt
+# from the shapes above.
+_SAME_WIDTH_PAIRS = [
+    (torch.float32, torch.int32),
+    (torch.int32, torch.float32),
+    (torch.float32, torch.int64),
+    (torch.int64, torch.float32),
+]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
@@ -421,12 +438,12 @@ TO_DTYPE_OP_EXPECT_FAIL = [
             DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
             and (src, dst) not in _SAME_WIDTH_PAIRS
         )
-        # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
-        # so there's no width change to trip the fp16-stick boundary.
+        # Sub-stick guard doesn't apply to fp32<->int32/int64 — all are 32-bit
+        # on device, so there's no width change to trip the fp16-stick boundary.
         or (
             src == torch.float32
             and shape[-1] < 32
-            and (src, dst) != (torch.float32, torch.int32)
+            and (src, dst) not in _SAME_WIDTH_PAIRS
         )
     )
 ]
@@ -3997,8 +4014,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # is registered this stops raising, and the case has to become a positive one.
             "expect_raise": {"eval_mode": "Could not run 'aten::native_batch_norm'"},
         },
-        # TODO: TorchInductor compilation failure in the Spyre lowering pass —
-        # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
+        # TODO: group_norm fails layout propagation with a stick incompatibility
+        # (issue #3287).
         ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
             "param_sets": {
                 "8_groups": (
@@ -6878,6 +6895,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # int64 prod over the stick dim decomposes to select+mul, and a
+            # stick-dim select reads one element per stick, a layout only a
+            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -6983,6 +7009,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "param_sets": {
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
+        # int64 arithmetic over rows of one tensor. The rows hold distinct values,
+        # so combining a row with the wrong one gives a wrong answer.
+        ("test_split_multi_ops_view_loads", "test_split_multi_ops_view_loads_cpu"): {
+            "ops_dict": {
+                "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
+                "mul_3_rows": lambda x: x.select(0, 0)
+                * x.select(0, 1)
+                * x.select(0, 2),
+                "add_3_rows": lambda x: x.select(0, 0)
+                + x.select(0, 1)
+                + x.select(0, 2),
+            },
+            "param_sets": {
+                "3x32": (
+                    torch.tensor([[2] * 32, [3] * 32, [5] * 32], dtype=torch.int64),
+                ),
             },
         },
         # A view that splits the stick dim into (heads, D) and then slices or
@@ -8965,6 +9009,84 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
+    def test_split_multi_ops_view_loads_cpu(self, op, x):
+        # Small integers convert to fp32 exactly, so any difference is a wrong row.
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
+
+    def test_split_multi_ops_view_loads_guard(self):
+        """split_multi_ops refuses an intermediate only if it combines view loads."""
+
+        def load(vid, name, index):
+            return ("load", vid, (), {"_name": name, "_index": index})
+
+        def validate(sizes, trace):
+            """Run the guard on a hand-built trace over one output dim of 32."""
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                for name, size in sizes.items():
+                    V.graph.name_to_buffer[name] = InputBuffer(
+                        name=name,
+                        layout=FixedLayout(
+                            torch.device("cpu"),
+                            torch.float32,
+                            size,
+                            [32, 1][-len(size) :],
+                        ),
+                    )
+                pointwise = Pointwise.create(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    inner_fn=lambda index: None,
+                    ranges=[32],
+                ).data.data
+                op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
+                intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
+                _validate_split_supported(op, trace, intermediate_ops)
+
+        (i0,) = _index_syms(1)
+        cases = {
+            # The split rebuilds the op over whole buffers, which would pair each
+            # element with itself.
+            "two_rows_of_one_buffer": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0),
+                    load(1, "arg", i0 + 32),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                True,
+            ),
+            # A single tensor operand is reloaded at its own index on replay.
+            "one_view_load": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0 + 32),
+                    ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
+                    ("add", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+            # Two buffers read at their own positions combine correctly.
+            "whole_buffers": (
+                {"a": [32], "b": [32]},
+                [
+                    load(0, "a", i0),
+                    load(1, "b", i0),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+        }
+        for case, (sizes, trace, refused) in cases.items():
+            with self.subTest(case):
+                if refused:
+                    with self.assertRaises(Unsupported):
+                        validate(sizes, trace)
+                else:
+                    validate(sizes, trace)
+
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.
 
@@ -9690,6 +9812,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
+    def test_dtype_op_table_bool_gate_matches_codegen(self):
+        """A bool conversion the lowering accepts has an op in every bool format.
+
+        The lowering decides from torch dtypes alone, before a bool has its
+        device format, and the codegen resolves the op from that format. Each
+        destination it accepts must therefore resolve under every format a bool
+        can take, or a conversion compiles to an Unsupported error.
+        """
+        bool_formats = [
+            fmt
+            for fmt in DataFormats.__members__.values()
+            if bool_equivalent_dtype(fmt) is not None
+        ]
+        assert bool_formats
+        dtypes = {dtype for pair in DtypeOpTable.get_dtype_pairs() for dtype in pair}
+        for dst in dtypes:
+            if not DtypeOpTable.is_supported(torch.bool, dst):
+                continue
+            for fmt in bool_formats:
+                assert DtypeOpTable.get_bool_src_operator(fmt, dst) is not None, (
+                    f"bool -> {dst} is accepted but has no op from {fmt}"
+                )
+
     def test_to_dtype_cpu(self, x, dst_dtype):
         def fn(x, dst_dtype):
             return x.to(dtype=dst_dtype)
@@ -9908,6 +10053,106 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_float32_to_int_truncates_cpu(self):
+        # A cast to an integer truncates, including a negative value with a
+        # fraction, which the device op alone floors.
+        x = torch.tensor(
+            [0.4, 0.6, 1.5, 2.5, -0.4, -0.6, -1.5, -2.9] * 8, dtype=torch.float32
+        )
+        for dst in (torch.int32, torch.int64):
+            with self.subTest(dst=dst):
+                self.compare_with_cpu(
+                    lambda x, dst=dst: x.to(dst),
+                    x,
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=False,
+                    run_eager=False,
+                )
+
+    def test_float32_to_int_truncates_views_cpu(self):
+        # The trunc reads its source twice, so over a view it must still compile.
+        # The stick-aligned slice starts at a whole stick (32 float32 elements).
+        x = (((torch.arange(4 * 64) * 7) % 23) - 11.5).reshape(4, 64)
+        views = {
+            "select": lambda x: x.select(0, 1),
+            "transpose": lambda x: x.t(),
+            "expand": lambda x: x[:, :1].expand(4, 64),
+            "aligned_slice": lambda x: x[:, 32:64],
+        }
+        for name, view in views.items():
+            for dst in (torch.int32, torch.int64):
+                with self.subTest(view=name, dst=dst):
+                    self.compare_with_cpu(
+                        lambda x, view=view, dst=dst: view(x).to(dst),
+                        x,
+                        atol=0.0,
+                        rtol=0.0,
+                        cpu_compile=False,
+                        run_eager=False,
+                    )
+
+    def test_gather_staggered_index_lane0_cpu(self):
+        # A float16 index widened onto a stick converts to int32 through a
+        # staggered float32 (hf-adapters' MoE expert indices). The gather reads
+        # lane 0 of each stick, which the stagger keeps in place, so the
+        # staggered index pairs with standard weights.
+        T, top_k, stick, experts, rows, cols = 4, 8, 64, 16, 64, 64
+        ids = (torch.arange(T * top_k) * 5 % experts).reshape(T, top_k)
+        idx_wide = ids[..., None].expand(T, top_k, stick).to(torch.float16)
+        weights = torch.arange(experts * rows * cols).reshape(experts, rows, cols)
+        weights = (weights % 251).to(torch.bfloat16)
+
+        def fn(idx_wide, weights):
+            addr = idx_wide.to(torch.float32)[..., : stick // 2].to(torch.int32)
+            return weights[addr[..., 0]].reshape(T * top_k, rows, cols)
+
+        self.compare_with_cpu(
+            fn,
+            idx_wide.contiguous(),
+            weights,
+            atol=0.0,
+            rtol=0.0,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_float32_to_int_saturates(self):
+        # Where a cast has no defined result in C (NaN, an infinity, a value
+        # outside int32 cast to int32), the CPU returns the minimum integer and
+        # the device saturates to the int32 range. A float32 is exact as an
+        # integer up to 2**24 and converts exactly within the int32 range.
+        values = [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            2.0**31,
+            -3.0e9,
+            1.0e20,
+            2.0**31 - 128,
+            -(2.0**31),
+            2.0**24 + 2,
+            -7.0,
+        ]
+        expected = [
+            2**31 - 1,
+            2**31 - 1,
+            -(2**31),
+            2**31 - 1,
+            -(2**31),
+            2**31 - 1,
+            2**31 - 128,
+            -(2**31),
+            2**24 + 2,
+            -7,
+        ]
+        x = torch.tensor(values, dtype=torch.float32)
+        cast = torch.compile(lambda x: x.to(torch.int32))
+        torch.testing.assert_close(
+            cast(x.to(utils_inductor.DEVICE)).cpu(),
+            torch.tensor(expected, dtype=torch.int32),
+        )
 
     def test_bool_staggered_ea_src_to_fp16_cpu(self):
         # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA
