@@ -1503,6 +1503,29 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 else:
                     self._eligible_copies.discard(idx)
 
+    def _switch_off_stale_copies(self, flags: dict[int, bool]) -> None:
+        """Switch off the copies among ``flags`` that a division change left
+        serving no one: switched on, and no consumer now reads its source
+        through them.
+
+        Such a copy is ineligible already, so nothing placed or counted
+        changes; it would only be carried through every later ripple, and the
+        anchoring, as a switched-on copy, which on a large graph is most of
+        them. Should the divisions return to its pair, a relayout move buys it
+        again. Called after a division change only: a relayout move switches a
+        copy on before it moves the divisions it serves under.
+        """
+        if not self._relayout_on:
+            return
+        stale = [
+            idx
+            for idx, flag in flags.items()
+            if not flag
+            and idx in self._relayout_on
+            and not self._relayout_copy_serves(idx)
+        ]
+        self._relayout_on.difference_update(stale)
+
     def _resident_addresses(self) -> list[Optional[int]]:
         """``packer.addresses`` with every buffer :meth:`_resident_indices`
         drops set to ``None``: the addresses the write-back commits."""
@@ -1833,6 +1856,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             [(x, flags[x]) for x in affected],
         )
         self._note_copy_eligibility(flags)
+        self._switch_off_stale_copies(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _retile_boundary(self, idx: int, config: DivisionConfig) -> None:
@@ -2014,6 +2038,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # One re-place for the whole region rather than one per buffer.
         self.packer.update(resizes, [(x, flags[x]) for x in affected_sorted])
         self._note_copy_eligibility(flags)
+        self._switch_off_stale_copies(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _toggle_relayout(self, copy_idx: int) -> None:

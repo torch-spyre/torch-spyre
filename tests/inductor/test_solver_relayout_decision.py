@@ -1038,6 +1038,25 @@ def test_annealer_state_stays_consistent_through_a_full_anneal(bufs, spill):
     _assert_eligible_count(solver)
 
 
+def test_annealer_switches_off_a_copy_a_division_change_strands():
+    """A switched-on copy no consumer reads through after a division change is
+    switched off with that change: it is ineligible anyway, and carrying it on
+    would drag it through every later ripple. Returning the divisions does not
+    revive it; a relayout move would buy it again."""
+    solver = _primed_annealer(_chain(1000.0))
+    m = _index(solver, "M")
+    first = _index(solver, relayout_copy_name("P", 0))
+    solver._toggle_relayout(first)
+    solver._apply_assignment(solver._relayout_assignment(first))
+    assert first in solver._relayout_on and solver.chosen[m].menu_index == 1
+    solver._atomic_flip(m, solver._menus[m].configs[0])
+    assert first not in solver._relayout_on
+    _assert_eligible_count(solver)
+    solver._atomic_flip(m, solver._menus[m].configs[1])
+    assert first not in solver._relayout_on
+    _assert_eligible_count(solver)
+
+
 def test_annealer_scores_relayout_charges_as_the_expression_does():
     """The annealer sums the copies' RelayoutCharge terms itself instead of
     compiling them. Over every division of M and every resident set, its score
