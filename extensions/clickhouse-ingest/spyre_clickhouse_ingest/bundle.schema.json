@@ -14,10 +14,11 @@
       ]
     },
     "kind": {
-      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg.",
+      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg. sendnn: results/*.txt, the perf suite's report_sendnn.txt, as torch-spyre benchmark rows on the sendnn backend (always uploaded; no CI leg runs sendnn).",
       "enum": [
         "junit",
-        "vllm"
+        "vllm",
+        "sendnn"
       ]
     },
     "artifact_id": {
@@ -48,7 +49,7 @@
       ]
     },
     "test_type": {
-      "description": "The tier; artifact_results.test_type's CHECK set.",
+      "description": "The tier; artifact_results.test_type's CHECK set. Implied perf for kind vllm and sendnn.",
       "enum": [
         "smoke",
         "unit",
@@ -143,7 +144,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "pattern": "^(results/[^/]+\\.(xml|json)|attachments/[^\\s]+)$"
+            "pattern": "^(results/[^/]+\\.(xml|json|txt)|attachments/[^\\s]+)$"
           },
           "sha256": {
             "type": "string",

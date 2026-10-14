@@ -2510,7 +2510,7 @@ def _enum_split_options(
             return [seed]
         options = {_candidate_key(seed): seed}
         for candidate in _factored_bm_splits(_reduction_bm_axes(op)):
-            full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+            full_candidate = dict.fromkeys(iteration_space_from_op(op), 1)
             full_candidate.update(candidate)
             options.setdefault(_candidate_key(full_candidate), full_candidate)
         return _legal_split_options(op, options.values())

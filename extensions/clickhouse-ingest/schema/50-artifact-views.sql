@@ -194,7 +194,7 @@ FROM
         -- A writer's props rank 3 unless it marked them a default (results' failure_confidence=1).
         toUInt8(multiIf(props['failure_reason'] != '', toUInt8OrDefault(props['failure_confidence'], toUInt8(3)),
                         own_reason != '', 2, 0)) AS own_conf
-    FROM artifact_results
+    FROM v_artifact_results_published
     ORDER BY ts DESC, audit_timestamp DESC
     LIMIT 1 BY artifact_id, run_id, result_kind, test_type
 ) AS r
