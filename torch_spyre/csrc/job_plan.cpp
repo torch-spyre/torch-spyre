@@ -113,11 +113,14 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
-  auto* params = flex::createComputeParams(
-      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
+      params(
+          flex::createComputeParams(&program_address_, std::move(tensor_allocs),
+                                    name_, bootstrap_offset_),
+          flex::destroyComputeParams);
+  params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(params);
-  flex::destroyComputeParams(params);
+  stream.launchCompute(params.get());
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -167,7 +170,19 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  stream.launchHostCompute(params);
+  // Keep the release API's combined host-compute/upload path for groups that
+  // cannot use the compound correction/compute submission.
+  if (!ctx.batch_program_corrections) {
+    stream.launchHostCompute(params);
+    return;
+  }
+
+  std::shared_ptr<flex::HostComputeBuffer> host_buffer(
+      stream.prepareHostCompute(params), flex::destroyHostComputeBuffer);
+  TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+  ctx.program_corrections.push_back(
+      {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
+                                   device_address_.clone_non_owning())});
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {

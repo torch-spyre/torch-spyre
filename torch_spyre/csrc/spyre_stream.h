@@ -68,6 +68,8 @@ class SpyreStream {
                  DataFormats dtype, bool use_dmai) const;
   // Host-side compute for deeptools host compute calls.
   void launchHostCompute(flex::HostComputeParams*) const;
+  // Prepare owned corrections for a later compound compute submission.
+  flex::HostComputeBuffer* prepareHostCompute(flex::HostComputeParams*) const;
 
   // Conversions
   c10::Stream unwrap() const;

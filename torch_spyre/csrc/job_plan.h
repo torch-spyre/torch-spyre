@@ -272,6 +272,8 @@ struct LaunchContext {
    * for existing callers that pass no payload.
    */
   std::vector<SymbolicArg> symbolic_args;
+  bool batch_program_corrections = false;
+  std::vector<flex::ProgramCorrection> program_corrections;
 };
 
 /**
