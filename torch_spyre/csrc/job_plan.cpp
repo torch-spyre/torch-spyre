@@ -177,6 +177,13 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     return;
   }
 
+  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
+  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
+  // before returning this fully written buffer (Flex #2027,
+  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
+  // caller ordering makes the bytes ready before S_dev receives the consuming
+  // ComputeParams, regardless of whether hazard tracking is enabled.
+  // Shared ownership then keeps the bytes alive through upload completion.
   std::shared_ptr<flex::HostComputeBuffer> host_buffer(
       stream.prepareHostCompute(params), flex::destroyHostComputeBuffer);
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
