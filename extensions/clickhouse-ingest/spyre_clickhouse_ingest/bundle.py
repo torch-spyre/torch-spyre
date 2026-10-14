@@ -28,6 +28,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import sendnn, vllm
 from .identity import DerivedId, RunId
@@ -83,6 +84,25 @@ def resolve_artifact(client, db: str, meta: dict):
     if not found:
         raise BundleError("artifact not recorded: " + "; ".join(missed))
     return next(iter(found.values()))
+
+
+def create_artifact(client, db: str, meta: dict, dry_run: bool):
+    """The bundle's image recorded as an upstream artifact, for an image no pipeline of ours
+    built (a dry run records nothing). Its identity is the image digest, as for any image."""
+    from .resolver import ensure
+
+    want = meta["create_artifact"]
+    name = want.get("name") or meta["image"].split("@")[0].rsplit("/", 1)[-1]
+    spec = f"image:{meta['image']};component={want['component']};name={name}"
+    try:
+        res = ensure(client, db, spec, meta["arch"], origin="upstream", registry="off",
+                     props={"created_by": "results-upload"}, dry_run=dry_run)  # fmt: skip
+    except ValueError as err:
+        raise BundleError(f"create_artifact: {err}") from None
+    ident = res.identity
+    return SimpleNamespace(
+        artifact_id=ident.artifact_id, arch=ident.arch, component=ident.component
+    )
 
 
 def existing_run(client, db: str, rid: str, component: str) -> tuple:
@@ -186,7 +206,12 @@ def _ingest(root: Path, args) -> dict:
             client.set_client_setting("readonly", "2")
     except Exception as err:  # noqa: BLE001 -- unreachable is a retry, not a verdict on the bundle
         raise BundleError(f"spyre_v2 unreachable: {err}", FAILED) from None
-    r, via = resolve_artifact(client, db, meta)
+    try:
+        r, via = resolve_artifact(client, db, meta)
+    except BundleError:
+        if not meta.get("create_artifact"):
+            raise
+        r, via = create_artifact(client, db, meta, args.dry_run), "create_artifact"
     sha = digest(root)
     uploader = args.uploader or meta.get("uploader") or getpass.getuser()
     meta.setdefault("arch", DerivedId.arch(r.arch))

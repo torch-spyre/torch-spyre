@@ -149,3 +149,43 @@ def test_sweeps_at_two_concurrencies_are_two_benchmarks():
         for e in (a, b)
     }
     assert len(ids) == 2
+
+
+ZAI = (
+    "icr.io/zai_pytorch/v0.1.0_4q26/test_spyre-0.5.0_cp-3.12_ubi-10.2@sha256:"
+    + "ab" * 32
+)
+
+
+def test_create_artifact_records_an_unbuilt_image_as_upstream():
+    c = DryRunClient()
+    meta = {
+        "image": ZAI,
+        "arch": "s390x",
+        "create_artifact": {"component": "zai-pytorch"},
+    }
+    r = bundle.create_artifact(c, "spyre_v2", meta, dry_run=True)
+    (art,) = c.rows["artifacts"]
+    assert (art["origin"], art["component"], art["arch"]) == (
+        "upstream",
+        "zai-pytorch",
+        "s390x",
+    )
+    assert art["artifact_name"] == "test_spyre-0.5.0_cp-3.12_ubi-10.2"
+    assert r.artifact_id == art["artifact_id"]
+    (ref,) = c.rows["artifact_refs"]
+    assert ref["content_digest"] == "sha256:" + "ab" * 32
+
+
+def test_create_artifact_needs_an_image_and_its_arch(tmp_path):
+    root = _bundle(tmp_path, artifact_id=None, arch=None, image=ZAI,
+                   create_artifact={"component": "zai-pytorch"})  # fmt: skip
+    with pytest.raises(offline.BundleError, match="create_artifact records an image"):
+        offline.check(root)
+    root = _bundle(
+        tmp_path / "ok",
+        artifact_id=None,
+        image=ZAI,
+        create_artifact={"component": "zai-pytorch"},
+    )
+    assert offline.check(root)["create_artifact"] == {"component": "zai-pytorch"}

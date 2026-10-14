@@ -404,6 +404,10 @@ def check(root: Path) -> dict:
         raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
+    if meta.get("create_artifact") and not (meta.get("image") and meta.get("arch")):
+        errors.append(
+            "create_artifact records an image: it needs image (by digest) and arch"
+        )
     kind = meta.get("kind", "junit")
     meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
     if not meta["test_type"]:

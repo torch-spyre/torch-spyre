@@ -345,6 +345,11 @@ own: accuracy evals (lm-eval tasks, MTEB, RAG) and other harnesses. Each `result
 - Accuracy metrics (`exact_match`, `acc_norm`, `ndcg_at_10`, `spearman`, `rouge*`, ...) are
   higher-is-better in `benchmark_metric_policy`, advisory.
 
+**An image no pipeline of ours built** (a partner's image, say) has no artifact to attach a
+verdict to. `"create_artifact": {"component": "<owner>", "name": "<optional>"}` with `image` (by
+digest) and `arch` records it as an `upstream` artifact keyed by its digest, when neither field
+names a recorded one; `name` defaults to the image repository's last path segment.
+
 ### Air-gapped flow
 
 1. **While connected**, from the artifact's dashboard page: pull the image **by digest**, and
