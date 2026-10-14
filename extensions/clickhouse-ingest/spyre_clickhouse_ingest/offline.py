@@ -69,7 +69,7 @@ VLLM_SIGNATURES = (
 ARTIFACT_KEYS = ("artifact_id", "image", "artifact")
 BASE_URL = "https://na.artifactory.swg-devops.com/artifactory"
 REPO = "sys-ai-sw-accel-team-cos-dev-generic-local"
-ROOT = "zsp/next/{arch}/v2-results"
+ROOT = "next/{arch}/v2-results"
 WAIT_MINUTES = 40
 POLL_SECONDS = 30
 

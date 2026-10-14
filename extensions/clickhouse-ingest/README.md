@@ -361,7 +361,7 @@ ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundl
 
 ### Uploading by hand
 
-The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/zsp/next/<arch>/v2-results/inbox/<key>/`
+The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/next/<arch>/v2-results/inbox/<key>/`
 on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
 the full path.
 - `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
@@ -377,7 +377,7 @@ after 24 hours is rejected.
 
 ```
 ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
-INBOX=zsp/next/<arch>/v2-results/inbox/<key>
+INBOX=next/<arch>/v2-results/inbox/<key>
 curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
 # a folder, bundle.json last
 (cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
