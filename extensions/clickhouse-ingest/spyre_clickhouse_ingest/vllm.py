@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 BENCH_COMPONENT = "spyre-inference"
 REPORT_KIND = "vllm"
-RUN_MODES = ("latency", "throughput", "serve")
+RUN_MODES = ("latency", "throughput", "serve", "serving")
 # In the hash, not merely in props: mode and the input shapes are what separate two runs of
 # the same model. Positional: reordering re-keys every benchmark.
 BENCH_ID_KEYS = (
@@ -46,6 +46,15 @@ BENCH_ID_KEYS = (
     "tensor_parallel",
     "input_len",
     "output_len",
+)
+# A concurrency sweep's name (serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>) also carries these.
+# A separate tuple, not appended to BENCH_ID_KEYS: every key emits into the hash even when
+# absent, so appending would re-key every existing vLLM benchmark.
+SWEEP_ID_KEYS = BENCH_ID_KEYS + (
+    "concurrency",
+    "num_prompts",
+    "max_model_len",
+    "max_num_seqs",
 )
 
 # Scalar metrics per vLLM bench schema; list fields (latencies, itls, ttfts, ...) are the raw
@@ -336,13 +345,17 @@ def extract_rows(
 
 def parse_input_shapes(test_name: str) -> dict[str, str]:
     """tp1_in64_out64 -> {tensor_parallel, input_len, output_len}: identity discriminators,
-    without which tp1 and tp4 are one benchmark."""
+    without which tp1 and tp4 are one benchmark; a sweep's c/n/len/seqs tokens too."""
     out: dict[str, str] = {}
     for token in (test_name or "").split("_"):
         for prefix, key in (
             ("tp", "tensor_parallel"),
             ("in", "input_len"),
             ("out", "output_len"),
+            ("c", "concurrency"),
+            ("n", "num_prompts"),
+            ("len", "max_model_len"),
+            ("seqs", "max_num_seqs"),
         ):
             rest = token[len(prefix) :]
             if token.startswith(prefix) and rest.isdigit():
@@ -390,7 +403,9 @@ def bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "iterations": iterations,
                 "run_props": run_props,
                 "disc": props,
-                "disc_keys": BENCH_ID_KEYS,
+                "disc_keys": SWEEP_ID_KEYS
+                if set(props) - set(BENCH_ID_KEYS) - {"model"}
+                else BENCH_ID_KEYS,
             }
         )
     return entries

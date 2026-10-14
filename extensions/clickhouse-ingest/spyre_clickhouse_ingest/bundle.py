@@ -36,6 +36,7 @@ from .offline import (
     MANUAL_PREFIX,
     STATUS,
     BundleError,
+    benchmark_entries,
     check,
     digest,
     inbox_keys,
@@ -216,6 +217,10 @@ def _ingest(root: Path, args) -> dict:
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
     elif meta.get("kind") == "sendnn":
         report["benchmark_runs"] = write_sendnn(client, db, root, meta, aid, rid, props)
+    elif meta.get("kind") == "benchmarks":
+        report["benchmark_runs"] = write_generic(
+            client, db, root, meta, aid, rid, props
+        )
     else:
         write_junit(db, root, meta, aid, rid, props, args.strict)
     if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
@@ -264,6 +269,62 @@ def write_vllm(client, db, root, meta, aid, rid, props) -> int:
         )  # fmt: skip
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"vLLM write failed: {err!r}", FAILED) from None
+    return n
+
+
+GENERIC_KIND = "benchmarks"
+
+
+def generic_entries(rows: list) -> list:
+    """A benchmarks file's rows in insert_benchmarks' entry shape: every prop is an identity key,
+    hashed in sorted order, so two rows differing in any prop are two benchmarks."""
+    out = []
+    for b in rows:
+        props = {k: str(v) for k, v in (b.get("props") or {}).items()}
+        out.append({
+            "name": b["name"].strip(), "tags": b.get("tags") or [], "backend": b.get("backend", ""),
+            "props": props, "disc": props, "disc_keys": tuple(sorted(props)),
+            "measurements": {k: [float(x) for x in (v if isinstance(v, list) else [v])]
+                             for k, v in b["measurements"].items()},
+            "iterations": b.get("iterations", 0), "run_props": b.get("run_props") or {},
+        })  # fmt: skip
+    return out
+
+
+def write_generic(client, db, root, meta, aid, rid, props) -> int:
+    """Generic benchmark rows (evals, harnesses with no runner format) under the bundle's own
+    component, then its verdict: the tier is perf or quality, the result_kind performance."""
+    from .client import tables_present
+    from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
+    from .writer import (
+        benchmarks_already_ingested,
+        insert_artifact_result,
+        insert_benchmarks,
+    )
+
+    if not tables_present(
+        client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
+    ):
+        raise BundleError(f"{db} lacks the benchmark tables", FAILED)
+    component = meta["component"]
+    try:
+        n = 0
+        for path in sorted((root / "results").glob("*.json")):
+            # Per file, as a retry after a failed verdict insert must not double the rows.
+            if benchmarks_already_ingested(
+                client, db, rid, component, GENERIC_KIND, path.name
+            ):
+                continue
+            n += insert_benchmarks(client, db, component, rid, generic_entries(benchmark_entries(path)),
+                                   report_kind=GENERIC_KIND, source_file=path.name)  # fmt: skip
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
+            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
+            props={**{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"benchmarks write failed: {err!r}", FAILED) from None
     return n
 
 

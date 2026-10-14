@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS artifact_results
     -- stages, each its own leg; model_ops/model_modules/model_support/model_serving are result_kind
     -- 'capability'.
     CONSTRAINT chk_test_type   CHECK test_type   IN
-        ('smoke','unit','integration','regression','trunk','perf',
+        ('smoke','unit','integration','regression','trunk','perf','quality',
          'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic',
          'model_ops','model_modules','model_support','model_serving'),
 
