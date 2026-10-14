@@ -172,8 +172,15 @@ The `relayout` move draws a copy uniformly.
 It switches a copy that is on off.
 It switches a copy that is off on together with one of its candidates' divisions, for the source and for every consumer the group can serve from it.
 Switching it on alone would pay only when the divisions already sat on one of its few priced pairs, so each half of the change would be worth nothing to the score on its own.
+Among the copy's source divisions, it draws from those that move the fewest buffers another switched-on copy is priced for, so a chain of relayouts (a buffer that is the consumer of one copy and the source of the next) does not lose one link for every link it gains.
+
+Every structural move then buys the seams it opened (`_buy_relayout_seams`): each edge out of a reassigned buffer, or into it from a parent, that no longer matches and whose new pair names a copy gets that copy switched on in the same step.
+A recolor's flood stops at every edge with no compatible pair, and those seams are exactly where a relayout can stand, so a region and the relayouts at its boundary are judged as one move.
+On the prefill attention graphs this is what reaches CP-SAT's plans, which recolor a region and relay out into it.
+
 The memory-only fallback has no price for a shuffle, so under it every copy stays off and the move is not offered.
 A relayout copy carries no division decision, so it buys the search no steps.
+Its price term is summed directly over the resident copies rather than compiled into the score function, since a graph can carry thousands of copies and each is zero while the copy is off.
 
 ## The apply round
 

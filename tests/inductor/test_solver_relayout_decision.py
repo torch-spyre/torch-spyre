@@ -164,7 +164,14 @@ def _view(slot: int, num_cores: int = 4) -> PerCoreView:
 
 
 def _candidate(
-    consumer, i, cost_ns, group=0, j=0, destination_span=16, destination_cores=4
+    consumer,
+    i,
+    cost_ns,
+    group=0,
+    j=0,
+    destination_span=16,
+    destination_cores=4,
+    parent="P",
 ) -> RelayoutCandidate:
     """The priced candidate the allocator would enumerate for P -> consumer under
     source division ``i`` / consumer division ``j``, landing on destination
@@ -172,7 +179,7 @@ def _candidate(
     is immaterial here; they must merely differ from the source and be
     distinct per group."""
     return RelayoutCandidate(
-        parent="P",
+        parent=parent,
         consumer=consumer,
         source_division=i,
         consumer_division=j,
@@ -812,6 +819,50 @@ def test_a_consumer_reads_the_copy_only_under_a_priced_pair(engine):
     assert _copy(r).address is None
 
 
+def _chain(relayout_cost_ns):
+    """P (uses [0, 1]) -> M (uses [1, 2]) -> C (uses [2, 3]), no slicing match
+    on either edge, so P and M reach LX only by relaying out. P -> M is priced
+    only into M's division 1; M -> C lands on one view of M, priced from either
+    of M's divisions. Both links fire only with M at division 1: M is the
+    consumer of one copy and the source of the next."""
+    m = CoreDivisionBuffer(
+        "M",
+        64,
+        [1, 2],
+        core_divisions=[CoreDivision(splits={1 - d: 4}) for d in range(2)],
+        parents=["P"],
+        cd_parent_matches={"P": []},
+        cd_parent_relayouts={"P": [_candidate("M", 0, relayout_cost_ns, j=1)]},
+    )
+    c = CoreDivisionBuffer(
+        "C",
+        64,
+        [2, 3],
+        core_divisions=[CoreDivision(splits={1: 4})],
+        parents=["M"],
+        cd_parent_matches={"M": []},
+        cd_parent_relayouts={
+            "M": [
+                _candidate("C", 0, relayout_cost_ns, parent="M"),
+                _candidate("C", 1, relayout_cost_ns, parent="M"),
+            ]
+        },
+    )
+    return _with_copies(_producer([0, 1]), m, c)
+
+
+def test_a_chain_of_relayouts_fires_both_links(engine):
+    """Spilling P or M costs 20000 each, a shuffle 1000: both links fire, with
+    M at the one division both are priced for."""
+    r = _solve(engine, _chain(1000.0), M=20000.0)
+    assert r["P"].address is not None and r["M"].address is not None
+    assert r["M"].chosen_division == 1
+    assert r["M"].chosen_relayouts["P"].candidate.consumer_division == 1
+    assert r["C"].chosen_relayouts["M"].candidate.source_division == 1
+    assert _copy(r).address is not None
+    assert r[relayout_copy_name("M", 0)].address is not None
+
+
 # ---------------------------------------------------------------------------
 # The annealer's half of the coupling
 # ---------------------------------------------------------------------------
@@ -930,6 +981,72 @@ def test_annealer_relayout_move_buys_the_group_with_its_divisions():
     solver._relayout()  # the only copy, drawn again: switched back off
     assert solver._relayout_on == set() and not solver._eligible(p)
     _assert_eligible_count(solver)
+
+
+def test_annealer_relayout_move_keeps_a_link_another_copy_is_priced_for():
+    """With P -> M switched on (M at division 1), switching on M's copy must
+    not move M off division 1, although that copy is priced from M's division
+    0 too: that would unprice the first link, so a chain could only ever trade
+    one link for the other. Every draw must keep it."""
+    solver = _primed_annealer(_chain(1000.0))
+    m = _index(solver, "M")
+    first = _index(solver, relayout_copy_name("P", 0))
+    second = _index(solver, relayout_copy_name("M", 0))
+    solver._toggle_relayout(first)
+    solver._apply_assignment(solver._relayout_assignment(first))
+    assert solver.chosen[m].menu_index == 1
+    for seed in range(20):
+        solver._rng = random.Random(seed)
+        assignment = solver._relayout_assignment(second)
+        assert assignment[m].menu_index == 1, "the anchored division moved"
+
+
+def test_annealer_relayout_move_buys_the_seams_it_opens():
+    """Switching on P -> M moves M to division 1, which no longer matches C:
+    the move switches on the copy that pair names in the same step, so P, M
+    and both copies are eligible at once."""
+    solver = _primed_annealer(_chain(1000.0))
+    first = _index(solver, relayout_copy_name("P", 0))
+    second = _index(solver, relayout_copy_name("M", 0))
+    solver._rng.choice = lambda options: first if second in options else options[0]
+    solver._relayout()
+    assert {first, second} <= solver._relayout_on
+    for name in ("P", "M"):
+        assert solver._eligible(_index(solver, name)), name
+    assert solver._eligible(first) and solver._eligible(second)
+    _assert_eligible_count(solver)
+
+
+def test_annealer_scores_relayout_charges_as_the_expression_does():
+    """The annealer sums the copies' RelayoutCharge terms itself instead of
+    compiling them. Over every division of M and every resident set, its score
+    must equal the whole objective evaluated directly."""
+    import itertools
+
+    from torch_spyre._inductor.scratchpad import utils
+
+    bufs = _chain(1000.0)
+    expr = _objective(bufs, {"M": 20000.0})
+    solver = _primed_annealer(bufs, expr=expr)
+    assert solver._score_fn is not None
+    m = _index(solver, "M")
+    names = [b.name for b in bufs]
+    for division in (0, 1):
+        chosen = list(solver.chosen)
+        chosen[m] = solver._menus[m].configs[division]
+        for flags in itertools.product((0, 1), repeat=len(bufs)):
+            resident = frozenset(n for n, flag in zip(names, flags) if flag)
+            bindings = {b.sym_is_lx: int(b.name in resident) for b in bufs}
+            bindings.update(
+                {b.sym_division: chosen[i].menu_index for i, b in enumerate(bufs)}
+            )
+            for i, b in enumerate(bufs):
+                for key, sym in b.sym_core_divs.items():
+                    bindings[sym] = chosen[i].splits.get(key, 1)
+            direct = float(expr.xreplace(bindings))
+            assert solver._score_fn(chosen, resident) == utils.to_fixed_us(
+                max(0.0, direct) / 1000.0
+            ), (division, sorted(resident))
 
 
 # ---------------------------------------------------------------------------
