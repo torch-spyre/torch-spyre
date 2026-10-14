@@ -82,6 +82,31 @@ for compute-heavy matmul layers.
 prof.export_chrome_trace("spyre_trace.json")
 ```
 
+The standard Kineto export includes CPU-to-`aiuSubmitToHardware` flow arrows,
+using external correlation IDs carried through the runtime queue. Each
+submission has a zero-duration `aiuCpuLaunch` marker on its originating CPU
+operation's lane and timestamp. These markers allow one CPU operation to link
+to multiple hardware batches without changing the CPU operation or its timing.
+Separate flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
+to the device activity.
+
+Missing CPU origins, calibration traffic, and correlation IDs that Kineto's
+32-bit lookup cannot represent do not receive CPU-to-submit arrows. The full
+external correlation ID remains in the runtime event metadata. No links are
+inferred from timestamp proximity. Support for full-width CPU lookups is tracked
+in [issue #5498](https://github.com/torch-spyre/torch-spyre/issues/5498).
+
+JSON, `.json.gz`, and scheduled exports all use the normal PyTorch API, for
+example `on_trace_ready=lambda p: p.export_chrome_trace(f"trace-{p.step_num}.json")`.
+
+Runtime activities use OS thread IDs, matching PyTorch's CPU lanes. Calibration
+activities share a logical `Spyre calibration (device N)` lane; their
+`host_thread` metadata preserves the actual emitting thread. Its DMA activity
+is calibration traffic, not model input transfer.
+
+These runtime records require matching Flex, libaiupti, and torch-spyre builds.
+Rebuild all three together after changing the activity record layout.
+
 See [Trace analysis](trace_analysis.md) for viewing.
 
 ### Compiled-kernel provenance names
