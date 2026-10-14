@@ -51,6 +51,7 @@ test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 """
 
 import functools
+import math
 import unittest
 import warnings
 from unittest.mock import patch
@@ -59,8 +60,11 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.constants import RESTICKIFY_OP
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
     prescribed_regions,
@@ -90,7 +94,13 @@ from for_each_tile_fixtures import (
     add_tiled_fn,
     add_tiled_reference,
     batched_online_softmax_fn,
+    carried_expert_sum_fn,
     carried_reduction_fn,
+    matmul_x_yt_nested_fn,
+    matmul_x_yt_tile_m_fn,
+    matmul_x_yt_tile_n_fn,
+    matmul_xt_y_nested_fn,
+    matmul_xt_y_tile_n_fn,
     moe_tile_experts_fn,
     nested_restickify_add_fn,
     outside_consumer_fn,
@@ -137,7 +147,7 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from utils_inductor import cached_randn, cached_xavier, dl16_round
+from utils_inductor import cached_randn, cached_xavier, dl16_round, opspec_summaries
 
 
 def _with_dynamo_reset(test_fn):
@@ -1188,7 +1198,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     ATOL = 0.1
     RTOL = 0.1
 
-    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None):
+    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None, ops=()):
         import regex as re
         from torch._inductor.utils import run_and_get_code
 
@@ -1197,6 +1207,8 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         src = "\n".join(code)
         counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
         self.assertIn("LoopSpec(", src)
+        for op in ops:
+            self.assertIn(f"op='{op}'", src, f"expected {op} in:\n{src}")
         expected = trips if isinstance(trips, list) else [trips]
         self.assertEqual(
             sorted(counts), sorted(expected), f"unexpected loop trip counts in:\n{src}"
@@ -1236,6 +1248,52 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
         ref = a.float().t() + x.float()
         self._check(nested_restickify_add_fn, (a, x), ref, trips=[2, 2])
+
+    def test_matmul_x_yt_tiled_on_m(self):
+        """x @ y.t() (the nn.Linear weight pattern): a weight restickify per trip."""
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_m_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
+
+    def test_matmul_xt_y_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_xt_y_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
 
     def test_outside_consumer_after_loop(self):
         a, b, c = (shaped_randn(256, 128, seed=s) for s in range(3))
@@ -1340,19 +1398,27 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
             tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
 
         # Only the expert weights advance; every other input read is fixed.
-        weight_size = [1, hidden, experts, ffn]
+        #
+        # A TensorArg's device_size is the compiler's device layout for that
+        # read, and its axis order and padding depend on the shapes (the
+        # weights come out as [1, 64, 3, 64] here but [64, 2, 3, 64] for
+        # ffn=128), so identify the weight read by its element count, which
+        # no layout change affects, rather than by a layout-specific shape.
+        weight_elements = experts * hidden * ffn
+        is_weight = lambda size: math.prod(size) == weight_elements  # noqa: E731
         weight_reads = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size == weight_size
+            if is_input and is_weight(size)
         ]
         self.assertEqual(len(weight_reads), 1)
         self.assertIsInstance(weight_reads[0], str)
         other_advances = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size != weight_size
+            if is_input and not is_weight(size)
         ]
+        self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
         weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
         self.assertIsNotNone(weight_step)
@@ -1379,6 +1445,132 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
             v, lambda acc, s: torch.minimum(acc, s.amin(0)), 65504.0
         )
         self._check(fn, (v,), v.float().amin(0), trips=4)
+
+
+class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
+    """A terminal sum over E carried through a ``for_each_tile`` loop.
+
+    The accumulator should stay in LX across the whole loop, with each core
+    owning the output rows named by ``work_div``, and be written to HBM once
+    after the loop.  The init value is built next to the loop and carries no
+    ``work_div`` of its own: the solver has to give it the update's split,
+    otherwise the pinned update and the unpinned init cannot share an LX
+    buffer and the accumulator silently lands in HBM.  That is why the
+    ``work_div`` values here include ones other than the default 32-way split.
+    """
+
+    CONFIG = {"sencores": 32, "lx_planning": True}
+
+    def _named(self, values):
+        """Device copy of ``values`` named ``["E", "T", "H"]`` for the hint."""
+        _pnd.reset()
+        for name, size in zip(("E", "T", "H"), values.shape):
+            _pnd.declare_tensor_dim(name, size)
+        return _pnd.name_tensor_dims(values.to(DEVICE_NAME), ["E", "T", "H"])
+
+    def _compile(self, fn, *inputs, extra_config=None):
+        from torch._inductor.utils import run_and_get_code
+
+        torch._inductor.codecache.FxGraphCache.clear()
+        compiled = torch.compile(
+            fn, dynamic=False, fullgraph=True, options={"epilogue_fusion": False}
+        )
+        with config.patch({**self.CONFIG, **(extra_config or {})}):
+            out, code = run_and_get_code(compiled, *inputs)
+        return out.cpu(), "\n".join(code)
+
+    def _assert_lx_resident_carry(self, source):
+        """The accumulate runs entirely in LX and one copy writes HBM after it."""
+        ops = opspec_summaries(source)
+        self.assertIn(
+            ["lx", "lx", "lx"],
+            [o["allocations"] for o in ops if o["op"] == "add"],
+            f"expected an LX-resident accumulate in:\n{source}",
+        )
+        self.assertIn(
+            ["lx", "hbm"],
+            [o["allocations"] for o in ops if o["op"] == "identity"],
+            f"expected one lx->hbm copy of the finished sum in:\n{source}",
+        )
+
+    @staticmethod
+    def _linspace_values(experts, lo=-4.0, hi=4.0):
+        base = torch.linspace(lo, hi, experts * 64 * 64, dtype=torch.float32)
+        return base.reshape(experts, 64, 64).to(torch.float16)
+
+    def test_carried_sum_accumulates_in_lx(self):
+        values = self._linspace_values(2)
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32), self._named(values)
+        )
+
+        self.assertEqual(src.count("LoopSpec("), 1)
+        self.assertIn("count=sympify('2')", src)
+        self._assert_lx_resident_carry(src)
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+        )
+
+    def test_carried_sum_row_split_follows_work_div(self):
+        """Every stage takes the requested split and the carry stays in LX."""
+        values = self._linspace_values(2)
+        for split in (8, 16, 32):
+            with self.subTest(work_div=split):
+                out, src = self._compile(
+                    lambda v: carried_expert_sum_fn(v, split), self._named(values)
+                )
+                self._assert_lx_resident_carry(src)
+                row_splits = {o["splits"][0] for o in opspec_summaries(src)}
+                self.assertEqual(row_splits, {split}, src)
+                torch.testing.assert_close(
+                    out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+                )
+
+    def test_carried_sum_e128_matches_ordinary_and_cpu(self):
+        """128 trips: the carried sum agrees with the untiled device sum."""
+        values = self._linspace_values(128, lo=-3.0, hi=4.0)
+        named = self._named(values)
+        ordinary, _ = self._compile(lambda v: v.sum(dim=0), named)
+        carried, src = self._compile(lambda v: carried_expert_sum_fn(v, 32), named)
+
+        self.assertIn("count=sympify('128')", src)
+        self._assert_lx_resident_carry(src)
+        torch.testing.assert_close(carried, ordinary, atol=1.0, rtol=0.05)
+        torch.testing.assert_close(
+            carried.float(), values.float().sum(0), atol=1.0, rtol=0.05
+        )
+
+    def test_carried_sum_spills_to_hbm_correctly(self):
+        """With no LX to spare the accumulator stays in HBM and is still right."""
+        torch.manual_seed(0)
+        values = torch.randn(2, 64, 64, dtype=torch.float16) * 0.1
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32),
+            self._named(values),
+            extra_config={"dxp_lx_frac_avail": 1.0},
+        )
+
+        self.assertNotIn("'lx'", src)
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+        )
+
+    def test_carried_sum_allows_outside_pointwise_consumer(self):
+        """An op after the loop reads the finished sum."""
+        torch.manual_seed(0)
+        values = torch.randn(4, 64, 64, dtype=torch.float16) * 0.1
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32) + 1, self._named(values)
+        )
+
+        self.assertEqual(src.count("LoopSpec("), 1)
+        self.assertIn(
+            ["lx", "lx", "lx"],
+            [o["allocations"] for o in opspec_summaries(src) if o["op"] == "add"],
+        )
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0) + 1, atol=0.05, rtol=0.05
+        )
 
 
 if __name__ == "__main__":

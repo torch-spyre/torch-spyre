@@ -602,6 +602,7 @@ class TestFP8Operations:
             ("large", (2, 4, 8)),
             ("mixed_signs", (2, 4, 32)),
             ("large_hidden", (1, 1, 8192)),
+            ("sub_stick_token", (1, 1, 8)),
         ],
     )
     def test_quantscalepertokenfp8_edge_cases(self, input_type, shape):
@@ -613,6 +614,7 @@ class TestFP8Operations:
         - large: Values near FP16 max (65504)
         - mixed_signs: Positive and negative values
         - large_hidden: Very large hidden dimension
+        - sub_stick_token: A single token shorter than one stick
         """
         if input_type == "zeros":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0
@@ -626,7 +628,7 @@ class TestFP8Operations:
             )
         elif input_type == "mixed_signs":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * MIXED_SIGNS_SCALE
-        elif input_type == "large_hidden":
+        elif input_type in ("large_hidden", "sub_stick_token"):
             x = cached_randn(shape, dtype=torch.float16, scale=1.0)
         else:
             raise ValueError(f"Unknown input_type: {input_type}")
