@@ -356,6 +356,21 @@ def test_a_minimal_bundle_takes_arch_component_and_run_key_from_artifact_and_con
     assert argv[-1] == "--strict" and "--dry-run" not in argv
 
 
+def test_bundle_props_reach_the_verdict_but_never_replace_the_source_keys(
+    tmp_path, online, capsys
+):
+    root = _minimal(tmp_path)
+    code, report = _ingest(
+        root, capsys, "--uploader", "jdoe", "--bundle-prop", "channel=dashboard",
+        "--bundle-prop", "source=forged", "--bundle-prop", "uploader=someone",
+    )  # fmt: skip
+    assert (code, report["arch"]) == (0, "s390x")
+    argv = online.calls[0]
+    props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
+    assert {"channel=dashboard", "source=bundle", "uploader=jdoe"} <= props
+    assert not {"source=forged", "uploader=someone"} & props
+
+
 def test_a_re_upload_of_the_same_content_is_a_duplicate(tmp_path, online, capsys):
     root = _minimal(tmp_path)
     online.client.verdicts = [offline.digest(root)]

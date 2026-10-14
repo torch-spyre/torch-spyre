@@ -29,7 +29,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import vllm
+from . import sendnn, vllm
 from .identity import DerivedId, RunId
 from .offline import (
     FAILED,
@@ -197,7 +197,7 @@ def _ingest(root: Path, args) -> dict:
         )
     aid, rid = r.artifact_id, run_id(meta)
     report = {"run_key": meta["run_key"], "run_id": rid, "artifact_id": aid, "artifact_from": via,
-              "test_type": meta["test_type"], "bundle_sha256": sha}  # fmt: skip
+              "test_type": meta["test_type"], "arch": meta["arch"], "bundle_sha256": sha}  # fmt: skip
     seen, files = existing_run(client, db, rid, meta["component"])
     if seen == {sha}:
         return {**report, "status": "duplicate"}
@@ -210,10 +210,12 @@ def _ingest(root: Path, args) -> dict:
         raise BundleError(f"run {rid} already has cases from {sorted(files - names)}")
     if args.dry_run:
         return {**report, "status": "would-ingest"}
-    props = {"source": SOURCE, "uploader": uploader, "bundle_sha256": sha,
-             "bundle_url": args.bundle_url}  # fmt: skip
+    props = {**dict(getattr(args, "bundle_prop", None) or []), "source": SOURCE,
+             "uploader": uploader, "bundle_sha256": sha, "bundle_url": args.bundle_url}  # fmt: skip
     if meta.get("kind") == "vllm":
         report["benchmark_runs"] = write_vllm(client, db, root, meta, aid, rid, props)
+    elif meta.get("kind") == "sendnn":
+        report["benchmark_runs"] = write_sendnn(client, db, root, meta, aid, rid, props)
     else:
         write_junit(db, root, meta, aid, rid, props, args.strict)
     if not verdict_recorded(client, db, aid, rid, meta["test_type"]):
@@ -262,4 +264,35 @@ def write_vllm(client, db, root, meta, aid, rid, props) -> int:
         )  # fmt: skip
     except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
         raise BundleError(f"vLLM write failed: {err!r}", FAILED) from None
+    return n
+
+
+def write_sendnn(client, db, root, meta, aid, rid, props) -> int:
+    """report_sendnn.txt as benchmark_runs on torch-spyre's own benchmark ids, then the verdict."""
+    from .client import tables_present
+    from .schema import ARTIFACT_RESULTS, BENCHMARK_RUNS, BENCHMARKS
+    from .writer import insert_artifact_result
+
+    if not tables_present(
+        client, db, tables=(BENCHMARKS, BENCHMARK_RUNS, ARTIFACT_RESULTS)
+    ):
+        raise BundleError(f"{db} lacks the benchmark tables", FAILED)
+    run_props = {"platform": meta["arch"]}
+    if meta.get("started_at"):
+        run_props["run_utc"] = sendnn.run_utc(meta["started_at"])
+    reports = sorted((root / "results").glob("*.txt"))
+    # Judged on what parses, not on what is written: a retry after a failed verdict insert
+    # writes nothing new, since the benchmark rows are already in.
+    if not any(sendnn.parse(p) for p in reports):
+        raise BundleError("no sendnn metric parsed from results/")
+    try:
+        n = sum(sendnn.write(client, db, rid, p, run_props) for p in reports)
+        insert_artifact_result(
+            client, db, artifact_id=aid, run_id=rid, test_type=meta["test_type"],
+            state="passed", arch=meta["arch"], result_kind="performance", duration_s=0.0,
+            props={**{k: v for k, v in props.items() if v},
+                   "run_url": meta.get("run_url") or props.get("bundle_url", "")},
+        )  # fmt: skip
+    except Exception as err:  # noqa: BLE001 -- a write error is a retry; the writes dedup
+        raise BundleError(f"sendnn write failed: {err!r}", FAILED) from None
     return n

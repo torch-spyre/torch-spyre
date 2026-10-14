@@ -237,6 +237,7 @@ def _dma_to_spyre_indirect_access(
         [rows, d // eps, eps],  # device_size: vocab dim outermost
         [d, eps, 1],  # stride_map
         get_device_dtype(dev_dtype),
+        {(0,): rows, (1, 2): d},  # valid_elements
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -325,6 +326,7 @@ def dma_moe_expert_weight_to_spyre(
         [experts, contract, free // eps, eps],
         [contract * free, free, eps, 1],
         get_device_dtype(dev_dtype),
+        {(0,): experts, (1,): contract, (2, 3): free},
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -360,6 +362,7 @@ def dma_moe_per_expert_scale_to_spyre(
         [experts, 1, eps],
         [eps, eps, 1],
         get_device_dtype(dev_dtype),
+        {(0,): experts, (1, 2): 1},
     )
     dst = spyre_empty_with_layout(
         widened.size(), widened.stride(), dev_dtype, layout, device=device

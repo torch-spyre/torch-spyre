@@ -124,6 +124,8 @@ class Sandbox:
             "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
             "(run_key, entry, component, artifact_name, arch, leg, attempt)",
         ),
+        # By time: a pending or rejected upload has no run_id.
+        ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
     )
 
     @classmethod
