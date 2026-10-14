@@ -1502,6 +1502,22 @@ def matmul_xt_y_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def fill_add_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
+    """x + full(0.5), with the fill built INSIDE the loop body.
+
+    The fill is a scalar-fill ComputedBuffer with no tiled loop variable, so it
+    is loop-invariant: its own write must not advance with the loop.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        bias = torch.full(x_tile.shape, 0.5, dtype=x_tile.dtype, device=x_tile.device)
+        return None, x_tile + bias
+
+    _, out = for_each_tile(body, (X,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
 def outside_consumer_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
 ) -> torch.Tensor:

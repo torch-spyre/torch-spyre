@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -263,19 +264,34 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
-_POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+
+_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
+    "max": {
+        DataFormats.SEN169_FP16: _FP16_MIN,
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "min": {
+        DataFormats.SEN169_FP16: _FP16_MAX,
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "exp": {
+        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    },
 }
 
+_POINTWISE_PADDING_OPS: set[str] = {"exp"}
 
-def _get_mask_value(op: str) -> float:
-    if op == "max":
-        return _FP16_MIN
-    if op == "min":
-        return _FP16_MAX
-    if op in _POINTWISE_PADDING_MASK_VALUE:
-        return _POINTWISE_PADDING_MASK_VALUE[op]
-    return 0
+
+def _get_mask_value(
+    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
+) -> float:
+    return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
 def _get_coordinate_mask(
@@ -286,7 +302,7 @@ def _get_coordinate_mask(
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
-    # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
+    # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
     #
     # SAMV coordinate masking is limited to <=16-bit element types by the
     # backend compiler ("Coordinate masking is supported only up to 16bit
@@ -308,7 +324,7 @@ def _get_coordinate_mask(
     # #3290 (padded-stick-state layout enum, the principled replacement for this
     # bandage).
     mask_pointwise = (
-        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+        op in _POINTWISE_PADDING_OPS and arg.data_format != DataFormats.IEEE_FP32
     )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
@@ -2362,7 +2378,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output

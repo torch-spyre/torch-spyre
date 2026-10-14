@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "AiuptiProfilerMacros.h"
@@ -66,6 +67,7 @@ class AiuptiActivityProfilerSession
   void removeCorrelatedPtiActivities(const libkineto::ITraceActivity* act1);
   bool outOfRange(const libkineto::ITraceActivity& act);
   int64_t getMappedQueueId(uint64_t sycl_queue_id);
+  const libkineto::ITraceActivity* linkedCpuActivity(uint64_t externalId);
   const libkineto::ITraceActivity* linkedActivity(
       int32_t correlationId,
       const std::unordered_map<int64_t, int64_t>& correlationMap);
@@ -94,6 +96,11 @@ class AiuptiActivityProfilerSession
   int64_t profilerStartTs_{0};
   int64_t profilerEndTs_{0};
   std::unordered_map<int64_t, int64_t> cpuCorrelationMap_;
+  std::unordered_set<uint32_t> deviceActivityIds_;
+  std::unordered_set<uint32_t> launchActivityIds_;
+  // Keep CPU-to-submit flows separate from the 32-bit hardware batch IDs.
+  // Stay unique when multiple captures from this session share an export.
+  int64_t nextSubmissionFlowId_{int64_t{1} << 32};
   std::unordered_map<int64_t, int64_t> userCorrelationMap_;
   std::unordered_map<int64_t, const libkineto::ITraceActivity*>
       correlatedPtiActivities_;
@@ -112,10 +119,12 @@ class AiuptiActivityProfilerSession
   uint32_t kExceedMaxTid = 1000;
 
   std::map<std::pair<int64_t, int64_t>, libkineto::ResourceInfo> resourceInfo_;
+  std::map<std::pair<uint32_t, uint32_t>, std::string> threadNames_;
   bool hasDeviceResource(uint32_t device, uint32_t id);
   void recordStream(uint32_t device, uint32_t id);
   void recordMemoryStream(uint32_t device, uint32_t id, std::string kind);
-  void recordThreadStream(uint32_t device, uint32_t id);
+  void recordThreadStream(uint32_t device, uint32_t id,
+                          const std::string& name);
 
   int64_t totalAllocatedBytes_{0};
 };
