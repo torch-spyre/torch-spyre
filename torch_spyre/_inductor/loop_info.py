@@ -455,6 +455,9 @@ _SPYRE_METADATA_ATTRS = (
     # added to this tuple, because copy_op_metadata only copies attrs
     # listed here.
     "tile_marker_dim",
+    # work_division_constraints.JOINT_TILING_AND_DIVISION_ATTR, spelled out
+    # since that module imports this one (through pass_utils).
+    "_work_division_chosen_with_tiling",
 )
 
 

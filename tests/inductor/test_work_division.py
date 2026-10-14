@@ -47,7 +47,11 @@ from torch_spyre._inductor import passes
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
+from torch_spyre._inductor.loop_info import (
+    CoarseTileInfo,
+    LoopCarryRecord,
+    copy_op_metadata,
+)
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
@@ -4151,3 +4155,8 @@ class TestJointTilingAndDivisionExemption(unittest.TestCase):
 
     def test_a_jointly_chosen_op_is_exempt(self):
         self.assertEqual(self._pins(self._tiled_op(marked=True)), {})
+
+    def test_the_marker_survives_an_op_rebuild(self):
+        rebuilt = SimpleNamespace()
+        copy_op_metadata(self._tiled_op(marked=True), rebuilt)
+        self.assertTrue(getattr(rebuilt, JOINT_TILING_AND_DIVISION_ATTR, False))
