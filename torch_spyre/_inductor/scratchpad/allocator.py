@@ -3698,7 +3698,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             name: capture_iteration_frame(cast(ComputedBuffer, op_by_name[name]))
             for name in tiled
         }
-        CoarseTilingPass(choices).apply_pass(graph)
+        chosen = ", ".join(
+            f"{name}={spec.label}" for name, spec in sorted(choices.items())
+        )
+        try:
+            CoarseTilingPass(choices).apply_pass(graph)
+        except Unsupported as exc:
+            exc.add_note(f"auto_coarse_tiling chose: {chosen}")
+            raise
         self._remap_tiled_symbols(graph, frames)
         # See ``JOINT_TILING_AND_DIVISION_ATTR``. Looked up afresh: the apply
         # replaces an op it redirects to a companion's full buffer
@@ -3706,11 +3713,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name = {op.name: op for op in graph.operations}
         for name in tiled:
             setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
-        logger.info(
-            "applied a coarse tiling to %d op(s): %s",
-            len(choices),
-            ", ".join(f"{name}={spec.label}" for name, spec in sorted(choices.items())),
-        )
+        logger.info("applied a coarse tiling to %d op(s): %s", len(choices), chosen)
         return tiled
 
     def _remap_tiled_symbols(

@@ -3261,6 +3261,11 @@ class _ReplacingTilingPass(_SqueezingTilingPass):
             )
 
 
+class _RefusingTilingPass(_SqueezingTilingPass):
+    def apply_pass(self, graph):
+        raise Unsupported("coarse tiling: tiled cannot take this tiling")
+
+
 class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
     """A tile that shrinks a dim to extent 1 drops that dim's loop symbol and
     renumbers every later one. The splits the solve chose, keyed by the
@@ -3389,6 +3394,18 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
             (live,) = applied.graph.operations
             self.assertIsNot(live, applied.op)
             self.assertTrue(getattr(live, JOINT_TILING_AND_DIVISION_ATTR, False))
+
+    def test_a_refusal_names_the_chosen_tilings(self):
+        tiling = TileSpec((TileAxis(host_dim=0, count=32),))
+        with self.assertRaises(Unsupported) as caught:
+            with self._applied(
+                [32, 1024], tiling, {1: 4}, tiling_pass=_RefusingTilingPass
+            ):
+                pass
+        self.assertEqual(
+            caught.exception.__notes__,
+            [f"auto_coarse_tiling chose: tiled={tiling.label}"],
+        )
 
 
 class TestTopKConstraints(unittest.TestCase):
