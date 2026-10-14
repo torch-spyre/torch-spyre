@@ -32,14 +32,17 @@ from torch._inductor.ir import (
     InputBuffer,
     Operation,
     Reduction,
+    TensorBox,
 )
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import DataFormats, SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.lowering import spyre_lowerings
+from torch_spyre._inductor.pass_utils import lower_pad_sequence
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
@@ -56,6 +59,8 @@ from torch_spyre._inductor.wsr.propagate_named_dims import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
+from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+from utils_inductor import expects_raise
 
 
 Ts = TypeVarTuple("Ts")
@@ -379,6 +384,128 @@ class TestInsertPaddingIR(unittest.TestCase):
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
+
+    def test_padding_copy_preserves_nonzero_fill(self) -> None:
+        """Exercise compiler padding directly, including softmax's -inf fill."""
+        calls = 0
+
+        def compiler_pad(x, pad, value=0):
+            nonlocal calls
+            self.assertEqual(pad, [0, 63])
+            x.realize()
+            padded, _ = lower_pad_sequence(
+                arg_fx_node=None,
+                padded_size=[4, 128],
+                device=x.get_device(),
+                dtype=x.get_dtype(),
+                dim=1,
+                insert_before=V.graph.current_node,
+                fill_value=value,
+                arg_buf=x.data.data,
+            )
+            calls += 1
+            return TensorBox.create(padded)
+
+        for dtype in (torch.float16, torch.bfloat16):
+            for fill in (3.5, float("-inf")):
+                with self.subTest(dtype=dtype, fill=fill):
+                    # Give unused input lanes a known value distinct from
+                    # both fills. An unmasked rounded copy overwrites the
+                    # destination padding with these 17s.
+                    storage = torch.full((4, 128), 17.0, dtype=dtype)
+                    storage[:, :65] = 0.125
+                    x = storage.to("spyre")[:, :65]
+
+                    def pad(x):
+                        return torch.nn.functional.pad(x, (0, 63), value=fill)
+
+                    before = calls
+                    # Route this explicit pad through the compiler-created
+                    # padding helper so its metadata and codegen both run.
+                    with patch.dict(
+                        spyre_lowerings,
+                        {torch.ops.aten.constant_pad_nd.default: compiler_pad},
+                    ):
+                        padded = torch.compile(pad, fullgraph=True)(x)
+                    self.assertGreater(calls, before)
+
+                    expected = pad(storage[:, :65])
+                    # DL16 represents -inf with a finite negative saturation
+                    # value. Its BF16 readback is -2**32; FP16 overflows to
+                    # -inf. Match the ordinary device-constant conversion.
+                    device_fill = torch.tensor([fill], dtype=dtype).to("spyre").cpu()
+                    if dtype == torch.bfloat16 and fill == float("-inf"):
+                        expected[:, 65:] = -(2**32)
+                    torch.testing.assert_close(
+                        device_fill, expected[0, 65:66], atol=0, rtol=0
+                    )
+                    torch.testing.assert_close(padded.cpu(), expected, atol=0, rtol=0)
+
+                    if fill == float("-inf"):
+                        probabilities = torch.compile(
+                            lambda y: y.softmax(-1), fullgraph=True
+                        )(padded).cpu()
+                        reference = pad(storage[:, :65].float()).softmax(-1).to(dtype)
+                        # Allow one dtype rounding unit at the uniform 1/65
+                        # probability, while requiring exact zero in the tail.
+                        torch.testing.assert_close(
+                            probabilities,
+                            reference,
+                            atol=torch.finfo(dtype).eps / 65,
+                            rtol=0,
+                        )
+                        self.assertEqual(torch.count_nonzero(probabilities[:, 65:]), 0)
+
+    def test_transposed_weight_padding_survives_poisoned_scratch(self) -> None:
+        """A partial-stick copy must preserve the zeros added for matmul K."""
+        original_run = SpyreSDSCKernelRunner.run
+        poisoned = 0
+
+        def run_with_poisoned_pool(runner, *args):
+            nonlocal poisoned
+            if runner.symbol_kinds and runner.symbol_kinds[0].is_pool:
+                size = args[0].numel()
+                # Raw 0xffff encodes DL16 NaN. Seed every scratch byte so
+                # unused lanes cannot accidentally pass by starting at zero.
+                layout = SpyreTensorLayout(
+                    device_size=[size],
+                    stride_map=[1],
+                    device_dtype=DataFormats.SENINT8,
+                )
+                pool = torch.full((size,), -1, dtype=torch.int8).to(
+                    args[0].device, device_layout=layout
+                )
+                args = (pool, *args[1:])
+                poisoned += 1
+            result = original_run(runner, *args)
+            torch.spyre.synchronize()
+            return result
+
+        with ts_inductor_config.patch(
+            {"frontend_pool_allocation": True, "sencores": 32}
+        ):
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(dtype=dtype):
+                    x = torch.full((4, 64, 528), 0.125, dtype=dtype).to("spyre")
+                    weight = torch.full((128, 528), 0.125, dtype=dtype)
+                    # Linear weights arrive with output channels in the stick.
+                    layout = SpyreTensorLayout(
+                        list(weight.shape), list(weight.stride()), dtype, [1, 0]
+                    )
+                    weight = weight.to("spyre", device_layout=layout)
+
+                    def linear(x, weight):
+                        return torch.nn.functional.linear(x, weight)
+
+                    before = poisoned
+                    with patch.object(
+                        SpyreSDSCKernelRunner, "run", run_with_poisoned_pool
+                    ):
+                        actual = torch.compile(linear, fullgraph=True)(x, weight).cpu()
+                    self.assertGreater(poisoned, before)
+                    torch.testing.assert_close(
+                        actual, torch.full_like(actual, 8.25), atol=0, rtol=0
+                    )
 
     def test_mm_unaligned_k_pads(self) -> None:
         """2D mm with K=67 (unaligned) — only y is padded before the matmul.
@@ -1051,6 +1178,41 @@ class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._graph_ctx.__exit__(None, None, None)
+
+    @expects_raise
+    def test_padding_copy_role_checked_before_marking(self) -> None:
+        """Swapping the two mutations must not mark the constant-fill op."""
+        from torch_spyre._inductor import lowering
+
+        source = InputBuffer(
+            name="arg0",
+            layout=FixedLayout(torch.device("cpu"), torch.float16, [4, 65]),
+        )
+        V.graph.name_to_buffer["arg0"] = source
+        V.graph.graph_inputs["arg0"] = source
+        original_lower = lowering.lower_constant_pad_nd
+
+        def swapped_mutations(*args, **kwargs):
+            result = original_lower(*args, **kwargs)
+            ops = V.graph.operations
+            ops[-2], ops[-1] = ops[-1], ops[-2]
+            return result
+
+        with (
+            patch.object(lowering, "lower_constant_pad_nd", swapped_mutations),
+            self.assertRaisesRegex(
+                AssertionError, "expected the final mutation to copy 'arg0'"
+            ),
+        ):
+            lower_pad_sequence(
+                arg_fx_node=None,
+                padded_size=[4, 128],
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                dim=1,
+                insert_before=next(iter(V.graph.graph.nodes)),
+                arg_buf=source,
+            )
 
     def test_broadcast_dim_kept_at_stride_zero_when_padding_adjacent_dim(
         self,

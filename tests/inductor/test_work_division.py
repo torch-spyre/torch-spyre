@@ -1625,11 +1625,26 @@ class TestCostModelConstraints(unittest.TestCase):
 
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):
-    """coordinate_mask_blocked_vars only reads reduction_vars/stick_vars/it_space,
-    so output_td/op are irrelevant here and stand in with a placeholder."""
+    """Coordinate masks constrain reductions and explicit padding copies."""
 
     _PLACEHOLDER_OP = _computed_buffer((128,), name="placeholder_buf")
     _PLACEHOLDER_TD = _tensor_dep("placeholder_buf", (128,), (_isym("_placeholder"),))
+
+    def test_padding_copy_blocks_only_unaligned_stick_dims(self):
+        k, n = _isym("k"), _isym("n")
+        for padding_copy in (False, True):
+            with self.subTest(padding_copy=padding_copy):
+                op = _computed_buffer((528, 128), name="pad_copy")
+                if padding_copy:
+                    op._spyre_pad_copy_value = 0.0
+                ctx = _make_context(
+                    op,
+                    self._PLACEHOLDER_TD,
+                    it_space={k: 528, n: 128},
+                    stick_vars={k: 64, n: 64},
+                )
+                result = coordinate_mask_blocked_vars(ctx)
+                self.assertEqual(result.blocked, {k} if padding_copy else set())
 
     def test_padded_stick_aligned_reduction_dim_is_blocked(self):
         r0 = _isym("r0")

@@ -3161,6 +3161,19 @@ def lower_pad_sequence(
         and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
+    # Verify the mutation's role before marking it: the padding fill is also
+    # a ComputedBuffer with a mutation layout, but reads the fill constant.
+    if dtype in (torch.float16, torch.bfloat16):
+        source = arg_buf if arg_buf is not None else graph_lowering.env[arg_fx_node]
+        copy_op = new_ops[3]
+        assert set(copy_op.get_read_names()) == {source.get_name()}, (
+            "lower_pad_sequence: expected the final mutation to copy "
+            f"{source.get_name()!r}, got reads {copy_op.get_read_names()}"
+        )
+        # Rounded copies must preserve the fill in unused lanes, including
+        # when a preceding restickify read uninitialized scratch storage.
+        setattr(copy_op, "_spyre_pad_copy_value", fill_value)
+
     if orig_stl is None:
         # Pre-stickification: leave host FixedLayouts in place for
         # propagate_spyre_tensor_layouts to convert.  The padded buffer's host

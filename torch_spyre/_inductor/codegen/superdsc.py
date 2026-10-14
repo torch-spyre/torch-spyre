@@ -279,10 +279,16 @@ def _get_mask_value(op: str) -> float:
 
 
 def _get_coordinate_mask(
-    iteration_space: dict, arg: SDSCArgs, dim_padding: dict, op: str = ""
+    iteration_space: dict,
+    arg: SDSCArgs,
+    dim_padding: dict,
+    op: str = "",
+    pad_copy: bool = False,
 ) -> dict:
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
+    # Compiler padding copies also mask their rounded input lanes, preserving
+    # the fill value in the destination's already initialized final stick.
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
@@ -308,8 +314,8 @@ def _get_coordinate_mask(
     # #3290 (padded-stick-state layout enum, the principled replacement for this
     # bandage).
     mask_pointwise = (
-        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
-    )
+        op in _POINTWISE_PADDING_MASK_VALUE or pad_copy
+    ) and arg.data_format != DataFormats.IEEE_FP32
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
@@ -2354,15 +2360,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         constants = (
             dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
         )
+    pad_copy = op_spec.op == IDENTITY_OP and "pad_copy_value" in op_spec.op_info
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op
+        sdsc_iteration_space, args[-1], padding, op_spec.op, pad_copy=pad_copy
     )
     masking_const_id = -1
     if coordinate_masking:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = (
+            op_spec.op_info["pad_copy_value"]
+            if pad_copy
+            else _get_mask_value(op_spec.op)
+        )
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output

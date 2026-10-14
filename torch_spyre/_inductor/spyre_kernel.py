@@ -939,6 +939,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space = iteration_space(self.current_node)
 
         ir_node = self.current_node.node  # ComputedBuffer
+        if op == IDENTITY_OP and hasattr(ir_node, "_spyre_pad_copy_value"):
+            op_info = {**op_info, "pad_copy_value": ir_node._spyre_pad_copy_value}
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )

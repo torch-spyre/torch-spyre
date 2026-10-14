@@ -101,7 +101,7 @@ out as a tile scan is left for the upstream default path.
 | 5 | `assign_dim_hints` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Lowers each `spyre_hint` scope to a per-op `DimHint` list. |
 | 6 | `_maybe_reorder_unhinted_interlopers` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Runs `reorder_unhinted_interlopers` to move unhinted ops that interrupt a hint-group run. |
 | 7 | `_maybe_coarse_tile_hints` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Hint-driven half of coarse tiling: `hints_to_coarse_tile_groups` + `validate_coarse_tile_groups` + `coarse_tile_pre_stickify`. Runs on host-side `FixedLayout` only. |
-| 8 | `insert_bmm_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads y's K to a stick boundary for `mm`/`bmm`. Runs pre-stickification so the padded buffer is laid out (and restickified if the matmul reads it through a view such as a transposed `nn.Linear` weight) like any user-written `F.pad`. |
+| 8 | `insert_bmm_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads y's K to a stick boundary for `mm`/`bmm`. Runs pre-stickification so the padded buffer is laid out (and restickified if the matmul reads it through a view such as a transposed `nn.Linear` weight) like any user-written `F.pad`. FP16/BF16 padding copies carry the fill value to codegen, which masks unused input lanes so a rounded copy cannot overwrite initialized padding with scratch contents. Masked dimensions remain unsplit across cores. |
 | 9 | `split_multi_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Splits multi-op loop bodies (e.g. type conversion + arithmetic) into separate single-op buffers and materializes constant args as `SpyreConstantFallback`. |
 | 10 | `propagate_spyre_tensor_layouts` | [propagate_layouts.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | Stamps `FixedTiledLayout` on every `ComputedBuffer`. |
 | 11 | `validate_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Checks that each op's inputs share the same `ElementArrangement`. Runs after layout propagation, when the `SpyreTensorLayout`s are available. |
@@ -122,6 +122,19 @@ out as a tile scan is left for the upstream default path.
 | 26 | `elide_proven_read_copies` | [read_copy_elision.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/read_copy_elision.py) | Removes copies whose direct-read form is proven equivalent, after physical planning. |
 
 Once stickification has run, every `ComputedBuffer` carries a `FixedTiledLayout`, so the later passes can take device layout into account when making decisions.
+
+Padding-copy masks pin only unaligned stick axes during work division. Other
+axes can still be divided across cores. A large copy with no other splittable
+axis therefore runs on one core, even if only a small tail needs masking.
+This can reduce copy parallelism; lifting the restriction requires support
+for masking across core splits or a padding-aware layout representation.
+
+The mask uses the same DL16 fill value as an ordinary device constant. An
+exact finite fill such as `3.5` is preserved in both FP16 and BF16. On the
+DL16 path, a requested `-inf` fill reads back as `-inf` in FP16 and as the
+finite saturation value `-2**32` in BF16. The latter still underflows to zero
+through softmax's exponential for the tested finite logits; it is not a
+general guarantee that IEEE infinities survive BF16 device round trips.
 
 For deeper treatment of individual passes see [Working Set Reduction](working_set_reduction.md), [Coarse-Tiling Loops](coarse_tiling_loops.md), [Work Division Planning](work_division_planning.md), and [Scratchpad Planning](scratchpad_planning.md).
 
