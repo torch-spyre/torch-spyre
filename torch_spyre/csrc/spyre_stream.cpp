@@ -306,7 +306,8 @@ void SpyreStream::launch(const JobPlan& plan,
 
   // Two-stream overlap topology:
   //   S_dev  = this stream (the default) — Compute (+ D2H).
-  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  //   S_prep = the persistent host-compute stream — HostCompute + separate H2D.
+  // Batched correction uploads instead travel with their compute on S_dev.
   // Compute overlaps HC/H2D because they run on different streams; every op
   // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
   // persistent flex handle each launch: getHostComputeStreamById is a pure
@@ -320,16 +321,34 @@ void SpyreStream::launch(const JobPlan& plan,
   // JobPlanStepHostCompute::construct can capture it by value without an extra
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
+  const bool is_vf = GlobalRuntime::get()->getDeviceHandle()->GetType() ==
+                     flex::DeviceTypes::VF;
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
   // single-stream floor). Routing keys on role(), so all-Dev plans never split.
   const bool should_split = get_hazard_tracker_enabled();
-  for (const auto& step : plan.steps) {
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    const auto& step = plan.steps[i];
+    if (is_vf && classifyStep(*step) == StepKind::HostCompute &&
+        (i == 0 || classifyStep(*plan.steps[i - 1]) != StepKind::HostCompute)) {
+      size_t end = i + 1;
+      while (end < plan.steps.size() &&
+             classifyStep(*plan.steps[end]) == StepKind::HostCompute) {
+        ++end;
+      }
+      // Flex's 16-entry compound submission reserves one slot for compute.
+      // Keep separate uploads for larger or non-adjacent correction groups.
+      ctx.batch_program_corrections =
+          end - i <= 15 && end < plan.steps.size() &&
+          classifyStep(*plan.steps[end]) == StepKind::Compute;
+    }
     const SpyreStream& target =
         (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
     step->construct(ctx, target);
   }
+  TORCH_CHECK(ctx.program_corrections.empty(),
+              "Program correction has no consuming compute step");
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
