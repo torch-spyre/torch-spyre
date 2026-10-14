@@ -224,11 +224,6 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
 
 
 SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
-    torch.amin: {
-        "compiled": True,
-        "eager": False,
-        "reason": "Spyre eager aten::amin.out is not supported yet (issue #1708)",
-    },
     torch.min: {
         "compiled": True,
         "eager": False,
@@ -4950,16 +4945,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            # Both cases pass on CI's deeptools and fail on other builds, so they are
-            # non-strict: a pass is reported, not an error.
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do.
-            # #5358: dbo-opt intermittently fails program verification for the fp32
-            # reduction over the 256-wide last dim on deeptools main.
-            "expect_fail_unstable": {
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
-            },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
                 "fp16_2d_dim_0": (
@@ -5162,13 +5147,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "fp32_3d_dim_2": "fp32 stick masking, passes on CI, #4492",
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5339,13 +5317,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
-            # #5358: dbo-opt intermittently fails program verification for the
-            # fp32 reduction over the 256-wide last dim on deeptools main, and
-            # passes on the older build CI uses. Non-strict, so either outcome is
-            # tolerated.
-            "expect_fail_unstable": {
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5594,13 +5565,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
-            # #5358: dbo-opt intermittently fails program verification for the
-            # fp32 reduction over the 256-wide last dim on deeptools main, and
-            # passes on the older build CI uses. Non-strict, so either outcome is
-            # tolerated.
-            "expect_fail_unstable": {
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -8260,6 +8224,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
+
+    # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
+    # multiple of the 32 elements in an fp32 stick). The front end pads with the fp16
+    # constants (+-65504.0, torch_spyre/_inductor/codegen/superdsc.py:_get_mask_value)
+    # whatever the dtype, and the backend rejects a 32-bit mask value whose two 16-bit
+    # halves differ (0xc77fe000 here). sum and mean pad with 0.0 and work. fp16 is fine.
+    # TODO: a missing feature (#2534): choose the pad value per dtype (0xFF7FFF7F for
+    # max, 0x7F7F7F7F for min). When it lands these have to become positive tests.
+    @expects_raise
+    def test_amax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amax(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_amin_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amin(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_softmax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(
+                lambda x: torch.softmax(x, dim=-1), x, run_eager=False
+            )
 
     @pytest.mark.xfail(
         reason=(
