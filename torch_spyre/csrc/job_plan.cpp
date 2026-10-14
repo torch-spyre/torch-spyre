@@ -187,8 +187,13 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  // Create a managed shared_ptr to ensure the host buffer's lifetime is tied to
-  // callback destruction.
+  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
+  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
+  // before returning this fully written buffer (Flex #1990,
+  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
+  // caller ordering makes the bytes ready before S_dev receives the consuming
+  // ComputeParams, regardless of whether hazard tracking is enabled.
+  // Shared ownership then keeps the bytes alive through upload completion.
   std::shared_ptr<flex::HostComputeBuffer> host_buffer(
       stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
 
