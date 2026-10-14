@@ -48,6 +48,7 @@ import heapq
 import math
 import random as rnd
 import statistics
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
@@ -243,7 +244,7 @@ def _one_axis_apart(left: "CoreDivision", right: "CoreDivision") -> bool:
     return sum(lhs.get(key, 1) != rhs.get(key, 1) for key in lhs | rhs) == 1
 
 
-class _DivisionSource:
+class _DivisionSource(ABC):
     """Where one buffer's candidate divisions come from, and what a move may
     reach from a given one.
 
@@ -265,22 +266,26 @@ class _DivisionSource:
     *is* a region that agrees on one ``TileSpec``.
     """
 
+    @abstractmethod
     def seed(self) -> DivisionConfig:
         """The buffer's committed division: where the search starts."""
         raise NotImplementedError
 
+    @abstractmethod
     def can_move(self) -> bool:
         """Whether this buffer has an alternative division at all -- a static
         filter, so the per-step move draw is over a fixed list. It is only an
         upper bound on :meth:`neighbours`, which is state-dependent."""
         raise NotImplementedError
 
+    @abstractmethod
     def can_split(self) -> bool:
         """Whether this buffer could take a *split* division, the only legal
         recolor anchor. Static, and for a generated source an
         over-approximation; :meth:`anchor` is what actually decides."""
         raise NotImplementedError
 
+    @abstractmethod
     def _step_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
         raise NotImplementedError
 
@@ -293,6 +298,7 @@ class _DivisionSource:
             self._neighbour_cache[config.key] = cached
         return cached
 
+    @abstractmethod
     def retiled(
         self, config: DivisionConfig, tiling: "TileSpec"
     ) -> Optional[DivisionConfig]:
@@ -307,6 +313,7 @@ class _DivisionSource:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def anchor(self, config: DivisionConfig, rng) -> Optional[DivisionConfig]:
         """A *splitting* division for a recolor to flood from, drawn with
         ``rng``, or ``None`` if this buffer has none to offer.
