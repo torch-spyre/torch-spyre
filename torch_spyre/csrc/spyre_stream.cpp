@@ -289,6 +289,11 @@ void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   resolveRuntimeHandle()->launchOperation(params);
 }
 
+void SpyreStream::launchCopyRaw(flex::CopyRawParams* params) const {
+  RECORD_FUNCTION("launch::CopyRaw", {});
+  resolveRuntimeHandle()->launchOperation(params);
+}
+
 flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
@@ -317,13 +322,14 @@ void SpyreStream::launch(const JobPlan& plan,
 
   // Create launch context with tensor arguments and typed symbolic payload.
   // symbolic_args is moved in so the closure in
-  // JobPlanStepHostCompute::construct can capture it by value without an extra
-  // copy.
+  // JobPlanStepHostCompute::construct can capture it by value without an
+  // extra copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
-  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
+  // single-stream floor). Routing keys on role(), so all-Dev plans never
+  // split.
   const bool should_split = get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
@@ -360,8 +366,9 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
     c10::StreamId sid = kHostComputeStreamStartPerDevice + i;
     // Create the flex handle only if this stream id has not been registered
     // yet. stream_handle_map is keyed by stream id, not device, so when the
-    // pool is initialized under more than one device index in the same process
-    // (all mapping to the same runtime) the handle is created once and reused.
+    // pool is initialized under more than one device index in the same
+    // process (all mapping to the same runtime) the handle is created once
+    // and reused.
     TORCH_CHECK(
         pool.stream_handle_map.find(sid) == pool.stream_handle_map.end(),
         "Host compute stream id ", sid,
@@ -489,7 +496,8 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   }
 
   // Ensure runtime is initialized before creating streams
-  // This is critical when torch.Stream() is called before any tensor operations
+  // This is critical when torch.Stream() is called before any tensor
+  // operations
   startRuntime();
 
   initializeStreamPool(device.index());
