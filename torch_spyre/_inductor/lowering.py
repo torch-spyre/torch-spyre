@@ -315,7 +315,9 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
     layout passes (which key off ``op.data.origins[].target``) recognize it even
     when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    if a ``target`` origin already exists. The node is registered in the graph
+    env, so split_multi_ops can resolve the buffer by name when a fused body
+    downstream loads it.
     """
 
     def _realized_buffer(node):
@@ -338,6 +340,12 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # Passes that read the node expect what an FX-lowered node carries: an
+    # example value and an env entry.
+    with V.fake_mode:
+        fx_node.meta["val"] = ir.ir_node_to_tensor(result)
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1757,13 +1765,41 @@ def lower_constant_pad_nd(
     return output
 
 
+def _trunc(x):
+    """Truncate a float32 tensor, as a cast to an integer dtype does.
+
+    The device converts float32 to int32 with floor, but a cast truncates
+    (C-style, like rounding_mode="trunc"), so a float32 -> int cast truncates
+    first; the conversion of the integer-valued result is then exact.
+    clip(x, -1, 1) is the sign of x wherever floor(|x|) is nonzero, so the product
+    needs no compare or select, which split_multi_ops cannot replay in a fused body.
+
+    The result is realized with an origin of its own. The product reads x twice,
+    and as the last op of its own body it may: split_multi_ops refuses only an
+    intermediate that combines a view load with another operand, so fused into
+    the conversion it would refuse a source read through a view.
+    """
+    result = lowering.mul(lowering.floor(lowering.abs(x)), lowering.clamp(x, -1.0, 1.0))
+    origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+    _ensure_synthetic_origin(
+        result, torch.ops.aten.trunc.default, () if origin is None else (origin,)
+    )
+    return result
+
+
 @register_spyre_lowering(
     torch.ops.prims.convert_element_type.default,
     type_promotion_kind=None,
 )
-def to_dtype(x, dst_dtype, use_compute_types=True):
+def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     # PT 2.12 passes a ``use_compute_types`` kwarg to registered dtype-conversion
     # lowerings; accept and forward it to the in-tree lowering.
+    #
+    # ``skip_trunc`` declares that a float source is integer-valued, so it converts
+    # to an integer exactly without the trunc. A lowering casting its own float
+    # result back to an integer should pass it: the trunc adds ops fused into the
+    # conversion, and split_multi_ops cannot split a fused body over a buffer
+    # realized inside a lowering, which has no FX node.
     from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
     src_dtype = x.get_dtype()
@@ -1791,6 +1827,16 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
 
+    if (
+        src_dtype == torch.float32
+        and dst_dtype in (torch.int32, torch.int64)
+        and not skip_trunc
+    ):
+        x = _trunc(x)
+
+    # Do not realize the result or stamp an origin on it here. split_multi_ops
+    # materializes a fused conversion over its source buffer; realizing it here
+    # would size the conversion of an expanded view at the broadcast extent.
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
     )
@@ -1818,18 +1864,29 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
-    converted_args = []
-    for x in args:
+    def convert(x):
         if isinstance(x, (int, float)):
-            converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            return x
+        converted = to_dtype(x, torch.float32)
 
-    output = fn(*converted_args)
+        # split_multi_ops currently does not support views in a fused
+        # intermediate: it rebuilds the op over the base buffers, so two
+        # conversions of one buffer at different offsets (e.g. two select()
+        # rows) would read the same elements. Work around it by giving each
+        # conversion a buffer of its own.
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        return converted
+
+    output = fn(*[convert(x) for x in args])
 
     if convert_output:
-        return to_dtype(output, torch.int64)
+        # The ops served here combine integer values into integer values.
+        return to_dtype(output, torch.int64, skip_trunc=True)
 
     return output
 
@@ -1917,7 +1974,8 @@ def lower_where(condition, self, other):
     # Realize the where result to prevent unintended fusing on fp32->int32
     result.realize()
     if result_dtype != val_dtype:
-        result = to_dtype(result, result_dtype)
+        # The result selects one of the integer-valued operands.
+        result = to_dtype(result, result_dtype, skip_trunc=True)
 
     return result
 
