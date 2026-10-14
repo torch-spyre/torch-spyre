@@ -1263,7 +1263,10 @@ def test_the_report_prices_loop_delivery_as_the_allocator_does(monkeypatch):
 _E, _T, _K, _N = 128, 128, 2816, 704
 _ONE_STICK = {d0: 2, d1: 11}  # 22 cores
 _K_SPLIT = {d0: 8, d2: 4}  # 32 cores
-_GATE_MENU = [_ONE_STICK, _K_SPLIT, {d0: 32}]
+# 8 cores, the bank fully replicated: below 32 cores its ungated delivery excess is
+# nonzero, so this candidate shows the division-local gate removing it.
+_REPLICATED_BANK = {d0: 8}
+_GATE_MENU = [_ONE_STICK, _K_SPLIT, {d0: 32}, _REPLICATED_BANK]
 
 
 class _LayoutGraph(_StubGraph):
@@ -1486,10 +1489,15 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
     """The allocator's symbolic run and objective, at each legal candidate, equal
     that candidate's concrete extraction and price. A read whose geometry is not
     proven at every candidate, or not fp16, declines everywhere, never a price for
-    some candidates only. CP-SAT keeps the term at every pinned candidate."""
+    some candidates only. CP-SAT keeps the term at every pinned candidate. At a
+    candidate below 32 cores that fully replicates the bank, the symbolic gate
+    removes the bank's loop-delivery excess, which is nonzero there ungated."""
     from test_cost_model_replication import _solve_pinned
 
-    from torch_spyre._inductor.cost_model import predict_ops
+    from torch_spyre._inductor.cost_model import (
+        _partitioned_operand_terms,
+        predict_ops,
+    )
     from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
     op, graph, space = _moe_gate(bank_dtype=bank_dtype)
@@ -1523,6 +1531,31 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
     # At the one-stick candidate only the bank's runs are short: declined, it adds
     # nothing. (At 32 token cores the activation's 512 B runs are priced too.)
     assert (priced[0] > 0) == ("arg1" not in declined)
+    # The fully replicated bank: the symbolic gate is 0 there, and the excess it
+    # removes (the same read priced as partitioned) is nonzero at 8 cores.
+    i = menu.index(_REPLICATED_BANK)
+    at = {symbols[d]: _REPLICATED_BANK.get(d, 1) for d in names}
+    bank = _read(symbolic, "arg1")
+    assert sympy.sympify(bank.partitions).subs(at) == 1
+    terms = dict(
+        (id(a), e) for a, e in _partitioned_operand_terms([symbolic], _COST_PARAMS)
+    )
+    assert sympy.sympify(terms[id(bank)]).subs(at) == 0
+    concrete = _allocator_features(monkeypatch, op, i, **kwargs)
+    assert concrete.cores == 8
+    assert _read(concrete, "arg1").partitions == 1
+    ungated = dataclasses.replace(
+        concrete,
+        args=[
+            dataclasses.replace(a, partitions=2) if a.name == "arg1" else a
+            for a in concrete.args
+        ],
+    )
+    removed = float(_delivery_ns(ungated)) - float(_delivery_ns(concrete))
+    assert removed > 0
+    assert float(predict_ops([ungated], _COST_PARAMS)) - float(
+        objective.subs(at)
+    ) == pytest.approx(removed, rel=1e-9)
 
 
 def test_a_coarse_loop_read_without_a_paired_variable_keeps_loop_delivery_disabled(

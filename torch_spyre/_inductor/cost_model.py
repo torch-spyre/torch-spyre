@@ -2553,8 +2553,9 @@ def _loop_operand_request_excess(ops: list, p: "CostParams"):
     the part E_part does not already charge, ``owned(max(E_part, E_req)) -
     owned(E_part)``, which is never negative.
 
-    Scope: looped matmuls only (``operand_request_cost_available``). Where the
-    report extracts without the legal menu, E_part is omitted and this is E_req.
+    Scope: looped matmuls only (``operand_request_cost_available``). E_part is zero
+    for a read the priced division does not partition (``partitions == 1``), so
+    there this is E_req. The report prices its committed division the same way.
     Uses only existing calibrated parameters; adds no constant.
     """
     # _partitioned_operand_terms yields the original ArgTraffic objects, retained
