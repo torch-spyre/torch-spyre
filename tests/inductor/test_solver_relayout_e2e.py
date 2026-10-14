@@ -589,10 +589,14 @@ def test_two_relayout_edges_into_one_consumer(monkeypatch, coopt):
         f"expected both producer edges into the single add: {recorded}"
     )
     # Two destinations live at the same tick: they must not overlap in LX.
-    a, b = recorded
-    per_core = 8 * 256 * 512 * 2 // a.num_cores
-    lo, hi = sorted((a.destination_address, b.destination_address))
-    assert lo + per_core <= hi, "the two destinations overlap in LX"
+    # Each holds its measured per-core span (#3440): not the source's share,
+    # which a destination broadcast onto more cores than its source is smaller
+    # than (``plan.num_cores`` is the source's count).
+    lo, hi = sorted(recorded, key=lambda plan: plan.destination_address)
+    assert (
+        lo.destination_address + lo.destination_footprint_bytes
+        <= hi.destination_address
+    ), "the two destinations overlap in LX"
     ref = (torch.neg(ha.float()) + torch.abs(hb.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
