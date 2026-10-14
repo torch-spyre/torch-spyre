@@ -65,7 +65,8 @@
         "svt-dynamic",
         "model_ops",
         "model_modules",
-        "model_support"
+        "model_support",
+        "model_serving"
       ]
     },
     "run_key": {
