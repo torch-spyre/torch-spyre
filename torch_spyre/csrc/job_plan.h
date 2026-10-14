@@ -215,8 +215,7 @@ enum class StepKind {
  *             launch as inputs_outputs[tensor_id].size(dim_index).
  *
  *             Read at launch rather than resolved by the frontend into
- *             SymbolicArg::value, which is what an earlier version of this
- *             comment described. The descriptor has to stay invariant across
+ *             SymbolicArg::value. The descriptor has to stay invariant across
  *             launches -- it is built once when the kernel is prepared -- while
  *             the size it names changes on every call, so the value cannot live
  *             in the descriptor. SymbolicArg::value is unused for this kind.
@@ -581,8 +580,11 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   /**
    * @brief Resolve a symbolic_args payload to a vector of HostComputeArgs.
    *
-   * kAddress and kShardAddress resolve to a device address, kDimension to the
-   * logical size of inputs_outputs[tensor_id] along dim_index, read at launch.
+   * A kAddress slot resolves to the tensor's composite address, a kShardAddress
+   * slot to one shard's device address, and a kDimension slot to one of that
+   * tensor's logical dimension sizes (inputs_outputs[tensor_id].size(dim_index)),
+   * read here at launch. The returned vector therefore carries two kinds of
+   * value, so anything that reads it has to handle both alternatives.
    */
   static std::vector<flex::HostComputeArg> resolveSymbolicArgs(
       const std::vector<at::Tensor>& tensors,
