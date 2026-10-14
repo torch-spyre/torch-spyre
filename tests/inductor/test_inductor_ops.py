@@ -404,53 +404,6 @@ TO_DTYPE_OP_PARAMS_SETS = {
     if src != torch.float8_e4m3fn
 }
 
-
-_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, so their conversions have no stick pairs to
-# keep together and are exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
-
-TO_DTYPE_OP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.float8_e4m3fn  # TO_DTYPE_OP_PARAMS_SETS has no float8 sources
-    if (
-        (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
-        or (
-            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-            and (src, dst) not in _SAME_WIDTH_PAIRS
-        )
-        # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
-        # so there's no width change to trip the fp16-stick boundary.
-        or (
-            src == torch.float32
-            and shape[-1] < 32
-            and (src, dst) != (torch.float32, torch.int32)
-        )
-    )
-]
-
-# Cases the predicate above flags that now pass on every config (base and both LX
-# planning classes). Listing them here, rather than loosening the predicate, keeps
-# the still-failing cases generated from the same rule.
-_TO_DTYPE_OP_NOW_PASSING = {
-    "bfloat16_to_bool_4x68",
-    "bfloat16_to_bool_68",
-    "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
-    "float16_to_bfloat16_4x68",
-    "float16_to_bfloat16_68",
-    "float16_to_bool_4x68",
-    "float16_to_bool_68",
-    "float32_to_bool_4x16",
-    "float32_to_bool_4x68",
-    "float32_to_bool_68",
-}
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in _TO_DTYPE_OP_NOW_PASSING
-]
-
 # Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
 # elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
 # 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
@@ -465,9 +418,35 @@ TO_DTYPE_OP_RESCALE_REJECTED = {
     for dst in ("float16", "bfloat16")
     for shape in _RESCALE_REJECTED_SHAPES
 }
-TO_DTYPE_OP_EXPECT_FAIL = [
-    case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
-]
+
+# After type conversion elements are staggered on device, in D2H path they are restored
+# to STANDARD format except for these cases.  fp16/bf16 -> fp32: a 16-bit stick dim
+# narrower than 64 is converted to a single fp32 stick, so half of each stick pair has
+# nowhere to go and the D2H restore rejects it instead of reading back wrong data.
+_D2H_PAIR_REJECTION = "D2H requires whole stick pairs along the stick dimension"
+_D2H_PAIR_REJECTED_SHAPES = ("4x16", "4x32", "4x63")
+TO_DTYPE_OP_D2H_PAIR_REJECTED = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in _D2H_PAIR_REJECTED_SHAPES
+}
+
+# fp16/bf16 -> fp32 with a padded stick dim (68 = one 64-element stick + 4):
+# work division does not account for stick padding yet, so the device conversion
+# itself leaves wrong values for the default work division. The D2H restore is
+# correct for this shape (see test_ea_restore_d2h, which uses a one-row-per-core
+# work_div hint).
+TO_DTYPE_OP_WORK_DIV_PADDING = {
+    "float16_to_float32_4x68",
+    "bfloat16_to_float32_4x68",
+}
+
+TO_DTYPE_OP_EXPECT_FAIL = TO_DTYPE_OP_WORK_DIV_PADDING
+
+TO_DTYPE_OP_EXPECT_RAISE = {
+    **dict.fromkeys(TO_DTYPE_OP_D2H_PAIR_REJECTED, _D2H_PAIR_REJECTION),
+    **dict.fromkeys(TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION),
+}
 
 # The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
 # host, and the result is wrong on 27-88% of its elements. The values on the device
@@ -6076,9 +6055,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_to_dtype", "test_to_dtype_cpu"): {
             "param_sets": TO_DTYPE_OP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
+            "expect_raise": TO_DTYPE_OP_EXPECT_RAISE,
         },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},

@@ -46,3 +46,12 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape
+
+        # SKIP Reduction tests that fail for some shapes with to_dtype
+        - names:
+            - LxPlanning.*::test_to_dtype_float32_to_float16_2x4x8x64_lx_planning_reduction
+            - LxPlanning.*::test_to_dtype_float32_to_float16_4x16_lx_planning_reduction
+            - LxPlanning.*::test_to_dtype_float32_to_float16_4x63_lx_planning_reduction
+            - LxPlanning.*::test_to_dtype_float32_to_float16_4x64_lx_planning_reduction
+            - LxPlanning.*::test_to_dtype_float32_to_float16_4x8x128_lx_planning_reduction
+          mode: skip

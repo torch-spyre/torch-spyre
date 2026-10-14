@@ -162,6 +162,229 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return tile_map;
 }
 
+/**
+ * Returns a copy of `info` with dimension `dim` replaced by `loops`.
+ *
+ * @param info DCSI to start from.
+ * @param dim Index of the dimension to replace (innermost first).
+ * @param loops Replacement loops, innermost first, each given as
+ *              {size, device (src) stride, host (dst) stride}.
+ */
+auto replace_dim(DataConversionStrideInfo info, size_t dim,
+                 const std::vector<std::array<int64_t, 3>>& loops)
+    -> DataConversionStrideInfo {
+  info.size_.erase(info.size_.begin() + dim);
+  info.stride_src_.erase(info.stride_src_.begin() + dim);
+  info.stride_dst_.erase(info.stride_dst_.begin() + dim);
+  for (size_t i = 0; i < loops.size(); i++) {
+    info.size_.insert(info.size_.begin() + dim + i, loops[i][0]);
+    info.stride_src_.insert(info.stride_src_.begin() + dim + i, loops[i][1]);
+    info.stride_dst_.insert(info.stride_dst_.begin() + dim + i, loops[i][2]);
+  }
+  return info;
+}
+
+/**
+ * Restore STANDARD element arrangement for an FP32_TO_DL16 D2H copy.
+ *
+ * One device stick holds the same host columns as in standard order, so each
+ * DCSI (whole stick or partial last stick) is restored on its own: device
+ * element `group * 8 + half * 4 + i` holds host column
+ * `half * 32 + group * 4 + i`. The columns are split into whole halves, whole
+ * groups of the next half and the remaining elements of the last group.
+ *
+ * @param restored Receives the restored DCSIs (appended).
+ * @param dcsi DCSI whose dim 0 holds 1..elems_per_stick host columns.
+ * @param elems_per_stick Elements in one device stick.
+ * @param elems_per_group Consecutive elements that stay together.
+ * @param halves_per_stick Number of halves a stick is split into.
+ */
+void ea_restore_fp32tofp16(std::vector<DataConversionStrideInfo>& restored,
+                           const DataConversionStrideInfo& dcsi,
+                           int64_t elems_per_stick, int64_t elems_per_group,
+                           int64_t halves_per_stick) {
+  const int64_t columns = dcsi.size_[0];
+  TORCH_CHECK(columns > 0 && columns <= elems_per_stick,
+              "FP32_TO_DL16 D2H: unexpected stick extent ", columns,
+              " for stick size ", elems_per_stick);
+
+  const int64_t device_elem_stride = dcsi.stride_src_[0];
+  const int64_t host_elem_stride = dcsi.stride_dst_[0];
+  const int64_t half_columns = elems_per_stick / halves_per_stick;
+  const int64_t groups_per_half = half_columns / elems_per_group;
+
+  // Restores `elems` elements x `halves` halves x `groups` groups, whose first
+  // host column is `first_column`.
+  auto restore = [&](int64_t elems, int64_t halves, int64_t groups,
+                     int64_t first_column) {
+    if (elems * halves * groups == 0) return;
+    const int64_t half = first_column / half_columns;
+    const int64_t group = (first_column % half_columns) / elems_per_group;
+
+    auto info = replace_dim(
+        dcsi, 0,
+        {{elems, device_elem_stride, host_elem_stride},
+         {halves, elems_per_group * device_elem_stride,
+          half_columns * host_elem_stride},
+         {groups, halves_per_stick * elems_per_group * device_elem_stride,
+          elems_per_group * host_elem_stride}});
+    info.offset_src_ += (half + group * halves_per_stick) * elems_per_group *
+                        device_elem_stride;
+    info.offset_dst_ += first_column * host_elem_stride;
+    restored.push_back(std::move(info));
+  };
+
+  const int64_t whole_halves = columns / half_columns;
+  const int64_t rest_columns = columns % half_columns;
+  const int64_t whole_groups = rest_columns / elems_per_group;
+  const int64_t last_group_elems = rest_columns % elems_per_group;
+  const int64_t rest_start = whole_halves * half_columns;
+
+  restore(elems_per_group, whole_halves, groups_per_half, 0);
+  restore(elems_per_group, 1, whole_groups, rest_start);
+  restore(last_group_elems, 1, 1, rest_start + whole_groups * elems_per_group);
+}
+
+auto is_ea_staggered(const ElementArrangement ea) {
+  switch (ea) {
+    case ElementArrangement::DL16_TO_FP32:
+    case ElementArrangement::FP32_TO_DL16:
+      return true;
+    default:
+      break;
+  }
+  return false;
+}
+
+/**
+ * Restore STANDARD element arrangement for an FP32_TO_DL16 device layout by
+ * rewriting the DCSIs of a D2H copy.
+ *
+ * @param dcsis DCSIs from get_device_stride_infos; replaced by the restored
+ *              DCSIs (their number can change).
+ * @param stl SpyreTensorLayout of the device tensor.
+ */
+void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
+                const SpyreTensorLayout& stl) {
+  constexpr int64_t kElemsPerGroup = 4;
+  constexpr int64_t kHalvesPerStick = 2;
+
+  const int64_t elems_per_stick = stl.elems_per_stick();
+  TORCH_CHECK(elems_per_stick > 0 && elems_per_stick % kHalvesPerStick == 0 &&
+                  (elems_per_stick / kHalvesPerStick) % kElemsPerGroup == 0,
+              "Unsupported stick size ", elems_per_stick,
+              " for element arrangement ",
+              elementArrangementToString(stl.element_arrangement));
+
+  std::vector<DataConversionStrideInfo> restored;
+  for (const auto& dcsi : dcsis) {
+    TORCH_CHECK(dcsi.size_.size() == stl.stride_map.size(),
+                "Unexpected DCI rank for element arrangement restoration");
+    ea_restore_fp32tofp16(restored, dcsi, elems_per_stick, kElemsPerGroup,
+                          kHalvesPerStick);
+  }
+  dcsis = std::move(restored);
+}
+
+/**
+ * Device dim that counts the sticks of the host dim tiled into the stick
+ * element dim (the innermost device dim).
+ *
+ * @param tile_map Device dims each host dim is tiled into (see get_tile_map),
+ *                 ordered by increasing stride, so the stick element dim is
+ *                 first.
+ * @param stick_elem_dim Index of the stick element dim in the device layout.
+ * @return Index of the stick-count dim, or -1 if the host dim is one stick.
+ */
+auto find_stick_count_dim(const std::vector<std::vector<int>>& tile_map,
+                          int stick_elem_dim) -> int {
+  for (const auto& tiles : tile_map) {
+    if (std::find(tiles.begin(), tiles.end(), stick_elem_dim) == tiles.end()) {
+      continue;
+    }
+    TORCH_CHECK(tiles.size() <= 2,
+                "Unable to determine the stick dimension for DL16_TO_FP32 "
+                "D2H");
+    return tiles.size() == 2 ? tiles[1] : -1;
+  }
+  TORCH_CHECK(false,
+              "Unable to determine the stick dimension for DL16_TO_FP32 D2H");
+  return -1;
+}
+
+/** Arrangement of a device dim that is not part of the stagger. */
+auto make_plain_ea(int64_t size, int64_t device_stride)
+    -> perdim_element_arrangement {
+  return {size, {size}, {1}, {1}, {device_stride}};
+}
+
+/**
+ * Arrangement of the stick dim of a DL16_TO_FP32 layout.
+ *
+ * With E elements per stick, host column
+ *   pair * 2E + group * 8 + stick_in_pair * 4 + elem_in_group
+ * is stored in device stick `2 * pair + stick_in_pair` at position
+ * `group * 4 + elem_in_group`. subElems_/subStride_ list those four digits
+ * (fastest first) with their strides in the stick-major index
+ * `stick * E + position`. cumElemsBefore_/cumOffset_ place that index in the
+ * device buffer: position within the stick, then stick.
+ *
+ * @param sticks Number of fp32 sticks along the stick dim (even).
+ * @param elems_per_stick Elements in one device stick.
+ * @param stick_stride Device stride between two sticks.
+ */
+auto make_dl16_to_fp32_stick_ea(int64_t sticks, int64_t elems_per_stick,
+                                int64_t stick_stride)
+    -> perdim_element_arrangement {
+  constexpr int64_t kElemsPerGroup = 4;
+  constexpr int64_t kSticksPerPair = 2;
+  const int64_t pair_elems = kSticksPerPair * elems_per_stick;
+  return {sticks * elems_per_stick,
+          {kElemsPerGroup, kSticksPerPair, elems_per_stick / kElemsPerGroup,
+           sticks / kSticksPerPair},
+          {1, elems_per_stick, kElemsPerGroup, pair_elems},
+          {1, elems_per_stick},
+          {1, stick_stride}};
+}
+
+/**
+ * Describe a DL16_TO_FP32 D2H copy as a GENERAL_SHUFFLE whose input is
+ * un-staggered first (input_dimwise_ea_). The DCSI stays the STANDARD one and
+ * the output arrangement stays STANDARD.
+ *
+ * @param dci DCI to update (dcsi_ already filled).
+ * @param stl SpyreTensorLayout of the device tensor.
+ * @param stick_count_dim Device dim counting sticks, or -1 for a single stick.
+ * @param device_strides Contiguous strides of stl.device_size.
+ */
+void set_dl16_to_fp32_shuffle(DataConversionInfo& dci,
+                              const SpyreTensorLayout& stl, int stick_count_dim,
+                              const std::vector<int64_t>& device_strides) {
+  // A stick pair is staggered together. A narrow stick dim only gets a single
+  // fp32 stick, so there is no partner stick for the odd groups.
+  TORCH_CHECK(stick_count_dim >= 0 && stl.device_size[stick_count_dim] % 2 == 0,
+              "DL16_TO_FP32 D2H requires whole stick pairs along the stick "
+              "dimension, but ",
+              stick_count_dim < 0 ? 1 : stl.device_size[stick_count_dim],
+              " sticks are allocated");
+  // The SEN input arrangement is only defined for fp32 input data.
+  TORCH_CHECK(stl.device_dtype == DataFormats::IEEE_FP32,
+              "DL16_TO_FP32 D2H expects an IEEE_FP32 device format");
+
+  const int stick_elem_dim = stl.device_size.size() - 1;
+  dci.dcOpName_ = DataConvertOpFuncs::GENERAL_SHUFFLE;
+  dci.output_dimwise_ea_.clear();
+  dci.input_dimwise_ea_.clear();
+  for (int dim = 0; dim < stick_elem_dim; dim++) {
+    dci.input_dimwise_ea_.push_back(
+        dim == stick_count_dim
+            ? make_dl16_to_fp32_stick_ea(stl.device_size[dim],
+                                         stl.device_size[stick_elem_dim],
+                                         device_strides[dim])
+            : make_plain_ea(stl.device_size[dim], device_strides[dim]));
+  }
+}
+
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
@@ -182,6 +405,12 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
   const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
+
+  // D2H copies of FP32_TO_DL16 layouts need their element arrangement
+  // restored by rewriting the DCSIs. DL16_TO_FP32 is un-staggered by a
+  // GENERAL_SHUFFLE DCI instead (see set_dl16_to_fp32_shuffle).
+  const bool restore_ea = !host2device && stl.element_arrangement ==
+                                              ElementArrangement::FP32_TO_DL16;
 
   // The host strides based on stride_map, used for remainder calculation.
   std::vector<int64_t> host_strides(device_rank, 1);
@@ -375,6 +604,8 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       stride_infos.push_back(info);
     }
   }
+
+  if (restore_ea) ea_restore(stride_infos, stl);
 
   return stride_infos;
 }
@@ -817,6 +1048,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   } else {
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device);
+    if (!host2device &&
+        stl.element_arrangement == ElementArrangement::DL16_TO_FP32) {
+      const auto tile_map =
+          get_tile_map(cpu_sizes, cpu_strides, stl.device_size, stl.stride_map);
+      set_dl16_to_fp32_shuffle(dci, stl,
+                               find_stick_count_dim(tile_map, device_rank - 1),
+                               device_strides);
+    }
 
     // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
