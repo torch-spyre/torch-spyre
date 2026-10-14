@@ -1879,7 +1879,13 @@ class TestSympyExprToCpSatPrinter(TestCase):
         x, y, z, resident = sympy.symbols(
             "split_x split_y split_z resident", integer=True
         )
+        # This cost is zero for every division candidate. Multiplying the
+        # table-folded zero by residency produces a CP-SAT LinearExpr constant;
+        # Min/Max must still accept it and preserve the runtime-cost objective.
+        zero_cost = sympy.Piecewise((0, x <= 8), (x, True)) * (1 - resident)
         expressions = [
+            sympy.Min(z - 2, zero_cost),
+            sympy.Max(z - 2, zero_cost),
             1e-6 * x**2 * y + sympy.Min(0.125 * x * y, 3.25),
             1000 * y / x + 0.25 * sympy.log(x, 2),
             x * y * z * (1 - resident),
