@@ -418,6 +418,35 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : stl.device_dtype;
   dci.dataformat_dst_ = host2device ? stl.device_dtype : cpu_format_host;
+  // A host format whose declared element width disagrees with PyTorch's
+  // element size cannot be transferred: output_shape_ below is set from the
+  // logical sizes while flex passes the real host storage size as
+  // out_capacity_bytes, so deeptools' ValidateDciBounds compares a volume in
+  // logical elements against a capacity in mis-sized ones and throws inside
+  // ConvertData, on the stream worker, which shuts the stream down and takes
+  // every later op in the process with it.
+  //
+  // uint8 hits this: its host format is SENUINT32 (4 bytes) because the
+  // device has no 1-byte unsigned format, but PyTorch stores it as 1 byte, so
+  // capacity reads storage/4.  Only D2H faulted, where dataformat_dst_ is the
+  // host format; for H2D it is the device format, which really is 4 bytes, so
+  // that direction succeeded silently.  Both are refused, because a silent
+  // H2D only defers the fault to the first read back.
+  //
+  // Allocation is deliberately left alone: torch.distributed allocates uint8
+  // tensors internally (distributed_c10d.py, barrier() and the object
+  // collectives), so is_supported_dtype() must keep accepting the dtype.
+  //
+  // Real fix needs a 1-byte unsigned host format in deeptools; no existing
+  // 1-byte DataFormat can carry a raw byte (SENINT8 maps >127 to val-256,
+  // BOOL normalises to 0/1).  See deeptools issue 4843.
+  TORCH_CHECK(!hasInconsistentHostFormatWidth(cpu_tensor->scalar_type()),
+              "Spyre backend does not support dtype ",
+              cpu_tensor->scalar_type(),
+              " for host transfers: its host data format declares ",
+              hostFormatBytes(cpu_format_host), " byte(s) per element but ",
+              "PyTorch stores ", c10::elementSize(cpu_tensor->scalar_type()),
+              ". See deeptools issue 4843.");
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",

@@ -87,8 +87,11 @@ _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
 )
 
 # TODO:ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
+# Not alignment: uint8's HOST data format is SENUINT32 (4 bytes) for a buffer
+# PyTorch stores as 1, so ConvertData's capacity reads storage/4 and the
+# transfer is refused. Needs a 1-byte unsigned host format (deeptools 4843).
 _SCALAR_ADD_SKIP_UINT8 = pytest.mark.skip(
-    reason="Spyre hardware requires 128-byte aligned buffers - small uint8 tensors cause alignment violations"
+    reason="uint8 host transfers unsupported: host format SENUINT32 is 4 bytes, PyTorch stores 1 (deeptools 4843)"
 )
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
@@ -784,6 +787,86 @@ class TestSpyre(TestCase):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
+
+    def test_uint8_transfer_rejected_not_card_fault(self):
+        """A uint8 host transfer must be refused up front, not mid-DMA.
+
+        uint8 maps to SENUINT32 as its HOST format (the device has no 1-byte
+        unsigned format), so the host leg claims 4 bytes per element for a
+        buffer PyTorch stores as 1.  deeptools derives ConvertData's capacity
+        as out_capacity_bytes / 4, so a contiguous uint8 tensor of N elements
+        reports a capacity of N/4 against an output volume of N and throws
+        "output_shape_ volume (N elem) exceeds out buffer capacity (N/4 elem)".
+
+        That throw lands on the stream worker, which marks the stream shut
+        down, so every later op in the process dies with StreamInErrorState.
+        One such fault cost 6846 tests in a single file in Spyre/product-test
+        875.  Refusing the transfer keeps the failure local to the one op.
+
+        Only D2H actually faulted before this change, and the direction matters:
+
+          D2H  dataformat_dst_ is the HOST format, SENUINT32 at 4 bytes, but the
+               host buffer holds 1 byte per element, so capacity reads N/4 and
+               ConvertData throws.  All 4 faults in product-test 875 were D2H.
+          H2D  dataformat_dst_ is the DEVICE format, SENUINT32, and the device
+               buffer really is 4 bytes per element, so the bounds check passes
+               and the transfer SUCCEEDS on an unfixed build.
+
+        The gate refuses both directions, because the host format is wrong for
+        either one and an H2D that silently succeeds only defers the problem to
+        the first read back.  The H2D assertion therefore holds because of this
+        change, not because H2D was broken before it; see PR 5447 for the
+        control run that establishes that distinction.
+
+        See https://github.com/torch-spyre/torch-spyre/issues/1588 and
+        deeptools issue 4843 for the real fix (a 1-byte unsigned host format).
+        """
+        # D2H: the direction that faulted on an unfixed build.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.empty(272, dtype=torch.uint8, device="spyre").cpu()
+        # H2D: refused by this gate too, so a wrong host format cannot reach
+        # the card in either direction.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.ones(272, dtype=torch.uint8).to("spyre")
+
+    def test_uint8_allocation_still_allowed(self):
+        """Allocating a uint8 tensor on device must keep working.
+
+        Only the host transfer is refused.  torch.distributed allocates uint8
+        tensors internally (distributed_c10d.py, used by barrier() and the
+        object collectives), so gating is_supported_dtype() on this would
+        break the multi-Spyre barrier tests.
+        """
+        t = torch.empty(272, dtype=torch.uint8, device="spyre")
+        self.assertEqual(t.device.type, "spyre")
+        self.assertEqual(t.dtype, torch.uint8)
+
+    def test_supported_dtypes_still_transferable(self):
+        """The uint8 rejection must not widen to other dtypes.
+
+        bool and int8 also carry a 1-byte host format and transferred fine in
+        product-test 875 (1222 bool references, zero converter faults), so they
+        must keep working.  Sub-byte formats are packed and are not 1:1 with a
+        host element width, so they are left alone.
+
+        int16 is allocation-only here: zeroing one fails in fill_tensor with
+        "unsupported DataFormat for fill pattern conversion", which is issue
+        #925 and unrelated to this gate.
+        """
+        for dtype in (
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        ):
+            with self.subTest(dtype=dtype):
+                cpu = torch.ones(128, dtype=dtype)
+                dev = cpu.to("spyre")
+                self.assertEqual(dev.device.type, "spyre")
+                self.assertEqual(dev.cpu().dtype, dtype)
 
     def test_d2h_h2d_dtype_conversion(self):
         """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.
