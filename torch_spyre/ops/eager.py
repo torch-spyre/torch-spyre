@@ -492,6 +492,7 @@ COMPILED_OPS = [
     aten.gt,
     aten.lt,
     aten.amax,
+    aten.amin,
     aten.maximum,
     aten.minimum,
     aten.pow,

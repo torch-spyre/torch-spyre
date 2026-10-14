@@ -676,7 +676,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
+        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):

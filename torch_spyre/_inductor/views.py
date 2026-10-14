@@ -116,7 +116,7 @@ def find_repeat_vars(index_exprs, var_ranges):
                 continue
 
             vars_in_expr = expr.free_symbols
-            term = expr.xreplace({v: 0 for v in vars_in_expr - {var}})
+            term = expr.xreplace(dict.fromkeys(vars_in_expr - {var}, 0))
 
             if term == node:
                 repeat_info[var] = {

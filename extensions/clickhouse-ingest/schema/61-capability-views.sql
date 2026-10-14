@@ -35,7 +35,8 @@ SELECT
     -- The shard that wrote this row, the dedup scope for a fan-out analysis.
     cr.props['shard'] AS shard
 FROM capability_runs AS cr
-INNER JOIN capabilities AS c ON c.capability_id = cr.capability_id;
+INNER JOIN capabilities AS c ON c.capability_id = cr.capability_id
+WHERE cr.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted');
 
 
 -- The per-(run, subject) counters model_ops_suites stored -- one row per subject per run,

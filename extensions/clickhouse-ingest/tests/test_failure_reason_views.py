@@ -61,6 +61,7 @@ def db():
     for name in (
         "10-functional-tests.sql",
         "20-artifacts.sql",
+        "49-result-uploads.sql",
         "50-artifact-views.sql",
     ):
         for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
