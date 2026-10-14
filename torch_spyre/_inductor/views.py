@@ -351,6 +351,10 @@ def compute_coordinates(
             else:
                 coordinates[primary_dim] += var * step // primary_stride
 
+    # index may be a plain Python int when the input is a 0-d tensor;
+    # promote to SymPy so .free_symbols and .xreplace are available.
+    if isinstance(index, int):
+        index = sympy.Integer(index)
     vars = index.free_symbols
     offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:

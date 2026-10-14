@@ -233,6 +233,9 @@ def generate_constant_info(
                 encoded_value = 0x7FFE
             elif data_format == DataFormats.SEN169_FP16 and value == -DLFLOAT16_MAX:
                 encoded_value = 0xFFFE
+            elif data_format == DataFormats.SENINT16:
+                # encode_constant() has no integer path; int16 constants are the raw 16-bit pattern
+                encoded_value = int(value) & 0xFFFF
             else:
                 encoded_value = encode_constant(value, data_format)
         except (ValueError, TypeError) as e:

@@ -498,9 +498,14 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
             _CONSTANT_TENSOR_CACHE.move_to_end(cache_key)
             return _CONSTANT_TENSOR_CACHE[cache_key]
 
-        # Cache miss: create new tensor with device-side fill
-        t = torch.empty((), dtype=dtype, device=device)
-        _C.fill_tensor(t, float(const_val))
+        # Cache miss: create new tensor with device-side fill.
+        # int16 fill is not supported by the Spyre runtime, so for int16
+        # we create the scalar on CPU and transfer it to the device.
+        if dtype == torch.int16:
+            t = torch.tensor(int(const_val), dtype=dtype).to(device)
+        else:
+            t = torch.empty((), dtype=dtype, device=device)
+            _C.fill_tensor(t, float(const_val))
 
         _CONSTANT_TENSOR_CACHE[cache_key] = t
 

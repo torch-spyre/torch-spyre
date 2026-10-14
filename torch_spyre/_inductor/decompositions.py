@@ -3048,16 +3048,6 @@ def bitwise_not(input: torch.Tensor) -> torch.Tensor:
         return torch.ops.aten.bitwise_xor(input, neg_one)
 
 
-@register_spyre_decompositions([torch.ops.aten.bitwise_and])
-def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
-    if input1.dtype is torch.bool and input2.dtype is torch.bool:
-        return torch.ops.aten.logical_and(input1, input2)
-    else:
-        return torch.ops.aten.bitwise_not(
-            torch.ops.aten.bitwise_or(
-                torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
-            )
-        )
 
 
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A

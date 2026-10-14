@@ -124,6 +124,7 @@ inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
       {DF::SEN169_FP16, DF::SEN169_FP16},
       {DF::SEN169_FP16, DF::SENINT16},
       {DF::SENINT16,    DF::SEN169_FP16},
+      {DF::SENINT16,    DF::SENINT16},
       {DF::IEEE_FP32,   DF::BFLOAT16},
       {DF::IEEE_FP16,   DF::BFLOAT16},
       {DF::BFLOAT16,    DF::IEEE_FP32},

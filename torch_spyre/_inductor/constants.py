@@ -183,6 +183,17 @@ SPYRE_INT32_OPS: frozenset[str] = frozenset({ADDI32TOI32_OP, MULI32TOI32_OP})
 # DLFloat16's largest finite value (0x7FFE); 0x7FFF is NaN-Infinity.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)
 
+SPYRE_INT16_OPS = [
+    "add",
+    "bitwise_and",
+    "bitwise_left_shift",
+    "bitwise_or",
+    "bitwise_right_shift",
+    "bitwise_xor",
+    "identity",
+    "to_dtype",
+]
+
 # FP8 E4M3 numeric limits
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)

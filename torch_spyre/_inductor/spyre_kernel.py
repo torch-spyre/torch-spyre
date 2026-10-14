@@ -40,6 +40,7 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
+    SPYRE_INT16_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -213,6 +214,34 @@ class SpyreOpFuncs:
         if _has_int32_operands(a, b):
             return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
+
+    @staticmethod
+    def bitwise_and(a, b):
+        return PointwiseOp("bitwise_and", [a, b])
+
+    @staticmethod
+    def bitwise_left_shift(a, b):
+        if not isinstance(b, Constant):
+            raise Unsupported("bitwise_left_shift requires a constant shift amount")
+        return PointwiseOp(
+            "bitwise_left_shift", [a], {"constants": {"shamt": int(b.value)}}
+        )
+
+    @staticmethod
+    def bitwise_or(a, b):
+        return PointwiseOp("bitwise_or", [a, b])
+
+    @staticmethod
+    def bitwise_right_shift(a, b):
+        if not isinstance(b, Constant):
+            raise Unsupported("bitwise_right_shift requires a constant shift amount")
+        return PointwiseOp(
+            "bitwise_right_shift", [a], {"constants": {"shamt": int(b.value)}}
+        )
+
+    @staticmethod
+    def bitwise_xor(a, b):
+        return PointwiseOp("bitwise_xor", [a, b])
 
     @staticmethod
     def clamp(x, min, max):
@@ -980,6 +1009,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (
                     op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
+                )
+                or (
+                    op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16
                 )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
