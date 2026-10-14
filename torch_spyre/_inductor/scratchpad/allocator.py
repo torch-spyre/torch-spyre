@@ -3764,7 +3764,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         allocation: Sequence[CoreDivisionBuffer],
         tiled: Mapping[str, TileSpec],
     ) -> None:
-        """Every tiled buffer's applied per-core footprint is the one it was
+        """Every tiled buffer's applied per-core footprint fits the one it was
         placed at, or this raises.
 
         The search divides the buffer's *total* size by
@@ -3774,7 +3774,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         device byte size exactly -- plausible, since ``build_tiling_space`` never
         tiles the stick dim, but per-dim device padding could re-round. An
         applied footprint *larger* than the priced one would overlap whatever
-        was packed above this buffer's LX interval.
+        was packed above this buffer's LX interval; a smaller one only leaves
+        part of the interval unused, so it is logged rather than refused.
         """
         for buffer in allocation:
             tiling = tiled.get(buffer.name)
@@ -3793,7 +3794,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             partition = buffer.core_divisions[buffer.chosen_division].output_partition
             applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
             priced = ceil_div(buffer.size, partition * tiling.output_tile_count)
-            if applied != priced:
+            if applied < priced:
+                logger.debug(
+                    "%s: applied per-core footprint %d bytes under tiling %s is "
+                    "below the %d it was placed at",
+                    buffer.name,
+                    applied,
+                    tiling.label,
+                    priced,
+                )
+            elif applied > priced:
                 raise Unsupported(
                     f"{buffer.name}: placed at a per-core footprint of {priced} "
                     f"bytes under tiling {tiling.label} ({buffer.size} bytes over "

@@ -3196,8 +3196,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             allocator._division_map(graph)
 
-    def test_a_tiling_the_applied_graph_did_not_get_is_refused(self):
-        """A tiled buffer is placed at a footprint the applied graph must have."""
+    def test_a_tiling_the_applied_graph_outgrew_is_refused(self):
+        """A tiled buffer's applied footprint must fit the one it was placed at."""
         spec = TileSpec((TileAxis(0, 4),))
         buf = CoreDivisionBuffer(
             name="buf0",
@@ -3215,11 +3215,13 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             )
         )
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
-        # Priced at 1024 bytes over 1 core x 4 tiles = 256.
-        with patch.object(
-            allocator_module, "get_device_size_in_bytes", return_value=256
-        ):
-            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+        # Priced at 1024 bytes over 1 core x 4 tiles = 256; a smaller applied
+        # footprint fits the interval.
+        for applied in (256, 128):
+            with patch.object(
+                allocator_module, "get_device_size_in_bytes", return_value=applied
+            ):
+                allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
         # The graph kept the full extent: the address is spaced for a quarter of
         # what will be written there.
         with (
