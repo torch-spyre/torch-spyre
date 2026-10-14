@@ -3983,6 +3983,58 @@ class TestResidencyEdgeInversion(unittest.TestCase):
                 edge.consumer_division_for(CoreDivision({self.x: 2}), space)
             )
 
+    def test_a_tiled_pair_split_apart_on_its_tiled_axis_shares_no_residency(self):
+        """Nothing makes a tiling group agree on how cores split its tiled axis:
+        the SA co-optimizer's residency gate prices a disagreement as a buffer
+        kept out of LX, and is the only thing that does. Both ends carry the
+        same tiling, so only the splits tell the pairs apart."""
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        parent_space = mock_op_split_space(
+            {self.x: [1, 2, 4, 8], self.y: [1, 2], self.k: [1, 2, 4]},
+            {self.x, self.y},
+            op=self.producer,
+            tiling=TilingSpace(max_dims=2, output_counts={0: [2]}),
+        )
+        cases = [
+            ({self.x: 4}, {self.r: 4}, True),
+            # Four cores on both ends, the tiled axis split 4 against 2.
+            ({self.x: 4}, {self.r: 2, self.c: 2}, False),
+            ({self.x: 2}, {self.r: 4}, False),
+        ]
+        with self._geometry():
+            parent = CoreDivisionBuffer(
+                name="p", size=1024, uses=[0, 1], core_divisions=[CoreDivision()]
+            )
+            parent.division_space = parent_space
+            consumer = CoreDivisionBuffer(
+                name="cons",
+                size=1024,
+                uses=[1, 2],
+                core_divisions=[CoreDivision()],
+                parents=["p"],
+            )
+            consumer.division_space = self._tiled_consumer_space({0: [2]})
+            consumer.residency_edges = {"p": self._edge()}
+            solver = SaCoOptimizingSolver([parent, consumer], 1 << 30, 128)
+            solver._precompute_topology()
+            parent_source, consumer_source = solver._sources
+            for parent_splits, consumer_splits, resident in cases:
+                solver.chosen = [
+                    parent_source.config_for(CoreDivision(parent_splits, tiling=tiled)),
+                    consumer_source.config_for(
+                        CoreDivision(consumer_splits, tiling=tiled)
+                    ),
+                ]
+                self.assertEqual(
+                    solver._eligible(0),
+                    resident,
+                    f"{_by_name(parent_splits)} -> {_by_name(consumer_splits)}",
+                )
+
 
 class _TwoReadEdge(NamedTuple):
     """A producer/consumer edge whose consumer reads the buffer twice."""
