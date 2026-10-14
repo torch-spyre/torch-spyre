@@ -29,6 +29,7 @@ from collections.abc import Callable
 import torch
 from torch._inductor.utils import run_and_get_code
 
+from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.wsr import for_each_tile
 
 
@@ -1430,6 +1431,77 @@ def restickify_matmul_xt_y_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def matmul_x_yt_tile_m_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x @ y.t() (the nn.Linear weight pattern), tiled on M; y is invariant."""
+
+    def body(_, ops):
+        x_tile, y_whole = ops
+        return None, x_tile @ y_whole.t()
+
+    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
+def matmul_x_yt_tile_n_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x @ y.t(), tiled on N (y's dim 0); x is invariant."""
+
+    def body(_, ops):
+        x_whole, y_tile = ops
+        return None, x_whole @ y_tile.t()
+
+    _, out = for_each_tile(body, (X, Y), dims=(None, 0), tile_size=64, out_dim=1)
+    return out
+
+
+def matmul_x_yt_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x @ y.t() with the outer loop on M and the inner loop on N."""
+
+    def outer_body(_, outer_ops):
+        x_rows, y_whole = outer_ops
+
+        def inner_body(_, inner_ops):
+            x_block, y_block = inner_ops
+            return None, x_block @ y_block.t()
+
+        _, row_out = for_each_tile(
+            inner_body, (x_rows, y_whole), dims=(None, 0), tile_size=64, out_dim=1
+        )
+        return None, row_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
+    return out
+
+
+def matmul_xt_y_tile_n_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x.t() @ y, tiled on N (y's dim 1); x is invariant."""
+
+    def body(_, ops):
+        x_whole, y_tile = ops
+        return None, x_whole.t() @ y_tile
+
+    _, out = for_each_tile(body, (X, Y), dims=(None, 1), tile_size=128, out_dim=1)
+    return out
+
+
+def matmul_xt_y_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """x.t() @ y with the outer loop on M (x's dim 1) and the inner loop on N."""
+
+    def outer_body(_, outer_ops):
+        x_cols, y_whole = outer_ops
+
+        def inner_body(_, inner_ops):
+            x_block, y_block = inner_ops
+            return None, x_block.t() @ y_block
+
+        _, row_out = for_each_tile(
+            inner_body, (x_cols, y_whole), dims=(None, 1), tile_size=128, out_dim=1
+        )
+        return None, row_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(1, None), tile_size=128, out_dim=0)
+    return out
+
+
 def outside_consumer_fn(
     A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
 ) -> torch.Tensor:
@@ -1533,3 +1605,45 @@ def nested_restickify_add_fn(A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
 
     _, out = for_each_tile(outer_body, (A, X), dims=(1, 0), tile_size=64, out_dim=0)
     return out
+
+
+def carried_expert_sum_fn(values: torch.Tensor, row_split: int) -> torch.Tensor:
+    """values[E, T, H].sum(0), one expert slab per trip, through a loop carry.
+
+    ``row_split`` is a ``work_div`` on the output row dim ``T``; ``values`` must
+    be named ``["E", "T", "H"]`` for the hint to resolve.  The carry's initial
+    value is built by the same function, so the solver, not the caller, has to
+    give it the update's split.
+    """
+
+    def body(acc, ops):
+        (slab,) = ops
+        return acc + slab.sum(0), None
+
+    init = torch.zeros(values.shape[1:], dtype=values.dtype, device=values.device)
+    with spyre_hint(work_div={"T": row_split}):
+        final, _ = for_each_tile(body, (values,), dims=(0,), tile_size=1, init=init)
+    return final
+
+
+def carried_routed_expert_sum_fn(
+    values: torch.Tensor, routing: torch.Tensor, row_split: int
+) -> torch.Tensor:
+    """sum over E of values * route, with route a permuted, contiguous copy.
+
+    ``routing`` is [T, E, 1]; the per-expert route slab [1, T, 1] is tiled with
+    ``values`` along E, so the tiled operand is itself the output of an
+    earlier relayout.
+    """
+    route = routing.permute(1, 0, 2).contiguous().clone()
+
+    def body(acc, ops):
+        slab, route_slab = ops
+        return acc + (slab * route_slab).sum(0), None
+
+    init = torch.zeros(values.shape[1:], dtype=values.dtype, device=values.device)
+    with spyre_hint(work_div={"T": row_split}):
+        final, _ = for_each_tile(
+            body, (values, route), dims=(0, 0), tile_size=1, init=init
+        )
+    return final

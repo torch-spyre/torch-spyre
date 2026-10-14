@@ -23,6 +23,7 @@ from unittest.mock import patch as mock_patch
 import torch
 import os
 import pytest
+import regex as re
 from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
@@ -1084,3 +1085,36 @@ def mock_op_split_space(
     # a domain is the real context's business.
     space._context = lambda tiling: context  # type: ignore[method-assign]
     return space
+
+
+def opspec_summaries(source: str) -> list[dict[str, Any]]:
+    """One summary per ``OpSpec`` in generated kernel source, in source order.
+
+    Each dict has ``op`` (the op name), ``allocations`` (the allocation kind --
+    ``hbm``, ``lx`` or ``hbm_pool`` -- of each ``TensorArg``, in argument
+    order) and ``splits`` (the per-core split of each iteration-space axis).
+    Lets a test say where a value lives and how cores divide an op without
+    matching the whole OpSpec text.
+    """
+    summaries = []
+    for chunk in source.split("OpSpec(\n")[1:]:
+        op = re.search(r"op='(\w+)'", chunk)
+        space = re.search(r"iteration_space=\{(.*?)\},\n", chunk)
+        splits = (
+            [
+                int(split)
+                for _, split in re.findall(
+                    r"\(sympify\('(\d+)'\), (\d+)\)", space.group(1)
+                )
+            ]
+            if space
+            else []
+        )
+        summaries.append(
+            {
+                "op": op.group(1) if op else None,
+                "allocations": re.findall(r"allocation=\{'(\w+)'", chunk),
+                "splits": splits,
+            }
+        )
+    return summaries
