@@ -163,6 +163,59 @@ inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
   return false;
 }
 
+// Byte width of a host-side DataFormat, matching deeptools'
+// elemBytesForBoundCheck(): deeptools derives ConvertData's out-buffer capacity
+// as out_capacity_bytes / this width.  A host format whose width disagrees with
+// PyTorch's element size therefore makes the bounds check read the host buffer
+// as the wrong number of elements.
+inline size_t hostFormatBytes(DataFormats df) {
+  switch (df) {
+    case DataFormats::IEEE_INT64:
+      return 8;
+    case DataFormats::IEEE_FP32:
+    case DataFormats::SENUINT32:
+    case DataFormats::IEEE_INT32:
+      return 4;
+    case DataFormats::BFLOAT16:
+    case DataFormats::SEN169_FP16:
+    case DataFormats::IEEE_FP16:
+    case DataFormats::SENINT16:
+      return 2;
+    case DataFormats::SENINT8:
+    case DataFormats::SEN080_FP8:
+    case DataFormats::SEN143_FP8:
+    case DataFormats::BOOL:
+      return 1;
+    default:
+      return 0;  // sub-byte or unknown: no single byte width
+  }
+}
+
+// True when the host leg of a dtype's DataFormat pair describes a different
+// element width than PyTorch uses for that dtype on the host.
+//
+// Such a dtype cannot be transferred: generate_dci() sets output_shape_ from
+// the logical sizes while flex passes the real host storage size as
+// out_capacity_bytes, so deeptools' ValidateDciBounds compares a volume in
+// logical elements against a capacity in mis-sized ones and throws
+// "output_shape_ volume (N elem) exceeds out buffer capacity (M elem)".  That
+// throw happens on the stream worker, which marks the stream shut down, so
+// every later op in the process fails with StreamInErrorState.
+//
+// uint8/quint8 hit this: both declare SENUINT32 (4 bytes) as their host format
+// because the device has no 1-byte unsigned format, but PyTorch stores them as
+// 1 byte.  Reject them up front instead of faulting the card mid-transfer.
+inline bool hasInconsistentHostFormatWidth(c10::ScalarType dtype) {
+  auto it = torchScalarToString.find(dtype);
+  if (it == torchScalarToString.end()) return false;
+  const auto [host_format, device_format] =
+      stringToDTDataFormatPair(it->second);
+  if (host_format == DataFormats::INVALID) return false;
+  const size_t host_bytes = hostFormatBytes(host_format);
+  if (host_bytes == 0) return false;  // sub-byte formats are packed, not 1:1
+  return host_bytes != c10::elementSize(dtype);
+}
+
 inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
   /* return size (bytes) on CPU and on Spyre*/
   static const std::unordered_map<c10::ScalarType, std::pair<size_t, size_t>>
