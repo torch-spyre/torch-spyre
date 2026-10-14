@@ -893,9 +893,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         charge_of = {name: (source, prices) for name, source, prices in charges}
         charged = frozenset(charge_of)
+        # Bound once, in argument order. ``value_of`` is keyed by the symbols
+        # the buffers hand out, which equal the expression's but are other
+        # objects, so every lookup misses the identity fast path for sympy's
+        # ``__eq__``: looked up per score, that was 90% of a score's time.
+        getters = [value_of[sym] for sym in free]
 
         def score(chosen, resident) -> int:
-            ns = fn(*(value_of[sym](chosen, resident) for sym in free))
+            ns = fn(*(getter(chosen, resident) for getter in getters))
             if charged:
                 # Over the resident copies only, a handful against the thousands
                 # a graph can carry; in name order, so the sum is the same
