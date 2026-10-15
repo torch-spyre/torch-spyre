@@ -7388,7 +7388,7 @@ def _retile_load_index(
 
         new_index = compute_tile_index(
             index_to_retile,
-            {sym: 1 for sym in loop_syms},
+            dict.fromkeys(loop_syms, 1),
             info.old_size,
             info.old_stride,
             info.new_stride,
