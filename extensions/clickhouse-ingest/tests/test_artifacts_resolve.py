@@ -416,7 +416,7 @@ def test_a_recorded_wheel_wins_even_with_another_component():
 
 
 def test_a_generic_file_is_found_by_url_and_sha_else_derived_from_its_sha():
-    url = "https://na.artifactory.swg-devops.com/artifactory/r/next/noarch/llvm/llvm-src-080ddeea9a07.tgz"
+    url = "https://artifactory.example.com/artifactory/r/next/noarch/llvm/llvm-src-080ddeea9a07.tgz"
     recorded = _row(
         "llvm", "llvm-src-080ddeea9a07.tgz", "080ddeea9a07", "x86_64", "generic", url
     )
@@ -737,7 +737,7 @@ def test_registry_off_never_calls_it_and_fails_when_the_spec_needs_it(monkeypatc
     monkeypatch.setattr(Registry, "from_env", lambda: NoRegistry())
     with pytest.raises(NeedsRegistry):
         resolve(f"image:{IMAGE}:nightly-latest", "s390x", registry="off")
-    url = "https://na.artifactory.swg-devops.com/artifactory/r/x.tgz"
+    url = "https://artifactory.example.com/artifactory/r/x.tgz"
     out = resolve(f"generic:{url}#{'ab' * 32};component=llvm", "x86_64", registry="off")
     assert out["source"] == "derived"
 

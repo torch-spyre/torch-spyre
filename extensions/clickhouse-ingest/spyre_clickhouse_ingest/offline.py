@@ -77,9 +77,9 @@ VLLM_SIGNATURES = (
     "output_throughput",
 )  # fmt: skip
 ARTIFACT_KEYS = ("artifact_id", "image", "artifact")
-BASE_URL = "https://na.artifactory.swg-devops.com/artifactory"
-REPO = "sys-ai-sw-accel-team-cos-dev-generic-local"
-ROOT = "next/{arch}/v2-results"
+ENV_BASE_URL = "ARTIFACTORY_BASE_URL"
+ENV_REPO = "ARTIFACTORY_V2_RESULTS_REPO"
+ENV_ROOT = "ARTIFACTORY_V2_RESULTS_ROOT"  # a path template with {arch}
 WAIT_MINUTES = 40
 POLL_SECONDS = 30
 
@@ -197,11 +197,24 @@ def bundle_name(meta: dict, digest: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", key) + "-" + meta["test_type"]
 
 
-def upload_path(meta: dict, digest: str, inbox: str = "inbox") -> str:
+def setting(value: str, flag: str, env: str) -> str:
+    """`value`, else $env; a deployment-specific setting has no built-in default."""
+    value = value or os.environ.get(env, "")
+    if not value:
+        raise BundleError(f"no {flag}: pass it or set ${env}", FAILED)
+    return value
+
+
+def results_root(meta: dict, root: str = "") -> str:
+    """The v2-results folder for the bundle's arch; a placeholder when unconfigured, for display."""
+    root = root or os.environ.get(ENV_ROOT, "") or f"<{ENV_ROOT}>"
+    return root.format(arch=meta.get("arch") or "any")
+
+
+def upload_path(meta: dict, digest: str, inbox: str = "inbox", root: str = "") -> str:
     """Its inbox folder under the generic repo; a .tgz goes at this path + .tgz."""
     key = meta.get("artifact_id") or min(inbox_keys(meta), default="<artifact_id>")
-    root = ROOT.format(arch=meta.get("arch") or "any")
-    return f"{root}/{inbox}/{key}/{bundle_name(meta, digest)}"
+    return f"{results_root(meta, root)}/{inbox}/{key}/{bundle_name(meta, digest)}"
 
 
 def sha256(path: Path) -> str:
@@ -628,7 +641,7 @@ def write(args) -> Path:
         file=sys.stderr,
     )
     print(
-        f"[info] inbox path: {upload_path(checked, dig, args.inbox)}{'.tgz' if tgz else '/'}",
+        f"[info] inbox path: {upload_path(checked, dig, args.inbox, args.root)}{'.tgz' if tgz else '/'}",
         file=sys.stderr,
     )
     return out
@@ -655,7 +668,8 @@ class Artifactory:
     """PUT and GET against the generic repo, with retries; auth from a token or ~/.netrc."""
 
     def __init__(self, base: str, repo: str, token: str = ""):
-        self.base, self.repo = base.rstrip("/"), repo
+        self.base = setting(base, "--base-url", ENV_BASE_URL).rstrip("/")
+        self.repo = setting(repo, "--repo", ENV_REPO)
         user = os.environ.get("ARTIFACTORY_USER", "")
         token = token or os.environ.get("ARTIFACTORY_TOKEN", "")
         if not token:
@@ -719,9 +733,10 @@ class Artifactory:
 def upload(path: Path, args) -> str:
     """PUT the bundle into its inbox (a .tgz, unless --as-folder); returns where it went."""
     art = Artifactory(args.base_url, args.repo, args.token)
+    results = setting(args.root, "--root", ENV_ROOT)
     with opened(path) as root:
         meta, dig = check(root), digest(root)
-        dest = upload_path(meta, dig, args.inbox)
+        dest = upload_path(meta, dig, args.inbox, results)
         if args.as_folder:
             # bundle.json last: the relay takes a folder only once it is there.
             for p in [*bundle_files(root), BUNDLE_FILE]:
@@ -736,19 +751,17 @@ def upload(path: Path, args) -> str:
                 )
     print(f"[info] uploaded {url}", file=sys.stderr)
     if args.wait:
-        return wait(art, meta, dig, args.wait, args.as_folder, args.inbox)
+        return wait(art, meta, dig, args.wait, args.as_folder, args.inbox, results)
     return json.dumps({"status": "uploaded", "url": url, "bundle_sha256": dig})
 
 
 def wait(
-    art, meta: dict, dig: str, minutes: int, as_folder=False, inbox="inbox"
+    art, meta: dict, dig: str, minutes: int, as_folder=False, inbox="inbox", results=""
 ) -> str:
     """Poll until the relay has moved the bundle to processed/ or rejected/, beside the inbox."""
     key = meta.get("artifact_id") or min(inbox_keys(meta))
     parent = inbox.rpartition("/")[0]
-    root = ROOT.format(arch=meta.get("arch") or "any") + (
-        f"/{parent}" if parent else ""
-    )
+    root = results_root(meta, results) + (f"/{parent}" if parent else "")
     stem = bundle_name(meta, dig)
     name = stem if as_folder else stem + ".tgz"
     deadline = time.time() + minutes * 60
@@ -804,13 +817,17 @@ def add_offline_options(parser) -> None:
         default="",
         help="Artifactory token; default $ARTIFACTORY_TOKEN, else ~/.netrc",
     )
-    g.add_argument("--base-url", default=BASE_URL)
+    g.add_argument(
+        "--base-url", default="", help=f"Artifactory URL; default ${ENV_BASE_URL}"
+    )
     g.add_argument(
         "--inbox",
         default="inbox",
-        help="under v2-results/; a trial uses inbox-test/inbox",
+        help="under the results root; a trial uses inbox-test/inbox",
     )
-    g.add_argument("--repo", default=REPO)
+    g.add_argument("--repo", default="", help=f"generic repo; default ${ENV_REPO}")
+    g.add_argument("--root", default="",
+                   help=f"results folder template with {{arch}}; default ${ENV_ROOT}")  # fmt: skip
     g.add_argument("--kind", choices=tuple(KINDS), default="junit")
     g.add_argument(
         "--vllm-results-dir", default="", help="vLLM bench *.json (implies --kind vllm)"

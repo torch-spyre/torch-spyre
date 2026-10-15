@@ -379,15 +379,23 @@ python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --benchma
 ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundle.tgz --wait
 ```
 
+`--upload` has no built-in location; take these from the relay's owner (spyre-frameworks,
+`docs/v2-artifact-recording.md`) and set them as environment or flags:
+
+| Setting | Flag | Meaning |
+|---|---|---|
+| `ARTIFACTORY_BASE_URL` | `--base-url` | `https://<host>/artifactory` |
+| `ARTIFACTORY_V2_RESULTS_REPO` | `--repo` | the generic repository |
+| `ARTIFACTORY_V2_RESULTS_ROOT` | `--root` | folder template with `{arch}` that holds `inbox/`, `processed/`, `rejected/` |
+
 `--wait` polls until the relay has moved the bundle to `processed/` (prints `ingested`) or
 `rejected/` (prints the reason). A host that is connected while it tests can do it in one step,
 `results --offline --upload --wait ...`.
 
 ### Uploading by hand
 
-The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/next/<arch>/v2-results/inbox/<key>/`
-on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
-the full path.
+The inbox is `<repo>/<root>/inbox/<key>/` on `<base-url>`, with the settings above and `{arch}`
+filled in. `--upload` and `--validate-only` print the path under `<repo>`.
 - `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
 - `<arch>` is `any` when the bundle names none.
 - The bundle goes there as `<name>.tgz` (atomic: preferred), or as a folder `<name>/`.
@@ -400,16 +408,17 @@ relay ingests once the folder's listing is unchanged across two polls. A folder 
 after 24 hours is rejected.
 
 ```
-ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
-INBOX=next/<arch>/v2-results/inbox/<key>
+REPO=$ARTIFACTORY_V2_RESULTS_REPO
+ART=$ARTIFACTORY_BASE_URL/$REPO
+INBOX=<root, {arch} filled in>/inbox/<key>
 curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
 # a folder, bundle.json last
 (cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
   curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T "$f" "$ART/$INBOX/<name>/$f"; done)
 # JFrog CLI (these two forms are untested here): the .tgz, or the folder and then bundle.json
-jf rt upload mybundle.tgz "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>.tgz"
-(cd mybundle && jf rt upload --flat=false "results/*" "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/" \
-  && jf rt upload bundle.json "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/")
+jf rt upload mybundle.tgz "$REPO/$INBOX/<name>.tgz"
+(cd mybundle && jf rt upload --flat=false "results/*" "$REPO/$INBOX/<name>/" \
+  && jf rt upload bundle.json "$REPO/$INBOX/<name>/")
 ```
 
 Uploading needs deploy permission on that repository. The token is `--token`, else

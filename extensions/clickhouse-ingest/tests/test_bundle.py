@@ -709,6 +709,11 @@ class FakeArtifactory(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+@pytest.fixture(autouse=True)
+def results_root(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "next/{arch}/v2-results")
+
+
 @pytest.fixture
 def art(monkeypatch):
     FakeArtifactory.store, FakeArtifactory.seen, FakeArtifactory.fail = {}, [], 0
@@ -752,6 +757,54 @@ def test_a_folder_upload_puts_bundle_json_last_and_retries_a_503(tmp_path, art, 
     puts = [p for m, p, _ in art.cls.seen]
     assert code == 0 and puts[0] == puts[1] and puts[-1].endswith("/bundle.json")
     assert puts[1].endswith("/results/junit.xml")
+
+
+@pytest.mark.parametrize("env", ["ARTIFACTORY_BASE_URL", "ARTIFACTORY_V2_RESULTS_REPO",
+                                 "ARTIFACTORY_V2_RESULTS_ROOT"])  # fmt: skip
+def test_upload_needs_its_location_settings(tmp_path, art, capsys, monkeypatch, env):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv(env, raising=False)
+    flags = {"ARTIFACTORY_BASE_URL": "--base-url", "ARTIFACTORY_V2_RESULTS_REPO": "--repo",
+             "ARTIFACTORY_V2_RESULTS_ROOT": "--root"}  # fmt: skip
+    argv = ["results", "--upload", str(path)]
+    argv += [
+        a
+        for k, f in flags.items()
+        if k != env
+        for a in (f, art.base if f == "--base-url" else "repo")
+    ]
+    capsys.readouterr()
+    assert cli(argv) == offline.FAILED
+    assert f"${env}" in json.loads(capsys.readouterr().out.splitlines()[-1])["reason"]
+
+
+def test_the_location_comes_from_the_environment_or_flags(
+    tmp_path, art, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", art.base)
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_REPO", "repo")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "env-root/{arch}")
+    capsys.readouterr()
+    assert cli(["results", "--upload", str(path)]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/env-root/s390x/inbox/{AID}/"
+    )
+    assert cli(["results", "--upload", str(path), "--root", "flag-root/{arch}"]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/flag-root/s390x/inbox/{AID}/"
+    )
+
+
+def test_validate_only_shows_a_placeholder_when_no_root_is_set(
+    tmp_path, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv("ARTIFACTORY_V2_RESULTS_ROOT")
+    capsys.readouterr()
+    assert cli(["results", "--from-bundle", str(path), "--validate-only"]) == 0
+    got = json.loads(capsys.readouterr().out)["upload_path"]
+    assert got.startswith("<ARTIFACTORY_V2_RESULTS_ROOT>/inbox/")
 
 
 def test_upload_without_a_token_fails_clearly(tmp_path, art, capsys, monkeypatch):
