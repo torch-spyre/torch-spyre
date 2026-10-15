@@ -217,37 +217,46 @@ Logger::LogStream::LogStream(const std::string& component, LogLevel level,
     : component_(component), level_(level), enabled_(enabled) {}
 
 Logger::LogStream::~LogStream() {
-  if (enabled_ && !stream_.str().empty()) {
-    auto now = std::time(nullptr);
-    std::tm tm_buf;              // stack-local buffer, one per thread
-    localtime_r(&now, &tm_buf);  // thread-safe version
-    char time_buf[32];
-    std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S",
-                  &tm_buf);  // use our local buffer
+  // The body below does heap-allocating std::string work that can throw
+  // (bad_alloc, length_error); ~LogStream() is implicitly noexcept, so an
+  // escaping exception would call std::terminate over what is, at worst,
+  // one dropped log record. Catch everything and drop the record instead.
+  try {
+    if (enabled_ && !stream_.str().empty()) {
+      auto now = std::time(nullptr);
+      std::tm tm_buf;              // stack-local buffer, one per thread
+      localtime_r(&now, &tm_buf);  // thread-safe version
+      char time_buf[32];
+      std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S",
+                    &tm_buf);  // use our local buffer
 
-    // Assemble into a local string so concurrent threads cannot interleave
-    // within a single log record.
-    std::string msg = stream_.str();
-    std::string record;
-    record.reserve(64 + msg.size());
-    record += '[';
-    record += log_level_to_string(level_);
-    record += "] [";
-    record += component_;
-    record += "] ";
-    record += time_buf;
-    record += ' ';
-    record += msg;
-    record += '\n';
+      // Assemble into a local string so concurrent threads cannot interleave
+      // within a single log record.
+      std::string msg = stream_.str();
+      std::string record;
+      record.reserve(64 + msg.size());
+      record += '[';
+      record += log_level_to_string(level_);
+      record += "] [";
+      record += component_;
+      record += "] ";
+      record += time_buf;
+      record += ' ';
+      record += msg;
+      record += '\n';
 
-    // Single write to the configured sink (respects SPYRE_LOG_FILE).
-    // Concurrent calls from multiple threads are safe on POSIX/Linux:
-    // std::cerr (sync_with_stdio default) and ofstream both delegate to
-    // FILE* whose fwrite() is internally serialized via flockfile().
-    // The C++ standard alone does not guarantee this — do not port to a
-    // platform without POSIX FILE* thread-safety without adding a mutex.
-    auto& out = LoggingConfig::instance().sink();
-    out.write(record.data(), static_cast<std::streamsize>(record.size()));
+      // Single write to the configured sink (respects SPYRE_LOG_FILE).
+      // Concurrent calls from multiple threads are safe on POSIX/Linux:
+      // std::cerr (sync_with_stdio default) and ofstream both delegate to
+      // FILE* whose fwrite() is internally serialized via flockfile().
+      // The C++ standard alone does not guarantee this — do not port to a
+      // platform without POSIX FILE* thread-safety without adding a mutex.
+      auto& out = LoggingConfig::instance().sink();
+      out.write(record.data(), static_cast<std::streamsize>(record.size()));
+    }
+  }
+  catch (...) {
+    // Best-effort logging: never propagate out of a destructor.
   }
 }
 
