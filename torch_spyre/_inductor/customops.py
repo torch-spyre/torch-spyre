@@ -850,6 +850,34 @@ def _(input: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
+@torch.library.custom_op("spyre::i16tofp32", mutates_args=(), device_types="spyre")
+def i16tofp32(input: torch.Tensor) -> torch.Tensor:
+    """
+    Both halfwords of every 32-bit lane, as unsigned fp32 (Path A spike).
+
+    One 64-element int16 stick maps to two consecutive 32-element fp32 sticks:
+    [lo of the stick (input elements 0,2,4,...), hi of the stick (1,3,5,...)],
+    each value read as an unsigned 16-bit number (0..65535). Output sticks
+    interleave: [lo0, hi0, lo1, hi1, ...]. The output has the input's shape;
+    the last dimension must be a multiple of 64.
+
+    Maps to: deeptools I16TOFP32 operation (max_unroll_factor=2)
+    """
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    x = input.cpu().to(torch.int32) & 0xFFFF
+    x = x.reshape(*input.shape[:-1], -1, 32, 2)  # (..., sticks, lane, half)
+    out = x.permute(*range(x.dim() - 3), -3, -1, -2)  # (..., sticks, half, lane)
+    return out.reshape(input.shape).to(torch.float32).to(input.device)
+
+
+@i16tofp32.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    return torch.empty(input.shape, dtype=torch.float32, device=input.device)
+
+
 
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
 # four-step pipeline; the only difference is the final format-conversion kernel:

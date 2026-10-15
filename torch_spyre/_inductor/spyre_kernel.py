@@ -21,7 +21,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.codegen.common import (
@@ -43,6 +43,7 @@ from .constants import (
     SPYRE_INT16_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
+    I16TOFP32_OP,
     IDENTITY_OP,
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
@@ -349,6 +350,10 @@ class SpyreOpFuncs:
     @staticmethod
     def qfp8ch(x):
         return PointwiseOp("qfp8ch", [x])
+
+    @staticmethod
+    def i16tofp32(x):
+        return PointwiseOp(I16TOFP32_OP, [x])
 
     @staticmethod
     def qfp8wt(x):
@@ -837,6 +842,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         name: str,
         tensor: TensorAccess,
         opspec_name: "str | None" = None,
+        override_device_layout: "SpyreTensorLayout | None" = None,
     ) -> TensorArg:
         current_node = self.current_node
         if current_node is None or current_node.node is None:
@@ -907,8 +913,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         base_index = per_trip_index(operation, tensor.index)
+        eff_device_layout = (
+            override_device_layout
+            if override_device_layout is not None
+            else tensor.layout.device_layout
+        )
         device_coords = alignment_coordinates(
-            tensor.layout.device_layout,
+            eff_device_layout,
             base_index,
             it_space,
             self.indirect_sizes,
@@ -916,18 +927,18 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         work_division = work_division_from_view(
             tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
-            tensor.layout.device_layout.device_size,
+            eff_device_layout.device_size,
             device_coords,
             it_space,
         )
         tensor_arg = TensorArg(
             is_input,
             -1,
-            tensor.layout.device_layout.device_dtype,
-            tensor.layout.device_layout.device_size,
+            eff_device_layout.device_dtype,
+            eff_device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            element_arrangement=tensor.layout.device_layout.element_arrangement,
+            element_arrangement=eff_device_layout.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
@@ -1012,6 +1023,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
                 or (
                     op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16
+                )
+                or (
+                    op == I16TOFP32_OP
+                    and arg.device_dtype == DataFormats.IEEE_FP32
                 )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
@@ -1316,7 +1331,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                     args.append(idx_arg)
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    args.append(self.create_tensor_arg(True, input.name, input))
+                    args.append(
+                        self.create_tensor_arg(
+                            True,
+                            input.name,
+                            input,
+                        )
+                    )
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
