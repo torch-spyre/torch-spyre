@@ -22,7 +22,11 @@ from torch.testing._internal.common_utils import (
     run_tests,
     subtest,
 )
+import os
+import subprocess
+import sys
 import warnings
+from torch_spyre.ops.eager import RetileWarning
 from torch_spyre.ops.fallbacks import FallbackWarning
 
 
@@ -138,6 +142,26 @@ class TestFallbacks(TestCase):
 
             self._assert_close(op, output_spyre.cpu(), output_cpu)
             self.assertEqual(id(buffer_spyre), id(output_spyre))
+
+
+class TestWarningTypes(TestCase):
+    def test_importable_without_backend_autoload(self):
+        # xdist's controller rebuilds each worker warning by importing its class's module.
+        env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+        for category in (FallbackWarning, RetileWarning):
+            script = (
+                "import importlib; "
+                f"getattr(importlib.import_module({category.__module__!r}), "
+                f"{category.__name__!r})"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                env=env,
+                timeout=130,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"{category.__name__}:\n{proc.stderr}")
 
 
 if __name__ == "__main__":

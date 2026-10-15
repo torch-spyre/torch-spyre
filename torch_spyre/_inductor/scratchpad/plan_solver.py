@@ -411,7 +411,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         core_divs = self.core_divisions
 
         def unique(args):
-            d = {arg: None for arg in args}
+            d = dict.fromkeys(args)
             return list(d)
 
         keys = unique(itertools.chain.from_iterable(cd.splits for cd in core_divs))

@@ -881,7 +881,7 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp == 0.25:
+            if expr.exp.is_Number and math.isclose(expr.exp, 0.25):
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
                 # pinned to return 1 at x=1, generated using tools/approximate-power.py.
                 # since we check that the base is a _split_ symbol, it is an integer in the
@@ -1344,9 +1344,9 @@ class _SympyExprToCpSat(Printer):
             lb, ub = _SympyExprToCpSat._affine_bounds(expr.expression)
             c, o = int(expr.coefficient), int(expr.offset)
             lb, ub = (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
-        elif hasattr(expr, "num_exprs"):
-            # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to a
-            # single offset + per-var coefficients and bound each term.
+        elif isinstance(expr, cp_model.LinearExpr):
+            # Flatten sums and folded constants (e.g. ``0 * is_lx``) to an
+            # offset + per-var coefficients and bound each term.
             flat = cp_model.FlatIntExpr(expr)
             lb = ub = int(flat.offset)
             for var, c in zip(flat.vars, flat.coeffs):
