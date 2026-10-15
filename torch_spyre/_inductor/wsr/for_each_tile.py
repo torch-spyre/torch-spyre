@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
-from torch.utils._pytree import tree_leaves, tree_map
+from torch.utils._pytree import keystr, tree_leaves, tree_map_with_path
 
 __all__ = ["Gather", "for_each_tile"]
 
@@ -303,7 +303,8 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     `num_tiles * extent`. For dim == 0 this is a view, (4, 2, 6) -> (8, 6) on the same
     storage, since the flatten merges two contiguous leading axes. For dim != 0 the
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
-    output ((3, 8, 2) -> (8, 6)); Phase 7 removes that by writing tile i in place.
+    output ((3, 8, 2) -> (8, 6)). Avoiding this copy requires destination-aware
+    lowering that writes tile i into its final slice, separately for each output leaf.
     """
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
@@ -428,7 +429,16 @@ def for_each_tile(
     if out_dim is None:
         return (None if map_mode else final_carry), None
 
-    out = tree_map(
-        lambda y: _stacked_to_full(y, utils.canonicalize_dim(y.ndim - 1, out_dim)), ys
-    )
+    def stack_output(path, y):
+        rank = y.ndim - 1  # scan adds the leading step axis.
+        try:
+            dim = utils.canonicalize_dim(rank, out_dim, wrap_scalar=False)
+        except IndexError as exc:
+            raise IndexError(
+                f"for_each_tile() out_dim={out_dim} is invalid for output"
+                f"{keystr(path)} with tile rank {rank}: {exc}"
+            ) from exc
+        return _stacked_to_full(y, dim)
+
+    out = tree_map_with_path(stack_output, ys)
     return (None if map_mode else final_carry), out

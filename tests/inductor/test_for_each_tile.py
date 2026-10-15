@@ -677,6 +677,87 @@ class TestForEachTileLowering(unittest.TestCase):
                         )
                 self.assertEqual(len(graphs), 1)
 
+    def test_pytree_outputs_with_carry(self):
+        """A carry and nested outputs retain traversal and per-leaf axis semantics."""
+        for axis, reverse in itertools.product((0, 1, -1), (False, True)):
+            with self.subTest(axis=axis, reverse=reverse):
+
+                def kernel(x, init):
+                    def body(carry, tiles):
+                        (tile,) = tiles
+                        return carry + tile.sum(), {
+                            "values": [tile + carry, (tile.unsqueeze(0) - carry,)]
+                        }
+
+                    return for_each_tile(
+                        body,
+                        (x,),
+                        dims=0,
+                        tile_size=2,
+                        init=init,
+                        out_dim=axis,
+                        reverse=reverse,
+                    )
+
+                x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+                init = torch.tensor(7.0)
+                blocks = x.reshape(3, 2, 4)
+                totals = blocks.sum(dim=(1, 2))
+                inclusive = (
+                    totals.flip(0).cumsum(0).flip(0) if reverse else totals.cumsum(0)
+                )
+                offsets = (init + inclusive - totals).reshape(3, 1, 1)
+                expected = {
+                    "values": [
+                        torch.cat((blocks + offsets).unbind(0), dim=axis),
+                        (
+                            torch.cat(
+                                (blocks - offsets).unsqueeze(1).unbind(0), dim=axis
+                            ),
+                        ),
+                    ]
+                }
+                torch._dynamo.reset()
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    for fn in (
+                        kernel,
+                        torch.compile(kernel, backend="inductor", fullgraph=True),
+                    ):
+                        final, out = fn(x, init)
+                        torch.testing.assert_close(final, init + x.sum())
+                        torch.testing.assert_close(out, expected)
+                torch.testing.assert_close(init, torch.tensor(7.0))
+
+    def test_pytree_output_dim_error_identifies_leaf(self):
+        for axis, scalar in ((1, False), (-2, False), (0, True)):
+            with self.subTest(axis=axis, scalar=scalar):
+
+                def body(_, tiles):
+                    (tile,) = tiles
+                    stats = tile.sum() if scalar else tile.sum(dim=0)
+                    return None, (tile + 1, {"stats": [stats]})
+
+                rank = 0 if scalar else 1
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                    self.assertRaisesRegex(
+                        IndexError,
+                        rf"out_dim={axis} is invalid for output\[1\]\['stats'\]\[0\]"
+                        rf" with tile rank {rank}",
+                    ),
+                ):
+                    for_each_tile(
+                        body,
+                        (torch.ones(6, 4),),
+                        dims=0,
+                        tile_size=2,
+                        out_dim=axis,
+                    )
+
     def test_split_k(self):
         """C: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.
 

@@ -120,7 +120,10 @@ Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
 Output leaves may have different ranks; `out_dim` is normalized separately for
-each leaf.
+each leaf and must name an existing axis in every output tile. Scalar output
+tiles have no axis to concatenate; return a length-one tensor instead.
+As with `scan`, output leaves must not alias inputs or one another: returning
+`(y, y)` for a computed tile `y` is invalid; use `(y, y.clone())` instead.
 
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
