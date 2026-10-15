@@ -73,6 +73,46 @@ class TestLaunchJobPlan(TestCase):
     def test_mul_matches_cpu(self):
         _run_compiled_op("mul")
 
+    def test_program_corrections_on_repeated_launches(self):
+        """Corrections survive queued launches; VF uploads travel with compute."""
+        torch._dynamo.reset()
+        torch.manual_seed(42)
+
+        def fn(x, y):
+            return torch.softmax(x * y + x, dim=-1)
+
+        compiled = torch.compile(fn, backend="inductor")
+        inputs = [
+            (
+                torch.randn(64, 128, dtype=torch.float16),
+                torch.randn(64, 128, dtype=torch.float16),
+            )
+            for _ in range(3)
+        ]
+        device_inputs = [tuple(t.to("spyre") for t in pair) for pair in inputs]
+        compiled(*device_inputs[0])
+        torch.spyre.synchronize()
+
+        # Exclude compilation and input uploads so H2D scopes here would be
+        # standalone program-correction uploads. Keep multiple launches live
+        # to exercise ownership of each launch's correction buffers.
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+            outputs = [compiled(*pair) for pair in device_inputs]
+            torch.spyre.synchronize()
+
+        for output, pair in zip(outputs, inputs):
+            torch.testing.assert_close(output.cpu(), fn(*pair), atol=0.01, rtol=0.1)
+
+        names = {event.name for event in prof.events()}
+        self.assertIn("launch::HostCompute", names)
+        self.assertIn("launch::Compute", names)
+        if os.environ.get("FLEX_DEVICE") == "VF":
+            self.assertNotIn("launch::H2D", names)
+        elif os.environ.get("FLEX_DEVICE") == "PF":
+            self.assertIn("launch::H2D", names)
+
     def test_invalid_hcm_metadata_surfaces_on_synchronize(self):
         """Host callback failures should surface as RuntimeError on stream synchronize."""
         with tempfile.TemporaryDirectory() as tmpdir:
