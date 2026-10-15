@@ -50,6 +50,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    adding_operations
    indirect_access
    indirect_access_work_division
+   element_arrangement
 
 .. toctree::
    :maxdepth: 2
@@ -59,6 +60,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    coarse_tiling_loops
    marker_resolution
    layout_optimization
+   ea_shuffle
    cost_model
    restickify_cost_model
    span_overflow_hint_analysis

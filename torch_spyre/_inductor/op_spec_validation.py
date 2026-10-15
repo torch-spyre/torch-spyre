@@ -102,7 +102,7 @@ REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS | {constants.KEEP_BY_INDEX_
 
 DTYPE_OPS = DtypeOpTable.op_names()
 
-SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
+SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP, constants.SHUFFLE_OP})
 
 BINARY_OPS = frozenset(
     {

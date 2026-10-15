@@ -708,6 +708,43 @@ def _single_arg_op_layout(
                 )
             ]
 
+        case spyreop.shuffle.default:
+            # Element-arrangement shuffle: same dtype and shape, same device
+            # layout geometry, but with a different ElementArrangement on the
+            # output (deeptools PR #4651). The four cases are:
+            #   1. fp32 DL16_TO_FP32 → fp32 STANDARD  (undo upcast stagger)
+            #   2. fp16 FP32_TO_DL16 → fp16 STANDARD  (undo downcast stagger)
+            #   3. fp32 STANDARD → fp32 FP32_TO_DL16  (apply downcast stagger)
+            #   4. fp16 STANDARD → fp16 DL16_TO_FP32  (apply upcast stagger)
+            #
+            # Read dst_arrangement from the stashed attribute on the buffer
+            # (set by lower_spyre_ea_shuffle).  Convert the int back to the
+            # ElementArrangement enum.
+            dst_ea_int = getattr(data, "ea_shuffle_dst_arrangement", None)
+            if dst_ea_int is None:
+                # Attribute may have been set one level up on the ComputedBuffer
+                # rather than on data (Loops); try the ComputedBuffer path.
+                dst_ea_int = getattr(op, "ea_shuffle_dst_arrangement", None)
+            if dst_ea_int is None:
+                raise Unsupported(
+                    "ea_shuffle: missing ea_shuffle_dst_arrangement on buffer"
+                )
+            dst_ea = next(
+                ea
+                for ea in ElementArrangement.__members__.values()
+                if ea.value == dst_ea_int
+            )
+            # Preserve the full device geometry (device_size, stride_map) and
+            # only change the element_arrangement tag.
+            out_stl = SpyreTensorLayout(
+                stl.device_size,
+                stl.stride_map,
+                stl.device_dtype,
+                dst_ea,
+            )
+            op.restick_cost_fn = AnyInNode.from_args()
+            return [out_stl]
+
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
