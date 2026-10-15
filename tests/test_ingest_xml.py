@@ -548,6 +548,174 @@ def test_quality_columns_are_omitted_when_absent(ingest):
     assert len(rows[0]) == len(columns)
 
 
+BACKFILL_RUN_SCHEMA = {
+    "benchmark_runs": list(FULL_RUN_SCHEMA["benchmark_runs"])
+    + [
+        "is_backfill",
+        "historical_measurement_timestamp",
+        "replay_timestamp",
+    ],
+}
+
+
+def test_parse_historical_measurement_rejects_unpadded(ingest):
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ingest.parse_historical_measurement("2026-9-6")
+
+
+def test_parse_historical_measurement_utc_midnight(ingest):
+    dt = ingest.parse_historical_measurement("2026-09-16")
+    assert dt == datetime(2026, 9, 16, tzinfo=UTC)
+
+
+def test_parse_replay_timestamp_rejects_date_only(ingest):
+    # fromisoformat would accept this as midnight — must refuse.
+    with pytest.raises(ValueError, match="time component"):
+        ingest.parse_replay_timestamp("2026-10-07")
+
+
+def test_parse_replay_timestamp_accepts_iso_with_time(ingest):
+    dt = ingest.parse_replay_timestamp("2026-10-07T15:30:00Z")
+    assert dt == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    dt_space = ingest.parse_replay_timestamp("2026-10-07 15:30:00")
+    assert dt_space == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+
+
+def test_build_backfill_meta_rejects_before_any_xml(ingest):
+    # main() calls this before connect / file loop — invalid CLI must raise here.
+    with pytest.raises(ValueError, match="time component"):
+        ingest.build_backfill_meta(
+            is_backfill=True,
+            historical_measurement="2026-09-16",
+            replay_timestamp="2026-10-07",
+        )
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ingest.build_backfill_meta(
+            is_backfill=True,
+            historical_measurement="2026-9-6",
+            replay_timestamp="2026-10-07T15:30:00Z",
+        )
+
+
+def test_build_backfill_meta_forward_empty(ingest):
+    assert ingest.build_backfill_meta() == {}
+    # Explicit None is omitted (same as not passing the flags).
+    assert (
+        ingest.build_backfill_meta(historical_measurement=None, replay_timestamp=None)
+        == {}
+    )
+
+
+def test_build_backfill_meta_rejects_supplied_blank(ingest):
+    # Blank must not look like "omitted" — that would ingest as forward and
+    # source_file-dedup a corrected retry.
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(historical_measurement=" ")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(historical_measurement="")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(replay_timestamp="\t")
+    with pytest.raises(ValueError, match="supplied blank"):
+        ingest.build_backfill_meta(is_backfill=True, replay_timestamp="   ")
+
+
+def test_apply_backfill_args_sets_scalars_without_touching_created_at(ingest):
+    created = datetime(2026, 10, 7, 12, 0, 0, tzinfo=UTC)
+    run_meta = {"source_file": "report.xml", "created_at": created}
+    ingest.apply_backfill_args(
+        run_meta,
+        is_backfill=True,
+        historical_measurement="2026-09-16",
+        replay_timestamp="2026-10-07T15:30:00Z",
+    )
+    assert run_meta["is_backfill"] == 1
+    assert run_meta["historical_measurement_timestamp"] == datetime(
+        2026, 9, 16, tzinfo=UTC
+    )
+    assert run_meta["replay_timestamp"] == datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    # Rafael: created_at is never the historical-day signal.
+    assert run_meta["created_at"] == created
+    assert run_meta["created_at"] != run_meta["historical_measurement_timestamp"]
+
+
+def test_apply_backfill_args_noop_on_forward(ingest):
+    run_meta = {"source_file": "report.xml", "created_at": datetime.now(UTC)}
+    ingest.apply_backfill_args(run_meta)
+    assert "is_backfill" not in run_meta
+    assert "historical_measurement_timestamp" not in run_meta
+    assert "replay_timestamp" not in run_meta
+
+
+def test_backfill_columns_stored_when_present(ingest):
+    client = FakeClient(dict(BACKFILL_RUN_SCHEMA))
+    created = datetime(2026, 10, 7, 12, 0, 0, tzinfo=UTC)
+    hist = datetime(2026, 9, 16, tzinfo=UTC)
+    replay = datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC)
+    ingest.insert_benchmark_run(
+        client,
+        1,
+        {
+            "source_file": "report.xml",
+            "created_at": created,
+            "version_info": json.dumps(FULL_PROVENANCE),
+            "is_backfill": 1,
+            "historical_measurement_timestamp": hist,
+            "replay_timestamp": replay,
+        },
+    )
+    _, rows, columns = client.inserts[0]
+    assert "is_backfill" in columns
+    assert "historical_measurement_timestamp" in columns
+    assert "replay_timestamp" in columns
+    assert rows[0][columns.index("is_backfill")] == 1
+    assert rows[0][columns.index("historical_measurement_timestamp")] == hist.replace(
+        tzinfo=None
+    )
+    assert rows[0][columns.index("replay_timestamp")] == replay.replace(tzinfo=None)
+    assert rows[0][columns.index("created_at")] == created.replace(tzinfo=None)
+    assert (
+        rows[0][columns.index("created_at")]
+        != rows[0][columns.index("historical_measurement_timestamp")]
+    )
+
+
+def test_backfill_refuses_insert_when_schema_absent(ingest):
+    # Soft-dropping then inserting would source_file-dedup a post-migration retry.
+    client = FakeClient(dict(FULL_RUN_SCHEMA))
+    with pytest.raises(ingest.BackfillSchemaIncomplete, match="dashboard migration"):
+        ingest.insert_benchmark_run(
+            client,
+            1,
+            {
+                "source_file": "report.xml",
+                "created_at": datetime.now(UTC),
+                "version_info": json.dumps(FULL_PROVENANCE),
+                "is_backfill": 1,
+                "historical_measurement_timestamp": datetime(2026, 9, 16, tzinfo=UTC),
+                "replay_timestamp": datetime(2026, 10, 7, 15, 30, 0, tzinfo=UTC),
+            },
+        )
+    assert client.inserts == []
+
+
+def test_forward_insert_omits_backfill_keys(ingest):
+    client = FakeClient(dict(BACKFILL_RUN_SCHEMA))
+    ingest.insert_benchmark_run(
+        client,
+        1,
+        {
+            "source_file": "report.xml",
+            "created_at": datetime.now(UTC),
+            "version_info": json.dumps(FULL_PROVENANCE),
+        },
+    )
+    _, rows, columns = client.inserts[0]
+    assert "is_backfill" not in columns
+    assert "historical_measurement_timestamp" not in columns
+    assert "replay_timestamp" not in columns
+    assert len(rows[0]) == len(columns)
+
+
 def test_success_full_provenance_inserts_benchmark_rows(ingest, monkeypatch, tmp_path):
     xml = _write_suite(
         tmp_path,

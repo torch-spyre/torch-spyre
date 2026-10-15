@@ -590,6 +590,7 @@ class PipelineRuns(Table):
         "repo",
         "pr_number",
         "sha",
+        "test_with",
         "component",
         "arches",
         "result",
