@@ -87,7 +87,7 @@ python -m spyre_clickhouse_ingest artifacts ensure --artifact image:icr.io/<repo
 # 3. An identity the caller already knows: no registry call, never rebound to another id.
 python -m spyre_clickhouse_ingest artifacts ensure \
   --artifact 'rpm:ibm-flex-*.<id12>.*.x86_64;component=flex;name=ibm-flex;id12=<id12>' --arch x86_64 \
-  --source ai-chip-toolchain/flex@main@<sha> --identity-dep base=<sha256> --prop k=v \
+  --source example-org/flex@main@<sha> --identity-dep base=<sha256> --prop k=v \
   --tag rc1 --tag-prop k=v --run-url "$BUILD_URL" --lookup off --registry off --dry-run
 ```
 

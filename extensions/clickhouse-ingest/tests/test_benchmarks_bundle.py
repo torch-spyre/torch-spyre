@@ -152,7 +152,7 @@ def test_sweeps_at_two_concurrencies_are_two_benchmarks():
 
 
 ZAI = (
-    "icr.io/zai_pytorch/v0.1.0_4q26/test_spyre-0.5.0_cp-3.12_ubi-10.2@sha256:"
+    "icr.io/example_pytorch/v0.1.0_4q26/test_spyre-0.5.0_cp-3.12_ubi-10.2@sha256:"
     + "ab" * 32
 )
 

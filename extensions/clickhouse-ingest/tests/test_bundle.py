@@ -34,7 +34,7 @@ from spyre_clickhouse_ingest.junit import RunCoordinates
 
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
 OTHER = "0" * 8 + AID[8:]
-IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
+IMAGE = "icr.io/example/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
 JUNIT = """<?xml version="1.0"?><testsuites><testsuite name="s" tests="2"
  timestamp="2026-10-08T10:00:00+00:00"><testcase classname="a.b" name="test_x" time="1"/>
  <testcase classname="a.b" name="test_y" time="1"><failure message="boom"/></testcase>

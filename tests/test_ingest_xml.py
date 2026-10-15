@@ -913,7 +913,7 @@ def test_an_icr_image_with_no_registry_credentials_still_gets_its_verdict(
     monkeypatch.setattr(Registry, "from_env", lambda: Unauthorized())
     c = _ArtifactClient()
     legs = {(_RUN_ID, "fvt"): {"failed": 0, "total": 4, "duration_s": 3.0}}
-    image = "icr.io/ai_sw_accel/2.0/prod/hf-adapters-devel@sha256:" + "ab" * 32
+    image = "icr.io/example/2.0/prod/hf-adapters-devel@sha256:" + "ab" * 32
     args = _args(artifact_id="", artifact=f"image:{image}", arch="s390x",
                  jenkins_run_key="job#1", run_url="https://ci.example.com/job/1/")  # fmt: skip
     ingest._write_artifact_verdicts(c, "db", args, legs)
