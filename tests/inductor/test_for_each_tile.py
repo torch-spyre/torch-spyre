@@ -127,6 +127,7 @@ def post_grad_graphs():
     `post_grad_custom_post_pass` fires BEFORE that decomposition, so a custom pass
     cannot see the while_loop; wrapping the decomposition itself can.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -139,7 +140,9 @@ def post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 
@@ -549,11 +552,6 @@ class TestForEachTileLowering(unittest.TestCase):
             compiled = torch.compile(fn, backend="inductor", fullgraph=True)
             out, code = run_and_get_code(compiled, *args)
 
-        # No `fresh_cache()` needed, unlike its neighbours in this suite: inductor
-        # bypasses the FX graph cache outright for a graph holding a `scan` HOP, which
-        # every case here has by construction, so a warm cache can never skip the
-        # post-grad pass the capture above hooks. Asserted rather than assumed -- if
-        # that ever changes, this says so instead of an IndexError on `graphs[-1]`.
         self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
 
         # The decomposition runs bottom-up, one module at a time, so the graph captured

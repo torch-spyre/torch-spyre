@@ -1299,6 +1299,7 @@ def _post_grad_graphs():
     so this monkey-patches the (now permanent, #4136-landed) decomposition
     function for the duration of one compile.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -1311,7 +1312,9 @@ def _post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 
