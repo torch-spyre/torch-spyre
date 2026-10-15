@@ -34,8 +34,11 @@ CAPABILITY_TYPE_VALUES = frozenset(
 SUITE_STAGE_VALUES = frozenset(
     {"fvt", "fvt-static", "fvt-dynamic", "svt", "svt-static", "svt-dynamic"}
 )
+# quality: accuracy evals (lm-eval tasks, MTEB, RAG), benchmark rows apart from perf's gates.
 TEST_TYPE_VALUES = (
-    frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+    frozenset(
+        {"smoke", "unit", "integration", "regression", "trunk", "perf", "quality"}
+    )
     | SUITE_STAGE_VALUES
     | CAPABILITY_TYPE_VALUES
 )

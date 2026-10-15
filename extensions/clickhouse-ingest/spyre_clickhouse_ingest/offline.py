@@ -33,6 +33,7 @@ import contextlib
 import getpass
 import hashlib
 import json
+import math
 import netrc
 import os
 import platform
@@ -56,11 +57,20 @@ FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
 MANUAL_PREFIX = "manual:"
 # kind -> the extension of its results/ files.
-KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt"}
+KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt", "benchmarks": ".json"}
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
+# A benchmarks bundle's tiers: perf numbers, or accuracy evals.
+BENCHMARK_TEST_TYPES = ("perf", "quality")
 VLLM_COMPONENT = "spyre-inference"
-RUN_MODES = ("latency", "throughput", "serve")
+# serving: a concurrency sweep (serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>).
+RUN_MODES = ("latency", "throughput", "serve", "serving")
+# Name token prefix -> identity key, as vllm.parse_input_shapes reads it; the last four only
+# in sweep names, so they key a benchmark only there.
+SHAPE_PREFIXES = (
+    ("tp", "tensor_parallel"), ("in", "input_len"), ("out", "output_len"),
+    ("c", "concurrency"), ("n", "num_prompts"), ("len", "max_model_len"), ("seqs", "max_num_seqs"),
+)  # fmt: skip
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
 VLLM_SIGNATURES = (
     "avg_latency", "requests_per_second", "tokens_per_second", "request_throughput",
@@ -69,7 +79,7 @@ VLLM_SIGNATURES = (
 ARTIFACT_KEYS = ("artifact_id", "image", "artifact")
 BASE_URL = "https://na.artifactory.swg-devops.com/artifactory"
 REPO = "sys-ai-sw-accel-team-cos-dev-generic-local"
-ROOT = "zsp/next/{arch}/v2-results"
+ROOT = "next/{arch}/v2-results"
 WAIT_MINUTES = 40
 POLL_SECONDS = 30
 
@@ -250,14 +260,11 @@ def read_records(path: Path) -> list:
 
 
 def shapes(name: str) -> dict:
-    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len}, as the ingest reads them."""
+    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len} (and a sweep's c/n/len/seqs),
+    as the ingest reads them."""
     out = {}
     for token in name.split("_"):
-        for prefix, key in (
-            ("tp", "tensor_parallel"),
-            ("in", "input_len"),
-            ("out", "output_len"),
-        ):
+        for prefix, key in SHAPE_PREFIXES:
             rest = token[len(prefix) :]
             if token.startswith(prefix) and rest.isdigit():
                 out[key] = rest
@@ -282,6 +289,76 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
         clash = [k for k in got if perf.get(k, got[k]) != got[k]]
         if clash:
             raise BundleError(f"{p}: its name's {clash} differ from perf {clash}")
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def benchmark_entries(path: Path) -> list:
+    """A benchmarks results file's rows, each checked; raises BundleError on the first bad one."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise BundleError(f"{path.name}: not JSON: {err}") from None
+    rows = data.get("benchmarks") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise BundleError(f'{path.name}: needs a non-empty "benchmarks" list')
+    for i, b in enumerate(rows):
+        where = f"{path.name} benchmarks[{i}]"
+        if (
+            not isinstance(b, dict)
+            or not isinstance(b.get("name"), str)
+            or not b["name"].strip()
+        ):
+            raise BundleError(f"{where}: needs a name")
+        unknown = set(b) - {
+            "name",
+            "props",
+            "backend",
+            "measurements",
+            "iterations",
+            "run_props",
+            "tags",
+        }
+        if unknown:
+            raise BundleError(f"{where}: unknown key(s) {sorted(unknown)}")
+        for key in ("props", "run_props"):
+            m = b.get(key, {})
+            if not isinstance(m, dict) or not all(
+                isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                for v in m.values()
+            ):
+                raise BundleError(f"{where}: {key} maps names to strings or numbers")
+        m = b.get("measurements")
+        if not isinstance(m, dict) or not m:
+            raise BundleError(f"{where}: needs measurements")
+        for k, v in m.items():
+            values = v if isinstance(v, list) else [v]
+            if not values or not all(_finite(x) for x in values):
+                raise BundleError(
+                    f"{where}: measurements[{k!r}] must be finite numbers"
+                )
+        if not isinstance(b.get("backend", ""), str) or not isinstance(
+            b.get("tags", []), list
+        ):
+            raise BundleError(f"{where}: backend is a string and tags a list")
+        n = b.get("iterations", 0)
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise BundleError(f"{where}: iterations is a count")
+    return rows
+
+
+def check_benchmarks(root: Path, meta: dict, results: list) -> None:
+    """Each results/*.json is a list of generic benchmark rows, for a perf or quality tier."""
+    if meta["test_type"] not in BENCHMARK_TEST_TYPES:
+        raise BundleError(
+            f"a benchmarks bundle is test_type {' or '.join(BENCHMARK_TEST_TYPES)}"
+        )
+    if not meta.get("component"):
+        raise BundleError("a benchmarks bundle names its component (the suite's owner)")
+    for p in results:
+        benchmark_entries(root / p)
 
 
 def check_sendnn(root: Path, meta: dict, results: list) -> None:
@@ -327,6 +404,10 @@ def check(root: Path) -> dict:
         raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
+    if meta.get("create_artifact") and not (meta.get("image") and meta.get("arch")):
+        errors.append(
+            "create_artifact records an image: it needs image (by digest) and arch"
+        )
     kind = meta.get("kind", "junit")
     meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
     if not meta["test_type"]:
@@ -382,6 +463,8 @@ def check(root: Path) -> dict:
         check_vllm(root, meta, results)
     elif kind == "sendnn":
         check_sendnn(root, meta, results)
+    elif kind == "benchmarks":
+        check_benchmarks(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -466,7 +549,13 @@ def _arch(value: str) -> str:
 def write(args) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
-    if kind == "sendnn":
+    if getattr(args, "benchmarks_dir", ""):
+        kind = "benchmarks"
+    if kind == "benchmarks":
+        if not args.benchmarks_dir:
+            raise BundleError("--kind benchmarks needs --benchmarks-dir")
+        results, extra = sorted(Path(args.benchmarks_dir).glob("*.json")), []
+    elif kind == "sendnn":
         if not args.sendnn_report:
             raise BundleError("--kind sendnn needs --sendnn-report <report_sendnn.txt>")
         results, extra = [Path(args.sendnn_report)], []
@@ -730,6 +819,11 @@ def add_offline_options(parser) -> None:
         "--sendnn-report",
         default="",
         help="--kind sendnn: the perf suite's report_sendnn.txt",
+    )
+    g.add_argument(
+        "--benchmarks-dir",
+        default="",
+        help='--kind benchmarks: *.json of {"benchmarks": [...]} rows (implies --kind benchmarks)',
     )
     g.add_argument("--perf", action="append", type=_pair, default=[],
                    help="vllm run context k=v: model, tensor_parallel, input_len, output_len, cards, "

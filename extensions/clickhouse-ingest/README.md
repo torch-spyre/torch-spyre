@@ -279,7 +279,7 @@ A folder, or a `.tgz` of one:
 
 ```
 bundle.json        # bundle.schema.json
-results/           # JUnit *.xml, or (kind vllm) vLLM bench *.json, or (kind sendnn) report_sendnn.txt; flat
+results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, or (kind benchmarks) *.json; flat
 attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
 ```
 
@@ -290,6 +290,7 @@ The **minimal** bundle.json is the artifact and the tier, beside at least one re
 {"image": "<repo>@sha256:<digest>", "arch": "s390x", "test_type": "fvt"}
 {"kind": "vllm", "artifact_id": "<uuid>"}
 {"kind": "sendnn", "artifact_id": "<uuid>", "started_at": "2026-10-06T11:56:00Z"}
+{"kind": "benchmarks", "artifact_id": "<uuid>", "test_type": "quality", "component": "spyre-inference"}
 ```
 
 Everything else is optional (`--offline` writes most of it):
@@ -317,7 +318,8 @@ run_key that already has another run's or bundle's results. The verdict's `props
 come from it.
 - `test_name` is `<latency|throughput|serve>_<model>_tp<N>_in<N>_out<N>`, as in spyre-inference's
   `vllm-benchmarks/` configs. The mode and shapes are the benchmark's identity, and must agree
-  with `perf` when it gives them.
+  with `perf` when it gives them. A concurrency sweep, `serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>`,
+  also keys `concurrency`, `num_prompts`, `max_model_len` and `max_num_seqs`.
 - The rows are `benchmarks` + `benchmark_runs` (`report_kind=vllm`) and a `perf` / `performance`
   verdict, `perf.state` (default `passed`).
 - `.cmd`/`.log` files in `--vllm-results-dir` go to `attachments/`.
@@ -328,6 +330,25 @@ torch-spyre; the sendnn column is read). No CI leg runs the sendnn stack, so thi
   same benchmark_id torch-spyre's report.xml gives that op (`sendnn.py`), so the two compare directly.
 - Rows carry `report_kind=perf-suite-sendnn-txt`, `source_file`, `platform` (arch) and `run_utc`
   (from `started_at`), with a `perf` / `performance` verdict on the artifact.
+
+**benchmarks bundles** hold generic benchmark rows, for producers with no runner format of their
+own: accuracy evals (lm-eval tasks, MTEB, RAG) and other harnesses. Each `results/*.json` is
+`{"benchmarks": [{"name", "props", "backend", "measurements", "iterations", "run_props", "tags"}]}`.
+- `name` and every `props` key are the benchmark's identity; `backend` (spyre, cpu, ...) is the
+  axis two runs of one benchmark compare across, unhashed.
+- `measurements` maps a metric to a number or a list of samples; `iterations` is the n behind a
+  pre-averaged number (e.g. an eval's sample count).
+- `test_type` is `perf` or `quality` (accuracy, kept apart from perf gates) and `component` names
+  the suite's owner. Rows carry `report_kind=benchmarks` and `source_file`, with a
+  `performance` verdict on the artifact. Per-sample outputs belong in `attachments/`: the sealed
+  bundle the verdict links (`bundle_url`) keeps them.
+- Accuracy metrics (`exact_match`, `acc_norm`, `ndcg_at_10`, `spearman`, `rouge*`, ...) are
+  higher-is-better in `benchmark_metric_policy`, advisory.
+
+**An image no pipeline of ours built** (a partner's image, say) has no artifact to attach a
+verdict to. `"create_artifact": {"component": "<owner>", "name": "<optional>"}` with `image` (by
+digest) and `arch` records it as an `upstream` artifact keyed by its digest, when neither field
+names a recorded one; `name` defaults to the image repository's last path segment.
 
 ### Air-gapped flow
 
@@ -351,6 +372,9 @@ python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --vllm-re
 python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --kind sendnn \
     --sendnn-report docs/report_sendnn.txt --artifact id:<artifact_id> --arch <arch> \
     --triggered-at <ISO-8601 run time>
+# Generic benchmark rows: an eval harness writes out/*.json as above
+python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --benchmarks-dir out \
+    --artifact id:<artifact_id> --arch <arch> --trigger-type quality --component spyre-inference
 # Connected host
 ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundle.tgz --wait
 ```
@@ -361,7 +385,7 @@ ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundl
 
 ### Uploading by hand
 
-The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/zsp/next/<arch>/v2-results/inbox/<key>/`
+The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/next/<arch>/v2-results/inbox/<key>/`
 on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
 the full path.
 - `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
@@ -377,7 +401,7 @@ after 24 hours is rejected.
 
 ```
 ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
-INBOX=zsp/next/<arch>/v2-results/inbox/<key>
+INBOX=next/<arch>/v2-results/inbox/<key>
 curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
 # a folder, bundle.json last
 (cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
