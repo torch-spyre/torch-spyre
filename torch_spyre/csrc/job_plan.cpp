@@ -113,11 +113,14 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
-  auto* params = flex::createComputeParams(
-      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  std::unique_ptr<flex::ComputeParams, decltype(&flex::destroyComputeParams)>
+      params(
+          flex::createComputeParams(&program_address_, std::move(tensor_allocs),
+                                    name_, bootstrap_offset_),
+          flex::destroyComputeParams);
+  params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(params);
-  flex::destroyComputeParams(params);
+  stream.launchCompute(params.get());
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -184,14 +187,26 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
-  // Create a managed shared_ptr to ensure the host buffer's lifetime is tied to
-  // callback destruction.
+  // Flex RuntimeStream::launchOperation(const HostComputeParams*) resolves
+  // arguments and calls deeptools::processComputeOnHostCommand[Fast] inline
+  // before returning this fully written buffer (Flex #1990,
+  // src/runtime_stream/runtime_stream.cpp). This is not queued work on S_prep:
+  // caller ordering makes the bytes ready before S_dev receives the consuming
+  // ComputeParams, regardless of whether hazard tracking is enabled.
+  // Shared ownership then keeps the bytes alive through upload completion.
   std::shared_ptr<flex::HostComputeBuffer> host_buffer(
       stream.launchHostCompute(params), flex::destroyHostComputeBuffer);
 
   // Enforce that the host buffer correction size matches the expected device
   // allocation size.
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  if (ctx.batch_program_corrections) {
+    ctx.program_corrections.push_back(
+        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
+                                     device_address_.clone_non_owning())});
+    return;
+  }
 
   // Create DmaParams to transfer the host buffer.
   auto* dma_params =

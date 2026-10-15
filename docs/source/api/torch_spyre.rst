@@ -857,6 +857,13 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``0``; set ``1`` to enable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
      - CPUs CP-SAT uses to size its search worker pool (config
        ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When
