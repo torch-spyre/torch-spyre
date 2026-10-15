@@ -17,7 +17,10 @@
  */
 #include "AiuptiActivityProfiler.h"
 
+#include <libaiupti/aiupti_runtime_cbid.h>
+
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -67,8 +70,46 @@ void AiuptiActivityProfilerSession::processTrace(
                                            "__aiu_profiler__");
   traceBuffer_.span.iteration = iterationCount_++;
 
+  // Associations and lane metadata belong to this capture, even if the
+  // session is reused and batch IDs or thread IDs appear again.
+  cpuCorrelationMap_.clear();
+  deviceActivityIds_.clear();
+  launchActivityIds_.clear();
+  threadNames_.clear();
+  resourceInfo_.clear();
+  activeThreadMap_.clear();
   auto aiuBuffer = api_.activityBuffers();
   if (aiuBuffer) {
+    // Records from different queues need not arrive in causal order. Build the
+    // batch -> CPU association before processing any device activities.
+    api_.processActivities(*aiuBuffer, [this](const Pti_Activity* record) {
+      if (record->kind == AIUPTI_ACTIVITY_KIND_THREAD) {
+        const auto* a = reinterpret_cast<const AIUpti_ActivityThread*>(record);
+        threadNames_[{a->process_id, a->thread_id}] =
+            std::string(a->name, strnlen(a->name, sizeof(a->name)));
+      } else if (record->kind == AIUPTI_ACTIVITY_KIND_RUNTIME) {
+        const auto* a = reinterpret_cast<const AIUpti_ActivityAPI*>(record);
+        if (a->calibration_id != 0) return;
+        const bool isSubmit =
+            a->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE;
+        const bool isLaunch =
+            a->cbid >= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB &&
+            a->cbid <= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMO;
+        if (isLaunch) launchActivityIds_.insert(a->correlation_id);
+        // Comms schedule IDs have a different namespace; never use them here.
+        if ((isSubmit || isLaunch) && a->external_id != 0) {
+          cpuCorrelationMap_[a->correlation_id] = a->external_id;
+        }
+      } else if (record->kind == AIUPTI_ACTIVITY_KIND_CMPT) {
+        deviceActivityIds_.insert(
+            reinterpret_cast<const AIUpti_ActivityCompute*>(record)
+                ->correlation_id);
+      } else if (record->kind == AIUPTI_ACTIVITY_KIND_MEMCPY) {
+        deviceActivityIds_.insert(
+            reinterpret_cast<const AIUpti_ActivityMemcpy*>(record)
+                ->correlation_id);
+      }
+    });
     api_.processActivities(
         *aiuBuffer, std::bind(&AiuptiActivityProfilerSession::handlePtiActivity,
                               this, std::placeholders::_1, &logger));
@@ -119,21 +160,20 @@ void AiuptiActivityProfilerSession::recordStream(uint32_t device, uint32_t id) {
   }
 }
 
-void AiuptiActivityProfilerSession::recordThreadStream(uint32_t device,
-                                                       uint32_t id) {
+void AiuptiActivityProfilerSession::recordThreadStream(
+    uint32_t device, uint32_t id, const std::string& name) {
   if (id == device) {
     return;
   }
-  // Right now id is thread counter id, not the actual thread id.
-  // Change in flex will automatically change it to real thread id.
   if (!hasDeviceResource(device, id)) {
     const int64_t sort_index = static_cast<int64_t>(device) + id;
     resourceInfo_.emplace(
         std::make_pair(device, id),
-        libkineto::ResourceInfo{.id = id,
-                                .sortIndex = sort_index,
-                                .deviceId = device,
-                                .name = fmt::format("Thread {}", id)});
+        libkineto::ResourceInfo{
+            .id = id,
+            .sortIndex = sort_index,
+            .deviceId = device,
+            .name = name.empty() ? fmt::format("Thread {}", id) : name});
   }
 }
 

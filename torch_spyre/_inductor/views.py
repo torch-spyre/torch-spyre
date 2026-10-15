@@ -38,7 +38,7 @@ def _mixed_radix_digits(expr, var, var_range, mods):
     this recognition deliberately strict preserves rejection of ambiguous
     combinations such as ``Mod(x, 4) + Mod(x, 6)``.
     """
-    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    term = expr.xreplace(dict.fromkeys(expr.free_symbols - {var}, 0))
     var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
     if len(var_terms) != len(mods):
         return None
@@ -404,7 +404,7 @@ def compute_coordinates(
             continue
 
         # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
+        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -571,7 +571,7 @@ def normalize_coordinates(
         # sympy uses floor to encode integer divisions, remove
         expr = coordinate.replace(sympy.floor, lambda x: x)
         vars = expr.free_symbols
-        offset = expr.xreplace({var: sympy.S.Zero for var in vars})
+        offset = expr.xreplace(dict.fromkeys(vars, sympy.S.Zero))
 
         if len(vars) == 0:
             if dim_size > 1 and dim_idx != len(size) - 1:
