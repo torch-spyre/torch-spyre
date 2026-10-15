@@ -57,6 +57,8 @@ _VALID_DTYPE_STRINGS = {
     "complex128",
     "bool",
     "half",
+    "float8_e4m3fn",
+    "float8_e5m2",
 }
 # -------------------------------------------
 # Valid tensor generation strategies
@@ -73,6 +75,7 @@ _VALID_INIT_STRATEGIES = {
     "full",
     "file",
     "cumsum_offsets",
+    "uniform",
 }
 
 _VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
@@ -110,6 +113,8 @@ DTYPE_STR_MAP: Dict[str, torch.dtype] = {
     "complex128": torch.complex128,
     "bool": torch.bool,
     "half": torch.half,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
 }
 
 DTYPE_NAMES_ORDERED = sorted(DTYPE_STR_MAP.keys(), key=len, reverse=True)
