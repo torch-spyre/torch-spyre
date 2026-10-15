@@ -6,10 +6,10 @@ test_suite_config:
       tests:
         # DeepTools 092f4e79 coordinate masking miscomputes this padded
         # fp16 sum over (63, 129): 0.58984375 instead of -0.468017578125.
-        # https://github.com/torch-spyre/torch-spyre/actions/runs/38655341700
+        # https://github.com/torch-spyre/torch-spyre/issues/5515
         - names:
             - TestOps::test_reduce_multidim_keepdim1_sum_pad_2d_dim_01_all
-          mode: xfail
+          mode: xfail_strict
         - names:
             - TestOps::test_reduce_multidim_keepdim1.*
             - TestOps::test_reduce_edge_multidim_keepdim1.*
