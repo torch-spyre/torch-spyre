@@ -14,6 +14,14 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
       unlisted_test_mode: skip
       tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            # fp16_fp32_1d256 is in expect_fail (mixed EA, stick reordering unsupported)
+            - LxPlanning.*::test_div_mixed_dtype_true_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_mixed_dtype_floor_div_fp16_fp32_1d256_lx_planning_(pointwise|reduction)
+          mode: xfail
         - names:
             - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_rmsnorm.*_lx_planning_(pointwise|reduction)
@@ -46,4 +54,7 @@ test_suite_config:
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_rounding_mode_floor_fp16_rand_2d_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_scalar_dtypes_true_div_bool_int_scalar_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_div_scalar_dtypes_floor_div_bool_int_scalar_lx_planning_(pointwise|reduction)
           mode: mandatory_success
