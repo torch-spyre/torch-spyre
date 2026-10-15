@@ -22,8 +22,9 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/numeric_convert.h>
 #include <util/sendefs/sendefs.h>
+#include <util/utils.h>
 
 #include <cstdint>
 #include <cstdlib>     // std::getenv
