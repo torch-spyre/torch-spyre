@@ -801,6 +801,13 @@ Environment Variables
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
        invocations (default ``0``; set ``1`` to enable)
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``0``; set ``1`` to enable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
      - Override the CPU count CP-SAT uses to size its search worker pool.
        When unset the count is derived from the cgroup v2 quota, then
