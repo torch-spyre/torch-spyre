@@ -117,7 +117,7 @@ class ProverResult:
 
 
 class _CondInnerFnRecorder(DefaultHandler):
-    """Records the loads/constants/comparison op a cond inner_fn issues.
+    """Records the loads/bounds/comparison op a cond inner_fn issues.
 
     Every other ops call (there should be none for the shape this prover
     recognizes) is routed through `_default` and answered with an opaque
@@ -127,16 +127,19 @@ class _CondInnerFnRecorder(DefaultHandler):
 
     def __init__(self) -> None:
         self.loads: list[tuple[str, Any]] = []
-        self.constants: list[Any] = []
+        self.bounds: list[Any] = []
         self.compare_ops: list[str] = []
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         if name == "load":
             self.loads.append((args[0], args[1]))
             return f"__load_{len(self.loads) - 1}__"
-        if name == "constant":
-            self.constants.append(args[0])
-            return f"__constant_{len(self.constants) - 1}__"
+        # A concrete trip count reaches the cond graph as `constant`, a symbolic
+        # one as `index_expr` carrying the sympy expression. Both are the loop's
+        # bound, so both land in one list and the caller checks it saw exactly one.
+        if name in ("constant", "index_expr"):
+            self.bounds.append(args[0])
+            return f"__bound_{len(self.bounds) - 1}__"
         if name in ("lt", "le", "gt", "ge", "eq", "ne"):
             self.compare_ops.append(name)
             return f"__cmp_{name}__"
@@ -176,58 +179,79 @@ def _first_placeholder_name(cond_graph) -> str | None:
     return next(iter(graph_inputs), None)
 
 
-def _extract_trip_count(cond_graph) -> sympy.Expr | None:
+def _extract_trip_count(cond_graph) -> ProverResult:
     """Find the single lt(iteration_sym, N)-shaped comparison cond_graph computes.
 
     for_each_tile's cond_fn (after decompose_scan_to_while_loop) reduces to
     exactly one boolean scalar ComputedBuffer computing
-    `ops.load(<first placeholder>, 0) < ops.constant(N, ...)`. Returns N as a
-    sympy.Expr, or None if the shape does not match.
+    `ops.load(<first placeholder>, 0) < N`, where N is a constant for a concrete
+    trip count and an index_expr for a symbolic one.
+
+    Returns an accepted result carrying N, or a declined one whose reason names
+    what it saw instead. The reason matters: declining is not an error, the
+    kernel simply specialises, so without it a symbolic loop that failed to be
+    recognised looks exactly like one that was never asked for.
     """
+
+    def declined(reason: str) -> ProverResult:
+        return ProverResult(accepted=False, reason=f"cond_subgraph {reason}")
+
     graph_outputs = getattr(cond_graph, "graph_outputs", None)
     if not graph_outputs or len(graph_outputs) != 1:
-        return None
+        return declined(
+            f"has {len(graph_outputs) if graph_outputs else 0} outputs, expected 1"
+        )
     operations = getattr(cond_graph, "operations", None)
     if not operations or len(operations) != 1:
-        return None
+        return declined(
+            f"has {len(operations) if operations else 0} operations, expected 1"
+        )
 
     op = operations[0]
     data = getattr(op, "data", None)
     inner_fn = getattr(data, "inner_fn", None)
     if inner_fn is None:
-        return None
+        return declined("operation has no inner_fn to replay")
     # The comparison is a scalar bool -- no output ranges to index over.
     get_size = getattr(data, "get_size", None)
     if get_size is None or list(get_size()) != []:
-        return None
+        return declined("operation is not a scalar, so it is not the comparison")
     if getattr(data, "dtype", None) != torch.bool:
-        return None
+        return declined(f"operation has dtype {getattr(data, 'dtype', None)}, not bool")
 
     first_placeholder = _first_placeholder_name(cond_graph)
     if first_placeholder is None:
-        return None
+        return declined("has no first placeholder to compare against")
 
     recorder = _CondInnerFnRecorder()
     with V.set_ops_handler(recorder):
         inner_fn(())
 
     if recorder.compare_ops != ["lt"]:
-        return None
-    if len(recorder.loads) != 1 or len(recorder.constants) != 1:
-        return None
+        return declined(f"issued comparisons {recorder.compare_ops}, expected ['lt']")
+    if len(recorder.loads) != 1:
+        return declined(f"issued {len(recorder.loads)} loads, expected 1")
+    if len(recorder.bounds) != 1:
+        return declined(
+            f"offered {len(recorder.bounds)} candidate bounds "
+            f"({recorder.bounds}), expected 1"
+        )
 
     (loaded_name, loaded_index) = recorder.loads[0]
     if loaded_name != first_placeholder:
-        return None
+        return declined(
+            f"loads {loaded_name!r}, not the first placeholder {first_placeholder!r}"
+        )
     if loaded_index != 0:
-        return None
+        return declined(f"loads at index {loaded_index}, expected 0")
 
-    bound = recorder.constants[0]
+    bound = recorder.bounds[0]
+    # bool before int: bool subclasses int, and `while True` is not a trip count.
     if isinstance(bound, bool):
-        return None
+        return declined("compares against a bool, which is not a trip count")
     if not isinstance(bound, (int, sympy.Expr)):
-        return None
-    return sympy.sympify(bound)
+        return declined(f"compares against a {type(bound).__name__}, not a number")
+    return ProverResult(accepted=True, trip_count=sympy.sympify(bound))
 
 
 def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
@@ -237,16 +261,7 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
     if cond_graph is None:
         return ProverResult(accepted=False, reason="no cond_subgraph.graph to inspect")
 
-    trip_count = _extract_trip_count(cond_graph)
-    if trip_count is None:
-        return ProverResult(
-            accepted=False,
-            reason=(
-                "cond_subgraph did not reduce to a single provable "
-                "lt(iteration_sym, N) comparison"
-            ),
-        )
-    return ProverResult(accepted=True, trip_count=trip_count)
+    return _extract_trip_count(cond_graph)
 
 
 def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:

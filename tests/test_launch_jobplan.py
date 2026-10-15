@@ -255,21 +255,22 @@ class TestD2HFromTensorSegment(TestCase):
 
 
 class TestSymbolicArg(TestCase):
-    """
-    Unit tests for the SymbolicArg typed payload.
+    """Unit tests for the SymbolicArg typed payload."""
 
-    Notes:
-        Tests will need to be reworked once kdimension is implemented.
-    """
+    def test_kdimension_entry_is_no_longer_refused(self):
+        """A kDimension entry traverses Python, pybind, LaunchContext, construct.
 
-    def test_kdimension_entry_reaches_construct_and_raises(self):
-        """A kDimension entry traverses Python → pybind → LaunchContext →
-        construct() and raises 'kDimension is not yet implemented'.
+        It used to assert construct() raised "kDimension is not yet
+        implemented". That slot is implemented now, so the thing left to pin is
+        that the refusal is gone.
 
-        Uses a real-symbols ComputeOnHost step (non-{0} ishape) so the
-        payload is consumed rather than short-circuited by the fake-symbols
-        nullptr path.  The raise proves the entry survived the full carrier
-        path and was read positionally from slot 0.
+        Deliberately not asserting what happens instead. The mock's artifact
+        declares no symbol inputs, so the backend currently reports a count
+        mismatch, and that is a property of the fixture rather than of the
+        carrier path. Asserting it would make this test fail again the day the
+        fixture or the backend message changes. Either outcome is fine here: the
+        call succeeding is correct, and so is it failing for an environment
+        reason. Only the old refusal is a regression.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = tpk().create_mock_spyrecode(
@@ -288,10 +289,10 @@ class TestSymbolicArg(TestCase):
 
             stream = torch.Stream("spyre")
             with stream:
-                with pytest.raises(
-                    RuntimeError, match="kDimension is not yet implemented"
-                ):
+                try:
                     torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
+                except RuntimeError as exc:
+                    self.assertNotIn("kDimension is not yet implemented", str(exc))
 
     def test_symbolic_arg_attributes_and_repr_roundtrip(self):
         """SymbolicArg fields and repr survive pybind construction.
@@ -414,6 +415,64 @@ class TestSymbolicArg(TestCase):
         self.assertEqual(
             resolved_rev[1], addr_t0, "slot 1 of reversed payload must be addr_t0"
         )
+
+    def test_a_kdimension_slot_resolves_to_the_logical_size(self):
+        """A kDimension slot resolves to that tensor's logical size on the dim.
+
+        Read through _resolve_symbolic_args, so this is the value the launch
+        path binds rather than a hand-built one. Logical is the load-bearing
+        word: under a max-strided reservation the allocation is larger than the
+        logical extent, and a trip count built from the allocated extent would
+        run the maximum number of iterations on every call while still looking
+        correct.
+
+        The three dims are deliberately different sizes, so reading the wrong
+        one shows up as a wrong number rather than as a coincidence.
+        """
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        for dim, expected in enumerate(t.shape):
+            resolved = torch_spyre._C._resolve_symbolic_args(
+                [t],
+                [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=dim)],
+            )
+            self.assertEqual(resolved, [expected], f"dim_index={dim}")
+
+    def test_address_and_dimension_slots_resolve_in_one_payload(self):
+        """One payload carrying both kinds resolves each in its own slot.
+
+        The resolved vector holds two kinds of value, so anything that assumes
+        a single kind fails here rather than at a launch.
+        """
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kaddr = torch_spyre._C.SymbolicArgKind.kAddress
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        addr = torch_spyre._C._resolve_symbolic_args(
+            [t], [torch_spyre._C.SymbolicArg(kind=kaddr, tensor_id=0)]
+        )[0]
+
+        resolved = torch_spyre._C._resolve_symbolic_args(
+            [t],
+            [
+                torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=1),
+                torch_spyre._C.SymbolicArg(kind=kaddr, tensor_id=0),
+                torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=2),
+            ],
+        )
+        self.assertEqual(resolved, [3, addr, 64])
+
+    def test_a_dim_index_out_of_range_is_refused(self):
+        """The refusal names the slot, the index and the rank it was given."""
+        t = torch.zeros(2, 3, 64, dtype=torch.float16, device="spyre")
+        kdim = torch_spyre._C.SymbolicArgKind.kDimension
+
+        with pytest.raises(RuntimeError, match="dim_index 3 is out of range"):
+            torch_spyre._C._resolve_symbolic_args(
+                [t],
+                [torch_spyre._C.SymbolicArg(kind=kdim, tensor_id=0, dim_index=3)],
+            )
 
 
 if __name__ == "__main__":

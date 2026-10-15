@@ -34,7 +34,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "job_plan.h"
@@ -694,11 +696,12 @@ PYBIND11_MODULE(_C, m) {
       "        preserves today's legacy behavior.");
 
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can verify the HostComputeArg ordering without needing
-  // a live HCM or device execution. Returns one integer (CompositeAddress*
-  // cast to uintptr_t) per resolved slot — same tensor yields the same
-  // integer, different tensor yields a different integer, so any ordering bug
-  // inside resolveSymbolicArgs is directly visible as a mismatched int vector.
+  // that Python tests can verify what each correction slot resolves to without
+  // needing a live HCM or device execution. Returns one integer per slot. An
+  // address slot gives the CompositeAddress* cast to uintptr_t, so the same
+  // tensor yields the same integer and a different tensor a different one, and
+  // a dimension slot gives the size itself. Any ordering bug inside
+  // resolveSymbolicArgs is therefore visible as a mismatched int vector.
   // The "_" prefix signals this is not part of the stable public API.
   m.def(
       "_resolve_symbolic_args",
@@ -707,18 +710,29 @@ PYBIND11_MODULE(_C, m) {
         const auto resolved =
             spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
                                                                symbolic_args);
-        std::vector<uintptr_t> addrs;
-        addrs.reserve(resolved.size());
+        std::vector<uintptr_t> values;
+        values.reserve(resolved.size());
         for (const auto& host_arg : resolved) {
-          addrs.push_back(reinterpret_cast<uintptr_t>(
-              std::get<const flex::CompositeAddress*>(host_arg)));
+          // A slot holds an address or a size, so visit rather than naming one
+          // alternative: naming it throws on the other kind.
+          values.push_back(std::visit(
+              [](auto&& slot) -> uintptr_t {
+                using T = std::decay_t<decltype(slot)>;
+                if constexpr (std::is_pointer_v<T>) {
+                  return reinterpret_cast<uintptr_t>(slot);
+                } else {
+                  return static_cast<uintptr_t>(slot);
+                }
+              },
+              host_arg));
         }
-        return addrs;
+        return values;
       },
       py::arg("tensors"), py::arg("symbolic_args"),
-      "Test-only: resolve a symbolic_args payload to a list of device-address "
-      "integers (CompositeAddress* cast to uintptr_t). Same tensor yields the "
-      "same integer; different tensor yields a different integer.");
+      "Test-only: resolve a symbolic_args payload to a list of integers, one "
+      "per slot. An address slot gives the CompositeAddress* cast to uintptr_t "
+      "and a dimension slot gives the size. Same tensor yields the same "
+      "address integer; a different tensor yields a different one.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
