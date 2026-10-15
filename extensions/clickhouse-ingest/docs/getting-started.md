@@ -152,13 +152,13 @@ from Groovy:
    ```
 
 2. **For test-result ingestion**, call `pushToClickhouse.pushJUnitXml(...)`.
-   This *does* end up running `ingest_xml.py` from this package — but inside
+   This *does* end up running this package's ingest, `python -m spyre_clickhouse_ingest results` — but inside
    a `podman run` against your product's own container image, with
    `extensions/clickhouse-ingest` attached via `uv run --with <local-path>`,
    not a git install. That means:
    - Your product's container image must bake a checkout of itself at
      `/home/senuser/<product>/`, including the ingest script (default path
-     `.github/scripts/ingest_xml.py`, overridable via `ingestScript`).
+     `.github/scripts/ingest_xml.py`, the deprecated forwarder to `python -m spyre_clickhouse_ingest results`; overridable via `ingestScript`).
    - For schema-v2 writes, the image must also bake
      `extensions/clickhouse-ingest` at
      `/home/senuser/<product>/extensions/clickhouse-ingest` —

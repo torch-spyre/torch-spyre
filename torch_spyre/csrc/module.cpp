@@ -30,9 +30,11 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "job_plan.h"
@@ -66,7 +68,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 3;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -216,8 +218,8 @@ PYBIND11_MODULE(_C, m) {
       SpyreHooksInterface() = default;
       explicit SpyreHooksInterface(SpyreHooksArgs) {}
       ~SpyreHooksInterface() override = default;
-      bool hasPrimaryContext(c10::DeviceIndex) const override {
-        return true;
+      bool hasPrimaryContext(c10::DeviceIndex idx) const override {
+        return idx == spyre::SpyreGuardImpl::tls_idx;
       }
       bool isAvailable() const override {
         return true;
@@ -284,6 +286,15 @@ PYBIND11_MODULE(_C, m) {
       .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
+  auto valid_elements_to_pydict =
+      [](const std::map<std::vector<int64_t>, int64_t>& ve) {
+        py::dict result;
+        for (const auto& [dims, count] : ve) {
+          result[py::tuple(py::cast(dims))] = count;
+        }
+        return result;
+      };
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
@@ -291,6 +302,11 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
                     &spyre::SpyreTensorLayout::element_arrangement)
+      .def_property_readonly(
+          "valid_elements",
+          [valid_elements_to_pydict](const spyre::SpyreTensorLayout& stl) {
+            return valid_elements_to_pydict(stl.valid_elements);
+          })
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
            py::arg("element_arrangement"))
@@ -311,13 +327,23 @@ PYBIND11_MODULE(_C, m) {
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
+      .def(
+          py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
+                   spyre::ElementArrangement,
+                   std::map<std::vector<int64_t>, int64_t>>(),
+          py::arg("device_size"), py::arg("stride_map"),
+          py::arg("device_dtype"),
+          py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
+          py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{})
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
+                    std::map<std::vector<int64_t>, int64_t>,
                     spyre::ElementArrangement>(),
            py::arg("device_size"), py::arg("stride_map"),
-           py::arg("device_dtype"),
+           py::arg("device_dtype"), py::arg("valid_elements"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(py::pickle(
-          [](const spyre::SpyreTensorLayout& p) {  // __getstate__
+          [valid_elements_to_pydict](
+              const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
             // If the pickle format changes, then update
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
@@ -325,7 +351,8 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement);
+                                  p.element_arrangement,
+                                  valid_elements_to_pydict(p.valid_elements));
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -358,6 +385,16 @@ PYBIND11_MODULE(_C, m) {
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[4].cast<spyre::ElementArrangement>());
+            } else if (version == 4) {
+              if (t.size() != 6) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
                   t[4].cast<spyre::ElementArrangement>());
             } else {
               throw py::value_error(
@@ -465,7 +502,16 @@ PYBIND11_MODULE(_C, m) {
                              &spyre::CompositeAddressHandle::num_chunks,
                              "Number of device chunks the allocation spans")
       .def("chunks", &spyre::CompositeAddressHandle::chunks,
-           "Per-chunk geometry, in order");
+           "Per-chunk geometry, in order")
+      .def("__eq__",
+           [](const spyre::CompositeAddressHandle& a,
+              const spyre::CompositeAddressHandle& b) {
+             return a.chunks() == b.chunks();
+           })
+      .def("__ne__", [](const spyre::CompositeAddressHandle& a,
+                        const spyre::CompositeAddressHandle& b) {
+        return a.chunks() != b.chunks();
+      });
 
   m.def("get_composite_address", &spyre::get_composite_address_handle,
         "Return a read-only handle over the device address backing a Spyre "
@@ -646,6 +692,33 @@ PYBIND11_MODULE(_C, m) {
       "        JobPlanStepHostCompute resolves each correction slot by kind\n"
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
+
+  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
+  // that Python tests can verify the HostComputeArg ordering without needing
+  // a live HCM or device execution. Returns one integer (CompositeAddress*
+  // cast to uintptr_t) per resolved slot — same tensor yields the same
+  // integer, different tensor yields a different integer, so any ordering bug
+  // inside resolveSymbolicArgs is directly visible as a mismatched int vector.
+  // The "_" prefix signals this is not part of the stable public API.
+  m.def(
+      "_resolve_symbolic_args",
+      [](const std::vector<at::Tensor>& tensors,
+         const std::vector<spyre::SymbolicArg>& symbolic_args) {
+        const auto resolved =
+            spyre::JobPlanStepHostCompute::resolveSymbolicArgs(tensors,
+                                                               symbolic_args);
+        std::vector<uintptr_t> addrs;
+        addrs.reserve(resolved.size());
+        for (const auto& host_arg : resolved) {
+          addrs.push_back(reinterpret_cast<uintptr_t>(
+              std::get<const flex::CompositeAddress*>(host_arg)));
+        }
+        return addrs;
+      },
+      py::arg("tensors"), py::arg("symbolic_args"),
+      "Test-only: resolve a symbolic_args payload to a list of device-address "
+      "integers (CompositeAddress* cast to uintptr_t). Same tensor yields the "
+      "same integer; different tensor yields a different integer.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 

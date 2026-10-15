@@ -8,11 +8,11 @@ the Torch-Spyre front-end and generates optimized Spyre program binaries.
 
 The back-end compiler is responsible for:
 
-- **Dataflow mapping** — mapping SuperDSC operations to optimized Spyre
+- **Dataflow mapping**: mapping SuperDSC operations to optimized Spyre
   dataflows and execution patterns
-- **Core scheduling** — determining the precise execution order and
+- **Core scheduling**: determining the precise execution order and
   timing of operations across cores
-- **Binary generation** — producing the executable program binaries
+- **Binary generation**: producing the executable program binaries
   loaded onto the Spyre device at runtime
 
 ## Front-End Artifacts
@@ -79,7 +79,7 @@ the iteration variables, not plain integer offsets. Here is the
 artifact for an `add` between two tensors that share an iteration space
 with three loop variables: `c0` of extent 10 with unit stride, `z0` of
 extent 50 walking the iteration space at stride 25 (the second value in
-each `iteration_space` entry — for example `(sympify('50'), 25)`), and
+each `iteration_space` entry, for example `(sympify('50'), 25)`), and
 `c1` of extent 200 with unit stride:
 
 ```python
@@ -157,7 +157,7 @@ separate Spyre feature flag.
 
 ## Further Reading
 
-- [Inductor Front-End](inductor_frontend.md) — how the front-end
+- [Inductor Front-End](inductor_frontend.md): how the front-end
   generates SuperDSC
-- [Dataflow Architecture](../architecture/dataflow_architecture.md) — the
+- [Dataflow Architecture](../architecture/dataflow_architecture.md): the
   hardware model that DeepTools targets

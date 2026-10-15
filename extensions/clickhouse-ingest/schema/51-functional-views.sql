@@ -34,12 +34,16 @@ SELECT
     countIf(cr.status = 'passed') AS passed,
     countIf(cr.status IN ('failed', 'error')) AS failed,
     countIf(cr.status = 'skipped') AS skipped,
+    -- Of passed, as in run_case_counters.recovered.
+    countIf(cr.status = 'passed' AND (cr.props['result.prior_status'] IN ('failed', 'error')
+            OR toUInt32OrZero(cr.props['result.reruns']) > 0)) AS recovered,
     passed / runs AS pass_rate,
     avg(cr.duration_s) AS mean_duration_s,
     anyIf(cr.fail_message, cr.fail_message != '') AS sample_fail_message
 FROM test_case_runs AS cr
 INNER JOIN test_cases AS c
         ON c.test_case_id = cr.test_case_id AND c.component = cr.component
+WHERE cr.run_id NOT IN (SELECT run_id FROM v_result_uploads WHERE state = 'retracted')
 GROUP BY component, classname, name, day;
 
 -- Per-tier counters for one run. The tier is the one its leg was dispatched for
@@ -67,7 +71,7 @@ INNER JOIN
     -- One tier per run: artifact_results holds a row per build/reuse of a leg, and a perf leg
     -- can share a functional leg's run_id.
     SELECT run_id, argMax(test_type, ts) AS tier
-    FROM artifact_results
+    FROM v_artifact_results_published
     WHERE result_kind = 'functional'
     GROUP BY run_id
 ) AS leg ON leg.run_id = cr.run_id
@@ -94,7 +98,7 @@ FROM
     INNER JOIN
     (
         SELECT run_id, argMax(test_type, ts) AS tier
-        FROM artifact_results
+        FROM v_artifact_results_published
         WHERE result_kind = 'functional'
         GROUP BY run_id
     ) AS leg ON leg.run_id = cr.run_id

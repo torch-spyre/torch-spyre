@@ -379,7 +379,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // same chunk (the owning CompositeAddress stays in job_allocation_, which is
   // later moved into the JobPlan and outlives this step). flex bounds the
   // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
-  // -- instead of the 16GB MAX_REGION_SIZE. The size grows automatically
+  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically
   // if/when deeptools grows the Allocate, requiring no further change here.
   TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
               "job_allocation must have 1 chunk");
@@ -699,11 +699,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
-  // Two-stream overlap. Emit the plain triple [HostCompute, H2D, Compute]; the
-  // ctors tag it with roles [Prep, Prep, Dev]. When SPYRE_HAZARD_TRACKER is on,
-  // the launch router splits it across S_prep/S_dev and flex inserts the
-  // cross-stream H2D->Compute edge; off keeps every step on S_dev. Every op
-  // keeps pipeline_barrier=true (per-stream FIFO). No plan rewrite here.
+  // HostCompute owns H2D on Prep; Compute is Dev. Hazard tracking inserts the
+  // cross-stream edges; otherwise all steps keep per-stream FIFO on Dev.
 
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
@@ -736,25 +733,22 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape count matches number of input tensors
 
   // P2-14: JobPlan step ordering validation
-  // After the HostCompute+H2D merge, the required sequence when the first step
-  // is a HostCompute is:  HostCompute(owns H2D) → Compute.
-  // The old HostCallback→H2D→Compute pattern is no longer expected in
-  // production SpyreCode; the translator collapses them.
-  if (!job_plan.steps.empty()) {
-    bool first_is_host_compute = dynamic_cast<const JobPlanStepHostCompute*>(
-                                     job_plan.steps[0].get()) != nullptr;
-
-    if (first_is_host_compute) {
-      // Step 0 is HostCompute (which owns the H2D); step 1 must be Compute.
-      TORCH_CHECK(job_plan.steps.size() >= 2,
-                  "Incomplete step sequence: HostCompute must be followed "
-                  "by Compute");
-      bool is_compute = dynamic_cast<const JobPlanStepCompute*>(
-                            job_plan.steps[1].get()) != nullptr;
-      TORCH_CHECK(is_compute,
-                  "Step ordering violation at step 1: "
-                  "HostCompute (with H2D) must be followed by Compute");
-    }
+  // A device program can need multiple correction blobs. Each leading
+  // HostCompute owns its H2D; all must precede the consuming Compute.
+  size_t compute_index = 0;
+  while (compute_index < job_plan.steps.size() &&
+         dynamic_cast<const JobPlanStepHostCompute*>(
+             job_plan.steps[compute_index].get()) != nullptr) {
+    ++compute_index;
+  }
+  if (compute_index > 0) {
+    TORCH_CHECK(compute_index < job_plan.steps.size(),
+                "Incomplete step sequence: HostCompute must be followed "
+                "by Compute");
+    TORCH_CHECK(dynamic_cast<const JobPlanStepCompute*>(
+                    job_plan.steps[compute_index].get()) != nullptr,
+                "Step ordering violation at step ", compute_index,
+                ": HostCompute (with H2D) must be followed by Compute");
   }
 
   // P2-15: Host compute metadata validation

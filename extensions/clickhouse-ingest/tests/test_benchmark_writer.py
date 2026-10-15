@@ -147,6 +147,34 @@ def test_two_backends_are_two_rows_not_one():
     assert len(ident) == 1, "one benchmark, two backends -- not two benchmarks"
 
 
+def test_a_kernel_stores_its_stable_key_and_its_raw_name_per_run():
+    # The id drops the per-compile token, so the run row is where the raw name survives.
+    raw = "spyre_kernel_v1_fused_add_maprxynops5ngbzx#2"
+    c = FakeClient()
+    insert_benchmarks(
+        c,
+        "db",
+        "torch-spyre",
+        RUN,
+        [
+            _bench(
+                name="pointwise_add",
+                props={"kernel_name": raw},
+                measurements={"duration_ms": [0.27]},
+                disc={"kernel_name": raw},
+                disc_keys=("kernel_name",),
+            )
+        ],
+    )
+    (fact,) = _rows(c, BENCHMARK_RUNS)[0]
+    (ident,) = _rows(c, BENCHMARKS)[0]
+    cols = BENCHMARK_RUNS.columns
+    assert fact[cols.index("props")]["kernel_name"] == raw
+    props = ident[BENCHMARKS.columns.index("props")]
+    assert props["kernel_name"] == raw
+    assert props["kernel_key"] == "spyre_kernel_v1_fused_add#2@1"
+
+
 def test_a_benchmark_with_no_measurements_is_dropped_not_inserted():
     # The DDL's CHECK length(measurements) > 0 rejects the row, failing the whole insert.
     c = FakeClient()

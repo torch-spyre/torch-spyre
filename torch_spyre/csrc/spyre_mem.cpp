@@ -1251,13 +1251,21 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
   // Map torch dtype to DataFormats for the value->pattern conversion, which
-  // fillAsync performs internally.
+  // flex::createFillAsyncParams performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
-  // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
+  // Launch a device-side MEMORY_FILL DMA. createFillAsyncParams converts value
+  // to the dtype-specific fill pattern; launchFillAsync submits it.
+  auto* params = flex::createFillAsyncParams(get_composite_address(self), value,
+                                             dtype, /*use_dmai=*/true);
+  struct Guard {
+    flex::FillAsyncParams* p;
+    ~Guard() {
+      flex::destroyFillAsyncParams(p);
+    }
+  } guard{params};
   SpyreStream stream;
-  stream.fillAsync(get_composite_address(self), value, dtype,
-                   /*use_dmai=*/true);
+  stream.launchFillAsync(params);
 
   return self;
 }

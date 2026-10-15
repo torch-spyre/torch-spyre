@@ -31,13 +31,11 @@ and that a refactor would quietly break:
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import pathlib
 import sys
 
 import pytest
-
-_SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts"
 
 # The ingest imports the shared library from extensions/; it is in this repo, so put it on
 # sys.path rather than requiring an install for a parse-only test.
@@ -50,17 +48,10 @@ if str(_CHLIB) not in sys.path:
 
 @pytest.fixture(scope="module")
 def ing():
-    """Load ingest_xml.py by path -- it is a script, not an importable package."""
-    sys.path.insert(0, str(_SCRIPTS))
-    spec = importlib.util.spec_from_file_location(
-        "ingest_xml", _SCRIPTS / "ingest_xml.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(mod)
+        return importlib.import_module("spyre_clickhouse_ingest.results")
     except ModuleNotFoundError as exc:  # lxml / clickhouse_connect / regex absent
-        pytest.skip(f"ingest_xml deps unavailable: {exc}")
-    return mod
+        pytest.skip(f"ingest deps unavailable: {exc}")
 
 
 class FakeRows:

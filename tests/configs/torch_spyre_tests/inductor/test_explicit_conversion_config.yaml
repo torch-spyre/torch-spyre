@@ -4,6 +4,9 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
       tests:
+        # Tests that are known to fail or to be rejected still run here as
+        # mandatory_success: their expected outcome (strict xfail with raises=, or an
+        # asserted rejection) is declared on the test itself, so a skip here would hide it.
         - names:
             - TestExplicitConversion::test_to_dtype_fp16_to_fp32_2d_stick_aligned
             - TestExplicitConversion::test_to_dtype_fp16_to_fp32_fp32_stick_aligned
@@ -24,38 +27,18 @@ test_suite_config:
             - TestExplicitConversion::test_wa_exp_sub_3d_stick_aligned
             - TestExplicitConversion::test_wa_exp_mul_4d_stick_aligned
             - TestExplicitConversion::test_explicit_fp16_to_fp32_chained_add_mul_3d
+            - TestExplicitConversion::test_wa_exp_add_non_contiguous_2d
+            - TestExplicitConversion::test_half_shortcut_value_correctness
+            - TestExplicitConversion::test_bfloat16_shortcut_from_fp32_value_correctness
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_3d_unaligned
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_4d_unaligned
+            - TestExplicitConversion::test_eager_to_dtype_fp32_to_fp16
+            - TestExplicitConversion::test_to_dtype_strided_slice_fp16_to_fp32
           mode: mandatory_success
 
         - names:
             - TestModelIntegration::test_compiled_linear_fp16
           mode: mandatory_success
-
-        # SKIP — non-contiguous fp16 source: slice (4,128)[:, :64] row stride 128 > logical extent; to_dtype wrong values
-        - names:
-            - TestExplicitConversion::test_wa_exp_add_non_contiguous_2d
-          mode: skip
-
-        # SKIP #2205 — FP32TODL16_OP output in DL16_TO_FP32 arrangement; D2H reads garbled values
-        - names:
-            - TestExplicitConversion::test_half_shortcut_value_correctness
-            - TestExplicitConversion::test_bfloat16_shortcut_from_fp32_value_correctness
-          mode: skip
-
-        # SKIP #2204 — unaligned shapes: padding propagation failure in to_dtype
-        - names:
-            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_3d_unaligned
-            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_4d_unaligned
-          mode: skip
-
-        # SKIP #2847 — eager .to(dtype) on Spyre tensor returns wrong result
-        - names:
-            - TestExplicitConversion::test_eager_to_dtype_fp32_to_fp16
-          mode: skip
-
-        # SKIP #2851 — stride-2 slice: unsupported stick expression
-        - names:
-            - TestExplicitConversion::test_to_dtype_strided_slice_fp16_to_fp32
-          mode: skip
 
   global:
     supported_dtypes:

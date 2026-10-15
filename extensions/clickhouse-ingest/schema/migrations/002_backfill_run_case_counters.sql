@@ -1,6 +1,6 @@
 -- run_case_counters_mv sees only inserts made after it was created; count the earlier rows.
 -- The cutoff is the MV's own creation time, so no row is counted by both paths.
-INSERT INTO run_case_counters
+INSERT INTO run_case_counters (run_id, component, total_tests, passed, failed, errors, skipped, xfail, xpass)
 SELECT
     run_id,
     component,

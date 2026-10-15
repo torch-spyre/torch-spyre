@@ -98,14 +98,19 @@ Run:
 """
 
 import contextlib
+import itertools
 import os
+import sys
 import unittest
+import warnings
 from typing import NamedTuple
+from unittest import mock
 
 import torch
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.wsr import Gather, for_each_tile
+from torch_spyre._monkey_patch import _patch_scan_input_aliasing
 
 DUMP_DIR = os.environ.get("SPYRE_FOR_EACH_TILE_DUMP")
 
@@ -1065,6 +1070,246 @@ class TestForEachTileLowering(unittest.TestCase):
             loops=1,
             materializations=0,
         )
+
+
+@unittest.skipUnless(
+    _patch_scan_input_aliasing(), "torch_spyre's scan aliasing patch is inactive"
+)
+class TestScanInputAliasing(unittest.TestCase):
+    """torch_spyre's scan patch (#4893): read-only loop inputs may share a storage."""
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.x, self.kv = torch.randn(8, 4), torch.randn(6, 8)
+
+    def test_views_of_one_storage_as_invariant_operands(self):
+        """K and V split from one tensor, both captured whole by the loop."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def fn(x, kv):
+            k, v = kv.split(4, dim=-1)
+
+            def body(_, tiles):
+                x_tile, k_tile, v_tile = tiles
+                return None, x_tile @ k_tile.T @ v_tile
+
+            _, out = for_each_tile(
+                body, (x, k, v), dims=(0, None, None), tile_size=2, out_dim=0
+            )
+            return out
+
+        k, v = self.kv.split(4, dim=-1)
+        tracers = {
+            "make_fx": lambda *a: make_fx(fn, tracing_mode="fake")(*a)(*a),
+            "torch.compile": lambda *a: torch.compile(
+                fn, backend="inductor", fullgraph=True
+            )(*a),
+        }
+        modes = {
+            "grad": torch.enable_grad,
+            "no_grad": torch.no_grad,
+            "inference_mode": torch.inference_mode,
+        }
+        for (tracer, trace), (mode, ctx) in itertools.product(
+            tracers.items(), modes.items()
+        ):
+            with self.subTest(tracer=tracer, mode=mode), ctx():
+                torch._dynamo.reset()
+                torch.testing.assert_close(trace(self.x, self.kv), self.x @ k.T @ v)
+
+    @staticmethod
+    def _scan_over_kv(body, init=None):
+        from torch._higher_order_ops.scan import scan
+
+        def fn(x, kv):
+            k, v = kv.split(4, dim=-1)
+            carry = torch.zeros(()) if init is None else init(k, v)
+            return scan(
+                lambda c, x_t: body(c, x_t, k, v), carry, x.unflatten(0, (4, 2))
+            )
+
+        return fn
+
+    def _compile(self, fn):
+        return torch.compile(fn, backend="inductor", fullgraph=True)
+
+    def test_carry_init_sharing_an_input_storage(self):
+        """The loop never writes a carry in place, so its init may alias an input."""
+        fn = self._scan_over_kv(
+            lambda c, x_t, k, v: (c + (x_t @ k.T).sum(), x_t @ v.T),
+            init=lambda k, v: v[0, 0],
+        )
+        torch.testing.assert_close(
+            self._compile(fn)(self.x, self.kv), fn(self.x, self.kv)
+        )
+
+    def test_aliased_inputs_requiring_grad_are_rejected(self):
+        fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, x_t @ k.T @ v))
+        with self.assertRaisesRegex(Exception, "Input-to-input aliasing"):
+            self._compile(fn)(self.x, self.kv.clone().requires_grad_())
+
+    def test_mutating_an_aliased_input_is_rejected(self):
+        def body(c, x_t, k, v):
+            k.add_(1.0)
+            return c + 1, x_t @ v.T
+
+        with self.assertRaisesRegex(Exception, "(?i)mutation"):
+            self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
+
+    def test_returning_an_input_is_rejected(self):
+        fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, k))
+        with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+            self._compile(fn)(self.x, self.kv)
+
+    def test_output_output_aliasing_is_rejected(self):
+        def body(c, x_t, k, v):
+            y = x_t @ k.T @ v
+            return c + 1, (y, y)
+
+        with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+            self._compile(self._scan_over_kv(body))(self.x, self.kv)
+
+    def test_other_hops_stay_strict(self):
+        """Only scan is relaxed: cond rejects aliased closures, also inside a scan."""
+
+        def cond_on(x, k, v):
+            return torch.cond(x.sum() > 0, lambda: x @ k.T @ v, lambda: x @ v.T @ k, ())
+
+        def top_level(x, kv):
+            k, v = kv.split(4, dim=-1)
+            return cond_on(x, k, v)
+
+        nested = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, cond_on(x_t, k, v)))
+        # 2.13's cond itself accepts aliasing once grad is disabled.
+        for name, fn in (("cond", top_level), ("cond inside scan", nested)):
+            with self.subTest(name), torch.enable_grad():
+                torch._dynamo.reset()
+                with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+                    self._compile(fn)(self.x, self.kv)
+
+
+# The package re-exports the `for_each_tile` function under the submodule's name, so
+# the module itself is only reachable through `sys.modules`.
+_FET_MODULE = "torch_spyre._inductor.wsr.for_each_tile"
+_RAII_PYTHONS = (3, 12) <= sys.version_info[:2] < (3, 14)
+
+
+class TestScanCRecursionBudget(unittest.TestCase):
+    """The nested `scan` compile's C-recursion budget (#4973).
+
+    Raised on s390x only (CPython caps C recursion at 800 there, 10000 elsewhere),
+    never lowered, and always restored.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.m = sys.modules[_FET_MODULE]
+        saved = torch._dynamo.get_recursion_limit()
+        self.addCleanup(torch._dynamo.set_recursion_limit, saved)
+        if saved != -1:
+            torch._dynamo.set_recursion_limit(-1)
+        self.x = torch.randn(4, 8)
+
+    def _run_eager(self):
+        """A reduction loop run outside Dynamo, so `scan` compiles its own body."""
+        final, _ = self.m.for_each_tile(
+            lambda c, t: (c + t[0].sum(0), None),
+            (self.x,),
+            dims=0,
+            tile_size=1,
+            init=torch.zeros(8),
+        )
+        return final
+
+    def _spy_set_limit(self):
+        return mock.patch.object(
+            torch._dynamo,
+            "set_recursion_limit",
+            wraps=torch._dynamo.set_recursion_limit,
+        )
+
+    def _target(self):
+        return self.m._scan_c_recursion_target("s390x", sys.version_info[:2])
+
+    def test_eager_no_runtime_warning(self):
+        """Dynamo warns when a new C limit is below the remaining budget."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+
+    def test_target_gating(self):
+        target = self.m._scan_c_recursion_target
+        for machine in ("x86_64", "aarch64", "ppc64le", "AMD64", "arm64"):
+            for py in ((3, 11), (3, 12), (3, 13), (3, 14)):
+                with self.subTest(machine=machine, py=py):
+                    self.assertIsNone(target(machine, py))
+        for py in ((3, 11), (3, 14), (3, 15)):
+            with self.subTest(machine="s390x", py=py):
+                self.assertIsNone(target("s390x", py))
+        for py in ((3, 12), (3, 13)):
+            with self.subTest(machine="s390x", py=py):
+                # Above CPython's s390x default, or it would lower the budget.
+                self.assertGreater(
+                    target("s390x", py), self.m._S390X_CPYTHON_C_RECURSION_LIMIT
+                )
+
+    def test_non_s390x_never_touches_limit(self):
+        with (
+            mock.patch("platform.machine", return_value="x86_64"),
+            mock.patch.object(
+                torch._dynamo,
+                "get_recursion_limit",
+                wraps=torch._dynamo.get_recursion_limit,
+            ) as get_spy,
+            self._spy_set_limit() as spy,
+        ):
+            torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+        get_spy.assert_not_called()
+        spy.assert_not_called()
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored(self):
+        target = self._target()
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+        ):
+            # Off s390x the target is below the host's remaining budget and warns.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            # Compare args, not mock.call objects: PyTorch's TestCase.assertEqual
+            # (used under the OOT wrapper) compares those tuples element-wise.
+            self.assertEqual([c.args for c in spy.call_args_list], [(target,), (-1,)])
+            self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
+
+            # A caller's limit at or above the target is left alone.
+            torch._dynamo.set_recursion_limit(target + 1)
+            with self._spy_set_limit() as spy:
+                torch.testing.assert_close(self._run_eager(), self.x.sum(0))
+            spy.assert_not_called()
+            self.assertEqual(torch._dynamo.get_recursion_limit(), target + 1)
+
+    @unittest.skipUnless(_RAII_PYTHONS, "Dynamo's C-recursion RAII is 3.12/3.13 only")
+    def test_limit_restored_when_body_raises(self):
+        target = self._target()
+        seen = []
+
+        def failing_scan(*args, **kwargs):
+            seen.append(torch._dynamo.get_recursion_limit())
+            raise ValueError("boom")
+
+        with (
+            warnings.catch_warnings(),
+            mock.patch("platform.machine", return_value="s390x"),
+            mock.patch.object(self.m, "scan", side_effect=failing_scan),
+        ):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self.assertRaisesRegex(ValueError, "boom"):
+                self._run_eager()
+        self.assertEqual(seen, [target])
+        self.assertEqual(torch._dynamo.get_recursion_limit(), -1)
 
 
 if __name__ == "__main__":

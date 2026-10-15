@@ -204,6 +204,16 @@ class SpyreTensorLayout:
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
         element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+        valid_elements: dict[tuple[int, ...], int] = {},
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self,
+        device_size: collections.abc.Sequence[typing.SupportsInt],
+        stride_map: collections.abc.Sequence[typing.SupportsInt],
+        device_dtype: DataFormats,
+        valid_elements: dict[tuple[int, ...], int],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
@@ -219,6 +229,8 @@ class SpyreTensorLayout:
     def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
+    @property
+    def valid_elements(self) -> dict[tuple[int, ...], int]: ...
 
 class _SpyreStreamBase:
     """

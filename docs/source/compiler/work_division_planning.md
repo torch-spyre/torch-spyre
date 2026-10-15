@@ -667,9 +667,10 @@ def fn(x, y):
 ```
 
 The compiler resolves each user-facing name onto the concrete iteration
-variables for each operation in the hint scope. Coarse-tiling hints are kept
-separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
-coexist in the same scope.
+variables for each operation in the hint scope. Tiling is expressed with
+`for_each_tile` rather than a hint, and a `spyre_hint(work_div={...})` scope
+wrapped around a `for_each_tile` call divides the operations in the loop body
+across cores.
 
 When the work-division planner sees a resolved user hint, it validates the
 request and commits the accepted splits directly instead of running the

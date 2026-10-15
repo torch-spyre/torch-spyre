@@ -937,6 +937,74 @@ def _materialize_carry_copy(
     return copy_buf
 
 
+def _validated_loop_origin(graph: "GraphLowering", while_op: "ir.WhileLoop") -> Any:
+    """Return the exact FX ``while_loop`` HOP node for ``while_op``, or None.
+
+    Called at the splice site, while the live ``ir.WhileLoop`` still exists
+    (``splice_while_loop`` deletes it right after ``_rewire_accumulator_output``
+    returns) and before its ``MultiOutput`` children are dropped.  The node is
+    retained on :class:`~torch_spyre._inductor.loop_info.LoopCarryRecord` so the
+    scratchpad allocator can anchor an output copy after the completed loop.
+
+    Why ``origins[0]`` is the right node: Inductor's lowering enters
+    ``IRNode.current_origins`` with ``OrderedSet([fx_node]) | gather_origins(args,
+    kwargs)`` for the FX node being lowered, and every IR node created in that
+    context copies those origins.  The while_loop HOP lowering creates the
+    ``WhileLoop`` under exactly that context, so its first origin is the outer
+    loop's FX node; body-subgraph nodes belong to a different FX graph and
+    realized-input origins can only be appended after it.
+
+    Fail-closed validation, in order: the first origin must exist and live in
+    this lowering's own FX graph; its target must be one of the registered
+    ``while_loop`` HOP overloads; and it must be the *only* graph-local origin
+    carrying a while_loop target.  Any failure returns None and the allocator's
+    post-loop materialization plan declines (today's HBM behavior).
+
+    Intentional false negatives (documented, not bugs): a loop nested inside
+    another construct, a loop inside an ``invoke_subgraph``, and a chained
+    carry seeded from an earlier loop's result all fail the first-origin or
+    uniqueness check and return None.  Never widen this to "any origin with a
+    while_loop target": that is the route back to a foreign or earlier loop's
+    node.
+    """
+    import torch
+
+    origins = getattr(while_op, "origins", None)
+    if not origins:
+        return None
+    try:
+        first = next(iter(origins), None)
+    except TypeError:
+        # A non-iterable origins value (hand-built mocks) cannot prove the
+        # identity; fail closed exactly like absent origins.
+        return None
+    fx_graph = getattr(graph, "graph", None)
+    if first is None or fx_graph is None:
+        return None
+    if getattr(first, "graph", None) is not fx_graph:
+        return None
+    if getattr(first, "op", None) != "call_function":
+        return None
+    higher_order = getattr(torch.ops, "higher_order", None)
+    targets = tuple(
+        target
+        for name in ("while_loop", "while_loop_stack_output")
+        if (target := getattr(higher_order, name, None)) is not None
+    )
+    if not targets or getattr(first, "target", None) not in targets:
+        return None
+    graph_local = [
+        node
+        for node in origins
+        if getattr(node, "graph", None) is fx_graph
+        and getattr(node, "op", None) == "call_function"
+        and getattr(node, "target", None) in targets
+    ]
+    if len(graph_local) != 1 or graph_local[0] is not first:
+        return None
+    return first
+
+
 def _rewire_accumulator_output(
     graph: "GraphLowering",
     while_op: "ir.WhileLoop",
@@ -1018,6 +1086,7 @@ def _rewire_accumulator_output(
     record = LoopCarryRecord(
         storage_name=storage_name,
         update_name=producer.get_name(),
+        loop_origin=_validated_loop_origin(graph, while_op),
     )
     storage._loop_carry_record = record
     producer._loop_carry_record = record

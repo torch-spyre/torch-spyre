@@ -522,18 +522,6 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
-@torch.library.custom_op("spyre::compact", mutates_args=(), device_types="spyre")
-def compact(  # type: ignore[empty-body]
-    x: torch.Tensor,
-) -> torch.Tensor:
-    pass
-
-
-@compact.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return x.new_empty(x.size())
-
-
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
@@ -643,7 +631,12 @@ def spyre_reshape_via_cpu(
     """
     warn_fallback("torch.ops.spyre.reshape_via_cpu")
     input_cpu = input.to("cpu")
-    result_cpu = input_cpu.reshape(shape)
+    # reshape() can return a non-contiguous VIEW -- e.g. squeezing a size-1 dim
+    # out of a non-contiguous/permuted input -- but the register_fake below
+    # advertises a *contiguous* new_empty(shape), so force contiguity so the real
+    # output matches the fake stride and inductor's assert_size_stride holds for
+    # every caller.
+    result_cpu = input_cpu.reshape(shape).contiguous()
     return result_cpu.to(input.device)
 
 
