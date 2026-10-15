@@ -26,7 +26,7 @@ import os
 import subprocess
 import sys
 import warnings
-from torch_spyre.ops.eager import RetileWarning
+from torch_spyre.ops.eager import HostStagedCopyWarning, RetileWarning
 from torch_spyre.ops.fallbacks import FallbackWarning
 
 
@@ -148,7 +148,7 @@ class TestWarningTypes(TestCase):
     def test_importable_without_backend_autoload(self):
         # xdist's controller rebuilds each worker warning by importing its class's module.
         env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
-        for category in (FallbackWarning, RetileWarning):
+        for category in (FallbackWarning, RetileWarning, HostStagedCopyWarning):
             script = (
                 "import importlib; "
                 f"getattr(importlib.import_module({category.__module__!r}), "
