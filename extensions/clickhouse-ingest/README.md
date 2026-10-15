@@ -60,6 +60,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
+| `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
 | `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
@@ -278,7 +279,7 @@ A folder, or a `.tgz` of one:
 
 ```
 bundle.json        # bundle.schema.json
-results/           # JUnit *.xml, or (kind vllm) vLLM bench *.json; flat
+results/           # JUnit *.xml, (kind vllm) vLLM bench *.json, (kind sendnn) report_sendnn.txt, or (kind benchmarks) *.json; flat
 attachments/...    # optional: logs, .cmd files; kept with the bundle, not ingested
 ```
 
@@ -288,6 +289,8 @@ The **minimal** bundle.json is the artifact and the tier, beside at least one re
 {"artifact_id": "<uuid>", "test_type": "regression"}
 {"image": "<repo>@sha256:<digest>", "arch": "s390x", "test_type": "fvt"}
 {"kind": "vllm", "artifact_id": "<uuid>"}
+{"kind": "sendnn", "artifact_id": "<uuid>", "started_at": "2026-10-06T11:56:00Z"}
+{"kind": "benchmarks", "artifact_id": "<uuid>", "test_type": "quality", "component": "spyre-inference"}
 ```
 
 Everything else is optional (`--offline` writes most of it):
@@ -297,7 +300,7 @@ Everything else is optional (`--offline` writes most of it):
 | `schema_version` | 1; a newer version is refused |
 | `artifact_id`, `image` | at least one. The id is tried first, else the image on `arch` (lookup only). Both given: they must name the same artifact. Blank = absent |
 | `arch`, `component` | the artifact's (`component` is a test_case_id input; vllm: `spyre-inference`) |
-| `test_type` | required, except `perf` for `kind: vllm` |
+| `test_type` | required, except `perf` for `kind: vllm` and `kind: sendnn` |
 | `run_key` | `manual:<uploader>:<bundle sha256>`: re-uploading the same content stays one run. `<JOB_NAME>#<BUILD_NUMBER>` (alias `jenkins_run_key`) gets the run_id a connected `v2Results` run of that build gets, and is accepted only from trusted jobs (`Spyre-Test/testing/`) |
 | `files` | `[{path, sha256}]`. When present, every file must be listed and match; when absent, nothing is checked but the bundle sha256 is still recorded |
 | `started_at`, `ended_at` | `--offline` reads the JUnit suite timestamps; otherwise unset |
@@ -315,10 +318,37 @@ run_key that already has another run's or bundle's results. The verdict's `props
 come from it.
 - `test_name` is `<latency|throughput|serve>_<model>_tp<N>_in<N>_out<N>`, as in spyre-inference's
   `vllm-benchmarks/` configs. The mode and shapes are the benchmark's identity, and must agree
-  with `perf` when it gives them.
+  with `perf` when it gives them. A concurrency sweep, `serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>`,
+  also keys `concurrency`, `num_prompts`, `max_model_len` and `max_num_seqs`.
 - The rows are `benchmarks` + `benchmark_runs` (`report_kind=vllm`) and a `perf` / `performance`
   verdict, `perf.state` (default `passed`).
 - `.cmd`/`.log` files in `--vllm-results-dir` go to `attachments/`.
+
+**sendnn bundles** hold the perf suite's `report_sendnn.txt` (single-stack, or merged with
+torch-spyre; the sendnn column is read). No CI leg runs the sendnn stack, so this is its only way in.
+- Each `Op:` / `Granite Config:` section becomes a `benchmark_runs` row on backend `sendnn`, under the
+  same benchmark_id torch-spyre's report.xml gives that op (`sendnn.py`), so the two compare directly.
+- Rows carry `report_kind=perf-suite-sendnn-txt`, `source_file`, `platform` (arch) and `run_utc`
+  (from `started_at`), with a `perf` / `performance` verdict on the artifact.
+
+**benchmarks bundles** hold generic benchmark rows, for producers with no runner format of their
+own: accuracy evals (lm-eval tasks, MTEB, RAG) and other harnesses. Each `results/*.json` is
+`{"benchmarks": [{"name", "props", "backend", "measurements", "iterations", "run_props", "tags"}]}`.
+- `name` and every `props` key are the benchmark's identity; `backend` (spyre, cpu, ...) is the
+  axis two runs of one benchmark compare across, unhashed.
+- `measurements` maps a metric to a number or a list of samples; `iterations` is the n behind a
+  pre-averaged number (e.g. an eval's sample count).
+- `test_type` is `perf` or `quality` (accuracy, kept apart from perf gates) and `component` names
+  the suite's owner. Rows carry `report_kind=benchmarks` and `source_file`, with a
+  `performance` verdict on the artifact. Per-sample outputs belong in `attachments/`: the sealed
+  bundle the verdict links (`bundle_url`) keeps them.
+- Accuracy metrics (`exact_match`, `acc_norm`, `ndcg_at_10`, `spearman`, `rouge*`, ...) are
+  higher-is-better in `benchmark_metric_policy`, advisory.
+
+**An image no pipeline of ours built** (a partner's image, say) has no artifact to attach a
+verdict to. `"create_artifact": {"component": "<owner>", "name": "<optional>"}` with `image` (by
+digest) and `arch` records it as an `upstream` artifact keyed by its digest, when neither field
+names a recorded one; `name` defaults to the image repository's last path segment.
 
 ### Air-gapped flow
 
@@ -338,6 +368,13 @@ SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 python .github/scripts/run_vllm_benchmarks.py
     --configs-dir vllm-benchmarks/benchmarks/spyre --results-dir out ...
 python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --vllm-results-dir out \
     --artifact id:<artifact_id> --arch <arch> --perf head_sha=<spyre-inference sha>
+# sendnn (spyre-perf-suite `run_benchmark.py --stacks sendnn` writes docs/report_sendnn.txt)
+python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --kind sendnn \
+    --sendnn-report docs/report_sendnn.txt --artifact id:<artifact_id> --arch <arch> \
+    --triggered-at <ISO-8601 run time>
+# Generic benchmark rows: an eval harness writes out/*.json as above
+python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --benchmarks-dir out \
+    --artifact id:<artifact_id> --arch <arch> --trigger-type quality --component spyre-inference
 # Connected host
 ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundle.tgz --wait
 ```
@@ -348,7 +385,7 @@ ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundl
 
 ### Uploading by hand
 
-The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/zsp/next/<arch>/v2-results/inbox/<key>/`
+The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/next/<arch>/v2-results/inbox/<key>/`
 on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
 the full path.
 - `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
@@ -364,7 +401,7 @@ after 24 hours is rejected.
 
 ```
 ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
-INBOX=zsp/next/<arch>/v2-results/inbox/<key>
+INBOX=next/<arch>/v2-results/inbox/<key>
 curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
 # a folder, bundle.json last
 (cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
@@ -383,6 +420,14 @@ Within 15 minutes the relay moves the bundle to `v2-results/processed/<key>/...`
 `results --from-bundle` exits `0` ingested or duplicate, `1` failed (retried), `2` rejected,
 `3` incomplete, and prints one JSON line on stdout. With `--dry-run` it runs every check on a
 read-only connection and writes nothing.
+
+### Retracted uploads and the HUD
+
+A retracted dashboard upload leaves every v2 view, which reads `v_artifact_results_published`.
+It does not leave the HUD projection (`schema/70`). Its rows stay in `oss_ci_benchmark_v3`, and in
+`oss_ci_benchmark_v3_by_tag` when it was retracted after a 15-minute refresh appended them. Its
+branch and commit stay in the metadata dropdowns too. The HUD reads these tables with PREWHERE, which
+a view cannot serve, so they cannot be filtered by a view. The follow-up is torch-spyre#5446.
 
 ## What is deliberately NOT here
 

@@ -190,9 +190,13 @@ def test_relayout_solve_presolves_by_default(monkeypatch, priced):
     assert (_copy(result).address is not None) == priced
 
 
-@pytest.mark.parametrize("deterministic,expected_workers", [(False, 96), (True, 1)])
+@pytest.mark.parametrize(
+    "deterministic,num_cpus,expected_workers",
+    # Two counts, so the case cannot pass by detection happening to match one.
+    [(False, 4, 4), (False, 16, 16), (True, 16, 1)],
+)
 def test_relayout_solve_uses_available_parallel_search_workers(
-    monkeypatch, deterministic, expected_workers
+    monkeypatch, deterministic, num_cpus, expected_workers
 ):
     """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
     from ortools.sat.python import cp_model
@@ -203,7 +207,7 @@ def test_relayout_solve_uses_available_parallel_search_workers(
     original = cp_model.CpSolver.Solve
     workers = []
 
-    monkeypatch.setattr(ilp_solver_ortools, "get_cpu_count", lambda: 96)
+    monkeypatch.setattr(config, "num_cpus", num_cpus)
     monkeypatch.setattr(
         ilp_solver_ortools.torch,
         "are_deterministic_algorithms_enabled",
@@ -218,6 +222,118 @@ def test_relayout_solve_uses_available_parallel_search_workers(
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
     _solve(buffers, expr=_objective(buffers))
     assert workers == [expected_workers]
+
+
+def test_cpu_count_setting_overrides_detection(monkeypatch):
+    """A set ``num_cpus`` is returned as is, before any detection runs."""
+    monkeypatch.setattr(config, "num_cpus", 3)
+    assert config.get_cpu_count() == 3
+
+
+def test_cpu_count_detects_when_the_setting_is_unset(monkeypatch):
+    """None means "detect"; a set 0 is not a CPU count either, so it detects the
+    same count, and a patched count lasts only as long as its patch."""
+    monkeypatch.setattr(config, "num_cpus", None)
+    detected = config.get_cpu_count()
+    assert detected >= 1
+    monkeypatch.setattr(config, "num_cpus", 0)
+    assert config.get_cpu_count() == detected
+    monkeypatch.setattr(config, "num_cpus", None)
+    with config.patch(num_cpus=detected + 1):
+        assert config.get_cpu_count() == detected + 1
+    assert config.num_cpus is None
+    assert config.get_cpu_count() == detected
+
+
+def test_num_cpus_stays_out_of_the_inductor_cache_key():
+    """The worker count describes the machine, not the graph: setting it must not
+    change the FX graph cache key, which ``save_config_portable`` of this config
+    module feeds (it is the backend's ``device_custom_config``). A setting that
+    does shape the compile still changes the key, so the config is still in it."""
+
+    def key():
+        return config.save_config_portable(
+            ignore_private_configs=False, readonly_values=True
+        )
+
+    base = key()
+    assert "num_cpus" not in base
+    with config.patch(num_cpus=3):
+        assert key() == base
+    with config.patch(cpsat_time_limit_seconds=config.cpsat_time_limit_seconds + 1):
+        assert key() != base
+
+
+def test_cpu_count_is_read_per_call(monkeypatch):
+    """No cached count: a patched ``num_cpus`` takes effect on the next call."""
+    monkeypatch.setattr(config, "num_cpus", 5)
+    assert config.get_cpu_count() == 5
+    monkeypatch.setattr(config, "num_cpus", 7)
+    assert config.get_cpu_count() == 7
+
+
+@pytest.mark.parametrize(
+    "cpu_max,expected",
+    [
+        ("400000 100000\n", 4),  # a container quota below the host count
+        ("50000 100000\n", 1),  # a fractional quota still gets one worker
+    ],
+)
+def test_cpu_count_detects_the_cgroup_quota(monkeypatch, cpu_max, expected):
+    """Without a setting, the cgroup v2 quota wins over the host's CPU count."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/cpu.max":
+            return io.StringIO(cpu_max)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "num_cpus", None)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(config.os, "cpu_count", lambda: 32)
+    assert config.get_cpu_count() == expected
+
+
+def test_cpu_count_without_a_quota_is_at_least_one(monkeypatch):
+    """An unlimited cgroup (``max``) falls through to the host count, never 0."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/sys/fs/cgroup/cpu.max":
+            return io.StringIO("max 100000\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "num_cpus", None)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert config.get_cpu_count() >= 1
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("", None),
+        ("8", 8),
+        (" 8 ", 8),
+        ("0", None),
+        ("-2", None),
+        ("abc", None),
+    ],
+)
+def test_num_cpus_env_accepts_only_positive_integers(monkeypatch, value, expected):
+    """SPYRE_NUM_CPUS backs ``num_cpus``; anything but a positive integer is None,
+    "detect", as before the setting moved into the config."""
+    if value is None:
+        monkeypatch.delenv("SPYRE_NUM_CPUS", raising=False)
+    else:
+        monkeypatch.setenv("SPYRE_NUM_CPUS", value)
+    assert config._positive_int_env("SPYRE_NUM_CPUS") == expected
 
 
 # ---------------------------------------------------------------------------

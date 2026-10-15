@@ -14,7 +14,7 @@
 
 import torch
 
-from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
 torch.manual_seed(0xAFFE)
 
@@ -25,21 +25,41 @@ d = torch.rand(64, 256, dtype=torch.float16)  # M N
 
 
 def f(a, b, c, d):
-    with spyre_hint(tiles={"K": 2}):
-        with spyre_hint(tiles={"M": 4}):
-            x = a + b
-        y = x @ c
+    # x = a + b, in four tiles along M (a "map": each trip produces a slice of x).
+    def add_body(_, tiles):
+        a_tile, b_tile = tiles
+        return None, a_tile + b_tile
+
+    _, x = for_each_tile(add_body, (a, b), dims=(0, 0), tile_size=16, out_dim=0)
+
+    # y = x @ c, in two tiles along K (a "carry": each trip adds a partial product).
+    def matmul_body(acc, tiles):
+        x_tile, c_tile = tiles
+        return acc + x_tile @ c_tile, None
+
+    y, _ = for_each_tile(
+        matmul_body,
+        (x, c),
+        dims=(1, 0),
+        tile_size=64,
+        init=torch.zeros(64, 256, dtype=x.dtype, device=x.device),
+    )
     return y + d
 
 
-cpu = f(a, b, c, d)
+def reference(a, b, c, d):
+    return (a + b) @ c + d
+
+
+cpu = reference(a, b, c, d)
 
 a_dev = a.to("spyre")
 b_dev = b.to("spyre")
 c_dev = c.to("spyre")
 d_dev = d.to("spyre")
 
-aiu = torch.compile(f)(a_dev, b_dev, c_dev, d_dev).cpu()
+# for_each_tile needs the whole function captured: fullgraph=True.
+aiu = torch.compile(f, fullgraph=True)(a_dev, b_dev, c_dev, d_dev).cpu()
 
 print(cpu)
 print(aiu)

@@ -45,6 +45,7 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
@@ -54,7 +55,12 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
+from for_each_tile_fixtures import (
+    carried_expert_sum_fn,
+    carried_routed_expert_sum_fn,
+)
 from utils_inductor import (
+    opspec_summaries,
     mock_backend_compiler,
     capture_backend_output_dirs,
 )
@@ -381,6 +387,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -410,6 +417,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -508,23 +516,26 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_do_not_create_work_div_hint(self):
+    def test_for_each_tile_does_not_create_work_div_hint(self):
         M, N = 128, 64
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
-        _declare_tensor_dim("M", M)
-        _declare_tensor_dim("N", N)
-        _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}):
-                return torch.abs(x)
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
+            _, out = for_each_tile(body, (x,), dims=(0,), tile_size=M // 4, out_dim=0)
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self.assertFalse(any("user-hint" in msg for msg in self._logs()))
 
@@ -536,7 +547,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_and_work_div_coexist(self):
+    def test_for_each_tile_and_work_div_coexist(self):
         M, N = 128, 128  # N=128 = 2 sticks; work_div={"N": 2} splits into 1 stick/core
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
@@ -544,15 +555,24 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
-                return torch.abs(x)
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
+            with spyre_hint(work_div={"N": 2}):
+                _, out = for_each_tile(
+                    body, (x,), dims=(0,), tile_size=M // 4, out_dim=0
+                )
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self._assert_user_hint_logged()
 
@@ -1650,7 +1670,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
 def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     """Keep the chosen E=2 down->route split while changing only its storage.
 
-    The only hint creates the two-expert loop; there is deliberately no work
+    The only loop is the two-expert for_each_tile; there is deliberately no work
     division hint. The cost model chooses T=4, H=4 and reduction=2 in both
     modes. ON gathers four finished H pieces into each reader's row slice;
     OFF retains the HBM boundary. No change to the chooser is required.
@@ -1671,24 +1691,24 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         .contiguous()
     )
     routes = torch.full((experts, tokens, 1), 0.5, dtype=torch.float16)
-    for name, size in (
-        ("E", experts),
-        ("T", tokens),
-        ("F", intermediate),
-        ("H", hidden),
-        ("R", 1),
-    ):
-        _declare_tensor_dim(name, size)
 
     def fn(activations, weights, routes):
-        with spyre_hint(num_tiles_per_dim={"E": experts}):
-            down = torch.bmm(activations, weights)
-            return down * routes
+        def body(_, ops):
+            act_tile, weight_tile, route_tile = ops
+            return None, torch.bmm(act_tile, weight_tile) * route_tile
+
+        _, out = for_each_tile(
+            body, (activations, weights, routes), dims=(0, 0, 0), tile_size=1, out_dim=0
+        )
+        return out
+
+    def reference(activations, weights, routes):
+        return torch.bmm(activations, weights) * routes
 
     device_args = (
-        _name_tensor_dims(activations.to("spyre"), ["E", "T", "F"]),
-        _name_tensor_dims(weights.to("spyre"), ["E", "F", "H"]),
-        _name_tensor_dims(routes.to("spyre"), ["E", "T", "R"]),
+        activations.to("spyre"),
+        weights.to("spyre"),
+        routes.to("spyre"),
     )
     torch._inductor.codecache.FxGraphCache.clear()
     with (
@@ -1696,11 +1716,16 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         _emitted_kernels() as kernels,
     ):
         actual, _ = run_and_get_code(
-            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            torch.compile(
+                fn,
+                dynamic=False,
+                fullgraph=True,
+                options={"epilogue_fusion": False},
+            ),
             *device_args,
         )
     torch.testing.assert_close(
-        actual.cpu(), fn(activations, weights, routes), rtol=0, atol=0
+        actual.cpu(), reference(activations, weights, routes), rtol=0, atol=0
     )
     specs = [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
     bmm_specs = [spec for spec in specs if spec.op == BATCH_MATMUL_OP]
@@ -2105,6 +2130,81 @@ def test_carried_reduction_after_tiled_pointwise_producer():
 
     torch.testing.assert_close(actual.cpu(), fn(values, routing), atol=0.05, rtol=0.05)
     assert "coarse_tile_reduction_drain" in "\n".join(code)
+
+
+def _assert_lx_resident_carry(code):
+    """The accumulate runs entirely in LX and one copy writes HBM after the loop."""
+    ops = opspec_summaries("\n".join(code))
+    assert ["lx", "lx", "lx"] in [o["allocations"] for o in ops if o["op"] == "add"]
+    assert ["lx", "hbm"] in [o["allocations"] for o in ops if o["op"] == "identity"]
+
+
+@config.patch(
+    {"sencores": 32, "lx_planning": True, "allow_all_ops_in_lx_planning": True}
+)
+def test_for_each_tile_carried_sum_keeps_its_accumulator_in_lx():
+    """A for_each_tile carry sum accumulates in LX and drains to HBM once.
+
+    for_each_tile counterpart of ``test_carried_reduction_stages_compile_to_a_drain``.
+    """
+
+    torch.manual_seed(0)
+    experts, tokens, hidden = 2, 64, 64
+    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
+    for name, size in (("E", experts), ("T", tokens), ("H", hidden)):
+        _declare_tensor_dim(name, size)
+
+    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(
+            lambda v: carried_expert_sum_fn(v, 32),
+            dynamic=False,
+            fullgraph=True,
+            options={"epilogue_fusion": False},
+        ),
+        device_values,
+    )
+
+    torch.testing.assert_close(
+        actual.cpu().float(), values.float().sum(0), atol=0.05, rtol=0.05
+    )
+    _assert_lx_resident_carry(code)
+
+
+@config.patch(
+    {"sencores": 32, "lx_planning": True, "allow_all_ops_in_lx_planning": True}
+)
+def test_for_each_tile_carried_sum_after_relayout_producer():
+    """A tiled operand that is itself a relayout copy still carries in LX.
+
+    for_each_tile counterpart of
+    ``test_carried_reduction_after_tiled_pointwise_producer``.
+    """
+
+    torch.manual_seed(0)
+    experts, tokens, hidden = 2, 64, 64
+    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
+    routing = torch.randn(tokens, experts, 1, dtype=torch.float16) * 0.1
+    for name, size in (("E", experts), ("T", tokens), ("H", hidden)):
+        _declare_tensor_dim(name, size)
+
+    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(
+            lambda v, r: carried_routed_expert_sum_fn(v, r, 32),
+            dynamic=False,
+            fullgraph=True,
+            options={"epilogue_fusion": False},
+        ),
+        device_values,
+        routing.to("spyre"),
+    )
+
+    expected = (values.float() * routing.float().permute(1, 0, 2)).sum(0)
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.05, rtol=0.05)
+    _assert_lx_resident_carry(code)
 
 
 @config.patch(

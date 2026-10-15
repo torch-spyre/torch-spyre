@@ -18,7 +18,21 @@ SELECT * FROM values(
     ('mean_ttft_ms',            'blocking',      false, 5),
     ('mean_tpot_ms',            'blocking',      false, 5),
     ('output_throughput',       'blocking',      true,  5),
-    ('request_throughput',      'advisory',      true,  5)
+    ('request_throughput',      'advisory',      true,  5),
+    -- Accuracy evals (test_type quality): higher is better, unlike the time-like default.
+    ('exact_match',             'advisory',      true,  2),
+    ('acc_norm',                'advisory',      true,  2),
+    ('lm_eval_acc',             'advisory',      true,  2),
+    ('rouge1',                  'advisory',      true,  2),
+    ('rouge2',                  'advisory',      true,  2),
+    ('rougeL',                  'advisory',      true,  2),
+    ('bleu_4',                  'advisory',      true,  2),
+    ('meteor',                  'advisory',      true,  2),
+    ('ndcg_at_10',              'advisory',      true,  2),
+    ('spearman',                'advisory',      true,  2),
+    ('accuracy',                'advisory',      true,  2),
+    ('v_measure',               'advisory',      true,  2),
+    ('retrieval_pct',           'advisory',      true,  2)
 );
 
 -- One row per run x series x metric; a series is (component, benchmark_id, backend, arch,

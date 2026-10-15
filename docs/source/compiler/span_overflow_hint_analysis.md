@@ -65,11 +65,14 @@ selected_host_dim = 1
 split_count       = 5
 ```
 
-Conceptually this is equivalent to:
+Conceptually this is equivalent to tiling the add by hand with `for_each_tile`:
 
 ```python
-with spyre_hint(num_tiles_per_dim={"H": 5}):
-    out = x + y
+def body(_, tiles):
+    x_tile, y_tile = tiles
+    return None, x_tile + y_tile
+
+_, out = for_each_tile(body, (x, y), dims=(1, 1), tile_size=8195 // 5, out_dim=1)
 ```
 
 Code flow:

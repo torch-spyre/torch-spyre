@@ -113,7 +113,7 @@ def test_offline_writes_a_bundle_from_the_usual_flags(tmp_path, capsys):
     assert meta["started_at"] == "2026-10-08T10:00:00Z"
     assert report["run_id"] == RunId.derive("jenkins", meta["run_key"], "s390x", "fvt")
     assert report["upload_path"].startswith(
-        f"zsp/next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
+        f"next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
     )
 
 
@@ -122,7 +122,7 @@ def test_offline_tgz_and_validate_only(tmp_path, capsys):
     assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "valid"
-    assert report["upload_path"].split("/")[5] == "sha256-" + "b6" * 32
+    assert report["upload_path"].split("/")[4] == "sha256-" + "b6" * 32
     assert report["run_key"].startswith("manual:<uploader>:")
 
 
@@ -354,6 +354,21 @@ def test_a_minimal_bundle_takes_arch_component_and_run_key_from_artifact_and_con
     props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
     assert {"source=bundle", "uploader=jdoe", f"bundle_sha256={sha}"} <= props
     assert argv[-1] == "--strict" and "--dry-run" not in argv
+
+
+def test_bundle_props_reach_the_verdict_but_never_replace_the_source_keys(
+    tmp_path, online, capsys
+):
+    root = _minimal(tmp_path)
+    code, report = _ingest(
+        root, capsys, "--uploader", "jdoe", "--bundle-prop", "channel=dashboard",
+        "--bundle-prop", "source=forged", "--bundle-prop", "uploader=someone",
+    )  # fmt: skip
+    assert (code, report["arch"]) == (0, "s390x")
+    argv = online.calls[0]
+    props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
+    assert {"channel=dashboard", "source=bundle", "uploader=jdoe"} <= props
+    assert not {"source=forged", "uploader=someone"} & props
 
 
 def test_a_re_upload_of_the_same_content_is_a_duplicate(tmp_path, online, capsys):
@@ -721,7 +736,7 @@ def test_offline_upload_puts_one_tgz_in_the_inbox(tmp_path, art, capsys):
     assert (code, report["status"]) == (0, "uploaded")
     ((method, path, auth),) = art.cls.seen
     assert path.startswith(
-        f"/artifactory/repo/zsp/next/s390x/v2-results/inbox/{AID}/manual_"
+        f"/artifactory/repo/next/s390x/v2-results/inbox/{AID}/manual_"
     )
     assert path.endswith("-fvt.tgz") and auth == "Bearer tok"
     tgz = tmp_path / "got.tgz"
@@ -769,7 +784,7 @@ def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
     path = _offline(tmp_path, capsys=capsys)
     with offline.opened(path) as root:
         meta, dig = offline.check(root), offline.digest(root)
-    done = f"/artifactory/repo/zsp/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
+    done = f"/artifactory/repo/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
     art.cls.store[done] = b"x"
     art.cls.store[done + ".REJECTED.json"] = json.dumps(
         {"reason": "sha256 mismatch"}

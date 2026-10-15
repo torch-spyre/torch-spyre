@@ -1,12 +1,12 @@
 ---
 name: write-spyre-op-test
-description: "Guide for writing compiled-path operator tests using the ParameterizedTestMeta framework and compare_with_cpu utilities. Use when adding tests for new or existing Spyre ops in tests/_inductor/test_inductor_ops.py."
+description: "Guide for writing compiled-path operator tests using the ParameterizedTestMeta framework and compare_with_cpu utilities. Use when adding tests for new or existing Spyre ops in tests/inductor/test_inductor_ops.py."
 ---
 
 # Writing Compiled-Path Operator Tests
 
 This skill covers the `ParameterizedTestMeta` + `compare_with_cpu` pattern
-used in `tests/_inductor/test_inductor_ops.py` — the standard way to test
+used in `tests/inductor/test_inductor_ops.py` — the standard way to test
 individual operations on the Spyre compiled path. See `test-template.py` in
 this directory for a ready-to-use skeleton.
 
@@ -21,10 +21,10 @@ this directory for a ready-to-use skeleton.
 
 | Test type | File |
 |---|---|
-| Compiled-path op tests | `tests/_inductor/test_inductor_ops.py` |
-| Eager-path op tests | `tests/test_ops.py` |
+| Compiled-path op tests | `tests/inductor/test_inductor_ops.py` |
+| Eager-path op tests | `tests/test_spyre.py` |
 
-All test utilities live in `tests/_inductor/utils_inductor.py`.
+All test utilities live in `tests/inductor/utils_inductor.py`.
 
 ---
 
@@ -176,6 +176,77 @@ make_param_dict([
 
 ---
 
+## Recording Expected Failures
+
+A case that does not work today is recorded as an expectation. It is never recorded by
+calling `pytest.xfail` or by catching the error, because then the body does not run
+and the test can never tell you the problem is gone. The rules are in the
+**Test Invariants** section of `CLAUDE.md`; this section shows how to apply them.
+
+First run the case with the expectation off (`--runxfail`; an OOT-wrapped test still
+reports an xfail, with the original message in `wasxfail`) and see what it does:
+
+| The case... | Record it as |
+|---|---|
+| passes | nothing: remove the entry |
+| raises a stable error (a deliberate rejection, or a missing feature) | `expect_raise` |
+| returns wrong values, or hits a bug | `expect_fail` (strict xfail) as `{case: reason}`, citing an open issue |
+| passes on some runs or some backend builds | `expect_fail_unstable` (non-strict), citing an issue |
+| kills the process or faults the device | `skip` or `device_fault`, citing an issue |
+
+The keys sit next to `param_sets` in `PARAMS`:
+
+```python
+("test_my_op", "test_my_op_base"): {
+    "ops_dict": {...},
+    "param_sets": {...},
+    # {case or "<op>_<case>": message fragment}. Must raise, and the message must
+    # match. Fails if it stops raising ("DID NOT RAISE") or raises something else.
+    "expect_raise": {"fp32_4x32": "cannot rescale device layout"},
+    # {case or "<op>_<case>": reason}. Strict xfail: fails if the case starts passing.
+    # The reason, with the issue, appears in the xfail report. A plain list of cases
+    # also works, but its reason only names the case.
+    "expect_fail": {"fp16_67x71": "wrong values, #1234"},
+    # {case or "<op>_<case>": reason}. Non-strict xfail, for an outcome that varies.
+    "expect_fail_unstable": {"fp16_4x63": "passes on some runs, #5285"},
+},
+```
+
+- A bare case name applies to every op in `ops_dict`; `"<op>_<case>"` to one op.
+- `expect_fail` is strict but cannot narrow the exception with `raises=`, so a failure
+  with a stable error is better as `expect_raise`. An `expect_fail` mapping entry needs
+  a non-empty reason; that is checked when the class is created.
+- `expect_raise` and `expect_fail_unstable` entries that match no generated test, or
+  that also appear under another key, fail when the class is created. A stale
+  `expect_fail` or `skip` entry is silently ignored, so delete entries when you fix
+  a case.
+- When the case is fixed, remove its entry in the same PR. A strict xfail that
+  starts passing fails the run.
+
+For a hand-written test, assert the rejection yourself and tag it so the LX-planning
+suite does not copy it (the rejection happens before the suite's second op is built):
+
+```python
+from utils_inductor import expects_raise
+
+@expects_raise
+def test_cumprod_dim0_rejected(self):
+    # TODO: a missing feature, not a design limit. When aten::cumprod.out is
+    # registered this stops raising, and the test has to become a positive one.
+    x = cached_randn((67, 256), scale=0.1)
+    with pytest.raises(NotImplementedError, match=r"Could not run 'aten::cumprod\.out'"):
+        self.compare_with_cpu(lambda x: torch.cumprod(x, dim=0), x, run_eager=False)
+```
+
+When whether it fails depends on a parameter or a fixture, in a pytest-style test, use
+`strict_xfail(request, raises=<exception type>, reason=...)` from `utils_inductor`.
+
+Also keep the test itself sound: no repeated indices in scatter-like ops, clone
+`cached_randn` results before mutating them, justify a tolerance against an fp32
+reference, and run `make check-all-configs` after adding a test.
+
+---
+
 ## Conventions
 
 - **Default dtype:** `torch.float16`
@@ -190,10 +261,10 @@ make_param_dict([
 
 ```bash
 # All compiled-path tests
-python3 -m pytest tests/_inductor/test_inductor_ops.py
+python3 -m pytest tests/inductor/test_inductor_ops.py
 
 # Single test
-python3 -m pytest tests/_inductor/test_inductor_ops.py -k "test_my_op"
+python3 -m pytest tests/inductor/test_inductor_ops.py -k "test_my_op"
 
 # All tests
 python3 -m pytest tests/

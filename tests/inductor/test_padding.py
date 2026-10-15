@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import pytest
 import sympy
 import torch
 import torch.fx as fx
@@ -40,6 +41,7 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
@@ -886,6 +888,44 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), K)
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile gives a silently wrong result (~64% of elements) for "
+            "a matmul with unaligned K=67 and a loop-invariant weight (#5440)"
+        ),
+    )
+    def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
+        """for_each_tile twin of test_bmm_read_copy_y_unaligned_k_pads.
+
+        x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
+        compiled result is ~64% wrong (max abs error ~2.7e4) although the same
+        graph with K=64 or without the loop is correct, and the hint-driven twin
+        above passes.  Compiling does not fail, so this is a silent wrong answer
+        in the for_each_tile path (#5440).
+        """
+        dtype = torch.float16
+        E, M, K, N = 3, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        x_cpu = torch.randn(E, M, K, dtype=dtype)
+        w_cpu = torch.randn(K, N, dtype=dtype)
+
+        def fn(x, w):
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, torch.matmul(x_tile, w_whole)
+
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.

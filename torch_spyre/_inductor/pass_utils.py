@@ -103,9 +103,11 @@ def register_operation_after_graph_edit(graph: GraphLowering, op: Operation) -> 
     same name.  The scheduler subsequently resolves a dependency to the wrong
     producer (or to one that occurs later) and fails while computing ancestors.
 
-    Keep upstream's naming convention, but find the first name that has never
-    been registered.  Scratchpad edits use this helper because they run late in
-    the lowering pipeline, after graph-pruning passes.
+    Keep upstream's naming convention, but find the first name that is not
+    currently registered.  Most removals keep the removed op in ``name_to_op``,
+    but ``dedup_and_promote_constants`` drops it, so its name can be reissued.
+    Scratchpad edits use this helper because they run late in the lowering
+    pipeline, after graph-pruning passes.
     """
     assert op.operation_name is None, f"Operation registered twice: {op}"
 
@@ -2200,7 +2202,7 @@ def apply_splits_from_index_coeff(
     in either dict default to 1.
     """
     output_coeff_splits, reduction_coeff_splits = coeff_splits
-    result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
+    result: dict[sympy.Symbol, int] = dict.fromkeys(sched_it_space, 1)
     for sym, size in sched_it_space.items():
         # Skip iteration vars with trivial range.  For symbolic ranges we
         # cannot statically determine triviality (and a symbolic size

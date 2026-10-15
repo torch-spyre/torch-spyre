@@ -15,10 +15,10 @@
 """
 Template for writing Spyre compiled-path operation tests.
 
-Copy this file to tests/_inductor/ and rename it. Then:
+Copy this file to tests/inductor/ and rename it. Then:
 1. Replace the op dict and param sets with your operation
 2. Implement the base test functions
-3. Run: python3 -m pytest tests/_inductor/<your_test>.py
+3. Run: python3 -m pytest tests/inductor/<your_test>.py
 """
 
 import unittest
@@ -58,6 +58,13 @@ class TestMyOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # --- Recording a case that does not work today ---
+        # Run the case with the expectation off first (see the write-spyre-op-test
+        # skill and "Test Invariants" in CLAUDE.md), then add the matching key to
+        # the entry above, next to "param_sets":
+        #   "expect_raise": {"case_name": "message fragment"},  # stable rejection
+        #   "expect_fail": {"case_name": "reason, #issue"},  # wrong values or a bug
+        #   "expect_fail_unstable": {"case_name": "reason, #issue"},  # varies
         # --- Example: Concrete test without ops_dict ---
         # Generates: test_my_specific_op_{case_name}
         # ("test_my_specific_op", "test_specific_base"): {

@@ -4,6 +4,9 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
       tests:
+        # Tests that are known to fail or to be rejected still run here as
+        # mandatory_success: their expected outcome (strict xfail with raises=, or an
+        # asserted rejection) is declared on the test itself, so a skip here would hide it.
         - names:
             - TestDataTransfer::test_bf16_compiled_round_trip
             - TestDataTransfer::test_roundtrip_cpu_fp32_spyre_fp16_cpu
@@ -17,27 +20,14 @@ test_suite_config:
             - TestDataTransfer::test_int64_in_range_value_preserved
             - TestDataTransfer::test_int64_out_of_range_truncates_no_exception
             - TestDataTransfer::test_int64_warning_fires_once_per_session
+            - TestDataTransfer::test_compiled_d2h_fp32_to_fp16
+            - TestDataTransfer::test_float_half_methods_on_spyre_tensor
+            - TestDataTransfer::test_compiled_copy_cross_dtype_fp32_to_fp16
           mode: mandatory_success
 
         - names:
             - TestUnsupportedGates::test_h2d_copy_fp64_raises_error
           mode: mandatory_success
-
-        # SKIP #2205 — compiled D2H fp32→fp16: DL16_TO_FP32 arrangement; copy_tensor rejects invalid sizes/stride map
-        - names:
-            - TestDataTransfer::test_compiled_d2h_fp32_to_fp16
-          mode: skip
-
-        # SKIP #2205 #1482 — eager .float()/.half() shortcuts on Spyre tensor
-        - names:
-            - TestDataTransfer::test_float_half_methods_on_spyre_tensor
-          mode: skip
-
-        # SKIP #2852 — cross-dtype copy_() fp32→fp16: no STL candidate for IEEE_FP32→SEN169_FP16
-        - names:
-            - TestDataTransfer::test_compiled_copy_cross_dtype_fp32_to_fp16
-          mode: skip
-
 
   global:
     supported_dtypes:

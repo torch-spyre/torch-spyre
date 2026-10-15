@@ -42,6 +42,27 @@ def _xfail_var_unsupported(request, execution_mode):
         )
 
 
+def _xfail_round_unsupported(request, execution_mode):
+    """Strict xfail for a body that calls ``torch.round`` (#1723).
+
+    Eager has no ``aten::round.out`` kernel; compiled generates a kernel module
+    that is not valid Python, because round has no lowering.
+    """
+    if execution_mode == "eager":
+        strict_xfail(
+            request,
+            NotImplementedError,
+            "aten::round.out has no Spyre kernel (#1723)",
+        )
+    else:
+        strict_xfail(
+            request,
+            torch._inductor.exc.InductorError,
+            "the generated kernel is not valid Python, because round has no "
+            "lowering (#1723)",
+        )
+
+
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
     compare_with_cpu(
         fn,
@@ -361,12 +382,9 @@ class TestNormalizationScalarOperations:
         tol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-3, 1e-2)
         _compare_modes(execution_mode, instancenorm, x, atol=tol[0], rtol=tol[1])
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.xfail(
-        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-    )
-    def test_instancenorm_1d(self, execution_mode):
+    def test_instancenorm_1d(self, request, execution_mode):
         """Test 1D InstanceNorm variant."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-5
 
@@ -378,12 +396,9 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 768, 100), dtype=torch.float32)
         _compare_modes(execution_mode, instancenorm_1d, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-    @pytest.mark.xfail(
-        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-    )
-    def test_instancenorm_3d(self, execution_mode):
+    def test_instancenorm_3d(self, request, execution_mode):
         """Test 3D InstanceNorm variant."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-5
 
@@ -451,12 +466,9 @@ class TestModelScalarOperations:
         )
         _compare_modes(execution_mode, scaled_qk_logits, q, k, atol=1e-1, rtol=1e-1)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
-    @pytest.mark.xfail(
-        reason="Variance (aten::var.correction) operation not implemented"
-    )
-    def test_layernorm_last_dim_eps1e12(self, execution_mode):
+    def test_layernorm_last_dim_eps1e12(self, request, execution_mode):
         """Last-dim layernorm with ``eps=1e-12`` (BERT-like 3D shape); not ``nn.LayerNorm``."""
+        _xfail_var_unsupported(request, execution_mode)
 
         eps = 1e-12
 
@@ -588,10 +600,9 @@ class TestModelScalarOperations:
         x = cached_randn((256, 256))
         _compare_modes(execution_mode, power_of_2_scale, x, atol=1e-3, rtol=1e-2)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
-    def test_symmetric_quantization(self, execution_mode):
+    def test_symmetric_quantization(self, request, execution_mode):
         """Symmetric quantization: round(x / scale) * scale."""
+        _xfail_round_unsupported(request, execution_mode)
 
         scale = 0.1
 
@@ -601,10 +612,9 @@ class TestModelScalarOperations:
         x = cached_randn((256, 256))
         _compare_modes(execution_mode, symmetric_quant, x, atol=0.1, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1723
-    @pytest.mark.xfail(reason="Round (aten::round.out) operation not implemented")
-    def test_asymmetric_quantization(self, execution_mode):
+    def test_asymmetric_quantization(self, request, execution_mode):
         """Test asymmetric quantization pattern."""
+        _xfail_round_unsupported(request, execution_mode)
 
         scale = 0.1
         zero_point = 128.0

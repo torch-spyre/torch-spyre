@@ -176,7 +176,18 @@ def pytest_runtest_makereport(item, call):
             # with no exception ("[XPASS(strict)] ..."). Only a call that raised
             # is an expected failure; leave the XPASS failed.
             raised = call.excinfo is not None
-            if rep.skipped or (rep.failed and raised):
+            # Like pytest's own handling, a failure that is not an instance of the
+            # mark's raises= is a real failure, not an expected one.
+            expected_exc = xfail_mark.kwargs.get("raises")
+            unexpected = (
+                rep.failed
+                and raised
+                and expected_exc is not None
+                and not isinstance(call.excinfo.value, expected_exc)
+            )
+            if unexpected:
+                pass
+            elif rep.skipped or (rep.failed and raised):
                 reason = _extract_failure_message(rep)
                 rep.outcome = "skipped"
                 rep.wasxfail = (

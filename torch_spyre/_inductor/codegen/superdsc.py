@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -263,19 +264,34 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
-_POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+
+_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
+    "max": {
+        DataFormats.SEN169_FP16: _FP16_MIN,
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "min": {
+        DataFormats.SEN169_FP16: _FP16_MAX,
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "exp": {
+        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    },
 }
 
+_POINTWISE_PADDING_OPS: set[str] = {"exp"}
 
-def _get_mask_value(op: str) -> float:
-    if op == "max":
-        return _FP16_MIN
-    if op == "min":
-        return _FP16_MAX
-    if op in _POINTWISE_PADDING_MASK_VALUE:
-        return _POINTWISE_PADDING_MASK_VALUE[op]
-    return 0
+
+def _get_mask_value(
+    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
+) -> float:
+    return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
 def _get_coordinate_mask(
@@ -286,7 +302,7 @@ def _get_coordinate_mask(
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
-    # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
+    # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
     #
     # SAMV coordinate masking is limited to <=16-bit element types by the
     # backend compiler ("Coordinate masking is supported only up to 16bit
@@ -308,7 +324,7 @@ def _get_coordinate_mask(
     # #3290 (padded-stick-state layout enum, the principled replacement for this
     # bandage).
     mask_pointwise = (
-        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+        op in _POINTWISE_PADDING_OPS and arg.data_format != DataFormats.IEEE_FP32
     )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
@@ -1499,7 +1515,7 @@ def _create_sdsc_tensors(
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
-                and dev_dim_size > it_dim_size
+                and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
@@ -1509,8 +1525,12 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
+                # Overlapping views can iterate beyond an aligned physical
+                # axis (e.g. unfold's window is wider than its step). Core
+                # offsets divide this span by the work split, so use the
+                # iteration extent even when it exceeds the device extent.
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
@@ -2078,20 +2098,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
-    # require at least one outer spatial dim beyond the stick; inject a
-    # virtual mb=1 row when the op's tensor has only the stick dim.
+    # A dtype conversion that changes the elements per stick (DL16TOFP32,
+    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
+    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
+    # only the stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
+    changes_stick_width = len(op_spec.args) == 2 and (
+        op_spec.args[0].device_dtype.elems_per_stick()
+        != op_spec.args[1].device_dtype.elems_per_stick()
+    )
     mb_sym: Symbol | None = None
-    if (
-        (
-            DtypeOpTable.is_dtype_op(op_spec.op)
-            or op_spec.op == "qfp8ch"
-            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
-        )
-        and op_spec.op != IDENTITY_OP
-        and (op_dim_order == [] or op_dim_order == [op_stick_dim])
-    ):
+    if changes_stick_width and (op_dim_order == [] or op_dim_order == [op_stick_dim]):
+        assert op_spec.op != IDENTITY_OP and (
+            DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op in ("qfp8ch", "qfp8wt")
+        ), f"{op_spec.op} changes the elements per stick but is not a conversion"
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
@@ -2358,7 +2378,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output

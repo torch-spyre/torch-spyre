@@ -53,23 +53,25 @@ that synthetic tests miss.
 - [ ] Run `pytest -c pytest_models.ini tests/models/test_model_ops.py -k <op_name>`
   where `<op_name>` is the torch op name that is replaced `.` with `_`.
   (e.g. `torch.add` -> `torch_add`)
-- [ ] All tests pass, or failures are in already-known unsupported features.
+- [ ] All tests pass, or failures are in already-known unsupported features. Record
+  such a failure as a test expectation, never with `pytest.xfail(...)`: see
+  "Recording Expected Failures" in the `write-spyre-op-test` skill.
 
 ## 5. Write Tests
 
-- [ ] Add compiled-path test in `tests/_inductor/test_inductor_ops.py`
+- [ ] Add compiled-path test in `tests/inductor/test_inductor_ops.py`
   - [ ] Use `compare_with_cpu()` or `compare()` from `utils_inductor`
   - [ ] Test shapes: 1D, 2D, 3D, 4D
   - [ ] Include stick-aligned (multiples of 64) and non-aligned sizes
   - [ ] Use `torch.float16` as default dtype
-- [ ] Add eager-path test in `tests/test_ops.py` (if op has eager support)
-- [ ] Add building-block test in `tests/_inductor/test_building_blocks.py`
+- [ ] Add eager-path test in `tests/test_spyre.py` (if op has eager support)
+- [ ] Add building-block test in `tests/inductor/test_building_blocks.py`
   (if op is part of a larger module like LayerNorm)
 
 ## 6. Final Checks
 
 - [ ] Run `pre-commit run --all-files`
-- [ ] Run `python3 -m pytest tests/_inductor/test_inductor_ops.py` (at
+- [ ] Run `python3 -m pytest tests/inductor/test_inductor_ops.py` (at
   minimum)
 - [ ] Verify Apache 2.0 license headers on all new/modified files
 - [ ] Use `import regex` not `import re` in any new Python files

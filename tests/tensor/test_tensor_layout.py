@@ -16,7 +16,6 @@
 
 import copy
 import pickle
-import unittest
 
 import torch
 from torch.testing._internal.common_utils import (
@@ -516,9 +515,6 @@ class TestSpyreTensorLayout(TestCase):
         x_dev = x_sliced.to("spyre")
         self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
 
-    @unittest.skip(
-        "Skip until device transfers are updated to account for overlapping tensors"
-    )
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [

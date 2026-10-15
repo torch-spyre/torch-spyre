@@ -53,6 +53,28 @@ runs:
               sed -i "s|^  { path = \"\.\./pytorch\", editable = false },|#  { path = \"../pytorch\", editable = true },|" pyproject.toml; \
               mv uv.lock.bak uv.lock' EXIT
 
+        # Cap build parallelism to this pod's CPU quota. ninja/cpp_extension
+        # size themselves off os.cpu_count() (the NODE's 192 cores), not this
+        # pod's 9.375-core quota, and ~192 concurrent compile/link jobs
+        # OOM-kill the pod at its memory limit (exit 137) -- issue #5384.
+        #
+        # This must come BEFORE the first uv sync below, not after it. #5385
+        # added the cap further down, past both syncs, so every compile this
+        # step runs still inherited MAX_JOBS unset: measured on a live runner,
+        # MAX_JOBS was unset at every level from the step shell down to
+        # cc1plus, with 193 concurrent cc1plus and memory.peak 4 KB under the
+        # 136.5 GiB limit. Same probe as build-torch-spyre-wheel (#3207).
+        MAX_JOBS="$(nproc)"
+        if [[ -f /sys/fs/cgroup/cpu.max ]]; then
+          read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+          if [[ "$cpu_quota" != "max" ]]; then
+            MAX_JOBS=$(( cpu_quota / cpu_period ))
+            [[ "$MAX_JOBS" -lt 1 ]] && MAX_JOBS=1
+          fi
+        fi
+        export MAX_JOBS
+        echo "MAX_JOBS $MAX_JOBS"
+
         # Install build dependencies without installing the project, required
         # for --no-build-isolation to work properly.
         uv sync --active --inexact --no-install-project --extra build
@@ -74,6 +96,7 @@ runs:
         # warning-as-error workaround, CMAKE_PREFIX_PATH) so that rebuild
         # succeeds too.
         export CXX="$(command -v c++)"
+
         CMAKE_PREFIX_PATH="${TORCH_SPYRE_DIR}/.venv" \
         USE_CUDA=0 \
         CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
