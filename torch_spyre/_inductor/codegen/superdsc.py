@@ -1590,7 +1590,8 @@ def _create_sdsc_tensors(
             offsets[matmul_n_dim] = 0
             max_dim_sizes[matmul_n_dim] = -1
 
-        effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
+        real_stick = op_stick_dim if stick_dim is None else stick_dim
+        effective_stick = [real_stick]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
         # Special handling for QFP8WT KERNEL tensors.
@@ -1605,8 +1606,21 @@ def _create_sdsc_tensors(
         ):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
-            # Use the last two dimensions from dim_order for 2D stick
-            effective_stick = dim_order[-2:]
+            # The 2D stick packs 2 values of the weight's K dim against 64 of
+            # its N (stick) dim, so stickDimOrder_ is [K, N] with the real
+            # stick dim last. K comes from the host layout (arg.qfp8wt_k_dim),
+            # since neither dim_order nor the iteration space identifies it:
+            # a batch dim can sit where K would be, and a view can reorder the
+            # iteration space.
+            companion = None
+            if arg.qfp8wt_k_dim is not None:
+                companion = symbol_mapping.get(arg.qfp8wt_k_dim, arg.qfp8wt_k_dim)
+            if companion is not None and companion in dim_order:
+                effective_stick = [companion, real_stick]
+            else:
+                # K not identifiable (e.g. a rank-1 weight): keep the
+                # positional behaviour.
+                effective_stick = dim_order[-2:]
 
         if has_indirect_access:
             label = get_indirect_layout_label(

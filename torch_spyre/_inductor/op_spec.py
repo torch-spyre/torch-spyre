@@ -268,6 +268,13 @@ class TensorArg:
             buffer reads it. The KTIR plan-time fuser deletes a producer op only
             for such a buffer; only the scheduler can see a buffer's users, so
             it is filled there and defaults to False.
+        qfp8wt_k_dim: For a QFP8WT (2D-stick) tensor, the iteration symbol
+            indexing the K dim of its [K, N] stick -- host dim -2, since
+            propagate_layouts._qfp8wt_stl always builds the stick from the
+            last two host dims. Filled in create_tensor_arg, where the host
+            layout is still available; SDSC codegen sees only device_size and
+            device_coordinates, in which K is indistinguishable from a batch
+            dim. None for every other element arrangement.
         replicated_scalar: True when EVERY element of this buffer's device
             allocation holds the same value, so a reader may take any element
             and get the scalar. Only a producer knows this, which is why it
@@ -294,6 +301,7 @@ class TensorArg:
     )
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
+    qfp8wt_k_dim: Symbol | None = None
     replicated_scalar: bool = False
 
 

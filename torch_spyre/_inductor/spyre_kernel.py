@@ -73,7 +73,9 @@ from .pass_utils import (
     alignment_coordinates,
     per_trip_index,
 )
-from .views import align_tensors, tiling_expr_to_device_expr
+
+# from .views import align_tensors, tiling_expr_to_device_expr
+from .views import align_tensors, compute_coordinates, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
@@ -885,6 +887,24 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
+
+        # A QFP8WT weight's 2D stick is [K, N] = its last two *host* dims.
+        # Record K's iteration symbol here; codegen cannot recover it later.
+        qfp8wt_k_dim = None
+        if (
+            tensor.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+            and len(tensor.layout.size) >= 2
+        ):
+            host_coords = compute_coordinates(
+                [concretize_expr(s) for s in tensor.layout.size],
+                [concretize_expr(s) for s in tensor.layout.stride],
+                it_space,
+                base_index,
+            )
+            k_free = host_coords[-2].free_symbols
+            if len(k_free) == 1:
+                qfp8wt_k_dim = next(iter(k_free))
+
         work_division = work_division_from_view(
             tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
             tensor.layout.device_layout.device_size,
@@ -903,6 +923,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
             kernel_local=kernel_local,
+            qfp8wt_k_dim=qfp8wt_k_dim,
             replicated_scalar=replicated_scalar,
         )
         if (
@@ -1759,6 +1780,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             if arg.element_arrangement != ElementArrangement.STANDARD:
                                 buf.writeline(
                                     f"element_arrangement={arg.element_arrangement},"
+                                )
+                            if arg.qfp8wt_k_dim is not None:
+                                buf.writeline(
+                                    f"qfp8wt_k_dim={sympy_str(arg.qfp8wt_k_dim)},"
                                 )
                             if arg.work_division is not None:
                                 splits = ", ".join(
