@@ -131,6 +131,7 @@ from for_each_tile_fixtures import (
     paged_gather_nested_reference,
     paged_gather_reference,
     scatter_carry_fn,
+    scatter_carry_old_value_fn,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
     split_k_caller_init_fn,
@@ -148,7 +149,13 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from utils_inductor import cached_randn, cached_xavier, dl16_round, opspec_summaries
+from utils_inductor import (
+    cached_randn,
+    cached_xavier,
+    dl16_round,
+    expects_raise,
+    opspec_summaries,
+)
 
 
 def _with_dynamo_reset(test_fn):
@@ -242,7 +249,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             )
             with (
                 self.subTest(rows=rows, inner=inner, transpose_source=transpose_source),
-                config.patch(backend_loop_unroll=False),
+                config.patch(
+                    backend_loop_unroll=False, lx_planning=True, hbm_pool_planning=True
+                ),
                 warnings.catch_warnings(),
                 torch.inference_mode(),
             ):
@@ -263,14 +272,14 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         ]
                     )
                     initial = torch.full((6 * rows, *inner), 3.0, dtype=torch.float16)
-                    expected = initial.clone()
-                    acc = torch.zeros_like(values[0])
+                    expected = initial.float()
+                    acc = torch.zeros_like(values[0], dtype=torch.float32)
                     for value, ids in zip(values, indices):
                         acc = acc + value
                         source = acc.permute(2, 0, 1) if transpose_source else acc
                         expected.index_copy_(0, ids, source)
-                    # Each visit's int32 sticks must be adjacent. The default
-                    # interleaved table layout does not walk the second stick.
+                    # Each visit's int32 sticks must be adjacent. Codegen's
+                    # _check_indirect_index_step rejects an interleaved row.
                     index_layout = SpyreTensorLayout(
                         device_size=[4, rows // 32, 32],
                         stride_map=[rows, 32, 1],
@@ -287,8 +296,97 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                     actual = compiled(*inputs).cpu()
                     if case:
                         self.assertEqual(counters["stats"]["unique_graphs"], before)
-                    torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.02)
+                    # DL16 has nine fraction bits. Four small inputs accumulate
+                    # on device versus fp32 here; the absolute budget covers
+                    # input/add rounding near cancellation, with 2% relative
+                    # tolerance for nonzero sums. Wrong rows differ by much more.
+                    torch.testing.assert_close(
+                        actual.float(), expected, atol=0.005, rtol=0.02
+                    )
                     torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
+
+    @expects_raise
+    def test_scatter_carry_rejects_interleaved_multi_stick_indices(self):
+        from torch._inductor.exc import InductorError
+
+        values = torch.zeros(4, 64, 64, dtype=torch.float16).to(DEVICE_NAME)
+        indices = torch.arange(256, dtype=torch.int32).reshape(4, 64).to(DEVICE_NAME)
+        initial = torch.zeros(256, 64, dtype=torch.float16).to(DEVICE_NAME)
+        with config.patch(backend_loop_unroll=False), torch.inference_mode():
+            compiled = torch.compile(scatter_carry_fn, fullgraph=True, dynamic=False)
+            with self.assertRaisesRegex(
+                InductorError, "index rows require adjacent physical sticks"
+            ):
+                compiled(values, indices, initial)
+
+    def test_scatter_carry_preserves_old_value_read_after_update(self):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        values = (
+            torch.arange(4, dtype=torch.float16)
+            .view(4, 1, 1)
+            .expand(4, 32, 64)
+            .contiguous()
+            / 8
+        )
+        indices = torch.stack([torch.arange(32) + 16 * i for i in range(4)])
+        initial = torch.full((96, 64), 0.25, dtype=torch.float16)
+        expected = initial.float()
+        old_sums = []
+        for value, ids in zip(values, indices):
+            old_sums.append(expected.sum(dim=0))
+            expected.index_copy_(0, ids, value.float())
+
+        for lx_planning, row_outermost in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with (
+                self.subTest(lx_planning=lx_planning, row_outermost=row_outermost),
+                config.patch(
+                    backend_loop_unroll=False,
+                    lx_planning=lx_planning,
+                    hbm_pool_planning=True,
+                ),
+                torch.inference_mode(),
+                warnings.catch_warnings(),
+            ):
+                warnings.simplefilter("error", FallbackWarning)
+                torch._dynamo.reset()
+                compiled = torch.compile(
+                    scatter_carry_old_value_fn, fullgraph=True, dynamic=False
+                )
+                # Exercise both a directly indexable destination and the
+                # default layout, which needs full-buffer relayout copies.
+                layout_kwargs = (
+                    {
+                        "device_layout": SpyreTensorLayout(
+                            device_size=[96, 1, 64],
+                            stride_map=[64, 64, 1],
+                            device_dtype=get_device_dtype(torch.float16),
+                        )
+                    }
+                    if row_outermost
+                    else {}
+                )
+                inputs = (
+                    values.to(DEVICE_NAME),
+                    indices.int().to(DEVICE_NAME),
+                    initial.to(DEVICE_NAME, **layout_kwargs),
+                )
+                actual, sums = compiled(*inputs)
+                # Binary fractions keep both the copied rows and the old-value
+                # reductions exactly representable in DL16 and fp32.
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    sums.cpu().float(), torch.stack(old_sums), atol=0, rtol=0
+                )
+                torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
 
     def test_computed_where_condition_in_broadcast_tile(self):
         from torch_spyre._inductor.wsr.for_each_tile import for_each_tile

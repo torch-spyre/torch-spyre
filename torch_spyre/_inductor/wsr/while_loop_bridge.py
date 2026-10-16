@@ -1042,7 +1042,7 @@ def _rewire_accumulator_output(
     from torch._inductor import ir
 
     from torch_spyre._inductor.pass_utils import (
-        _identity_load,
+        identity_load,
         redirect_computed_buffer_reads,
     )
 
@@ -1086,12 +1086,15 @@ def _rewire_accumulator_output(
     if len(updates) == 1 and isinstance(updates[0].data, ir.Scatter):
         # A private carry needs no full clone before an index_copy scatter
         # when the clone preserves every address, size, stride and offset.
-        identity = _identity_load(producer)
+        # splice_while_loop snapshots later old-value readers first. Require
+        # exclusive placeholder readership here too, so this local elision
+        # never introduces an unprotected read-after-write.
+        identity = identity_load(producer)
         body_graph = while_op.body_subgraph.graph
         placeholder_name = list(body_graph.graph_inputs)[binding.carry_index]
         placeholder_layout = body_graph.graph_inputs[placeholder_name].get_layout()
         clone_layout = producer.get_layout()
-        update_layout = updates[0].layout.real_layout()
+        update_layout = updates[0].layout.target.get_layout()
         if (
             identity is not None
             and identity[0] == placeholder_name
@@ -1099,8 +1102,14 @@ def _rewire_accumulator_output(
             and clone_layout.size == placeholder_layout.size == update_layout.size
             and clone_layout.stride == placeholder_layout.stride == update_layout.stride
             and clone_layout.offset == placeholder_layout.offset == update_layout.offset
-            and clone_layout.dtype == placeholder_layout.dtype
+            and clone_layout.dtype == placeholder_layout.dtype == update_layout.dtype
             and identity[1] == placeholder_layout.make_indexer()(identity[2])
+            and updates[0].layout.make_indexer()(identity[2]) == identity[1]
+            and all(
+                _operation_reads_buffer(op, placeholder_name) is False
+                for op in body_ops
+                if op is not producer
+            )
         ):
             body_ops = [op for op in body_ops if op is not producer]
             producer = updates[0]
@@ -1119,6 +1128,9 @@ def _rewire_accumulator_output(
     # same recursive view/box unwrapping used when resolving mutation storage.
     storage = mutation_layout.get_buffer()
     storage_name = storage.get_name()
+    # LoopCarryRecord opts full-buffer accumulators into LX residency. A
+    # scatter must retain its whole destination in HBM, including untouched
+    # rows; ordinary mutation dependencies carry its lifetime across trips.
     if not partial_update:
         record = LoopCarryRecord(
             storage_name=storage_name,

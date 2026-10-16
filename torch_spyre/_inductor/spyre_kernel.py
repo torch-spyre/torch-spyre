@@ -878,7 +878,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         return tensor_arg
 
     def _check_indirect_index_step(self, idx_arg: TensorArg) -> None:
-        """Refuse an indirect index whose per-trip advance is sub-stick.
+        """Require aligned starts and adjacent sticks in counted-loop index rows.
 
         Scoped to indirect index operands: their per-trip start must remain
         stick-aligned. Reuses ``coeff_through_floor`` on
@@ -894,6 +894,25 @@ class SpyreKernel(Kernel[CSEVariable]):
         expr = idx_arg.device_tile_advance_expr
         if expr is None:
             return
+        # The indirect row walker advances through adjacent physical sticks.
+        # An interleaved trip/batch axis between the row's outer-stick and
+        # inner-stick axes introduces a gap that the walker does not encode.
+        coords = idx_arg.device_coordinates
+        if coords:
+            for axis, coord in enumerate(coords[:-1]):
+                for symbol in coord.free_symbols & coords[-1].free_symbols:
+                    if any(
+                        size != 1 and symbol not in middle.free_symbols
+                        for size, middle in zip(
+                            idx_arg.device_size[axis + 1 : -1],
+                            coords[axis + 1 : -1],
+                        )
+                    ):
+                        raise Unsupported(
+                            "counted-loop indirect index rows require adjacent "
+                            "physical sticks; put the trip/batch axes outside "
+                            "all index-row axes in SpyreTensorLayout"
+                        )
         # Read the index's committed device format rather than assuming int32
         # (same query as pass_utils' dev_layout.device_dtype.elems_per_stick()).
         elems_per_stick = idx_arg.device_dtype.elems_per_stick()

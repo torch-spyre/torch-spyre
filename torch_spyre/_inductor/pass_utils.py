@@ -762,7 +762,7 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     return True
 
 
-class _IdentityLoadRecorder(DefaultHandler):
+class IdentityLoadRecorder(DefaultHandler):
     """Recognize a Pointwise body that returns exactly one load.
 
     ``WhileLoop.create`` uses such bodies to repair an input's strides before
@@ -783,7 +783,7 @@ class _IdentityLoadRecorder(DefaultHandler):
         return self.value
 
 
-def _identity_load(
+def identity_load(
     op: Operation,
 ) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]] | None:
     """Return the sole load performed by a pure pointwise identity.
@@ -800,7 +800,7 @@ def _identity_load(
         sympy.Symbol(f"_fet_identity_i{i}", integer=True)
         for i in range(len(op.data.ranges))
     )
-    recorder = _IdentityLoadRecorder()
+    recorder = IdentityLoadRecorder()
     try:
         with V.set_ops_handler(recorder):
             result = op.data.inner_fn(indices)
@@ -816,7 +816,10 @@ def _identity_load(
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
-    """Read scatter index dependencies through the indexer, including wrapped ones."""
+    """Read scatter index dependencies through the indexer, including wrapped ones.
+
+    Requires an active ``V.graph``: indirect indexers consult its ``sizevars``.
+    """
     from torch._inductor.dependencies import extract_read_writes
 
     if not isinstance(op.data, Scatter):
@@ -1870,11 +1873,13 @@ def iter_var_id(stick_expr) -> int:
 
 
 def _scatter_iteration_space(rw: ReadWrites) -> dict[sympy.Symbol, sympy.Expr]:
-    # With loop merging disabled, the longest dependency range retains the
+    # _SpyreWrapperCodegenMixin._patch_sizevars installs noop_simplify_loops_impl;
+    # without loop merging, the longest dependency range retains the
     # value/index axes hidden by an indirect store.
     return max(
         (dep.ranges for dep in rw.reads_and_writes() if isinstance(dep, MemoryDep)),
         key=len,
+        default={},
     ).copy()
 
 

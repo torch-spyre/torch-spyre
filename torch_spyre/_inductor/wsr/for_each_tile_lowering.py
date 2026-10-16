@@ -98,7 +98,7 @@ from torch._inductor.virtualized import V
 from .. import timing_recorder
 from ..deadcode_elimination import deadcode_elimination
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import _identity_load, format_operations
+from ..pass_utils import identity_load, format_operations
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -2324,7 +2324,7 @@ def _contract_cross_scope_input_materializations(
         identities = {
             op.get_name(): identity
             for op in operations
-            if (identity := _identity_load(op)) is not None
+            if (identity := identity_load(op)) is not None
         }
         roots = [
             name
@@ -2687,7 +2687,7 @@ def _contract_exact_stride_input_materializations(
         identities = {
             op.get_name(): identity
             for op in operations
-            if (identity := _identity_load(op)) is not None
+            if (identity := identity_load(op)) is not None
         }
         if not identities:
             continue
@@ -2983,7 +2983,7 @@ def _contract_exact_stride_input_materializations(
     identities = {
         op.get_name(): identity
         for op in operations
-        if (identity := _identity_load(op)) is not None
+        if (identity := identity_load(op)) is not None
     }
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)

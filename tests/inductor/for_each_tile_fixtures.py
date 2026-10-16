@@ -1390,6 +1390,19 @@ def scatter_carry_fn(values, indices, output, *, transpose_source=False):
     return result
 
 
+def scatter_carry_old_value_fn(values, indices, output):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(dst, tiles):
+        value, ids = tiles
+        new = dst.index_copy(0, ids[0], value[0])
+        return new, dst.sum(dim=0).unsqueeze(0)
+
+    return for_each_tile(
+        body, (values, indices), dims=(0, 0), tile_size=1, init=output, out_dim=0
+    )
+
+
 # ---------------------------------------------------------------------------
 # Graph-shape fixtures: for_each_tile bodies that interact with other passes
 # (restickify, views, broadcast, outside consumers, E-tiled matmul, carried

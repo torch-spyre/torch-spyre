@@ -183,6 +183,17 @@ def test_scatter_iteration_space_preserves_indirect_axes(indexed_axis, normalize
         assert len(next(iter(rw.writes)).ranges) == 2
 
 
+def test_scatter_iteration_space_without_memory_deps():
+    from torch._inductor.dependencies import ReadWrites
+
+    rw = ReadWrites(
+        reads=OrderedSet([StarDep("destination")]),
+        writes=OrderedSet([WeakDep("mutation", "buffer")]),
+        index_exprs=OrderedSet(),
+    )
+    assert pass_utils._scatter_iteration_space(rw) == {}
+
+
 def test_reduction_iteration_space_ignores_weak_dependencies(monkeypatch):
     """Mutation ordering edges describe no loop dimensions."""
 
