@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -25,6 +25,8 @@ class LoadedCase:
     defaults: Dict[str, Any]
     case: Dict[str, Any]
     source_path: Path
+    # Top-level "dtypes" entries: [{name: <dtype>, precision: {atol, rtol}}, ...]
+    dtypes: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def models_dir(pytest_root: Path) -> Path:
@@ -108,12 +110,19 @@ def load_all_cases(pytest_root: Path) -> List[LoadedCase]:
             raise ValueError(f"Failed to parse YAML file: {p}") from e
         model = spec.get("model", p.stem)
         defaults = dict(spec.get("defaults", {}))
+        dtypes = list(spec.get("dtypes") or [])
         for case in spec.get("cases", []):
             # allow "cases" to omit "op" if the YAML provides a top-level op (optional)
             if "op" not in case and "op" in spec:
                 case = dict(case)
                 case["op"] = spec["op"]
             items.append(
-                LoadedCase(model=model, defaults=defaults, case=case, source_path=p)
+                LoadedCase(
+                    model=model,
+                    defaults=defaults,
+                    case=case,
+                    source_path=p,
+                    dtypes=dtypes,
+                )
             )
     return items
