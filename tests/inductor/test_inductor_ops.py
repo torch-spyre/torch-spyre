@@ -9641,6 +9641,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # backend cannot mask that (#5285), so dbo-opt rejects it. Compiled, the
         # softmax ops are no longer pinned by the padding's offset write, so the
         # co-optimizing allocator divides them over batch and heads instead.
+        # #5285 is still open for the compiled path: it passes only because of
+        # that choice, so this case does not catch a plan that splits the token
+        # dim again.
         with (
             pytest.raises(
                 Exception,

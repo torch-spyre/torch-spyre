@@ -22,6 +22,7 @@ import subprocess
 import sys
 import types
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
@@ -1906,6 +1907,19 @@ class TestSympyExprToCpSatPrinter(TestCase):
             # The single-menu table fits, but multiplying its wide integer
             # by z does not. The original factored terms still fit the bound.
             sympy.Piecewise((80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)) * z,
+            # The same overflow under a Piecewise the table cannot absorb (its
+            # guard reads the free residency flag): the untabled retry has to
+            # re-lower the Piecewise, not reuse its tabled lowering.
+            sympy.Piecewise(
+                (
+                    sympy.Piecewise(
+                        (80_000_000 * x, x <= 2), (80_000_000 * x + 1, True)
+                    ),
+                    resident > 0,
+                ),
+                (0, True),
+            )
+            * z,
             sympy.Piecewise(
                 (0.25 * x * y, sympy.And(x >= 2, y >= 2)),
                 (1e-6 * x**2, sympy.Or(x <= 1, y <= 1)),
@@ -2522,6 +2536,43 @@ class SolveStatsTest(TestCase):
         with config.patch({"_cpsat_warn_on_cost_expr": True}):
             solver.plan_layout_and_core_divisions(unlowerable)
         self.assertFalse(solver.last_solve_stats["objective_used"])
+
+    @staticmethod
+    def _stopped_solver(status, limit_s):
+        """A solver stub whose ``Solve`` returns ``status`` after 2.5 s, as one
+        stopped by its time limit would, without waiting for a real timeout."""
+        stub = unittest.mock.MagicMock()
+        stub.Solve.return_value = status
+        stub.WallTime.return_value = 2.5
+        stub.StatusName.return_value = cp_model.CpSolver().StatusName(status)
+        stub.parameters.max_time_in_seconds = limit_s
+        return stub
+
+    def test_a_solve_stopped_by_the_limit_warns(self):
+        """FEASIBLE under a limit means the search stopped before proving the
+        optimum. Each stage gets the whole budget, so without the warning a
+        slow compile gives no hint that raising the limit may help."""
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        stub = self._stopped_solver(cp_model.FEASIBLE, 2.0)
+        with self.assertLogs(
+            "torch_spyre._inductor.scratchpad.ilp_solver_ortools", "WARNING"
+        ) as logs:
+            solver._solve_and_record(stub, cp_model.CpModel(), stage="parallelism")
+        (message,) = logs.output
+        self.assertIn("parallelism solve hit the 2s time limit", message)
+        self.assertIn("CPSAT_TIME_LIMIT_SECONDS", message)
+        self.assertEqual(solver.last_solve_stats["status"], "FEASIBLE")
+
+    def test_an_unlimited_or_proven_solve_does_not_warn(self):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        for status, limit_s in [(cp_model.OPTIMAL, 2.0), (cp_model.FEASIBLE, 0.0)]:
+            with self.subTest(status=status, limit_s=limit_s):
+                with self.assertNoLogs(
+                    "torch_spyre._inductor.scratchpad.ilp_solver_ortools", "WARNING"
+                ):
+                    solver._solve_and_record(
+                        self._stopped_solver(status, limit_s), cp_model.CpModel()
+                    )
 
 
 class TestCpSatUnallocatedReads(TestCase):

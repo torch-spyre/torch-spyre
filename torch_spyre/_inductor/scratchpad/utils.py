@@ -513,7 +513,11 @@ def ops_in_offset_mutation_component(
             successors.setdefault(dep.name, set()).add(op.name)
         layout = getattr(op, "layout", None)
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
-            target = layout.target.get_name()
+            # MutationLayoutSHOULDREMOVE's constructor already resolves this
+            # name (to mark the buffer mutated) and asserts that the target
+            # unwraps to a Buffer, so it cannot fail here. get_buffer() also
+            # sees through the ReinterpretView of a sliced target.
+            target = layout.get_buffer().get_name()
             successors.setdefault(op.name, set()).add(target)
             successors.setdefault(target, set()).add(op.name)
 

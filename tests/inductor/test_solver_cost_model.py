@@ -26,6 +26,7 @@ and the clone's one load is priced separately, outside the readers' bundle turna
 No Spyre device or backend compiler is required; features are built directly.
 """
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 
@@ -367,10 +368,15 @@ def test_the_clone_in_saves_the_turnaround_its_readers_no_longer_pay():
     # read/write turnaround. Measured on device (x*2 + x*3, x = 16 MiB): 417 us
     # without the clone, 222 us with it -- one read plus one write at the peak rate.
     p = CostParams()
-    hbm = [_reader("C", "buf1"), _reader("D", "buf2")]
+    # On all 32 cores, as measured: a one-core reader would also pay the
+    # low-core pointwise rate on the load the clone removes.
+    hbm = [
+        dataclasses.replace(_reader("C", "buf1"), cores=32),
+        dataclasses.replace(_reader("D", "buf2"), cores=32),
+    ]
     lx = [
-        _reader("C", "buf1", resident={"arg0_1"}),
-        _reader("D", "buf2", resident={"arg0_1"}),
+        dataclasses.replace(_reader("C", "buf1", resident={"arg0_1"}), cores=32),
+        dataclasses.replace(_reader("D", "buf2", resident={"arg0_1"}), cores=32),
     ]
     # Each reader writes BYTES to HBM, so min(R, W) is the one load of the input.
     saved = p.rw_turnaround_ns_per_byte * BYTES

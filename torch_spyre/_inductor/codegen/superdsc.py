@@ -1530,6 +1530,32 @@ def _create_sdsc_tensors(
                 #
                 if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
+                elif (
+                    dim is not stick_dim
+                    and dim not in reduced_dims
+                    and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
+                    and dim_coord.subs(symbol_mapping) == dim
+                    and dim_coord in op_spec.iteration_space
+                    and -(-it_dim_size // int(op_spec.iteration_space[dim_coord][1]))
+                    <= dev_dim_size
+                ):
+                    # Keep the per-core extent guard above in sync with
+                    # work_division_constraints.overlapping_window_split_domains.
+                    # An overlapping read (``x.unfold(d, 4, 2)``: device row
+                    # ``2*w + k``) gives the window variable a device dimension
+                    # smaller than its range; it spills into the next outer
+                    # dimension. The backend lays dimensions out by iteration
+                    # extent, so shrink this one back to its physical size with
+                    # a negative backGap, or every outer stride is scaled by
+                    # it/dev. Only when the work division leaves at most
+                    # ``dev_dim_size`` values per core (see
+                    # overlapping_window_split_domains): the backend also caps
+                    # in-core iteration at the layout extent, so no core
+                    # iterates into the gap (issue #5347). Otherwise the
+                    # division pins the overlapping outer variable to one value
+                    # per core instead and the iteration-extent layout is
+                    # already exact.
+                    backGap[dim] = dev_dim_size - it_dim_size
                 # Overlapping views can iterate beyond an aligned physical
                 # axis (e.g. unfold's window is wider than its step). Core
                 # offsets divide this span by the work split, so use the

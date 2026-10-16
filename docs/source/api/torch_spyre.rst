@@ -729,8 +729,10 @@ Environment Variables
      - Use the co-optimizing LX allocator strategy (default ``1``)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
      - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
-       disables the limit). Applies separately to each optimization phase.
-       A timeout may return a feasible plan without proving optimality.
+       disables the limit). Applies to the cost-objective solve, or to each
+       stage of the fallback lexicographic ladder separately. A solve that
+       stops at the limit returns a feasible plan not proven optimal and logs
+       a warning.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)

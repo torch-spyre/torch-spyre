@@ -218,13 +218,12 @@ def test_arithmetic_transport_replaces_the_general_read_burst_charge(cores):
     assert cm._transport_dma_excess_ns([op], p) == pytest.approx(expected)
     assert cm._read_burst_excess_ns([op], p) == 0
 
-    # Without transport geometry, the general burst path retains its calibrated
-    # counts only. The arithmetic extension at 22 cores is an explicit assumption.
+    # Without transport geometry, the general burst path prices the same read
+    # by the same law: 22 cores take the 16-core rate there too (an
+    # uncalibrated count priced at zero was the cheapest short-burst read).
     general = replace(op, transport_read_run_bytes=None, transport_tile_elems=None)
     assert cm._transport_dma_excess_ns([general], p) == 0
-    assert cm._read_burst_excess_ns([general], p) == pytest.approx(
-        expected if cores == 16 else 0
-    )
+    assert cm._read_burst_excess_ns([general], p) == pytest.approx(expected)
 
 
 def test_a_mixed_bundle_prices_only_the_arithmetic_read_at_an_uncalibrated_count():

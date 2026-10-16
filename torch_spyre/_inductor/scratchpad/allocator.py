@@ -1277,8 +1277,10 @@ class ScratchpadAllocator:
         }
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
-        target = getattr(getattr(op, "origin_node", None), "target", None)
-        if target is None:
+        # Only the origin check remains from the old tag test. It keeps ops
+        # with no FX origin target ineligible for in-place reuse, as they were
+        # when the tag decided.
+        if getattr(getattr(op, "origin_node", None), "target", None) is None:
             return []
         # A pointwise ATen target can consume a transposed/broadcast view after
         # lowering. Its tag does not prove element-for-element storage reuse.

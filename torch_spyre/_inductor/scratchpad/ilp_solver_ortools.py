@@ -107,6 +107,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import cache
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 import numpy as np
 import sympy
@@ -192,6 +193,36 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     model.add_allowed_assignments([src_div, dst_div], compatible).only_enforce_if(
         enforce_lit
     )
+
+
+def _is_hbm_term(expr):
+    """``c * is_hbm_X`` if ``expr`` is exactly ``c - c*is_lx_X`` for a
+    number ``c``, else None."""
+    if not expr.is_Add or len(expr.args) != 2:
+        return None
+    c, term = expr.args
+    if not c.is_Number:
+        c, term = term, c
+    if not c.is_Number:
+        return None
+    coeff, s = term.as_coeff_Mul()
+    if not (s.is_Symbol and s.name.startswith("is_lx_") and coeff == -c):
+        return None
+    hbm = sympy.Symbol(
+        "is_hbm_" + s.name.removeprefix("is_lx_"), integer=True, nonnegative=True
+    )
+    return c * hbm
+
+
+def _is_literal(arg) -> bool:
+    """Whether ``arg`` is a CP-SAT variable or a negated boolean literal."""
+    return isinstance(arg, (cp_model.IntVar, cp_model_helper.NotBooleanVariable))
+
+
+def _is_bool_literal(arg) -> bool:
+    if isinstance(arg, cp_model_helper.NotBooleanVariable):
+        return True
+    return isinstance(arg, cp_model.IntVar) and arg.is_boolean
 
 
 def _eq_fact(rel):
@@ -645,7 +676,6 @@ class _SympyExprToCpSat(Printer):
         self._expr_cache: dict = {}
         self._untabled_expr_cache: dict = {}
         self._conjunction_cache: dict = {}
-        self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
         super().__init__()
 
@@ -659,18 +689,14 @@ class _SympyExprToCpSat(Printer):
             )
         return self._expr_cache[expr]
 
-    def _candidate_values(self, expr):
+    @memoize_method
+    def _evaluate_candidates(self, expr):
         """Evaluate an expression over at most one buffer's division menu.
 
         Residency and other free decisions stop evaluation at that node. Work
         on the rewritten expression, including its reciprocal/log scales and
         Min/Max rounding, so tabulation does not change the cost model.
         """
-        if expr not in self._candidate_cache:
-            self._candidate_cache[expr] = self._evaluate_candidates(expr)
-        return self._candidate_cache[expr]
-
-    def _evaluate_candidates(self, expr):
         if expr in (sympy.true, sympy.false):
             return None, bool(expr)
         if expr.is_Number:
@@ -711,7 +737,7 @@ class _SympyExprToCpSat(Printer):
             if expr.is_Piecewise
             else expr.args
         )
-        evaluated = [self._candidate_values(arg) for arg in args]
+        evaluated = [self._evaluate_candidates(arg) for arg in args]
         if any(value is None for value in evaluated):
             return None
         owners = [value[0] for value in evaluated if value[0] is not None]
@@ -747,8 +773,11 @@ class _SympyExprToCpSat(Printer):
             return None
         return owner, result
 
-    def _division_table(self, expr):
-        evaluated = self._candidate_values(expr)
+    def _division_table(self, expr, levels=False):
+        """``expr`` over one buffer's divisions as an ``add_element`` table,
+        or None. With ``levels``, a table too wide for that falls back to
+        :meth:`_level_expr` instead of None."""
+        evaluated = self._evaluate_candidates(expr)
         if evaluated is None:
             return None
         owner, values = evaluated
@@ -769,12 +798,12 @@ class _SympyExprToCpSat(Printer):
             return raw[0]
         table = tuple(v // divisor for v in differences)
         if max(table) > _MAX_PRODUCT_BOUND:
-            return None
+            return self._level_expr(owner, raw) if levels else None
         scale = Fraction(divisor, denominator)
         offset = int(base) if base.denominator == 1 else float(base)
         coefficient = int(scale) if scale.denominator == 1 else float(scale)
         if Fraction(offset) != base or Fraction(coefficient) != scale:
-            return None
+            return self._level_expr(owner, raw) if levels else None
         key = owner.division.index, table
         if key not in self._division_table_cache:
             var = self._model.new_int_var_from_domain(
@@ -793,6 +822,67 @@ class _SympyExprToCpSat(Printer):
         logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
         return self._print(cost_expr)
 
+    def _level_expr(self, wrapper, values):
+        """``values[division]`` as an exact linear expression: the minimum of
+        ``values``, plus each higher level's excess on one literal for "the
+        division is in this level" (:meth:`_level_literal`). A buffer takes
+        exactly one division, so the expression equals the table for every
+        assignment, and a residency factor gates one product per level rather
+        than one per division. Unlike the ``add_element`` table it needs no
+        common integer scale, so it takes float prices such as a burst price,
+        whose branch-by-branch lowering was about 10k of a GPT-2 prefill
+        graph's 19k variables, with an LP relaxation weak enough that CP-SAT
+        stopped FEASIBLE at its 30 s limit."""
+        # Prices equal in exact arithmetic can come out an ulp apart along
+        # different branches; 12 significant digits makes them one level (one
+        # literal) and moves no price by more than 1e-12 of itself.
+        values = [
+            int(v) if isinstance(v, Integral) else float(f"{v:.12g}") for v in values
+        ]
+        base = min(values)
+        levels: dict[float, list[int]] = {}
+        for index, value in enumerate(values):
+            if value > base:
+                levels.setdefault(value - base, []).append(index)
+        expr = base
+        for extra, indices in levels.items():
+            expr += extra * self._level_literal(wrapper, indices)
+        return expr
+
+    def _level_literal(self, wrapper, indices):
+        """A literal true exactly when ``wrapper`` takes one of the divisions
+        ``indices``: that division's literal for one index, else a variable
+        equal to the sum of their literals (at most one holds). Built on the
+        ``division == i`` literals, which CP-SAT recognises as the encoding of
+        the division and relates in its LP relaxation; enforced domain
+        constraints would leave the levels free there. Shared between tables
+        over the same buffer, so their gated products are too."""
+        if len(indices) == 1:
+            return self._division_is(wrapper, indices[0])
+        division = wrapper.division
+        suffix = "_".join(map(str, indices))
+        # Keyed by the selector's model index, like the products in
+        # _print_multiply; the variable keeps the readable name.
+        key = f"_level_{division.index}_{suffix}"
+        if key not in self._sym_map:
+            lit = self._model.new_bool_var(f"level_{division.name}_{suffix}")
+            self._model.add(lit == sum(self._division_is(wrapper, i) for i in indices))
+            self._sym_map[key] = lit
+        return self._sym_map[key]
+
+    def _division_is(self, wrapper, index):
+        """The literal ``division == index``: the buffer's own, or one made
+        here for an owner that only exposes ``division``."""
+        if hasattr(wrapper, "division_is"):
+            return wrapper.division_is(index)
+        key = f"_division_is_{wrapper.division.index}_{index}"
+        if key not in self._sym_map:
+            lit = self._model.new_bool_var(f"{wrapper.division.name}_is_{index}")
+            self._model.add(wrapper.division == index).only_enforce_if(lit)
+            self._model.add(wrapper.division != index).only_enforce_if(lit.Not())
+            self._sym_map[key] = lit
+        return self._sym_map[key]
+
     def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
         """The symbolic rewrites that bring ``cost_expr`` into the form the
         printer lowers: floors dropped, logs of Min/Max pushed inside, split
@@ -803,6 +893,11 @@ class _SympyExprToCpSat(Printer):
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
+        )
+        # `c - c*is_lx_X` -> `c*is_hbm_X`, so that expand keeps the HBM charge
+        # as one term gated by the complement literal.
+        cost_expr = cost_expr.replace(
+            lambda e: _is_hbm_term(e) is not None, _is_hbm_term
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
@@ -1125,12 +1220,12 @@ class _SympyExprToCpSat(Printer):
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
             return a * b
+        if _is_literal(a) and _is_literal(b):
+            return self._print_multiply([a, b])
         if isinstance(a, cp_model_helper.NotBooleanVariable):
             return b - self._print_multiply_two(a.Not(), b)
         if isinstance(b, cp_model_helper.NotBooleanVariable):
             return self._print_multiply_two(b, a)
-        if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
-            return self._print_multiply([a, b])
         if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
             return (
                 a.coefficient * self._print_multiply_two(a.expression, b) + a.offset * b
@@ -1151,20 +1246,21 @@ class _SympyExprToCpSat(Printer):
         raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
 
     def _print_multiply(self, args):
-        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
-        nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        ints = [arg for arg in args if _is_literal(arg)]
+        nonints = [arg for arg in args if not _is_literal(arg)]
         if len(ints) == 1:
             return self._print_multiply_two(math.prod(nonints), ints[0])
         elif len(ints) == 0:
             return math.prod(nonints)
 
         # Names need not be unique: in particular, both Boolean constants
-        # have an empty name. Cache by the variables' actual model identity.
+        # have an empty name. Cache by the variables' actual model identity
+        # (a negated literal's index is negative, so it differs too).
         name = "_product_" + "_".join(str(arg.index) for arg in ints)
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        if any(arg.is_boolean for arg in ints):
+        if any(_is_bool_literal(arg) for arg in ints):
             product = self._print_gated_product(ints, name)
             self._sym_map[name] = product
             return self._print_multiply_two(math.prod(nonints), product)
@@ -1202,8 +1298,8 @@ class _SympyExprToCpSat(Printer):
         otherwise, two linear constraints enforced on the literal (as in
         ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
         the solver can only propagate through bounds."""
-        gates = [arg for arg in ints if arg.is_boolean]
-        rest = [arg for arg in ints if not arg.is_boolean]
+        gates = [arg for arg in ints if _is_bool_literal(arg)]
+        rest = [arg for arg in ints if not _is_bool_literal(arg)]
         if not rest:
             value, gates = gates[0], gates[1:]
         elif len(rest) == 1:
@@ -1227,6 +1323,12 @@ class _SympyExprToCpSat(Printer):
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
             return self._sym_map[expr.name]
+        if expr.name.startswith("is_hbm_"):
+            # The complement of `is_lx_X` (see _is_hbm_term): its negated
+            # literal, so no variable or linking constraint is added.
+            in_buffer = "is_lx_" + expr.name.removeprefix("is_hbm_")
+            if in_buffer in self._sym_map:
+                return self._sym_map[in_buffer].Not()
         if not expr.name.startswith(("log2_", "inv_")):
             raise NotImplementedError(f"not implemented. expr: {expr}")
         name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
@@ -1343,8 +1445,18 @@ class _SympyExprToCpSat(Printer):
         self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
         return or_var
 
-    @memoize_method
+    # Not memoized, unlike the condition printers: ``_print`` already caches
+    # each expression once per table mode, and a method-level cache would hand
+    # the untabled retry in ``_print_Mul`` a lowering built from wide tables,
+    # so the retry would overflow again. A condition lowers to a literal either
+    # way, so sharing those across modes adds no product terms.
     def _print_Piecewise(self, expr):
+        # Over one buffer's divisions but too wide for an exact table: a
+        # linear form over the division literals, not a literal per branch.
+        if self._allow_tables:
+            table = self._division_table(expr, levels=True)
+            if table is not None:
+                return table
         args = expr.args
         assert args[-1][1] == sympy.true
         result = 0
@@ -1376,6 +1488,8 @@ class _SympyExprToCpSat(Printer):
     def _affine_bounds(expr):
         if isinstance(expr, cp_model.IntVar):
             lb, ub = expr.domain.min(), expr.domain.max()
+        elif isinstance(expr, cp_model_helper.NotBooleanVariable):
+            lb, ub = 0, 1
         elif isinstance(expr, (int, float)):
             lb, ub = expr, expr
         elif isinstance(expr, cp_model_helper.IntAffine):
@@ -1891,9 +2005,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         *,
         objective: bool = False,
+        stage: str = "cost objective",
     ) -> int:
         """Solve, and stash what it cost and returned for the cost-expression
         dump. The one way this class solves.
+
+        A solve that stops at the time limit with an incumbent returns
+        FEASIBLE: a plan, but not a proven optimum. That is logged, because
+        each stage gets the whole budget and a slow compile would otherwise
+        give no hint that raising ``CPSAT_TIME_LIMIT_SECONDS`` may help.
 
         Recording is bound to solving rather than left to each call site:
         ``_run`` solves in its own occupancy passes when
@@ -1907,12 +2027,23 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         slow" currently has no artifact behind it.
         """
         status = solver.Solve(model)
+        limit_s = solver.parameters.max_time_in_seconds
+        if status == cp_model.FEASIBLE and limit_s:
+            logger.warning(
+                "[CP-SAT layout solver] the %s solve hit the %gs time limit "
+                "(%.2fs) and returned a feasible plan not proven optimal; raise "
+                "CPSAT_TIME_LIMIT_SECONDS (0 disables it) for a better plan at "
+                "the cost of compile time",
+                stage,
+                limit_s,
+                solver.WallTime(),
+            )
         self.last_solve_stats = {
             "status": solver.StatusName(status),
             "solve_s": round(solver.WallTime(), 3),
             "variables": len(model.proto.variables),
             "constraints": len(model.proto.constraints),
-            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "limit_s": limit_s or None,
             "objective_used": objective,
         }
         return status
@@ -1983,7 +2114,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         occupancy: Optional[int] = None
 
         def _solve_stage(stage: str) -> int:
-            result = self._solve_and_record(solver, model)
+            result = self._solve_and_record(solver, model, stage=stage)
             if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(result)} without a plan "

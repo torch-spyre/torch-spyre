@@ -408,9 +408,9 @@ Where it does not apply:
   ops with proven geometry use that term too, in any bundle, looped or not; the
   general read-burst term then declines them to avoid a second request charge.
   This arithmetic extension uses the per-trip footprint and the rate at the largest
-  calibrated core count at or below the choice. At an uncalibrated count this adds
-  pricing where the general burst term charged zero. A matmul never enters the
-  transport term.
+  calibrated core count at or below the choice. The general burst term prices its
+  reads by the same law and the same rate rule, so an uncalibrated count is priced
+  there too. A matmul never enters the transport term.
 
 The report has no menu, so the delivery estimate is absent there and the report charges
 the whole request excess. Two things are assumptions, not measurements: the rate at core
