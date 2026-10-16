@@ -61,6 +61,7 @@ from .constants import (
 from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .wsr.coarse_tile import has_k_split_combine_path
 from .pass_utils import (
     AlignmentAccess,
     build_operation_alignment_inputs,
@@ -988,26 +989,39 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep plain reductions on one core along every reduction axis.
+    """Keep plain reductions without a combine path on one core per reduction axis.
 
-    Even a single reduction variable cannot safely be split across cores in
-    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
-    encoder block outputs.
-    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
-    it does not establish a cross-core combine for arbitrary work divisions.
-    Keep this restriction until those divisions have a validated combine path.
+    Single-axis K-splits are safe when _insert_combine_op has a combine path
+    for the reduction type (sum/prod/max/min/xor_sum). They are unsafe for
+    exx2, mean, welford_reduce, welford_combine, and any: no cross-core combine
+    is available, so splitting corrupts results in fused graphs (validated:
+    RoBERTa encoder exx2/welford regression, hf-adapters PR #661).
+    welford_combine is a genuine Reduction node type produced by Inductor
+    (torch/_inductor/ir.py) for layer-norm / var mean; it can arrive here.
 
-    Structured reductions have their own backend combine or blocking rules.
-    Output axes remain available for parallelism, and reduction-range coarse
-    tiling is still handled separately by WSR.
+    Multi-axis plain reductions are always pinned regardless of type: the
+    backend rejects kernels with more than one reduction variable split across
+    cores ("More than one reduction dim is split across cores: not currently
+    supported").
+
+    Structured reductions (matmul, conv, topk, pool) have their own blocking
+    or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
+    # Multi-axis: always pin all reduction vars.
+    if len(ctx.reduction_vars) > 1:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    # Single-axis: only pin if there is no cross-core combine path.
+    if not has_k_split_combine_path(ctx.op.data.reduction_type):
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:

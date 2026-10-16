@@ -4373,6 +4373,30 @@ def _rescale_index(
 # ---------------------------------------------------------------------------
 
 
+# Reduction types for which _insert_combine_op has a working cross-core combine
+# path AND which plain_reduction_k_split_domains is allowed to K-split single-axis.
+# Types excluded from this set are pinned to split=1 by that constraint.
+#
+# BATCH_MATMUL_OP is excluded: caught by _STRUCTURED_REDUCTION_TYPES in
+# work_division_constraints.py before reaching plain_reduction_k_split_domains.
+# "any" is excluded: _insert_combine_op has a branch for it but it calls
+# vops.logical_or which is not yet in SpyreOpFuncs, so K-splitting would
+# silently produce wrong results — keep it pinned until that gap is closed.
+# "xor_sum" is included: the combine path (vops.bitwise_xor) is correct in
+# principle, but spyre_kernel.py currently returns UnimplementedOp for xor_sum,
+# so this path is untested end-to-end. The kernel gate fires before any wrong
+# results could occur; include it here so the constraint is not the blocker
+# once the kernel gap is closed.
+_COMBINE_OP_REDUCTION_TYPES: frozenset[str] = frozenset(
+    {"sum", "prod", "max", "min", "xor_sum"}
+)
+
+
+def has_k_split_combine_path(reduction_type: str) -> bool:
+    """Return True if _insert_combine_op can cross-core combine this reduction type."""
+    return reduction_type in _COMBINE_OP_REDUCTION_TYPES
+
+
 def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
@@ -4420,6 +4444,17 @@ def _insert_combine_op(
     from torch._inductor.virtualized import ops as vops
 
     reduction_type = tiled_op.data.reduction_type
+    # "any" has a branch below but is not in _COMBINE_OP_REDUCTION_TYPES
+    # (vops.logical_or not yet in SpyreOpFuncs); BATCH_MATMUL_OP is caught
+    # by _STRUCTURED_REDUCTION_TYPES before plain_reduction_k_split_domains.
+    assert (
+        reduction_type in _COMBINE_OP_REDUCTION_TYPES
+        or reduction_type == BATCH_MATMUL_OP
+        or reduction_type == "any"
+    ), (
+        f"_insert_combine_op: unsupported reduction_type {reduction_type!r} — "
+        f"add it to _COMBINE_OP_REDUCTION_TYPES"
+    )
     partial_loader = tiled_op.make_loader()
     accum_loader = accum_buf.make_loader()
 
