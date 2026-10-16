@@ -53,7 +53,7 @@ from .op_spec import IndirectAccess
 from .pass_utils import (
     AlignmentAccess,
     _build_indirect_store_subs,
-    _find_scatter_index_buf_names,
+    _scatter_index_buf_names_ordered,
     build_operation_alignment_inputs,
     concretize_expr,
     indirect_info_from_op,
@@ -117,7 +117,7 @@ def _scatter_access_subs_and_sizes(
     Returns ({sym: IndirectAccess(...)}, {sym: size}).
     """
 
-    store_subs, _ = _build_indirect_store_subs(scatter_op)
+    store_subs = _build_indirect_store_subs(scatter_op)
 
     # Extract the actual scatter index symbols from write_dep.index.
     # These are symbols that appear in the write but NOT in write_dep.ranges.
@@ -305,7 +305,7 @@ def _materialize_unaligned_scatter_source(
     # pair a scatter symbol with its real index buffer.  Also exclude index
     # tensors recovered directly from the Scatter closure so they are never
     # mistaken for a source candidate.
-    index_names = index_names | _find_scatter_index_buf_names(op)
+    index_names = index_names | set(_scatter_index_buf_names_ordered(op))
     # A fused Scatter retains no distinguished source edge.  Its remaining
     # direct reads are therefore candidates, not assumptions: accept one only
     # when substituting its dense layout makes the complete alignment valid.

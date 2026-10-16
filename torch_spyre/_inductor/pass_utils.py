@@ -831,15 +831,10 @@ def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
     return names
 
 
-def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in scatter output_indexer."""
-    return set(_scatter_index_buf_names_ordered(op))
-
-
 def _build_indirect_store_subs(
     op: ComputedBuffer,
-) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
-    """Map indirect symbols in scatter writes to (IndexedBase subs, sizes).
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Map indirect symbols in scatter writes to IndexedBase subs.
 
     For Scatter ops, the scatter indices are loop vars in write_dep.index.
     Identify which loop vars come from scatter index buffers by extracting
@@ -870,7 +865,7 @@ def _build_indirect_store_subs(
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
     if not writes:
-        return {}, None
+        return {}
     write_dep = writes[0]
 
     # Extract scatter index symbols (symbols in write_dep.index not in loop
@@ -881,8 +876,7 @@ def _build_indirect_store_subs(
     scatter_index_syms = all_write_syms - loop_syms
 
     if not scatter_index_syms:
-        # No scatter symbols found.
-        return {}, None
+        return {}
 
     # Try to map scatter symbols to index buffers from the closure.
     index_buf_names = _scatter_index_buf_names_ordered(op)
@@ -929,7 +923,7 @@ def _build_indirect_store_subs(
                 index_buf_names,
             )
         if subs:
-            return subs, None
+            return subs
 
     # Fallback: if we couldn't extract index buffer names from the closure,
     # create placeholder subs so that scatter_access_subs can be built.
@@ -944,7 +938,7 @@ def _build_indirect_store_subs(
     # Return None, matching indirect_info_from_op's documented convention:
     # sizes=None tells compute_coordinates to skip unknown symbols silently
     # rather than raising Unsupported or misreading a fabricated size.
-    return subs, None
+    return subs
 
 
 def indirect_info_from_op(
@@ -967,25 +961,18 @@ def indirect_info_from_op(
 
     # For scatter ops, extract info from the write side instead of reads.
     if isinstance(op.data, Scatter):
-        subs, sizes = _build_indirect_store_subs(op)
-        scatter_names: set[str] = set()
-        for expr in subs.values():
-            if hasattr(expr, "base") and hasattr(expr.base, "name"):
-                scatter_names.add(expr.base.name)
-        access_subs = {
-            sym: IndirectAccess(sympy.Symbol(expr.base.name))
-            for sym, expr in subs.items()
-            if hasattr(expr, "base")
-        }
-        return scatter_names, access_subs, sizes
-
-    # For gather and other ops, use the read side.
-    subs, sizes = _build_indirect_load_subs(op)
-    names: set[str] = {expr.base.name for expr in subs.values()}
-    names |= _find_scatter_index_buf_names(op)
-    access_subs = {
-        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
-    }
+        subs = _build_indirect_store_subs(op)
+        eff = _effective_output_layout(op)
+        write = next(iter(op.get_read_writes().writes))
+        sizes: dict[Any, int] | None = indirect_store_sizes(write, eff)
+    else:
+        subs, sizes = _build_indirect_load_subs(op)
+    names: set[str] = set()
+    access_subs = {}
+    for sym, expr in subs.items():
+        if hasattr(expr, "base") and hasattr(expr.base, "name"):
+            names.add(expr.base.name)
+            access_subs[sym] = IndirectAccess(sympy.Symbol(expr.base.name))
     return names, access_subs, sizes
 
 
@@ -1163,13 +1150,27 @@ def indirect_access_subs_from_op(
     writes). Returns substitutions that mark these dimensions with IndirectAccess
     so the work division planner knows not to split them incorrectly.
 
-    Uses indirect_info_from_op() for the load side (already returns IndirectAccess
-    markers), then merges scatter store-side subs via _build_indirect_store_subs.
+    Uses indirect_load_subs_from_op for the load side, then merges scatter
+    store-side subs via _build_indirect_store_subs.
     """
-    _, load_subs, _ = indirect_info_from_op(op)
-    store_subs_raw, _ = _build_indirect_store_subs(op)
-    store_subs = _wrap_indirect_subs(store_subs_raw)
+    load_subs, _ = indirect_load_subs_from_op(op)
+    store_subs = indirect_store_subs_from_op(op)
+
     return {**load_subs, **store_subs}
+
+
+def indirect_load_subs_from_op(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Find indirect accesses in scatter writes only.
+
+    This is the write-only version of `indirect_access_subs_from_op`. Marks
+    the scatter destination's row dimension as IndirectAccess so it stays at a
+    shared base address across cores (same treatment as gather value tables).
+    Returns empty for non-scatter operations.
+    """
+    load_subs_raw, sizes = _build_indirect_load_subs(op)
+    return _wrap_indirect_subs(load_subs_raw), sizes
 
 
 def indirect_store_subs_from_op(
@@ -1182,7 +1183,7 @@ def indirect_store_subs_from_op(
     shared base address across cores (same treatment as gather value tables).
     Returns empty for non-scatter operations.
     """
-    store_subs_raw, _ = _build_indirect_store_subs(op)
+    store_subs_raw = _build_indirect_store_subs(op)
     return _wrap_indirect_subs(store_subs_raw)
 
 
@@ -1730,9 +1731,8 @@ def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     # (indirect_sizes), not the IndirectAccess marker map. Compute the coordinates
     # with the raw indirect symbol treated as a normal loop var, then xreplace the
     # subs to mark the runtime-chosen row.
-    subs = indirect_access_subs_from_op(op)
+    subs, ind_sizes = indirect_load_subs_from_op(op)
     if subs:
-        ind_sizes = indirect_sizes_from_op(op)
         for d in op.get_read_writes().reads:
             if isinstance(d, MemoryDep) and d.is_indirect():
                 layout = _fixed_read_layout(V.graph.get_buffer(d.name))

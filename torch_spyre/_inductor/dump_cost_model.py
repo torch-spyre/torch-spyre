@@ -1245,7 +1245,7 @@ def _indirect_write_elems(op, out_elems: int) -> int | None:
         # A slot chosen separately for each column breaks contiguous rows.
         # The existing helper's unresolved placeholders still contain tmpN;
         # require actual index loads expressed in known loop variables.
-        slots, _ = _build_indirect_store_subs(op)
+        slots = _build_indirect_store_subs(op)
         for symbol in dep.index.free_symbols - set(dep.ranges):
             load = slots.get(symbol)
             if not isinstance(load, sympy.Indexed):
