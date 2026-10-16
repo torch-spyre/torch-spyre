@@ -27,7 +27,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
-from . import pass_counters, timing_recorder
+from . import pass_counters
 from .constants import DEVICE_NAME
 
 

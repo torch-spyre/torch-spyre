@@ -37,23 +37,24 @@ a 534x ratio below any useful threshold.
 Bounds are calibrated on the two graphs below rather than on the sweep, because
 the sweep measures the pre-scheduling pipeline over model shapes while these
 tests count a whole ``torch.compile`` of a small graph. Measured per operation
-(``_calibrate``, torch 2.13 on a Spyre pod):
+(``_calibrate``, torch 2.13 and torch-spyre main ``c30e6bc0`` on a Spyre pod):
 
 =================  ====  ========  ============  ==================  ========
 workload            ops    misses   extractions  device coordinates  requests
 =================  ====  ========  ============  ==================  ========
-matmul_chain          4      1.50        102.00               31.00    203.25
-elementwise_chain    32      1.03        107.03               26.81    214.31
+matmul_chain          4      1.50        135.50               52.50    270.50
+elementwise_chain    32      1.03        149.00               52.13    282.78
 =================  ====  ========  ============  ==================  ========
 
 Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
 and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
 not float on the shell's environment.
 
-The sweep's figures over 4,443 operations counted at pre-scheduling-pipeline
-entry -- 1.32 misses, 90.7 extractions, 39.1 device coordinates, 705.9 requests
-per operation -- agree on everything except requests, which are far lower here
-because a four-operation graph gives later passes little to re-ask about.
+At the first calibration (main ``1a56c846``), the sweep's figures over 4,443
+operations counted at pre-scheduling-pipeline entry -- 1.32 misses, 90.7
+extractions, 39.1 device coordinates, 705.9 requests per operation -- agreed on
+everything except requests, which are far lower here because a four-operation
+graph gives later passes little to re-ask about.
 
 ``matmul_chain``'s 1.50 misses per operation is a small-N artifact: six misses
 over four operations. The bound holds anyway, and the second workload at 32
@@ -83,13 +84,14 @@ WORKLOADS = ("matmul_chain", "elementwise_chain")
 #: Measured 1.03-1.50 here, 1.32 on the sweep, against a cold-cache floor of 1.0.
 MAX_MISSES_PER_OP = 4.0
 #: Per workload, because this is the bound a bypass has to breach and a single
-#: figure covering both has to sit above the looser one. Measured 102.00 and
-#: 107.03; 1.27x headroom, which is what it takes to catch the 11-site bypass
-#: in the test plan (133.25 and 165.97). A counter this reproducible -- 0.03%
+#: figure covering both has to sit above the looser one. Measured 135.50 and
+#: 149.00; each bound sits midway to what bypassing the memo at the 12
+#: ``op_read_writes(op)`` sites in ``scratchpad/utils.py`` measures (166.25 and
+#: 207.94), so it catches that bypass. A counter this reproducible -- 0.03%
 #: p90 across the sweep -- can carry a tight bound; a legitimate change that
 #: breaches it should re-measure and move it rather than widen it blindly.
-MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 130.0, "elementwise_chain": 135.0}
-#: Measured 27-31 here, 39.1 on the sweep. Unmemoized, so the count is the work.
+MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 150.0, "elementwise_chain": 175.0}
+#: Measured 52-53 here. Unmemoized, so the count is the work.
 MAX_DEVICE_COORDS_PER_OP = 100.0
 
 
@@ -151,7 +153,7 @@ def _counted_compile(fn, args) -> tuple[dict[str, int], int]:
         patch.object(passes, "CustomPreSchedulingPasses", _Capturing),
         torch._inductor.config.patch({"force_disable_caches": True}),
         # Which passes run, and how much each does, comes from the environment.
-        # A bound with 1.27x headroom cannot float on whatever SENCORES or
+        # A bound with 1.1-1.2x headroom cannot float on whatever SENCORES or
         # LAYOUT_SOLVER the shell happens to export, so pin the four that matter
         # to the values the calibration was taken at.
         ts_inductor_config.patch("sencores", 32),
@@ -176,15 +178,16 @@ class TestFrontendWorkBounds(TestCase):
     #: shape -> (counter deltas, operations). Cold compiles are expensive.
     _measured: dict[str, tuple[dict[str, int], int]] = {}
 
-    @classmethod
-    def _counts(cls, shape: str) -> tuple[dict[str, int], int]:
-        if shape not in cls._measured:
-            cls._measured[shape] = _counted_compile(*_workload(shape))
-        deltas, ops = cls._measured[shape]
-        assert ops, (
+    def _counts(self, shape: str) -> tuple[dict[str, int], int]:
+        if shape not in self._measured:
+            self._measured[shape] = _counted_compile(*_workload(shape))
+        deltas, ops = self._measured[shape]
+        self.assertGreater(
+            ops,
+            0,
             f"PRECONDITION: the pre-scheduling pipeline never ran for {shape}, "
             "so nothing was counted -- most likely a cache hit. Not a work "
-            "regression."
+            "regression.",
         )
         return deltas, ops
 
@@ -219,8 +222,8 @@ class TestFrontendWorkBounds(TestCase):
         ``ComputedBuffer.get_read_writes`` only: the scheduler extracts directly
         in ``SchedulerNode._compute_attrs``, and so do several ``ir.py`` classes.
 
-        Scope, measured rather than claimed: bypassing 11 call sites in
-        ``scratchpad/utils.py`` raises this 31% on ``matmul_chain`` and 55% on
+        Scope, measured rather than claimed: bypassing 12 call sites in
+        ``scratchpad/utils.py`` raises this 23% on ``matmul_chain`` and 40% on
         ``elementwise_chain``, which the bound catches. Bypassing a *single* site
         moves it by a few percent and no bound with usable headroom would see it.
         This guards wholesale memo failure and multi-site drift, not one call.

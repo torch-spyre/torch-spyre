@@ -116,6 +116,19 @@ class TestCountingRegion:
         assert ComputedBuffer.get_read_writes is original
         assert not COUNTERS.enabled
 
+    def test_exit_keeps_a_wrapper_installed_inside_the_region(self) -> None:
+        original = ComputedBuffer.get_read_writes
+
+        def other(self):
+            return "other"
+
+        try:
+            with pass_counters.counting():
+                ComputedBuffer.get_read_writes = other  # type: ignore[method-assign]
+            assert ComputedBuffer.get_read_writes is other
+        finally:
+            ComputedBuffer.get_read_writes = original  # type: ignore[method-assign]
+
     def test_disabled_installs_nothing(self) -> None:
         original = ComputedBuffer.get_read_writes
         with pass_counters.counting(install=False):

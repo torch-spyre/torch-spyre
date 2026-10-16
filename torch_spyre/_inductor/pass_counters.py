@@ -164,7 +164,9 @@ def counting(install: bool = True) -> Iterator[PassCounters]:
     finally:
         COUNTERS.enabled = False
         COUNTERS.reset()
-        ComputedBuffer.get_read_writes = original  # type: ignore[method-assign]
+        # Leave a wrapper someone installed over ours inside the region alone.
+        if ComputedBuffer.get_read_writes is counted:
+            ComputedBuffer.get_read_writes = original  # type: ignore[method-assign]
 
 
 @contextlib.contextmanager

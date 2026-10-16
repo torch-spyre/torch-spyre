@@ -204,6 +204,12 @@ so misses sitting far below extractions is the normal state and not a finding; a
 requests against misses, not against extractions. Pipeline events carry the
 inclusive total, the same way `inclusive_ns` does.
 
+The counters are one process-wide, unsynchronized store. If two threads compile
+at once (a multi-threaded server such as vLLM, say), each pass's counts include
+the other compile's work, and a negative delta means another compile reset the
+store mid-pass. Profile with a single compiling thread to get per-compile
+figures.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |
