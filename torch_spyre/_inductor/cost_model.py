@@ -1513,7 +1513,9 @@ def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
         if found is None:
             continue
         arg, rows = found
-        # Weight bytes per unit of HBM residency: the one gate that stays symbolic.
+        # Single-pass decode weights have loop_factor == 1. With replication
+        # removed, b == full * (1 - is_lx); the symbolic path applies this
+        # residency gate outside the division-price functor.
         b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
         full = arg.elems * arg.loop_factor * op.dtype_bytes
         m_split, k_split, cores = op.matmul_m_split, op.reduction_cores, op.cores

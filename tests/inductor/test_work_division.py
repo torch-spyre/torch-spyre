@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Work-division tests.
+
+Sibling imports (decode_matmul_sweep, utils_inductor) require tests/inductor on
+sys.path, as configured by the OOT runner. For direct runs from the repository
+root, include tests/inductor in PYTHONPATH.
+"""
+
 import dataclasses
 import itertools
 import math
