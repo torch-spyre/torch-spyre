@@ -41,6 +41,7 @@ from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    broadcast_gather_pass,
     decompose_addmm,
     mm_to_bmm_pass,
 )
@@ -277,6 +278,9 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
+                # Turn a gather whose index is broadcast along the trailing
+                # dims into a row gather on a flattened source (#4840).
+                broadcast_gather_pass.apply,
             ]
         )
 

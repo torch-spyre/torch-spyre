@@ -848,6 +848,88 @@ class TestMaskedScatterRejectReason(IndirectAccessTestCase):
         self.assertIn("rank", reason)
 
 
+class TestBroadcastGatherRewrite(IndirectAccessTestCase):
+    """The #4840 rewrite of a trailing-broadcast gather into a row gather.
+
+    Runs on CPU tensors: `_is_row_broadcast_gather` decides from shapes and
+    strides alone, and `_emit_row_gather` must equal torch.gather exactly.
+    """
+
+    @staticmethod
+    def _broadcast_index(shape, dim, n, dtype=torch.int64):
+        small = [*shape[:dim], n] + [1] * (len(shape) - dim - 1)
+        idx = torch.randint(0, shape[dim], small, dtype=dtype)
+        return idx.expand(*shape[:dim], n, *shape[dim + 1 :])
+
+    def test_row_gather_matches_torch_gather(self):
+        from torch_spyre._inductor.temp_passes import (
+            _emit_row_gather,
+            _is_row_broadcast_gather,
+        )
+
+        def run_op(op, *args, **kwargs):
+            return op(*args, **kwargs)
+
+        cases = [((12, 4, 512), 1), ((64, 256), 0), ((2, 6, 4, 128), 1)]
+        cases += [((2, 3, 5, 64), 2), ((1, 4, 64), 1)]
+        for shape, dim in cases:
+            for n in (1, 3):
+                for dtype in (torch.int32, torch.int64):
+                    with self.subTest(shape=shape, dim=dim, n=n, dtype=dtype):
+                        x = torch.randn(shape)
+                        idx = self._broadcast_index(shape, dim, n, dtype)
+                        self.assertTrue(_is_row_broadcast_gather(x, dim, idx))
+                        got = _emit_row_gather(
+                            run_op,
+                            x,
+                            idx,
+                            dim,
+                            x.shape,
+                            idx.shape[dim],
+                            idx.dtype,
+                            idx.device,
+                        )
+                        torch.testing.assert_close(
+                            got,
+                            torch.gather(x, dim, idx),
+                            rtol=0,
+                            atol=0,
+                        )
+
+    def test_non_row_gathers_not_rewritten(self):
+        from torch_spyre._inductor.temp_passes import _is_row_broadcast_gather
+
+        x = torch.randn(12, 4, 512)
+        bcast = self._broadcast_index((12, 4, 512), 1, 1)
+        cases = {
+            "materialized index": (x, 1, bcast.contiguous()),
+            "gather along the last dim": (
+                x,
+                2,
+                torch.randint(0, 512, (12, 4, 1)).expand(12, 4, 512),
+            ),
+            "smaller prefix": (
+                x,
+                1,
+                torch.zeros(6, 1, 1, dtype=torch.int64).expand(6, 1, 512),
+            ),
+            "smaller trailing": (
+                x,
+                1,
+                torch.zeros(12, 1, 1, dtype=torch.int64).expand(12, 1, 256),
+            ),
+            "no real broadcast dim": (
+                torch.randn(12, 4, 1),
+                1,
+                torch.zeros(12, 1, 1, dtype=torch.int64),
+            ),
+            "float index": (x, 1, torch.zeros(12, 1, 1).expand(12, 1, 512)),
+        }
+        for name, (xx, dim, idx) in cases.items():
+            with self.subTest(name):
+                self.assertFalse(_is_row_broadcast_gather(xx, dim, idx))
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
