@@ -18,10 +18,14 @@ __all__: list[str] = [
     "SymbolicArg",
     "SymbolicArgKind",
     "_SpyreStreamBase",
+    "_resolve_symbolic_args",
     "current_stream",
     "default_stream",
     "get_device_state",
+    "get_hazard_tracker_enabled",
     "get_stream_from_pool",
+    "host_compute_stream",
+    "host_compute_stream_by_id",
     "set_current_stream",
     "stream_get_error",
     "stream_get_error_string",
@@ -426,6 +430,24 @@ class JobPlan:
         """Get the profiler-visible name for a compute step, or None"""
         ...
 
+    def get_step_stream_role(self, idx: int) -> str:
+        """Get the stream role for the step at the given index.
+
+        Returns "Prep" for steps routed to S_prep (host-compute stream 65)
+        when SPYRE_HAZARD_TRACKER is on, or "Dev" for steps that run on the
+        launch stream (S_dev, stream 0 by default).
+        """
+        ...
+
+    def get_step_pipeline_barrier(self, idx: int) -> bool:
+        """Get the pipeline_barrier flag for the step at the given index.
+
+        True means the step issues a pipeline barrier before executing,
+        ensuring strict in-order execution on its stream.  Every step in
+        the split triple (HostCompute, H2D, Compute) carries True.
+        """
+        ...
+
 def launch_jobplan(
     job_plan: JobPlan,
     args: collections.abc.Sequence[torch.Tensor],
@@ -512,4 +534,59 @@ def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
 def stream_get_error_string(error: SpyreStreamError) -> str: ...
 def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
+def get_hazard_tracker_enabled() -> bool:
+    """Return True if SPYRE_HAZARD_TRACKER was set to a truthy value at startup.
+
+    When True, SpyreStream::launch routes HostCompute steps to S_prep and
+    Compute steps to S_dev (the two-stream split).  When False (the default),
+    every step runs on S_dev.
+    """
+    ...
+
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...
+def host_compute_stream(device: torch.device) -> _SpyreStreamBase:
+    """Get a host-compute stream for a device (round-robin across the pool).
+
+    S_prep (stream ID 65 by default) is the stream that HostCompute steps are
+    routed to when SPYRE_HAZARD_TRACKER is enabled.  Calling this repeatedly
+    cycles through all host-compute streams and wraps back to the first.
+
+    Args:
+        device: The Spyre device to query.
+
+    Returns:
+        A _SpyreStreamBase for the next host-compute stream in the pool.
+    """
+    ...
+
+def host_compute_stream_by_id(id: int, device: torch.device) -> _SpyreStreamBase:
+    """Return the host-compute stream with the given stream ID.
+
+    Args:
+        id: The stream ID to look up (e.g. 65 for the default S_prep).
+        device: The Spyre device that owns the stream.
+
+    Returns:
+        The _SpyreStreamBase whose id() == id.
+    """
+    ...
+
+def _resolve_symbolic_args(
+    tensors: list[torch.Tensor],
+    symbolic_args: list[SymbolicArg],
+) -> list[int]:
+    """Test-only: resolve a symbolic_args payload to a list of address integers.
+
+    Calls JobPlanStepHostCompute::resolveSymbolicArgs and returns one
+    uintptr_t (CompositeAddress* cast) per resolved slot.  The same tensor
+    always yields the same integer; a different tensor yields a different one,
+    making ordering bugs directly visible as a mismatched int vector.
+
+    Args:
+        tensors: The tensor list to resolve addresses from.
+        symbolic_args: The typed payload produced by the compiler.
+
+    Returns:
+        List of resolved address integers, one per symbolic_arg entry.
+    """
+    ...
