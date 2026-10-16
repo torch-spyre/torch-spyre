@@ -600,8 +600,8 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
     the same buffer name, but with different get_size() results.
 
     Returns the first candidate (the base buffer, with no view applied), or
-    None if no candidate exists -- e.g. a coarse_tile read-copy buffer (see
-    coarse_tile.py's _insert_one_read_copy), which is synthesized purely at
+    None if no candidate exists -- e.g. a coarse_tile copy buffer (see
+    coarse_tile.py's _insert_copy_op), which is synthesized purely at
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
@@ -2901,7 +2901,7 @@ def lower_pad_sequence(
     later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
-    coarse_tile read-copy (see coarse_tile.py's _insert_one_read_copy), which is
+    coarse_tile copy buffer (see coarse_tile.py's _insert_copy_op), which is
     synthesized purely at the IR level after FX lowering completed.  In that
     case ``arg_buf`` (the buffer itself) must be given instead, and the pad is
     lowered by calling the constant_pad_nd lowering function directly against a

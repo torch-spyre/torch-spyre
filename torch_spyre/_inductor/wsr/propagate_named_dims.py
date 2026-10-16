@@ -607,12 +607,9 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
         # Keep only the hints for_each_tile's lowering already stamped on this op
         # (see for_each_tile_lowering.py's _synthesize_dim_hints_for_group and
         # _stamp_direct_loop_info; they are the ones with loop_var_range set).
-        # splice_while_loops runs before this pass and immediately calls
-        # coarse_tile_pre_stickify, which can synthesize fresh read-copy
-        # ComputedBuffers that inherit these hints via copy_op_metadata; such a
-        # copy has no spyre_hint() scope of its own, so without this
-        # preservation the pass would wipe the loop_var/loop_var_range info
-        # those ops need to compute their own output coordinates (see
+        # splice_while_loops runs before this pass; without this preservation
+        # the pass would wipe the loop_var/loop_var_range info those ops need
+        # to compute their own output coordinates (see
         # op_out_coords/loop_var_ranges_from_dim_hints).
         existing = getattr(op, "dim_hints", None) or []
         op.dim_hints = [  # type: ignore[attr-defined]

@@ -982,11 +982,9 @@ class TestInsertPaddingIR(unittest.TestCase):
 class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
     """White-box tests for ``lower_pad_sequence``'s host-stride ranking.
 
-    A coarse-tile read-copy buffer can carry a broadcast dim -- stride 0,
-    size > 1 -- alongside a dim that needs stick-boundary padding (see
-    coarse_tile.py's ``_insert_one_read_copy``: an ``ADVANCING_READ`` source
-    keeps its full, uncompacted rank, with absent/broadcast dims left at
-    stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
+    A buffer can carry a broadcast dim -- stride 0, size > 1 -- alongside a
+    dim that needs stick-boundary padding (an uncompacted-rank copy leaves
+    absent/broadcast dims at stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
     by the source buffer's raw host stride to preserve fastest/slowest
     ordering; ranking a stride-0 broadcast dim by that raw value put it
     first (0 sorts smallest) and handed it a real nonzero stride, corrupting

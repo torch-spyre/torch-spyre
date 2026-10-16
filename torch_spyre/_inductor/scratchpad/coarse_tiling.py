@@ -711,9 +711,8 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout. Use the
-        # post-stickify entry point (run_read_copies=False): a read copy-in here
-        # would only be a useless HBM-to-HBM copy, exactly as the sibling
-        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        # post-stickify entry point, exactly as the sibling post-stickify
+        # consumer (_maybe_coarse_tile_span_overflow) does.
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )

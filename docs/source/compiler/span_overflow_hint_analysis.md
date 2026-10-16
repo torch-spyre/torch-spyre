@@ -1151,10 +1151,6 @@ accumulation noise is not mistaken for a tiling bug.
 | matmul -> matmul | pass | n/a | n/a |
 | matmul -> pointwise -> matmul | pass | not tested | not tested |
 
-The read-copy path this depends on was reworked by #3612 ("coarse tiling:
-optional read copy") and the transposed post-tile layout it once built was
-fixed by #3613 (`_raw_to_squeezed_pos`).
-
 `matmul -> matmul` is marked n/a rather than xfail because it is refused by
 design -- a Reduction consumer has no conform path, so both plans must
 independently agree (`TODO(span-overflow-reduction-conform)`,

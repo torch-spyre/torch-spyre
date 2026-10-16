@@ -31,7 +31,7 @@ what constraints forced each choice, see the companion RFC
 
 - [Design Overview](#design-overview)
 - [Small Example](#small-example)
-- [Layer 1: IR pass & `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` API](#layer-1-pre-scheduling-ir-pass)
+- [Layer 1: IR pass & `coarse_tile_post_stickify()` API](#layer-1-pre-scheduling-ir-pass)
   - [Groups derivation and placement](#groups-derivation-and-placement-in-custompreschedulingpasses)
 - [Layer 2: `CountedLoopSchedulerNode`](#layer-2-countedloopschedulernode)
 - [Layer 3: `LoopSpec` & codegen](#layer-3-loopspec-and-codegen)
@@ -139,11 +139,11 @@ op.loop_info = CoarseTileInfo(
 )
 ```
 
-This is the same `CoarseTileInfo` dataclass `coarse_tile_pre_stickify()`/
-`coarse_tile_post_stickify()` stamp for span-overflow groups
+This is the same `CoarseTileInfo` dataclass `coarse_tile_post_stickify()`
+stamps for span-overflow groups
 (see [Layer 1](#layer-1-pre-scheduling-ir-pass) below), both frontends
 share every downstream layer. The one structural difference is
-`propagation`: `_coarse_tile_common`'s planning step (`_plan_tiling_propagation`)
+`propagation`: `coarse_tile_post_stickify`'s planning step (`_plan_tiling_propagation`)
 decides a `PropagationPlan` for each op *before* any transformation pass
 touches the IR; `for_each_tile`'s direct-stamping path has no equivalent
 planning phase, so `propagation` is always `None` here. `tiled_dims_per_read`
@@ -253,12 +253,8 @@ Key points worth reading closely:
   from the full-tensor graph inputs (`arg0_1`, `arg1_1`, `arg2_1`) with the
   tile advance baked straight into their own index expression
   (`i1 + 4096 * i0 + 524288 * u0`, the `524288 * u0` term is the per-tile
-  row advance, `128 * 4096`). The `coarse_tile_pre_stickify()` path's
-  `_full_buffer_read_deps`/`_insert_all_read_copy_ops` machinery, which
-  exists specifically to give a tiled op a tile-sized *copy* of a full-buffer
-  read (see [Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
-  below), simply never runs on this path: `for_each_tile`'s own tracing
-  through `scan` already produces per-tile-sized reads of `a`/`b`/`c`
+  row advance, `128 * 4096`). `for_each_tile`'s own tracing through `scan`
+  already produces per-tile-sized reads of `a`/`b`/`c`
   directly, with no full-size intermediate buffer for a copy op to adapt.
 - **`u0` is the (spliced-in) loop induction variable**, and it appears
   explicitly in the read index expressions above (`524288 * u0`) rather than
@@ -423,9 +419,9 @@ Key observations:
   `_general_tile_advance` returns `None` and the printer omits the field.
 - **`add` and `mul` are *not* zero-operand.** Each still reads one HBM
   operand directly (`a`+`b_tile`'s scratchpad neighbor for `add`; `c` for
-  `mul`) because there is no read-copy op to have already absorbed that HBM
+  `mul`) because there is no earlier op to have already absorbed that HBM
   read. This is the direct consequence of the "no separate read-copy ops"
-  difference called out in the `graph.operations` section above. Only the
+  point called out in the `graph.operations` section above. Only the
   identity copy at the end carries a full-tensor HBM operand on its output
   side.
 
@@ -560,7 +556,7 @@ class CoarseTileInfo:
 | `tiled_dims_per_read` | `list[list[list[tuple[int, int]]]]` | One entry per read dependency, each itself a per-level list of `(dim, extent)` pairs describing which dims of *that read* are tiled at that level. An empty per-level list means the read is loop-invariant (already tile-local, or a dim the op doesn't advance into) at that level, see the dim-omission convention discussed in the Small Example above. Consumed by `_general_tile_advance` when building each `TensorArg.device_tile_advance_expr`. |
 | `output_tiled_dims` | `list[list[tuple[int, int]]]` | Per-level `(dim, extent)` pairs describing which dims of the op's *own output* are tiled at that level. Empty at a level means the op's own buffer does not advance at that level (typically because it is loop-internal scratch); non-empty on a copy-out op's `MutationLayoutSHOULDREMOVE` target means that full buffer does advance. |
 | `squeezed_advance_per_read` / `squeezed_advance_output` | same shapes as `tiled_dims_per_read` / `output_tiled_dims` | Carry the advance contribution from dims that Inductor's `SqueezeView.squeezer` has since collapsed out of the op's current index expression (extent-1 dims squeezed away after `loop_info` was first stamped). Without these, an advance term for a since-squeezed dim would simply vanish rather than being folded into the surviving expression. Both default to matching-shaped all-empty structures when no squeezing has occurred, which is the common case (both example dumps above show this). |
-| `propagation` | `PropagationPlan \| None` | `_coarse_tile_common`'s own decision (via `_plan_tiling_propagation`, shared by both `coarse_tile_pre_stickify` and `coarse_tile_post_stickify`) about how this op's result crosses the loop boundary, `None` on the for_each_tile direct-stamping path, which has no equivalent planning phase. See [Prove, splice, identify, stamp](#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info) above and [Buffer propagation](#buffer-propagation-planning-and-the-three-transformation-passes) below. |
+| `propagation` | `PropagationPlan \| None` | `coarse_tile_post_stickify`'s own decision (via `_plan_tiling_propagation`) about how this op's result crosses the loop boundary, `None` on the for_each_tile direct-stamping path, which has no equivalent planning phase. See [Prove, splice, identify, stamp](#prove-splice-identify-stamp-how-a-for_each_tile-call-becomes-loop_info) above and [Buffer propagation](#buffer-propagation-planning-and-the-two-transformation-passes) below. |
 
 `tiled_dims_per_read`, `output_tiled_dims`, `squeezed_advance_per_read`, and
 `squeezed_advance_output` are omitted from the dataclass definition's default
@@ -585,7 +581,7 @@ The four fields discussed so far (`loop_group_id`, `loop_count`,
 consults to rewrite each op's iteration ranges; `tiled_dims_per_read`,
 `output_tiled_dims`, and the rest, listed in the table above, describe the
 *data perimeter* around the loop instead and are covered in [Buffer
-propagation](#buffer-propagation-planning-and-the-three-transformation-passes)
+propagation](#buffer-propagation-planning-and-the-two-transformation-passes)
 below.
 
 `loop_count` is redundant across all ops sharing the same `loop_group_id`
@@ -633,15 +629,9 @@ bypass this:
 object.__setattr__(data, "ranges", ranges)
 ```
 
-### Public API: `coarse_tile_pre_stickify` and `coarse_tile_post_stickify`
+### Public API: `coarse_tile_post_stickify`
 
 ```python
-def coarse_tile_pre_stickify(
-    graph: GraphLowering,
-    groups: list[tuple],
-    group_idx_offset: int = 0,
-) -> None:
-
 def coarse_tile_post_stickify(
     graph: GraphLowering,
     groups: list[tuple],
@@ -649,28 +639,19 @@ def coarse_tile_post_stickify(
 ) -> None:
 ```
 
-These are the two public entry points.
-`coarse_tile_pre_stickify` plans and applies caller-supplied groups on
-host-side `FixedLayout`; no pipeline pass calls it today (the hint-driven
-producer that used to was removed in favor of `for_each_tile`), so it is
-exercised only by unit tests. `coarse_tile_post_stickify` is called with the
-groups `span_overflow_groups` derives from an overflowing per-core memory
-span, and runs after stickification (device layout must already be
+`coarse_tile_post_stickify` is the public entry point. It is called with
+the groups `span_overflow_groups` derives from an overflowing per-core
+memory span, and runs after stickification (device layout must already be
 committed for span arithmetic; see "Groups derivation and placement,"
-below). Both are thin wrappers over one shared driver,
-`_coarse_tile_common(graph, groups, group_idx_offset, run_read_copies)`,
-differing only in `run_read_copies`: `True` for the pre-stickify caller,
-`False` for the post-stickify caller, since by the time span-overflow runs
-every op's device layout is already committed and a read-copy would only
-produce a pointless HBM-to-HBM copy (see "Read-side adaptation," below,
-for what the read copy-in is for). `for_each_tile` calls neither entry
-point, it stamps `loop_info` directly via `_stamp_direct_loop_info`
-without going through group derivation or `_coarse_tile_common` at all
-(see "Prove, splice, identify, stamp," above, and "Groups
-derivation and placement," below).
+below). Every op's device layout is already committed by then, so no
+read copy-in is needed: it would only produce a pointless HBM-to-HBM copy.
+`for_each_tile` does not call it: it stamps `loop_info` directly via
+`_stamp_direct_loop_info` without going through group derivation or
+`coarse_tile_post_stickify` at all (see "Prove, splice, identify, stamp,"
+above, and "Groups derivation and placement," below).
 
-`groups` is a pre-computed list of group tuples, produced by whichever
-group producer the caller uses. Each `ops` list must be a contiguous
+`groups` is a pre-computed list of group tuples, produced by
+`span_overflow_groups`. Each `ops` list must be a contiguous
 sub-sequence of `graph.operations`; a gap indicates a data-flow dependency
 crossing the group boundary and raises `RuntimeError`.  The full
 `GraphLowering` is required (not just the operations list) because
@@ -682,7 +663,7 @@ call, in practice, `coarse_tile_post_stickify`'s span-overflow groups are
 offset past the IDs already stamped by `for_each_tile` loops earlier in the
 pipeline.
 
-`_coarse_tile_common` itself is a thin plan-then-transform driver, and
+`coarse_tile_post_stickify` is a plan-then-transform driver, and
 planning is itself two calls, not one: `plan_coarse_tile_groups(operations, groups)`
 decides each op's tiling attributes (loop nesting, which dims are tiled),
 and `_plan_tiling_propagation(operations, groups, plan)` decides, for every
@@ -690,13 +671,12 @@ tiled op, how its result crosses its loop boundary; see "Buffer
 propagation," below. Both run with zero IR mutation, up front, for every
 group in the list, and both raise `Unsupported` if any op in any group
 can't be tiled (see "Sequential recurrences are rejected at planning time"
-below). Only if planning succeeds does `_coarse_tile_common` move on to
+below). Only if planning succeeds does `coarse_tile_post_stickify` move on to
 transformation: it loops over `groups` again and calls `_apply_plan` once
 per group to perform the actual IR mutation (stamping `loop_info`, dividing
-ranges). Transformation then runs up to three fixed, non-interleaved passes
-over the whole op list, `_insert_all_read_copy_ops` (Pass 1, skipped when
-`run_read_copies=False`), then `_insert_all_reduction_ops` (Pass 2), then
-`_insert_all_write_copy_ops` (Pass 3), each consuming the plan's decisions
+ranges). Transformation then runs two fixed, non-interleaved passes
+over the whole op list, `_insert_all_reduction_ops` (Pass 1), then
+`_insert_all_write_copy_ops` (Pass 2), each consuming the plan's decisions
 rather than making new ones, followed by `_patch_retiled_load_indexes`,
 once per group.  There is no per-group interleaving of planning and
 mutation, every group is planned before any group is transformed, and no
@@ -733,8 +713,7 @@ they are derived per-op inside `plan_coarse_tile_groups` by consulting each
 op's `DimHint.loop_var`.
 
 `plan_coarse_tile_groups` receives this canonical list-of-pairs
-representation, built by `span_overflow_groups`, before `coarse_tile_pre_stickify`/
-`coarse_tile_post_stickify` plan and then transform each group.
+representation, built by `span_overflow_groups`, before `coarse_tile_post_stickify` plan and then transform each group.
 
 ### Groups derivation and placement in `CustomPreSchedulingPasses`
 
@@ -848,14 +827,14 @@ achieve.  `scratchpad_planning` receives the full `GraphLowering` object
 (not just `operations`) because it needs access to graph-level metadata
 for buffer lifetime analysis.
 
-### Buffer propagation: planning and the three transformation passes
+### Buffer propagation: planning and the two transformation passes
 
 Its job is to ensure that any op whose result is consumed **outside** the
 loop (or is a graph output) exposes a complete, fully-sized buffer to its
 consumers.  Ops whose outputs are consumed only inside the loop are marked
 so `generate_bundle` does not advance their base addresses.
 
-This is split, like the rest of `_coarse_tile_common`, into a zero-mutation
+This is split, like the rest of `coarse_tile_post_stickify`, into a zero-mutation
 planning step and a fixed sequence of transformation passes that only
 consume the plan's decisions:
 
@@ -870,24 +849,18 @@ consume the plan's decisions:
   (see "Reduction tiling," further below); this check runs first, before
   the use-def analysis that decides `loop_internal` vs. `copy_out` for
   every other tiled op.
-- **Pass 1, `_insert_all_read_copy_ops(operations)`.** For every tiled op
-  that directly reads a full-size buffer, inserts a tile-sized read
-  copy-in (see "Read-side adaptation," below). Runs first because Pass 2
-  and Pass 3 read each op's *current* reads/loader, and a tiled-reduction
-  or copy-out op may itself need a read copy-in before its own machinery is
-  built.
-- **Pass 2, `_insert_all_reduction_ops(operations)`.** For every op whose
+- **Pass 1, `_insert_all_reduction_ops(operations)`.** For every op whose
   plan has `kind == "reduction"`, builds the fill/combine/accumulator
   buffers from the plan's `ReductionPlan` data (see "Reduction tiling,"
   below).
-- **Pass 3, `_insert_all_write_copy_ops(operations)`.** For every op whose
+- **Pass 2, `_insert_all_write_copy_ops(operations)`.** For every op whose
   plan has `kind == "copy_out"`, allocates the full buffer and inserts the
   copy-out (see "Treatment by consumer topology," below). Runs last because
   `_allocate_full_buffer`/`_insert_copy_op` read the op's *current*
-  reads/loader/layout, which Pass 1/2 may have already changed.
+  reads/loader/layout, which Pass 1 may have already changed.
 
 A `"reduction"` op is never also `"copy_out"`, the plan's `kind` routes
-each op to exactly one of the three, so Pass 2 and Pass 3 never compete for
+each op to exactly one of the three, so Pass 1 and Pass 2 never compete for
 the same op. Each pass re-resolves "the current object for buffer name X"
 fresh from `operations` at its own start, rather than trusting an object
 reference captured before an earlier pass ran. This is why no per-op
@@ -905,7 +878,7 @@ For each `ComputedBuffer` in a loop group, planning asks two questions:
    `users`/`get_alias_name` machinery) count as outside consumers.
    `_find_outside_consumers_planned` (the planning-time helper; the
    transformation-time original, `_find_outside_consumers`, still exists
-   and is called by Pass 3) answers this by name, not object identity,
+   and is called by Pass 2) answers this by name, not object identity,
    see the name-stability note above.
 
 2. **Does this buffer have inside consumers?**  A consumer is "inside" if it
@@ -929,12 +902,12 @@ via `affine.apply`, no conversion, just addressing.  Only producer-side
 crossings need adaptation.
 
 For each tiled `ComputedBuffer`, planning classifies by consumer topology
-(`kind`) and Pass 3 applies one of two treatments accordingly:
+(`kind`) and Pass 2 applies one of two treatments accordingly:
 
 | Case | Inside consumers | Outside consumers | `kind` | Treatment |
 |---|---|---|---|---|
-| 1 | ✓ | ✗ | `loop_internal` | Nothing to build, Pass 3 skips this op entirely |
-| 2 | any | ✓ | `copy_out` | Pass 3 allocates a full HBM buffer and inserts a loop-tagged copy op that publishes each tile into the correct slice |
+| 1 | ✓ | ✗ | `loop_internal` | Nothing to build, Pass 2 skips this op entirely |
+| 2 | any | ✓ | `copy_out` | Pass 2 allocates a full HBM buffer and inserts a loop-tagged copy op that publishes each tile into the correct slice |
 
 Every cross-loop-group write, regardless of inside-consumer topology or
 whether any of the op's real inputs are themselves loop-internal, takes
@@ -983,7 +956,7 @@ unconditionally excludes `MutationLayoutSHOULDREMOVE` outputs). Under the
 current always-copy rule, the real op's own output is never a mutation
 layout, so it never loses scratchpad eligibility on that account.
 
-**Note on code-level naming**: `coarse_tile.py`'s Pass 3 executor
+**Note on code-level naming**: `coarse_tile.py`'s Pass 2 executor
 `_propagate_tiled_op` (called from `_insert_all_write_copy_ops` once per
 op planned `kind="copy_out"`) carries the operative comment describing a
 single unconditional path: "Every cross-loop-group write always takes the
@@ -991,7 +964,7 @@ copy-op path: the real compute op keeps its own natural, input-derived,
 tile-sized layout, and a separate copy op takes
 `MutationLayoutSHOULDREMOVE(full_buf)`." The planning-time decision behind
 this, whether an op is `copy_out` at all, is made once, up front, by
-`_plan_tiling_propagation`; Pass 3 only executes it. The single operative
+`_plan_tiling_propagation`; Pass 2 only executes it. The single operative
 treatment corresponds to the doc's Case 2 row above.
 
 **Revisited and re-deferred (2026-08-08): skipping the copy for
@@ -1044,7 +1017,7 @@ without becoming implemented:
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
 another without ever leaving scratchpad.  Planning routes such an op to
-`kind="loop_internal"`, and Pass 3 leaves its `loop_info.output_tiled_dims`
+`kind="loop_internal"`, and Pass 2 leaves its `loop_info.output_tiled_dims`
 empty at every level:
 
 ```python
@@ -1106,8 +1079,8 @@ planning time and one at codegen time.
 **Stage 1 (decision, planning time):** this is `plan_coarse_tile_groups`'s
 own, older planning step, distinct from `_plan_tiling_propagation`'s
 `kind`/`ReductionPlan` decisions described under [Buffer
-propagation](#buffer-propagation-planning-and-the-three-transformation-passes)
-above, and computed earlier in `_coarse_tile_common`'s pipeline. `plan_coarse_tile_groups`
+propagation](#buffer-propagation-planning-and-the-two-transformation-passes)
+above, and computed earlier in `coarse_tile_post_stickify`'s pipeline. `plan_coarse_tile_groups`
 (`coarse_tile.py`) records, per dependency, a per-level *decision*, not a
 substituted expression, on `CoarseTileInfo.tiled_dims_per_read` (one entry
 per read dependency) and `CoarseTileInfo.output_tiled_dims` (for the
@@ -1231,42 +1204,12 @@ its own distinct symbol) rather than a single-entry-per-host-dim shape,
 since the latter cannot distinguish the outer level's advance from the
 inner level's for the same dim.
 
-(read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)=
-
-#### Read-side adaptation: full-buffer inputs to a loop-internal op
-
-The write-side perimeter above is not the whole story. Pass 1
-(`_insert_all_read_copy_ops`) checks, for every op, whether it directly
-reads a full-size buffer produced by a cross-loop-group producer, either a
-full-size `SpyreEmptyFallback` buffer (typically an accumulator that the
-copy-out path above already promoted to full size; see "Reduction tiling,"
-below, for the nested output-dim + inner-reduction-dim case that produces
-this), or any other `ComputedBuffer` whose own `loop_group_id` outer key
-differs from `op`'s (see `_full_buffer_read_deps`). A loop-internal op
-cannot read such a buffer directly: its own candidate layouts are
-tile-sized, and the full-size buffer has only one, full-size candidate
-layout, so the two can never be made stick-compatible. Pass 1 recomputes
-`_full_buffer_read_deps(op)` fresh, post-division, for every op, rather
-than relying on any planning-time snapshot, precisely because a
-cross-loop-group producer's full-size promotion may itself be a product of
-this same pipeline (a nested reduction's `accum_full`, built by Pass 2, or
-an earlier op's `copy_out` target, built by Pass 3 in a prior compilation
-pass over another group) and so is only guaranteed current once
-transformation has actually run. `_insert_read_copy_ops` always
-materializes a tile-sized copy `ComputedBuffer` per such read, rewriting
-`op`'s `inner_fn` (via a `WrapperHandler` subclass, per the
-wrap-never-reconstruct convention) to read the copy instead of the full
-buffer. This means the "no conversion, just addressing" claim above holds
-only when the full buffer being read is a genuine graph input or other
-host-side tensor, not when it is itself the product of an earlier
-tile→full promotion inside the same compilation.
-
 #### Reduction tiling: stick and non-stick reduction dims
 
 When a `Reduction` op has a non-empty `loop_tiled_reduction_dims`
 (i.e. the hint named a reduction dimension), planning routes it to
 `kind="reduction"` and computes its `ReductionPlan` (identity, nesting,
-full/per-tile shapes, see `loop_info.py`). Pass 2
+full/per-tile shapes, see `loop_info.py`). Pass 1
 (`_insert_all_reduction_ops`, which calls the per-op executor
 `_propagate_tiled_reduction_op` for every op so planned) then builds the
 actual buffers using a **fill-initialize + per-tile combine** pattern,
@@ -1388,12 +1331,12 @@ is rejected outright, before any IR mutation happens.
 
 **Detection, not propagation.** `plan_coarse_tile_groups` (the planning
 phase, see
-[Public API](#public-api-coarse_tile_pre_stickify-and-coarse_tile_post_stickify)) calls
+[Public API](#public-api-coarse_tile_post_stickify)) calls
 `_seed_buffer_for_carry` on every op that is loop-invariant at the group's
 reduction-tiled level(s) (`_plan_is_loop_invariant_at_reduction_levels`
 gates this call). If `_seed_buffer_for_carry` identifies `op` as the
 carry-producing step of such a recurrence, planning raises `Unsupported`
-immediately, `_coarse_tile_common` never reaches the transformation phase
+immediately, `coarse_tile_post_stickify` never reaches the transformation phase
 for that group, and no buffers are allocated or rewired for the recurrence.
 `_seed_buffer_for_carry` exists purely to answer "does this op need a
 pattern we don't support," not to drive any propagation; there is no
@@ -1434,11 +1377,9 @@ loop-invariant at a reduction-tiled level, that op is the carry-producing
 step of a recurrence this pass cannot execute, and planning raises
 `Unsupported` for the whole group.
 
-**Scope of this rejection: both `coarse_tile_pre_stickify`/`coarse_tile_post_stickify`
-callers, never `for_each_tile`.** The
-detection above lives in `plan_coarse_tile_groups`, which `_coarse_tile_common`
-calls unconditionally, so it applies equally to hint-derived groups and
-span-overflow groups, whichever producer built them, but it has no bearing
+**Scope of this rejection: `coarse_tile_post_stickify`, never `for_each_tile`.** The
+detection above lives in `plan_coarse_tile_groups`, which `coarse_tile_post_stickify`
+calls unconditionally, so it applies to span-overflow groups, but it has no bearing
 on `for_each_tile`, which never calls `plan_coarse_tile_groups` at all. That
 frontend handles
 true recurrences (an online-softmax-style running max/denominator, carried
@@ -1777,7 +1718,7 @@ LoopSpec(
 
 `OpSpec.tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it
 reads `loop_info.loop_tiled_dims` (a `list[list[int]]`) from the
-`ir.Operation` (stamped by `_coarse_tile_common` or, for `for_each_tile`,
+`ir.Operation` (stamped by `coarse_tile_post_stickify` or, for `for_each_tile`,
 `_stamp_direct_loop_info`), and for each loop level
 selects the symbols at those indices from the scheduler-level
 `iteration_space` dict.  The result is stored innermost-first.
@@ -1877,7 +1818,7 @@ landed.
 | File | Role |
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` (both thin wrappers over `_coarse_tile_common`) stamp `loop_info` and rewrite ranges; `_plan_tiling_propagation` plus the `_insert_all_read_copy_ops`/`_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile_post_stickify()` stamps `loop_info` and rewrites ranges; `_plan_tiling_propagation` plus the `_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
 | `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `prepare_kernel`, `_codegen_loop_body`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
@@ -1886,7 +1827,6 @@ landed.
 | `torch_spyre/_inductor/passes.py` | Wires all passes into `CustomPreSchedulingPasses` and `CustomPreFusionPasses` |
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager (`work_div` and the named-dim keys; the removed tiling keys raise `ValueError`); `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/wsr/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` entry points |
 | `torch_spyre/_inductor/wsr/for_each_tile.py` | `for_each_tile()` frontend: thin wrapper over `torch._higher_order_ops.scan.scan`; `Gather`/`Kind`/`TileSpec` types |
 | `torch_spyre/_inductor/wsr/for_each_tile_lowering.py` | Layer 1 (for_each_tile path): `try_prove_for_each_tile`/`_extract_trip_count` prove the static trip count; `splice_while_loops` splices the traced `ir.WhileLoop` body into `graph.operations` and calls `_stamp_direct_loop_info` |
 | `torch_spyre/_inductor/wsr/while_loop_bridge.py` | Carry-rewiring for `for_each_tile`'s accumulator (`carry`) outputs, the true-recurrence mechanism |
@@ -1918,8 +1858,8 @@ before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,
 and `scratchpad_planning`.  `build_loop_scheduler_nodes` must run in
 `CustomPreFusionPasses` (before Inductor's own fusion pass and before
 `spyre_fuse_nodes`), see the ordering rationale above.  `for_each_tile`'s
-`splice_while_loops` runs even earlier than `coarse_tile_pre_stickify()`/
-`coarse_tile_post_stickify()` themselves: it is the
+`splice_while_loops` runs even earlier than `coarse_tile_post_stickify()`
+itself: it is the
 very first `CustomPreSchedulingPasses` pass, ahead of `deadcode_elimination`
 (a real captured pass-timing trace shows `splice_while_loops` at ~51ms,
 before `deadcode_elimination` at ~6ms), it must prove the trip count and
@@ -1944,17 +1884,15 @@ restatement of the Case 1/2/3 classification, the reduction accum pattern, or
 the carry seed/closure detection vocabulary, all covered above.
 
 **Scope note**: everything below describes `coarse_tile.py`'s IR-rewiring
-machinery, read-copy insertion, index-expression remapping,
-`MutationLayoutSHOULDREMOVE` write-copy insertion, and the rest, shared by
-**both** `coarse_tile_pre_stickify` (hint-derived groups) and
-`coarse_tile_post_stickify` (span-overflow groups), since both are thin
-wrappers over the same `_coarse_tile_common` driver (see "Public API,"
+machinery, index-expression remapping,
+`MutationLayoutSHOULDREMOVE` write-copy insertion, and the rest, driven by
+`coarse_tile_post_stickify` (span-overflow groups; see "Public API,"
 above). None of it
 applies to `for_each_tile`'s direct-stamping path (`splice_while_loops` /
 `_stamp_direct_loop_info` in `for_each_tile_lowering.py`), which stamps
 `loop_info` onto ops already produced by tracing `scan` and never runs any
 of the IR-rewiring passes this appendix documents. There is no read-copy
-insertion (see the Small Example above for why: the traced ops already read
+staging (see the Small Example above for why: the traced ops already read
 tile-sized slices directly) and no separate propagation-planning phase to
 reason about soundness for. A wrong-code bug in the for_each_tile path is
 more likely to originate in trip-count proof (`try_prove_for_each_tile`) or
@@ -2008,11 +1946,6 @@ so that stale per-object caches on the old buffer can never leak forward.
 
 Call sites, all following this exact shape:
 
-- `_insert_read_copy_ops` (in `coarse_tile.py`, with a local
-  `_NameSwapHandler` defined just above it in the same file),
-  see
-  [Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
-  above; detailed further below.
 - `_patch_consumers` (in `coarse_tile.py`, `NameSwapHandler` imported
   from `insert_restickify.py`), patches an outside consumer's `inner_fn` to
   read the newly-promoted full buffer instead of the original tile-sized one.
@@ -2057,7 +1990,7 @@ and they are staged deliberately rather than combined:
 2. **`_patch_retiled_load_indexes`** fixes a different problem: *other* ops
    whose captured load index still carries the pre-tiling stride
    coefficient for a buffer that has since been re-tiled. This is driven
-   exactly once, at the very end of `_coarse_tile_common`, after every group in
+   exactly once, at the very end of `coarse_tile_post_stickify`, after every group in
    the call has been processed, not per-group. `_stride_rewrite_map`
    (in `coarse_tile.py`) builds the substitution from old to new
    stride coefficients; `_retile_load_index_from_strides`
@@ -2072,7 +2005,7 @@ and they are staged deliberately rather than combined:
    substitution to the consumer's `inner_fn`, following the same
    wrap-never-reconstruct idiom as every other site in this appendix.
 
-   The concrete case is exactly the Small Example above: before Pass 3's
+   The concrete case is exactly the Small Example above: before Pass 2's
    copy-out path is inserted for `buf1`, `buf1`'s
    captured load of `y` is `i1 + 4096*i0`, a coefficient computed against
    the *pre-tiling* full row stride (4096). Once `y`'s producer is tiled down
@@ -2099,34 +2032,15 @@ information is *derived from* `inner_fn` by re-tracing it, not stored
 independently, so the only way to actually redirect what an op reads is to
 change what its `inner_fn` does when traced.
 
-`_insert_read_copy_ops` (in `coarse_tile.py`) is the concrete instance
-already introduced under
-[Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
-above: when a loop-internal op reads a full-size `SpyreEmptyFallback` buffer
-directly (typically an accumulator that an earlier Case-2/mutation rewrite
-already promoted to full size), the two-step mechanism is (1) insert, before
-the tiled op, a small tile-sized copy `ComputedBuffer` whose `inner_fn` loads
-the full buffer's current tile slice using the *same* index expression the
-tiled op already computes and the *same* `loop_info` (so the per-iteration
-base address advances identically to the tiled op's own reads); then (2) wrap
-the tiled op's own `inner_fn` with the local `_NameSwapHandler` so that its
-load of the full buffer's name is retargeted to the new copy buffer's name
-instead. This always materializes an actual copy. There is no conditional
-path that instead installs a zero-copy "view" over the full buffer; every
-call constructs a real `Pointwise`/`ComputedBuffer` that Inductor's own
-scheduler treats as an ordinary tile-sized producer. The copy's own layout is
-built from the full buffer's per-variable strides (extracted from the read
-dependency's index, which is affine in its var_names) rather than fresh
-contiguous strides, specifically so the tiled op's *unmodified* read index
-still resolves correctly once `_NameSwapHandler` retargets only the buffer
-name, not the index expression itself.
-
-The reason a copy is needed at all, rather than simply changing which name
-the tiled op loads from, is the same `AllSameNode` stick-compatibility
-constraint that motivates the Case 1/2 split on the write side: a full-size
-buffer has exactly one candidate layout (sized to the full buffer), while the
-tiled op's own candidate layouts are all tile-sized, the two can never be
-made stick-compatible without an intermediate buffer sized to match.
+`_patch_consumers` (in `coarse_tile.py`) is the concrete instance: when an
+outside consumer reads a tile-sized buffer that the copy-out path has just
+promoted to a full-size buffer, the consumer's `inner_fn` is wrapped with
+`NameSwapHandler` so its load of the old buffer name is retargeted to the new
+full buffer's name. The wrapper changes only the buffer name; the consumer's
+index expression is left alone and re-derived through the usual re-tracing.
+The reason a rename is enough is that the consumer sits outside the loop and
+so reads the full-size buffer at its full-size layout, while the tiled
+producer's own candidate layouts are all tile-sized.
 
 ### `MutationLayoutSHOULDREMOVE`: the real contract
 
@@ -2207,7 +2121,7 @@ onto a target that already carries one:
 | `_insert_copy_op` | `coarse_tile.py` | full buffer (copy-out) |
 | `_insert_combine_op` | `coarse_tile.py` | `accum_full`/`accum_tile` (per-tile combine) |
 | `_insert_reduction_copy_op` | `coarse_tile.py` | `accum_full` (nested-tiling copy-out) |
-| fill op inside `_propagate_tiled_reduction_op` (Pass 2) | `coarse_tile.py` | fill target (identity-value seed) |
+| fill op inside `_propagate_tiled_reduction_op` (Pass 1) | `coarse_tile.py` | fill target (identity-value seed) |
 
 This was checked directly against the current codebase and no violation was
 found, but the invariant is currently upheld by convention (one assignment
@@ -2241,10 +2155,10 @@ knows this question is already on record as open, not newly discovered.
 **Two mechanisms named "propagation", do not conflate them.** The
 pass-ordering section above already establishes when each runs; the naming
 collision is worth calling out explicitly since both touch
-`MutationLayoutSHOULDREMOVE`-adjacent state: `_coarse_tile_common`'s buffer
-*propagation* machinery (`_plan_tiling_propagation` plus its three
-transformation passes, `_insert_all_read_copy_ops`,
-`_insert_all_reduction_ops`, `_insert_all_write_copy_ops`; the last of
+`MutationLayoutSHOULDREMOVE`-adjacent state: `coarse_tile_post_stickify`'s buffer
+*propagation* machinery (`_plan_tiling_propagation` plus its two
+transformation passes, `_insert_all_reduction_ops`,
+`_insert_all_write_copy_ops`; the last of
 these is the pass that *stamps* `MutationLayoutSHOULDREMOVE`, pre-
 scheduling, inside `CustomPreSchedulingPasses`, before any `Scheduler`
 object exists) is a completely different mechanism from
