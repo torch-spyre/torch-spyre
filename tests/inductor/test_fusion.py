@@ -28,9 +28,15 @@ import unittest
 from unittest import mock
 import torch
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.scheduler import NopKernelSchedulerNode, SchedulerNode
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import DEVICE_NAME
-from torch_spyre._inductor.fusion import estimate_bundles, group_contiguous_fusable
+from torch_spyre._inductor.fusion import (
+    _is_fusable_node,
+    _is_hoistable_node,
+    estimate_bundles,
+    group_contiguous_fusable,
+)
 
 
 def _is_even(x: int) -> bool:
@@ -154,6 +160,45 @@ class TestEstimateBundles(unittest.TestCase):
         ops = [_spyre("a"), _spyre("b"), _spyre("c")]
         with mock.patch.object(config, "bundle_symbolic_args", False):
             self.assertEqual(_tags(estimate_bundles(ops)), [["a"], ["b"], ["c"]])
+
+
+def _scheduler_node(tag: str) -> SchedulerNode:
+    """A bare Spyre ``SchedulerNode``: only the type and device are consulted."""
+    node = SchedulerNode.__new__(SchedulerNode)
+    node.tag = tag
+    node.get_device = lambda: torch.device(DEVICE_NAME)
+    return node
+
+
+def _nop_node(tag: str) -> NopKernelSchedulerNode:
+    """A bare ``NopKernelSchedulerNode``: only the type is consulted."""
+    node = NopKernelSchedulerNode.__new__(NopKernelSchedulerNode)
+    node.tag = tag
+    return node
+
+
+class TestHoistNopNodes(unittest.TestCase):
+    """The scheduler-node predicates that ``spyre_fuse_nodes`` groups by."""
+
+    def _group(self, nodes):
+        return _tags(
+            group_contiguous_fusable(nodes, _is_fusable_node, _is_hoistable_node)
+        )
+
+    def test_nop_is_moved_ahead_of_the_run(self):
+        # Without hoisting, the nop would split the run into [a, b] and [c, d].
+        nodes = [
+            _scheduler_node("a"),
+            _scheduler_node("b"),
+            _nop_node("nop"),
+            _scheduler_node("c"),
+            _scheduler_node("d"),
+        ]
+        self.assertEqual(self._group(nodes), [["nop"], ["a", "b", "c", "d"]])
+
+    def test_nop_with_no_pending_run_stays_in_place(self):
+        nodes = [_nop_node("nop"), _scheduler_node("a"), _scheduler_node("b")]
+        self.assertEqual(self._group(nodes), [["nop"], ["a", "b"]])
 
 
 if __name__ == "__main__":
