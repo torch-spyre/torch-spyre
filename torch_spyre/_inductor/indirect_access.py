@@ -14,7 +14,7 @@
 
 from typing import Callable
 
-from sympy import Symbol
+from sympy import S, Symbol
 
 from .op_spec import IndirectAccess, OpSpec, TensorArg
 
@@ -121,35 +121,6 @@ def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
     return -1
 
 
-def _get_index_tensor_device_size_at(
-    index_arg: TensorArg,
-    stride_idx: int,
-) -> int | None:
-    """Return index_arg.device_size at the same stride position, or None if
-    out of range."""
-    pos = -stride_idx - 2
-    if abs(pos) <= len(index_arg.device_size):
-        return index_arg.device_size[pos]
-    return None
-
-
-def _get_index_active_dims_for_value(
-    index_arg: "TensorArg",
-    symbol_mapping: dict,
-) -> list[Symbol]:
-    """Return the ordered list of free symbols (active dims) in index_arg's coords."""
-    seen: set[Symbol] = set()
-    active: list[Symbol] = []
-    for coord in index_arg.device_coordinates:
-        if not hasattr(coord, "free_symbols"):
-            continue
-        for sym in coord.subs(symbol_mapping).free_symbols:
-            if sym not in seen:
-                seen.add(sym)
-                active.append(sym)
-    return active
-
-
 def compute_indirect_max_dim_sizes(
     tensor_idx: int,
     dim: Symbol,
@@ -167,9 +138,8 @@ def compute_indirect_max_dim_sizes(
     Value tensor:
       - stick dim → -1 (always dynamic)
       - dimension not in index tensor → -1 (data dimension, full range)
-      - dimension in index tensor, multi-dim index, not the last active dim →
-        idx_size (bounded by the index tensor's size along that axis)
-      - dimension in index tensor, last (or only) active dim → 1 (indirect)
+      - dimension present in physical value coordinates → -1 (full range)
+      - dimension contributed only by index coordinates → 1 (shared table)
 
     Index tensor:
       - always -1
@@ -188,12 +158,17 @@ def compute_indirect_max_dim_sizes(
         indirect_dims = get_indirect_dim_symbols(arg, index_arg, symbol_mapping)
         if dim not in indirect_dims:
             return -1
-        idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
-        if idx_size is None:
-            return -1
-        active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
-        if len(active_dims) > 1 and dim != active_dims[-1]:
-            return idx_size
+        # Axes contributed only by the indices choose pages of one shared
+        # table; they do not add physical batch dimensions to that table.
+        # Keep actual value coordinates (e.g. a batched gather) at full extent.
+        for coord in arg.device_coordinates:
+            if not hasattr(coord, "atoms"):
+                continue
+            physical = coord.xreplace(
+                {node: S.Zero for node in coord.atoms(IndirectAccess)}
+            )
+            if dim in physical.subs(symbol_mapping).free_symbols:
+                return -1
         return 1
 
     elif tensor_idx in index_tensor_indices:

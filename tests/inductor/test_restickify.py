@@ -28,11 +28,16 @@ import math
 import pytest
 from unittest.mock import patch
 
+import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer
 from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
+from torch_spyre._C import get_device_dtype
 from torch_spyre._inductor import config
 from utils_inductor import _compile_and_run, compare_with_cpu
 
@@ -1227,6 +1232,78 @@ def test_sparse_dense_pointwise():
     _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed_axes", [1, 2])
+def test_packed_broadcast_infeasible_edge(dtype, packed_axes):
+    """Unrepresentable sparse targets must be rejected by layout search."""
+    b, k, h = sympy.symbols("b k h", integer=True, nonnegative=True)
+    if packed_axes == 1:
+        # All 64 values fit in one stick; there is no outer chunk to promote.
+        shape, stride = [64], [1]
+        device_size, stride_map = [64], [1]
+        variables, sizes = (b, h), (64, 128)
+        index, out_index, out_shape = b, 128 * b + h, [64, 128]
+    else:
+        # The input stick combines two host axes, so neither host coordinate
+        # alone identifies the packed axis for the sparse conversion.
+        shape, stride = [4, 8], [8, 1]
+        device_size, stride_map = [1, 64], [64, 1]
+        variables, sizes = (b, k, h), (4, 8, 128)
+        index, out_index, out_shape = 8 * b + k, 1024 * b + 128 * k + h, [4, 8, 128]
+
+    source = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+    target = SpyreTensorLayout(out_shape, dtype)
+    graph = GraphLowering(torch.fx.symbolic_trace(lambda: None))
+    graph.name_to_buffer["input"] = InputBuffer(
+        name="input", layout=FixedLayout(DEVICE, dtype, shape, stride)
+    )
+    graph.name_to_buffer["output"] = InputBuffer(
+        name="output", layout=FixedLayout(DEVICE, dtype, out_shape)
+    )
+    with V.set_graph_handler(graph):
+        edge = _optimize_restickify.EdgeCostMap(
+            MemoryDep("input", index, variables, sizes),
+            [source],
+            [target],
+            MemoryDep("output", out_index, variables, sizes),
+            None,
+        )
+        assert edge.cost(source, target) == _optimize_restickify.INF
+        assert (
+            edge.layout(source, target) is _optimize_restickify.EdgeCostMap.INFEASIBLE
+        )
+
+
+@pytest.mark.parametrize("batch", [4, 64, 65])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("materialize", [False, True])
+def test_packed_axis_broadcast_to_new_stick(batch, dtype, materialize):
+    """Broadcast a packed token axis onto a new, hidden-sticked dimension."""
+    weights = (torch.arange(batch * 8).reshape(batch, 8) % 17 + 1).to(dtype)
+    # Include top-k's short-axis layout: its inactive chunk uses the logical
+    # batch extent in its stride, rather than the padded stick extent.
+    layout = SpyreTensorLayout(
+        device_size=[(batch + 63) // 64, 8, 64],
+        stride_map=[min(batch, 64) * 8, 1, 8],
+        device_dtype=get_device_dtype(dtype),
+    )
+    device_weights = weights.to(device="spyre", device_layout=layout)
+    x = torch.ones(batch, 8, 128, dtype=dtype, device="spyre")
+
+    def fn(w, x):
+        if materialize:
+            return w[..., None].expand_as(x).contiguous()
+        return x * w[..., None]
+
+    compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+    actual = compiled(device_weights, x).cpu()
+    expected = weights[..., None].expand(batch, 8, 128)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        compiled(device_weights, x).cpu(), actual, atol=0, rtol=0
+    )
+
+
 # ------- Restickify padding: strided input raises Unsupported ---------
 
 
@@ -2273,7 +2350,8 @@ def test_unsqueeze_broadcast_dense_pointwise():
     """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
+    # Move the packed vector to one scalar per stick, keeping b's layout.
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
@@ -2296,7 +2374,7 @@ def test_unsqueeze_expand_broadcast_dense_pointwise():
     """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise."""
     a = torch.randn((S,), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S)
 
 
 def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
@@ -2321,15 +2399,15 @@ def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
 def test_broadcast_outer_diff():
     """acs.unsqueeze(-1) - acs.unsqueeze(-2): outer-product subtraction over [BH, C].
 
-    Both reads of acs conflict (stick on d1 vs d2); the optimizer picks stick on
-    dim 0 (BH) at cost 2 * acs.numel() — two restickifies of the 2D input.
+    The reads conflict (stick on d1 vs d2). Converting one read to scalar per
+    stick lets it broadcast onto the other's stick, costing acs.numel().
     """
     BH, C = 64, 64
     acs = torch.randn((BH, C), dtype=torch.float16)
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2341,7 +2419,7 @@ def test_broadcast_expand_first():
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2353,7 +2431,7 @@ def test_broadcast_expand_second():
     _compare(
         lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2).expand(-1, C, -1)),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 
@@ -2367,7 +2445,7 @@ def test_broadcast_expand_both():
             acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2).expand(-1, C, -1)
         ),
         acs,
-        optimal_cost=2 * acs.numel(),
+        optimal_cost=acs.numel(),
         check_strides=False,
     )
 

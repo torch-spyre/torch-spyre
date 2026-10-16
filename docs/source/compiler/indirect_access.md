@@ -323,6 +323,15 @@ The argument ordering rule for op specs that contain an index tensor is:
 The helper `_is_indirect_index_arg` identifies index-role args post-hoc by
 scanning other args' coordinates for `IndirectAccess` atoms whose name matches.
 
+For `table[indices]`, where `table` is `[E, H]` and `indices` is `[B, K]`,
+both `B` and `K` select pages of the same table. They do not create physical
+batch dimensions in its allocation. The descriptor therefore uses
+`maxDimSizes = 1` for value-tensor axes contributed only by the index
+coordinates. Dimensions present in the value's physical coordinates retain
+their full extent (`-1`), including a real batch axis in a batched table.
+This distinction also applies when the indices occupy one scalar per stick;
+using their device sizes as table bounds can generate invalid per-core bases.
+
 ---
 
 ## Fusion
@@ -337,7 +346,8 @@ the input arg.
 
 ## Current limitations
 
-- Only 1-D index tensors (a single indirect symbol per data dep) are supported.
+- A single indirect symbol per data dependency is supported; the index tensor
+  supplying it may have multiple dimensions.
 - Scatter index tensors (`aten.scatter_`, `aten.index_put_`) are correctly
   detected via `_find_scatter_index_buf_names` and excluded from stick
   compatibility checks. However, `IndirectAccess` coordinates on output args

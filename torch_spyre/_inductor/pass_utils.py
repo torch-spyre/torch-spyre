@@ -2509,14 +2509,24 @@ def compute_restickify_needed(
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
     target_stick = out_idc[-1]
 
-    if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
-        # The output stick is 0 (sparse) and the input is clean-dense.  For
-        # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
+    input_symbols = set().union(*(c.free_symbols for c in ic))
+    broadcast_stick = (
+        in_stl.element_arrangement == ElementArrangement.STANDARD
+        and bool(target_stick.free_symbols - input_symbols)
+    )
+    if (
+        in_stick_offset_free
+        and idc[-1].free_symbols
+        and ((target_stick == sympy.S.Zero and _is_matmul_op(op)) or broadcast_stick)
+    ):
+        # Move the packed input axis out of the stick so each scalar can be
+        # broadcast over a new output stick axis. The same sparse conversion
+        # serves matmul when N=1 collapses the output stick to zero.
         # Build the sparse target from in_stl's device dimensions — not from host
         # dimensions, which may include size-1 dims (e.g. M=1) that cause
         # SpyreTensorLayout constructor 2 to produce an extra device dimension.
-        # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
-        # it by stick_size, promote the element stride there, set stick to -1.
+        # Promote the packed-axis chunk dimension to scalar granularity and
+        # make the stick synthetic (stride -1).
         stick_size = get_elem_in_stick(in_host.dtype)
         ds = list(in_stl.device_size)
         sm = list(in_stl.stride_map)
@@ -2525,17 +2535,39 @@ def compute_restickify_needed(
             (i for i in range(len(sm) - 1) if sm[i] == elem_stride * stick_size),
             None,
         )
+        old_host_dim = matching_dim(ic, idc[-1]) if broadcast_stick else None
+        if broadcast_stick and old_host_dim is None:
+            # A packed combination of host axes has no scalar-per-stick
+            # target here. EdgeCostMap records (True, None) as INFEASIBLE
+            # with INF cost, so layout search can try another candidate.
+            return True, None
+        if k_chunk_dim is None and old_host_dim is not None:
+            # A short packed axis (e.g. top-k's token axis) can use its
+            # unpadded extent in the inactive outer-chunk stride.
+            k_chunk_dim = next(
+                (
+                    i
+                    for i, coord in enumerate(idc[:-1])
+                    if coord == 0
+                    and ds[i] == 1
+                    and sm[i] == elem_stride * in_host.size[old_host_dim]
+                ),
+                None,
+            )
         if k_chunk_dim is not None:
             y_ds = list(ds)
             y_sm = list(sm)
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
+            if old_host_dim is not None:
+                # Preserve the logical extent here. The padding pass rounds
+                # the promoted axis before lowering the transpose.
+                y_ds[k_chunk_dim] = concretize_expr(in_host.size[old_host_dim])
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = -1
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
-        assert False, (
-            f"k_chunk_dim not found in sparse-N=1 restickify path: "
-            f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
-        )
+        # There is no outer chunk axis to promote. Reject just this candidate
+        # through the same infeasible-edge contract, rather than abort search.
+        return True, None
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout

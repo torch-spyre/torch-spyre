@@ -66,6 +66,9 @@ from torch_spyre._inductor.op_spec import (  # noqa: E402
 from torch_spyre._inductor.pass_utils import (  # noqa: E402
     _non_indirect_coord_syms,
 )
+from torch_spyre._inductor.indirect_access import (  # noqa: E402
+    compute_indirect_max_dim_sizes,
+)
 from torch_spyre.execution.async_compile import SpyreAsyncCompile  # noqa: E402
 
 
@@ -83,6 +86,33 @@ def _tensor_arg(is_input, coords, name=None):
 
 def _op(name):
     return OpSpec(op=name, is_reduction=False, iteration_space={}, args=[], op_info={})
+
+
+class TestIndirectAllocationBounds(IndirectAccessTestCase):
+    def _bounds(self, has_batch):
+        b, k, h = sympy.symbols("b k h")
+        mb, x, out = sympy.symbols("mb x out")
+        indices = _tensor_arg(True, [b, k, sympy.S.Zero], "indices")
+        indices.device_size = [4, 8, 32]
+        value_coords = [IndirectAccess(sympy.Symbol("indices")), sympy.Mod(h, 64)]
+        if has_batch:
+            value_coords.insert(0, b)
+        values = _tensor_arg(True, value_coords, "values")
+        spec = _op("identity")
+        spec.args = [indices, values]
+        mapping = {b: mb, k: x, h: out}
+        return [
+            compute_indirect_max_dim_sizes(
+                1, dim, out, stride, 128, spec, mapping, {0}, {}, None
+            )
+            for dim, stride in ((mb, 2), (x, 1), (out, 0))
+        ]
+
+    def test_multi_axis_indices_do_not_add_table_dimensions(self):
+        self.assertEqual(self._bounds(False), [1, 1, -1])
+
+    def test_physical_batch_dimension_is_preserved(self):
+        self.assertEqual(self._bounds(True), [-1, 1, -1])
 
 
 # ===========================================================================

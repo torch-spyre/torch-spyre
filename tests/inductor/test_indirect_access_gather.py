@@ -282,6 +282,17 @@ class _GatherScenarios:
         self.name_dims(ids, {"P": P})
         self._stage_and_e2e(lambda t, i: t[i], table, ids, expect=GATHER_OP_SPEC)
 
+    def test_gather_2d_scalar_per_stick_indices(self):
+        """Both index axes select pages of a single shared one-stick table."""
+        table = self.to_spyre(
+            (torch.arange(128)[:, None] / 128).expand(128, 64).half().contiguous()
+        )
+        ids = (7 * torch.arange(32).reshape(4, 8) + 13) % 128
+        # Gemma's top-k index conversion leaves one index per device stick.
+        # Plain contiguous [B,K] indices would not exercise this descriptor.
+        ids = ids.int()[..., None].expand(4, 8, 32).contiguous().to("spyre")[..., 0]
+        self._stage_and_e2e(lambda t, i: t[i], table, ids, expect=GATHER_OP_SPEC)
+
     def test_embedding_2d_index_stick_size_1(self):
         V, E, B = 4096, 1024, 2
         weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
