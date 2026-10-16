@@ -11281,11 +11281,72 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         run_eager=False,
                     )
 
+    def test_trunc_cpu(self):
+        # torch.trunc rounds toward zero. The values are exact in every dtype,
+        # DLFloat16 on device included.
+        values = [0.25, 0.5, 0.75, 1.5, 2.5, 3.75, 7.5, 100.5, 0.0, 1.0, 3.0]
+        x = torch.tensor((values + [-v for v in values]) * 3)[:64]
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self.compare_with_cpu(
+                    torch.trunc,
+                    x.to(dtype),
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=False,
+                    run_eager=False,
+                )
+
+    def test_trunc_special_values_cpu(self):
+        # NaN and the infinities pass through, and float32 values at the ends of
+        # the range truncate exactly.
+        values = [float("nan"), float("inf"), float("-inf"), 8388607.5, -8388607.5]
+        values += [1.0e20, -1.0e20, 1.5e-38, -1.5e-38, 0.99999994, -0.99999994]
+        x = torch.tensor(values * 6)[:64]
+        self.compare_with_cpu(
+            torch.trunc, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
+
+    def test_trunc_views_cpu(self):
+        # The truncation reads its source twice, so over a view it must still
+        # compile. The stick-aligned slice starts at a whole stick.
+        x = (((torch.arange(4 * 64) * 7) % 23) - 11.5).reshape(4, 64)
+        views = {
+            "select": lambda x: x.select(0, 1),
+            "transpose": lambda x: x.t(),
+            "expand": lambda x: x[:, :1].expand(4, 64),
+            "aligned_slice": lambda x: x[:, 32:64],
+        }
+        for name, view in views.items():
+            with self.subTest(view=name):
+                self.compare_with_cpu(
+                    lambda x, view=view: torch.trunc(view(x)),
+                    x,
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=False,
+                    run_eager=False,
+                )
+
+    def test_trunc_int_cpu(self):
+        # An integer tensor is already truncated.
+        x = (torch.arange(64, dtype=torch.int32) % 17) - 8
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+                self.compare_with_cpu(
+                    torch.trunc,
+                    x.to(dtype),
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=False,
+                    run_eager=False,
+                )
+
     def test_gather_staggered_index_lane0_cpu(self):
         # A float16 index widened onto a stick converts to int32 through a
         # staggered float32 (hf-adapters' MoE expert indices). The gather reads
-        # lane 0 of each stick, which the stagger keeps in place, so the
-        # staggered index pairs with standard weights.
+        # element 0, which the stagger keeps in place, so the staggered index
+        # pairs with standard weights.
         T, top_k, stick, experts, rows, cols = 4, 8, 64, 16, 64, 64
         ids = (torch.arange(T * top_k) * 5 % experts).reshape(T, top_k)
         idx_wide = ids[..., None].expand(T, top_k, stick).to(torch.float16)
@@ -11293,7 +11354,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         weights = (weights % 251).to(torch.bfloat16)
 
         def fn(idx_wide, weights):
-            addr = idx_wide.to(torch.float32)[..., : stick // 2].to(torch.int32)
+            addr = idx_wide.to(torch.float32)[..., :1].to(torch.int32)
             return weights[addr[..., 0]].reshape(T * top_k, rows, cols)
 
         self.compare_with_cpu(
