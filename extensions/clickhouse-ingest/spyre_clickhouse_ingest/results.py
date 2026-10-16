@@ -36,7 +36,7 @@ import json
 import os
 import platform as _platform
 import sys
-
+import tempfile
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
@@ -1781,6 +1781,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ingest_kind(argv, args) -> int:
+    """vllm, sendnn and benchmarks, connected: the bundle `--offline` would write, recorded as
+    the relay records it, so a direct run and an uploaded bundle leave the same v2 rows."""
+    from spyre_clickhouse_ingest import bundle, offline
+
+    off, _ = offline.parser().parse_known_args(argv)
+    with tempfile.TemporaryDirectory(prefix="results-") as tmp:
+        off.out = str(Path(tmp) / "bundle")
+        try:
+            args.from_bundle = str(offline.write(off))
+        except offline.BundleError as err:
+            print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
+            return err.code
+        return bundle.ingest(args)
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.offline or args.validate_only or args.upload:
@@ -1789,6 +1805,13 @@ def main(argv=None):
         from spyre_clickhouse_ingest.bundle import ingest
 
         return ingest(args)
+    if (
+        args.kind != "junit"
+        or args.vllm_results_dir
+        or args.sendnn_report
+        or args.benchmarks_dir
+    ):
+        return _ingest_kind(argv, args)
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot

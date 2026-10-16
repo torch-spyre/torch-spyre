@@ -738,6 +738,7 @@ class ArtifactSubscriptions(Table):
         "payload_fields",
         "credential_id",
         "owner",
+        "updated_by",
         "notes",
         "props",
     )
@@ -803,6 +804,20 @@ class ArtifactDispatches(Table):
     )
 
 
+class DispatchTargets(Table):
+    """The dispatcher's allow-list, one snapshot per publish; an empty list is one '' / '' row."""
+
+    name = "dispatch_targets"
+    columns = (
+        "target_type",
+        "target_prefix",
+        "credential_id",
+        "published_at",
+        "job_run",
+    )
+    required = ("published_at",)
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -820,6 +835,7 @@ CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
+DISPATCH_TARGETS = DispatchTargets
 
 TABLES = {
     t.name: t
@@ -840,6 +856,7 @@ TABLES = {
         ArtifactSubscriptions,
         DispatchRequests,
         ArtifactDispatches,
+        DispatchTargets,
     )
 }
 

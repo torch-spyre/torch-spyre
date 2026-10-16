@@ -62,7 +62,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
-| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
+| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
@@ -254,6 +254,20 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | upload one | `results --upload <dir\|tgz> [--as-folder] [--wait]` |
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
+
+A **connected** run records every kind directly with the same flags, no `--offline`:
+
+| kind | direct (connected) command |
+|---|---|
+| junit | `results --schema v2 --xml-dir <dir> <the usual flags>` |
+| vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
+| sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
+| benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+
+vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
+temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
+uploaded bundle's, `source=bundle` included. It needs `CLICKHOUSE_DB_V2`, and the run key is
+`--jenkins-run-key` when given, else `manual:<user>:<bundle sha256>`.
 
 The usual flags are `--artifact id:<uuid>`, or `image:<repo>@sha256:<digest>` (and
 `--artifact-id <uuid>` beside an image), plus:
