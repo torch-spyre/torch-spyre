@@ -1,0 +1,8 @@
+test_suite_config:
+  # Dispatch-only label: a maintainer with Actions write access must trigger
+  # this manually.  It is kept separate from [trunk] until the "Test Spyre
+  # Profiler" CI job is consistently green (tracked as a separate issue).
+  labels: [split_execution_trace]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_split_execution_trace.py
+      unlisted_test_mode: mandatory_success

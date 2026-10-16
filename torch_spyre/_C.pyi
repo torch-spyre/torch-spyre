@@ -297,6 +297,16 @@ def default_stream(device: torch.device) -> _SpyreStreamBase:
     """
     ...
 
+def host_compute_stream_by_id(stream_id: int, device: torch.device) -> _SpyreStreamBase:
+    """
+    Get the host-compute stream for a device by its numeric ID.
+
+    Args:
+        stream_id: The stream ID (e.g. 65 for S_prep)
+        device: The Spyre device
+    """
+    ...
+
 def set_current_stream(stream: _SpyreStreamBase) -> None:
     """
     Set the current stream for the stream's device.
@@ -424,6 +434,14 @@ class JobPlan:
 
     def get_step_name(self, idx: int) -> str | None:
         """Get the profiler-visible name for a compute step, or None"""
+        ...
+
+    def get_step_stream_role(self, idx: int) -> str:
+        """Get the stream role for a step ('Prep' or 'Dev')"""
+        ...
+
+    def get_step_pipeline_barrier(self, idx: int) -> bool:
+        """Get whether a step carries a pipeline barrier (True) or is overlap-eligible (False)"""
         ...
 
 def launch_jobplan(
