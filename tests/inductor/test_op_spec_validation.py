@@ -165,6 +165,12 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
     def test_keep_by_index_is_known(self):
         self.assertIn(KEEP_BY_INDEX_OP, _all_known_ops())
 
+    def test_unknown_op_name_raises(self):
+        op = _make_valid_op_spec("not_a_registered_op")
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage="test")
+        self.assertIn("unknown op name", str(ctx.exception))
+
     def test_conv_and_quant_reduction_ops_are_known(self):
         known = _all_known_ops()
         for op in (
@@ -428,21 +434,6 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
             op.args[0], arg_index=-1, allocation={"lx": 0x0}
         )
         validate_op_specs([op], stage="before_bundle_generation")
-
-    def test_unknown_op_no_output_passes(self):
-        """Unknown/synthetic ops without output args are valid."""
-        op = OpSpec(
-            op="synthetic_test_op",
-            is_reduction=False,
-            iteration_space={
-                _C_ROW: (Integer(128), 1),
-                _C_COL: (Integer(256), 1),
-            },
-            args=[_make_tensor_arg(is_input=True, arg_index=0)],
-            op_info={},
-            tiled_symbols=[],
-        )
-        validate_op_specs([op], stage="test")
 
     def test_allocation_invalid_keys(self):
         """allocation must contain exactly one of hbm/lx/hbm_pool."""

@@ -363,12 +363,18 @@ def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
 
 
 def _check_op_name(op_spec: OpSpec, stage: str) -> None:
-    """OS-2: Op name should be a known operation."""
+    """OS-2: Op name must be a known operation.
+
+    A new op must be registered in one of the sets behind _all_known_ops()
+    (see constants.py) so that it also gets the per-op checks below.
+    """
     if op_spec.op not in _all_known_ops():
-        logger.warning(
-            "Unknown op name %r in OpSpec at stage %s. "
-            "This may be valid for new ops not yet registered.",
-            op_spec.op,
+        raise OpSpecValidationError(
+            op_spec,
+            "unknown op name",
+            f"Got op={op_spec.op!r}. Register new ops in the op sets in "
+            "constants.py (or SpyreOpFuncs for pointwise ops) so they are "
+            "known to op_spec_validation.",
             stage,
         )
 
@@ -474,7 +480,7 @@ def _check_args(op_spec: OpSpec, stage: str) -> None:
 
         _check_allocation(op_spec, arg, i, stage)
 
-    if not has_output and op_spec.op in _all_known_ops():
+    if not has_output:
         raise OpSpecValidationError(
             op_spec,
             "OpSpec must have at least one output TensorArg (is_input=False)",
