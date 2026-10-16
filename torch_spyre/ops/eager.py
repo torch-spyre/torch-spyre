@@ -790,4 +790,26 @@ def spyre__copy_from(self, dst, non_blocking=False):
         return dst
 
 
+@torch.library.register_kernel("aten::masked_fill.Scalar", ["spyre"])  # type:ignore
+def spyre__masked_fill_scalar(
+    self: torch.Tensor, mask: torch.Tensor, value: int | float | bool | complex
+) -> torch.Tensor:
+    """Decompose masked_fill into where, mirroring the compiled-mode lowering."""
+    if isinstance(value, complex):
+        raise TypeError("spyre masked_fill does not support complex fill values")
+    fill = torch.empty_like(self)
+    fill_tensor(fill, float(value))
+    return aten.where.self(mask, fill, self)
+
+
+@torch.library.register_kernel("aten::masked_fill_.Scalar", ["spyre"])  # type:ignore
+def spyre__masked_fill__scalar(
+    self: torch.Tensor, mask: torch.Tensor, value: int | float | bool | complex
+) -> torch.Tensor:
+    """In-place masked_fill: compute out-of-place then copy_ back."""
+    result = spyre__masked_fill_scalar(self, mask, value)
+    self.copy_(result)
+    return self
+
+
 # INSERT_CODEGEN_HERE

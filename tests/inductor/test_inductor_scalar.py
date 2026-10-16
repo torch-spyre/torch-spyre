@@ -418,12 +418,6 @@ class TestSdpaScalarHyperparameters:
 
     def test_sdpa_causal_triu_mask_neg_inf(self, request, execution_mode):
         """SDPA: causal mask via ``triu`` + ``masked_fill(..., -inf)``."""
-        if execution_mode == "eager":
-            strict_xfail(
-                request,
-                NotImplementedError,
-                "aten::masked_fill_.Scalar has no Spyre kernel (#4356)",
-            )
 
         def causal_attention(q, k, v):
             d_k = q.size(-1)

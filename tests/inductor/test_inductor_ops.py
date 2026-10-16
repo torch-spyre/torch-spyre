@@ -6923,6 +6923,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_masked_fill_scalar", "test_masked_fill_scalar_eager"): {
+            "ops_dict": {"masked_fill": torch.Tensor.masked_fill},
+            "param_sets": {
+                "fp16_2d_zero": (
+                    cached_randn((4, 64), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp16_2d_neginf": (
+                    cached_randn((5, 10), dtype=torch.float16) > 0,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    float("-inf"),
+                ),
+                "fp16_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float16) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float16),
+                    -1.0e4,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((64,), dtype=torch.float16) > 0,
+                    cached_randn((4, 64), dtype=torch.float16),
+                    0.0,
+                ),
+                "fp32_2d": (
+                    cached_randn((4, 64), dtype=torch.float32) > 0,
+                    cached_randn((4, 64), dtype=torch.float32),
+                    0.0,
+                ),
+                "fp32_3d": (
+                    cached_randn((2, 8, 32), dtype=torch.float32) > 0,
+                    cached_randn((2, 8, 32), dtype=torch.float32),
+                    -1.0e4,
+                ),
+                "int32_2d": (
+                    torch.zeros(4, 32, dtype=torch.bool),
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                    0,
+                ),
+                "int32_3d": (
+                    torch.zeros(2, 8, 64, dtype=torch.bool),
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                    -1,
+                ),
+            },
+        },
         ("test_to_dtype_op_map", "test_to_dtype_op_map"): {
             "param_sets": TO_DTYPE_OP_MAP_PARAMS_SETS,
         },
@@ -10877,6 +10922,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda condition, x, y, z: op(condition, x, y, out=z), condition, x, y, z
         )
+
+    def test_masked_fill_scalar_eager(self, op, mask, x, value):
+        self.compare_with_cpu(lambda mask, x: op(x, mask, value), mask, x)
 
     def test_attn_qkv_paths(self, q, k, v):
         # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
