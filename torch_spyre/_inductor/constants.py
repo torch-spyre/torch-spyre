@@ -254,11 +254,21 @@ DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
 # Single-input reductions: everything store_reduction dispatches to its
 # fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
 # reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
-# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
+# ops (exx2, topkvalue/topkindex, avgpoolfwd, quantscalepertokenfp8) -- there is no upstream registry
 # of supported reduction_type strings to derive this from, so it is written
 # down here explicitly.
 SINGLE_INPUT_REDUCTION_OPS = frozenset(
-    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+    {
+        "sum",
+        "mean",
+        "max",
+        "min",
+        "prod",
+        "exx2",
+        *TOPK_OPS,
+        AVGPOOL2D_OP,
+        QUANTSCALEPERTOKENFP8_OP,
+    }
 )
 
 # Populate more valid labels from deeptools here if needed

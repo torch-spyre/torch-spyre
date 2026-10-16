@@ -44,6 +44,7 @@ from torch_spyre._inductor.op_spec_validation import (
     _is_unimplemented_op,
     validate_op_specs,
 )
+from torch_spyre._inductor import constants
 from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 
 # ---------------------------------------------------------------------------
@@ -163,6 +164,37 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
 
     def test_keep_by_index_is_known(self):
         self.assertIn(KEEP_BY_INDEX_OP, _all_known_ops())
+
+    def test_conv_and_quant_reduction_ops_are_known(self):
+        known = _all_known_ops()
+        for op in (
+            *constants.CONV_OPS,
+            *constants.TWO_INPUT_REDUCTION_OPS,
+            *constants.SINGLE_INPUT_REDUCTION_OPS,
+            constants.QUANTSCALEPERTOKENFP8_OP,
+        ):
+            self.assertIn(op, known)
+
+    def test_emitted_reduction_op_names_are_known(self):
+        """Every ReductionOp literal in SpyreOpFuncs must be a known op."""
+        import ast
+        import inspect
+        import textwrap
+
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(SpyreOpFuncs)))
+        names = {
+            n.args[0].value
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "ReductionOp"
+            and n.args
+            and isinstance(n.args[0], ast.Constant)
+        }
+        self.assertTrue(names)
+        self.assertLessEqual(names, _all_known_ops())
 
     def test_tiled_symbols_valid(self):
         op = _make_valid_op_spec()
