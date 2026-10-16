@@ -20,6 +20,12 @@ granite-3.3-8b projections with their device weight layouts, x[M, K] @ W[K, N]
 ``spyre_hint(work_div=...)``. One process and a fresh cache per split: splits
 compiled in one process were not reliably distinct. Device time is the median of
 15 synced calls; card 2 is normalized by its measured 2.8% offset to card 3.
+
+Replay on a configured stack from the repository root with
+``python tools/cost_model/run_decode_matmul_sweep.py --output /tmp/decode-full``.
+Add ``--sample`` for the 67-case 2026-10-16 calibration check, or ``--list`` to
+inspect the plan without hardware. The runner records core/LX settings and raw
+per-card times; the historical card-2 correction is not applied to fresh runs.
 """
 
 # (K, N) of each projection.

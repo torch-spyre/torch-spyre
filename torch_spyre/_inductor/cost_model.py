@@ -1466,19 +1466,26 @@ def _decode_weight(op) -> tuple | None:
     """``(arg, rows)`` for a matmul's shared 2D weight reused over 2..32 rows.
 
     That is the small-M decode projection ``work_division._decode_weight_delivery_us``
-    was measured on. Rows are MACs per weight element. A shared weight has
-    K * N = (A / rows) * (out / rows) elements; a per-batch operand (attention's K or
-    V) has B times more, and a B^2 test separates the two. Symbolic or unknown
-    counts do not qualify."""
+    was measured on. The extractor's A/B byte counts exclude batch, while MACs
+    and output elements include it. Require one K*N weight slice, then check
+    K*N = (A / rows) * (out / rows), with rows = MACs / weight elements. Together
+    these exclude both per-batch weights and shared weights under B > 1.
+    Symbolic or unknown counts do not qualify."""
     if (
         not op.is_matmul
         or op.dtype_bytes != 2  # the sweep measured fp16 weights only
-        or _is_sym(op.matmul_macs, op.out_elems, op.matmul_a_bytes)
+        or _is_sym(op.matmul_macs, op.out_elems, op.matmul_a_bytes, op.matmul_b_bytes)
+        or op.matmul_b_bytes <= 0
     ):
         return None
     a_elems = op.matmul_a_bytes / max(1, op.dtype_bytes)
+    b_elems = op.matmul_b_bytes / op.dtype_bytes
     for arg in op.args:
         if arg.role != "input" or _is_sym(arg.elems) or arg.elems <= 0:
+            continue
+        # A per-batch [B,K,N] input has B times this footprint. Its extra batch
+        # factor otherwise cancels against the batch-inclusive MAC/output counts.
+        if abs(arg.elems - b_elems) > 0.05 * b_elems:
             continue
         rows = round(op.matmul_macs / arg.elems)
         if not 1 < rows <= _DECODE_MAX_ROWS:

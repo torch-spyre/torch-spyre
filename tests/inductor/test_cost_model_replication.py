@@ -1006,6 +1006,39 @@ def _at(m, n, k):
     return {SPLIT_M: m, SPLIT_N: n, SPLIT_K: k}
 
 
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_batched_matmuls_keep_cohort_pricing(batch, shared_weight, symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 16, 2, 1)
+    activation, weight, output = op.args
+    weight = dataclasses.replace(
+        weight, elems=weight.elems * (1 if shared_weight else batch)
+    )
+    # The extractor's A/B byte counts exclude batch; MACs, output elements,
+    # and per-batch argument footprints include it.
+    op = dataclasses.replace(
+        op,
+        matmul_macs=op.matmul_macs * batch,
+        out_elems=op.out_elems * batch,
+        args=[
+            dataclasses.replace(activation, elems=activation.elems * batch),
+            weight,
+            dataclasses.replace(output, elems=output.elems * batch),
+        ],
+    )
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    cohort = _shared_operand_read_excess([op], _COST_PARAMS)
+    actual = float(sympy.sympify(cohort).xreplace(_at(16, 2, 1)))
+    expected = (
+        weight.elems
+        * op.dtype_bytes
+        * (wd._matmul_multicast_penalty(16) - 1)
+        / _COST_PARAMS.bw_peak_gbps
+    )
+    assert actual == pytest.approx(expected)
+
+
 @pytest.mark.parametrize("symbolic", [False, True])
 def test_decode_delivery_charges_a_shared_boundary_weight_once(symbolic):
     op = _decode_symbolic(8) if symbolic else _gate_up(8, 4, 8, 1)
