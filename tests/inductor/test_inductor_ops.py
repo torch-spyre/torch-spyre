@@ -10438,13 +10438,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_bool_host_reshaped_to_fp32_cpu(self):
         # Same as test_bool_host_to_fp32_cpu, but through a reshape view first,
         # which leaves 8 elements on the stick dim.
-        # TODO: convert a stick-unaligned float16 tensor to float32 (#3999); then
-        # this reads back like test_bool_host_to_fp32_cpu.
+        # TODO: read a view that folds rows into one stick (stick expression
+        # 8*d0 + d1); then this reads back like test_bool_host_to_fp32_cpu.
         def fn(x):
             return x.reshape(8, 8).to(dtype=torch.float32)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
-        with pytest.raises(Exception, match="no supported output layout"):
+        with pytest.raises(Exception, match="Unexpected stick expression"):
             self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_bool_host_to_fp32_consumed_cpu(self):
