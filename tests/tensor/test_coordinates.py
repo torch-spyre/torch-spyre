@@ -842,8 +842,7 @@ class TestTilingExprToDeviceExpr(TestCase):
         # call crash with AttributeError: 'int' object has no attribute
         # 'xreplace'. This mirrors the real _general_tile_advance call shape
         # when a tiled dim's extent is 1 and no other term survives
-        # substitution (see tests/inductor/test_coarse_tile_e2e.py's
-        # test_hint_nested_loop_with_scratchpad).
+        # substitution.
         index = p0
         result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
         self.assertEqual(result, p0)

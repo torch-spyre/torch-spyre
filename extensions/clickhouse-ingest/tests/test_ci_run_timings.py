@@ -51,7 +51,7 @@ def _batch(**over):
             "trigger_source": "spyre-test",
             "preset": "trigger-pr-validation",
             "build_mode": "pr",
-            "trigger_pr": "github.ibm.com/ai-chip-toolchain/deeptools#4500",
+            "trigger_pr": "ghe.example.com/example-org/deeptools#4500",
             "pr_components": ["github.com/torch-spyre/torch-spyre#3372"],
             "sha": "0123456789abcdef",
             "base_ref": "main",
@@ -428,7 +428,7 @@ def test_times_parse_from_millis_and_iso():
 @pytest.mark.parametrize(
     "trigger_pr, expect",
     [
-        ("github.ibm.com/ai-chip-toolchain/flex#1457", ("flex", 1457)),
+        ("ghe.example.com/example-org/flex#1457", ("flex", 1457)),
         ("github.com/torch-spyre/torch-spyre#3372", ("torch-spyre", 3372)),
         ("", ("", 0)),
         ("torch-spyre", ("", 0)),

@@ -368,9 +368,9 @@ def span_overflow_groups(
     """Build coarse_tile_post_stickify() groups from automatic span-overflow
     plans.
 
-    This adapter converts SpanOverflowTilePlans into the same group shape as
-    user spyre_hint annotations: ``[(ops, [(hint_id, count)])]``.  Ops that
-    already carry user dim hints are left for the user-hint grouping path.
+    This adapter converts SpanOverflowTilePlans into the same group shape that
+    for_each_tile's lowering builds: ``[(ops, [(hint_id, count)])]``.  Ops that
+    a for_each_tile loop already tiles (they carry dim hints) are left alone.
     ``is_reduction`` is not carried in the group-level ``levels`` list; it
     lives on each op's own ``DimHint`` and is consulted directly by
     ``plan_coarse_tile_groups``.
@@ -440,10 +440,9 @@ def span_overflow_groups(
     """
     from .. import config
 
-    if config.ignore_wsr_hints or config.ignore_span_overflow_hints:
+    if config.ignore_span_overflow_hints:
         logger.debug(
-            "[span-overflow groups] disabled ignore_wsr_hints=%s ignore_span_overflow_hints=%s",
-            config.ignore_wsr_hints,
+            "[span-overflow groups] disabled ignore_span_overflow_hints=%s",
             config.ignore_span_overflow_hints,
         )
         return [], []
@@ -463,12 +462,13 @@ def span_overflow_groups(
     # reading such a producer gets a precise "multi-consumer not yet supported"
     # error rather than the generic pointwise-only conflict message.
     reduction_joined_producers: set[str] = set()
-    # Producers already tiled by a user spyre_hint (assign_dim_hints runs
-    # before this pass and leaves dim_hints set; hints_to_coarse_tile_groups
-    # only reads it, it never clears it). An op reading one of these has the
+    # Producers already tiled by a for_each_tile loop: splice_while_loops runs
+    # earlier and stamps their dim_hints, and this pass never clears them (it
+    # applies span-overflow hints only after planning, so any dim_hints seen
+    # here came from a for_each_tile loop). An op reading one of these has the
     # same unsynchronized-loop-nest risk as reading an auto_tiled_producers
     # entry, so both sets guard the same conflict checks below.
-    manually_hinted_producers: set[str] = {
+    loop_tiled_producers: set[str] = {
         op.get_name()
         for op in graph.operations
         if isinstance(op, ComputedBuffer) and getattr(op, "dim_hints", [])
@@ -584,7 +584,7 @@ def span_overflow_groups(
         )
 
         completed_conflicts = sorted(
-            read_deps & (auto_tiled_producers | manually_hinted_producers)
+            read_deps & (auto_tiled_producers | loop_tiled_producers)
         )
         joined_conflicts = sorted(set(completed_conflicts) & reduction_joined_producers)
         if joined_conflicts:
@@ -608,8 +608,8 @@ def span_overflow_groups(
                 f"Cannot auto-tile {op.get_name()}: it reads already-tiled "
                 f"producer(s) {completed_conflicts} that are not in an open "
                 "group this op can join — either their coarse-tile group has "
-                "already been flushed, or they were tiled by a user "
-                "spyre_hint. Automatic span-overflow grouping can only fuse a "
+                "already been flushed, or they are tiled by a for_each_tile "
+                "loop. Automatic span-overflow grouping can only fuse a "
                 "consumer into a producer's group while that group is still "
                 "open (the producers must be contiguous with the consumer), so "
                 "tiling this producer and consumer independently can produce "

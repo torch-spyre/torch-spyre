@@ -1031,13 +1031,11 @@ def abs_add_mul_tiled_reference(
 def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
     """Map mode: row-tile dim 0, softmax the (whole, untiled) last dim per tile.
 
-    Mirrors test_hint_softmax_row_tiling's HINT-driven equivalent
-    (test_coarse_tile_e2e.py): reduction lives entirely inside the tile body
-    on the untiled column dim, so a multi-stick tile_size exercises the same
-    per-tile device_size[1] invariant that test documents -- a bug that
-    shrinks the row-stride dimension corrupts all stick groups after the
-    first in each non-first tile, and only shows up once a tile spans more
-    than one stick's worth of columns.
+    The reduction lives entirely inside the tile body on the untiled column
+    dim, so a multi-stick tile_size exercises the per-tile device_size[1]
+    invariant: a bug that shrinks the row-stride dimension corrupts all stick
+    groups after the first in each non-first tile, and only shows up once a
+    tile spans more than one stick's worth of columns.
     """
 
     def body(_, ops):
@@ -1300,6 +1298,7 @@ def _post_grad_graphs():
     so this monkey-patches the (now permanent, #4136-landed) decomposition
     function for the duration of one compile.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -1312,7 +1311,9 @@ def _post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 

@@ -1023,9 +1023,9 @@ def _rewire_accumulator_output(
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
     real zeros-filling ``ComputedBuffer`` that runs before the loop, which is
-    exactly the "fill" step WSR's ``CarriedReductionRecord`` pattern wants;
-    reusing it avoids synthesizing a second fill (and a second buffer) that
-    would then have to be kept consistent with it.
+    exactly the "fill" step an accumulator needs; reusing it avoids
+    synthesizing a second fill (and a second buffer) that would then have to be
+    kept consistent with it.
 
     The outside consumer is reached through the ``WhileLoop``'s
     ``MultiOutput`` child for this carry index -- the object
@@ -1116,7 +1116,7 @@ def _repoint_refs_to_buffer(
     over the name, not an object reference reachable via ``.inputs`` at all
     (same class of hazard as the in-body carry reads this bridge already
     redirects via ``redirect_computed_buffer_reads``/``NameSwapHandler``,
-    per CLAUDE.md's "wrap, never reconstruct" rule; see
+    per AGENTS.md's "wrap, never reconstruct" rule; see
     ``splice_while_loop``'s own ``name_map`` rewrite for the body-side
     counterpart of this same mechanism). Patch every such consumer still in
     ``graph.operations`` the same way, or its dependency on ``old_name``
@@ -1226,7 +1226,7 @@ def splice_while_loop(
     Two distinct read shapes exist in the body and both need rewiring:
     ComputedBuffer.inner_fn issues ops.load(name, index) calls (name-based
     -- handled by redirect_computed_buffer_reads/NameSwapHandler, per
-    CLAUDE.md's "wrap, never reconstruct" rule); DynamicScalar/
+    AGENTS.md's "wrap, never reconstruct" rule); DynamicScalar/
     ExternKernelOut hold direct Python object references to the
     placeholder buffer in `.inputs` (object-based -- handled by
     _substitute_direct_input_refs, since no name_map rename can reach a

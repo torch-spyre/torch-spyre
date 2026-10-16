@@ -24,6 +24,7 @@ from spyre_clickhouse_ingest.schema import (
     ARTIFACT_DISPATCHES,
     ARTIFACT_SUBSCRIPTIONS,
     DISPATCH_REQUESTS,
+    DISPATCH_TARGETS,
     SchemaError,
 )
 
@@ -46,7 +47,8 @@ def ddl_columns(table: str) -> list:
 
 
 @pytest.mark.parametrize(
-    "model", [ARTIFACT_SUBSCRIPTIONS, DISPATCH_REQUESTS, ARTIFACT_DISPATCHES]
+    "model",
+    [ARTIFACT_SUBSCRIPTIONS, DISPATCH_REQUESTS, ARTIFACT_DISPATCHES, DISPATCH_TARGETS],
 )
 def test_model_columns_are_the_ddl_minus_audit(model):
     assert list(model.columns) == [

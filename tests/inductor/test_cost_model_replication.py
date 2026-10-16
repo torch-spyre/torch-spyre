@@ -736,6 +736,17 @@ def test_loop_operand_requests_skip_resident_and_single_pass_reads():
     assert _read_burst_excess_ns([coarse], p) == 0
 
 
+def test_a_candidate_tile_count_declines_the_looped_matmul_terms():
+    # Under a candidate coarse tiling the trip count is a tile-count symbol. The
+    # op is still untiled, so it has no per-trip geometry for either term.
+    tiles = sympy.Symbol("tile_buf0_o0", integer=True, positive=True)
+    op = dataclasses.replace(
+        _with_run(_expert_loop_projection(16), 128), loop_trip=tiles
+    )
+    assert _partitioned_operand_read_excess([op], _COST_PARAMS) == 0
+    assert _loop_operand_request_excess([op], _COST_PARAMS) == 0
+
+
 @pytest.mark.parametrize("boundary", [True, False])
 @pytest.mark.parametrize("order", [(0, 1), (1, 0)])
 def test_a_weight_read_by_two_looped_matmuls_is_counted_by_its_owner(boundary, order):

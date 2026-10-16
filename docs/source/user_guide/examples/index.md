@@ -15,7 +15,7 @@ common Torch-Spyre use cases.
 | `mean.py` | Computing mean reduction on Spyre |
 | `mul.py` | Element-wise multiplication on Spyre |
 | `softplus.py` | Computing softplus activation on Spyre |
-| `spyre_hints.py` | Using Spyre compiler hints to control tiling |
+| `for_each_tile.py` | Tiling a computation into a loop with `for_each_tile` (a map over M, a split-K carry) |
 | `profile_ops.py` | Measuring one operation's device time with the PyTorch profiler (see [the cost model](../../compiler/cost_model.md)) |
 | `run_cost_model_sweep.py` | Re-measuring every configuration in the cost-model database |
 

@@ -306,8 +306,12 @@ _E2E_SPLIT_COUNT = 5
 _E2E_TILE_SHAPE = [1, 1639, 256, 64]
 
 
-def _manual_h_hint_group(op, hint_id=1, split_count=_E2E_SPLIT_COUNT):
-    """Return the coarse-tile group produced by spyre_hint over dim H."""
+def _pretiled_h_group(op, hint_id=1, split_count=_E2E_SPLIT_COUNT):
+    """Return a hand-built one-level coarse-tile group splitting dim H.
+
+    It stands for a group a for_each_tile loop would have produced: the op
+    carries a ``DimHint`` over H, as an op that is already tiled does.
+    """
     hint = DimHint(
         dim_names=["H"],
         split_count=split_count,
@@ -1908,9 +1912,9 @@ class TestSpanOverflowGroups(InductorTestCase):
             ):
                 _apply_span_overflow(_graph([producer, matmul1, matmul2]))
 
-    def test_k_only_plan_rejects_manually_tiled_producer(self):
+    def test_k_only_plan_rejects_loop_tiled_producer(self):
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
-        _manual_h_hint_group(producer)
+        _pretiled_h_group(producer)
         bmm = _reduction_op(
             _E2E_SHAPE,
             name="buf1",
@@ -2086,18 +2090,18 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(restickify_weight.dim_hints[0].loop_var, sympy.Symbol("d0"))
         self.assertEqual(lm_head_bmm.dim_hints[0].loop_var, sympy.Symbol("d1"))
 
-    def test_manually_hinted_producer_blocks_auto_tiled_consumer(self):
-        """A user spyre_hint on a producer must also guard its auto-tiled consumer.
+    def test_loop_tiled_producer_blocks_auto_tiled_consumer(self):
+        """A for_each_tile-tiled producer must also guard its auto-tiled consumer.
 
         auto_tiled_producers only tracks producers this pass tiles itself.
-        assign_dim_hints runs earlier and leaves dim_hints set on any
-        manually-hinted op, so a consumer this pass independently decides to
-        auto-tile must also be checked against those -- reading a manually
-        tiled producer has the exact same unsynchronized-loop-nest risk as
-        reading one this pass auto-tiled itself.
+        splice_while_loops runs earlier and leaves dim_hints set on every op a
+        for_each_tile loop tiles, so a consumer this pass independently
+        decides to auto-tile must also be checked against those -- reading a
+        loop-tiled producer has the exact same unsynchronized-loop-nest risk
+        as reading one this pass auto-tiled itself.
         """
         producer = _pointwise_op(_E2E_SHAPE, name="buf1")
-        _manual_h_hint_group(producer)  # simulates a user spyre_hint
+        _pretiled_h_group(producer)  # simulates a for_each_tile loop
 
         consumer = _pointwise_op(_E2E_SHAPE, name="buf0")
         consumer.get_read_writes = MagicMock(
@@ -2205,10 +2209,10 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(groups[0][0], [unhinted_op])
         self.assertEqual(getattr(hinted_op, "dim_hints")[0].hint_id, 1)
 
-    def test_ignore_wsr_hints_config_suppresses_groups(self):
+    def test_ignore_span_overflow_hints_config_suppresses_groups(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "ignore_wsr_hints": True}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": True}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
@@ -5586,7 +5590,7 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                 auto_graph = _graph([auto_op])
                 auto_groups = _apply_span_overflow(auto_graph)
                 manual_graph = _graph([manual_op])
-                manual_groups = _manual_h_hint_group(manual_op)
+                manual_groups = _pretiled_h_group(manual_op)
 
                 self.assertEqual(len(auto_groups), 1)
                 self.assertEqual(len(manual_groups), 1)
@@ -5744,10 +5748,7 @@ def _forced_span_plan(shape, levels):
 def _forced_reduction_range_plan(split_count, reduction_size, output_split=None):
     """Force a non-matmul Reduction onto a reduction-range tile plan.
 
-    The automatic-span-overflow analogue of the manual
-    ``spyre_hint(expected_reduction_dims=...)`` tests in
-    ``test_coarse_tile_e2e.py``: it drives the *planner output*
-    (``is_reduction=True``), so the full
+    It drives the *planner output* (``is_reduction=True``), so the full
     ``span_overflow_groups -> coarse_tile -> identity-fill/combine/drain``
     path runs for a plain sum/max/min and its result is checked against CPU.
 
@@ -6505,10 +6506,8 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
     regression test. These tests close that gap for both the matmul case and
     the non-matmul-reduction case this change adds.
 
-    No kernel-launch mocking here (unlike ``test_coarse_tile_e2e.py``'s
-    codegen-only tests) -- ``compare_with_cpu`` runs the compiled function for
-    real, the same pattern ``test_coarse_tile_e2e.py`` already uses for its
-    own real numeric tests (e.g. ``test_hint_matmul_row_tiling``).
+    No kernel-launch mocking here, unlike the codegen-only tests above --
+    ``compare_with_cpu`` runs the compiled function for real.
     """
 
     @config.patch(

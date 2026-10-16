@@ -2753,7 +2753,7 @@ class NameSwapHandler(WrapperHandler):
 
     This is the canonical WrapperHandler wrapping pattern for compiler passes:
     wrap, never rebuild index expressions from scratch (they go stale — see
-    CLAUDE.md "Compiler Pass Conventions" and issue #2797).
+    AGENTS.md "Compiler Pass Conventions" and issue #2797).
     """
 
     def __init__(self, inner, name_map: dict[str, str]):

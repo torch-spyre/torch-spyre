@@ -76,7 +76,7 @@ inner_fn's closure cells (an internal, unstable implementation detail of
 torch._inductor.ir.make_pointwise/ops_wrapper), this module *runs* inner_fn
 once under a small recording ops handler that intercepts `load`/`constant`
 and returns opaque placeholders for everything else. This is the same "wrap
-the ops handler, don't reconstruct index expressions" pattern CLAUDE.md
+the ops handler, don't reconstruct index expressions" pattern AGENTS.md
 mandates for ComputedBuffer.inner_fn elsewhere in this codebase (see issue
 #2797), applied here for read-only shape recognition rather than mutation.
 """
@@ -605,7 +605,7 @@ def _marker_substitution(
     ``get_read_writes()`` and let the caller substitute into it -- the same
     "index expressions are symbolic, substitute don't re-execute"
     discipline this module and ``coarse_tile.py`` already follow
-    everywhere else (see CLAUDE.md's "wrap, never reconstruct").
+    everywhere else (see AGENTS.md's "wrap, never reconstruct").
 
     Returns the marker's own single MemoryDep read's ``(name, index)``,
     where ``index`` is expressed in terms of the marker's own WRITE dep's
@@ -664,7 +664,7 @@ class _InlineMarkerHandler(WrapperHandler):
     -- a pure sympy substitution, never a live re-execution of the
     marker's ``inner_fn`` (see ``_marker_substitution``'s docstring for why
     that would be wrong). This keeps the "wrap, never reconstruct"
-    convention (CLAUDE.md, issue #2797): the marker's ORIGINAL index
+    convention (AGENTS.md, issue #2797): the marker's ORIGINAL index
     expression is reused verbatim, never re-derived by hand -- only the
     free variables are substituted, exactly as any other index-composition
     in this codebase already does.
@@ -839,7 +839,7 @@ def _consume_tile_dim_markers(
       Pointwise/Reduction/Scan/Sort body): the read surfaces as a
       ``MemoryDep`` named after the marker in ``get_read_writes().reads``.
       Erased via ``_inline_marker_into_consumer``, which wraps (never
-      reconstructs, per CLAUDE.md) the inner_fn with ``_InlineMarkerHandler``
+      reconstructs, per AGENTS.md) the inner_fn with ``_InlineMarkerHandler``
       so every load of the marker re-issues the MARKER'S OWN inner_fn
       (``marker_op.data.make_loader()``) at the consumer's load-site index,
       rather than merely renaming past it. A plain name-swap

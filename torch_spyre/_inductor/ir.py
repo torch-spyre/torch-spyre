@@ -446,7 +446,7 @@ class SpyreEmptyFallback(ir.ExternKernel):
     spyre_empty_with_layout(size, stride, dtype, device_layout, device) when the
     layout is a FixedTiledLayout; the placeholder FixedLayout set at construction
     time must be replaced with a FixedTiledLayout before codegen runs.  This upgrade
-    happens via finalize_layouts (post-stickify hint-driven path) or
+    happens via finalize_layouts (the pre-stickify for_each_tile path) or
     lower_pad_sequence (post-stickify span-overflow path).  If the layout is never
     upgraded the wrapper falls back to the generic CPU allocator, which is incorrect
     on Spyre.

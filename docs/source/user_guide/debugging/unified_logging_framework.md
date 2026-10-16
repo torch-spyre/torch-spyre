@@ -358,7 +358,7 @@ The full list of dynamic loggers in the codebase:
 | `"scratchpad.allocator"` | `spyre.inductor.scratchpad.allocator` | `_inductor/scratchpad/allocator.py` |
 | `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
 | `"scratchpad.greedy_solver"` | `spyre.inductor.scratchpad.greedy_solver` | `_inductor/scratchpad/greedy_solver.py` |
-| `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/coarse_tile_hints.py` |
+| `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/propagate_named_dims.py` |
 | `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile.py`, `_inductor/wsr/coarse_tile_span_overflow.py` |
 | `"wsr.propagate_named_dims"` | `spyre.inductor.wsr.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
 | `"wsr.span_overflow_hint_analysis"` | `spyre.inductor.wsr.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |

@@ -133,7 +133,6 @@ def collect_work_division_constraints(
     blocked: set[Symbol] = set()
     allowed_splits: dict[Symbol, frozenset[int]] = {}
     for constraint in (
-        carried_reduction_pinned_row,
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
         reduction_window_blocked_vars,
@@ -348,33 +347,6 @@ def aligned_ownership_split_domains(
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def carried_reduction_pinned_row(
-    ctx: WorkDivConstraintContext,
-) -> ConstraintResult:
-    """Keep every stage of a carried sum on its declared output-row split."""
-
-    record = getattr(ctx.op, "_carried_reduction_record", None)
-    if record is None:
-        return ConstraintResult()
-
-    loop_var_dims = getattr(ctx.op, "work_div_loop_info", {})
-    candidates = [
-        sym
-        for sym in ctx.it_space_adjusted
-        if record.row_dim_name in loop_var_dims.get(sym, [])
-    ]
-    if len(candidates) != 1:
-        raise Unsupported(
-            f"{ctx.op.get_name()}: carried reduction row "
-            f"{record.row_dim_name!r} resolved to {candidates}"
-        )
-    return ConstraintResult(
-        allowed_splits={
-            candidates[0]: frozenset({record.required_row_split}),
-        }
-    )
-
-
 def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
     """Block reduction stick vars that cannot be split across cores.
 
@@ -478,6 +450,20 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
 # _insert_reduce_copy_op and its _insert_combine_op/reduction-drain
 # call sites. If either naming site changes, update this tuple to match.
 _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
+
+
+# Set on an operation whose coarse tiling and core division were chosen by one
+# solver, together. It exempts the op from
+# :func:`coarse_tile_local_dim_split_domains`, whose pin guards against
+# *independent* per-op choosers -- see that function -- on the same ground as
+# the user ``work_div`` hint exemption there. Keyed on the op rather than a
+# config flag: the greedy passes run on the same graph and stay pinned, and an
+# op the hint pass tiled carries ``loop_info`` before the menu is enumerated, so
+# its candidates respect the pin. Written by whoever applies such a solve
+# (``CoOptimizingAllocator._apply_chosen_tilings``) and never cleared: nothing
+# after scratchpad planning re-derives a work division, so its lifetime is the
+# rest of the compile.
+JOINT_TILING_AND_DIVISION_ATTR = "_work_division_chosen_with_tiling"
 
 
 def _hinted_work_div_syms(ctx: WorkDivConstraintContext) -> set[Symbol]:
@@ -619,6 +605,9 @@ def coarse_tile_local_dim_split_domains(
     loop_info = getattr(ctx.op, "loop_info", None)
     if loop_info is None:
         return ConstraintResult()
+
+    if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
+        return ConstraintResult()  # see JOINT_TILING_AND_DIVISION_ATTR
 
     if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
         return ConstraintResult()

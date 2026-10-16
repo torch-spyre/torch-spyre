@@ -627,14 +627,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "stack of a staggered fp32 value loses its element arrangement, so "
-            "about 40% of the elements come back wrong (#5278)"
-        ),
-    )
+    @_rejected("mixed element arrangements", "#2252")
     def test_stack_fp16_fp32_implicit_promotion(self):
         """stack([fp16, fp32]) implicit promotion."""
         x = cached_randn((4, 64), differentiation="tp04_fp16")
@@ -645,14 +638,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "cat of a staggered fp32 value loses its element arrangement, so "
-            "about 40% of the elements come back wrong (#5278)"
-        ),
-    )
+    @_rejected("mixed element arrangements", "#2252")
     def test_cat_fp16_fp32_implicit_promotion(self):
         """cat([fp16, fp32]) implicit promotion."""
         x = cached_randn((4, 64), differentiation="spe06_fp16")

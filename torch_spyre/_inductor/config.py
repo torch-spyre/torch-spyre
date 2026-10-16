@@ -179,11 +179,10 @@ max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
+# Ignore spyre_hint(work_div=...) and use the automatic work-distribution planner.
 ignore_work_division_hints: bool = (
-    os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS", "0") == "1"
 )
-
-ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
 # Temporary kill switch for removing a proven-redundant read copy after LX
 # planning.  A failed proof leaves the original graph unchanged.
@@ -250,9 +249,7 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # under them. Read by the summarize-sdsc skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
-# Disable compiler-generated span-overflow coarse-tiling hints.  The global
-# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
-# suppress all WSR/coarse-tiling hint paths.
+# Disable compiler-generated span-overflow coarse-tiling hints.
 #
 # Defaults to disabled (opt-in): span-overflow auto-tiling can synchronize
 # compatible contiguous pointwise groups, but incompatible producer/consumer
@@ -261,8 +258,7 @@ dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 # tests exercising this path directly should override via
 # config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (
-    ignore_wsr_hints
-    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
+    os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
 # Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
@@ -390,11 +386,18 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
-# Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
+# Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
-# selects. Off by default, and inert unless the joint CP-SAT co-opt path is
-# active (co_optimizing_lx_planning and layout_solver == "cpsat"). Ops a
-# spyre_hint or for_each_tile loop already tiles keep that tiling.
+# selects. Off by default, and inert unless a joint co-opt path is active
+# (co_optimizing_lx_planning, with layout_solver "cpsat" or
+# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
+# keep that tiling.
+#
+# Under the SA co-optimizer, anything the apply refuses raises rather than
+# falling back, so any gap between what the search believes it may tile and
+# what ``coarse_tile`` accepts is a compile failure. And nothing yet prices the
+# loop cost above the split cap, so the search has no downward pressure on the
+# tiling axis and takes as much of it as the divisor lattice offers.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out

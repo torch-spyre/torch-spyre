@@ -41,13 +41,12 @@ is the case that exercises the full splice -> DimHint synthesis ->
 coarse-tile -> single scf.for pipeline.
 
 TestForEachTilePointwiseE2E adds simpler single-level pointwise/softmax
-coverage (add, abs, a 3-operand abs(a+b)*c chain, row-tiled softmax),
-ported down from test_coarse_tile_e2e.py's HINT-driven test_add_*/test_abs_*
-and test_hint_softmax_row_tiling families -- for_each_tile doesn't need
-coarse_tile's exhaustive combinatorial coverage, but benefits from its own
-easy-to-debug cases, including a multi-stick tile_size variant of each
-(multi-stick tiling has been a historical source of bugs; see
-test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
+coverage (add, abs, a 3-operand abs(a+b)*c chain, row-tiled softmax).
+for_each_tile doesn't need an exhaustive combinatorial grid of shapes and tile
+counts, but benefits from easy-to-debug cases of its own, including a
+multi-stick tile_size variant of each (multi-stick tiling has been a historical
+source of bugs: it exercises the per-tile device_size[1] invariant described
+on softmax_row_tiled_fn in for_each_tile_fixtures.py).
 """
 
 import functools
@@ -523,14 +522,13 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     """Single-level map-mode pointwise/softmax fixtures, simpler than TestForEachTileE2E.
 
-    for_each_tile doesn't need coarse_tile_e2e's exhaustive combinatorial
-    coverage (see test_add_*/test_abs_* there); these cases exist to give
-    the lowering pipeline easy-to-debug pointwise/reduction coverage of its
-    own. Each op is tested at a small, single-stick debug size and again at
-    a tile_size that spans multiple 64-fp16-element sticks -- multi-stick
-    tiling has historically been a source of bugs (see
-    test_hint_softmax_row_tiling's device_size[1] docstring in
-    test_coarse_tile_e2e.py), so both sizes are kept as separate tests
+    for_each_tile doesn't need an exhaustive combinatorial grid of shapes and
+    tile counts; these cases exist to give the lowering pipeline easy-to-debug
+    pointwise/reduction coverage of its own. Each op is tested at a small,
+    single-stick debug size and again at a tile_size that spans multiple
+    64-fp16-element sticks -- multi-stick tiling has historically been a source
+    of bugs (see the device_size[1] note on softmax_row_tiled_fn in
+    for_each_tile_fixtures.py), so both sizes are kept as separate tests
     rather than only covering the large one.
 
     References here skip dl16_round: unlike TestForEachTileE2E's matmuls,
@@ -933,7 +931,10 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
     def _compile(self, fn, *args):
         _CollectRegions.operations = []
         _CollectRegions.regions = []
-        with patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions):
+        with (
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             torch.compile(fn, backend="inductor", fullgraph=True)(*args)
         return _CollectRegions.operations, _CollectRegions.regions
 
@@ -1188,10 +1189,9 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     """for_each_tile bodies that exercise passes beyond plain tiling.
 
-    Ported from the retired hint-driven coarse-tile e2e suite: each case
-    keeps the scenario (restickify inside a tile, a view feeding a tiled head
-    dim, an outside consumer, expert-tiled matmul, carried reductions) and
-    drops the hint plumbing.  Every test asserts the loop really formed (a
+    Each case is a scenario beyond plain tiling: restickify inside a tile, a
+    view feeding a tiled head dim, an outside consumer, expert-tiled matmul,
+    carried reductions.  Every test asserts the loop really formed (a
     ``LoopSpec`` with the expected trip count in the generated source) and
     that numerics match CPU, so a silently-untiled compile cannot pass.
     """
