@@ -4437,8 +4437,6 @@ def _insert_combine_op(
         if reduction_type == "min":
             return vops.minimum(accum, partial)
         if reduction_type == "any":
-            # TODO: add vops.logical_or to SpyreOpFuncs before enabling
-            # hardware-level 'any' support — it is currently absent.
             return vops.logical_or(accum, partial)
         raise RuntimeError(
             f"coarse_tile: _insert_combine_op: unsupported reduction_type "

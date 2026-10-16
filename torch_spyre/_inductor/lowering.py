@@ -170,8 +170,8 @@ def register_fallback_over_decomp(fallback_ops):
     return added
 
 
-# Overload names for aten.clamp
-_CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
+# Note: aten.clamp decomposes upstream into clamp_min + clamp_max,
+# so only clamp_min and clamp_max reach lowering.
 
 
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
@@ -208,36 +208,52 @@ def enable_spyre_lowerings():
                     ]
                 lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
 
-            # Build adapters that call your Spyre lowering
-            def _impl_lower_aten_clamp(x, min=None, max=None):
-                return lower_clamp(x, min=min, max=max)
-
-            def _impl_lower_aten_clamp_min(x, min):
-                return lower_clamp(x, min=min, max=None)
-
-            def _impl_lower_aten_clamp_max(x, max):
-                return lower_clamp(x, min=None, max=max)
-
             # Collect overload handles
-            clamp_ovs = [
-                getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
-            ]
             clamp_min_ov = getattr(torch.ops.aten.clamp_min, "default", None)
             clamp_max_ov = getattr(torch.ops.aten.clamp_max, "default", None)
 
             # Save originals and patch — keep references in function attribute
             saved = {}
 
-            def _save_set(ov, fn):
-                if ov is None:
-                    return
+            # Capture stock Inductor lowerings before overwriting them, so the
+            # adapters below can fall back to them for host-side (CPU) tensors.
+            # (Same pattern as _register_cmp_lowerings captures stock_tensor /
+            # stock_scalar before enable_spyre_lowerings() installs its overlay.)
+            all_clamp_ovs = [
+                ov for ov in [clamp_min_ov, clamp_max_ov] if ov is not None
+            ]
+            for ov in all_clamp_ovs:
                 saved[ov] = lowering.lowerings.get(ov)
-                lowering.lowerings[ov] = fn
 
-            for ov in clamp_ovs:
-                _save_set(ov, _impl_lower_aten_clamp)
-            _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
-            _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
+            def _make_clamp_adapter(stock_key, spyre_fn):
+                """Route to stock Inductor for CPU tensors, Spyre lowering otherwise."""
+
+                def _adapter(*args, **kwargs):
+                    # ATen uses "self" as the first positional argument name.
+                    x = args[0] if args else kwargs.get("self")
+                    if x is not None and hasattr(x, "get_device"):
+                        if x.get_device().type != DEVICE_NAME:
+                            stock = saved.get(stock_key)
+                            if stock is not None:
+                                return stock(*args, **kwargs)
+                    return spyre_fn(*args, **kwargs)
+
+                return _adapter
+
+            def _spyre_clamp_min(x, min):
+                return lower_clamp(x, min=min, max=None)
+
+            def _spyre_clamp_max(x, max):
+                return lower_clamp(x, min=None, max=max)
+
+            if clamp_min_ov is not None:
+                lowering.lowerings[clamp_min_ov] = _make_clamp_adapter(
+                    clamp_min_ov, _spyre_clamp_min
+                )
+            if clamp_max_ov is not None:
+                lowering.lowerings[clamp_max_ov] = _make_clamp_adapter(
+                    clamp_max_ov, _spyre_clamp_max
+                )
 
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
@@ -1131,25 +1147,77 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 def lower_clamp(x, min=None, max=None):
     if min is None and max is None:
         raise Unsupported("clamp requires at least one bound")
+
+    operands = [torch.empty(0, dtype=x.get_dtype())]
+    if min is not None:
+        operands.append(
+            torch.empty(0, dtype=min.get_dtype()) if hasattr(min, "get_dtype") else min
+        )
+    if max is not None:
+        operands.append(
+            torch.empty(0, dtype=max.get_dtype()) if hasattr(max, "get_dtype") else max
+        )
+
+    result_dtype, _ = elementwise_dtypes(
+        *operands,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+
+    _, val_dtype = elementwise_dtypes(
+        *operands,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+
+    if x.get_dtype() != val_dtype:
+        converted_x = to_dtype(x, val_dtype)
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted_x,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+    else:
+        converted_x = x
+
     # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
     # encoding is finite. FP32 has IEEE infinities, so preserve those too.
-    dtype = x.get_dtype()
-    limit = float("inf") if dtype == torch.float32 else DLFLOAT16_MAX
+    limit = float("inf") if val_dtype == torch.float32 else DLFLOAT16_MAX
+
     if min is None:
-        min = -limit
+        min_val = -limit
+    else:
+        min_val = float(min)
+
     if max is None:
-        max = limit
+        max_val = limit
+    else:
+        max_val = float(max)
+
     pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=dtype,
+        device=converted_x.get_device(),
+        dtype=val_dtype,
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
-            x.make_loader()(index), min, max
+            converted_x.make_loader()(index), min_val, max_val
         ),
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
+        ranges=converted_x.get_size(),
+        origin_node=converted_x.get_origin_node(),
         traceback=x.get_traceback(),
     )
     pw.realize()
+
+    if result_dtype != val_dtype:
+        origin = (
+            converted_x.get_origin_node()
+            if isinstance(converted_x, ir.IRNode)
+            else None
+        )
+        _ensure_synthetic_origin(
+            pw,
+            torch.ops.spyre.clamp,
+            () if origin is None else (origin,),
+        )
+        return to_dtype(pw, result_dtype, skip_trunc=True)
+
     return pw
 
 
@@ -1972,12 +2040,21 @@ def lower_where(condition, self, other):
     return result
 
 
+# type_promotion_kind=None: DEFAULT performs FP16→FP32 promotion before layout
+# propagation, leaving an IR node with STANDARD EA.  With None the FP16 operand
+# survives into the fused body so propagate_layouts can assign DL16_TO_FP32 EA.
+# The underlying lowering applies default promotion; when both operands stay
+# int32, SpyreOpFuncs.add / SpyreOpFuncs.mul emits the dedicated hardware op
+# (addi32toi32 / muli32toi32).
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
+    # Keep the explicit scale-and-realize for alpha != 1. Delegating to
+    # lowering.add(x, y, alpha=alpha) fails for fractional alpha (test_add_alpha,
+    # alpha=0.5) with InductorError "No FX node for buf1" from split_multi_ops.
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -1986,20 +2063,25 @@ def lower_add(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    return lowering.add(x, y)
 
 
+# Same type_promotion_kind=None rationale as lower_add above.
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    return lowering.mul(x, y)
 
 
+# NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
+# with_int64_fallback, so unlike add/mul it is inexact above 2**24. The planned
+# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int32/int64
+# sub reuses the native addi32toi32 / muli32toi32 path.
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,

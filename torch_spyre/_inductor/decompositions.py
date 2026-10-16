@@ -3731,23 +3731,14 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 def spyre_prod_dim_int(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> torch.Tensor:
-    # int64 is converted to fp32 for now, so it stays on the decomposition
-    # path below.
-    if input.dtype != torch.int64:
-        return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
-
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    reduce_size = out_shape.pop(dim)
-    acc = torch.ones(out_shape, dtype=input.dtype, device=input.device)
-    for i in range(reduce_size):
-        acc = acc * input.select(dim, i)
-
-    if keepdim:
-        acc = acc.unsqueeze(dim)
-
-    return acc
+    # All dtypes route through spyre.prod_dim_int.  For int64, lower_prod_dim
+    # uses with_int64_fallback which converts the input to fp32 via one CPU
+    # round-trip before the hardware reduction.  Stick-dim reductions fail at
+    # compile time (NotImplementedError "no mechanism to resolve stick
+    # incompatibility") until ReStickifyOpHBM supports fp32 (issue #2544; the
+    # CPU fallback is to be removed by issue #5126).  Those cases are
+    # expect_fail in test_prod_cpu; remove the entries when the issues land.
+    return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
 
 @register_spyre_decompositions(

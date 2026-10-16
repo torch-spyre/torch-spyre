@@ -37,6 +37,7 @@ import torch
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
+from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
@@ -266,11 +267,13 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
 
 
 def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
-    """``lx_solver_relayout()`` says whether the configured solver decides
+    """The solver's ``decides_lx_relayouts()`` says whether it decides
     relayouts; when it does not, no candidate is enumerated and the
     co-optimizing solve is exactly what it was before this feature."""
     observed = _arm_forced(monkeypatch)
-    monkeypatch.setattr(alloc_mod, "lx_solver_relayout", lambda: False)
+    monkeypatch.setattr(
+        CpSatLayoutSolver, "decides_lx_relayouts", classmethod(lambda cls: False)
+    )
 
     def fn(t):
         return torch.relu(torch.neg(t)) + 1.0

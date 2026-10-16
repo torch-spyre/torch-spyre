@@ -49,7 +49,7 @@ import math
 import random as rnd
 import statistics
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -87,13 +87,12 @@ logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 # RNG seed; fixes the (deterministic) search trajectory.
 _SEED = 0
 
-# Step budget: clamp(_STEPS_PER_BUFFER * n, _MIN_STEPS, _MAX_STEPS). The ceiling
-# sits above the layout-only annealer's clamp (``SelfCalibratingReheatingSchedule
+# Step budget: min(_STEPS_PER_BUFFER * n, _MAX_STEPS). The ceiling sits above
+# the layout-only annealer's clamp (``SelfCalibratingReheatingSchedule
 # .max_steps``, 5_000) since this engine searches divisions too, and binds only
 # well past the validated corpus. It bounds *steps*, not wall-clock.
-_STEPS_PER_BUFFER = 40
-_MIN_STEPS = 200
-_MAX_STEPS = 15_000
+_STEPS_PER_BUFFER = 200
+_MAX_STEPS = 50_000
 
 # Fixed proposal weights over the three move types. Reorder's weight is
 # effectively 0 while every eligible buffer is resident (see
@@ -106,9 +105,8 @@ _BURST_FRACTION = 0.1
 
 # How often a recolor anchor is drawn untiled outright (see
 # ``_GeneratedDivisions._draw_tiling``). Flat, and deliberately not a per-dim
-# opt-out: the tiling axis has no downward pressure in the objective, so the
-# probability of proposing an untiled region must not decay with the number of
-# tileable dims.
+# opt-out: the probability of proposing an untiled region must not decay with the
+# number of tileable dims.
 _UNTILED_ANCHOR_PROB = 0.5
 
 # The geometric cool spans t0 down to t0 / _COOLING_SPAN.
@@ -397,9 +395,13 @@ class _GeneratedDivisions(_DivisionSource):
         return self._config_cache[key]
 
     def can_move(self) -> bool:
-        return any(
-            len(factors) > 1 for factors in self.space.factor_domains.values()
-        ) or not (self.space.tiling is None or self.space.tiling.is_empty)
+        return (
+            any(len(factors) > 1 for factors in self.space.factor_domains.values())
+            or self.can_tile()
+        )
+
+    def can_tile(self) -> bool:
+        return self.space.tiling is not None and not self.space.tiling.is_empty
 
     def can_split(self) -> bool:
         return any(
@@ -482,10 +484,17 @@ class _GeneratedDivisions(_DivisionSource):
         the **product** ``prod_d 1/(k_d + 1)`` over the tileable dims -- about
         1/289 at two dims and ``_MAX_SPLITS_PER_DIM`` counts, 1/4913 at three --
         so undividing a region would vanish exactly as the search gained room to
-        over-divide it. Nothing else pushes the tiling axis down: the objective
-        sees a tiling only through a monotone per-core footprint, so a tiling
-        move is score-neutral (accepted unconditionally) or score-improving, and
-        recolor is the only long-range move there is.
+        over-divide it.
+
+        *Whether* to tile is priced: :meth:`SaCoOptimizingSolver._companion_bytes`
+        charges the full-extent companion an escaping op needs, so a tiling move
+        is no longer accepted unconditionally. *How deep* to tile is not. The
+        objective sees depth only through a monotone per-core footprint, and the
+        companion charge is a function of the buffer's size and its outside
+        readers rather than of the tile count, so a drawn tiling is as deep as
+        the draw made it. Hence the flat untiled draw: it is what keeps
+        undividing a region proposable at all, and recolor is the only
+        long-range move there is.
 
         Each tileable dim then offers its legal counts plus ``None`` for "leave
         this one alone". A level the space does not admit is dropped, which
@@ -675,11 +684,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     Args:
         buffers: the buffers to plan, in the allocator's order. Declared as
-            ``Sequence[LifetimeBoundBuffer]`` so the class itself satisfies
-            ``CoreDivisionSolverFactory`` (``Callable`` parameters are
-            contravariant, so a narrower annotation would not), but every buffer
-            passed must be a :class:`CoreDivisionBuffer` -- the engine reads
-            each one's ``core_divisions``, its residency relation to each parent
+            ``Sequence[LifetimeBoundBuffer]`` to match the base constructor the
+            allocator calls, but every buffer passed must be a
+            :class:`CoreDivisionBuffer` -- the engine reads each one's
+            ``core_divisions``, its residency relation to each parent
             (``division_space`` and ``residency_edges`` where the allocator
             built them, ``cd_parent_matches`` otherwise), and its cost symbols.
 
@@ -692,6 +700,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         size: scratchpad capacity in bytes.
         alignment: placement alignment (128 = one Spyre stick).
     """
+
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def generates_divisions(cls) -> bool:
+        return True
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return True
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
 
     def __init__(
         self,
@@ -761,6 +797,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.packer = self._build_seed_packer()
 
         self._anneal()
+        self._log_tilings()
         self._write_back()
         return list(self._bufs)
 
@@ -789,7 +826,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
             # menu position, not the key, so equal configs need not bind alike: a
             # generated config has no position at all. Sound only while no such
-            # term reaches the annealer, which lx_solver_relayout() ensures (#4425).
+            # term reaches the annealer, which ``decides_lx_relayouts()`` ensures
+            # (#4425).
             value_of[buf.sym_division] = lambda chosen, resident, idx=idx: (
                 chosen[idx].menu_index
             )
@@ -895,6 +933,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # draw is :meth:`_DivisionSource.anchor`.
         self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
         self._build_operation_positions()
+        # Whether any buffer can carry a tiling at all, so the companion term
+        # costs one bool per score where it cannot -- which is every graph with
+        # ``auto_coarse_tiling`` off.
+        self._tilings_are_possible = any(
+            isinstance(source, _GeneratedDivisions) and source.can_tile()
+            for source in self._sources
+        )
         generated = sum(
             isinstance(source, _GeneratedDivisions) for source in self._sources
         )
@@ -985,37 +1030,40 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             for producer, reads in self._tile_reads.get(position, ())
         )
 
-    def _run_bounds(
-        self,
-        position: int,
-        override: Optional[dict[int, DivisionConfig]] = None,
-    ) -> tuple[int, int]:
-        """The run holding ``position`` -- inclusive on both ends: the group
-        ``derive_tiling_groups`` forms there, i.e. the maximal stretch of
-        positions agreeing on the loop nest, cut where :meth:`_breaks_at`.
+    def _runs(
+        self, override: Optional[dict[int, DivisionConfig]] = None
+    ) -> Iterator[tuple[int, int]]:
+        """Every run, left to right, under ``override`` if given -- inclusive on
+        both ends: the groups ``derive_tiling_groups`` forms, i.e. the maximal
+        stretches of positions agreeing on the loop nest, cut where
+        :meth:`_breaks_at`.
 
         Untiled is a spec value like any other, so these runs partition the whole
         operation list. That is what lets a boundary move *create* a tiled region
         rather than only shrink one.
         """
-        nest = self._tiling_at(position, override).level_counts
-        stretch = position
-        while (
-            stretch > 0 and self._tiling_at(stretch - 1, override).level_counts == nest
-        ):
-            stretch -= 1
-        lo = stretch
-        for at in range(stretch + 1, position + 1):
-            if self._breaks_at(at, stretch, override):
-                lo = at
-        hi = position
-        while (
-            hi + 1 < self._n_positions
-            and self._tiling_at(hi + 1, override).level_counts == nest
-            and not self._breaks_at(hi + 1, stretch, override)
-        ):
-            hi += 1
-        return lo, hi
+        stretch = 0
+        while stretch < self._n_positions:
+            nest = self._tiling_at(stretch, override).level_counts
+            lo = at = stretch
+            while (
+                at + 1 < self._n_positions
+                and self._tiling_at(at + 1, override).level_counts == nest
+            ):
+                at += 1
+                if self._breaks_at(at, stretch, override):
+                    yield lo, at - 1
+                    lo = at
+            yield lo, at
+            stretch = at + 1
+
+    def _run_bounds(
+        self,
+        position: int,
+        override: Optional[dict[int, DivisionConfig]] = None,
+    ) -> tuple[int, int]:
+        """The run of :meth:`_runs` holding ``position``."""
+        return next(run for run in self._runs(override) if position <= run[1])
 
     def _edge_relation(self, p_idx: int, c_idx: int, p_name: str) -> _EdgeRelation:
         """The relation on the edge ``p_idx -> c_idx``.
@@ -1103,9 +1151,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         :meth:`_eligible`, which is an engine threshold rather than a cost
         term, and be paid for afterwards in the traffic residency frees.
 
-        Optimistic while it stands alone: this is the *per-tile* scratch, and
-        an op whose output escapes its tiling group also needs a full-extent
-        companion buffer that nothing sizes yet.
+        Only the per-tile scratch is sized: an escaping op's companion never
+        enters LX (``CoOptimizingAllocator._apply_chosen_tilings``).
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
@@ -1225,6 +1272,93 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * max(0, buffer.size)
 
+    def _companion_bytes(self, addresses: Sequence[Optional[int]]) -> int:
+        """HBM bytes the apply's companion buffers move that the rest of the
+        objective does not count, under the current state: the sum of
+        :meth:`_companion_charges`.
+        """
+        return sum(nbytes for _run, nbytes in self._companion_charges(addresses))
+
+    def _companion_charges(
+        self, addresses: Sequence[Optional[int]]
+    ) -> Iterator[tuple[tuple[int, int], int]]:
+        """``(run, bytes)`` for each escaping buffer of a tiled run: the HBM bytes
+        its companion moves that the rest of the objective does not count.
+
+        A tiling shrinks what the buffer holds at once; it does not shrink what
+        the buffer moves. For an op whose output escapes its tiling group,
+        ``CoarseTilingPass`` allocates a full-extent ``full_buf``, inserts a copy
+        op that drains one tile into it per iteration, and repoints every outside
+        consumer and any graph output at it (``wsr/coarse_tile.py``). None of
+        that is in the features: they were extracted from the untiled graph,
+        before ``_post_solve`` applies anything, so the search sees the per-tile
+        shrink and neither the copy nor the outside consumers' HBM reads. It
+        therefore over-values tiling by a quantity that does not fall with the
+        tile count.
+
+        Per escaping buffer of ``size`` bytes, with ``r`` consumers outside its
+        run, the difference between the applied graph and the extracted one is:
+
+        * the copy op's read of the per-tile scratch, ``size`` when that scratch
+          is in HBM and free when it is resident;
+        * the copy op's write of ``full_buf``, ``size`` and always HBM -- except
+          for a graph output, whose externally visible write the model already
+          charges whether or not the buffer is resident (#4271), so there the
+          copy replaces a write already counted and only the op's own write into
+          scratch is new;
+        * ``r * size`` when the buffer is resident, because those consumers read
+          ``full_buf`` from HBM rather than the scratch residency freed them
+          from. Not resident, the model already charges them.
+
+        So an op whose consumers all sit inside its own run costs nothing here,
+        which is the shape the recolor flood exists to build, while tiling a
+        buffer that is not resident costs a full HBM round trip -- both of which
+        are the point.
+
+        :meth:`_score` adds this to either objective at the HBM rate, because
+        neither can express it: the cost expression is built once from the
+        untiled graph over splits and residency, with no symbol for a tiling, and
+        the fallback's spill costs are loop-invariant by construction.
+
+        Two known under-corrections, neither expressible from what the solver
+        holds: a consumer is counted once however many times it reads, and a
+        matmul consumer's ``replication`` (#4454) would make its read of
+        ``full_buf`` cost more than one pass.
+        """
+        if not self._tilings_are_possible:
+            return
+        # Untiled positions mint no companion.
+        tiled = (
+            (position, (lo, hi))
+            for lo, hi in self._runs()
+            if not self._tiling_at(lo).is_untiled
+            for position in range(lo, hi + 1)
+        )
+        for position, (lo, hi) in tiled:
+            idx = self._buffer_at[position]
+            buf = self._bufs[idx]
+            # A buffer with no operation position is in no run, so it is not
+            # here; ``_position_of`` being None on a *consumer* means the same
+            # thing, and puts it outside every run.
+            outside = sum(
+                1
+                for child_idx, _relation in self._children[idx]
+                if not (
+                    (child_position := self._position_of[child_idx]) is not None
+                    and lo <= child_position <= hi
+                )
+            )
+            is_graph_output = buf.boundary is BufferType.Output
+            if not (outside or is_graph_output):
+                # Nothing escapes: the apply keeps the buffer as loop-internal
+                # scratch and allocates no full buffer at all.
+                continue
+            size = max(0, buf.size)
+            copy_read = 0 if addresses[idx] is not None else size
+            copy_write = copy_read if is_graph_output else size
+            outside_reads = size * outside if addresses[idx] is not None else 0
+            yield (lo, hi), copy_read + copy_write + outside_reads
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is
@@ -1238,22 +1372,27 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         a spill adds **over** residency -- so a resident buffer contributes zero
         and only spilled ones are summed, the same shape as the CP-SAT engine's
         ``spill_cost() * (1 - in_buffer)``.
+
+        Both add :meth:`_companion_bytes` at the HBM rate.
         """
         addresses = self.packer.addresses
+        companions = utils.to_fixed_us(
+            self._companion_bytes(addresses) / self._hbm_bytes_per_us
+        )
         if self._score_fn is not None:
             resident = frozenset(
                 b.name
                 for b, address in zip(self._bufs, addresses)
                 if address is not None
             )
-            return self._score_fn(self.chosen, resident)
+            return self._score_fn(self.chosen, resident) + companions
 
         traffic = sum(
             cost
             for cost, address in zip(self._spill_costs, addresses)
             if address is None
         )
-        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us)
+        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us) + companions
 
     # -- moves ---------------------------------------------------------------
 
@@ -1700,7 +1839,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """One geometric cool over the clamped step budget, at fixed proposal
         weights, publishing the best state seen."""
         n = len(self._bufs)
-        steps = min(_MAX_STEPS, max(_MIN_STEPS, _STEPS_PER_BUFFER * n))
+        steps = min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
         if _STEPS_PER_BUFFER * n > _MAX_STEPS:
             logger.debug(
                 "SA co-optimizer step budget clamped to %d for %d buffers (%d "
@@ -1736,6 +1875,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._adopt(self._best_snap)
 
     # -- write-back ----------------------------------------------------------
+
+    def _log_tilings(self) -> None:
+        """Report the tiled runs the search kept, each with its companion
+        traffic, or that it kept none although some buffer could tile."""
+        if not self._tilings_are_possible:
+            return
+        charges: dict[tuple[int, int], int] = {}
+        for run, nbytes in self._companion_charges(self.packer.addresses):
+            charges[run] = charges.get(run, 0) + nbytes
+        tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
+        if not tiled:
+            logger.info(
+                "SA co-optimizer kept no coarse tiling; %d buffer(s) could tile",
+                sum(
+                    isinstance(source, _GeneratedDivisions) and source.can_tile()
+                    for source in self._sources
+                ),
+            )
+        for lo, hi in tiled:
+            logger.debug(
+                "SA co-optimizer tiled %s at %s; companion HBM traffic %d bytes",
+                ", ".join(
+                    self._bufs[self._buffer_at[position]].name
+                    for position in range(lo, hi + 1)
+                ),
+                self._tiling_at(lo).label,
+                charges.get((lo, hi), 0),
+            )
 
     def _write_back(self) -> None:
         """Commit the best state to the buffers and record spill causes.
