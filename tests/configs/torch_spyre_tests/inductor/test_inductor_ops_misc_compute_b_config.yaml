@@ -62,6 +62,7 @@ test_suite_config:
             - TestOps::test_where.*
             # pooling
             - TestOps::test_avg_pool2d.*
+            - TestOps::test_max_pool2d.*
             # invalid-dim error-path tests
             - TestOps::test_core_reduction_invalid_dims_api.*
             - TestOps::test_core_reduction_invalid_dims_spyre.*
