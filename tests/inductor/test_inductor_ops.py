@@ -10529,9 +10529,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_gather_staggered_index_lane0_cpu(self):
         # A float16 index widened onto a stick converts to int32 through a
-        # staggered float32 (hf-adapters' MoE expert indices). The gather reads
-        # lane 0 of each stick, which the stagger keeps in place, so the
-        # staggered index pairs with standard weights.
+        # staggered float32 (hf-adapters' MoE expert indices). Every lane holds
+        # the index, so its max over the stick is the index, as an unstaggered
+        # float32 that pairs with standard weights.
         T, top_k, stick, experts, rows, cols = 4, 8, 64, 16, 64, 64
         ids = (torch.arange(T * top_k) * 5 % experts).reshape(T, top_k)
         idx_wide = ids[..., None].expand(T, top_k, stick).to(torch.float16)
@@ -10539,7 +10539,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         weights = (weights % 251).to(torch.bfloat16)
 
         def fn(idx_wide, weights):
-            addr = idx_wide.to(torch.float32)[..., : stick // 2].to(torch.int32)
+            addr = idx_wide.to(torch.float32).amax(-1, keepdim=True).to(torch.int32)
             return weights[addr[..., 0]].reshape(T * top_k, rows, cols)
 
         self.compare_with_cpu(
