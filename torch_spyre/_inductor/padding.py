@@ -75,11 +75,13 @@ from .pass_utils import (
     device_coordinates,
     find_reduction_var,
     find_fx_node,
+    forward_valid_elements,
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
     lower_pad_sequence,
     patch_env,
+    prepend_dim_valid_elements,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -502,7 +504,11 @@ def _pad_device_dim(
     new_device_size = list(stl.device_size)
     new_device_size[device_dim] = new_dim_size
     padded_stl = SpyreTensorLayout(
-        new_device_size, list(stl.stride_map), stl.device_dtype, stl.element_arrangement
+        new_device_size,
+        list(stl.stride_map),
+        stl.device_dtype,
+        forward_valid_elements(stl),
+        stl.element_arrangement,
     )
     host_size = [concretize_expr(s) for s in layout.size]
     host_stride = [concretize_expr(s) for s in layout.stride]
@@ -534,6 +540,7 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
         [stick, *stl.device_size],
         [-1, *stl.stride_map],
         stl.device_dtype,
+        prepend_dim_valid_elements(stl, 1),
         stl.element_arrangement,
     )
     host_size = [concretize_expr(s) for s in layout.size]
@@ -836,6 +843,7 @@ def lower_identity_clone(
         list(orig_stl.device_size),
         list(orig_stl.stride_map),
         orig_stl.device_dtype,
+        forward_valid_elements(orig_stl),
         orig_stl.element_arrangement,
     )
     # insert_restickify_padding runs after propagate_spyre_tensor_layouts, so

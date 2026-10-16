@@ -85,6 +85,7 @@ from .pass_utils import (
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
+    forward_valid_elements,
     get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
@@ -186,6 +187,7 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
         device_size,
         stride_map,
         stl.device_dtype,
+        forward_valid_elements(stl),
         stl.element_arrangement,
     )
 
@@ -463,6 +465,7 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
         out_device_size,
         out_stride_map,
         get_device_dtype(out_dtype),
+        forward_valid_elements(stl),
         ElementArrangement.QFP8CH,
     )
 
@@ -749,6 +752,7 @@ def _single_arg_op_layout(
             stl.device_size,
             stl.stride_map,
             out_device_dtype,
+            forward_valid_elements(stl),
             stl.element_arrangement,
         )
         return [stl]
@@ -1728,6 +1732,7 @@ def _multi_arg_pointwise_layouts(
                 template_stl.device_size,
                 template_stl.stride_map,
                 out_device_dtype,
+                forward_valid_elements(template_stl),
                 output_ea,
             )
         )
@@ -1796,6 +1801,7 @@ def _multi_arg_pointwise_layouts(
             src_stl.device_size,
             src_stl.stride_map,
             get_device_dtype(output.dtype),
+            forward_valid_elements(src_stl),
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])
