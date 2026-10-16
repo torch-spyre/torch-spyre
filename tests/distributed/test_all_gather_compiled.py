@@ -18,7 +18,20 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from utils import (
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
+    _native_bfloat16_tensor,
+)
 
 import torch_spyre  # noqa: F401
 
@@ -70,6 +83,7 @@ class AllGatherCompiledModule(torch.nn.Module):
         return torch.ops._c10d_functional.wait_tensor(y)
 
 
+@instantiate_parametrized_tests
 class TestAllGatherCompiled(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -290,6 +304,103 @@ class TestAllGatherCompiled(TestCase):
                     f"all_gather chunk for rank {rank} incorrect. "
                     f"Expected {float(rank)}, got {chunk[0].item()}",
                 )
+
+    @parametrize("shape", [(128,), (4, 96)])
+    def test_allgather_compiled_bfloat16(self, shape):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.all_gather_into_tensor(
+                x, self.comm_size, _GROUP_NAME
+            )
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+            result = compiled(x)
+            self.assertEqual(result.dtype, torch.bfloat16)
+            self.assertEqual(
+                result.cpu(),
+                _bfloat16_collective_expected("allgather", shape, self.comm_size),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_allgather_compiled_float16_padded_intermediate(self):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.all_gather_into_tensor(
+                x, self.comm_size, _GROUP_NAME
+            )
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        shape = (4, 96)
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+            self.assertEqual(
+                compiled(x).cpu(),
+                _collective_expected("allgather", shape, self.comm_size, torch.float16),
+                rtol=0,
+                atol=0,
+            )
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("chunk_rank", [0, 1])
+    def test_allgather_compiled_padded_view(self, dtype, chunk_rank):
+        shape = (4, 96)
+
+        def fn(x):
+            gathered = torch.ops._c10d_functional.all_gather_into_tensor(
+                x * 2.0, self.comm_size, _GROUP_NAME
+            )
+            base = torch.ops._c10d_functional.wait_tensor(gathered)
+            chunk = base.narrow(0, chunk_rank * shape[0], shape[0])
+            gathered_view = torch.ops._c10d_functional.all_gather_into_tensor(
+                chunk, self.comm_size, _GROUP_NAME
+            )
+            return base * 0.5, torch.ops._c10d_functional.wait_tensor(
+                gathered_view
+            ) * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        expected_chunk = _collective_rank_input(chunk_rank, shape, dtype)
+        for _ in range(2):
+            x = _collective_rank_input(self.comm_rank, shape, dtype).to(DEVICE)
+            base, gathered_view = compiled(x)
+            self.assertEqual(
+                base.cpu(),
+                _collective_expected("allgather", shape, self.comm_size, dtype),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(
+                gathered_view.cpu(),
+                torch.cat([expected_chunk] * self.comm_size),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_allgather_compiled_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            torch.ops.spyre.allgather_run(x, -1, self.comm_size)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_allgather_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            torch.ops.spyre.allgather_run(x, -1, self.comm_size)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

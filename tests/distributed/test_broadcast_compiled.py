@@ -18,7 +18,20 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from utils import (
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
+    _native_bfloat16_tensor,
+)
 
 import torch_spyre  # noqa: F401
 
@@ -66,6 +79,7 @@ class BroadcastCompiledModule(torch.nn.Module):
         return torch.ops._c10d_functional.wait_tensor(y)
 
 
+@instantiate_parametrized_tests
 class TestBroadcastCompiled(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -193,6 +207,89 @@ class TestBroadcastCompiled(TestCase):
                 f"Rank {self.comm_rank}: iteration {iteration} incorrect. "
                 f"Expected 10.0, got {result[0].to('cpu').item()}",
             )
+
+    @parametrize("shape", [(128,), (4, 96)])
+    def test_broadcast_compiled_bfloat16(self, shape):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.broadcast(x, self.comm_size - 1, _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+            result = compiled(x)
+            self.assertEqual(result.dtype, torch.bfloat16)
+            self.assertEqual(
+                result.cpu(),
+                _bfloat16_collective_expected("broadcast", shape, self.comm_size),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_broadcast_compiled_float16_padded_intermediate(self):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.broadcast(x, self.comm_size - 1, _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        shape = (4, 96)
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+            self.assertEqual(
+                compiled(x).cpu(),
+                _collective_expected("broadcast", shape, self.comm_size, torch.float16),
+                rtol=0,
+                atol=0,
+            )
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("view_kind", ["reshape", "prefix", "offset"])
+    def test_broadcast_compiled_view(self, dtype, view_kind):
+        shape = (2, 2, 96) if view_kind == "reshape" else (5, 96)
+
+        def view(base):
+            if view_kind == "reshape":
+                return base.reshape(4, 96)
+            return base[:4] if view_kind == "prefix" else base[1:]
+
+        def fn(x):
+            base = x * 2.0
+            result = torch.ops._c10d_functional.broadcast(
+                view(base), self.comm_size - 1, _GROUP_NAME
+            )
+            ready = torch.ops._c10d_functional.wait_tensor(result)
+            return base * 0.5, ready * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        local = _collective_rank_input(self.comm_rank, shape, dtype)
+        expected = view(_collective_rank_input(self.comm_size - 1, shape, dtype))
+        for _ in range(2):
+            base, result = compiled(local.to(DEVICE))
+            self.assertEqual(base.cpu(), local, rtol=0, atol=0)
+            self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
+    def test_broadcast_compiled_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            torch.ops.spyre.broadcast_run(x, -1, 0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_broadcast_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            torch.ops.spyre.broadcast_run(x, -1, 0)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

@@ -27,8 +27,10 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_collective_utils.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
+#include "spyre_tensor_impl.h"
 #include "types_mapping.h"
 
 namespace c10d {
@@ -322,20 +324,29 @@ convert_string_to_datatype_pair(const std::string& type_name) {
 
 spyre_comms::TensorInfo SpyreCCLBackend::getTensorInfo(
     const at::Tensor& input) {
-  std::vector<int64_t> shape;
-  if (input.dim() == 0) {
-    shape = {1};
-  } else {
-    for (const int64_t& element : input.sizes()) {
-      shape.push_back(element);
-    }
-  }
+  spyre::check_collective_storage(input);
   auto str_type = spyre::torchScalarToString[input.scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       convert_string_to_datatype_pair(str_type);
-  spyre_comms::TensorShape t_shape(shape);
-  spyre_comms::TensorInfo ti{sen_dtype_cpu, t_shape};
-  return ti;
+  auto dtype = sen_dtype_cpu;
+  if (input.scalar_type() == c10::ScalarType::BFloat16) {
+    // convert_string_to_datatype_pair("bfloat16") is {bfloat16, sen_fp16}.
+    // check_collective_storage verified that the borrowed bytes are DL16.
+    TORCH_INTERNAL_ASSERT(sen_dtype_dev ==
+                          spyre_comms::TensorDataTypeEnum::sen_fp16);
+    dtype = sen_dtype_dev;
+  }
+  const auto bytes =
+      spyre::get_device_size_in_bytes(spyre::get_spyre_tensor_layout(input));
+  const auto element_bytes = spyre_comms::DataTypeSizeBytes(dtype);
+  TORCH_CHECK(element_bytes > 0 && bytes % element_bytes == 0,
+              "Collective storage size is incompatible with its data type");
+  // The comms buffer is flat device storage, including stick padding. Count
+  // in the planner dtype's units so copy-only host/device width differences
+  // (for example int64) retain exactly the same byte coverage.
+  return spyre_comms::TensorInfo{
+      dtype,
+      spyre_comms::TensorShape({static_cast<int64_t>(bytes / element_bytes)})};
 }
 
 /**
@@ -437,8 +448,18 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   }
   check_vector_tensor(inputTensors, 1, 1);
 
+  auto input = inputTensors[0];
+  spyre::check_collective_device(input);
+  if (input.storage_offset() == 0 &&
+      c10::multiply_integers(spyre::get_spyre_tensor_sizes(input)) !=
+          input.numel()) {
+    // Eager LM-head unpadding can return a contiguous prefix with its base
+    // allocation's descriptor. Copy the view before borrowing its device
+    // address; communicating the base would include unrelated elements.
+    input = input.clone(at::MemoryFormat::Contiguous);
+  }
   spyre_comms::Tensor input_tensor;
-  prepare_tensor(inputTensors[0], &input_tensor);
+  prepare_tensor(input, &input_tensor);
 
   std::vector<spyre_comms::Tensor> output_tensors;
   for (auto& outputTensor : outputTensors[0]) {
@@ -449,6 +470,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
 
   c10::intrusive_ptr<SpyreCCLWork> work =
       c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER);
+  work->input_tensor_ = input;
   work->work_schedule_ =
       group_context_->allgather(output_tensors, input_tensor);
   work->work_schedule_->start();
@@ -475,11 +497,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
                            " Actual: " + std::to_string(opts.reduceOp);
     TORCH_CHECK(false, _err_msg);
   }
-  // Spyre Comms only supports float16 tensors because of the 'op' path
-  // through the compiler. The data transfers do not have this restriction.
-  if (spyre::torchScalarToString[tensors[0].scalar_type()] != "float16") {
+  // FP16 and BF16 both use DL16 for device-side SUM.
+  if (tensors[0].scalar_type() != c10::ScalarType::Half &&
+      tensors[0].scalar_type() != c10::ScalarType::BFloat16) {
     std::string _err_msg =
-        "[" + getBackendName() + "]: Allreduce only supports float16 tensors." +
+        "[" + getBackendName() +
+        "]: Allreduce only supports float16 and bfloat16 tensors." +
         " Actual: " + spyre::torchScalarToString[tensors[0].scalar_type()];
     TORCH_CHECK(false, _err_msg);
   }
@@ -601,11 +624,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
                            " Actual: " + std::to_string(opts.reduceOp);
     TORCH_CHECK(false, _err_msg);
   }
-  // Spyre Comms only supports float16 tensors because of the 'op' path
-  // through the compiler. The data transfers do not have this restriction.
-  if (spyre::torchScalarToString[tensors[0].scalar_type()] != "float16") {
+  // FP16 and BF16 both use DL16 for device-side SUM.
+  if (tensors[0].scalar_type() != c10::ScalarType::Half &&
+      tensors[0].scalar_type() != c10::ScalarType::BFloat16) {
     std::string _err_msg =
-        "[" + getBackendName() + "]: Reduce only supports float16 tensors." +
+        "[" + getBackendName() +
+        "]: Reduce only supports float16 and bfloat16 tensors." +
         " Actual: " + spyre::torchScalarToString[tensors[0].scalar_type()];
     TORCH_CHECK(false, _err_msg);
   }
