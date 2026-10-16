@@ -37,6 +37,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
     StorageBox,
     TensorBox,
 )
@@ -2374,6 +2375,26 @@ def _scan_mutation_layout_inputs(
             first_read = next(iter(rw.reads), None)
             in_args = _get_prop_args([first_read], strict=False)
             in_arg = in_args[0] if in_args else None
+            if isinstance(op.data, Scatter):
+                # A write through a view that merges sub-stick dims of the
+                # allocation (e.g. index_put_ on x.view(8, 1024) of an
+                # [8, 32, 32] fp16 input) has no representable stick.
+                try:
+                    device_coordinates(target_stl, output_dep, None)
+                except Unsupported as e:
+                    elems_per_stick = get_elem_in_stick(
+                        _mutation_layout_dtype(target_layout, target_stl)
+                    )
+                    raise Unsupported(
+                        f"{op.get_operation_name()}: scatter write to mutation "
+                        f"target {name!r} (allocation size="
+                        f"{list(target_layout.size)}, dtype={target_layout.dtype}, "
+                        f"elems_per_stick={elems_per_stick}) has no "
+                        f"representable stick layout: {e}. The write index "
+                        f"{output_dep.index!r} collapses sub-stick dims; "
+                        f"allocate the input with an innermost dim that is a "
+                        f"multiple of the stick size."
+                    ) from e
             alt_stl = _find_alt_target_stl(
                 target_layout, target_stl, output_dep, in_arg
             )
