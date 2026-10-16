@@ -877,6 +877,47 @@ class TestComputeValidElements(TestCase):
         )
         self.assertEqual(stl.valid_elements, expected)
 
+    @parametrize(
+        "device_size, valid_elements",
+        [
+            ([4, 512, 64], {}),
+            ([4, 512, 64], {(0, 2): 256, (1,): 512}),
+            ([4, 512, 64], {(0, 2): 200, (1,): 7}),
+            ([4, 512, 64], {(0, 2): 0, (1,): 0}),
+            ([4, 0, 64], {(0, 2): 256, (1,): 0}),
+        ],
+    )
+    def test_valid_elements_accepted(self, device_size, valid_elements):
+        stl = SpyreTensorLayout(
+            device_size,
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            valid_elements,
+        )
+        self.assertEqual(stl.valid_elements, valid_elements)
+
+    @parametrize(
+        "valid_elements, message",
+        [
+            ({(): 0}, "empty device dimension tuple"),
+            ({(2, 0): 256, (1,): 512}, "not strictly increasing"),
+            ({(0, 0, 2): 256, (1,): 512}, "not strictly increasing"),
+            ({(-1,): 1}, "nonnegative integers, but encountered -1"),
+            ({(3,): 1}, r"less than len\(device_size\)"),
+            ({(0, 2): 256, (0, 1): 4}, "multiple keys"),
+            ({(0, 2): 256, (1,): -1}, "values must be nonnegative"),
+            ({(0, 2): 257, (1,): 512}, "exceeds the 256 positions"),
+        ],
+    )
+    def test_valid_elements_rejected(self, valid_elements, message):
+        with self.assertRaisesRegex(RuntimeError, message):
+            SpyreTensorLayout(
+                [4, 512, 64],
+                [64, 256, 1],
+                get_device_dtype(torch.float16),
+                valid_elements,
+            )
+
 
 if __name__ == "__main__":
     run_tests()
