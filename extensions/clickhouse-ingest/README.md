@@ -62,7 +62,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `vllm.py` | vLLM bench JSON -> `benchmarks`/`benchmark_runs` (`report_kind=vllm`): spyre-inference's live perf ingest and vLLM bundles |
 | `sendnn.py` | the perf suite's report_sendnn.txt -> `benchmark_runs` on backend `sendnn` (`report_kind=perf-suite-sendnn-txt`): sendnn bundles |
 | `offline.py`, `bundle.schema.json` | `results --offline` / `--upload` / `--validate-only`: write, check and upload a results bundle, standard library only ([below](#offline-results-bundles)) |
-| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay) |
+| `bundle.py` | `results --from-bundle`: record a bundle in spyre_v2 (the relay, and a connected vllm / sendnn / benchmarks run) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
 | `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 | `dispatch.py` | artifact subscriptions, requests and the dispatch ledger: derived ids, template rendering, the rate-limit/coalescing `decide`, and `python -m spyre_clickhouse_ingest dispatch request\|preview`; the trigger loop is spyre-frameworks' artifact-dispatch job |
@@ -87,7 +87,7 @@ python -m spyre_clickhouse_ingest artifacts ensure --artifact image:icr.io/<repo
 # 3. An identity the caller already knows: no registry call, never rebound to another id.
 python -m spyre_clickhouse_ingest artifacts ensure \
   --artifact 'rpm:ibm-flex-*.<id12>.*.x86_64;component=flex;name=ibm-flex;id12=<id12>' --arch x86_64 \
-  --source ai-chip-toolchain/flex@main@<sha> --identity-dep base=<sha256> --prop k=v \
+  --source example-org/flex@main@<sha> --identity-dep base=<sha256> --prop k=v \
   --tag rc1 --tag-prop k=v --run-url "$BUILD_URL" --lookup off --registry off --dry-run
 ```
 
@@ -255,6 +255,20 @@ results only: its artifact must already be in spyre_v2, and a manual bundle adds
 | check one | `results --from-bundle <dir\|tgz> --validate-only` |
 | record one (the relay) | `results --from-bundle <dir\|tgz> --strict` |
 
+A **connected** run records every kind directly with the same flags, no `--offline`:
+
+| kind | direct (connected) command |
+|---|---|
+| junit | `results --schema v2 --xml-dir <dir> <the usual flags>` |
+| vllm | `results --vllm-results-dir <dir> [--perf k=v] <the usual flags>` |
+| sendnn | `results --kind sendnn --sendnn-report report_sendnn.txt --triggered-at <ISO-8601> <the usual flags>` |
+| benchmarks | `results --benchmarks-dir <dir> --trigger-type perf\|quality --component <suite owner> <the usual flags>` |
+
+vllm, sendnn and benchmarks are v2-only. A direct run writes the bundle `--offline` would, in a
+temporary folder, and records it as the relay does (`--strict` applies). So its rows match an
+uploaded bundle's, `source=bundle` included. It needs `CLICKHOUSE_DB_V2`, and the run key is
+`--jenkins-run-key` when given, else `manual:<user>:<bundle sha256>`.
+
 The usual flags are `--artifact id:<uuid>`, or `image:<repo>@sha256:<digest>` (and
 `--artifact-id <uuid>` beside an image), plus:
 - `--arch` (default: this host);
@@ -379,15 +393,23 @@ python -m spyre_clickhouse_ingest results --offline --out mybundle.tgz --benchma
 ARTIFACTORY_TOKEN=... python -m spyre_clickhouse_ingest results --upload mybundle.tgz --wait
 ```
 
+`--upload` has no built-in location; take these from the relay's owner (spyre-frameworks,
+`docs/v2-artifact-recording.md`) and set them as environment or flags:
+
+| Setting | Flag | Meaning |
+|---|---|---|
+| `ARTIFACTORY_BASE_URL` | `--base-url` | `https://<host>/artifactory` |
+| `ARTIFACTORY_V2_RESULTS_REPO` | `--repo` | the generic repository |
+| `ARTIFACTORY_V2_RESULTS_ROOT` | `--root` | folder template with `{arch}` that holds `inbox/`, `processed/`, `rejected/` |
+
 `--wait` polls until the relay has moved the bundle to `processed/` (prints `ingested`) or
 `rejected/` (prints the reason). A host that is connected while it tests can do it in one step,
 `results --offline --upload --wait ...`.
 
 ### Uploading by hand
 
-The inbox is `sys-ai-sw-accel-team-cos-dev-generic-local/next/<arch>/v2-results/inbox/<key>/`
-on `https://na.artifactory.swg-devops.com/artifactory`. `--upload` and `--validate-only` print
-the full path.
+The inbox is `<repo>/<root>/inbox/<key>/` on `<base-url>`, with the settings above and `{arch}`
+filled in. `--upload` and `--validate-only` print the path under `<repo>`.
 - `<key>` is the artifact_id, or `sha256-<digest>` for a bundle that names only an image.
 - `<arch>` is `any` when the bundle names none.
 - The bundle goes there as `<name>.tgz` (atomic: preferred), or as a folder `<name>/`.
@@ -400,16 +422,17 @@ relay ingests once the folder's listing is unchanged across two polls. A folder 
 after 24 hours is rejected.
 
 ```
-ART=https://na.artifactory.swg-devops.com/artifactory/sys-ai-sw-accel-team-cos-dev-generic-local
-INBOX=next/<arch>/v2-results/inbox/<key>
+REPO=$ARTIFACTORY_V2_RESULTS_REPO
+ART=$ARTIFACTORY_BASE_URL/$REPO
+INBOX=<root, {arch} filled in>/inbox/<key>
 curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T mybundle.tgz "$ART/$INBOX/<name>.tgz"
 # a folder, bundle.json last
 (cd mybundle && for f in $(find results attachments -type f 2>/dev/null) bundle.json; do
   curl -fsS -H "Authorization: Bearer $ARTIFACTORY_TOKEN" -T "$f" "$ART/$INBOX/<name>/$f"; done)
 # JFrog CLI (these two forms are untested here): the .tgz, or the folder and then bundle.json
-jf rt upload mybundle.tgz "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>.tgz"
-(cd mybundle && jf rt upload --flat=false "results/*" "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/" \
-  && jf rt upload bundle.json "sys-ai-sw-accel-team-cos-dev-generic-local/$INBOX/<name>/")
+jf rt upload mybundle.tgz "$REPO/$INBOX/<name>.tgz"
+(cd mybundle && jf rt upload --flat=false "results/*" "$REPO/$INBOX/<name>/" \
+  && jf rt upload bundle.json "$REPO/$INBOX/<name>/")
 ```
 
 Uploading needs deploy permission on that repository. The token is `--token`, else

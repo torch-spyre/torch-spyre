@@ -220,7 +220,7 @@ _SCAN_CACHE_SALT = "torch-spyre-scan-v1"
 def _allow_scan_graph_caching() -> None:
     """Let the FX graph and AOTAutograd caches keep graphs that use ``scan``.
 
-    Opt-in with ``TORCH_SPYRE_CACHE_SCAN=1``. ``for_each_tile`` (used by the
+    On by default; turn off with ``TORCH_SPYRE_CACHE_SCAN=0``. ``for_each_tile`` (used by the
     SDPA K/V loop) is the ``scan`` op, and PyTorch skips the caches for any
     graph with a higher-order op it does not know is cacheable. So every
     SDPA with more than one K/V block is compiled again in every process.
@@ -233,7 +233,7 @@ def _allow_scan_graph_caching() -> None:
     by metadata only, as for any other graph. A change to ``scan`` in PyTorch
     is not in the key: bump ``_SCAN_CACHE_SALT`` to drop old entries.
     """
-    if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "0") != "1":
+    if os.environ.get("TORCH_SPYRE_CACHE_SCAN", "1") != "1":
         return
     import torch._inductor.config as inductor_config
 

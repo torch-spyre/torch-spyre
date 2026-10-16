@@ -222,10 +222,10 @@ wrong attribution rather than an explicit missing join.
 The full reference is in the upstream
 [PyTorch profiler documentation][torch-profiler-docs]:
 
-- `record_function` — annotate named spans
-- `schedule` — skip warmup, sample a bounded window
-- `on_trace_ready` — stream to TensorBoard-compatible JSON
-- `with_stack` — include file and line for Python ops
+- `record_function`: annotate named spans
+- `schedule`: skip warmup, sample a bounded window
+- `on_trace_ready`: stream to TensorBoard-compatible JSON
+- `with_stack`: include file and line for Python ops
 
 ## Communication events
 
@@ -235,7 +235,10 @@ Queue waits, manager setup, HDMA resets, and socket barriers have separate
 Host-side communication spans emitted by spyre-comms appear in the trace
 under `aiuComms*` names. Collectives such as allreduce, allgather, and
 broadcast, together with the send, receive, and transfer operations beneath
-them, are recorded alongside compute kernels on multi-AIU runs.
+them, are recorded alongside compute kernels on multi-AIU runs. These spans and
+the per-launch `aiuSubmitToHardware` marker are host-side runtime activities, so
+they render on `Thread {N}` rows rather than the `Stream {N}` compute rows; see
+[Trace analysis](trace_analysis.md) for the row layout.
 
 ## See also
 

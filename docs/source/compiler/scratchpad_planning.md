@@ -139,7 +139,6 @@ after work division has stamped per-op core splits:
 deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
-_maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
 insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout

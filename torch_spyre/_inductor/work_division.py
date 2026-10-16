@@ -1289,10 +1289,10 @@ class OpSplitSpace:
         uniformly over this list gives them a share that follows its length: up
         to ``|tileable dims| x |counts|`` entries against ~7 per axis, which
         from the untiled state is most of the mass. That is an implicit retune
-        of the flip move relative to the weights #4233 measured, and it is
-        stated rather than tuned while nothing applies a chosen tiling. It also
-        makes ``|N(x)|`` vary much more with state, which an uncorrected
-        Metropolis test reads as a bias towards states with more neighbours.
+        of the flip move relative to the weights #4233 measured, left
+        uncorrected. It also makes ``|N(x)|`` vary much more with state, which
+        an uncorrected Metropolis test reads as a bias towards states with more
+        neighbours.
         """
         current = self.splits(division)
         tiling = division.tiling
@@ -2134,7 +2134,7 @@ def _minmax(sympy_fn, builtin_fn, args, kwargs):
     sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
     otherwise defers to ``builtin_fn``, which also handles ``default``."""
     if len(args) == 1:
-        values = args[0]
+        values = list(args[0])
     else:
         values = args
     if "key" not in kwargs and any(isinstance(a, sympy.Basic) for a in values):

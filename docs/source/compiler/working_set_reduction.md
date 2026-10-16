@@ -89,7 +89,8 @@ def for_each_tile(
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of each returned output leaf. Tiles may be a tensor or a pytree of
+            tensors. ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -117,6 +118,12 @@ that a purely elementwise tiling doesn't need: `init` threads a **carry**
 each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Output leaves may have different ranks; `out_dim` is normalized separately for
+each leaf and must name an existing axis in every output tile. Scalar output
+tiles have no axis to concatenate; return a length-one tensor instead.
+As with `scan`, output leaves must not alias inputs or one another: returning
+`(y, y)` for a computed tile `y` is invalid; use `(y, y.clone())` instead.
 
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values

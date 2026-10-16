@@ -3913,6 +3913,148 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
+def _grouped_mm_capacity(n: int, num_experts: int) -> int:
+    """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
+
+    Computed from static shapes only so the decomposition stays traceable.
+    compute_grouped_mm_routing_tables raises at runtime if any segment exceeds it.
+    """
+    per_expert = (n + num_experts - 1) // num_experts
+    return max(64, min(n, ((per_expert + 63) // 64) * 64 * 2))
+
+
+@register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
+def spyre_grouped_mm(
+    self: torch.Tensor,
+    mat2: torch.Tensor,
+    offs: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decomposition of aten._grouped_mm covering all 4 upstream shape variants:
+
+    1. 2D x 3D with offs (mat_a [T, K] x mat_b [E, K, N]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, capacity, K] @ [E, K, N]
+       -> On-device Unpack (index_select) -> out [T, N].
+    2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
+       Direct 3D BMM -> out [E, M, N].
+    3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, M, K] @ [E, K, capacity]
+       -> On-device Unpack (index_select) -> out [M, T].
+    4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
+       On-device Pack along reduction dim K -> Direct 3D BMM [E, M, capacity] @ [E, capacity, N]
+       -> out [E, M, N].
+
+    Scope and known limitations:
+      * BF16 only (upstream's meta rejects bias, a non-default out_dtype, and
+        fp16 off CUDA).
+      * `offs` must be a Spyre tensor. Eager calls with a CPU `offs` are
+        rejected by `_OPWrapper`'s device check (upstream accepted them).
+      * Per-expert capacity is static: 2 * ceil_to_64(n / num_experts),
+        clamped to [64, n]. A segment larger than that raises RuntimeError in
+        compute_grouped_mm_routing_tables; see #5534.
+    """
+    # Upstream's meta rejects bias and any out_dtype other than the input dtype
+    # for the dtypes Spyre supports (bf16), so these are never legitimately set.
+    assert bias is None, "Spyre grouped_mm does not support bias"
+    assert out_dtype is None or out_dtype == self.dtype, (
+        "Spyre grouped_mm does not support out_dtype != input dtype"
+    )
+
+    a_is_2d = self.dim() == 2
+    b_is_2d = mat2.dim() == 2
+
+    if a_is_2d and not b_is_2d:
+        assert offs is not None, "2D x 3D grouped_mm requires offs"
+        total_tokens: int = self.shape[0]
+        K: int = self.shape[1]
+        num_experts: int = mat2.shape[0]
+        N: int = mat2.shape[-1]
+
+        capacity = _grouped_mm_capacity(total_tokens, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, total_tokens, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
+        self_with_zero = torch.cat([self, zero_row], dim=0)
+        padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+
+        padded_out = torch.bmm(padded_a, mat2.contiguous())
+        flat_out = padded_out.reshape(num_experts * capacity, N)
+        out = torch.index_select(flat_out, 0, dst_indices)
+
+    elif not a_is_2d and not b_is_2d:
+        out = torch.bmm(self, mat2.contiguous())
+
+    elif not a_is_2d and b_is_2d:
+        assert offs is not None, "3D x 2D grouped_mm requires offs"
+        num_experts = self.shape[0]
+        M = self.shape[1]
+        K = self.shape[2]
+        T = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(T, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
+
+        b_2d_T = mat2.transpose(0, 1).contiguous()
+        zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([b_2d_T, zero_row], dim=0)
+        padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, K
+        )
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()
+
+        padded_out = torch.bmm(self, padded_b)
+        flat_padded_out_T = (
+            padded_out.transpose(1, 2).reshape(num_experts * capacity, M).contiguous()
+        )
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)
+        out = out_T.transpose(0, 1).contiguous()
+
+    elif a_is_2d and b_is_2d:
+        assert offs is not None, "2D x 2D grouped_mm requires offs"
+        num_experts = offs.shape[0]
+        M = self.shape[0]
+        K_total = self.shape[1]
+        N = mat2.shape[1]
+
+        capacity = _grouped_mm_capacity(K_total, num_experts)
+
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, K_total, num_experts, capacity
+        )
+        src_indices = packed[: num_experts * capacity]
+
+        a_T = self.transpose(0, 1).contiguous()
+        zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
+        a_with_zero = torch.cat([a_T, zero_row_a], dim=0)
+        padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, M
+        )
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()
+
+        zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
+        padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, capacity, N
+        )
+
+        out = torch.bmm(padded_a, padded_b)
+
+    return out
+
+
 @register_spyre_decompositions([torch.ops.aten.triu.default])
 def spyre_triu(
     input: torch.Tensor,

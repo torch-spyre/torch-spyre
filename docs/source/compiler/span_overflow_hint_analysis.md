@@ -9,13 +9,13 @@ for one core.  When that happens, backend compilation can fail with Work
 Division warnings, deeptools mutable-address failures, or immediate/EAR boundary
 errors.
 
-`span_overflow_hint_analysis.py` is the compiler-generated version of a user
-`spyre_hint`: it detects span-risky `ComputedBuffer` ops and asks existing
+`span_overflow_hint_analysis.py` is the compiler-generated counterpart of a user-written
+`for_each_tile` loop: it detects span-risky `ComputedBuffer` ops and asks existing
 coarse tiling to run those ops in smaller output-range tiles.
 
 The planner does not mutate IR directly.  It computes a `SpanOverflowTilePlan`.
 The adapter in `coarse_tile_span_overflow.py` converts that plan into the same
-`DimHint` and coarse-tile group format used by manual `spyre_hint`.
+`DimHint` and coarse-tile group format that `for_each_tile` loops use.
 
 ```text
 span_overflow_hint_analysis
@@ -487,8 +487,8 @@ op.
 
 `span_overflow_groups(graph)` consumes the plan, decides synthetic `DimHint`s
 for each op (without assigning them — that is left to the caller, see
-"Adapter and Coarse Tiling" below), and returns groups shaped like user hint
-groups:
+"Adapter and Coarse Tiling" below), and returns groups in the standard
+coarse-tile group format:
 
 ```python
 [([op], [(hint_id, split_count), ...])]
@@ -549,7 +549,7 @@ raise (see Known Limitations) and are silently skipped instead.
 | Symbolic layout metadata | No | Return `None` |
 | More than `_MAX_TILE_DIMS` overflowing host dims | No | Raise `Unsupported` |
 | No legal exact divisor / stick-safe split | No | Raise `Unsupported` |
-| User already supplied `spyre_hint` for op | Manual wins | Auto hint is not added for that op |
+| Op already tiled by a `for_each_tile` loop | Manual wins | Auto hint is not added for that op |
 
 ## Pointwise Flow
 
@@ -750,9 +750,9 @@ construction, and automatic split counts above `_MAX_AUTO_TILE_SPLIT_COUNT` are
 rejected because current automatic `LoopSpec` lowering can materialize one SDSC
 spec per coarse tile.  A plan such as `split_count=769` can therefore generate
 `sdsc_0.json` through `sdsc_768.json` instead of one compact symbolic tile loop.
-Manual `spyre_hint` remains explicit/user-controlled and can rely on the more
-mature user-hint grouping path; the automatic pass is intentionally capped until
-auto groups can reuse the same compact grouped lowering.
+A user-written `for_each_tile` loop is explicit and uses the compact loop
+lowering; the automatic pass is intentionally capped until auto groups can
+reuse the same compact grouped lowering.
 Combinations are tried in increasing cost order:
 
 ```python
@@ -818,9 +818,8 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 
 `coarse_tile_span_overflow.span_overflow_groups(graph)`:
 
-1. skips auto groups if `config.ignore_wsr_hints` or
-   `config.ignore_span_overflow_hints` is enabled;
-2. skips ops that already have user dim hints;
+1. skips auto groups if `config.ignore_span_overflow_hints` is enabled;
+2. skips ops that a `for_each_tile` loop already tiles (they carry dim hints);
 3. calls `plan_span_overflow_tile`;
 4. maps each `selected_host_dim` to a concrete output loop symbol via
    `op_out_coords(op)`;
@@ -859,8 +858,8 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    through that check on the join branch. If nothing joins, the run flushes to
    exactly the singleton group an unjoined Reduction produced before;
 6. rejects any op that reads a buffer from an already-closed auto-tiled
-   group, from a producer already tiled by a user `spyre_hint` (checked via
-   the same `dim_hints` attribute `assign_dim_hints` leaves behind, since
+   group, from a producer already tiled by a `for_each_tile` loop (checked via
+   the `dim_hints` attribute carrying its `loop_var_range`, since
    this pass never clears it), or from the open run without being fusable
    into it (mismatched signature and conform fails, or a Reduction that
    cannot join per step 5), since two independent loop nests over the same
@@ -872,13 +871,13 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 7. creates synthetic `DimHint`s with ids starting at
    `_SPAN_OVERFLOW_HINT_ID = 10000`, shared across every op in a fused group;
 8. returns `(groups, dim_hint_assignments)` — coarse-tile groups in the same
-   format as user hints, plus the `(op, dim_hints)` pairs decided in step 7.
+   format as `for_each_tile` loops, plus the `(op, dim_hints)` pairs decided in step 7.
    `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
    planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
    `passes.py`) applies the assignments immediately before
-   `validate_coarse_tile_groups`/`coarse_tile` run.
+   `validate_coarse_tile_groups`/`coarse_tile_post_stickify` run.
 
-From `coarse_tile` onward, automatic and manual hints share the same path:
+From `coarse_tile` onward, automatic span-overflow groups and `for_each_tile` loops share the same path:
 
 - rewrite `op.data.ranges` and `op.layout.size` per tile;
 - stamp `CoarseTileInfo`;
@@ -900,12 +899,8 @@ pass with:
 SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
 ```
 
-The broader working-set-reduction hint switch also suppresses this path when
-set: `SPYRE_INDUCTOR_IGNORE_HINTS=1` (which populates `config.ignore_wsr_hints`,
-default off) disables both manual and automatic hints with one switch.
-
-User-authored `spyre_hint` groups take precedence per op.  Automatic hints are
-not added to ops that already carry user dim hints.
+Ops that a `for_each_tile` loop already tiles take precedence.  Automatic hints
+are not added to ops that already carry dim hints.
 
 When span-overflow hints are explicitly enabled, copy-back elision preserves
 Pointwise `FixedTiledLayout` producers instead of rewriting them to mutation
@@ -968,8 +963,8 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   mathematical span limit: current automatic coarse tiling can unroll a large
   tile count into many generated SDSC specs, which is expensive and can appear
   to hang compilation.  For example, an automatic split of `769` may emit 769
-  per-tile specs.  Manual `spyre_hint` is still user-controlled and may be able
-  to use existing grouped hint lowering more effectively; automatic
+  per-tile specs.  A user-written `for_each_tile` loop is explicit and may be able
+  to use the compact loop lowering more effectively; automatic
   span-overflow should grow producer-consumer/grouped loop lowering before this
   cap is relaxed.
 - Reduction auto-tiling rejects splits that shrink the selected output dim's
@@ -1023,13 +1018,13 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   span-overflow-sized data can desynchronize, and materializing a tiled
   producer's full buffer for such an unfused consumer can reintroduce the
   exact span violation tiling was meant to prevent. A producer and consumer
-  that are both inside the same manual `spyre_hint` group are unaffected,
-  since users can explicitly group them into one shared coarse-tile group; the
+  that are both inside the same `for_each_tile` loop are unaffected,
+  since users can explicitly group them into one shared loop; the
   conflict check only fires when an *automatically*-tiled op reads a
-  manually-hinted producer that it was not itself grouped with.
+  `for_each_tile`-tiled producer that it was not itself grouped with.
 
   Two distinct rejection messages tell these cases apart. Reading a producer
-  whose group has already been flushed — or one tiled by a user `spyre_hint` —
+  whose group has already been flushed — or one tiled by a `for_each_tile` loop —
   gives `it reads already-tiled producer(s) [...] that are not in an open group
   this op can join`. Reading a producer in the *open* group but failing a join
   condition gives `it reads auto-tiled producer(s) [...] in the open group but
@@ -1156,10 +1151,6 @@ accumulation noise is not mistaken for a tiling bug.
 | matmul -> matmul | pass | n/a | n/a |
 | matmul -> pointwise -> matmul | pass | not tested | not tested |
 
-The read-copy path this depends on was reworked by #3612 ("coarse tiling:
-optional read copy") and the transposed post-tile layout it once built was
-fixed by #3613 (`_raw_to_squeezed_pos`).
-
 `matmul -> matmul` is marked n/a rather than xfail because it is refused by
 design -- a Reduction consumer has no conform path, so both plans must
 independently agree (`TODO(span-overflow-reduction-conform)`,
@@ -1182,7 +1173,7 @@ terminating its group.
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Coarse-tile IR stamping (`coarse_tile`, `CoarseTileInfo`) |
-| `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
+| `torch_spyre/_inductor/passes.py` | Wires `splice_while_loops` (`for_each_tile`) and automatic span-overflow tiling into the pipeline |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |
 | `torch_spyre/_inductor/work_division.py` | Span limit constants and downstream per-core span diagnostics |
