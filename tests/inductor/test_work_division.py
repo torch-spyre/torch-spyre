@@ -2608,9 +2608,12 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor_cls = stack.enter_context(
                 patch.object(allocator_module, "GraphEditor")
             )
-            # The validator asks the real editor which collectives it rewrites.
+            # The validator asks the real editor which accesses it rewrites.
             editor_cls.collective_operand_name.side_effect = (
                 GraphEditor.collective_operand_name
+            )
+            editor_cls.is_repointable_access.side_effect = (
+                GraphEditor.is_repointable_access
             )
 
             plans = allocator_module.validated_drain_plans(
@@ -2722,58 +2725,77 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
 
     def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
-        """A carry whose only post-loop use is an all_reduce stays in LX.
+        """A carry reduced in place after its loop stays in LX.
 
         The all_reduce's whole-buffer read has no residency edge, so as a
         parent of the all_reduce the carry admits no division pair, which
         forces it -- and every in-loop update -- into HBM.  The plan gives the
-        all_reduce a post-loop drain to read instead: the carry is no longer
-        its parent, the carry is resident, the push repoints the all_reduce at
-        the drain, and the carry's lifetime still ends at the all_reduce
-        rather than the graph exit (``tail`` runs after it).
+        all_reduce a post-loop drain to work on instead.  Its result lives in
+        its operand, so the wait and the later reader (``tail``) move to the
+        drain with it: the carry is no longer their parent, the carry is
+        resident, the push repoints all three at the drain, and the carry's
+        lifetime still ends at its last access rather than the graph exit
+        (``out`` runs after it).
         """
         try:
             from ortools.sat.python import cp_model  # noqa: F401
         except ImportError:
             self.skipTest("the joint path needs the CP-SAT solver (ortools)")
-        from torch._inductor.ir import StorageBox, TensorBox
+        from torch._inductor.ir import Pointwise, StorageBox, TensorBox
 
-        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+        from torch_spyre._inductor.ir import AllReduceKernel, WaitKernel
 
         storage_op = self.op_by_name["plain"]
-        all_reduce = MagicMock(spec=AllReduceAsyncFallback)
+        all_reduce = MagicMock(spec=AllReduceKernel)
         all_reduce.get_name.return_value = "all_reduce"
         all_reduce.inputs = [TensorBox(StorageBox(storage_op))]
+        wait = MagicMock(spec=WaitKernel)
+        wait.get_name.return_value = "wait"
+        wait.inputs = [TensorBox(StorageBox(storage_op))]
         tail_op = self._op("tail")
-        graph, ops = self._drained_carry_graph([all_reduce, tail_op], [tail_op])
-        # An extern kernel reads and writes whole buffers.
-        self.rw[all_reduce] = SimpleNamespace(
-            reads=OrderedSet([StarDep("plain")]),
-            writes=OrderedSet([StarDep("all_reduce")]),
+        tail_op.data = MagicMock(spec=Pointwise)
+        out_op = self._op("out")
+        graph, ops = self._drained_carry_graph(
+            [all_reduce, wait, tail_op, out_op], [out_op]
         )
-        self.rw[tail_op] = self._rw(["all_reduce"], ["tail"])
+        # Extern kernels read and write whole buffers.
+        for kernel in (all_reduce, wait):
+            self.rw[kernel] = SimpleNamespace(
+                reads=OrderedSet([StarDep("plain")]),
+                writes=OrderedSet([StarDep(kernel.get_name())]),
+            )
+        self.rw[tail_op] = self._rw(["plain"], ["tail"])
+        self.rw[out_op] = self._rw(["tail"], ["out"])
         mem_usage = {
             "plain": {"size": 256, "op_inputs": []},
             "update": {"size": -1, "op_inputs": ["plain"]},
             "consumer": {"size": 256, "op_inputs": ["update"]},
-            # An extern kernel's FixedLayout output is unsized.
+            # An in-place extern kernel's NoneLayout output is unsized.
             "all_reduce": {"size": -1, "op_inputs": ["plain"]},
-            "tail": {"size": 256, "op_inputs": ["all_reduce"]},
+            "wait": {"size": -1, "op_inputs": ["plain"]},
+            "tail": {"size": 256, "op_inputs": ["plain"]},
+            "out": {"size": 256, "op_inputs": ["tail"]},
         }
         residency = {
             "plain": None,
             "update": "op not allowed",
             "consumer": None,
             "all_reduce": "op not allowed",
+            "wait": "op not allowed",
             "tail": None,
+            "out": None,
         }
         divisions = {
             "plain": self.parent_divs,
             "update": self.parent_divs,
             "consumer": self.consumer_divs[:2],
             "all_reduce": [CoreDivision(splits={})],
+            "wait": [CoreDivision(splits={})],
             "tail": self.parent_divs[:1],
+            "out": self.parent_divs[:1],
         }
+        # The view fixture looks up the readers' own divisions.
+        self.divisions.update(tail=divisions["tail"], out=divisions["out"])
 
         def run(with_plan):
             real_plans = allocator_module.validated_drain_plans
@@ -2781,15 +2803,18 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             with patch.object(allocator_module, "validated_drain_plans", plans_fn):
                 return self._plan_solve_push(graph, divisions, mem_usage, residency)
 
-        with self.subTest("the collective is drained"):
+        with self.subTest("the collective and its followers are drained"):
             plans, built, solved, editor_cls = run(with_plan=True)
             self.assertEqual(set(plans), {"plain"})
             plan = plans["plain"]
             self.assertIs(plan.collective, all_reduce)
+            self.assertEqual(plan.post_loop_accesses, (all_reduce, wait, tail_op))
             self.assertIsNotNone(solved["plain"].address)
-            self.assertNotIn("plain", built["all_reduce"].parents)
-            # Live to the all_reduce (index 3), not to the graph exit (5).
-            self.assertEqual(built["plain"].end_time, ops.index(all_reduce) + 1)
+            for name in ("all_reduce", "wait", "tail"):
+                self.assertNotIn("plain", built[name].parents)
+            # Live to its last access (tail), not to the graph exit.
+            self.assertEqual(built["plain"].end_time, ops.index(tail_op) + 1)
+            self.assertLess(built["plain"].end_time, len(ops))
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_called_once_with(
                 storage_op,
@@ -2800,8 +2825,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 lower_anchor=plan.anchor_op,
             )
             drain = editor.push_allocation_with_clone.return_value
-            editor.replace_collective_operand.assert_called_once_with(
-                all_reduce, "plain", drain
+            editor.replace_post_loop_accesses.assert_called_once_with(
+                (all_reduce, wait, tail_op), "plain", drain
             )
             editor.change_graph_output.assert_not_called()
 
@@ -2810,7 +2835,59 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIsNone(solved["plain"].address)
             self.assertIn("plain", built["all_reduce"].parents)
             self.assertNotIn("plain", built["all_reduce"].cd_parent_matches)
-            editor_cls.return_value.replace_collective_operand.assert_not_called()
+            editor_cls.return_value.replace_post_loop_accesses.assert_not_called()
+
+    def test_a_returned_carry_reduced_in_place_drains_with_its_collective(self):
+        """``return wait(all_reduce_(acc))`` returns the carry itself.
+
+        An output clone alone would copy the carry before the in-place
+        collective reduces it, so the plan must take the collective's path and
+        repoint it and its wait at the drain.  A post-loop mutator the push
+        cannot repoint declines the plan instead.
+        """
+        from torch._inductor.ir import ExternKernel, StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllReduceKernel, WaitKernel
+
+        storage_op = self.op_by_name["plain"]
+
+        def in_place(cls, name):
+            op = MagicMock(spec=cls)
+            op.get_name.return_value = name
+            op.inputs = [TensorBox(StorageBox(storage_op))]
+            op.mutation_outputs = [
+                SimpleNamespace(get_mutation_names=lambda: ["plain"])
+            ]
+            self.rw[op] = SimpleNamespace(
+                reads=OrderedSet([StarDep("plain")]),
+                writes=OrderedSet([StarDep(name)]),
+            )
+            return op
+
+        def plans_for(after_loop):
+            graph, _ops = self._drained_carry_graph(after_loop, [storage_op])
+            with (
+                self._patches(),
+                patch.object(
+                    allocator_module, "clone_at_graph_boundaries", return_value=True
+                ),
+            ):
+                return allocator_module.validated_drain_plans(
+                    graph, division_is_fixed=False
+                )
+
+        with self.subTest("the collective and its wait follow the drain"):
+            all_reduce = in_place(AllReduceKernel, "all_reduce")
+            wait = in_place(WaitKernel, "wait")
+            plans = plans_for([all_reduce, wait])
+            self.assertEqual(set(plans), {"plain"})
+            self.assertIs(plans["plain"].collective, all_reduce)
+            self.assertEqual(plans["plain"].post_loop_accesses, (all_reduce, wait))
+
+        with self.subTest("a mutator the push cannot repoint declines"):
+            all_reduce = in_place(AllReduceKernel, "all_reduce")
+            opaque = in_place(ExternKernel, "opaque")
+            self.assertEqual(plans_for([all_reduce, opaque]), {})
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):

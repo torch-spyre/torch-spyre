@@ -5091,5 +5091,44 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
         self.assertTrue(readers)
 
 
+class TestRepointRefsToBuffer(unittest.TestCase):
+    """An outside consumer of a spliced loop output is repointed at the carry."""
+
+    def test_in_place_collective_mutation_follows_its_operand(self):
+        """create_inplace records the mutation on MutationOutputs and
+        alias_names, which an .inputs rewrite alone never reaches: left alone
+        they name the removed loop output and the scheduler fails on it."""
+        import types
+
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.ir import AllReduceKernel
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _repoint_refs_to_buffer,
+        )
+
+        def buffer(name):
+            buf = mock.MagicMock(spec=ir.ComputedBuffer)
+            buf.get_name.return_value = name
+            return buf
+
+        all_reduce = AllReduceKernel.__new__(AllReduceKernel)
+        all_reduce.inputs = [ir.TensorBox(ir.StorageBox(buffer("loop_out")))]
+        all_reduce.mutation_outputs = [
+            types.SimpleNamespace(mutation_names=["loop_out"])
+        ]
+        all_reduce.alias_names = ["loop_out"]
+        graph = types.SimpleNamespace(
+            graph_outputs=[], operations=[all_reduce], mutated_buffers=set()
+        )
+
+        _repoint_refs_to_buffer(graph, "loop_out", buffer("carry"))
+
+        self.assertEqual(all_reduce.inputs[0].get_name(), "carry")
+        self.assertEqual(all_reduce.mutation_outputs[0].mutation_names, ["carry"])
+        self.assertEqual(all_reduce.alias_names, ["carry"])
+        self.assertIn("carry", graph.mutated_buffers)
+
+
 if __name__ == "__main__":
     unittest.main()

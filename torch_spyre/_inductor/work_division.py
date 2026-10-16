@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    _CollectiveKernel,
 )
 
 from torch_spyre._C import ElementArrangement
@@ -43,13 +44,9 @@ from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
 from .errors import Unsupported
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
-    WaitWorkFallback,
 )
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
@@ -2687,6 +2684,9 @@ def _iter_computed_buffers(operations: list[Operation]):
             if layout is None or layout.device.type != DEVICE_NAME:
                 continue
             yield op
+        elif isinstance(op, _CollectiveKernel):
+            # Collectives run in spyre-comms; no work division.
+            pass
         elif isinstance(op, FallbackKernel):
             # FallbackKernel produces 0..N trailing MultiOutputs
             # (see torch_spyre/_inductor/propagate_layouts.py).
@@ -2699,16 +2699,6 @@ def _iter_computed_buffers(operations: list[Operation]):
             if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
                 # Work division not supported on allocation/constant kernels, nor
                 # on DeviceCopy.
-                pass
-            elif isinstance(
-                op,
-                (
-                    BroadcastAsyncFallback,
-                    WaitWorkFallback,
-                    AllGatherAsyncFallback,
-                    AllReduceAsyncFallback,
-                ),
-            ):
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")

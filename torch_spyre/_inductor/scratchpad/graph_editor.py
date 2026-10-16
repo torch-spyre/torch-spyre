@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from typing import Any
 
 from torch.fx import Node
@@ -44,14 +45,16 @@ from torch._inductor.ir import (
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import AllReduceAsyncFallback, FixedTiledLayout
+from torch_spyre._inductor.ir import AllReduceKernel, FixedTiledLayout, WaitKernel
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
-# Collectives whose codegen reads exactly one tensor operand, ``inputs[0]``, and
-# only through ``codegen_reference``/``get_layout``: repointing that operand at
-# an addressing-equivalent copy is the complete rewrite.  all_gather and
-# broadcast share that shape but have no test reading a loop carry yet.
-_REWRITABLE_COLLECTIVES = (AllReduceAsyncFallback,)
+# In-place collectives whose codegen reads exactly one tensor operand,
+# ``inputs[0]``, and only through ``codegen_reference``/``get_layout``.  The
+# result lives in that operand (``create_inplace`` returns it), so the rewrite
+# repoints the operand, the collective's ``MutationOutput``, its waits and every
+# later reader together.  all_gather and broadcast are out of place and have no
+# test reading a loop carry yet.
+_REWRITABLE_COLLECTIVES = (AllReduceKernel,)
 
 
 def unwrapped_buffer_name(node: Any) -> str | None:
@@ -375,44 +378,89 @@ class GraphEditor:
             inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
 
         So instead we just allow ops that wrap a Pointwise or Reduction.  The
-        one exception is :meth:`replace_collective_operand`, where that swap is
-        the complete rewrite because the collective's codegen reads only
-        ``inputs[0]``.
+        exceptions are the rewritable collectives and their waits in
+        :meth:`replace_post_loop_accesses`, where that swap is the complete
+        rewrite because their codegen reads only ``inputs[0]``.
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
 
     @staticmethod
-    def collective_operand_name(op: Operation) -> str | None:
-        """The buffer a rewritable collective's operand names, or ``None``.
+    def _sole_operand_name(op: Operation) -> str | None:
+        """The buffer ``op``'s one operand names through plain boxes, or ``None``.
 
-        ``None`` when ``op`` is not one of ``_REWRITABLE_COLLECTIVES`` or a
-        ``ReinterpretView`` sits on its operand chain: the view would have to be
-        rebuilt around the new storage, and the view object may be shared with
-        another op, so such a consumer is not rewritten.
+        ``None`` when a ``ReinterpretView`` sits on the operand chain: the view
+        would have to be rebuilt around the new storage, and the view object may
+        be shared with another op, so such an op is not rewritten.
         """
-        if not isinstance(op, _REWRITABLE_COLLECTIVES) or len(op.inputs) != 1:
+        inputs = getattr(op, "inputs", None)
+        if not inputs or len(inputs) != 1:
             return None
-        node = op.inputs[0]
+        node = inputs[0]
         while not isinstance(node, Buffer):
             if not isinstance(node, TensorBox | StorageBox):
                 return None
             node = node.data
         return node.get_name()
 
-    def replace_collective_operand(
-        self, op: Operation, old_name: str, new: ComputedBuffer
-    ) -> None:
-        """Make a rewritable collective read (and, for all_reduce, mutate) ``new``.
+    @staticmethod
+    def collective_operand_name(op: Operation) -> str | None:
+        """The buffer a rewritable collective's operand names, or ``None``."""
+        if not isinstance(op, _REWRITABLE_COLLECTIVES):
+            return None
+        return GraphEditor._sole_operand_name(op)
 
-        The operand's ``TensorBox``/``StorageBox`` wrappers are rebuilt around
-        ``new`` rather than edited, so no IR object shared with another op
-        changes. ``new`` must be addressing-equivalent to ``old_name`` (same
+    @staticmethod
+    def is_repointable_access(op: Operation, name: str) -> bool:
+        """Whether :meth:`replace_post_loop_accesses` can move ``op`` off ``name``.
+
+        A rewritable collective or a wait on ``name``, or a Pointwise/Reduction
+        loop (whose loads are renamed).
+        """
+        if GraphEditor.collective_operand_name(op) == name:
+            return True
+        if isinstance(op, WaitKernel):
+            return GraphEditor._sole_operand_name(op) == name
+        return GraphEditor.is_rewritable_consumer(op)
+
+    def replace_post_loop_accesses(
+        self, accesses: Sequence[Operation], old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Make every op in ``accesses`` read (and mutate) ``new`` for ``old_name``.
+
+        ``accesses`` is every post-loop access of a drained carry: an in-place
+        collective's result lives in its operand, so its waits and later readers
+        must follow it onto ``new``.  Collectives and waits get their operand's
+        ``TensorBox``/``StorageBox`` wrappers rebuilt around ``new`` rather than
+        edited, so no IR object shared with another op changes, and their
+        ``MutationOutput``/alias bookkeeping renamed.  Loops get their loads
+        renamed.  ``new`` must be addressing-equivalent to ``old_name`` (same
         layout): the collective's plan is sized from the operand's layout.
         """
-        if self.collective_operand_name(op) != old_name:
-            raise ValueError(
-                f"{op.get_name()} is not a rewritable collective reading {old_name}"
-            )
+        for op in accesses:
+            if not self.is_repointable_access(op, old_name):
+                raise ValueError(
+                    f"{op.get_name()} is not a repointable access of {old_name}"
+                )
+        new_name = new.get_name()
+        for op in accesses:
+            if self.is_rewritable_consumer(op):
+                self._replace_loop_input(op, old_name, new_name)
+            else:
+                self._replace_sole_operand(op, old_name, new)
+
+        op_names = {op.get_name() for op in accesses}
+        kept: list[IRNode] = []
+        moved: list[IRNode] = []
+        for user in self.lowering.name_to_users.get(old_name, []):
+            is_op = unwrapped_buffer_name(user) in op_names
+            (moved if is_op else kept).append(user)
+        self.lowering.name_to_users[old_name] = kept
+        self.lowering.name_to_users[new_name].extend(moved)
+
+    def _replace_sole_operand(
+        self, op: Operation, old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Repoint a collective's or wait's one operand at ``new``."""
         wrappers = []
         node = op.inputs[0]
         while not isinstance(node, Buffer):
@@ -434,18 +482,22 @@ class GraphEditor:
         for wrapper in reversed(wrappers):
             replacement = wrapper(replacement)
         op.inputs = [replacement]
-        invalidate_op_read_writes(op)
-        op.get_free_symbol_uses.clear_cache(op)
 
         new_name = new.get_name()
-        op_name = op.get_name()
-        kept: list[IRNode] = []
-        moved: list[IRNode] = []
-        for user in self.lowering.name_to_users.get(old_name, []):
-            is_op = unwrapped_buffer_name(user) == op_name
-            (moved if is_op else kept).append(user)
-        self.lowering.name_to_users[old_name] = kept
-        self.lowering.name_to_users[new_name].extend(moved)
+
+        def rename(names: list[str]) -> list[str]:
+            return [new_name if n == old_name else n for n in names]
+
+        # create_inplace / create_wait record the mutation on separate
+        # MutationOutput buffers and the kernel's alias_names, not on inputs.
+        for mutation in getattr(op, "mutation_outputs", ()):
+            mutation.mutation_names = rename(mutation.mutation_names)
+        if hasattr(op, "alias_names"):
+            op.alias_names = rename(op.alias_names)
+        if getattr(op, "mutation_outputs", None):
+            self.lowering.mutated_buffers.add(new_name)
+        invalidate_op_read_writes(op)
+        op.get_free_symbol_uses.clear_cache(op)
 
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str
