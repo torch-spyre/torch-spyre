@@ -34,7 +34,7 @@ The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
 identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
-`clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
+`min(200n, 50000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
 
 ### Where the candidates come from
@@ -80,8 +80,9 @@ but never above not tiling. What a tiling does is divide `_per_core_size` by `ou
 well as `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid
 in the HBM traffic residency then frees.
 
-The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: this
-engine, and `config.auto_coarse_tiling` (off by default; see its comment).
+The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: a
+solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
+`config.auto_coarse_tiling` (off by default; see its comment).
 
 Three move types:
 
@@ -172,6 +173,11 @@ or a `sumcol`-style reduction) either drops that rate silently or, if the read r
 whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
 the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
+
+**Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
+writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group,
+which features extracted from the untiled graph do not see. It rides outside `cost_expr` because
+that expression has no symbol for a tiling; see `_companion_bytes`.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has

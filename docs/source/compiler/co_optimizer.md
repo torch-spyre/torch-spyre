@@ -212,12 +212,12 @@ the same inputs and the same cost model:
   `co_optimizing_lx_planning`) anneals a single joint state heuristically. The state is the pair
   `(pi, W)`: the LX layout permutation `pi` (held in a composed `PermutationBasedLayoutSolver`)
   and the division vector `W`, one candidate-menu index per buffer. It seeds every buffer at
-  menu index 0 with a FirstFit placement, then runs one geometric cool for
-  `clamp(40n, 200, 15000)` steps using three move types — **reorder** (re-place a buffer in `pi`,
-  weight 0.5), **flip** (change one buffer's division, weight 0.3), and **recolor** (flood a
-  coordinated division change across a connected region via the `cd_parent_matches`
-  compatibility relation, weight 0.2) — and returns the best state seen, so the result is never
-  worse than the seed. See [Joint core-division + LX placement](sa_co_optimization.md) for the
+  menu index 0 with a FirstFit placement, then runs one geometric cool, a capped number of
+  steps per buffer, using three move types — **reorder** (re-place a buffer in `pi`,
+  weight 0.5), **flip** (change one buffer's division, or move a coarse-tiling boundary, weight
+  0.3), and **recolor** (flood a coordinated division change across a connected region via the
+  `cd_parent_matches` compatibility relation, weight 0.2) — and returns the best state seen, so
+  the result is never worse than the seed. See [Joint core-division + LX placement](sa_co_optimization.md) for the
   full mechanics.
 
 ### Co-optimizer will honor `spyre_hint` for work divisions
@@ -292,7 +292,8 @@ subsections below — see [How it works in general](#how-it-works-in-general) fo
 and for what happens with a non-core-division-capable `layout_solver` and the
 `ExhaustiveSearchSolver` fallback. Those two are all (a) needs; (b) adds one more on top,
 `config.auto_coarse_tiling` (env `AUTO_COARSE_TILING`, off by default) — the dedicated switch
-for adding coarse tiling to the pair in (a), inert unless `layout_solver == "cpsat"`.
+for adding coarse tiling to the pair in (a), inert unless `layout_solver` is `"cpsat"` or
+`"simulated_annealing"`.
 
 ### a) LX placement and work division
 
@@ -323,25 +324,24 @@ represented and survives scheduling and codegen — is implemented and documente
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-At a high level: tiling isn't priced as a third term alongside LX placement and work division
-in `cost_expr` — it's still decided jointly with them, in the *same* constraint model, just
-ranked by a different objective. CP-SAT takes the lead here. When `auto_coarse_tiling` is on,
+At a high level: neither solver prices tiling as a third term alongside LX placement and work
+division in `cost_expr`, but both decide it jointly with them. CP-SAT does so in the *same*
+constraint model, just ranked by a different objective. When `auto_coarse_tiling` is on,
 `cost_expr` is dropped and residency, division, and tiling are all still decided together, but
 now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
 cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
 step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
 apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
 second joint solve, not a continuation of the first, since tiling is no longer offered as a
-choice at that point. Simulated annealing picks a tiling the same way, jointly with division —
-that part is merged and live in `OpSplitSpace` — but can't act on its own choice yet: applying
-a chosen tiling to the graph is a separate PR still landing, so the ability to choose stays
-gated inert until it does. See the stack status below for exactly where that line is drawn.
+choice at that point. Simulated annealing picks a tiling jointly with division too, through
+`OpSplitSpace`, but keeps ranking by `cost_expr`, where a tiling pays only through the residency
+it makes possible. Its chosen tilings are applied the same way, and its placement stands: there
+is no second solve.
 
-**Status: landed for CP-SAT, partially landed for simulated annealing.** `CoreDivision.tiling`
-/ `min_footprint` in `plan_solver.py` already account for a tiling if one is present, shared by
-both solvers. The apply-side plumbing itself — `scratchpad/coarse_tiling.py`'s `CoarseTilingPass`
-taking a `TileSpec` and lowering it to `DimHint`s — is CP-SAT's path only; `sa_cooptimizer.py`
-doesn't call it yet, matching the apply step still pending in SA's own stack below:
+**Status: landed for both solvers, off by default; SA fixes still landing.** `CoreDivision.tiling`
+/ `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
+`scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
+`DimHint`s — applies the chosen tilings, both shared by the two solvers:
 
 - **CP-SAT**: landed via `#4768` (`main` as of this update). Each op is offered a menu of
   output-axis tilings, each with its own division menu; a producer/consumer pair is only
@@ -352,17 +352,19 @@ doesn't call it yet, matching the apply step still pending in SA's own stack bel
   and the allocation is solved again over the now-tiled graph, with no further tilings
   offered — that second plan is the one committed.
 
-- **Simulated annealing**: a 7-PR stack (`#4456` through `#4894`) adds this; 3 of the 7
-  (`#4456`, `#4457`, `#4491`) are merged, landing `OpSplitSpace`'s `TilingSpace` half and
-  letting the **recolor** move (one of the annealer's search moves — it floods a coordinated
-  division change across a connected region of buffers) propose tiling changes jointly with
-  division — but gated inert by `TILE_CHOICES_ARE_APPLIED = False`, since nothing yet turns a
-  chosen tiling into real tiled ops in the graph. `#4602` is that apply step; `#4611`, `#4770`,
-  and `#4894` round out companion-buffer copy-out pricing, cross-tile-boundary reads, and
-  admission-mismatch fixes found once the apply step exists. `#4894` in particular must land
-  with or before `#4602`'s flag ever goes on — its admission-model fixes close gaps `#4602`'s
-  raise-on-refusal policy turns into compile failures. None of the remaining four are in
-  `main` yet.
+- **Simulated annealing**: a 7-PR stack (`#4456` through `#4894`) adds this; the first five
+  are merged. `OpSplitSpace`'s `TilingSpace` half offers each op its tilings; the **flip** move
+  shifts a tiled run's boundary, and the **recolor** move (it floods a coordinated division
+  change across a connected region of buffers) carries a tiling along with it. `#4602`
+  applies the chosen tilings before the divisions are committed, keeping the anneal's
+  placement; a tiling the apply refuses raises rather than falling back. `#4611` prices the
+  HBM traffic of the full-extent companion buffer the apply mints for a tiled op whose output
+  escapes its run. Still to come: `#4770` prices the loop a tiling introduces, through
+  tile-count symbols in `cost_expr`, and lets the anneal place a staging copy for a tiled op's
+  read across its run's boundary; `#4894` fixes the gaps between what the search may tile and
+  what the apply builds that surface once tilings are applied, as compile failures or
+  mis-scaled reads. Until `#4894` lands, keep `auto_coarse_tiling` off under simulated
+  annealing. See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
 
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
 here for current status, rather than carrying their own stale claim.
@@ -562,9 +564,9 @@ Open items from drafting this page that are worth resolving before calling it do
   has no sweep knob of its own yet, the same way `WD_M`/`WD_N`/`WD_K` is `mmwd`'s knob for
   forced work-division splits today. Its prediction accuracy is therefore unmeasured right now,
   not hypothetically — nothing in [Accuracy](cost_model.md#accuracy)'s table covers it. The
-  same gap is coming for simulated annealing's stack (`#4456` through `#4894`, 3 of 7 merged —
-  see [b) LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling))
-  once the remaining PRs land and the feature is actually reachable. Combined with the point
+  same gap holds for simulated annealing's solver-chosen tiling (`#4456` through `#4894` —
+  see [b) LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)),
+  reachable behind the same flag since `#4602`. Combined with the point
   above (no automatic coverage check), a new optimization axis landing without a deliberate
   sweep-plan update is a real way for its prediction accuracy to go unmeasured indefinitely
   rather than loudly missing.
@@ -587,20 +589,15 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ### Tiling-related:
 
-- SA's coarse-tiling stack (`#4456` through `#4894`) is 3 of 7 merged as of this update —
-  update [b) LX placement, work division, and coarse
-  tiling](#b-lx-placement-work-division-and-coarse-tiling) above (and `scratchpad_planning.md`'s
-  pointers to it) again as `#4602`, `#4611`, `#4770`, and `#4894` land.
-- The existing docs *and the current code* use "tiling" for at least two different things —
-  `CoreDivision.tiling` (coarse tiling proper, a `TileSpec`), and, separately, (a)
-  `scratchpad_planning.md`'s co-optimization section calling core-division splits for matmuls
-  "the matmuls' tilings," and (b) `sa_cooptimizer.py`'s own `_flood_region(anchor, tiling)` and
-  `_rng.choice(self._nontrivial_menu[anchor])`, where `tiling` names a division-menu index, not
-  a `TileSpec` — confirmed on `upstream/main` as of this draft (`sa_cooptimizer.py:519-581`).
-  So the naming collision isn't just a doc-wording slip; it's in a parameter name in the
-  pre-coarse-tiling code the SA stack is extending. Worth a terminology pass across the
-  documents *and* that code once coarse tiling lands, so "division"/"split" and "tiling" stay
-  consistently distinct.
+- SA's coarse-tiling stack (`#4456` through `#4894`) is 5 of 7 merged — update [b) LX
+  placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
+  above (and `scratchpad_planning.md`'s pointers to it) again as `#4770` and `#4894` land.
+- The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
+  tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
+  core-division splits for matmuls "the matmuls' tilings." The code no longer does:
+  `sa_cooptimizer.py`'s `_flood_region`, whose division-menu index parameter was named `tiling`,
+  now takes a `DivisionConfig`. Worth a terminology pass across the documents, so
+  "division"/"split" and "tiling" stay consistently distinct.
 
 ### Solver performance:
 

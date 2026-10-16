@@ -657,14 +657,8 @@ class TestNegativeScalarOperations:
         elif expected_behavior == "overflow_or_large":
             assert torch.isinf(result).any() or result.abs().max() > 60000
 
-    def test_int_tensor_float_scalar_promotion(self, request, execution_mode):
+    def test_int_tensor_float_scalar_promotion(self, execution_mode):
         """Int tensor + float scalar promotes to float."""
-        strict_xfail(
-            request,
-            AssertionError,
-            "an int64 tensor plus a float scalar returns int64 with the scalar "
-            "dropped (#5363)",
-        )
 
         def int_float_add(x):
             return x + 0.5

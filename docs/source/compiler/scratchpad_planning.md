@@ -655,8 +655,8 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`); simulated
-  annealing's stack (`#4456`-`#4894`) is 3 of 7 merged — see
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`), partially
+  landed for simulated annealing — see
   [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
   current status.
 

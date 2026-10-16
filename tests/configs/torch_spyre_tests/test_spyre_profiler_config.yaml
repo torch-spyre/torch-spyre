@@ -35,4 +35,5 @@ test_suite_config:
             - test_find_duplicate_kernel_start_timestamps
             - test_find_duplicate_kernel_start_timestamps_invalid_events
             - test_duplicate_kernel_start_timestamps
+            - test_non_collective_activities_have_no_coll_args
           mode: mandatory_success

@@ -93,6 +93,18 @@ POINTWISE_BINARY_OPS_INT64_DICT = {
     "maximum": torch.maximum,
 }
 
+# Ops with a dedicated native-integer intrinsic on Spyre (addi32toi32 / muli32toi32).
+_NATIVE_INT32_OPS_DICT = {
+    "add": torch.add,
+    "mul": torch.mul,
+}
+
+# 2**24 + 1 = 16_777_217 — the first integer not exactly representable in fp32.
+_FIRST_INT32_BEYOND_FP32 = 2**24 + 1
+
+# 2**31 - 1 = 2_147_483_647 — INT32_MAX.
+_INT32_MAX = 2**31 - 1
+
 CORE_REDUCTION_OPS_DICT = {
     "sum": torch.sum,
     "mean": torch.mean,
@@ -855,7 +867,21 @@ SCALED_MM_TESTS = {
     for sa, sb, b in _SCALED_MM_PARAMS
 }
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
+
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
+
+
+def _clamp_tol(dtype):
+    """Exact for integers; epsilon-scale (FP16_EPS / FP32_EPS) for fp16 / fp32.
+
+    clamp only selects between the input and a bound, so no arithmetic error
+    accumulates -- the default 0.1 tolerance would hide real bugs.
+    """
+    if not dtype.is_floating_point:
+        return 0, 0
+    eps = FP16_EPS if dtype == torch.float16 else FP32_EPS
+    return eps, eps
+
 
 # DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
 # finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
@@ -1239,13 +1265,105 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(-100, 100, (256,), dtype=torch.int64),
                     torch.randint(-100, 100, (256,), dtype=torch.int64),
                 ),
+                "1d_bcast": (
+                    torch.randint(-100, 100, (1,), dtype=torch.int64),
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                ),
                 "2d": (
                     torch.randint(-100, 100, (67, 256), dtype=torch.int64),
+                    torch.randint(-100, 100, (67, 256), dtype=torch.int64),
+                ),
+                "2d_batch_bcast": (
+                    torch.randint(-100, 100, (1, 256), dtype=torch.int64),
+                    torch.randint(-100, 100, (67, 256), dtype=torch.int64),
+                ),
+                "2d_stick_bcast": (
+                    torch.randint(-100, 100, (67, 1), dtype=torch.int64),
                     torch.randint(-100, 100, (67, 256), dtype=torch.int64),
                 ),
                 "3d": (
                     torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
                     torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
+                ),
+            },
+        },
+        # Large-value int64 add/mul (physically IEEE_INT32 on device):
+        # same _FIRST_INT32_BEYOND_FP32 boundary proof for the int64 native path.
+        # test_binary_op compares integer results exactly (atol=0, rtol=0), so
+        # an fp32 round-trip (e.g. 2**24 + 1 + 1) fails these cases.
+        (
+            "test_native_int64_large_values",
+            "test_binary_op",
+        ): {
+            "ops_dict": _NATIVE_INT32_OPS_DICT,
+            "param_sets": {
+                "1d_int64": (
+                    torch.full((256,), _FIRST_INT32_BEYOND_FP32, dtype=torch.int64),
+                    torch.full((256,), 1, dtype=torch.int64),
+                ),
+                "2d_int64": (
+                    torch.full((67, 256), _FIRST_INT32_BEYOND_FP32, dtype=torch.int64),
+                    torch.full((67, 256), 1, dtype=torch.int64),
+                ),
+                "1d_int64_mul_large_both": (
+                    torch.full((256,), _FIRST_INT32_BEYOND_FP32, dtype=torch.int64),
+                    torch.full((256,), 3, dtype=torch.int64),
+                ),
+            },
+        },
+        # int64 operands beyond INT32_MAX (> 2**31-1): on Spyre, int64 is
+        # physically stored as IEEE_INT32, so values exceeding _INT32_MAX
+        # cannot be represented and all param sets are expected to fail.
+        (
+            "test_native_int64_beyond_int32_large_values",
+            "test_binary_op",
+        ): {
+            "ops_dict": _NATIVE_INT32_OPS_DICT,
+            "param_sets": {
+                # add: _INT32_MAX + 1 overflows the physical int32 storage.
+                "1d_int64": (
+                    torch.full((256,), _INT32_MAX + 1, dtype=torch.int64),
+                    torch.full((256,), 1, dtype=torch.int64),
+                ),
+                "2d_int64": (
+                    torch.full((67, 256), _INT32_MAX + 1, dtype=torch.int64),
+                    torch.full((67, 256), 1, dtype=torch.int64),
+                ),
+                # mul: (_INT32_MAX + 1) * 3 also exceeds representable range.
+                "1d_int64_mul_large_both": (
+                    torch.full((256,), _INT32_MAX + 1, dtype=torch.int64),
+                    torch.full((256,), 3, dtype=torch.int64),
+                ),
+            },
+            "expect_fail": [
+                "1d_int64",
+                "2d_int64",
+                "1d_int64_mul_large_both",
+            ],
+        },
+        # addi32toi32/muli32toi32 use a SENUINT32 (unsigned) SDSC descriptor.
+        # Verify that negative broadcast operands are not mis-interpreted as
+        # unsigned when SDSC fills the broadcast lanes.
+        (
+            "test_native_int64_negative_broadcast",
+            "test_binary_op",
+        ): {
+            "ops_dict": _NATIVE_INT32_OPS_DICT,
+            "param_sets": {
+                # Stick-broadcaster (axis -1, size 1) holds a fixed negative value.
+                "2d_stick_bcast_neg": (
+                    torch.full((67, 1), -7, dtype=torch.int64),
+                    torch.randint(-100, 100, (67, 256), dtype=torch.int64),
+                ),
+                # Batch-dimension broadcaster (axis 0, size 1) with a negative value.
+                "2d_batch_bcast_neg": (
+                    torch.randint(-100, 100, (1, 256), dtype=torch.int64),
+                    torch.full((67, 256), -3, dtype=torch.int64),
+                ),
+                # Both operands negative, stick broadcast.
+                "2d_stick_bcast_both_neg": (
+                    torch.full((67, 1), -50, dtype=torch.int64),
+                    torch.full((67, 256), -1, dtype=torch.int64),
                 ),
             },
         },
@@ -2993,6 +3111,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_1x64x64": (cached_randn((1, 64, 64)),),
             },
         },
+        # Host-resident integer tensor clamped inside a Spyre graph: an index
+        # vector built with torch.arange (CPU int64) is clamped before being
+        # moved to the device, mirroring LFM2-style mask construction. The clamp
+        # runs on CPU, so the Spyre int -> float promotion must not be applied.
+        ("test_clamp_host_operand", "test_clamp_host_operand_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                "fp16_1x64x64": (cached_randn((1, 64, 64)),),
+            },
+        },
         # -----------------------------------------------------------------------
         # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
         # so above 2**24 the gaps between representable values exceed 1 and two
@@ -3090,19 +3222,307 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        (
-            "test_pointwise_range_op",
-            "test_range_op",
-        ): {
+        # -----------------------------------------------------------------------
+        # int64 clamp: all clamp variants across 1D/2D/3D/4D shapes.
+        # int64 inputs fall back to CPU for int64->int32/fp32 casting,
+        # and the clamp computation runs compiled on Spyre.
+        # -----------------------------------------------------------------------
+        ("test_clamp_int64", "test_clamp_int64_cpu"): {
             "ops_dict": {
                 "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
             },
             "param_sets": {
-                "fp16": (
+                # 1-D: MoE model case — expert_ids.clamp(0, self.num_experts - 1)
+                # (e.g. HuggingFace Transformers MoE, 272 tokens, 128 experts)
+                "1d_272_moe": (
+                    torch.randint(0, 1000, (272,), dtype=torch.int64),
+                    0,
+                    127,
+                ),
+                # 1-D: stick-aligned (256 elements)
+                "1d_256": (
+                    torch.randint(0, 1000, (256,), dtype=torch.int64),
+                    0,
+                    127,
+                ),
+                # 1-D: non-stick-aligned (> 32 elements)
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    0,
+                    31,
+                ),
+                # 2-D: stick-aligned last dim
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    10,
+                    500,
+                ),
+                # 2-D: non-aligned last dim (44 elements)
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                    0,
+                    31,
+                ),
+                # 2-D: small last dim (4 elements, supported because outer dim > 1)
+                "2d_2x4": (
+                    torch.randint(0, 1000, (2, 4), dtype=torch.int64),
+                    0,
+                    127,
+                ),
+                # 3-D
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                    10,
+                    500,
+                ),
+                # 4-D
+                "4d_2x3x4x64": (
+                    torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int64),
+                    10,
+                    500,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # int32 clamp: all clamp variants across 1D/2D/3D/4D shapes.
+        # int32 inputs promote to fp32 in the lowering and run on device.
+        # -----------------------------------------------------------------------
+        ("test_clamp_int32", "test_clamp_int32_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                # 1-D: Gemma MoE histc bin index clamp pattern (non-32-aligned: 272 % 32 = 16)
+                "1d_272_gemma": (
+                    torch.randint(0, 1000, (272,), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # 1-D: stick-aligned (64 % 32 == 0)
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # 1-D: non-stick-aligned (44 % 32 != 0)
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                    0,
+                    31,
+                ),
+                # 1-D: < 32 elements triggers DtException (no valid schedule candidate)
+                "1d_8_small": (
+                    torch.randint(0, 1000, (8,), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # 2-D: stick-aligned last dim
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                    10,
+                    500,
+                ),
+                # 2-D: non-aligned last dim
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                    0,
+                    31,
+                ),
+                # 2-D: small last dim (4 elements, 2D tiling handles small inner dim)
+                "2d_2x4": (
+                    torch.randint(0, 1000, (2, 4), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # 3-D
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                    10,
+                    500,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # clamp mixed dtype: tensor vs float/int scalar or mixed precision bounds.
+        # Following torch promotion semantics:
+        #   - fp16 tensor with float scalar -> fp16 clamp
+        #   - fp32 tensor with int scalar -> fp32 clamp
+        #   - int32 tensor with float scalar -> fp32 clamp -> int32
+        #   - int64 tensor with float scalar -> fp32 clamp -> int64 (via CPU cast fallback)
+        # -----------------------------------------------------------------------
+        ("test_clamp_mixed_dtype", "test_clamp_mixed_dtype_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                "fp16_float_scalar": (
+                    torch.randn(256, dtype=torch.float16) * 100.0,
+                    -10.5,
+                    10.5,
+                ),
+                "fp16_int_scalar": (
+                    torch.randn(256, dtype=torch.float16) * 100.0,
+                    -10,
+                    10,
+                ),
+                "fp32_int_scalar": (
+                    torch.randn(256, dtype=torch.float32) * 100.0,
+                    -10,
+                    10,
+                ),
+                "int32_float_scalar": (
+                    torch.randint(-1000, 1000, (256,), dtype=torch.int32),
+                    -50.5,
+                    50.5,
+                ),
+                "int64_float_scalar": (
+                    torch.randint(-1000, 1000, (256,), dtype=torch.int64),
+                    -50.5,
+                    50.5,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # fp16 / fp32 clamp: native float clamp across 1D/2D/3D/4D shapes.
+        # fp16 sticks are 64 elements wide; fp32 sticks are 32 elements wide.
+        # Shapes cover stick-aligned, non-aligned, and ragged inner dims.
+        # -----------------------------------------------------------------------
+        ("test_clamp_fp16_fp32", "test_clamp_fp16_fp32_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                "fp16_1d_256": (
+                    cached_randn((256,), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_1d_44": (
+                    cached_randn((44,), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_2d_128x256": (
                     cached_randn((128, 256), dtype=torch.float16),
                     0.1,
                     0.9,
-                    FP16_EPS,
+                ),
+                "fp16_2d_7x44": (
+                    cached_randn((7, 44), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_3d_2x4x64": (
+                    cached_randn((2, 4, 64), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_4d_2x3x4x64": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_1d_256": (
+                    cached_randn((256,), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_1d_44": (
+                    cached_randn((44,), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_2d_128x256": (
+                    cached_randn((128, 256), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_2d_7x44": (
+                    cached_randn((7, 44), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_3d_2x4x64": (
+                    cached_randn((2, 4, 64), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_4d_2x3x4x64": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # clamp bigint: large integers where int -> fp32 promotion may lose precision.
+        # Below 2**24 (16.7M) every integer is exact in fp32.
+        # Above 2**24, gaps between consecutive integers occur.
+        # -----------------------------------------------------------------------
+        ("test_clamp_bigint", "test_clamp_bigint_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "expect_fail": ["int32_2e9", "int64_2e9"],
+            "param_sets": {
+                # Control: values below 2**24 are exact
+                "int32_small": (
+                    torch.tensor([1000, 2000, 3000, 4000] * 16, dtype=torch.int32),
+                    1500,
+                    3500,
+                ),
+                "int64_small": (
+                    torch.tensor([1000, 2000, 3000, 4000] * 16, dtype=torch.int64),
+                    1500,
+                    3500,
+                ),
+                # Large integers: lose lower bits during int32/int64 -> fp32 cast
+                "int32_2e9": (
+                    torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int32),
+                    2000000000,
+                    2000000001,
+                ),
+                "int64_2e9": (
+                    torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int64),
+                    2000000000,
+                    2000000001,
+                ),
+            },
+        },
+        ("test_clamp_inplace", "test_clamp_inplace_cpu"): {
+            "ops_dict": {
+                "clamp_": torch.Tensor.clamp_,
+                "clamp_min_": torch.Tensor.clamp_min_,
+                "clamp_max_": torch.Tensor.clamp_max_,
+            },
+            "param_sets": {
+                # fp32 in-place: basic device correctness
+                "fp32_256": (
+                    torch.randn(256, dtype=torch.float32) * 100.0,
+                    -10,
+                    10,
+                ),
+                # int32 in-place: stick-aligned
+                "int32_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # int64 in-place: Gemma MoE pattern (192 elements, int64)
+                "int64_192": (
+                    torch.randint(0, 1000, (192,), dtype=torch.int64),
+                    0,
+                    127,
                 ),
             },
         },
@@ -4334,7 +4754,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "1d": (cached_randn((1024,), dtype=torch.float16), 3.0),
+                "1d_fp32": (cached_randn((1024,), dtype=torch.float32), 3.0),
+                "1d_int64": (torch.randint(-100, 100, (1024,), dtype=torch.int64), 3),
                 "2d": (cached_randn((512, 1024), dtype=torch.float16), 1.0),
+                "2d_fp32": (cached_randn((512, 1024), dtype=torch.float32), 1.0),
+                "2d_int64": (
+                    torch.randint(-100, 100, (512, 1024), dtype=torch.int64),
+                    1,
+                ),
                 "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
             },
@@ -7891,6 +8318,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
         torch.testing.assert_close(result, torch.eq(x, y))
 
+    def test_bool_logical_or(self):
+        dtype = torch.bool
+        x = torch.randint(0, 2, (2, 64), dtype=dtype)
+        x_spyre = x.to("spyre")
+        y = torch.randint(0, 2, (2, 64), dtype=dtype)
+        y_spyre = y.to("spyre")
+        result = torch.compile(torch.logical_or, dynamic=False)(x_spyre, y_spyre).cpu()
+        torch.testing.assert_close(result, torch.logical_or(x, y))
+
+    def test_bool_add(self):
+        # torch.add(bool, bool) is routed to logical_or by upstream Inductor
+        # (override_fn_when_input_bool="logical_or" on aten.add), so this
+        # exercises SpyreOpFuncs.logical_or indirectly.
+        dtype = torch.bool
+        x = torch.randint(0, 2, (2, 64), dtype=dtype)
+        x_spyre = x.to("spyre")
+        y = torch.randint(0, 2, (2, 64), dtype=dtype)
+        y_spyre = y.to("spyre")
+        result = torch.compile(torch.add, dynamic=False)(x_spyre, y_spyre).cpu()
+        torch.testing.assert_close(result, torch.add(x, y))
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_scalar_cpu(self, op, *args):
         def fn(*tensor_args):
@@ -7937,7 +8385,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             tiny_value_mask = torch.abs(b) < FP16_EPS
             b[tiny_value_mask] = FP16_EPS
 
-        self.compare_with_cpu(op, a, b)
+        # Integer (and bool) results must match exactly. With the default
+        # atol/rtol of 0.1 an fp32 round-trip error of a few units on values
+        # near 2**24 would still pass, so the native addi32toi32/muli32toi32
+        # path would not be distinguishable from the lossy one. Only do this
+        # when both operands are integral: a float operand keeps the tolerance.
+        all_integral = all(
+            isinstance(t, torch.Tensor)
+            and not (t.dtype.is_floating_point or t.dtype.is_complex)
+            for t in (a, b)
+        )
+        if all_integral:
+            self.compare_with_cpu(op, a, b, atol=0, rtol=0)
+        else:
+            self.compare_with_cpu(op, a, b)
 
     def test_storage_offset_placeholder(self, op, slicer, base):
         # slicer runs after .to("spyre") and before compile, so the
@@ -8346,6 +8807,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             positions = torch.arange(x.shape[-1])
             mask = op(positions, 2)[None, None, :]
             return x * mask.to(dtype=x.dtype, device=x.device)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_clamp_host_operand_cpu(self, op, x):
+        # The clamp operand lives on CPU even though the graph targets Spyre.
+        # An int64 position index is clamped then moved to the device, as in
+        # LFM2-style causal conv mask construction.
+        def fn(x):
+            positions = torch.arange(x.shape[-1])  # CPU int64
+            if op is torch.clamp:
+                clamped = op(positions, min=0, max=1)
+            elif op is torch.clamp_min:
+                clamped = op(positions, min=0)
+            else:  # clamp_max
+                clamped = op(positions, max=1)
+            return x * clamped[None, None, :].to(dtype=x.dtype, device=x.device)
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
@@ -9188,8 +9665,101 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x, y: torch.where(cond_op(x, y), x, y), x, y, run_eager=False
         )
 
-    def test_range_op(self, op, input, min, max, err):
-        self.compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+    def _run_clamp_cpu(self, op, x, min_val, max_val, **kwargs):
+        """Shared body for all integer-clamp tests.
+
+        Integer results must be compared exactly (atol=0, rtol=0); the default
+        tolerance of 0.1 is far too loose — a clamp to 127 that returned 139
+        would still pass with 10% relative tolerance.
+        """
+        if op is torch.clamp:
+            self.compare_with_cpu(
+                lambda a: op(a, min=min_val, max=max_val),
+                x,
+                run_eager=False,
+                **kwargs,
+            )
+        elif op is torch.clamp_min:
+            self.compare_with_cpu(
+                lambda a: op(a, min=min_val), x, run_eager=False, **kwargs
+            )
+        elif op is torch.clamp_max:
+            self.compare_with_cpu(
+                lambda a: op(a, max=max_val), x, run_eager=False, **kwargs
+            )
+
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
+    def test_clamp_int64_cpu(self, op, x, min_val, max_val):
+        """int64 clamp (int64->fp32 cast fallback, clamp compiled on device)."""
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    def test_clamp_int32_cpu(self, op, x, min_val, max_val):
+        """int32 clamp (int32->fp32 promotion inside lowering, fully on device)."""
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
+    def test_clamp_mixed_dtype_cpu(self, op, x, min_val, max_val):
+        """clamp with mixed dtype operands (tensor vs float/int scalars).
+
+        Integer-tensor cases (int32/int64) use exact tolerance; float-tensor
+        cases use a tight per-dtype epsilon (FP16_EPS / FP32_EPS).
+        """
+        atol, rtol = _clamp_tol(x.dtype)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=atol, rtol=rtol)
+
+    def test_clamp_fp16_fp32_cpu(self, op, x, min_val, max_val):
+        """fp16 and fp32 clamp across 1D/2D/3D/4D shapes (native float path)."""
+        atol, rtol = _clamp_tol(x.dtype)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=atol, rtol=rtol)
+
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
+    def test_clamp_bigint_cpu(self, op, x, min_val, max_val):
+        """clamp on large integers around 2**24 float32 precision limits.
+
+        Uses exact tolerance (atol=0, rtol=0) so that int→fp32 precision loss
+        is actually detected.  The *_2e9 param-sets are marked xfail because
+        the device really does collapse 2e9+1 → 2e9 after the cast.
+        """
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    def test_clamp_inplace_cpu(self, op, x, min_val, max_val):
+        """in-place clamp_ variants mutating a graph input (fixes #4069).
+
+        The input itself is clamped in place and returned, so the compiled
+        graph must write the result back into its input buffer. (Clamping
+        ``a.clone()`` would be functionalized into a plain out-of-place clamp
+        and never exercise the write-back.)
+        """
+        atol, rtol = _clamp_tol(x.dtype)
+        if op is torch.Tensor.clamp_:
+
+            def fn(a):
+                a.clamp_(min=min_val, max=max_val)
+                return a
+
+        elif op is torch.Tensor.clamp_min_:
+
+            def fn(a):
+                a.clamp_min_(min_val)
+                return a
+
+        elif op is torch.Tensor.clamp_max_:
+
+            def fn(a):
+                a.clamp_max_(max_val)
+                return a
+
+        # clone_inputs: fn mutates its input, so the CPU reference and the
+        # Spyre run must each get a fresh copy.
+        self.compare_with_cpu(
+            fn, x, run_eager=False, atol=atol, rtol=rtol, clone_inputs=True
+        )
 
     def test_clamp_preserves_unspecified_bound(self, operation, dtype):
         """Missing bounds must preserve the input device format's full range."""
@@ -11360,14 +11930,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_restickify_int64_unsupported(self):
         """The same, for INT64: there is no feasible layout without a restickify.
 
-        The device computes the int64 add in IEEE_FP32 (the message lists IEEE_FP32
-        for the converted operands), so the fragment pins that dtype, as above.
+        int64 is stored as IEEE_INT32 on device and now uses the native
+        addi32toi32 path, so the error message names IEEE_INT32 for the
+        operands (not IEEE_FP32 as in the fp32 case above).
         """
         x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
         # Transpose creates layout incompatibility that triggers restickify
         with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
+            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_INT32"
         ):
             self.compare_with_cpu(
                 lambda x, y: x.t() + y,
