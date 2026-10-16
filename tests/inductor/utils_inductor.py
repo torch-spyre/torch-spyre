@@ -27,6 +27,11 @@ import regex as re
 from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    reinterpret_tensor_with_layout,
+)
+
 import unittest
 from typing import Any, TYPE_CHECKING
 
@@ -1118,6 +1123,20 @@ def opspec_summaries(source: str) -> list[dict[str, Any]]:
             }
         )
     return summaries
+
+
+def try_reinterpret_host_shape(t_dev: torch.Tensor, size: list[int]) -> torch.Tensor:
+    """Reinterpret existing tensor with another shape
+
+    This function creates a canonical STL for a given shape and
+    creates a view to an existing tensor with that shape. It should
+    only be used for testing purposes, for example to inspect the
+    contents of padding, as it can result in invalid memory access.
+    """
+    stl = SpyreTensorLayout(size, t_dev.dtype)
+    stride = torch.empty(size).stride()
+    view = reinterpret_tensor_with_layout(t_dev, size, list(stride), 0, stl)
+    return view
 
 
 def ir_input_loader(name: str, size: list[int]) -> Callable:
