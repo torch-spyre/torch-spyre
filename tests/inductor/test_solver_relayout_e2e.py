@@ -28,6 +28,9 @@ the plan (views under the chosen divisions, solved addresses), the existing
 computes the right numbers on device.
 """
 
+from contextlib import contextmanager
+from unittest.mock import patch as mock_patch
+
 import pytest
 
 pytest.importorskip("ortools")
@@ -36,10 +39,62 @@ import torch
 
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
+from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
+from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+
+
+@contextmanager
+def _emitted_kernels():
+    """Collect every kernel the backend emits during one compile.
+
+    Duplicated from test_work_division_hint.py's own helper of the same
+    name, matching that file's own convention of duplicating rather than
+    importing across test files."""
+
+    kernels = []
+    real_codegen = SpyreKernel.codegen_kernel
+
+    def codegen_kernel(kernel):
+        kernels.append(kernel)
+        return real_codegen(kernel)
+
+    with mock_patch.object(
+        SpyreKernel, "codegen_kernel", side_effect=codegen_kernel, autospec=True
+    ):
+        yield kernels
+
+
+def _assert_lx_only_relayout_kernels(kernels):
+    """Exactly one LX-to-LX relayout copy was emitted, carrying no HBM
+    allocation -- duplicated from test_work_division_hint.py's own
+    helper of the same name; see that copy's docstring for why (upstream
+    PR #4984 / issue #4886)."""
+
+    all_specs = [
+        spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)
+    ]
+    lx_copies = [
+        spec
+        for spec in all_specs
+        if spec.op == IDENTITY_OP
+        and len(spec.args) == 2
+        and all("lx" in arg.allocation for arg in spec.args)
+    ]
+    assert len(lx_copies) == 1, (
+        f"expected exactly one LX-to-LX relayout copy, found {len(lx_copies)}"
+    )
+    copy = lx_copies[0]
+    assert all(
+        not any("hbm" in str(key) for key in arg.allocation) for arg in copy.args
+    ), (
+        "relayout copy carries an HBM allocation: "
+        f"{[dict(arg.allocation) for arg in copy.args]}"
+    )
+    return copy
 
 
 def _no_matches(self, edges, *args, **kwargs):
@@ -423,12 +478,16 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
 
     observed = _Observed(monkeypatch, force=False)
     fn, args, reference, expect = grouped_relayout_graph(kind)
-    with config.patch({**_COOPT, "sencores": 32}):
+    with (
+        config.patch({**_COOPT, "sencores": 32}),
+        _emitted_kernels() as kernels,
+    ):
         out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
             *args
         )
 
     observed.assert_emitted_in_lx(expected_plans=1)
+    _assert_lx_only_relayout_kernels(kernels)
     (plan,) = observed.plans
     assert plan.num_cores == expect["source_cores"], "the plan keeps the source's"
     assert plan.destination_view.num_cores == expect["destination_cores"]
