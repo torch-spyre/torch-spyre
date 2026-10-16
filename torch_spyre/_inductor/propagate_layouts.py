@@ -334,6 +334,38 @@ def _candidate_output_stls(
     return stls
 
 
+def _compatible_output_stick_exprs(
+    stick_expr: sympy.Expr, out_coords, dep: MemoryDep
+) -> list[sympy.Expr]:
+    """Output stick expressions one input can feed without a restickify.
+
+    ``stick_expr`` is the input's device stick coordinate, ``dep`` its load and
+    ``out_coords`` the output's host coordinates. The result starts with
+    ``stick_expr`` itself, the preserved layout.
+
+    A stick of constant 0 is a size-1 stick, which says nothing about where the
+    output's stick goes. For such an input, the coordinate of each output dim it
+    is expanded along is added, e.g. ``d2`` for ``y`` ``[3, 5, 1]`` read through
+    ``y.expand(3, 5, 128)``, or both ``d1`` and ``d2`` for ``[3, 1, 1]`` expanded
+    to ``[3, 64, 128]``. Every lane of a stick on such a dim needs the same input
+    element, which the op broadcasts, so ``stick_compatible`` accepts the pair.
+
+    The consumer picks among the returned sticks, e.g. a full-size operand on the
+    expanded last dim or a transposed one on another expanded dim; the size-1
+    stick stays for a consumer with a size-1 last dim.
+    """
+    if stick_expr != 0:
+        return [stick_expr]
+    in_syms = dep.index.free_symbols
+    # An expanded dim is indexed by a variable the input's load lacks, so the
+    # input's element does not vary along it. A dim the input does index is left
+    # out: a stick there would gather elements from several input sticks.
+    expanded_dim_coords = [
+        coord for coord in out_coords if coord.is_symbol and coord not in in_syms
+    ]
+    return [stick_expr, *expanded_dim_coords]
+
+
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     """Reject fixed-layout ops when any input has a stick expression with a constant offset.
 
@@ -591,15 +623,7 @@ def _single_arg_op_layout(
             # bool-equivalent dtype of the STL's device_dtype as the source.
             ea_src_dtype = in_layout.dtype
             if ea_src_dtype == torch.bool:
-                resolved_dtype = bool_equivalent_dtype(stl.device_dtype)
-                if resolved_dtype is not None:
-                    ea_src_dtype = resolved_dtype
-                else:
-                    logger.warning(
-                        "bool input has unrecognised device_dtype %s; "
-                        "falling back to torch.bool for EA map lookup",
-                        stl.device_dtype,
-                    )
+                ea_src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
 
             fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
 
@@ -733,13 +757,21 @@ def _single_arg_op_layout(
     if in_device_coords is None:
         return []
     stick_expr = in_device_coords[-1]
+    stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
 
     # Try to preserve input layout, fall back to scanning all output dims
-    out_stl = _output_stl_from_stick_expr(
-        stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-    )
-    if out_stl is not None:
-        return [out_stl]
+    output_stls = [
+        out_stl
+        for expr in stick_exprs
+        for out_stl in [
+            _output_stl_from_stick_expr(
+                expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+            )
+        ]
+        if out_stl is not None
+    ]
+    if output_stls:
+        return output_stls
     return _candidate_output_stls(
         out_coords,
         output_dep,
@@ -1437,10 +1469,34 @@ def _multi_arg_pointwise_layouts(
        4. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+
+    # An index operand read only at lane 0 of each stick takes no part in the
+    # arrangement: a stagger keeps lane 0 in place, so a staggered index read
+    # there yields the same indices as a standard one. An index with such a
+    # candidate keeps only those candidates, as a broadcast operand below keeps
+    # its broadcast ones, so the solver picks one of them.
+    # TODO: lanes 1-3 and 60-63 are also fixed under the fp16 <-> fp32 stagger.
+    def _lane0_candidates(arg) -> list[SpyreTensorLayout]:
+        return [
+            stl
+            for stl in arg.layouts
+            for coords in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
+            if coords is not None and coords[-1] == 0
+        ]
+
+    ea_args = []
+    for arg in args:
+        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
+        if lane0:
+            arg.layouts[:] = lane0
+        else:
+            ea_args.append(arg)
+
     # Determine output ElementArrangement from inputs
     # Collect all unique EAs from input SpyreTensorLayouts
     input_eas = set()
-    for arg in args:
+    for arg in ea_args:
         if arg.layouts:
             # Get EA from first SpyreTensorLayout (all should have same EA for this input)
             input_eas.add(arg.layouts[0].element_arrangement)
@@ -1503,13 +1559,13 @@ def _multi_arg_pointwise_layouts(
 
         std_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts
             and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
         ]
         stag_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
@@ -1579,14 +1635,18 @@ def _multi_arg_pointwise_layouts(
         # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
         output_ea = ElementArrangement.STANDARD
 
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     stick_exprs = {
-        dc[-1]
+        stick
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
         for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
+        for stick in _compatible_output_stick_exprs(dc[-1], out_coords, arg.dep)
     }
 
     # Bool physical format resolution: see resolve_output_formats's docstring.
@@ -1599,10 +1659,6 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [
-        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
-    ]
-    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -2257,8 +2313,12 @@ def _align_single_source_producer(
 
 def _scan_mutation_layout_inputs(
     operations: list[Operation],
-) -> tuple[dict[str, SpyreTensorLayout], dict[str, int]]:
-    """One walk of ``operations`` gathering ``(alt_stls, consumer_counts)``.
+) -> tuple[
+    dict[str, SpyreTensorLayout], dict[str, int], dict[str, list[ComputedBuffer]]
+]:
+    """One walk of ``operations`` gathering ``(alt_stls, consumer_counts, writers)``.
+
+    ``writers`` maps each mutation target to the ops writing it, in order.
 
     Aliasing writes into one target must agree on a single alt layout, so
     ``alt_stls`` is keyed by buffer rather than by op. An internal buffer takes
@@ -2333,7 +2393,129 @@ def _scan_mutation_layout_inputs(
                     f"not yet supported"
                 )
             alt_stls[name] = alt_stl
-    return alt_stls, consumer_counts
+    return alt_stls, consumer_counts, groups
+
+
+def _fresh_allocation_layout(
+    op: Operation, writers: list[ComputedBuffer]
+) -> SpyreTensorLayout:
+    """Device layout of a no-op allocation, tagged with what its writers store.
+
+    An Inductor ``empty`` (the output of ``cat`` or ``constant_pad_nd``) has no
+    inputs, so its layout is fixed here, before any of its mutation writers is
+    visited, and each writer then adopts it. The sources of ``cat`` and
+    ``constant_pad_nd`` writers are lowered before the allocation, so they are
+    already laid out, and a staggered element arrangement among them is carried
+    onto the allocation rather than written into a buffer tagged STANDARD.
+    """
+    stl = generic_layout(op)
+    name = op.get_name()
+    source_eas: set[ElementArrangement] = set()
+    for writer in writers:
+        reads = [
+            r
+            for r in writer.get_read_writes().reads
+            if r.name != name and _carries_element_arrangement(r, op.get_dtype())
+        ]
+        # TODO: a source computed after the allocation, as in
+        # torch.empty(...).index_copy_(0, idx, x.float()), has no layout yet and
+        # is left out, so its arrangement is lost.
+        for arg in _get_prop_args(reads, strict=False):
+            source_eas.update(s.element_arrangement for s in arg.layouts)
+    staggered_eas = source_eas & STAGGERED_EAS
+    if not staggered_eas:
+        return stl
+    if len(source_eas) > 1:
+        # TODO: support mixed arrangements; needs an arrangement-converting
+        # copy.
+        raise Unsupported(
+            f"writers of {name} store mixed element arrangements "
+            f"{sorted(ea.name for ea in source_eas)}"
+        )
+    stl = stl.with_element_arrangement(next(iter(staggered_eas)))
+    for writer in writers:
+        _check_whole_stagger_units(writer, op.get_layout(), stl)
+    return stl
+
+
+def _carries_element_arrangement(read, dtype: torch.dtype) -> bool:
+    """Whether a writer's ``read`` decides the element arrangement it stores.
+
+    An index tensor has another dtype and is never stored, and a constant fill
+    (``torch.zeros``, ``torch.full``) holds the same value in every element.
+    """
+    if not isinstance(read, MemoryDep):
+        return False
+    buf = V.graph.get_buffer(read.name)
+    if buf.get_dtype() != dtype:
+        return False
+    if not isinstance(buf, ComputedBuffer):
+        return True
+    # A buffer with no reads, such as an arange, is not a constant fill.
+    fill_reads = [r for r in buf.get_read_writes().reads if isinstance(r, MemoryDep)]
+    return not fill_reads or not all(
+        isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
+        for r in fill_reads
+    )
+
+
+def _check_whole_stagger_units(
+    writer: ComputedBuffer, target_layout: FixedLayout, target_stl: SpyreTensorLayout
+) -> None:
+    """Raise unless ``writer`` keeps whole stagger units of the stick dim.
+
+    Both staggered arrangements interleave the elements of one fp16 stick (a
+    DL16_TO_FP32 stick pair, or one FP32_TO_DL16 stick), so a write at an offset
+    or with an extent inside such a unit cannot keep the arrangement. A write
+    that ends at the end of the stick dim can, partial last unit included, as
+    long as the generic layout allocates that unit whole: a DL16_TO_FP32 stick
+    dim spanning an odd number of fp32 sticks leaves out the second stick of its
+    last pair.
+    """
+    c_size = [concretize_expr(s) for s in target_layout.size]
+    c_stride = [concretize_expr(s) for s in target_layout.stride]
+    # The device stick's host stride names the stick dim; a size-1 dim can share
+    # that stride without being it.
+    stick_dim = next(
+        (
+            d
+            for d in reversed(range(len(c_size)))
+            if c_size[d] > 1 and c_stride[d] == target_stl.stride_map[-1]
+        ),
+        None,
+    )
+    if stick_dim is None:
+        return
+    unit = get_elem_in_stick(torch.float16)
+    output_dep = next(iter(writer.get_read_writes().writes))
+    coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
+    syms = coord.free_symbols
+    offset = coord.subs({s: 0 for s in syms})
+    extent: int | None
+    if not syms:
+        extent = 1
+    elif len(syms) == 1 and coord - offset == next(iter(syms)):
+        extent = _concrete_int(output_dep.ranges.get(next(iter(syms))))
+    else:
+        extent = None
+    dim_size = c_size[stick_dim]
+    sticks_per_unit = unit // target_stl.elems_per_stick()
+    allocates_whole_units = (
+        math.ceil(dim_size / target_stl.elems_per_stick()) % sticks_per_unit == 0
+    )
+    keeps_whole_units = (
+        extent is not None
+        and offset.is_Integer
+        and int(offset) % unit == 0
+        and (extent % unit == 0 or int(offset) + extent == dim_size)
+    )
+    if not (allocates_whole_units and keeps_whole_units):
+        # TODO: support writes that split a stagger unit.
+        raise Unsupported(
+            f"{writer.get_name()} writes {target_stl.element_arrangement.name} "
+            f"data at stick-dim coordinate {coord}, not whole units of {unit} "
+            f"elements"
+        )
 
 
 def _find_alt_target_stl(
@@ -2633,14 +2815,18 @@ def propagate_spyre_tensor_layouts(
                     tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
-    mutation_alts, mutation_consumer_counts = _scan_mutation_layout_inputs(operations)
+    mutation_alts, mutation_consumer_counts, mutation_writers = (
+        _scan_mutation_layout_inputs(operations)
+    )
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
     # performed to compute the set of possible output SpyreTensorLayouts.
     for op in operations:
         if op.is_no_op():
-            op.layouts = [generic_layout(op)]
+            op.layouts = [
+                _fresh_allocation_layout(op, mutation_writers.get(op.get_name(), []))
+            ]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
             layout = op.maybe_get_layout()

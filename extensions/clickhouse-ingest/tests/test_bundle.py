@@ -34,7 +34,7 @@ from spyre_clickhouse_ingest.junit import RunCoordinates
 
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
 OTHER = "0" * 8 + AID[8:]
-IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
+IMAGE = "icr.io/example/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
 JUNIT = """<?xml version="1.0"?><testsuites><testsuite name="s" tests="2"
  timestamp="2026-10-08T10:00:00+00:00"><testcase classname="a.b" name="test_x" time="1"/>
  <testcase classname="a.b" name="test_y" time="1"><failure message="boom"/></testcase>
@@ -113,7 +113,7 @@ def test_offline_writes_a_bundle_from_the_usual_flags(tmp_path, capsys):
     assert meta["started_at"] == "2026-10-08T10:00:00Z"
     assert report["run_id"] == RunId.derive("jenkins", meta["run_key"], "s390x", "fvt")
     assert report["upload_path"].startswith(
-        f"zsp/next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
+        f"next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
     )
 
 
@@ -122,7 +122,7 @@ def test_offline_tgz_and_validate_only(tmp_path, capsys):
     assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "valid"
-    assert report["upload_path"].split("/")[5] == "sha256-" + "b6" * 32
+    assert report["upload_path"].split("/")[4] == "sha256-" + "b6" * 32
     assert report["run_key"].startswith("manual:<uploader>:")
 
 
@@ -354,6 +354,21 @@ def test_a_minimal_bundle_takes_arch_component_and_run_key_from_artifact_and_con
     props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
     assert {"source=bundle", "uploader=jdoe", f"bundle_sha256={sha}"} <= props
     assert argv[-1] == "--strict" and "--dry-run" not in argv
+
+
+def test_bundle_props_reach_the_verdict_but_never_replace_the_source_keys(
+    tmp_path, online, capsys
+):
+    root = _minimal(tmp_path)
+    code, report = _ingest(
+        root, capsys, "--uploader", "jdoe", "--bundle-prop", "channel=dashboard",
+        "--bundle-prop", "source=forged", "--bundle-prop", "uploader=someone",
+    )  # fmt: skip
+    assert (code, report["arch"]) == (0, "s390x")
+    argv = online.calls[0]
+    props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
+    assert {"channel=dashboard", "source=bundle", "uploader=jdoe"} <= props
+    assert not {"source=forged", "uploader=someone"} & props
 
 
 def test_a_re_upload_of_the_same_content_is_a_duplicate(tmp_path, online, capsys):
@@ -694,6 +709,11 @@ class FakeArtifactory(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+@pytest.fixture(autouse=True)
+def results_root(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "next/{arch}/v2-results")
+
+
 @pytest.fixture
 def art(monkeypatch):
     FakeArtifactory.store, FakeArtifactory.seen, FakeArtifactory.fail = {}, [], 0
@@ -721,7 +741,7 @@ def test_offline_upload_puts_one_tgz_in_the_inbox(tmp_path, art, capsys):
     assert (code, report["status"]) == (0, "uploaded")
     ((method, path, auth),) = art.cls.seen
     assert path.startswith(
-        f"/artifactory/repo/zsp/next/s390x/v2-results/inbox/{AID}/manual_"
+        f"/artifactory/repo/next/s390x/v2-results/inbox/{AID}/manual_"
     )
     assert path.endswith("-fvt.tgz") and auth == "Bearer tok"
     tgz = tmp_path / "got.tgz"
@@ -737,6 +757,54 @@ def test_a_folder_upload_puts_bundle_json_last_and_retries_a_503(tmp_path, art, 
     puts = [p for m, p, _ in art.cls.seen]
     assert code == 0 and puts[0] == puts[1] and puts[-1].endswith("/bundle.json")
     assert puts[1].endswith("/results/junit.xml")
+
+
+@pytest.mark.parametrize("env", ["ARTIFACTORY_BASE_URL", "ARTIFACTORY_V2_RESULTS_REPO",
+                                 "ARTIFACTORY_V2_RESULTS_ROOT"])  # fmt: skip
+def test_upload_needs_its_location_settings(tmp_path, art, capsys, monkeypatch, env):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv(env, raising=False)
+    flags = {"ARTIFACTORY_BASE_URL": "--base-url", "ARTIFACTORY_V2_RESULTS_REPO": "--repo",
+             "ARTIFACTORY_V2_RESULTS_ROOT": "--root"}  # fmt: skip
+    argv = ["results", "--upload", str(path)]
+    argv += [
+        a
+        for k, f in flags.items()
+        if k != env
+        for a in (f, art.base if f == "--base-url" else "repo")
+    ]
+    capsys.readouterr()
+    assert cli(argv) == offline.FAILED
+    assert f"${env}" in json.loads(capsys.readouterr().out.splitlines()[-1])["reason"]
+
+
+def test_the_location_comes_from_the_environment_or_flags(
+    tmp_path, art, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", art.base)
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_REPO", "repo")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "env-root/{arch}")
+    capsys.readouterr()
+    assert cli(["results", "--upload", str(path)]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/env-root/s390x/inbox/{AID}/"
+    )
+    assert cli(["results", "--upload", str(path), "--root", "flag-root/{arch}"]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/flag-root/s390x/inbox/{AID}/"
+    )
+
+
+def test_validate_only_shows_a_placeholder_when_no_root_is_set(
+    tmp_path, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv("ARTIFACTORY_V2_RESULTS_ROOT")
+    capsys.readouterr()
+    assert cli(["results", "--from-bundle", str(path), "--validate-only"]) == 0
+    got = json.loads(capsys.readouterr().out)["upload_path"]
+    assert got.startswith("<ARTIFACTORY_V2_RESULTS_ROOT>/inbox/")
 
 
 def test_upload_without_a_token_fails_clearly(tmp_path, art, capsys, monkeypatch):
@@ -769,7 +837,7 @@ def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
     path = _offline(tmp_path, capsys=capsys)
     with offline.opened(path) as root:
         meta, dig = offline.check(root), offline.digest(root)
-    done = f"/artifactory/repo/zsp/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
+    done = f"/artifactory/repo/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
     art.cls.store[done] = b"x"
     art.cls.store[done + ".REJECTED.json"] = json.dumps(
         {"reason": "sha256 mismatch"}

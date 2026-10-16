@@ -103,7 +103,6 @@ from collections import Counter
 import logging
 import math
 import operator
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -117,12 +116,17 @@ import torch
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
+
+    _CP_MODEL_IMPORT_ERROR = ""
 else:
+    # Why ortools failed to import: often a missing dependency of it, not ortools itself.
+    _CP_MODEL_IMPORT_ERROR = ""
     try:
         from ortools.sat.python import cp_model, cp_model_helper
 
-    except ImportError:  # pragma: no cover - exercised only when ortools is absent
+    except ImportError as exc:  # pragma: no cover - only when ortools is absent
         cp_model = None
+        _CP_MODEL_IMPORT_ERROR = str(exc)
 
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -157,6 +161,9 @@ _CORE_LOG_SCALE = 32.0
 # the split has no candidate values (see _SympyExprToCpSat._inv_scale).
 # error <= ~4%
 _CORE_INV_SCALE = 1024
+# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
+# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
+_CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
 
@@ -180,13 +187,11 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     if not compatible:
         model.Add(enforce_lit == 0)
         return
-    pair_lits = []
-    for i, j in compatible:
-        lit = model.NewBoolVar("")
-        model.Add(src_div == i).OnlyEnforceIf(lit)
-        model.Add(dst_div == j).OnlyEnforceIf(lit)
-        pair_lits.append(lit)
-    model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
+    # Let CP-SAT encode the relation as a table, instead of introducing a
+    # Boolean and two implications for every compatible pair on every edge.
+    model.add_allowed_assignments([src_div, dst_div], compatible).only_enforce_if(
+        enforce_lit
+    )
 
 
 def _eq_fact(rel):
@@ -405,6 +410,12 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 key: only.splits.get(key, 1) for key in b.sym_core_divs
             }
             self.cp_core_divs_raw = {key: [v] for key, v in self.cp_core_divs.items()}
+            self.cp_tile_counts = {
+                key: only.tiling.count_for(key) for key in b.sym_tile_counts
+            }
+            self.cp_tile_counts_raw = {
+                key: [v] for key, v in self.cp_tile_counts.items()
+            }
             true, false = m.new_constant(1), m.new_constant(0)
             self.division_is = lambda i: true if i == 0 else false
             return
@@ -425,6 +436,20 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
 
         self.cp_core_divs = cp_core_divs
         self.cp_core_divs_raw = cp_core_divs_raw
+
+        # The coarse-tiling counts, tied to the division index the same way:
+        # each candidate division carries its own tiling.
+        cp_tile_counts: dict = {}
+        cp_tile_counts_raw: dict = {}
+        for key, symbol in b.sym_tile_counts.items():
+            raw = [cd.tiling.count_for(key) for cd in b.core_divisions]
+            cp_var = m.new_int_var(min(raw), max(raw), symbol.name)
+            m.add_element(self.division, raw, cp_var)
+            cp_tile_counts[key] = cp_var
+            cp_tile_counts_raw[key] = raw
+
+        self.cp_tile_counts = cp_tile_counts
+        self.cp_tile_counts_raw = cp_tile_counts_raw
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
@@ -534,37 +559,6 @@ _inv_rel_op = {
 }
 
 
-@cache
-def get_cpu_count() -> int:
-    """CPUs this process may actually use, after spyre-inference's
-    ``threading_config.get_cpu_count``. Resolution order: ``SPYRE_NUM_CPUS``,
-    the cgroup v2 CPU quota, psutil's physical core count, ``os.cpu_count()``.
-
-    ``os.cpu_count()`` reports the host (128 on the dev pods) while the
-    container is limited to 16; CP-SAT with 8x more search workers than cores
-    thrashes instead of searching, and the oversubscription starves everything
-    else in the pod."""
-    env = os.environ.get("SPYRE_NUM_CPUS", "")
-    if env.strip().isdigit() and int(env) > 0:
-        return int(env)
-    try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-        if quota != "max":
-            return max(1, int(quota) // int(period))
-    except (OSError, ValueError):
-        pass
-    try:
-        import psutil
-
-        physical = psutil.cpu_count(logical=False)
-        if physical:
-            return int(physical)
-    except ImportError:
-        pass
-    return os.cpu_count() or 1
-
-
 class _LazyMin(sympy.Min):
     """``Min`` built without canonicalization. An evaluated ``Min``/``Max`` runs
     sympy's pairwise dominance check on its arguments (``_find_localzeros``),
@@ -645,7 +639,151 @@ class _SympyExprToCpSat(Printer):
         self._count = 0
         self._sym_map = sym_map
         self._buffer_map = buffer_map
+        self._allow_tables = True
+        # These caches belong to one converter/model. A class-level @cache
+        # would retain every converter and its CP model across compilations.
+        self._expr_cache: dict = {}
+        self._untabled_expr_cache: dict = {}
+        self._conjunction_cache: dict = {}
+        self._candidate_cache: dict = {}
+        self._division_table_cache: dict = {}
         super().__init__()
+
+    def _print(self, expr, **kwargs):
+        if expr not in self._expr_cache:
+            table = (
+                self._division_table(expr) if self._allow_tables and expr.args else None
+            )
+            self._expr_cache[expr] = (
+                super()._print(expr, **kwargs) if table is None else table
+            )
+        return self._expr_cache[expr]
+
+    def _candidate_values(self, expr):
+        """Evaluate an expression over at most one buffer's division menu.
+
+        Residency and other free decisions stop evaluation at that node. Work
+        on the rewritten expression, including its reciprocal/log scales and
+        Min/Max rounding, so tabulation does not change the cost model.
+        """
+        if expr not in self._candidate_cache:
+            self._candidate_cache[expr] = self._evaluate_candidates(expr)
+        return self._candidate_cache[expr]
+
+    def _evaluate_candidates(self, expr):
+        if expr in (sympy.true, sympy.false):
+            return None, bool(expr)
+        if expr.is_Number:
+            return None, int(expr) if expr.is_Integer else float(expr)
+        if expr.is_Symbol:
+            mapped = self._sym_map.get(expr.name)
+            if isinstance(mapped, (int, float)):
+                return None, mapped
+            name = expr.name
+            prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
+            raw_name = name[len(prefix) :]
+            entry = self._buffer_map.get(raw_name)
+            if entry is None:
+                wrapper = self._sym_map.get(f"_division_of_{name}")
+                if wrapper is None:
+                    return None
+                entry = wrapper, range(len(wrapper.buffer.core_divisions))
+            wrapper, raw = entry
+            if wrapper is None:
+                # Domain-only entries can set reciprocal scales without a
+                # shared division selector. Keep their arithmetic symbolic;
+                # their candidate arrays are not scalar constants or a table.
+                return None
+            if prefix == "inv_":
+                scale = self._inv_scale(raw_name)
+                raw = [scale // v for v in raw]
+            elif prefix == "log2_":
+                raw = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
+            values = np.asarray(raw, dtype=object)
+            if all(v == values[0] for v in values):
+                return None, values[0]
+            return wrapper, values
+
+        if expr.is_Piecewise and expr.args[-1][1] != sympy.true:
+            return None  # Preserve the ordinary printer's required default.
+        args = (
+            [part for pair in expr.args for part in pair]
+            if expr.is_Piecewise
+            else expr.args
+        )
+        evaluated = [self._candidate_values(arg) for arg in args]
+        if any(value is None for value in evaluated):
+            return None
+        owners = [value[0] for value in evaluated if value[0] is not None]
+        owner = owners[0] if owners else None
+        if any(other is not owner for other in owners):
+            return None
+        values = [value[1] for value in evaluated]
+        if expr.is_Add:
+            result = sum(values)
+        elif expr.is_Mul:
+            result = math.prod(values)
+        elif expr.is_Pow:
+            result = values[0] ** values[1]
+        elif isinstance(expr, (sympy.Min, sympy.Max)):
+            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Relational:
+            result = _operator_map[expr.rel_op](*values)
+        elif expr.func in (sympy.And, sympy.Or):
+            operation = np.logical_and if expr.func is sympy.And else np.logical_or
+            result = values[0]
+            for value in values[1:]:
+                result = operation(result, value)
+        elif expr.is_Piecewise:
+            result = values[-2]
+            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
+                result = np.where(cond, value, result)
+        elif expr.func is sympy.KroneckerDelta:
+            result = np.equal(*values)
+        else:
+            return None
+        return owner, result
+
+    def _division_table(self, expr):
+        evaluated = self._candidate_values(expr)
+        if evaluated is None:
+            return None
+        owner, values = evaluated
+        if owner is None:
+            return np.asarray(values).item()
+        raw = np.asarray(values, dtype=object).reshape(-1).tolist()
+        # An exact affine encoding of the binary floating values, without
+        # introducing another rounding scale. If its integer range is too
+        # large, lower the expression normally and try its smaller children.
+        if not all(math.isfinite(v) for v in raw):
+            return None
+        rationals = [Fraction(v) for v in raw]
+        base = min(rationals)
+        denominator = math.lcm(*(v.denominator for v in rationals))
+        differences = [int((v - base) * denominator) for v in rationals]
+        divisor = math.gcd(*differences)
+        if divisor == 0:
+            return raw[0]
+        table = tuple(v // divisor for v in differences)
+        if max(table) > _MAX_PRODUCT_BOUND:
+            return None
+        scale = Fraction(divisor, denominator)
+        offset = int(base) if base.denominator == 1 else float(base)
+        coefficient = int(scale) if scale.denominator == 1 else float(scale)
+        if Fraction(offset) != base or Fraction(coefficient) != scale:
+            return None
+        key = owner.division.index, table
+        if key not in self._division_table_cache:
+            var = self._model.new_int_var_from_domain(
+                cp_model.Domain.FromValues(table), f"division_cost_{self._count}"
+            )
+            self._count += 1
+            self._model.add_element(owner.division, table, var)
+            self._division_table_cache[key] = var
+        return coefficient * self._division_table_cache[key] + offset
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
@@ -706,20 +844,32 @@ class _SympyExprToCpSat(Printer):
 
     @staticmethod
     def _is_split_sym(expr):
-        return expr.is_Symbol and expr.name.startswith("split_")
+        # A tile count is, like a core split, a positive integer tabulated over
+        # its buffer's candidate divisions, so its log and inverse lower the
+        # same way.
+        return expr.is_Symbol and expr.name.startswith(("split_", "tile_"))
 
     def _inv_scale(self, name: str) -> int:
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
         across the candidate divisions, so every ``scale // v`` is exact and the
         variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
-        are no values, or a value with many divisors if the LCM exceeds it."""
+        are no values, or a value with many divisors if the LCM exceeds the cap.
+
+        The cap is ``_CORE_INV_SCALE`` for values up to the core count and
+        doubles with each doubling past it, so a tile count, which can far
+        exceed any core split, keeps the resolution a split has rather than
+        flattening to ``scale // v == 0``."""
         _, raw = self._buffer_map.get(name, (None, ()))
         if not raw or min(raw) < 1:
             return _CORE_INV_SCALE
 
         ints = [int(r) for r in raw]
+        widen = max(
+            0, (max(ints) - 1).bit_length() - _CORE_INV_SCALE_MAX_VALUE.bit_length() + 1
+        )
+        cap = _CORE_INV_SCALE << widen
         lcm = math.lcm(*ints)
-        if lcm <= _CORE_INV_SCALE:
+        if lcm <= cap:
             return lcm
 
         # Otherwise: find the highest power of 2 in ints; among its multiples,
@@ -727,11 +877,9 @@ class _SympyExprToCpSat(Printer):
         # (We weight entries of ints by multiplicity.)
         cnt = Counter(ints)
         pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
-        assert pow2 < _CORE_INV_SCALE, (
-            f"expected _CORE_INV_SCALE={_CORE_INV_SCALE} to be greater than any "
-            f"power of 2 that might occur as a core division, but found {pow2}"
-        )
-        scaled_core_inv_scale = _CORE_INV_SCALE // pow2
+        # The cap is sized past every value, so this holds by construction.
+        assert pow2 < cap, f"expected cap={cap} past every value, found {pow2}"
+        scaled_core_inv_scale = cap // pow2
         counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
         for a, mult in cnt.items():
             step = a // math.gcd(a, pow2)
@@ -766,7 +914,12 @@ class _SympyExprToCpSat(Printer):
         elif expr.func == sympy.Pow:
             if not self._is_split_sym(arg):
                 return expr
-            if expr.exp == 0.25:
+            # Core splits only: a tile count can exceed 32.
+            if (
+                expr.exp.is_Number
+                and math.isclose(expr.exp, 0.25)
+                and arg.name.startswith("split_")
+            ):
                 # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
                 # pinned to return 1 at x=1, generated using tools/approximate-power.py.
                 # since we check that the base is a _split_ symbol, it is an integer in the
@@ -945,11 +1098,37 @@ class _SympyExprToCpSat(Printer):
 
     def _print_Mul(self, expr):
         args = [self._print(arg) for arg in expr.args]
-        return self._print_multiply(args)
+        try:
+            return self._print_multiply(args)
+        except ValueError:
+            if not self._allow_tables:
+                raise
+            # A table can combine an affine sum into one wider integer, whose
+            # product exceeds the bound even though each original term fits.
+            # Keep the original factorization locally. Unused table helpers
+            # are removed by presolve; other expressions can still tabulate.
+            # Reuse this converter's variable namespace and guard caches.
+            self._allow_tables = False
+            self._expr_cache, self._untabled_expr_cache = (
+                self._untabled_expr_cache,
+                self._expr_cache,
+            )
+            try:
+                return self._print(expr)
+            finally:
+                self._expr_cache, self._untabled_expr_cache = (
+                    self._untabled_expr_cache,
+                    self._expr_cache,
+                )
+                self._allow_tables = True
 
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
             return a * b
+        if isinstance(a, cp_model_helper.NotBooleanVariable):
+            return b - self._print_multiply_two(a.Not(), b)
+        if isinstance(b, cp_model_helper.NotBooleanVariable):
+            return self._print_multiply_two(b, a)
         if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
             return self._print_multiply([a, b])
         if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
@@ -979,7 +1158,9 @@ class _SympyExprToCpSat(Printer):
         elif len(ints) == 0:
             return math.prod(nonints)
 
-        name = "_product_" + "_".join([arg.name for arg in ints])
+        # Names need not be unique: in particular, both Boolean constants
+        # have an empty name. Cache by the variables' actual model identity.
+        name = "_product_" + "_".join(str(arg.index) for arg in ints)
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
@@ -1119,9 +1300,14 @@ class _SympyExprToCpSat(Printer):
 
     @memoize_method
     def _print_condition(self, cond):
-        if not isinstance(cond, sympy.core.relational.Relational):
-            return self._print(cond)
         cond_expr = self._print(cond)
+        if isinstance(cond_expr, (cp_model.IntVar, cp_model_helper.NotBooleanVariable)):
+            return cond_expr
+        if isinstance(cond_expr, (bool, int)):
+            # Fixed divisions turn many symbolic predicates into constants.
+            return self._model.new_constant(int(cond_expr))
+        if not isinstance(cond, sympy.core.relational.Relational):
+            return cond_expr
         not_cond_expr = self._print(sympy.Not(cond))
         var = self._model.new_bool_var(f"cond_{self._count}")
         self._count += 1
@@ -1129,14 +1315,24 @@ class _SympyExprToCpSat(Printer):
         self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
         return var
 
+    def _conjunction(self, lits):
+        # Expanded cost terms often have different values under exactly the
+        # same branch guard. Share the guard even when the Piecewise differs.
+        key = tuple(sorted({lit.index for lit in lits}))
+        if key not in self._conjunction_cache:
+            var = self._model.new_bool_var(f"and_{self._count}")
+            self._count += 1
+            self._model.add_bool_and(lits).only_enforce_if(var)
+            self._model.add_bool_or([lit.Not() for lit in lits]).only_enforce_if(
+                var.Not()
+            )
+            self._conjunction_cache[key] = var
+        return self._conjunction_cache[key]
+
     @memoize_method
     def _print_And(self, expr):
         lits = [self._print_condition(arg) for arg in expr.args]
-        and_var = self._model.new_bool_var(f"and_{self._count}")
-        self._count += 1
-        self._model.AddBoolAnd(lits).OnlyEnforceIf(and_var)
-        self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
-        return and_var
+        return self._conjunction(lits)
 
     @memoize_method
     def _print_Or(self, expr):
@@ -1186,9 +1382,9 @@ class _SympyExprToCpSat(Printer):
             lb, ub = _SympyExprToCpSat._affine_bounds(expr.expression)
             c, o = int(expr.coefficient), int(expr.offset)
             lb, ub = (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
-        elif hasattr(expr, "num_exprs"):
-            # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to a
-            # single offset + per-var coefficients and bound each term.
+        elif isinstance(expr, cp_model.LinearExpr):
+            # Flatten sums and folded constants (e.g. ``0 * is_lx``) to an
+            # offset + per-var coefficients and bound each term.
             flat = cp_model.FlatIntExpr(expr)
             lb = ub = int(flat.offset)
             for var, c in zip(flat.vars, flat.coeffs):
@@ -1289,8 +1485,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     ) -> None:
         if cp_model is None:
             raise ImportError(
-                "The 'cpsat' layout solver requires the 'ortools' package, "
-                "which is not installed. Install it with 'pip install ortools' "
+                "The 'cpsat' layout solver requires the 'ortools' package, which "
+                f"could not be imported ({_CP_MODEL_IMPORT_ERROR or 'not installed'}). "
+                "Install it with 'pip install ortools' "
                 "or select a different layout_solver (e.g. 'greedy')."
             )
         super().__init__(buffers, size, alignment)
@@ -1444,6 +1641,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             symbol = sympy.Symbol("_product_" + "_".join(product))
             sym_map[symbol.name] = t.cores
             buffer_map[symbol.name] = (t, t.cores_used)
+
+            for key, symbol in t.buffer.sym_tile_counts.items():
+                sym_map[symbol.name] = t.cp_tile_counts[key]
+                buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
@@ -1735,7 +1936,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 max_copies,
             )
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
+            1
+            if torch.are_deterministic_algorithms_enabled()
+            else config.get_cpu_count()
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0

@@ -46,10 +46,6 @@ from .temp_passes import (
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
-from .wsr.coarse_tile_hints import (
-    hints_to_coarse_tile_groups,
-    reorder_unhinted_interlopers,
-)
 from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
 from .propagate_hints import (
@@ -88,13 +84,12 @@ from .fusion import spyre_fuse_nodes
 from .scheduler import (
     build_loop_scheduler_nodes,
     prepare_spyre_kernels,
-    verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
-from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
+from .wsr.coarse_tile import coarse_tile_post_stickify
 from .dump_cost_model import dump_cost_model
 
 # The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
@@ -321,15 +316,13 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     def __init__(self):
         # Fusion fixes the final loop coordinates. Every bundle's kernel is
         # then prepared once, with the real finalization, while HBM fallback
-        # is still available. HBM planning claims anything preparation demotes
-        # before the carried-reduction pass checks that its required stages
-        # still exist; emission binds only what pooling decided.
+        # is still available. HBM planning claims anything preparation demotes;
+        # emission binds only what pooling decided.
         super().__init__(
             [
                 spyre_fuse_nodes,
                 prepare_spyre_kernels,
                 hbm_pool_planning,
-                verify_carried_reduction_ownership,
             ]
         )
 
@@ -353,70 +346,6 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 
 
 @_runs(
-    reorder_unhinted_interlopers,
-)
-def _maybe_reorder_unhinted_interlopers(graph: GraphLowering) -> None:
-    """Move unhinted ComputedBuffer ops that interrupt hint-group runs."""
-    if config.ignore_wsr_hints:
-        return
-    reorder_unhinted_interlopers(graph)
-
-
-@_runs(
-    hints_to_coarse_tile_groups,
-    validate_coarse_tile_groups,
-    coarse_tile_pre_stickify,
-)
-def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
-    """Hint-driven coarse tiling only.  Runs PRE-stickification.
-
-    span_overflow_groups is intentionally absent: it requires FixedTiledLayout
-    (device_layout) and must run post-stickification.
-
-    spyre_hint()-based coarse tiling is on a deprecation path in favor of
-    for_each_tile (splice_while_loops, which runs earlier in this pipeline).
-    If splice_while_loops already coarse-tiled anything this compile, it has
-    already called coarse_tile_pre_stickify itself per spliced WhileLoop, and
-    every op it transformed still carries the DimHints it synthesized (see
-    for_each_tile_lowering.py's _synthesize_dim_hints_for_group) -- assign_dim_
-    hints runs after it but does not clear those. Re-deriving groups here via
-    hints_to_coarse_tile_groups would sweep those same ops into a second,
-    spurious group and re-plan them against their now-already-rewritten reads
-    (e.g. a read-copy's index, which deliberately no longer carries the
-    WhileLoop-splice loop_var -- see _insert_one_read_copy), silently
-    overwriting the correct plan with an empty one. Since the two mechanisms
-    are mutually exclusive within a single compile in practice, skip this
-    pass entirely once splice_while_loops has done anything, rather than
-    teaching hints_to_coarse_tile_groups to filter WhileLoop-splice hints out.
-    """
-    if config.ignore_wsr_hints:
-        return
-    if any(
-        getattr(h, "loop_var_range", None) is not None
-        for op in graph.operations
-        for h in getattr(op, "dim_hints", []) or []
-    ):
-        return
-    groups = hints_to_coarse_tile_groups(graph)
-    if not groups:
-        return
-    # Compute offset to avoid loop_group_id collision with any while-loop
-    # groups already stamped by splice_while_loops (which runs earlier in
-    # the pipeline and calls coarse_tile_pre_stickify per spliced WhileLoop,
-    # each starting its own local group_idx_offset at 0).
-    used_ids = [
-        op.loop_info.loop_group_id[0]
-        for op in graph.operations
-        if hasattr(op, "loop_info") and op.loop_info is not None
-    ]
-    group_idx_offset = max(used_ids, default=-1) + 1
-    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-    validate_coarse_tile_groups(groups)
-    coarse_tile_pre_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
-
-
-@_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
     coarse_tile_post_stickify,
@@ -425,7 +354,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
 
     Requires FixedTiledLayout (device_layout) on all ops.
-    hint-driven groups (hints_to_coarse_tile_groups) are intentionally
+    Loops built from for_each_tile (splice_while_loops) are intentionally
     absent: they have already run pre-stickification.
 
     Uses coarse_tile_post_stickify: layout propagation has already
@@ -445,9 +374,9 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     # hint lookups), not something they produce.
     for op, dim_hints in dim_hint_assignments:
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
-    # Compute offset to avoid loop_group_id collision with any hint-driven
-    # groups already stamped by _maybe_coarse_tile_hints.
-    # E.g. if hints used groups 0 and 1, span-overflow groups start at 2.
+    # Compute offset to avoid loop_group_id collision with any groups already
+    # stamped by splice_while_loops (for_each_tile).
+    # E.g. if those used groups 0 and 1, span-overflow groups start at 2.
     used_ids = [
         op.loop_info.loop_group_id[0]
         for op in graph.operations
@@ -518,18 +447,18 @@ class CustomPreSchedulingPasses:
             splice_while_loops,
             deadcode_elimination,
             #
-            # Working Set Reduction (hint-driven, pre-stickification)
-            # These passes only need host-side FixedLayout (size/stride) and
-            # loop variable ranges.  Running before stickification means
-            # _divide_ranges does not call _resize_device_layout: stickification
-            # computes the correct SpyreTensorLayout from the already-divided
-            # ranges.  This also dissolves the insert_restickify→hint cross-phase
-            # contract (issue #3135).
+            # Named-dimension propagation (pre-stickification)
+            # Resolves spyre_hint(work_div=...) names onto loop variables from
+            # the host-side FixedLayout (size/stride) and loop variable ranges.
+            # Coarse tiling itself (splice_while_loops, above) also runs before
+            # stickification, so _divide_ranges does not call
+            # _resize_device_layout: stickification computes the correct
+            # SpyreTensorLayout from the already-divided ranges.  This also
+            # dissolves the insert_restickify→tiling cross-phase contract
+            # (issue #3135).
             propagate_named_dims,
             validate_named_dims,
             assign_dim_hints,
-            _maybe_reorder_unhinted_interlopers,
-            _maybe_coarse_tile_hints,
             #
             # Matmul K padding (pre-stickification)
             # Pads y's K to a stick boundary while every buffer still has a

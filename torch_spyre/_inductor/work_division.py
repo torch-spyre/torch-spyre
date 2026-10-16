@@ -294,7 +294,7 @@ def multi_dim_iteration_space_split(
     symbol_meta = symbol_meta or {}
     is_reduction_included = bool(reduction_dims)
 
-    splits = {v: 1 for v in iteration_space}
+    splits = dict.fromkeys(iteration_space, 1)
     cores_used = 1
 
     mandatory_splits = dict(min_splits or {})
@@ -512,7 +512,7 @@ def get_per_core_span(
         per_core_max = 0
         per_core_min = 0
         for v in coord.free_symbols:
-            term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
+            term = coord.subs(dict.fromkeys(coord.free_symbols - {v}, 0))
             # Per-core span is a hardware-bound quantity that must be checked
             # against MAX_SPAN_BYTES. For symbolic dims we use ``max_size``
             # (the worst-case footprint, also the HBM allocation footprint).
@@ -1289,10 +1289,10 @@ class OpSplitSpace:
         uniformly over this list gives them a share that follows its length: up
         to ``|tileable dims| x |counts|`` entries against ~7 per axis, which
         from the untiled state is most of the mass. That is an implicit retune
-        of the flip move relative to the weights #4233 measured, and it is
-        stated rather than tuned while nothing applies a chosen tiling. It also
-        makes ``|N(x)|`` vary much more with state, which an uncorrected
-        Metropolis test reads as a bias towards states with more neighbours.
+        of the flip move relative to the weights #4233 measured, left
+        uncorrected. It also makes ``|N(x)|`` vary much more with state, which
+        an uncorrected Metropolis test reads as a bias towards states with more
+        neighbours.
         """
         current = self.splits(division)
         tiling = division.tiling
@@ -2134,7 +2134,7 @@ def _minmax(sympy_fn, builtin_fn, args, kwargs):
     sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
     otherwise defers to ``builtin_fn``, which also handles ``default``."""
     if len(args) == 1:
-        values = args[0]
+        values = list(args[0])
     else:
         values = args
     if "key" not in kwargs and any(isinstance(a, sympy.Basic) for a in values):

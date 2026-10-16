@@ -33,8 +33,6 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
 /**
- * Fill a spyre tensor with a scalar value using device-side FillDMA.
- *
  * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely
  * on-device without allocating a host buffer or performing an H2D DMA.
  *

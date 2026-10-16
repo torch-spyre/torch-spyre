@@ -42,7 +42,7 @@ from spyre_clickhouse_ingest.resolver import (
 from spyre_clickhouse_ingest.writer import ArtifactWriter
 from spyre_clickhouse_ingest.schema import ARTIFACT_REFS, ARTIFACT_TAGS, ARTIFACTS
 
-REPO = "ai_sw_accel/2.0/prod/torch-spyre-devel"
+REPO = "example/2.0/prod/torch-spyre-devel"
 IMAGE = f"icr.io/{REPO}"
 LEAF = "sha256:" + "b6" * 32
 OTHER = "sha256:" + "6b" * 32
@@ -182,7 +182,7 @@ def test_an_unregistered_image_derives_what_register_and_ingest_record():
     )
     for spec in (
         out["artifact"],
-        f"image:icr.io/ai_sw_accel_dev/torch-spyre/torch-spyre-devel:snap-latest@{LEAF}",
+        f"image:icr.io/example_dev/torch-spyre/torch-spyre-devel:snap-latest@{LEAF}",
     ):
         assert (
             ArtifactIdentity.parse(spec, "s390x", "x").artifact_id == out["artifact_id"]
@@ -198,7 +198,7 @@ def test_an_existing_record_found_by_its_leaf_wins_over_the_derived_id():
 
 
 def _labelled(
-    component="torch-spyre", repo="ai_sw_accel/2.0/next/builds/amd64/torch-spyre"
+    component="torch-spyre", repo="example/2.0/next/builds/amd64/torch-spyre"
 ):
     aid = ArtifactId.derive(component, "torch-spyre-dev", "9e28cf2e5c48", "x86_64")
     labels = {"spyre.artifact.id": aid, "spyre.artifact.id12": "9e28cf2e5c48",
@@ -213,7 +213,7 @@ def _labelled(
 def test_an_orchestrator_image_is_named_by_its_own_label_without_a_database():
     aid, reg = _labelled()
     out = resolve(
-        f"image:icr.io/ai_sw_accel/2.0/next/builds/amd64/torch-spyre@{LEAF}",
+        f"image:icr.io/example/2.0/next/builds/amd64/torch-spyre@{LEAF}",
         "x86_64",
         registry=reg,
     )
@@ -221,9 +221,9 @@ def test_an_orchestrator_image_is_named_by_its_own_label_without_a_database():
 
 
 def test_a_label_inherited_from_a_base_image_is_ignored():
-    aid, reg = _labelled(repo="ai_sw_accel/2.0/prod/hf-adapters-devel")
+    aid, reg = _labelled(repo="example/2.0/prod/hf-adapters-devel")
     out = resolve(
-        f"image:icr.io/ai_sw_accel/2.0/prod/hf-adapters-devel@{LEAF}",
+        f"image:icr.io/example/2.0/prod/hf-adapters-devel@{LEAF}",
         "x86_64",
         registry=reg,
     )
@@ -416,7 +416,7 @@ def test_a_recorded_wheel_wins_even_with_another_component():
 
 
 def test_a_generic_file_is_found_by_url_and_sha_else_derived_from_its_sha():
-    url = "https://na.artifactory.swg-devops.com/artifactory/r/next/noarch/llvm/llvm-src-080ddeea9a07.tgz"
+    url = "https://artifactory.example.com/artifactory/r/next/noarch/llvm/llvm-src-080ddeea9a07.tgz"
     recorded = _row(
         "llvm", "llvm-src-080ddeea9a07.tgz", "080ddeea9a07", "x86_64", "generic", url
     )
@@ -737,7 +737,7 @@ def test_registry_off_never_calls_it_and_fails_when_the_spec_needs_it(monkeypatc
     monkeypatch.setattr(Registry, "from_env", lambda: NoRegistry())
     with pytest.raises(NeedsRegistry):
         resolve(f"image:{IMAGE}:nightly-latest", "s390x", registry="off")
-    url = "https://na.artifactory.swg-devops.com/artifactory/r/x.tgz"
+    url = "https://artifactory.example.com/artifactory/r/x.tgz"
     out = resolve(f"generic:{url}#{'ab' * 32};component=llvm", "x86_64", registry="off")
     assert out["source"] == "derived"
 
@@ -829,7 +829,7 @@ def test_a_batch_artifact_writes_what_insert_artifact_wrote():
         "artifact": {"component": "flex", "artifact_name": "ibm-flex", "id12": "c" * 12,
                      "arch": "x86_64", "kind": "rpm", "ref": f"ibm-flex-*.{'c' * 12}.*.x86_64"},
         "origin": "built",
-        "sources": [{"repo": "ai-chip-toolchain/flex", "git_ref": "main", "git_sha": "ab12"}],
+        "sources": [{"repo": "example-org/flex", "git_ref": "main", "git_sha": "ab12"}],
         "identity_deps": ["base=x"],
         "context_deps": ["ctx"],
         "props": {"run_url": "https://ci/1"},
@@ -837,7 +837,7 @@ def test_a_batch_artifact_writes_what_insert_artifact_wrote():
     old, new = FakeClient(), FakeClient()
     ArtifactWriter.insert_artifact(
         old, "db", artifacts.batch_identity(entry["artifact"]), origin="built",
-        sources=[("ai-chip-toolchain/flex", "main", "ab12")], identity_deps=["base=x"],
+        sources=[("example-org/flex", "main", "ab12")], identity_deps=["base=x"],
         context_deps=["ctx"], props={"run_url": "https://ci/1"},
     )  # fmt: skip
     assert artifacts.write_batch(new, "db", {"artifacts": [entry]})["artifacts"] == 1

@@ -104,9 +104,11 @@ def register_operation_after_graph_edit(graph: GraphLowering, op: Operation) -> 
     same name.  The scheduler subsequently resolves a dependency to the wrong
     producer (or to one that occurs later) and fails while computing ancestors.
 
-    Keep upstream's naming convention, but find the first name that has never
-    been registered.  Scratchpad edits use this helper because they run late in
-    the lowering pipeline, after graph-pruning passes.
+    Keep upstream's naming convention, but find the first name that is not
+    currently registered.  Most removals keep the removed op in ``name_to_op``,
+    but ``dedup_and_promote_constants`` drops it, so its name can be reissued.
+    Scratchpad edits use this helper because they run late in the lowering
+    pipeline, after graph-pruning passes.
     """
     assert op.operation_name is None, f"Operation registered twice: {op}"
 
@@ -761,6 +763,15 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
 
 
 class _IdentityLoadRecorder(DefaultHandler):
+    """Recognize a Pointwise body that returns exactly one load.
+
+    ``WhileLoop.create`` uses such bodies to repair an input's strides before
+    handing it to the loop body.  After a for_each_tile WhileLoop is spliced,
+    that otherwise-benign whole-input materialization sits inside the counted
+    loop.  This recorder lets the post-splice contraction below prove the copy
+    is an identity without inspecting ``inner_fn`` closures.
+    """
+
     def __init__(self) -> None:
         self.value = object()
         self.loads: list[tuple[str, Any]] = []
@@ -775,6 +786,14 @@ class _IdentityLoadRecorder(DefaultHandler):
 def _identity_load(
     op: Operation,
 ) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]] | None:
+    """Return the sole load performed by a pure pointwise identity.
+
+    The generated exact-stride normalizations this recognizes are ordinary
+    Pointwise buffers, not a dedicated IR node.  Run their body under a
+    recording handler so accepting one is based on behavior (one load whose
+    value is returned unchanged), not an origin name or a fragile graph
+    pattern.
+    """
     if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return None
     indices = tuple(
@@ -797,6 +816,7 @@ def _identity_load(
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
+    """Read scatter index dependencies through the indexer, including wrapped ones."""
     from torch._inductor.dependencies import extract_read_writes
 
     if not isinstance(op.data, Scatter):
@@ -2189,7 +2209,7 @@ def apply_splits_from_index_coeff(
     in either dict default to 1.
     """
     output_coeff_splits, reduction_coeff_splits = coeff_splits
-    result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
+    result: dict[sympy.Symbol, int] = dict.fromkeys(sched_it_space, 1)
     for sym, size in sched_it_space.items():
         # Skip iteration vars with trivial range.  For symbolic ranges we
         # cannot statically determine triviality (and a symbolic size
@@ -2746,7 +2766,7 @@ class NameSwapHandler(WrapperHandler):
 
     This is the canonical WrapperHandler wrapping pattern for compiler passes:
     wrap, never rebuild index expressions from scratch (they go stale — see
-    CLAUDE.md "Compiler Pass Conventions" and issue #2797).
+    AGENTS.md "Compiler Pass Conventions" and issue #2797).
     """
 
     def __init__(self, inner, name_map: dict[str, str]):

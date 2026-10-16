@@ -26,6 +26,7 @@ import torch
 from torch._inductor.exc import InductorError
 from utils_inductor import (
     DEVICE,
+    _compile_and_run,
     cached_randn,
     compare_with_pytorch,
 )
@@ -49,6 +50,14 @@ FP16_SAFE_LARGE_VALUE = (
 )
 MIXED_SIGNS_SCALE = 100.0  # Scale factor to test moderate value ranges with mixed positive/negative values
 
+# A stick-unaligned FP8 conversion accesses beyond its buffers today, which a tight
+# device allocation turns into a page fault, so these cases are collected but never
+# run (--runxfail would run them). Remove the mark when unaligned conversions are
+# supported.
+_UNALIGNED_FP8 = pytest.mark.xfail(
+    run=False, reason="#3999: stick-unaligned FP8 conversion is not supported yet"
+)
+
 
 def _fp8_reference_quantize_dequantize(x, scale):
     """CPU reference for FP8 quantize→dequantize: clamp, cast to FP8, cast back, rescale."""
@@ -64,14 +73,14 @@ class TestFP8Operations:
         """Test basic FP16→FP8 format conversion with qfp8ch.
 
         Tests:
-        - Basic conversion with shape [1, 2, 8]
+        - Basic conversion with shape [1, 2, 128]
         - Roundtrip: FP16 → FP8 → FP16 with scaling
         - Verifies qfp8ch operation is used internally
 
         Note: We use dequantize_fp8_with_scale for FP8→FP16 conversion
         because direct .to(torch.float16) cannot transfer to CPU.
         """
-        x = cached_randn((1, 2, 8), scale=1.0, dtype=torch.float16)
+        x = cached_randn((1, 2, 128), scale=1.0, dtype=torch.float16)
         scale = torch.ones((1, 2, 1), dtype=torch.float16)
 
         def spyre_fn(x, scale):
@@ -86,16 +95,33 @@ class TestFP8Operations:
             # CPU reference: direct format conversion with identity scale
             return _fp8_reference_quantize_dequantize(x, scale)
 
+        device_result = _compile_and_run(spyre_fn, (x, scale), DEVICE)
         compare_with_pytorch(
             spyre_fn,
             pytorch_fn,
             x,
             scale,
-            atol=0.0,
-            rtol=0.0,
+            # The device rounds the input to DLFloat16 before FP8, so a value next to
+            # the midpoint of two FP8 values can land one E4M3 step (12.5%) away, and
+            # it does not match the CPU on FP8 subnormals (below 2**-6).
+            atol=2**-6,
+            rtol=0.125,
+            target=device_result,
+        )
+        # The tolerance alone accepts a conversion that is one step off everywhere, so
+        # also bound how many normal-range values may differ from the CPU (3 of 251
+        # today); a wrong rounding mode, or a one-step bias, gets half or more wrong.
+        reference = pytorch_fn(x, scale)
+        normal = reference.abs() >= 2**-6
+        mismatched = (device_result != reference)[normal].float().mean().item()
+        assert mismatched <= 0.02, (
+            f"{mismatched:.1%} of normal-range values differ from the CPU"
         )
 
-    def test_fp8todl16_basic_conversion(self):
+    @pytest.mark.parametrize(
+        "shape", [(1, 2, 128), pytest.param((1, 2, 8), marks=_UNALIGNED_FP8)]
+    )
+    def test_fp8todl16_basic_conversion(self, shape):
         """Test FP8→FP16 dtype conversion with fp8todl16.
 
         Tests:
@@ -109,7 +135,7 @@ class TestFP8Operations:
         scaling cannot transfer to CPU, so we use identity scale (ones) to enable
         CPU transfer while still testing the fp8todl16 operation.
         """
-        x = cached_randn((1, 2, 8), scale=1.0, dtype=torch.float16)
+        x = cached_randn(shape, scale=1.0, dtype=torch.float16)
         scale = torch.ones((1, 2, 1), dtype=torch.float16)
 
         def spyre_fn(x, scale):
@@ -145,16 +171,17 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 0.0, 1.0),
-            ((1, 2, 32), 0.01, 0.0, 5.0),
-            ((1, 2, 32), 0.1, 0.0, 1.0),
-            ((1, 2, 32), 0.1, 0.0, 5.0),
-            ((1, 2, 32), 0.5, 0.0, 1.0),
-            ((1, 2, 32), 0.5, 0.0, 5.0),
-            ((1, 2, 32), 1.0, 0.0, 1.0),
-            ((1, 2, 32), 1.0, 0.0, 5.0),
-            ((1, 2, 32), 2.0, 0.0, 1.0),
-            ((1, 2, 32), 2.0, 0.0, 5.0),
+            ((1, 2, 128), 0.01, 0.0, 1.0),
+            ((1, 2, 128), 0.01, 0.0, 5.0),
+            ((1, 2, 128), 0.1, 0.0, 1.0),
+            ((1, 2, 128), 0.1, 0.0, 5.0),
+            ((1, 2, 128), 0.5, 0.0, 1.0),
+            ((1, 2, 128), 0.5, 0.0, 5.0),
+            ((1, 2, 128), 1.0, 0.0, 1.0),
+            ((1, 2, 128), 1.0, 0.0, 5.0),
+            ((1, 2, 128), 2.0, 0.0, 1.0),
+            ((1, 2, 128), 2.0, 0.0, 5.0),
+            pytest.param((1, 2, 32), 1.0, 0.0, 1.0, marks=_UNALIGNED_FP8),
         ],
     )
     def test_quantize_dequantize_fp8_small_range(
@@ -177,11 +204,11 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 10.0, 50.0),
-            ((1, 2, 32), 0.1, 10.0, 50.0),
-            ((1, 2, 32), 0.5, 10.0, 50.0),
-            ((1, 2, 32), 1.0, 10.0, 50.0),
-            ((1, 2, 32), 2.0, 10.0, 50.0),
+            ((1, 2, 128), 0.01, 10.0, 50.0),
+            ((1, 2, 128), 0.1, 10.0, 50.0),
+            ((1, 2, 128), 0.5, 10.0, 50.0),
+            ((1, 2, 128), 1.0, 10.0, 50.0),
+            ((1, 2, 128), 2.0, 10.0, 50.0),
         ],
     )
     def test_quantize_dequantize_fp8_medium_range(
@@ -208,16 +235,16 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_value,mean,std",
         [
-            ((1, 2, 32), 0.01, 100.0, 100.0),
-            ((1, 2, 32), 0.01, 200.0, 200.0),
-            ((1, 2, 32), 0.1, 100.0, 100.0),
-            ((1, 2, 32), 0.1, 200.0, 200.0),
-            ((1, 2, 32), 0.5, 100.0, 100.0),
-            ((1, 2, 32), 0.5, 200.0, 200.0),
-            ((1, 2, 32), 1.0, 100.0, 100.0),
-            ((1, 2, 32), 1.0, 200.0, 200.0),
-            ((1, 2, 32), 2.0, 100.0, 100.0),
-            ((1, 2, 32), 2.0, 200.0, 200.0),
+            ((1, 2, 128), 0.01, 100.0, 100.0),
+            ((1, 2, 128), 0.01, 200.0, 200.0),
+            ((1, 2, 128), 0.1, 100.0, 100.0),
+            ((1, 2, 128), 0.1, 200.0, 200.0),
+            ((1, 2, 128), 0.5, 100.0, 100.0),
+            ((1, 2, 128), 0.5, 200.0, 200.0),
+            ((1, 2, 128), 1.0, 100.0, 100.0),
+            ((1, 2, 128), 1.0, 200.0, 200.0),
+            ((1, 2, 128), 2.0, 100.0, 100.0),
+            ((1, 2, 128), 2.0, 200.0, 200.0),
         ],
     )
     def test_quantize_dequantize_fp8_boundary_cases(
@@ -234,7 +261,8 @@ class TestFP8Operations:
             mean,
             std,
             atol=FP8_E4M3FN_MAX_SPACING * scale_value,
-            rtol=0.0,
+            # One FP8 step plus the fp16 rounding of the rescaled value
+            rtol=0.005,
         )
 
     @pytest.mark.parametrize(
@@ -381,7 +409,7 @@ class TestFP8Operations:
         since that path produces a flat QFP8CH layout compatible with
         fp8todl16. Verifies numerical correctness via a compiled roundtrip.
         """
-        x = cached_randn((1, 2, 8), dtype=torch.float16, scale=1.0)
+        x = cached_randn((1, 2, 128), dtype=torch.float16, scale=1.0)
         scale = torch.tensor([1.0], dtype=torch.float16)
 
         def spyre_fn(inp, s):
@@ -556,7 +584,7 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_ub",
         [
-            ((2, 4, 8), FP8_E4M3FN_MAX),
+            ((2, 4, 128), FP8_E4M3FN_MAX),
             ((1, 128, 512), FP8_E4M3FN_MAX),
         ],
     )
@@ -602,6 +630,7 @@ class TestFP8Operations:
             ("large", (2, 4, 8)),
             ("mixed_signs", (2, 4, 32)),
             ("large_hidden", (1, 1, 8192)),
+            ("sub_stick_token", (1, 1, 8)),
         ],
     )
     def test_quantscalepertokenfp8_edge_cases(self, input_type, shape):
@@ -613,6 +642,7 @@ class TestFP8Operations:
         - large: Values near FP16 max (65504)
         - mixed_signs: Positive and negative values
         - large_hidden: Very large hidden dimension
+        - sub_stick_token: A single token shorter than one stick
         """
         if input_type == "zeros":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0
@@ -626,7 +656,7 @@ class TestFP8Operations:
             )
         elif input_type == "mixed_signs":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * MIXED_SIGNS_SCALE
-        elif input_type == "large_hidden":
+        elif input_type in ("large_hidden", "sub_stick_token"):
             x = cached_randn(shape, dtype=torch.float16, scale=1.0)
         else:
             raise ValueError(f"Unknown input_type: {input_type}")

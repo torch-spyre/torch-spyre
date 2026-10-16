@@ -2131,6 +2131,173 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_grow_from_singleton_permuted(self):
+        """The grow path on a permuted buffer: a device dim tiled to size 1
+        (stride_map -1) grows back to the full buffer's actual host stride, not
+        the contiguous one."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        order = [1, 0, 2, 3]
+        expected = SpyreTensorLayout(size, stride, torch.float16, order)
+        # The per-tile buffer's compact strides, in the full buffer's dim order.
+        for tile_size, tile_stride in (
+            ([1, 8, 512, 512], [512, 512, 4096, 1]),
+            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
+        ):
+            with self.subTest(tile_size=tile_size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                self.assertIn(-1, list(stl.stride_map))
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=3,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(result, expected)
+
+    def test_resize_device_layout_grow_from_one_stick(self):
+        """The grow path from a tile whose stick dim is one stick long: its
+        tile-count dim has size 1 but a real stride_map, so it is grown, not
+        taken for a placeholder or for a host dim of extent 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
+        cases = (
+            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
+            # Also a host dim of extent 1, which the tile-count dim must not
+            # be matched to.
+            (
+                [512, 64, 64, 2],
+                [128, 1, 65536, 64],
+                [512, 64, 64, 1],
+                [64, 1, 32768, 64],
+                [0, 2, 3, 1],
+                None,
+            ),
+        )
+        for size, stride, tile_size, tile_stride, order, shd in cases:
+            with self.subTest(size=size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=shd,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(
+                    result, SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+
+    def test_resize_device_layout_sub_stick_tile_count(self):
+        """A stick host dim shorter than a stick: its size-1 tile-count dim
+        steps the whole dim (stride_map 32 here), not a stick (64), and size-1
+        host dims are left over, so only that stride identifies it."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [1, 20, 1, 32], [640, 32, 32, 1]
+        order = [0, 1, 2, 3]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
+        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+
+        tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=3,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result, SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+        )
+
+    def test_resize_device_layout_permuted_same_size_dims(self):
+        """A permuted layout whose two size-8 dims both miss the contiguous
+        strides: only the buffer's own strides tell which device dim is d0.
+
+        Attention scores [8, 8, 512, 512] with host strides (512, 4096, 32768, 1);
+        the tile count ceil(512/64) = 8 collides with both. Tiling d0 by 2 must
+        halve device dim 0 (stride_map 512), not leave the layout full size."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2, 3])
+        self.assertEqual(list(stl.device_size), [8, 512, 8, 8, 64])
+        self.assertEqual(list(stl.stride_map), [512, 32768, 64, 4096, 1])
+
+        # The per-tile buffer's compact strides, in the full buffer's dim order.
+        tile_size, tile_stride = [4, 8, 512, 512], [512, 2048, 16384, 1]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=3,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(list(result.device_size), [4, 512, 8, 8, 64])
+        # The stride_map follows the tile's host strides, as a layout built from
+        # them directly would.
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(tile_size, tile_stride, torch.float16, [1, 0, 2, 3]),
+        )
+
+    def test_resize_device_layout_ignores_a_coincident_contiguous_stride(self):
+        """[2, 128, 2, 64] with the stick on dim 1, at host strides
+        (16384, 1, 8192, 128): the tile-count dim (size 2, stride_map 64) ties
+        dims 0 and 2 in size and misses both their strides, but equals dim 2's
+        contiguous stride. Given the actual strides, that coincidence must not
+        make it dim 2's."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride, order = [2, 128, 2, 64], [16384, 1, 8192, 128], [0, 2, 3, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [2, 64, 2, 2, 64])
+        self.assertEqual(list(stl.stride_map), [8192, 128, 64, 16384, 1])
+
+        tile_size, tile_stride = [2, 128, 2, 32], [8192, 1, 4096, 128]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=1,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(tile_size, tile_stride, torch.float16, order),
+        )
+
+    def test_resize_device_layout_refuses_a_tile_count_dim_at_a_foreign_stride(
+        self,
+    ):
+        """The same layout without its strides: the two size-8 dims tie the
+        tile count in size, but not in stride, so they are not the tile count.
+        Taking them for it returned the layout unresized."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2, 3])
+        for tile_size in ([4, 8, 512, 512], [8, 4, 512, 512]):
+            with self.subTest(tile_size=tile_size):
+                with self.assertRaisesRegex(RuntimeError, "not the tile-count dim"):
+                    _resize_device_layout(stl, size, tile_size, stick_host_dim=3)
+
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
         cannot be uniquely identified from stride_map[-1].
@@ -6379,6 +6546,76 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
 
+    def test_a_copy_of_a_permuted_source_is_resized_by_its_strides(self):
+        # Attention scores [8, 8, 512, 512] at host strides
+        # (512, 4096, 32768, 1), read by ops tiling d0 by 2. Without the
+        # strides the resize cannot tell d0 from d1 or the tile count; the
+        # copy kept the full-size device layout, twice its reservation.
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device, dtype = torch.device("cpu"), torch.float16
+        size, stride, order = [8, 8, 512, 512], [512, 4096, 32768, 1], [1, 0, 2, 3]
+        tile_size, tile_stride = [4, 8, 512, 512], [512, 2048, 16384, 1]
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, size, device, dtype
+        )
+        full_buf.layout = FixedTiledLayout(
+            device,
+            dtype,
+            [Integer(x) for x in size],
+            [Integer(x) for x in stride],
+            SpyreTensorLayout(size, stride, dtype, order, ElementArrangement.STANDARD),
+        )
+        loader = TensorBox(StorageBox(full_buf)).make_loader()
+        readers = []
+        for name in ("op_a", "op_b"):
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=loader,
+                ranges=[Integer(x) for x in tile_size],
+            )
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(x) for x in tile_size]),
+                data=pw.data.data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(2)],
+                loop_tiled_dims=[[0]],
+                tiled_dims_per_read=[[[]]],
+            )
+            V.graph.name_to_buffer[name] = op
+            readers.append(op)
+        operations = [full_buf, *readers]
+        plans = _plan_read_copies(operations, [((0,), readers, {})])
+        _insert_all_read_copy_ops(operations, plans)
+        (copy,) = [
+            op
+            for op in operations
+            if op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        self.assertEqual(
+            copy.layout.device_layout,
+            SpyreTensorLayout(tile_size, tile_stride, dtype, order),
+        )
+
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
@@ -8873,457 +9110,6 @@ class TestReductionIdentityValues(unittest.TestCase):
         self.assertEqual(self._identity(BATCH_MATMUL_OP), 0)
 
 
-# ===========================================================================
-# TestReorderUnhintedInterlopers
-# ===========================================================================
-
-
-def _make_rui_op(name, reads=(), hint_ids=(), mutates=()):
-    """Return a fake ComputedBuffer for reorder_unhinted_interlopers tests.
-
-    ``reads`` is an iterable of buffer names this op reads.
-    ``hint_ids`` is an iterable of hint-id integers; empty means unhinted.
-    ``mutates`` is an iterable of buffer names this op mutates in-place.
-    """
-    from torch._inductor.ir import ComputedBuffer
-    from torch_spyre._inductor.propagate_hints import DimHint
-
-    op = MagicMock(spec=ComputedBuffer)
-    op.get_name.return_value = name
-    op.get_read_names.return_value = OrderedSet(reads)
-    op.get_mutation_names.return_value = list(mutates)
-    if hint_ids:
-        op.dim_hints = [
-            DimHint(
-                dim_names=["d0"],
-                split_count=1,
-                loop_var=None,
-                is_reduction=False,
-                hint_id=hid,
-            )
-            for hid in hint_ids
-        ]
-    else:
-        op.dim_hints = []
-    return op
-
-
-def _make_rui_non_computed(name):
-    """Return a fake non-ComputedBuffer operation.
-
-    Uses an unspec'd MagicMock so isinstance(..., ComputedBuffer) is False,
-    which causes reorder_unhinted_interlopers to treat it as an immovable
-    boundary that breaks any hint-group run.
-    """
-    op = MagicMock()
-    op.get_name.return_value = name
-    return op
-
-
-class TestReorderUnhintedInterlopers(unittest.TestCase):
-    """reorder_unhinted_interlopers moves unhinted ops out of hint-group runs."""
-
-    def _run(self, ops):
-        from torch_spyre._inductor.wsr.coarse_tile_hints import (
-            reorder_unhinted_interlopers,
-        )
-
-        graph = SimpleNamespace(operations=list(ops))
-        reorder_unhinted_interlopers(graph)
-        return [op.get_name() for op in graph.operations]
-
-    def test_no_ops(self):
-        self.assertEqual(self._run([]), [])
-
-    def test_all_hinted_unchanged(self):
-        a = _make_rui_op("a", hint_ids=(0,))
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, b]), ["a", "b"])
-
-    def test_all_unhinted_unchanged(self):
-        a = _make_rui_op("a")
-        b = _make_rui_op("b")
-        self.assertEqual(self._run([a, b]), ["a", "b"])
-
-    def test_interloper_moved_before_run(self):
-        # [hinted, unhinted, hinted] → [unhinted, hinted, hinted]
-        # unhinted has no data deps; move before is preferred.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x")  # interloper
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b]), ["x", "a", "b"])
-
-    def test_interloper_blocked_move_before_reads_hinted(self):
-        # x reads a's output → cannot move before a; try move-after.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x", reads=("a",))
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b]), ["a", "b", "x"])
-
-    def test_interloper_move_after_blocked_by_hinted_reader(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after).
-        # Keep x in place and split the hinted ops into separate runs.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x", reads=("a",))
-        b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
-
-    def test_interloper_blocked_both_directions(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after).
-        # The original topological order is already valid and is preserved.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x_out", reads=("a",))
-        b = _make_rui_op("b", reads=("x_out",), hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b]), ["a", "x_out", "b"])
-
-    def test_non_computed_buffer_breaks_run(self):
-        # A non-ComputedBuffer between two hinted ops cannot be reordered.
-        a = _make_rui_op("a", hint_ids=(0,))
-        extern = _make_rui_non_computed("extern")
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, extern, b]), ["a", "extern", "b"])
-
-    def test_differently_hinted_pulled_across_when_safe(self):
-        # An op with a different hint_id is not a candidate for reordering
-        # itself, but the later same-key op is pulled before it when doing
-        # so is dependency-safe, making the hint-0 run contiguous.
-        a = _make_rui_op("a", hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(1,))
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, c, b]), ["a", "b", "c"])
-
-    def test_differently_hinted_breaks_run_when_pull_unsafe(self):
-        # b reads c's output, so pulling b before c would violate that
-        # read dependency; the pull is skipped and the run stays broken
-        # (left for validate_coarse_tile_groups to report).
-        a = _make_rui_op("a", hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(1,))
-        b = _make_rui_op("b", hint_ids=(0,), reads=("c",))
-        self.assertEqual(self._run([a, c, b]), ["a", "c", "b"])
-
-    def test_multiple_interlopers_all_moveable_before(self):
-        # [H, U1, U2, H] with no deps → both move before.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x")
-        y = _make_rui_op("y")
-        b = _make_rui_op("b", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, y, b]), ["x", "y", "a", "b"])
-
-    def test_multiple_interlopers_second_depends_on_first(self):
-        # y reads x → x can move before, but then y reads x which is now
-        # before the run start → y can also move before (after x).
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x")
-        y = _make_rui_op("y", reads=("x",))
-        b = _make_rui_op("b", hint_ids=(0,))
-        result = self._run([a, x, y, b])
-        # x moves before, then y (reads x, which is now before run_start)
-        # — y's reads are not produced by any op in run_start..j-1 after x moved.
-        self.assertEqual(result, ["x", "y", "a", "b"])
-
-    def test_trailing_consumer_not_error(self):
-        # Unhinted op after the run that reads run outputs — trailing consumer,
-        # not an interloper.  No hinted ops follow it so it should not raise.
-        a = _make_rui_op("a", hint_ids=(0,))
-        b = _make_rui_op("b", hint_ids=(0,))
-        x = _make_rui_op("x", reads=("a", "b"))
-        self.assertEqual(self._run([a, b, x]), ["a", "b", "x"])
-
-    def test_interloper_at_start_of_list(self):
-        # Unhinted op before any hinted op — no run started yet, nothing to do.
-        x = _make_rui_op("x")
-        a = _make_rui_op("a", hint_ids=(0,))
-        self.assertEqual(self._run([x, a]), ["x", "a"])
-
-    def test_move_after_multiple_trailing_hinted(self):
-        # [H, U, H, H] where U reads nothing and no one reads U:
-        # move-before is legal and preferred over move-after.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x")
-        b = _make_rui_op("b", hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b, c]), ["x", "a", "b", "c"])
-
-    def test_move_after_op_follows_run(self):
-        # [H, U(reads H), H, H, V(reads U)] — move-before blocked (x reads a);
-        # move-after should land x just after c, before d.
-        # Catches the pop-then-insert off-by-one: insert must be at run_end-1
-        # not run_end after the pop shifts indices.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x", reads=("a",))
-        b = _make_rui_op("b", hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(0,))
-        d = _make_rui_op("d", reads=("x",))  # unhinted, reads x — after run
-        self.assertEqual(self._run([a, x, b, c, d]), ["a", "b", "c", "x", "d"])
-
-    def test_interloper_with_unhinted_gap_before_next_hinted(self):
-        # [H, U(reads H), V(unhinted), H2] — run_end must span past V to H2.
-        # Without this fix, run_end collapses to j+1=V and move-after is a
-        # silent no-op that leaves U in place with no error.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x", reads=("a",))  # blocked from moving before
-        v = _make_rui_op("v")  # another unhinted op (no deps)
-        a2 = _make_rui_op("a2", hint_ids=(0,))
-        # v has no deps and moves before the run; x (reads a) cannot move before
-        # but can move after a2 (run_end spans past v to a2).
-        self.assertEqual(self._run([a, x, v, a2]), ["v", "a", "a2", "x"])
-
-    def test_non_contiguous_run_multiple_interlopers(self):
-        # [H, U1(reads H), H2, U2, H3] — U1 cannot move before (reads a);
-        # move-after must span to H3 (the last same-key op), not just H2.
-        # Without the fix U1 moves to between H2 and U2, still splitting [H3].
-        # With the fix: u1 moves after c (run_end spans to c); u2 then moves
-        # before the run; result is one contiguous hinted block [a, b, c].
-        a = _make_rui_op("a", hint_ids=(0,))
-        u1 = _make_rui_op("u1", reads=("a",))
-        b = _make_rui_op("b", hint_ids=(0,))
-        u2 = _make_rui_op("u2")
-        c = _make_rui_op("c", hint_ids=(0,))
-        self.assertEqual(self._run([a, u1, b, u2, c]), ["u2", "a", "b", "c", "u1"])
-
-    def test_two_interlopers_both_move_after(self):
-        # [H(a), U1(reads a), U2(reads a), H(b), H(c)]
-        # U1 and U2 both read 'a' so neither can move before the run.
-        # Both have no dependents in the remaining hinted ops so both can
-        # move after.  After U1 moves after c, U2 is encountered next; it
-        # also reads a (blocked from moving before) and can move after c.
-        # Verifies the chained move-after path for consecutive interlopers.
-        a = _make_rui_op("a", hint_ids=(0,))
-        u1 = _make_rui_op("u1", reads=("a",))
-        u2 = _make_rui_op("u2", reads=("a",))
-        b = _make_rui_op("b", hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(0,))
-        # u1 is processed first and moves after c; u2 is processed next and
-        # also moves after c (now at index 3), landing between c and u1.
-        self.assertEqual(self._run([a, u1, u2, b, c]), ["a", "b", "c", "u2", "u1"])
-
-    def test_mutating_interloper_blocked(self):
-        # x mutates buffer 'a' produced by a hinted op; x cannot legally move
-        # before the run (would run before 'a' is produced) and b reads x so
-        # x cannot move after. Keep it in place as the run boundary.
-        a = _make_rui_op("a", hint_ids=(0,))
-        x = _make_rui_op("x", mutates=("a",))  # mutation dep on a
-        b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
-        c = _make_rui_op("c", hint_ids=(0,))
-        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
-
-
-# ===========================================================================
-# TestHintsLevels
-# ===========================================================================
-
-
-class TestHintsLevels(unittest.TestCase):
-    """_hints_levels must drop size-1 split_count hints as no-ops."""
-
-    def _make_op(self, hints):
-        """Return a fake ComputedBuffer with the given DimHint list.
-
-        hints: list of (hint_id, split_count, loop_var) tuples.
-        """
-        from torch._inductor.ir import ComputedBuffer
-        from torch_spyre._inductor.propagate_hints import DimHint
-
-        op = MagicMock(spec=ComputedBuffer)
-        op.get_name.return_value = "buf0"
-        op.dim_hints = [
-            DimHint(
-                dim_names=[f"dim{i}"],
-                split_count=sc,
-                loop_var=lv,
-                is_reduction=False,
-                hint_id=hid,
-            )
-            for i, (hid, sc, lv) in enumerate(hints)
-        ]
-        return op
-
-    def test_size1_hint_dropped(self):
-        """A single hint with split_count=1 produces an empty levels list."""
-        import sympy
-        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
-
-        op = self._make_op([(0, 1, sympy.Symbol("c0"))])
-        self.assertEqual(_hints_levels([op]), [])
-
-    def test_size1_hint_dropped_with_debug_log(self):
-        """A size-1 hint emits a debug log message when dropped."""
-        import logging
-        import logging.handlers
-        import sympy
-        import torch_spyre._inductor.wsr.coarse_tile_hints as cth_mod
-        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
-
-        op = self._make_op([(7, 1, sympy.Symbol("c0"))])
-
-        original_level = cth_mod.hints_logger.level
-        cth_mod.hints_logger.setLevel(logging.DEBUG)
-        handler = logging.handlers.MemoryHandler(
-            capacity=100, flushLevel=logging.CRITICAL
-        )
-        cth_mod.hints_logger.addHandler(handler)
-        try:
-            result = _hints_levels([op])
-            handler.flush()
-            messages = [r.getMessage() for r in handler.buffer]
-        finally:
-            cth_mod.hints_logger.removeHandler(handler)
-            cth_mod.hints_logger.setLevel(original_level)
-
-        self.assertEqual(result, [])
-        self.assertTrue(
-            any("split_count=1" in m and "no-op" in m for m in messages),
-            f"Expected a 'split_count=1 … no-op' debug message; got: {messages}",
-        )
-
-    def test_nonunit_hint_kept(self):
-        """A hint with split_count > 1 is retained normally."""
-        import sympy
-        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
-
-        c0 = sympy.Symbol("c0")
-        op = self._make_op([(3, 4, c0)])
-        levels = _hints_levels([op])
-        self.assertEqual(len(levels), 1)
-        hint_id, count = levels[0]
-        self.assertEqual(hint_id, 3)
-        self.assertEqual(count, sympy.Integer(4))
-
-    def test_mixed_hints_drops_only_size1(self):
-        """When one hint is size-1 and another is size>1, only the size>1 survives."""
-        import sympy
-        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
-
-        c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
-        op = self._make_op([(0, 1, c0), (1, 8, c1)])
-        levels = _hints_levels([op])
-        self.assertEqual(len(levels), 1)
-        hint_id, count = levels[0]
-        self.assertEqual(hint_id, 1)
-        self.assertEqual(count, sympy.Integer(8))
-
-    def test_all_size1_hints_dropped_falls_through_to_next_op(self):
-        """If every hint on op0 is size-1, _hints_levels tries op1 next."""
-        import sympy
-        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
-
-        c0 = sympy.Symbol("c0")
-        op0 = self._make_op([(0, 1, c0)])
-        op1 = self._make_op([(0, 4, c0)])
-        levels = _hints_levels([op0, op1])
-        self.assertEqual(len(levels), 1)
-        _, count = levels[0]
-        self.assertEqual(count, sympy.Integer(4))
-
-
-# ===========================================================================
-# TestHintsToCoarseTileGroupsLogging
-# ===========================================================================
-
-
-def _make_htctg_op(name, hints):
-    """Return a fake ComputedBuffer for hints_to_coarse_tile_groups logging tests.
-
-    hints: list of (hint_id, dim_names, split_count, loop_var) tuples.
-    loop_var may be None to simulate an op that is broadcast on that dim.
-    """
-    from torch._inductor.ir import ComputedBuffer
-    from torch_spyre._inductor.propagate_hints import DimHint
-
-    op = MagicMock(spec=ComputedBuffer)
-    op.get_name.return_value = name
-    op.get_operation_name.return_value = name
-    op.origins = []
-    op.dim_hints = [
-        DimHint(
-            dim_names=dim_names,
-            split_count=split_count,
-            loop_var=loop_var,
-            is_reduction=False,
-            hint_id=hint_id,
-        )
-        for hint_id, dim_names, split_count, loop_var in hints
-    ]
-    return op
-
-
-def _run_htctg_and_capture_log(ops):
-    """Run hints_to_coarse_tile_groups with INFO logging and return the log text."""
-    import logging
-    import logging.handlers
-    from types import SimpleNamespace
-    from torch_spyre._inductor.wsr.coarse_tile_hints import hints_to_coarse_tile_groups
-    import torch_spyre._inductor.wsr.coarse_tile_hints as coarse_tile_hints_mod
-
-    graph = SimpleNamespace(operations=list(ops))
-
-    # Temporarily force the module-level hints_logger to INFO so the logging
-    # block inside hints_to_coarse_tile_groups actually runs.
-    original_level = coarse_tile_hints_mod.hints_logger.level
-    coarse_tile_hints_mod.hints_logger.setLevel(logging.INFO)
-
-    handler = logging.handlers.MemoryHandler(capacity=1000, flushLevel=logging.CRITICAL)
-    coarse_tile_hints_mod.hints_logger.addHandler(handler)
-    try:
-        hints_to_coarse_tile_groups(graph)
-        handler.flush()
-        return "\n".join(r.getMessage() for r in handler.buffer)
-    finally:
-        coarse_tile_hints_mod.hints_logger.removeHandler(handler)
-        coarse_tile_hints_mod.hints_logger.setLevel(original_level)
-
-
-class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
-    """The scopes= log line must list all hint dims, not just those with
-    loop_var set on the first op in the group.
-
-    Regression test for a bug where group_ops[0] had loop_var=None for a hint
-    (e.g. a restickify op that doesn't iterate over Lq), causing that hint to
-    be absent from group_levels and therefore omitted from the scopes= line.
-    """
-
-    def test_scopes_includes_all_hints_when_first_op_is_broadcast_on_second_hint(self):
-        """When group_ops[0] has loop_var=None for hint 2 (Lq), the scopes= line
-        must still include Lq — not just H."""
-        import sympy
-
-        h_sym = sympy.Symbol("c0")
-        lq_sym = sympy.Symbol("c1")
-
-        # op0: iterates over H only — loop_var=None for Lq (broadcast, like restickify)
-        op0 = _make_htctg_op(
-            "op0",
-            [
-                (1, ["H"], 8, h_sym),  # hint_id=1, H, has loop_var
-                (2, ["Lq"], 4, None),  # hint_id=2, Lq, loop_var=None → broadcast
-            ],
-        )
-        # op1: iterates over both H and Lq
-        op1 = _make_htctg_op(
-            "op1",
-            [
-                (1, ["H"], 8, h_sym),
-                (2, ["Lq"], 4, lq_sym),
-            ],
-        )
-
-        log_output = _run_htctg_and_capture_log([op0, op1])
-
-        # Find the scopes= line specifically
-        scopes_line = next(
-            (ln for ln in log_output.splitlines() if "scopes=" in ln), ""
-        )
-        self.assertIn("H", scopes_line, f"scopes= must mention H; got: {scopes_line!r}")
-        self.assertIn(
-            "Lq",
-            scopes_line,
-            f"scopes= must mention Lq even though op0 is broadcast on Lq "
-            f"(loop_var=None for hint_id=2 on group_ops[0]); "
-            f"got: {scopes_line!r}",
-        )
-
-
 class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
     """Unit test for loop_info.py's _SPYRE_METADATA_ATTRS coverage."""
 
@@ -9631,20 +9417,12 @@ class TestPredictFrame(unittest.TestCase):
     def test_unit_extent_level_followed_by_another_level(self):
         """A dim tiled to extent 1 by a *non-final* level.
 
-        The single-level cases above pass under a one-shot full->tile resize;
-        this one does not, which is why ``_predict_output_layout`` resizes once
-        per level. ``_resize_device_layout`` matches size-1 device dims to a
-        size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
-        one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
-        level 2 re-matches the one-stick tile-count dim onto it and collapses
-        its stride to the ``-1`` sentinel.  A single resize never sees that
-        intermediate state and leaves the real stride there, predicting
-        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
-
-        Needs all three: a dim tiled to extent 1, at a non-final level, with a
-        stick host dim of exactly one stick (64 elems at fp16) so a second
-        size-1 device dim exists to be mis-matched.  Drop any one and a
-        one-shot resize agrees.
+        With a stick host dim of exactly one stick (64 elems at fp16), the
+        tile-count dim has size 1 too. ``_resize_device_layout`` used to match
+        it to host dim 0 by size once level 1 put that at extent 1, collapsing
+        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        never did; hence ``_predict_output_layout`` resizes once per level,
+        as ``_divide_ranges`` does.
         """
         self._apply_and_compare(
             (2, 512, 64),
@@ -10266,7 +10044,7 @@ class TestTileHelpers(unittest.TestCase):
 
 class TestCustomPostFusionPassesOrder(unittest.TestCase):
     def test_hbm_pool_planning_runs_after_fusion(self):
-        """Kernels are prepared before HBM placement and stage validation."""
+        """Kernels are prepared before HBM placement."""
         from torch_spyre._inductor.passes import CustomPostFusionPasses
 
         pipeline = CustomPostFusionPasses()
@@ -10277,7 +10055,6 @@ class TestCustomPostFusionPassesOrder(unittest.TestCase):
                 "spyre_fuse_nodes",
                 "prepare_spyre_kernels",
                 "hbm_pool_planning",
-                "verify_carried_reduction_ownership",
             ],
         )
 
@@ -11566,7 +11343,6 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
-            _carried_reduction_record=object(),
         )
         if with_plan:
             allocator._validated_drain_plans = {"buf2": plan}
@@ -11610,7 +11386,6 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         # loop/carry metadata.
         self.assertFalse(hasattr(result.clone, "loop_info"))
         self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
-        self.assertFalse(hasattr(result.clone, "_carried_reduction_record"))
         result.editor.change_graph_output.assert_called_once_with(
             result.storage_op, result.clone
         )
@@ -11625,7 +11400,6 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         # The ordinary clone path is not touched by the drain-only clearing.
         self.assertTrue(hasattr(result.clone, "loop_info"))
         self.assertTrue(hasattr(result.clone, "_loop_carry_record"))
-        self.assertTrue(hasattr(result.clone, "_carried_reduction_record"))
 
     def test_push_emits_no_copy_when_solver_chose_hbm(self):
         result = self._run_push(with_plan=True, address=None)
@@ -11678,7 +11452,6 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
-            _carried_reduction_record=object(),
         )
         with (
             patch.object(
@@ -12008,7 +11781,7 @@ class TestHoistedInputClone(unittest.TestCase):
             lx_view=result.lx_view,
             lower_before=None,
         )
-        for attr in ("loop_info", "_loop_carry_record", "_carried_reduction_record"):
+        for attr in ("loop_info", "_loop_carry_record"):
             self.assertTrue(hasattr(result.clone, attr), attr)
         result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
 
@@ -12029,7 +11802,6 @@ class TestHoistedInputClone(unittest.TestCase):
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
-            _carried_reduction_record=object(),
         )
         with (
             patch.object(
@@ -12066,7 +11838,6 @@ class TestHoistedInputClone(unittest.TestCase):
         )
         self.assertFalse(hasattr(result.clone, "loop_info"))
         self.assertFalse(hasattr(result.clone, "_loop_carry_record"))
-        self.assertFalse(hasattr(result.clone, "_carried_reduction_record"))
         result.set_alloc.assert_called_once_with(result.clone, 0x4000, result.lx_view)
 
     def test_push_keeps_todays_input_clone_outside_loops(self):

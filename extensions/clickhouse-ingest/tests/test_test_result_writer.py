@@ -312,7 +312,7 @@ def test_an_unregistered_capability_type_is_skipped_before_any_insert(capsys):
     ]
     err = capsys.readouterr().err
     assert "unregistered capability.test_type 'module_ops'" in err
-    assert "model_modules, model_ops, model_support" in err
+    assert "model_modules, model_ops, model_serving, model_support" in err
 
 
 def test_unknown_capability_keys_are_reported_and_dropped(capsys):

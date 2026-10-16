@@ -38,7 +38,7 @@ def _mixed_radix_digits(expr, var, var_range, mods):
     this recognition deliberately strict preserves rejection of ambiguous
     combinations such as ``Mod(x, 4) + Mod(x, 6)``.
     """
-    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    term = expr.xreplace(dict.fromkeys(expr.free_symbols - {var}, 0))
     var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
     if len(var_terms) != len(mods):
         return None
@@ -116,7 +116,7 @@ def find_repeat_vars(index_exprs, var_ranges):
                 continue
 
             vars_in_expr = expr.free_symbols
-            term = expr.xreplace({v: 0 for v in vars_in_expr - {var}})
+            term = expr.xreplace(dict.fromkeys(vars_in_expr - {var}, 0))
 
             if term == node:
                 repeat_info[var] = {
@@ -352,7 +352,7 @@ def compute_coordinates(
                 coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
-    offset = index.xreplace({v: 0 for v in vars})
+    offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
@@ -404,7 +404,7 @@ def compute_coordinates(
             continue
 
         # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
+        term = index.xreplace(dict.fromkeys(vars - {var}, 0))
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -571,7 +571,7 @@ def normalize_coordinates(
         # sympy uses floor to encode integer divisions, remove
         expr = coordinate.replace(sympy.floor, lambda x: x)
         vars = expr.free_symbols
-        offset = expr.xreplace({var: sympy.S.Zero for var in vars})
+        offset = expr.xreplace(dict.fromkeys(vars, sympy.S.Zero))
 
         if len(vars) == 0:
             if dim_size > 1 and dim_idx != len(size) - 1:
@@ -610,7 +610,7 @@ def normalize_coordinates(
                 )
 
             # extract term for each var
-            term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
+            term = expr.xreplace(dict.fromkeys(vars - {var}, 0)) - offset
             dim_terms.append(Term.from_coordinate(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)

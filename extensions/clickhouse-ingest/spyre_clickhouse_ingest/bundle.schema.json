@@ -14,10 +14,12 @@
       ]
     },
     "kind": {
-      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg.",
+      "description": "junit (default): results/*.xml through `results`. vllm: results/*.json from `vllm bench`, through vllm.py, as the live spyre-inference perf leg. sendnn: results/*.txt, the perf suite's report_sendnn.txt, as torch-spyre benchmark rows on the sendnn backend (always uploaded; no CI leg runs sendnn). benchmarks: results/*.json of generic benchmark rows ({\"benchmarks\": [{name, props, backend, measurements, iterations, run_props, tags}]}), for evals and harnesses with no runner format of their own; test_type perf or quality.",
       "enum": [
         "junit",
-        "vllm"
+        "vllm",
+        "sendnn",
+        "benchmarks"
       ]
     },
     "artifact_id": {
@@ -34,6 +36,24 @@
       "description": "Compatibility: any `artifacts resolve` spec; id: and image: specs are read as artifact_id / image.",
       "type": "string"
     },
+    "create_artifact": {
+      "description": "Record the image as a new artifact when neither artifact_id nor image names a recorded one (an image our pipeline did not build). Needs image (by digest) and arch; the artifact is origin upstream, under this component and name (default: the image repository's last path segment).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component"
+      ],
+      "properties": {
+        "component": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        }
+      }
+    },
     "component": {
       "description": "The suite's owner, a test_case_id hash input. Default: the artifact's component.",
       "type": "string",
@@ -48,7 +68,7 @@
       ]
     },
     "test_type": {
-      "description": "The tier; artifact_results.test_type's CHECK set.",
+      "description": "The tier; artifact_results.test_type's CHECK set. Implied perf for kind vllm and sendnn.",
       "enum": [
         "smoke",
         "unit",
@@ -56,6 +76,7 @@
         "regression",
         "trunk",
         "perf",
+        "quality",
         "fvt",
         "fvt-static",
         "fvt-dynamic",
@@ -64,7 +85,8 @@
         "svt-dynamic",
         "model_ops",
         "model_modules",
-        "model_support"
+        "model_support",
+        "model_serving"
       ]
     },
     "run_key": {
@@ -143,7 +165,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "pattern": "^(results/[^/]+\\.(xml|json)|attachments/[^\\s]+)$"
+            "pattern": "^(results/[^/]+\\.(xml|json|txt)|attachments/[^\\s]+)$"
           },
           "sha256": {
             "type": "string",

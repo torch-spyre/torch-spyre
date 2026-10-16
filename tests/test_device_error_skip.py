@@ -313,6 +313,20 @@ class TestE(unittest.TestCase):
     def test_e_oot_xfail_that_fails(self):
         raise RuntimeError("Unsupported: flip")
     test_e_oot_xfail_that_fails.pytestmark = [pytest.mark.xfail(reason="oot", strict=True)]
+
+class TestF(unittest.TestCase):
+    def test_f_oot_raises_matches(self):
+        raise RuntimeError("Unsupported: flip")
+    test_f_oot_raises_matches.pytestmark = [
+        pytest.mark.xfail(reason="oot", strict=True, raises=RuntimeError)
+    ]
+
+class TestG(unittest.TestCase):
+    def test_g_oot_raises_mismatch(self):
+        raise RuntimeError("Unsupported: flip")
+    test_g_oot_raises_mismatch.pytestmark = [
+        pytest.mark.xfail(reason="oot", strict=True, raises=KeyError)
+    ]
 """
 
 _LAST_TEST_FAULTS = """
@@ -399,6 +413,8 @@ class TestDeviceFaultSession(TestCase):
                 "test_c_non_strict_xpass": "passed",  # strict=False allows an XPASS
                 "test_d_strict_xfail_that_fails": "skipped",  # a genuine XFAIL
                 "test_e_oot_xfail_that_fails": "skipped",  # a genuine OOT XFAIL
+                "test_f_oot_raises_matches": "skipped",  # the expected exception type
+                "test_g_oot_raises_mismatch": "failure",  # a different one is a real failure
             },
             proc.stdout,
         )

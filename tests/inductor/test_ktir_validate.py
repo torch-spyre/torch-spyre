@@ -79,6 +79,7 @@ def make_op_spec(
     baked: bool = False,
     advances: list | None = None,
     kernel_locals: list | None = None,
+    replicated_scalars: list | None = None,
     is_reduction: bool = False,
     divisions: dict | None = None,
     space: dict | None = None,
@@ -110,6 +111,9 @@ def make_op_spec(
     * ``kernel_locals`` per arg: the bit the scheduler fills, saying nothing
       outside this kernel reads the buffer.  Defaults to False, as it does in
       the contract.
+    * ``replicated_scalars`` per arg: the bit the frontend fills for a
+      ``spyre.constant`` buffer, saying every element of it holds the same value.
+      Defaults to False, as it does in the contract.
     * ``divisions`` maps a coordinate symbol's name to its work division;
       ``space`` replaces the iteration space outright (``{}`` for a tiled op).
     * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
@@ -158,6 +162,7 @@ def make_op_spec(
                 element_arrangement=at(arrangements, position)
                 or ElementArrangement.STANDARD,
                 kernel_local=bool(at(kernel_locals, position)),
+                replicated_scalar=bool(at(replicated_scalars, position)),
             )
         )
 
@@ -358,6 +363,38 @@ def make_broadcast_op_spec(form: str = "row") -> OpSpec:
             arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
         )
     raise ValueError(f"make_broadcast_op_spec: unknown form {form!r}")
+
+
+def make_scalar_operand_op_spec(
+    dtype: DataFormats = FP16, *, replicated: bool = True
+) -> OpSpec:
+    """``a == 0.0``: a degenerate ``spyre.constant`` operand, as projected.
+
+    The frontend describes the constant as ONE STICK at a constant coordinate on
+    every axis -- it walks nothing -- which is the shape the emitter has to widen
+    to a lane-walking read of the whole stick before dbo-opt will lower it.
+
+    Stated at both formats because the stick is not the same size at each: 64
+    lanes of two bytes at fp16 over a ``(256, 64)`` tensor gives ``[1, 256, 64]``,
+    and 32 lanes of four bytes gives ``[2, 256, 32]`` with a ``[1, 1, 32]``
+    constant.  ``replicated=False`` keeps the identical shape and drops only the
+    producer's claim about the padding, which is the control for the flag being
+    what decides and not the shape.
+    """
+    rows, lanes = sympy.symbols("c0 c1")
+    stick = 64 if dtype == FP16 else 32
+    chunks = 1 if dtype == FP16 else 2
+    full = [sympy.floor(lanes / stick), rows, sympy.Mod(lanes, stick)]
+    zero = sympy.Integer(0)
+    return make_op_spec(
+        "equal",
+        dtype=dtype,
+        names=["arg0_1", "buf1", "buf0"],
+        sizes=[[chunks, 256, stick], [1, 1, stick], [chunks, 256, stick]],
+        coords_per_arg=[full, [zero, zero, zero], full],
+        replicated_scalars=[False, replicated, False],
+        space={rows: (256, 1), lanes: (64, 1)},
+    )
 
 
 def make_statistic_reader_specs(reader: str = "realdiv") -> list:
