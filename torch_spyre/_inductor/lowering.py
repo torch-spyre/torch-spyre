@@ -49,13 +49,13 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
+    AllGatherKernel,
+    AllReduceKernel,
+    BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
     SpyreReduction,
-    WaitWorkFallback,
+    WaitKernel,
 )
 from .logging_utils import get_inductor_logger
 
@@ -2528,136 +2528,88 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
-@register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
-def lower_c10d_broadcast_async(tensor, src_rank, group_name):
-    """
-    Direct lowering for _c10d_functional.broadcast using ASYNC pattern.
+# These mirror torch/_inductor/comm_lowering.py: nodes are built with the
+# upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
+# create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+_c10d = torch.ops._c10d_functional
 
-    Creates an async broadcast operation that returns immediately without blocking.
-    This provides the infrastructure for potential communication-compute overlap,
-    though actual overlap depends on scheduler decisions.
 
-    Flow:
-      _c10d_functional.broadcast → This lowering → BroadcastAsyncFallback
-      → Generated code: torch.ops.spyre.broadcast_async() → C++ → spyre-comms (non-blocking)
-    """
+@register_spyre_lowering(_c10d.broadcast.default)
+def lower_c10d_broadcast(tensor, src_rank, group_name):
+    """Out-of-place broadcast: broadcast_run writes a fresh output tensor."""
     logger.debug(
-        "Lowering _c10d_functional.broadcast to BroadcastAsyncFallback "
-        "(src_rank=%s, group_name='%s')",
+        "Lowering _c10d_functional.broadcast (src_rank=%s, group_name='%s')",
         src_rank,
         group_name,
     )
-
-    tensor.realize()
     return ir.TensorBox.create(
-        BroadcastAsyncFallback(
-            torch.ops.spyre.broadcast_async.default,
-            tensor,
-            src_rank,
-            group_name,
+        BroadcastKernel.create_out_of_place(
+            _c10d.broadcast.default, tensor, src_rank, group_name
         )
     )
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.wait_tensor.default)
-def lower_c10d_wait_tensor_async(tensor):
+@register_spyre_lowering(_c10d.wait_tensor.default)
+def lower_c10d_wait_tensor(tensor):
+    """Block until the collective producing *tensor* completes.
+
+    The wait mutates *tensor*, so returning it orders every later reader after
+    the wait.
     """
-    Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
+    logger.debug("Lowering _c10d_functional.wait_tensor")
+    WaitKernel.create_wait(_c10d.wait_tensor.default, tensor)
+    return tensor
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
 
-    Flow:
-      _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
-      → Generated code: torch.ops.spyre.wait_work() → C++ → work->wait()
-    """
-    logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
-
-    tensor.realize()
+def _all_gather(tensor, group_size, group_name):
     return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+        AllGatherKernel.create_out_of_place(
+            _c10d.all_gather_into_tensor.default, tensor, group_size, group_name
         )
     )
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
-def lower_c10d_all_gather_async(tensor, group_size, group_name):
-    """
-    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
-
-    Creates an async all_gather operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
-
-    Flow:
-      _c10d_functional.all_gather_into_tensor → This lowering
-      → AllGatherAsyncFallback → Generated code:
-      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
-    """
-    logger.info(
-        "Lowering _c10d_functional.all_gather_into_tensor to "
-        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+@register_spyre_lowering(_c10d.all_gather_into_tensor.default)
+def lower_c10d_all_gather(tensor, group_size, group_name):
+    """Out-of-place all_gather: output shape[0] = input.shape[0] * group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.all_gather_into_tensor "
+        "(group_size=%s, group_name='%s')",
         group_size,
         group_name,
     )
+    return _all_gather(tensor, group_size, group_name)
 
-    tensor.realize()
-    return ir.TensorBox.create(
-        AllGatherAsyncFallback(
-            torch.ops.spyre.all_gather_async.default,
-            tensor,
-            group_size,
-            group_name,
-        )
+
+def _all_reduce_inplace(tensor, reduce_op, group_name):
+    AllReduceKernel.create_inplace(
+        _c10d.all_reduce_.default, tensor, reduce_op, group_name
     )
+    return tensor
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce.default)
-def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
+@register_spyre_lowering(_c10d.all_reduce.default)
+def lower_c10d_all_reduce(tensor, reduce_op, group_name):
+    """Functional all_reduce, lowered as all_reduce_ on a clone of the input.
+
+    Inductor's reinplace pass already rewrites all_reduce to all_reduce_ when
+    the input is not needed afterwards, so reaching this lowering means the
+    input must be preserved.
     """
-    Direct lowering for _c10d_functional.all_reduce using ASYNC pattern.
-
-    Creates an async all_reduce operation that returns immediately without blocking.
-    Output tensor has shape[0] = input.shape[0].
-    """
-    tensor.realize()
     logger.debug(
-        "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
+        "Lowering _c10d_functional.all_reduce (reduce_op=%s, group_name='%s')",
         reduce_op,
         group_name,
     )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops.spyre.all_reduce_async.default,
-            tensor,
-            reduce_op,
-            group_name,
-        )
-    )
+    return _all_reduce_inplace(clone(tensor), reduce_op, group_name)
 
 
-@register_spyre_lowering(torch.ops._c10d_functional.all_reduce_.default)
+@register_spyre_lowering(_c10d.all_reduce_.default)
 def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
-    """
-    Lowering for _c10d_functional.all_reduce_ (in-place variant).
-
-    Inductor's reinplace pass converts the functional all_reduce to the in-place
-    all_reduce_ when the output shape matches the input. This lowering catches
-    that case and emits the same Spyre all_reduce op (always in-place on device).
-    """
-    tensor.realize()
+    """In-place all_reduce_ (produced by the reinplace pass)."""
     logger.debug(
-        "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
-        "(reduce_op=%s, group_name='%s')",
+        "Lowering _c10d_functional.all_reduce_ (reduce_op=%s, group_name='%s')",
         reduce_op,
         group_name,
     )
-    return ir.TensorBox.create(
-        AllReduceAsyncFallback(
-            torch.ops._c10d_functional.all_reduce_.default,
-            tensor,
-            reduce_op,
-            group_name,
-        )
-    )
+    return _all_reduce_inplace(tensor, reduce_op, group_name)

@@ -249,7 +249,7 @@ class ExternalOperandTest(TestCase):
         write = mock.sentinel.write
         view = SimpleNamespace(work_slice_dims=[], same_partition=lambda _: True)
         utils = "torch_spyre._inductor.scratchpad.utils"
-        for drained, cores in ((None, -1), ({_BUF: "all_reduce"}, 1)):
+        for drained, cores in ((None, -1), ({_BUF: {"all_reduce"}}, 1)):
             with (
                 self.subTest(drained=drained),
                 mock.patch(

@@ -14,6 +14,7 @@
 """Unit tests for the ``deadcode_elimination`` IR pass."""
 
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import torch
@@ -29,12 +30,16 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from torch_spyre.constants import DEVICE_NAME
 
 from torch_spyre._inductor import deadcode_elimination as dce_module
+from torch_spyre._inductor.ir import AllGatherKernel, AllReduceKernel, WaitKernel
 from torch_spyre._inductor.wsr import for_each_tile_lowering
 from torch_spyre._inductor.deadcode_elimination import deadcode_elimination
+
+_c10d = torch.ops._c10d_functional
 
 
 class TestDeadMutationElimination(unittest.TestCase):
@@ -173,6 +178,72 @@ class TestDeadMutationElimination(unittest.TestCase):
 
         self.assertIn("mutation", survivors)
         self.assertIn("producer", survivors)
+
+
+class TestUnusedCollectiveIsKept(unittest.TestCase):
+    """An unused collective or wait survives, and so does what it reads.
+
+    Every rank takes part in a collective, so dropping one on a rank whose
+    result goes unread would leave the other ranks waiting for it. The nodes
+    are built with the upstream ``_CollectiveKernel`` factories, as the
+    lowerings build them, so they are ``FallbackKernel``s whose
+    ``has_side_effects()`` is True; this pins that the pass honours it.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # The factories run the op's Meta impl under the graph's fake mode.
+        stack.enter_context(V.set_fake_mode(FakeTensorMode()))
+        stack.enter_context(V.set_graph_handler(GraphLowering(gm)))
+
+    def _collective_ops(self, build):
+        """Run ``build`` and return the operations it registered."""
+        before = len(V.graph.operations)
+        build()
+        return V.graph.operations[before:]
+
+    def test_unused_all_reduce_is_kept(self):
+        producer = TestDeadMutationElimination._make_buffer("producer")
+        operand = TensorBox(StorageBox(producer))
+        ops = self._collective_ops(
+            lambda: AllReduceKernel.create_inplace(
+                _c10d.all_reduce_.default, operand, "sum", "group0"
+            )
+        )
+        names = {op.get_name() for op in ops}
+
+        V.graph.operations = [producer, *ops]
+        V.graph.get_output_names = lambda: []
+        deadcode_elimination(V.graph)
+        survivors = {op.get_name() for op in V.graph.operations}
+
+        self.assertEqual(survivors, {"producer"} | names)
+
+    def test_unused_all_gather_and_wait_are_kept(self):
+        producer = TestDeadMutationElimination._make_buffer("producer")
+        operand = TensorBox(StorageBox(producer))
+
+        def build():
+            gathered = AllGatherKernel.create_out_of_place(
+                _c10d.all_gather_into_tensor.default, operand, 2, "group0"
+            )
+            WaitKernel.create_wait(
+                _c10d.wait_tensor.default, TensorBox.create(gathered)
+            )
+
+        ops = self._collective_ops(build)
+        self.assertEqual(
+            [type(op) for op in ops], [AllGatherKernel, WaitKernel], "fixture drifted"
+        )
+
+        V.graph.operations = [producer, *ops]
+        V.graph.get_output_names = lambda: []
+        deadcode_elimination(V.graph)
+        survivors = {op.get_name() for op in V.graph.operations}
+
+        self.assertEqual(survivors, {"producer"} | {op.get_name() for op in ops})
 
 
 class TestForEachTileCarryIsCollected(unittest.TestCase):

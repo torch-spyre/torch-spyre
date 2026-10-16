@@ -1144,13 +1144,30 @@ def _repoint_refs_to_buffer(
         else:
             outputs[i] = new_tb
 
-    name_map = {old_name: new_buf.get_name()}
+    new_name = new_buf.get_name()
+    name_map = {old_name: new_name}
     for i, op in enumerate(graph.operations):
         inputs = getattr(op, "inputs", None)
         if inputs:
             for j, inp in enumerate(inputs):
                 if getattr(inp, "get_name", lambda: None)() == old_name:
                     inputs[j] = new_tb
+        # An in-place collective or wait (create_inplace / create_wait) also
+        # names its operand on its MutationOutput buffers and alias_names,
+        # which no .inputs rewrite reaches; left alone they name a buffer the
+        # splice removes.
+        mutated = False
+        for mutation in getattr(op, "mutation_outputs", None) or ():
+            if old_name in mutation.mutation_names:
+                mutation.mutation_names = [
+                    new_name if n == old_name else n for n in mutation.mutation_names
+                ]
+                mutated = True
+        alias_names = getattr(op, "alias_names", None)
+        if alias_names and old_name in alias_names:
+            op.alias_names = [new_name if n == old_name else n for n in alias_names]
+        if mutated:
+            graph.mutated_buffers.add(new_name)
         if isinstance(op, ir.ComputedBuffer):
             reads = {dep.name for dep in op.get_read_writes().reads}
             if old_name in reads:
