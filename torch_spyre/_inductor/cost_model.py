@@ -1530,9 +1530,7 @@ def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
             excess = (1 - is_lx) * price(m_split, k_split, cores)
         if arg.is_graph_boundary:
             external[arg.name] = (
-                _max_traffic(external[arg.name], excess)
-                if arg.name in external
-                else excess
+                max(external[arg.name], excess) if arg.name in external else excess
             )
         else:
             total += excess

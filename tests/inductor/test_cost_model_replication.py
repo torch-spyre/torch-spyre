@@ -1006,6 +1006,17 @@ def _at(m, n, k):
     return {SPLIT_M: m, SPLIT_N: n, SPLIT_K: k}
 
 
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_decode_delivery_charges_a_shared_boundary_weight_once(symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 4, 8, 1)
+    other = _gate_up(8, 8, 4, 1)
+    expr = _decode_weight_delivery_excess([op, other], _COST_PARAMS)
+    for m, n, k in DECODE_MENU if symbolic else [(4, 8, 1)]:
+        actual = float(sympy.sympify(expr).xreplace(_at(m, n, k)))
+        expected = max(_decode_expected(m, k, m * n * k), _decode_expected(8, 1, 32))
+        assert actual == pytest.approx(expected, abs=1.0)
+
+
 def test_the_symbolic_price_equals_the_concrete_price_at_every_candidate():
     expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
     at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K], expr, modules="math")
@@ -1059,7 +1070,10 @@ def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
         model.add(resident == int(weight_lx))
         wrapper = types.SimpleNamespace(division=division, buffer=buffer)
         sym_map = {is_lx.name: resident}
-        buffer_map = {sym.name: (wrapper, ()) for sym in buffer.sym_core_divs.values()}
+        buffer_map = {
+            sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+            for key, sym in buffer.sym_core_divs.items()
+        }
         model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
         solver = cp_model.CpSolver()
         assert solver.Solve(model) == cp_model.OPTIMAL
@@ -1093,7 +1107,10 @@ def test_cp_sat_gates_the_price_on_residency_without_a_product():
         division=model.new_int_var(0, len(DECODE_MENU) - 1, "div"), buffer=buffer
     )
     sym_map = {is_lx.name: model.new_bool_var("resident")}
-    buffer_map = {sym.name: (wrapper, ()) for sym in buffer.sym_core_divs.values()}
+    buffer_map = {
+        sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+        for key, sym in buffer.sym_core_divs.items()
+    }
     _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
     constraints = model.proto.constraints
     # One lookup for the price, though ``expand`` repeats it under the gate,
