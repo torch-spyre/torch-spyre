@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import pytest
 import sympy
 import torch
 import torch.fx as fx
@@ -39,7 +40,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
-from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
@@ -48,10 +49,6 @@ from torch_spyre._inductor.padding import (
     _is_dense_flattened_coordinate,
     _is_nonoverlapping_aligned_stick_coordinate,
     _restickify_input_required_extent,
-)
-from torch_spyre._inductor.wsr.propagate_named_dims import (
-    declare_tensor_dim,
-    name_tensor_dims,
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
@@ -843,49 +840,44 @@ class TestInsertPaddingIR(unittest.TestCase):
         # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
-    def test_bmm_read_copy_y_unaligned_k_pads(self) -> None:
-        """y is a coarse-tile read-copy buffer AND has unaligned K.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "for_each_tile gives a silently wrong result (~64% of elements) for "
+            "a matmul with unaligned K=67 and a loop-invariant weight (#5440)"
+        ),
+    )
+    def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
+        """A loop-invariant weight with unaligned K inside a for_each_tile body.
 
-        x is [E, M, K] tiled over E via spyre_hint; w (y in BatchMatmul terms)
-        is [K, N], loop-invariant across the E tiles, so coarse tiling inserts
-        a read-copy ComputedBuffer for it (see coarse_tile.py's
-        _insert_one_read_copy) -- that copy has no FX node of its own.  K=67 is
-        not stick-aligned, so insert_bmm_padding must pad the read-copy buffer,
-        not any FX-graph node.  Regression test for issue where
-        _find_arg_fx_node raised "no FX node found" for such a buffer.
+        x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
+        compiled result is ~64% wrong (max abs error ~2.7e4) although the same
+        graph with K=64 or without the loop is correct.  Compiling does not
+        fail, so this is a silent wrong answer in the for_each_tile path
+        (#5440).  insert_bmm_padding must also pad the read-copy buffer for w,
+        which has no FX node of its own.
         """
         dtype = torch.float16
-        stick_size = get_elem_in_stick(dtype)
         E, M, K, N = 3, 64, 67, 128
-        assert K % stick_size != 0
+        assert K % get_elem_in_stick(dtype) != 0
 
         x_cpu = torch.randn(E, M, K, dtype=dtype)
         w_cpu = torch.randn(K, N, dtype=dtype)
-        x = x_cpu.to(device="spyre")
-        w = w_cpu.to(device="spyre")
-
-        declare_tensor_dim("E", E)
-        declare_tensor_dim("M", M)
-        declare_tensor_dim("K", K)
-        declare_tensor_dim("N", N)
-        name_tensor_dims(x, ["E", "M", "K"])
-        name_tensor_dims(w, ["K", "N"])
 
         def fn(x, w):
-            with spyre_hint(num_tiles_per_dim={"E": E}):
-                return torch.matmul(x, w)
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, torch.matmul(x_tile, w_whole)
 
-        ops, result = self.compile_and_run(fn, (x, w))
-        matmuls = self._matmul_ops(ops)
-        self.assertEqual(len(matmuls), 1, "Expected exactly one batched matmul op")
-        mm = matmuls[0]
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
 
-        # reduction_ranges stays at K.
-        reduction = mm.data
-        assert isinstance(reduction, Reduction)
-        self.assertEqual(int(reduction.reduction_ranges[0]), K)
-
-        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
@@ -990,11 +982,9 @@ class TestInsertPaddingIR(unittest.TestCase):
 class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
     """White-box tests for ``lower_pad_sequence``'s host-stride ranking.
 
-    A coarse-tile read-copy buffer can carry a broadcast dim -- stride 0,
-    size > 1 -- alongside a dim that needs stick-boundary padding (see
-    coarse_tile.py's ``_insert_one_read_copy``: an ``ADVANCING_READ`` source
-    keeps its full, uncompacted rank, with absent/broadcast dims left at
-    stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
+    A buffer can carry a broadcast dim -- stride 0, size > 1 -- alongside a
+    dim that needs stick-boundary padding (an uncompacted-rank copy leaves
+    absent/broadcast dims at stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
     by the source buffer's raw host stride to preserve fastest/slowest
     ordering; ranking a stride-0 broadcast dim by that raw value put it
     first (0 sorts smallest) and handed it a real nonzero stride, corrupting

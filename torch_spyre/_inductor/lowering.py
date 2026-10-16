@@ -41,6 +41,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
     DEVICE_NAME,
+    DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -149,17 +150,21 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    An overload is eligible if it appears in either ``lowering.decompositions``
+    (the Spyre+Inductor merged table) *or* ``torch._decomp.get_decompositions``
+    (the raw upstream table that ``make_fallback``'s CI guard checks directly).
+    Checking both tables closes the gap where an overload is present in the
+    global post-autograd table (e.g. via ``_refs`` registrations) but absent
+    from Inductor's decomposition table — which is what caused the CI guard to
+    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
     """
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
             if (
                 overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+                or bool(torch._decomp.get_decompositions([overload]))
+            ) and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -310,7 +315,9 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
     layout passes (which key off ``op.data.origins[].target``) recognize it even
     when the lowering was called directly, without an FX node of its own. No-op
-    if a ``target`` origin already exists.
+    if a ``target`` origin already exists. The node is registered in the graph
+    env, so split_multi_ops can resolve the buffer by name when a fused body
+    downstream loads it.
     """
 
     def _realized_buffer(node):
@@ -333,6 +340,12 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # Passes that read the node expect what an FX-lowered node carries: an
+    # example value and an env entry.
+    with V.fake_mode:
+        fx_node.meta["val"] = ir.ir_node_to_tensor(result)
+    V.graph.env[fx_node] = result
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1116,13 +1129,19 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    if min is None and max is None:
+        raise Unsupported("clamp requires at least one bound")
+    # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
+    # encoding is finite. FP32 has IEEE infinities, so preserve those too.
+    dtype = x.get_dtype()
+    limit = float("inf") if dtype == torch.float32 else DLFLOAT16_MAX
     if min is None:
-        min = torch.finfo(torch.float16).min
+        min = -limit
     if max is None:
-        max = torch.finfo(torch.float16).max
+        max = limit
     pw = Pointwise.create(
         device=x.get_device(),
-        dtype=x.get_dtype(),
+        dtype=dtype,
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
             x.make_loader()(index), min, max
         ),
@@ -1423,37 +1442,6 @@ def lower_restickify(x):
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=base.get_size(),
-        origin_node=V.get_current_node(),
-        traceback=x.get_traceback(),
-    )
-
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.compact)
-def lower_compact(x):
-    # Just emit a pointwise op here. At this point we only know that
-    # 1) the host output layout should be the same as the host input layout
-    # 2) the device output layout should be the default for the host layout
-    # 3) we don't know the device input layout
-    #
-    # Later, during Opspec generation we have the input device layout and
-    # there we can decide to emit an identity or restickify and slice.
-
-    # Here we don't unwrap because we need to know what dimensions
-    # Pytorch is reasoning on.
-    x.realize()
-    loader = x.make_loader()
-
-    def inner_fn(index):
-        return loader(index)
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
@@ -1777,13 +1765,41 @@ def lower_constant_pad_nd(
     return output
 
 
+def _trunc(x):
+    """Truncate a float32 tensor, as a cast to an integer dtype does.
+
+    The device converts float32 to int32 with floor, but a cast truncates
+    (C-style, like rounding_mode="trunc"), so a float32 -> int cast truncates
+    first; the conversion of the integer-valued result is then exact.
+    clip(x, -1, 1) is the sign of x wherever floor(|x|) is nonzero, so the product
+    needs no compare or select, which split_multi_ops cannot replay in a fused body.
+
+    The result is realized with an origin of its own. The product reads x twice,
+    and as the last op of its own body it may: split_multi_ops refuses only an
+    intermediate that combines a view load with another operand, so fused into
+    the conversion it would refuse a source read through a view.
+    """
+    result = lowering.mul(lowering.floor(lowering.abs(x)), lowering.clamp(x, -1.0, 1.0))
+    origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+    _ensure_synthetic_origin(
+        result, torch.ops.aten.trunc.default, () if origin is None else (origin,)
+    )
+    return result
+
+
 @register_spyre_lowering(
     torch.ops.prims.convert_element_type.default,
     type_promotion_kind=None,
 )
-def to_dtype(x, dst_dtype, use_compute_types=True):
+def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     # PT 2.12 passes a ``use_compute_types`` kwarg to registered dtype-conversion
     # lowerings; accept and forward it to the in-tree lowering.
+    #
+    # ``skip_trunc`` declares that a float source is integer-valued, so it converts
+    # to an integer exactly without the trunc. A lowering casting its own float
+    # result back to an integer should pass it: the trunc adds ops fused into the
+    # conversion, and split_multi_ops cannot split a fused body over a buffer
+    # realized inside a lowering, which has no FX node.
     from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
     src_dtype = x.get_dtype()
@@ -1791,26 +1807,28 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
+    # No bool format has an op to an integer, but float32 has one, and a bool's
+    # 0/1 values convert exactly through it.
+    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
 
-    # DMA-copied bool InputBuffers have a different HBM element ordering than
-    # computation-kernel outputs, so a stick-reordering typecast (e.g.
-    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
-    # Fall back to CPU for host bools whose conversion reorders sticks; an
-    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
-    # use the native path. Peel through views (reshape/expand) too, since a
-    # viewed host bool is still backed by the same DMA-copied InputBuffer.
-    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
-        dst_dtype
+    if (
+        src_dtype == torch.float32
+        and dst_dtype in (torch.int32, torch.int64)
+        and not skip_trunc
     ):
-        if isinstance(_peel_through_views(x), ir.InputBuffer):
-            op = torch.ops.spyre.to_dtype_cpu.default
-            return eager_fallback(op, x, dst_dtype)
+        x = _trunc(x)
 
+    # Do not realize the result or stamp an origin on it here. split_multi_ops
+    # materializes a fused conversion over its source buffer; realizing it here
+    # would size the conversion of an expanded view at the broadcast extent.
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
     )
@@ -1838,18 +1856,29 @@ def with_int64_fallback(fn, *args, convert_output=True):
     if not has_int64:
         return fn(*args)
 
-    # Convert args, skipping constants
-    converted_args = []
-    for x in args:
+    def convert(x):
         if isinstance(x, (int, float)):
-            converted_args.append(x)
-        else:
-            converted_args.append(to_dtype(x, torch.float32))
+            return x
+        converted = to_dtype(x, torch.float32)
 
-    output = fn(*converted_args)
+        # split_multi_ops currently does not support views in a fused
+        # intermediate: it rebuilds the op over the base buffers, so two
+        # conversions of one buffer at different offsets (e.g. two select()
+        # rows) would read the same elements. Work around it by giving each
+        # conversion a buffer of its own.
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+        return converted
+
+    output = fn(*[convert(x) for x in args])
 
     if convert_output:
-        return to_dtype(output, torch.int64)
+        # The ops served here combine integer values into integer values.
+        return to_dtype(output, torch.int64, skip_trunc=True)
 
     return output
 
@@ -1884,7 +1913,7 @@ def lower_where(condition, self, other):
     #
     # Behaviour per value dtype:
     #   fp16/bf16:  host bool skips cast; computed bool and others cast normally
-    #   fp32:       condition cast to fp32 (aligns sticks; host bool via CPU fallback)
+    #   fp32:       condition cast to fp32 (aligns sticks)
     #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
     #   int64:      CPU fallback for int→fp32; cast back to int64 after
 
@@ -1925,6 +1954,9 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if not skip_cast:
+        # Spliced loop bodies no longer have FX bindings for splitting this cast.
+        converted_condition.realize()
 
     result = lowering.where(converted_condition, converted_self, converted_other)
 
@@ -1934,7 +1966,8 @@ def lower_where(condition, self, other):
     # Realize the where result to prevent unintended fusing on fp32->int32
     result.realize()
     if result_dtype != val_dtype:
-        result = to_dtype(result, result_dtype)
+        # The result selects one of the integer-valued operands.
+        result = to_dtype(result, result_dtype, skip_trunc=True)
 
     return result
 
@@ -2071,9 +2104,9 @@ def _cmp_operand_dtype(tensors):
     Unifying the dtype does not make every mixed pair run on device, and the
     three outcomes are worth keeping straight:
 
-    * fp16 <-> fp32 goes through dl16tofp32 / fp32todl16, which are
-      STICK-REORDERING conversions (see _STICK_REORDERING_OPS in dtype_ops.py):
-      the converted operand ends up with a staggered element arrangement. That is
+    * fp16 <-> fp32 goes through dl16tofp32 / fp32todl16, which change the
+      elements per stick: the converted operand ends up with a staggered element
+      arrangement. That is
       legal on device and is NOT refused here -- propagate_layouts.py allows a
       staggered operand to combine with a STANDARD one that broadcasts at the
       stick dim, and rejects the rest. Both branches still fail overall, but for

@@ -100,6 +100,28 @@ def _preserve_spyre_input_storage_offsets():
 
 
 @contextmanager
+def _unique_operation_names():
+    """Name every operation as ``register_operation_after_graph_edit`` does.
+
+    Upstream ``GraphLowering.register_operation`` names an op
+    ``op{len(graph.operations)}``.  Pre-scheduling passes that lower new nodes
+    (``insert_restickify``, ``insert_bmm_padding``, ``coarse_tile``) register
+    them after earlier passes have shortened the list, so the name can already
+    belong to a live op and ``name_to_op`` is overwritten.  Anything that then
+    looks the op up by name gets the newcomer.  While lowering only appends, the
+    first free name is the upstream one.
+    """
+    from torch_spyre._inductor.pass_utils import register_operation_after_graph_edit
+
+    old_register_operation = GraphLowering.register_operation
+    GraphLowering.register_operation = register_operation_after_graph_edit  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.register_operation = old_register_operation  # type: ignore[method-assign]
+
+
+@contextmanager
 def enable_spyre_context(example_inputs: list[InputType]):
     """
     Context manager that sets up the complete Spyre compilation environment.
@@ -137,6 +159,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor import timing_recorder
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
@@ -191,7 +214,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
                 recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
-        old_update_scheduler(self)
+        # Upstream scheduler construction, which the pre-scheduling pipeline runs
+        # immediately before. Timed separately so the two are not conflated.
+        with timing_recorder.stage("stage:GraphLowering:update_scheduler"):
+            old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
@@ -227,6 +253,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
+        _unique_operation_names(),
         enable_spyre_lowerings(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),

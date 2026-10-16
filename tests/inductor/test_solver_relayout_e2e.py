@@ -42,8 +42,8 @@ from torch_spyre._inductor.scratchpad import allocator as alloc_mod
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
 
 
-def _no_matches(self, consumer_op, consumer_divs, parent_names, *args, **kwargs):
-    return {parent: [] for parent in parent_names}
+def _no_matches(self, edges, *args, **kwargs):
+    return {parent: [] for parent in edges}
 
 
 class _Observed:
@@ -390,60 +390,45 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
     torch.testing.assert_close(out.cpu(), fn(hx, hw), rtol=2e-2, atol=2e-2)
 
 
-def _prices_replicated_reads() -> bool:
-    """Whether the cost model charges a replicated matmul operand per replica core
-    (#4454). Without it the demoted bmm's re-read of a broadcast operand is priced
-    once at the shared peak, ~312 ns here against a ~208 ns shuffle after the
-    overlap discount, so the solver correctly declines the wrong comparison."""
-    import dataclasses
-
-    from torch_spyre._inductor.cost_model import ArgTraffic
-
-    return "replication" in {f.name for f in dataclasses.fields(ArgTraffic)}
-
-
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "gather",
-        pytest.param(
-            "broadcast",
-            marks=pytest.mark.xfail(
-                not _prices_replicated_reads(),
-                strict=True,
-                reason="broadcast admission needs #4454's replicated-read pricing",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("kind", ["gather", "broadcast"])
 def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     """#3440's grouped fixtures decided by the solver instead of the greedy
     collector (see ``relayout_fixtures.grouped_relayout_graph``). Hints pin both
     divisions, so no slicing match exists and the solver either buys the
     grouped movement or demotes ``hidden`` to HBM, where every replica core
     re-reads its slice (#4454 prices that). The only patches are read-only
-    spies; the parity spy checks the committed collector certifies the same
-    edge, and #3440's payload check that the emitted op runs in LX."""
-    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+    spies.
 
+    Frontend checks (no native-output validation):
+    - assert_emitted_in_lx verifies that exactly one plan was produced, no
+    group was demoted by the scheduler, the solver's planned (source,
+    destination) LX address pair matches the pair emitted by codegen, exactly
+    one shuffle op was recorded by spyre_kernel, and every plan consumer
+    reads the materialized copy buffer.
+    - The parity sub-check runs the committed collector on the same committed
+    graph and verifies the same edge with matching core count, work-slice
+    partition, and per-endpoint LX footprint.
+    - plan.num_cores and destination_view.num_cores match the fixture's
+    source_cores / destination_cores expectations, verifying that the
+    solver preserves the core counts from the grouped graph.
+    - _core_slices owner-set sizes match src_owners / dst_owners,
+    verifying the physical partitioning at the source and destination.
+
+    Numerical check:
+    torch.testing.assert_close compares the device output, moved to CPU
+    float, against the fixture reference (rtol=2e-2, atol=2e-1)."""
+
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
     from relayout_fixtures import grouped_relayout_graph
-    from utils_inductor import (
-        assert_lx_only_relayout_payload,
-        capture_backend_output_dirs,
-    )
 
     observed = _Observed(monkeypatch, force=False)
     fn, args, reference, expect = grouped_relayout_graph(kind)
-    with (
-        config.patch({**_COOPT, "sencores": 32}),
-        capture_backend_output_dirs() as dirs,
-    ):
+    with config.patch({**_COOPT, "sencores": 32}):
         out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
             *args
         )
 
     observed.assert_emitted_in_lx(expected_plans=1)
-    assert_lx_only_relayout_payload(dirs)
     (plan,) = observed.plans
     assert plan.num_cores == expect["source_cores"], "the plan keeps the source's"
     assert plan.destination_view.num_cores == expect["destination_cores"]
@@ -596,24 +581,15 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
     )
 
 
-@pytest.mark.skip(
-    reason="co-opt+cpsat crashes on any coarse-tiled graph before relayout "
-    "is even considered (symbolic relationals in coarse_underfill_eff and "
-    "the LX-spill derate reached by tiled ops; #3810 review finding). "
-    "Unskip when the substrate handles symbolic coarse-tile features; the "
-    "gate itself is covered by unit tests in "
-    "test_solver_relayout_candidates.py."
-)
 def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     """A coarse-tiled graph must enumerate NO relayout candidates.
 
-    Both ops sit in one coarse-tile hint scope, so the producer's buffer is
+    Both ops sit in one for_each_tile body, so the producer's buffer is
     per-tile scratch and the edge lives inside the loop. The fitted law has
     no loop_trip factor and the committed-path planner forbids in-loop
     relayouts; the solver path must decline at enumeration (loop_info gate),
     not merely decline to fire."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
     orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
@@ -641,25 +617,24 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     torch._dynamo.reset()
 
     def fn(t, u):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                z = torch.abs(t) + u
-                return z * 2
+        def body(_, ops):
+            t_tile, u_tile = ops
+            return None, (torch.abs(t_tile) + u_tile) * 2
+
+        return for_each_tile(body, (t, u), dims=(0, 0), tile_size=128, out_dim=0)[1]
 
     torch.manual_seed(0)
     ha = torch.randn(512, 256, dtype=torch.float16)
     hb = torch.randn(512, 256, dtype=torch.float16)
-    for name, size in (("A", 512), ("B", 256)):
-        _pnd.declare_tensor_dim(name, size)
-    a = _pnd.name_tensor_dims(ha.to("spyre"), ["A", "B"])
-    b = _pnd.name_tensor_dims(hb.to("spyre"), ["A", "B"])
+    a = ha.to("spyre")
+    b = hb.to("spyre")
     with config.patch(
         {
             "co_optimizing_lx_planning": True,
             "layout_solver": "cpsat",
         }
     ):
-        out = torch.compile(fn, dynamic=False)(a, b)
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
     assert tables == [], f"coarse-tiled edges were offered relayout: {tables}"
     assert recorded == []

@@ -21,6 +21,7 @@ from unittest import mock
 
 import torch
 import torch.nn.functional as F
+from torch._inductor.test_case import fresh_cache
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
@@ -1181,6 +1182,105 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
         torch.testing.assert_close(
             actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2
         )
+
+    def test_decode_o_proj_after_sdpa(self):
+        """M=1 SDPA decode with head tiling, followed by the o_proj linear.
+
+        Head-tiled SDPA leaves its output [B, H, 1, D] in a factorized layout.
+        After transpose+reshape to [B, 1, H*D], the combined H*D dim is the K
+        dimension of the o_proj bmm, whose x then reads a mixed-radix function
+        of the contraction variable alone, here ``[floor(d1/512),
+        floor(Mod(d1, 512)/128), 0, Mod(d1, 128)]`` for eight head tiles, which
+        ``_canonical_stl_from_collapsed_host`` must collapse into one logical K
+        dimension.
+
+        The default ``decode`` strategy no longer tiles the heads of this shape,
+        so the test forces eight head tiles, and asserts that a loop really
+        formed so a strategy change cannot quietly turn it back into a plain
+        compile-and-numerics check.
+
+        This test does NOT guard the case it was first written for, where an
+        outer tile variable appears alongside the contraction variable
+        (``[0, 32*d0 + floor(d1/D), 0, Mod(d1, D)]``, which needed o_proj to
+        sit inside SDPA's loop).  SDPA no longer places o_proj there, and
+        restoring the strict pre-fix check in ``propagate_layouts`` does not
+        fail this test.  A split-K-over-heads ``for_each_tile`` reaches the same
+        "cannot canonicalize factorized x_var" rejection today.
+        """
+        B, H, Lq, Lk, D = 1, 32, 1, 2048, 128
+        hidden = H * D
+        generator = torch.Generator().manual_seed(0x4331)
+        q = torch.randn(B, H, Lq, D, dtype=torch.float16, generator=generator)
+        k = torch.randn(B, H, Lk, D, dtype=torch.float16, generator=generator)
+        v = torch.randn(B, H, Lk, D, dtype=torch.float16, generator=generator)
+        w = torch.randn(hidden, hidden, dtype=torch.float16, generator=generator)
+
+        def fn(q, k, v, w):
+            attn_out = F.scaled_dot_product_attention(q, k, v, scale=D**-0.5)
+            x = attn_out.transpose(1, 2).reshape(B, Lq, hidden)
+            return F.linear(x, w)
+
+        def force_head_tiles(**kwargs):
+            return dataclasses.replace(_select_sdpa_tiling(**kwargs), num_head_tiles=8)
+
+        expected = fn(q, k, v, w)
+        # A fresh cache: the patched selector is not part of the compile cache
+        # key, so a cached unforced compile of the same graph would be reused.
+        with (
+            fresh_cache(),
+            mock.patch.object(
+                _decompositions, "_select_sdpa_tiling", side_effect=force_head_tiles
+            ),
+        ):
+            actual, sources = run_and_get_code(
+                torch.compile(fn, fullgraph=True, dynamic=False),
+                q.to("spyre"),
+                k.to("spyre"),
+                v.to("spyre"),
+                w.to("spyre"),
+            )
+
+        self.assertIn("LoopSpec(", "\n".join(sources))
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0.2, rtol=0.2
+        )
+
+    def test_packed_qkv_input_offsets_h8(self):
+        """Read copies preserve offsets of QKV views repaired after pre-stickify.
+
+        Eight heads trigger SDPA's H coarse tiling.  K and V are non-contiguous
+        views into one packed allocation, with nonzero storage offsets.  Before
+        issue #4331's fix the generated per-tile read copies silently read Q's
+        slice for both tensors.
+        """
+        B, H, L, D = 1, 8, 64, 64
+        generator = torch.Generator().manual_seed(0x4331)
+        packed = torch.randn(B, L, 3 * H * D, dtype=torch.float16, generator=generator)
+
+        def split_qkv(x):
+            return tuple(
+                part.reshape(B, L, H, D).transpose(1, 2) for part in x.chunk(3, dim=-1)
+            )
+
+        q_cpu, k_cpu, v_cpu = split_qkv(packed)
+        mask = torch.zeros(L, L, dtype=torch.float16).masked_fill(
+            ~torch.ones(L, L, dtype=torch.bool).tril(),
+            torch.finfo(torch.float16).min,
+        )[None, None]
+        expected = F.scaled_dot_product_attention(
+            q_cpu, k_cpu, v_cpu, attn_mask=mask, scale=D**-0.5
+        )
+
+        q, k, v = split_qkv(packed.to("spyre"))
+        self.assertEqual(
+            (q.storage_offset(), k.storage_offset(), v.storage_offset()),
+            (0, H * D, 2 * H * D),
+        )
+        actual = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask.to("spyre"), scale=D**-0.5
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.1)
 
 
 if __name__ == "__main__":

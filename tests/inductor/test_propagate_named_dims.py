@@ -36,12 +36,8 @@ from utils_inductor import _compile_and_run, mock_backend_compiler
 
 DEVICE = torch.device("spyre")
 
-# loop_var symbols (d0, d1, ...) are assigned by Inductor outermost-first and
-# are stable across compilations for a given function shape.  d0 is the outermost
-# surviving loop variable for both pointwise and reduction ops.
-# (Verified: test_2d_add and test_2d_reduce_on_M both assign d0 across 3 runs.)
 _CaptureResult = collections.namedtuple(
-    "_CaptureResult", ["propagated_dims", "reduction_dims", "dim_hints"]
+    "_CaptureResult", ["propagated_dims", "reduction_dims"]
 )
 
 # Dim sizes shared by the attention-shaped tests.
@@ -59,21 +55,14 @@ def _run_and_capture(
     *,
     expected_propagated_dims=None,
     expected_reduction_dims=None,
-    expected_dim_hints=None,
 ):
     """Declare dims, annotate device tensors, compile, return _CaptureResult.
 
     named_dims: the output op's _dim_prop_info.named_dims (captured between
         propagate_named_dims and assign_dim_hints).
     reduction_dims: the output op's _dim_prop_info.reduction_named_dims.
-    dim_hints: the output op's dim_hints list (captured after assign_dim_hints).
 
     If expected_propagated_dims is provided, asserts result.propagated_dims matches.
-    If expected_dim_hints is provided, asserts that the captured dim_hints match.
-    Each dim_hints entry is a dict:
-        {"loop_var": "d0", "dim_names": ["B"], "split_count": 4, "is_reduction": False}
-    loop_var is the sympy Symbol rendered as a string, or None for broadcast ops.
-
     Only the final output op is captured — same scope as named_dims.
     """
     for name, size in named_dims.items():
@@ -83,7 +72,6 @@ def _run_and_capture(
 
     captured = {}
     real_propagate = _passes.propagate_named_dims
-    real_assign = _passes.assign_dim_hints
 
     def capturing_propagate(graph):
         real_propagate(graph)
@@ -103,22 +91,8 @@ def _run_and_capture(
                 else None
             )
 
-    def capturing_assign(graph):
-        real_assign(graph)
-        output_names = set(graph.get_output_names())
-        output_ops = [
-            op
-            for op in graph.operations
-            if isinstance(op, ComputedBuffer)
-            and op.get_name() in output_names
-            and getattr(op, "dim_hints", None)
-        ]
-        if output_ops:
-            captured["dim_hints"] = list(output_ops[-1].dim_hints)
-
     with (
         patch.object(_passes, "propagate_named_dims", capturing_propagate),
-        patch.object(_passes, "assign_dim_hints", capturing_assign),
         patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
         patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
         mock_backend_compiler(),
@@ -137,7 +111,6 @@ def _run_and_capture(
     result = _CaptureResult(
         propagated_dims=captured.get("named_dims", []),
         reduction_dims=captured.get("reduction_dims"),
-        dim_hints=captured.get("dim_hints", []),
     )
 
     if expected_propagated_dims is not None:
@@ -150,20 +123,6 @@ def _run_and_capture(
         assert result.reduction_dims == expected_reduction_dims, (
             f"reduction_named_dims mismatch:\n  got:      {result.reduction_dims}"
             f"\n  expected: {expected_reduction_dims}"
-        )
-
-    if expected_dim_hints is not None:
-        actual = [
-            {
-                "loop_var": str(h.loop_var) if h.loop_var is not None else None,
-                "dim_names": h.dim_names,
-                "split_count": h.split_count,
-                "is_reduction": h.is_reduction,
-            }
-            for h in result.dim_hints
-        ]
-        assert actual == expected_dim_hints, (
-            f"dim_hints mismatch:\n  got:      {actual}\n  expected: {expected_dim_hints}"
         )
 
     return result
@@ -180,22 +139,13 @@ def test_2d_add():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a + b
+        return a + b
 
     _run_and_capture(
         fn,
         [x, y],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"], y: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M", "N"],
     )
 
@@ -206,22 +156,13 @@ def test_2d_add_transposed():
     y = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a + b.t()
+        return a + b.t()
 
     _run_and_capture(
         fn,
         [x, y],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"], y: ["N", "M"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M", "N"],
     )
 
@@ -231,22 +172,13 @@ def test_2d_reduce_on_M():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
-            return a.sum(dim=0)
+        return a.sum(dim=0)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["N"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["N"],
     )
 
@@ -256,22 +188,13 @@ def test_2d_reduce_on_N():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.sum(dim=1)
+        return a.sum(dim=1)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M"],
     )
 
@@ -281,22 +204,13 @@ def test_2d_reduce_on_M_contiguous_before():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
-            return a.contiguous().sum(dim=0)
+        return a.contiguous().sum(dim=0)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["N"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["N"],
     )
 
@@ -306,22 +220,13 @@ def test_2d_reduce_on_M_contiguous_after():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
-            return a.sum(dim=0).contiguous()
+        return a.sum(dim=0).contiguous()
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["N"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["N"],
     )
 
@@ -331,22 +236,13 @@ def test_2d_reduce_on_N_contiguous_before():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.contiguous().sum(dim=1)
+        return a.contiguous().sum(dim=1)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M"],
     )
 
@@ -356,22 +252,13 @@ def test_2d_reduce_on_N_contiguous_after():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.sum(dim=1).contiguous()
+        return a.sum(dim=1).contiguous()
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M"],
     )
 
@@ -381,22 +268,13 @@ def test_2d_transposed_reduce_on_M():
     x = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
-            return a.t().sum(dim=0)
+        return a.t().sum(dim=0)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["N", "M"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["N"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["N"],
     )
 
@@ -406,22 +284,13 @@ def test_2d_transposed_reduce_on_N():
     x = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.t().sum(dim=1)
+        return a.t().sum(dim=1)
 
     _run_and_capture(
         fn,
         [x],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["N", "M"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M"],
     )
 
@@ -435,22 +304,13 @@ def test_no_permute():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return (q * scale).contiguous()
+        return (q * scale).contiguous()
 
     _run_and_capture(
         fn,
         [queries],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "H", "Lq", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
@@ -461,22 +321,13 @@ def test_permute_then_contiguous():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return (q.permute(0, 2, 1, 3) * scale).contiguous()
+        return (q.permute(0, 2, 1, 3) * scale).contiguous()
 
     _run_and_capture(
         fn,
         [queries],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
@@ -487,22 +338,13 @@ def test_permute_no_contiguous():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, s):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return q.permute(0, 2, 1, 3) * s
+        return q.permute(0, 2, 1, 3) * s
 
     _run_and_capture(
         fn,
         [queries, scale],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
@@ -513,22 +355,13 @@ def test_contiguous_then_mul():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return q.permute(0, 2, 1, 3).contiguous() * scale
+        return q.permute(0, 2, 1, 3).contiguous() * scale
 
     _run_and_capture(
         fn,
         [queries],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
@@ -545,10 +378,9 @@ def test_permute_matmul():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, k):
-        with _spyre_hint(num_tiles_per_dim={"L": 2}):
-            q_perm = q.permute(0, 2, 1, 3) * scale
-            k_perm = k.permute(0, 2, 3, 1) * scale
-            return torch.matmul(q_perm, k_perm)
+        q_perm = q.permute(0, 2, 1, 3) * scale
+        k_perm = k.permute(0, 2, 3, 1) * scale
+        return torch.matmul(q_perm, k_perm)
 
     _run_and_capture(
         fn,
@@ -558,24 +390,12 @@ def test_permute_matmul():
             queries: ["B", "L", "H", "D"],
             keys: ["B", "L", "H", "D"],
         },
-        expected_dim_hints=[
-            {
-                "loop_var": "d3",
-                "dim_names": ["L"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "L", "L"],
     )
 
 
 def test_view_reshape_a():
     """View/reshape with shared name for equal-size dims (A==D, both called AD).
-
-    No expected_dim_hints: b=3 creates a fractional coordinate expression
-    (2*c0 + 2*c2/3) in views.py that the coordinate normalizer does not support,
-    so any hint triggers an InductorError during compilation.
 
     Dims of size 2 share one name AD; all other dims are distinct.
     w, x: [1, AD, B*AD*E] annotated ["AD", "B", "AD", "E"]
@@ -639,7 +459,6 @@ def test_view_reshape_b():
             y: ["A", "C", "D", "E"],
             z: ["A", "C"],
         },
-        # no dim_hints: 4-input fusion hits the 5-tensor bundle limit with a hint
         expected_propagated_dims=["A", "C", "B", "D", "E"],
     )
 
@@ -653,31 +472,19 @@ def test_permute_exp():
     queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return q.permute(0, 2, 1, 3).exp()
+        return q.permute(0, 2, 1, 3).exp()
 
     _run_and_capture(
         fn,
         [queries],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={queries: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
 
 def test_permute_matmul_distinct_lqlk():
     """Two permuted inputs into matmul with Lq != Lk; passes with distinct sizes.
-
-    No expected_dim_hints: all dims are too small to tile safely
-    (largest is Lk=32; split_count=2 gives tile size 16, below the 64-element minimum).
 
     queries [B, Lq, H, D] -> permute -> [B, H, Lq, D]
     keys    [B, Lk, H, D] -> permute -> [B, H, D, Lk]
@@ -707,9 +514,6 @@ def test_permute_matmul_distinct_lqlk():
 
 def test_permute_mul_equal_dims():
     """Permute + constant multiply where the two middle dims share the same size.
-
-    No expected_dim_hints: all dims are too small to tile safely
-    (L=16, D=64; split_count=2 gives tile sizes 8 and 32, both below the 64-element minimum).
 
     queries [B, L, L, D] -> permute(0,2,1,3) * 0.5 -> [B, L, L, D]
     """
@@ -741,8 +545,7 @@ def test_broadcast_unsqueeze_mul():
 
     def fn(a, c_full):
         c_reduced = c_full.amax(dim=-1)  # [B,H,Lk,D] -> [B,H,Lk]
-        with _spyre_hint(num_tiles_per_dim={"Lk": 2}):
-            return c_reduced.unsqueeze(-1) * a
+        return c_reduced.unsqueeze(-1) * a
 
     _run_and_capture(
         fn,
@@ -751,14 +554,6 @@ def test_broadcast_unsqueeze_mul():
         tensor_dims={
             c: ["B", "H", "Lk", "D"],
         },
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lk"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lk", "_untracked_128"],
     )
 
@@ -775,8 +570,7 @@ def test_permute_matmul_equal_lqlk_distinct_names():
     def fn(q, k):
         q_perm = q.permute(0, 2, 1, 3) * scale
         k_perm = k.permute(0, 2, 3, 1) * scale
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return torch.matmul(q_perm, k_perm)
+        return torch.matmul(q_perm, k_perm)
 
     _run_and_capture(
         fn,
@@ -786,14 +580,6 @@ def test_permute_matmul_equal_lqlk_distinct_names():
             queries: ["B", "Lq", "H", "D"],
             keys: ["B", "Lk", "H", "D"],
         },
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "Lk"],
     )
 
@@ -811,22 +597,13 @@ def test_permuted_intermediate_then_reduce():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            return (q * scale).permute(0, 2, 1, 3).sum(dim=-1)
+        return (q * scale).permute(0, 2, 1, 3).sum(dim=-1)
 
     _run_and_capture(
         fn,
         [q],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={q: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq"],
     )
 
@@ -848,32 +625,20 @@ def test_permuted_intermediate_then_pointwise():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, bias):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            inter = (q * scale).permute(0, 2, 1, 3).exp()
-            return inter * bias
+        inter = (q * scale).permute(0, 2, 1, 3).exp()
+        return inter * bias
 
     _run_and_capture(
         fn,
         [q, bias],
         named_dims={"B": B, "H": H, "Lq": Lq, "D": D},
         tensor_dims={q: ["B", "Lq", "H", "D"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d2",
-                "dim_names": ["Lq"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["B", "H", "Lq", "D"],
     )
 
 
 def test_view_reshape_a_distinct_names():
-    """Like test_view_reshape_a but with distinct names A/D for the equal-size dims.
-
-    No expected_dim_hints: same b=3 fractional coordinate limitation as test_view_reshape_a.
-    """
+    """Like test_view_reshape_a but with distinct names A/D for the equal-size dims."""
     a, b, c, d, e = 2, 3, 4, 2, 64
     w = torch.randn(1, a, b * d * e, dtype=torch.float16, device=DEVICE) * 0.1
     x = torch.randn(1, a, b * d * e, dtype=torch.float16, device=DEVICE) * 0.1
@@ -903,8 +668,6 @@ def test_view_reshape_a_distinct_names():
 def test_view_reshape_then_reduce():
     """View/reshape intermediate fed into a Reduction.
 
-    No expected_dim_hints: same b=3 fractional coordinate limitation as test_view_reshape_a.
-
     w, x: [1, A, B*D*E] -> add -> view(1, A, B, D, E) -> sum(dim=-1) -> [1, A, B, D]
 
     The view intermediate has fused dims in its layout (dep.index has multi-symbol
@@ -932,10 +695,7 @@ def test_view_reshape_then_reduce():
 
 
 def test_permute_mul_equal_dims_distinct_names():
-    """Like test_permute_mul_equal_dims but with distinct names H/Lq for equal dims.
-
-    No expected_dim_hints: same small-dim limitation as test_permute_mul_equal_dims.
-    """
+    """Like test_permute_mul_equal_dims but with distinct names H/Lq for equal dims."""
     _B, _H, _Lq, _D = 2, 16, 16, 64
     queries = torch.randn(_B, _Lq, _H, _D, dtype=torch.float16, device=DEVICE)
 
@@ -998,7 +758,6 @@ def test_reshape_1d_to_2d_exp():
     """1-D tensor [4096] annotated ['A'] -> reshape(64,64) raises Unsupported.
 
     A single named dim split by reshape cannot be propagated accurately.
-    No expected_dim_hints: compilation raises before assign_dim_hints runs.
     """
     _A = 4096
     x = torch.randn(_A, dtype=torch.float16, device=DEVICE)
@@ -1048,22 +807,13 @@ def test_broadcast_expand_leading_dim():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.expand(_M, _N) + b
+        return a.expand(_M, _N) + b
 
     _run_and_capture(
         fn,
         [x, y],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": None,
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["_untracked_128", "_untracked_256"],
     )
 
@@ -1080,31 +830,19 @@ def test_broadcast_expand_trailing_dims():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
-            return a.expand(_M, _N) + b
+        return a.expand(_M, _N) + b
 
     _run_and_capture(
         fn,
         [x, y],
         named_dims={"M": _M, "N": _N},
         tensor_dims={x: ["M", "N"]},
-        expected_dim_hints=[
-            {
-                "loop_var": "d0",
-                "dim_names": ["M"],
-                "split_count": 2,
-                "is_reduction": False,
-            },
-        ],
         expected_propagated_dims=["M", "_untracked_256"],
     )
 
 
 def test_broadcast_expand_middle_dim():
     """Broadcast annotation not yet supported: [B,1,D] annotated ["B","H","D"] mis-maps.
-
-    No expected_dim_hints: all dims too small to tile safely (B=4, H=32, D=64;
-    split_count=2 gives tile sizes 2, 16, and 32, all below the 64-element minimum).
 
     B is assigned correctly; the middle size-1 dim is skipped and "H" stays in
     remaining. _consume_names(["H","D"], D2=64) fails because "H"=32 is at the
@@ -1271,3 +1009,52 @@ def test_gather_2d_index():
         tensor_dims={x: ["M", "N"], i: ["P", "Q"]},
         expected_propagated_dims=["P", "Q", "N"],
     )
+
+
+# -------- validate_named_dims: expected_* hints must match propagation --------
+
+
+def _compile_expecting_error(fn, x, match):
+    """Compile ``fn`` and require validate_named_dims to reject its hints.
+
+    The assertion fires before assign_dim_hints runs, so the declared dims are
+    not cleared by the pipeline and are reset here to keep later tests clean.
+    """
+    try:
+        with (
+            patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
+            patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
+            mock_backend_compiler(),
+            pytest.raises(Exception, match=match),
+        ):
+            _compile_and_run(fn, [x], DEVICE)
+    finally:
+        _pnd.reset()
+
+
+def test_validate_named_dims_raises_on_mismatch():
+    """validate_named_dims raises when expected_named_dims is wrong."""
+    x = torch.randn(256, 256, dtype=torch.float16, device=DEVICE)
+    _pnd.declare_tensor_dim("A", 256)
+    _pnd.declare_tensor_dim("B", 256)
+    _pnd.name_tensor_dims(x, ["A", "B"])
+
+    def fn(x):
+        with _spyre_hint(expected_named_dims=["WRONG", "DIMS"]):
+            return torch.abs(x)
+
+    _compile_expecting_error(fn, x, "expected_named_dims")
+
+
+def test_validate_reduction_dims_raises_on_mismatch():
+    """validate_named_dims raises when expected_reduction_dims is wrong."""
+    x = torch.randn(512, 256, dtype=torch.float16, device=DEVICE)
+    _pnd.declare_tensor_dim("A", 512)
+    _pnd.declare_tensor_dim("B", 256)
+    _pnd.name_tensor_dims(x, ["A", "B"])
+
+    def fn(x):
+        with _spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["WRONG"]):
+            return x.amin(dim=0)
+
+    _compile_expecting_error(fn, x, "expected_reduction_dims")

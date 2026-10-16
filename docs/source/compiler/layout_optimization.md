@@ -25,9 +25,11 @@ The following passes implement the layout assignment pipeline, in order:
 |------|------|---------|
 | `propagate_spyre_tensor_layouts` | `propagate_layouts.py` | Forward propagation: assign *sets* of candidate STLs to each op's output |
 | `optimize_restickify_locations` | `optimize_restickify.py` | Layout selection: reduce each candidate set to one committed STL, minimizing total restickify cost |
+| `reorder_nonstick_dims` | `nonstick_dim_order.py` | Reorder non-stick device dimensions; records deferred work for mutation targets and graph inputs |
 | `finalize_layouts` | `insert_restickify.py` | Convert committed STLs to `FixedTiledLayout` and build the restickify insertion plan |
 | `insert_restickify` | `insert_restickify.py` | Insert restickify ops into the graph |
-| `reorder_nonstick_dims` | `nonstick_dim_order.py` | Reorder non-stick device dimensions for performance (independent of stick compatibility) |
+| `reorder_nonstick_dims_mutation` | `nonstick_dim_order.py` | Execute deferred dim-order reorders recorded by `reorder_nonstick_dims` |
+| `insert_post_mutation_restickify` | `insert_restickify.py` | Insert pre/post ops for offset-mutation edge cases |
 
 ---
 
@@ -220,7 +222,30 @@ prune the optimal path from the beam.
 
 ---
 
-## Pass 3 — Finalization and Restickify Insertion
+## Pass 3 — Non-stick Dimension Reorder (`reorder_nonstick_dims`)
+
+Passes 1 & 2 focus on stick constraints only ; non-stick dimension ordering is not optimized. `reorder_nonstick_dims` is a pass that focuses on selecting the order of non-stick dimensions.  It does not impact or change stick compatibility.  It is a separate pass (for now) to avoid coupling decisions that are fundamentally decoupled.
+
+`reorder_nonstick_dims` operates in two phases, run in order:
+
+### Phase 1 — constraint transforms
+
+Some ops impose hardware requirements on which device position a particular dimension must occupy. Phase 1 identifies these constraints and records them in `pinned_dims`, which phase 2 must respect. Currently this includes:
+
+- **Gather IA**: the indirectly-indexed dimension of a gather value tensor must sit at device position 0
+- **Scatter IA**: the scattered dimension of a scatter destination must sit at device position 0
+
+### Phase 2 — performance transforms
+
+Applies performance-motivated reorderings, respecting `pinned_dims` from phase 1. Currently this includes:
+
+- **Matmul perf reorder**: a fixed heuristic that swaps the largest non-pinned non-stick dim into the slot between the two stick dims (`outer_stick+1`). Applied to matmul input buffers by default; output buffer reorder is off by default (`SPYRE_NDO_MATMUL_OUTPUT_REORDER=1` to enable).
+
+For `ComputedBuffer`s, both phases update `committed_stl` in place. Cases that require inserting copy nodes — graph inputs and scatter mutation destinations — are deferred to `reorder_nonstick_dims_mutation`.
+
+---
+
+## Pass 4 — Finalization and Restickify Insertion
 
 ### `finalize_layouts`
 
@@ -241,23 +266,19 @@ loads and redirects them to the new restickified buffer, without touching any
 index expressions. The consumer `ComputedBuffer` is reconstructed as a fresh
 object to invalidate any cached size/body derived from the old inputs.
 
-### `insert_post_mutation_restickify`
+---
 
-A mutation op (`MutationLayoutSHOULDREMOVE`) writes its output directly into
-an existing target buffer rather than allocating a new one — it is an in-place
-write.  These need to be handled separately because `insert_restickify` pass runs before scheduling, but inductor requires an mutation ops to have their `FixedLayout` (rather than `FixedTiledLayout`) during scheduling. The solution is to have a separate pass, `insert_post_mutation_restickify`, handle mutation ops after scheduling has run.  
+## Pass 5 — Non-stick Dimension Reorder, Mutation (`reorder_nonstick_dims_mutation`)
+
+Analogous to `insert_post_mutation_restickify`: mutation op targets must retain their `FixedLayout` during scheduling, so their dim-order reorders cannot be applied before that point. This pass runs after `insert_restickify` once all layouts are frozen as `FixedTiledLayout`, and executes the deferred entries recorded by `reorder_nonstick_dims` — inserting copy nodes or rewriting producer layouts in place.
 
 ---
 
-## Pass 4 — Non-stick Dimension Reorder (`reorder_nonstick_dims`)
+## Pass 6 — Post-mutation Restickify (`insert_post_mutation_restickify`)
 
-Layout propagation varies only which dimension is the stick; non-stick
-dimension ordering is not optimized. `reorder_nonstick_dims` is a pass that focuses on selecting the order of non-stick dimensions.  It does not impact or change stick compatibility.
-
-The current pass focuses only on improving `matmul` performance by swapping the largest non-stick device dimension into the slot
-between the two stick dimensions (`outer_stick+1`).  However this pass will be expanded in future work.
-
-NOTE: this pass is currently executed after propagate_layouts and before `optimize_restickify`; however the code will soon align with the order written in this document.  `reorder_nonstick_dims` does not impact stick decisions or `optimize_restickify` in any way, so executing it between those passes is confusing and unnecessary.
+A mutation op (`MutationLayoutSHOULDREMOVE`) writes its output directly into
+an existing target buffer rather than allocating a new one — it is an in-place
+write.  These need to be handled separately because `insert_restickify` pass runs before scheduling, but inductor requires an mutation ops to have their `FixedLayout` (rather than `FixedTiledLayout`) during scheduling. The solution is to have a separate pass, `insert_post_mutation_restickify`, handle mutation ops after scheduling has run.
 
 ---
 
@@ -270,6 +291,10 @@ propagate_spyre_tensor_layouts(graph)
 optimize_restickify_locations(graph)
     → op.committed_stl for every op
 
+reorder_nonstick_dims(graph)
+    → rewrites committed_stl for non-stick dimensions
+    → records deferred work in graph.nonstick_deferred
+
 finalize_layouts(graph)
     → op.layout = FixedTiledLayout(committed_stl) for every op
     → graph.restickify_plan = {op_name: [{arg_name, target_layout}, ...], ...}
@@ -278,11 +303,11 @@ insert_restickify(graph)
     → splices restickify ComputedBuffers before affected consumer ops
     → patches consumer inner_fn via NameSwapHandler
 
+reorder_nonstick_dims_mutation(graph)
+    → executes graph.nonstick_deferred entries (copy nodes or producer rewrites)
+
 insert_post_mutation_restickify(graph)
     → inserts pre/post ops for offset-mutation edge cases
-
-reorder_nonstick_dims(graph)
-    → rewrites non-stick dimensions - no impact on stick compatibility
 ```
 
 ---

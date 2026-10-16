@@ -22,34 +22,46 @@ that chooses among tilings live elsewhere.
 
 The pass mints hint ids and a group-id offset from bases derived off the graph
 (never a reserved constant), so a tiling applied here cannot collide with a
-hint-driven group already stamped pre-stickification at pass 430. It reuses the
+for_each_tile group already stamped pre-stickification at pass 430. It reuses the
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
-ops that share a spec.
+ops that run the same loop nest.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import operator
 from collections.abc import Mapping, Sequence
 
 import sympy
 
+from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import iteration_space_from_op, op_out_coords
+from ..pass_utils import (
+    _prepare_per_core_view,
+    iteration_space_from_op,
+    op_out_coords,
+    op_read_writes,
+    tile_ownership_view,
+)
 from ..propagate_hints import DimHint
+from ..views import convert_modular_indexing
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
+from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
+from .utils import buffer_not_read_in_full
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -160,6 +172,98 @@ def _get_red_var(
     return loop_var, None
 
 
+def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
+    """Why ``op`` takes no coarse tiling for carrying a symbolic extent, or
+    ``None``.
+
+    Not a lowering limit but an applier one. The applier reads every output
+    range, reduction range and layout size of a tiled op as an ``int``
+    (``_raw_to_squeezed_pos``, ``_divide_ranges``), whichever axis the tiling
+    falls on. So an op with a symbolic extent anywhere -- a dim a recompile for
+    a second shape left symbolic -- cannot be tiled even on its static dims.
+
+    The same holds for the rest of a tiled layout's metadata
+    (``_layout_has_static_span_metadata``): the host strides can be symbolic
+    over static sizes -- a mutation op inherits its target view's strides --
+    and ``compute_tile_stride`` orders them by value.
+    """
+    for what, extents in (
+        ("output range", getattr(op.data, "ranges", None)),
+        ("reduction range", getattr(op.data, "reduction_ranges", None)),
+        ("layout size", getattr(getattr(op, "layout", None), "size", None)),
+    ):
+        for extent in extents or ():
+            if not (isinstance(extent, int) or getattr(extent, "is_Integer", False)):
+                return (
+                    f"coarse tiling: {op.get_name()} has symbolic {what} "
+                    f"{extent}; the applier reads every extent of a tiled op "
+                    "as an integer, so the op cannot be tiled."
+                )
+    layout = getattr(op, "layout", None)
+    if isinstance(layout, FixedTiledLayout) and not _layout_has_static_span_metadata(
+        layout
+    ):
+        return (
+            f"coarse tiling: {op.get_name()} has symbolic layout metadata "
+            f"(stride {list(layout.stride)}); the applier reads a tiled op's "
+            "layout as integers, so the op cannot be tiled."
+        )
+    return None
+
+
+def _revisits_an_element(
+    index: sympy.Expr, loop_var: sympy.Symbol, extent: sympy.Expr
+) -> bool:
+    """Whether ``index`` reaches some element twice as ``loop_var`` alone runs
+    ``extent`` iterations, every other variable held at 0. An index that cannot
+    be evaluated counts as revisiting."""
+    along = index.xreplace({s: 0 for s in index.free_symbols - {loop_var}})
+    try:
+        at = sympy.lambdify(
+            loop_var, along, modules=[{"FloorDiv": operator.floordiv}, "math"]
+        )
+        seen = set()
+        for step in range(int(extent)):
+            element = at(step)
+            if element in seen:
+                return True
+            seen.add(element)
+    except (NameError, TypeError, ValueError):
+        return True
+    return False
+
+
+def _repeated_read_reason(op: ComputedBuffer, loop_var: sympy.Symbol) -> str | None:
+    """Why ``loop_var`` cannot be tiled for walking an input more than once, or
+    ``None``.
+
+    ``x.repeat(1, 2, 1)`` reads ``x[d0, d1 mod N, d2]``: as ``d1`` runs, the
+    read walks ``x``'s dim 1 and then walks it again. The applier moves a tiled
+    read on by one tile extent per iteration, and this one would have to come
+    back round. A tile holding one whole repetition reads the same span every
+    time, which fails in codegen; a smaller one advances and then wraps, which
+    compiles and reads the wrong elements.
+
+    Only a read that comes back to an element is refused. The digits of a
+    reshape -- ``(d mod 4, d // 4)`` -- are modular and reach each element
+    once, so they are left alone, and so is a read that does not move along the
+    axis at all (a broadcast), which the applier holds still.
+    """
+    for dep in op_read_writes(op).reads:
+        if not isinstance(dep, MemoryDep) or loop_var not in dep.ranges:
+            continue
+        index = convert_modular_indexing(dep.index)
+        if not any(loop_var in mod.free_symbols for mod in index.find(sympy.Mod)):
+            continue
+        if _revisits_an_element(index, loop_var, dep.ranges[loop_var]):
+            return (
+                f"coarse tiling: {op.get_name()} reads {dep.name} more than once "
+                f"along {loop_var} ({dep.index}); a tile of that axis would have "
+                f"to wrap back over {dep.name}, so the axis cannot be tiled."
+            )
+    return None
+
+
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, spec: TileSpec
 ) -> tuple[list[sympy.Symbol] | None, str | None]:
@@ -176,7 +280,15 @@ def try_resolve_tile_axis_loop_vars(
     ``is_reduction``: ``op_out_coords(op)`` for an output axis
     (:func:`_get_out_var`), the squeezed reduction loop variables for a
     reduction axis (:func:`_get_red_var`).
+
+    A non-empty ``spec`` on an op with a symbolic extent is rejected whatever
+    its axes (:func:`_symbolic_extent_reason`), and so is an axis some read of
+    the op repeats along (:func:`_repeated_read_reason`).
     """
+    if spec.axes:
+        reason = _symbolic_extent_reason(op)
+        if reason is not None:
+            return None, reason
     out_coords = op_out_coords(op)
     iter_space = iteration_space_from_op(op)
     loop_vars: list[sympy.Symbol] = []
@@ -186,6 +298,9 @@ def try_resolve_tile_axis_loop_vars(
         else:
             loop_var, reason = _get_out_var(op, out_coords, iter_space, axis.host_dim)
         if loop_var is None:
+            return None, reason
+        reason = _repeated_read_reason(op, loop_var)
+        if reason is not None:
             return None, reason
         loop_vars.append(loop_var)
     return loop_vars, None
@@ -307,46 +422,201 @@ def prescribed_regions(operations: Sequence[Operation]) -> list[PrescribedRegion
 def derive_tiling_groups(
     graph: GraphLowering,
     choices: Mapping[str, TileSpec],
-) -> list[tuple[list[Operation], TileSpec]]:
-    """Group consecutive ops that share the same non-empty :class:`TileSpec`.
+) -> list[tuple[list[Operation], tuple[int, ...]]]:
+    """Group consecutive ops that run the same non-empty loop nest.
 
-    Mirrors ``hints_to_coarse_tile_groups``' consecutive-run shape with the hint
-    key replaced by the chosen ``TileSpec``: a run breaks whenever an op is
-    untiled (absent from ``choices`` or mapped to the empty spec) or its spec
-    differs from the run's. Contiguity is a hard requirement, not an
-    optimization -- ``validate_coarse_tile_groups`` and ``_apply_plan`` both rely
-    on each group occupying one contiguous stretch of the operation list, so a
-    connected component that skipped an intervening untiled op would be rejected
-    at apply time.
+    Groups are consecutive runs, keyed by each op's nest
+    (:attr:`TileSpec.level_counts`): a run
+    breaks whenever an op is untiled (absent from ``choices`` or mapped to the
+    empty spec) or its nest differs from the run's. Contiguity is a hard
+    requirement, not an optimization -- ``validate_coarse_tile_groups`` and
+    ``_apply_plan`` both rely on each group occupying one contiguous stretch of
+    the operation list.
+
+    Two non-adjacent runs on the same nest are therefore **two groups**, each
+    minting its own hint ids and group id. They are not the same group and not
+    an error: nest equality is structural, so unrelated regions anywhere in the
+    graph collide on a small alphabet (~6 counts per axis over at most two
+    dims), and refusing them would refuse ordinary graphs.
+
+    **Precondition on the caller, which this signature cannot check.** Ops meant
+    to tile together have to be contiguous in ``graph.operations``. A chooser
+    walking producer/consumer reachability is not walking contiguity: an op it
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. That is a mispricing rather than an illegal graph, and a
+    name->spec map carries no region identity to detect it with, so it belongs
+    to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
+    for the illegal case.
+
+    Ops in one run may tile different dims: ``host_dim`` is positional in each
+    op's own output, so equal specs can tile different dims of a buffer two
+    ops share, and different specs the same one. A run therefore also breaks at
+    a consumer that does not read some producer of its stretch tile by tile
+    (:func:`tile_misread`), which then reads that producer's full buffer across
+    the group boundary. The stretch is every op since the nest last changed,
+    not only the current group: that over-splits only where the producer is
+    already in an earlier group, and it keeps where a group starts a function of
+    the ops between a consumer and what it reads, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``). Returns
+    ``(ops, level counts)`` per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
-    groups: list[tuple[list[Operation], TileSpec]] = []
+    groups: list[tuple[list[Operation], tuple[int, ...]]] = []
     current_ops: list[Operation] = []
-    current_spec: TileSpec | None = None
+    current_nest: tuple[int, ...] = ()
+    stretch: dict[str, Operation] = {}
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
-        if spec is not None and spec.is_untiled:
-            spec = None
-        if spec is not None and spec == current_spec:
-            current_ops.append(op)
+        nest = spec.level_counts if spec is not None else ()
+        if spec is not None and nest and nest == current_nest:
+            misread = _stretch_misread(graph, op, spec, stretch, choices)
+            if misread is None:
+                current_ops.append(op)
+            else:
+                logger.debug("coarse tiling: new loop group: %s", misread)
+                groups.append((current_ops, current_nest))
+                current_ops = [op]
         else:
             if current_ops:
-                assert current_spec is not None
-                groups.append((current_ops, current_spec))
-            current_ops = [op] if spec is not None else []
-            current_spec = spec
+                groups.append((current_ops, current_nest))
+            current_ops = [op] if nest else []
+            current_nest = nest
+            stretch = {}
+        if nest:
+            stretch[op.get_name()] = op
     if current_ops:
-        assert current_spec is not None
-        groups.append((current_ops, current_spec))
+        groups.append((current_ops, current_nest))
     return groups
+
+
+def _stretch_misread(
+    graph: GraphLowering,
+    op: Operation,
+    spec: TileSpec,
+    stretch: Mapping[str, Operation],
+    choices: Mapping[str, TileSpec],
+) -> str | None:
+    """The first :func:`tile_misread` of ``op`` against a producer in
+    ``stretch`` (keyed by the buffer it writes), or ``None``."""
+    for read in op_read_writes(op).reads:
+        producer = stretch.get(read.name)
+        if producer is None:
+            continue
+        reason = tile_misread(
+            graph,
+            producer,
+            choices[producer.get_operation_name()],
+            op,
+            spec,
+            read,
+        )
+        if reason is not None:
+            return reason
+    return None
+
+
+def tile_misread(
+    graph: GraphLowering,
+    producer: Operation,
+    producer_spec: TileSpec,
+    consumer: Operation,
+    consumer_spec: TileSpec,
+    read: Dep,
+) -> str | None:
+    """Why ``consumer`` under ``consumer_spec`` cannot read ``read`` tile by
+    tile as ``producer`` writes it under ``producer_spec``, or ``None`` when it
+    can.
+
+    On tile ``t`` a consumer that shares its producer's loop nest can read only
+    what the producer wrote on tile ``t``. That holds exactly when both own the
+    buffer they share the same way on every tile (``tile_ownership_view``) and
+    the buffer is read in full, since a view compares partitions, not extents.
+    ``host_dim`` is positional, so equal specs can disagree here (a permuted
+    reader) and unequal ones agree, and a spec need not resolve on both ops at
+    all; one that does not on either is a misread too.
+    """
+    write = next(
+        (
+            w
+            for w in op_read_writes(producer).writes
+            if w.name == read.name and isinstance(w, MemoryDep)
+        ),
+        None,
+    )
+    if (
+        write is None
+        or not isinstance(read, MemoryDep)
+        or buffer_not_read_in_full(graph, read.name)
+    ):
+        return (
+            f"{consumer.get_name()} reads {read.name} through a dependency "
+            "whose per-tile slice cannot be checked"
+        )
+    producer_vars, reason = try_resolve_tile_axis_loop_vars(producer, producer_spec)
+    if producer_vars is None:
+        return reason
+    consumer_vars, reason = try_resolve_tile_axis_loop_vars(consumer, consumer_spec)
+    if consumer_vars is None:
+        return reason
+    produced = tile_ownership_view(
+        _prepare_per_core_view(producer, write, read.name),
+        tuple((v, a.count) for v, a in zip(producer_vars, producer_spec.axes)),
+    )
+    consumed = tile_ownership_view(
+        _prepare_per_core_view(consumer, read, read.name),
+        tuple((v, a.count) for v, a in zip(consumer_vars, consumer_spec.axes)),
+    )
+    if produced is None or consumed is None or not produced.same_partition(consumed):
+        return (
+            f"{consumer.get_name()} ({consumer_spec.label}) does not read "
+            f"{read.name} tile by tile as {producer.get_name()} "
+            f"({producer_spec.label}) writes it"
+        )
+    return None
+
+
+@dataclasses.dataclass
+class TileReads:
+    """Whether ``consumer`` reads ``producer`` tile by tile under a pair of
+    specs -- :func:`tile_misread` over every read of it, the question
+    :func:`derive_tiling_groups` asks of an edge in a stretch -- memoized per
+    pair, for a search that asks it per move."""
+
+    graph: GraphLowering
+    producer: Operation
+    consumer: Operation
+    _memo: dict[tuple[TileSpec, TileSpec], bool] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+
+    def aligned(self, producer_spec: TileSpec, consumer_spec: TileSpec) -> bool:
+        key = (producer_spec, consumer_spec)
+        if key not in self._memo:
+            name = self.producer.get_name()
+            self._memo[key] = all(
+                tile_misread(
+                    self.graph,
+                    self.producer,
+                    producer_spec,
+                    self.consumer,
+                    consumer_spec,
+                    read,
+                )
+                is None
+                for read in op_read_writes(self.consumer).reads
+                if read.name == name
+            )
+        return self._memo[key]
 
 
 def _derive_hint_id_base(graph: GraphLowering) -> int:
     """``max(hint_id present in the graph, default=-1) + 1``.
 
     Derived, never a reserved constant: whatever hint ids a pre-stickification
-    hint-driven group already minted, this pass mints strictly above them, so
+    for_each_tile group already minted, this pass mints strictly above them, so
     ``validate_coarse_tile_groups`` can never see a hint id in two groups.
     """
     ids = [h.hint_id for op in graph.operations for h in getattr(op, "dim_hints", [])]
@@ -356,7 +626,7 @@ def _derive_hint_id_base(graph: GraphLowering) -> int:
 def _derive_group_idx_offset(graph: GraphLowering) -> int:
     """``max(loop_group_id[0] present, default=-1) + 1`` -- the same derivation
     ``_maybe_coarse_tile_span_overflow`` uses to avoid a ``loop_group_id``
-    collision with a hint-driven group stamped pre-stickification."""
+    collision with a for_each_tile group stamped pre-stickification."""
     used = [
         op.loop_info.loop_group_id[0]
         for op in graph.operations
@@ -369,12 +639,13 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     """Apply a declared coarse tiling to a graph, inside the scratchpad pass.
 
     The tiling is an *input* (``choices``: operation name -> TileSpec),
-    not a search. Consecutive ops sharing a non-empty spec form one loop group;
-    the pass mints hint ids and a group-id offset from bases derived off the
-    graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
-    ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    not a search. Consecutive ops running the same non-empty loop nest form one
+    loop group, split where a consumer does not read its producer tile by tile
+    (:func:`derive_tiling_groups`); the pass mints hint ids and a group-id offset from
+    bases derived off the graph, stamps each op's ``dim_hints`` from its own
+    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or
+    all-untiled) ``choices`` it is a no-op and the op count is unchanged -- which
+    is what keeps it inert until a solver hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):
@@ -382,6 +653,20 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
 
     def apply_pass(self, graph: GraphLowering) -> None:
         groups_specs = derive_tiling_groups(graph, self._choices)
+        # The group partition is the whole shape of the plan -- which ops share
+        # one loop nest, and therefore where the boundaries (and their full
+        # buffers and copy ops) fall. Nothing else reports it before the tiling
+        # is already applied.
+        for idx, (group_ops, nest) in enumerate(groups_specs):
+            logger.debug(
+                "tiling group %d: nest=%s ops=[%s]",
+                idx,
+                nest,
+                ", ".join(
+                    f"{op.get_name()}:{self._choices[op.get_operation_name()].label}"
+                    for op in group_ops
+                ),
+            )
         if not groups_specs:
             return
         # A for_each_tile region's tiling is the user's and already stamped;
@@ -393,7 +678,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             for region in prescribed_regions(graph.operations)
             for name in region.names
         }
-        for group_ops, spec in groups_specs:
+        for group_ops, _nest in groups_specs:
             clash = [
                 op.get_operation_name()
                 for op in group_ops
@@ -401,32 +686,33 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             ]
             if clash:
                 raise Unsupported(
-                    f"coarse tiling: {spec} would re-tile {', '.join(clash)}, "
+                    f"coarse tiling would re-tile {', '.join(clash)}, "
                     "which a for_each_tile loop already tiles."
                 )
         # Both bases are derived off the graph *before* this pass stamps any of
-        # its own hints/groups, so pre-existing (hint-driven) ids are avoided
+        # its own hints/groups, so pre-existing (for_each_tile) ids are avoided
         # and the ids this pass mints increase monotonically.
         next_hint_id = _derive_hint_id_base(graph)
         group_idx_offset = _derive_group_idx_offset(graph)
         groups: list[tuple] = []
-        for group_ops, spec in groups_specs:
-            hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
-            next_hint_id += len(spec.axes)
+        for group_ops, nest in groups_specs:
+            hint_ids = list(range(next_hint_id, next_hint_id + len(nest)))
+            next_hint_id += len(nest)
             levels = [
-                (hint_id, sympy.Integer(axis.count))
-                for hint_id, axis in zip(hint_ids, spec.axes)
+                (hint_id, sympy.Integer(count))
+                for hint_id, count in zip(hint_ids, nest)
             ]
             for op in group_ops:
-                op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
+                op.dim_hints = tile_spec_to_dim_hints(
+                    op, self._choices[op.get_operation_name()], hint_ids
+                )
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout. Use the
-        # post-stickify entry point (run_read_copies=False): a read copy-in here
-        # would only be a useless HBM-to-HBM copy, exactly as the sibling
-        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        # post-stickify entry point, exactly as the sibling post-stickify
+        # consumer (_maybe_coarse_tile_span_overflow) does.
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )

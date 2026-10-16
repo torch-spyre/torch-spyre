@@ -329,7 +329,7 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 8, 256, 256, head_dim=128)
         _compare_attention(query, key, value, 64)
 
-    @unittest.skip("Temporarily disabled: slow SWA compile; re-enable after #4610")
+    @unittest.skip("Skipped for runtime: it passes, but compiles for about 3.5 minutes")
     @config.patch({"cpsat_time_limit_seconds": 30})
     def test_prefill_long(self):
         # 32 blocks — a long unrolled loop rather than a handful.
@@ -345,7 +345,6 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 2, 1, 512)
         _compare_attention(query, key, value, 128)
 
-    @unittest.skip("Temporarily disabled: slow SWA compile; re-enable after #4610")
     def test_decode_long_cache(self):
         query, key, value = _inputs(1, 8, 8, 1, 8192)
         _compare_attention(query, key, value, 64)
@@ -377,7 +376,12 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 8, 128, 128)
         _compare_attention(query, key, value, 128)
 
-    @unittest.skip("Temporarily disabled pending the SWA solver fixes in #4610")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a ragged query length together with a ragged window returns NaN and "
+        "wrong values; each alone is correct (#5362)",
+    )
     def test_ragged_query_and_window_together(self):
         # An off-by-one in the pad arithmetic can survive either alone.
         query, key, value = _inputs(1, 8, 2, 100, 512)
@@ -568,7 +572,6 @@ class TestCompactCache(unittest.TestCase):
             buffer_origin=buffer_origin,
         )
 
-    @unittest.skip("Temporarily disabled: slow SWA compile; re-enable after #4610")
     def test_multiblock_rolled_prefill_with_distinct_read_starts(self):
         # 8 blocks of a 512-row prefill against a rolled, non-aligned
         # cache_seqlen -- every block reads a different physical offset

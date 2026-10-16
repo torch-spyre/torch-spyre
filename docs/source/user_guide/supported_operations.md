@@ -15,6 +15,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.matmul` | Y | Y | Spyre | Decomposes to `mm`/`bmm`, both of which have eager kernels |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
+| `torch._grouped_mm` | Y | Y | Spyre | All four upstream shape variants; the ragged ones pack/`bmm`/unpack with host-computed routing tables. BF16 only; `offs` must be a Spyre tensor; raises if routing is too skewed for the static per-expert capacity. |
 | `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
 | `torch.ops.spyre.quantscalepertokenfp8` | | Y | Spyre | Compiled only; no eager fallback. Fused per-token amax + scale computation for FP8 activation quantization |
 | `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 activation to FP8 using a pre-computed scale (`qfp8ch` layout) |
@@ -78,7 +79,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.amin` | | Y | Spyre | Custom decomposition |
 | `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
-| `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16 eager); int64 falls back to CPU |
+| `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
@@ -140,17 +141,17 @@ see [Adding Operations](../compiler/adding_operations.md).
 
 > **Column key:**
 >
-> - **Eager** — supported when running operations directly on a Spyre
+> - **Eager**: supported when running operations directly on a Spyre
 >   tensor without `torch.compile`. Eager ops are registered via
 >   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py`, and the
 >   Spyre decomposition table, which installs a PrivateUse1 eager kernel
 >   for every aten-namespace decomposition (`decompositions.py`).
-> - **Compiled** — supported when using `torch.compile(model)` with the
+> - **Compiled**: supported when using `torch.compile(model)` with the
 >   model on a Spyre device (Inductor routes to the Spyre backend
 >   automatically).
-> - **Execution** — whether the op runs natively on the Spyre accelerator
+> - **Execution**: whether the op runs natively on the Spyre accelerator
 >   or falls back to CPU. CPU fallback ops are automatically handled by
->   the compiler — a warning is emitted when fallback occurs.
+>   the compiler; a warning is emitted when fallback occurs.
 >
 > View ops have **partial support**: some shapes and dimension
 > combinations may trigger internal recompilation, and a few
@@ -160,7 +161,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 >
 > This table reflects the operations validated in the torch-spyre test
 > suite (`tests/inductor/test_inductor_ops.py`). Coverage
-> grows continuously — check the
+> grows continuously; check the
 > [test suite](https://github.com/torch-spyre/torch-spyre/tree/main/tests)
 > for the latest state.
 
@@ -205,9 +206,9 @@ The cache capacity must be positive and a multiple of 64, and `Lq` must be in
 ## Unsupported Operations
 
 Operations not listed above will either:
-- **Fall back to CPU** — if Inductor cannot lower the op to a Spyre
+- **Fall back to CPU**: if Inductor cannot lower the op to a Spyre
   kernel, it falls back to CPU execution. A warning is emitted.
-- **Raise a compile-time error** — if the op produces a tensor layout
+- **Raise a compile-time error**: if the op produces a tensor layout
   that is incompatible with downstream Spyre ops.
 
 To request support for a new operation or to contribute one yourself,

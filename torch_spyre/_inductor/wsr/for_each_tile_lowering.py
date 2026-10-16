@@ -45,7 +45,7 @@ every step of turning one into tiled, schedulable ops:
    (from the prover), loop var (from the spliced body), and tiled-dim
    position (from lookup_marker_dim, or a structural fallback anchored on
    the op's own output coordinates when no marker resolves it). This never
-   calls coarse_tile_pre_stickify: re-deriving tiling from index
+   goes through coarse_tile.py's group planning: re-deriving tiling from index
    coefficients independently at each nesting level risks a level's already-
    committed metadata going stale once a later-spliced, more-deeply-nested
    level renames or rewires the buffers that metadata depended on.
@@ -76,7 +76,7 @@ inner_fn's closure cells (an internal, unstable implementation detail of
 torch._inductor.ir.make_pointwise/ops_wrapper), this module *runs* inner_fn
 once under a small recording ops handler that intercepts `load`/`constant`
 and returns opaque placeholders for everything else. This is the same "wrap
-the ops handler, don't reconstruct index expressions" pattern CLAUDE.md
+the ops handler, don't reconstruct index expressions" pattern AGENTS.md
 mandates for ComputedBuffer.inner_fn elsewhere in this codebase (see issue
 #2797), applied here for read-only shape recognition rather than mutation.
 """
@@ -485,35 +485,50 @@ def _marker_axis_is_consumed(axis_coords: "list[sympy.Expr] | None") -> bool:
 def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
     """Invert a FixedLayout-style flat index back into per-dim coordinates.
 
-    ``ops.load(name, index)`` always receives ``index`` already flattened
-    to a single sympy expression by the loaded buffer's own
-    ``make_indexer()`` -- see ``Buffer.make_loader``/``_fixed_indexer`` --
-    never the original ``Sequence[Expr]`` coordinate list a ``Loops``
-    ``inner_fn``'s own index is parameterized by. Inlining the marker's
-    own read (see ``_InlineMarkerHandler``) needs that coordinate list
-    back, so undo ``_fixed_indexer``'s ``sum(idx[i] * stride[i]) +
-    offset`` here: every per-dim loop-index symbol (``i0``, ``r0``, ``d0``,
-    ...) appears in exactly one additive term of that sum with
-    coefficient ``stride[i]`` (the same one-symbol-per-term linearity
-    every coordinate-recovery helper in this package already assumes --
-    see coarse_tile.py's ``_loop_var_to_ranges_pos``/the deleted
-    ``_loop_var_pos_from_reads``), so dividing each matched term by its
-    own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
-    term at all (``_fixed_indexer`` skips it), so its coordinate is
-    simply 0.
+    ``ops.load(name, index)`` receives ``index`` already flattened by the
+    loaded buffer's own indexer into ``sum(idx[i] * stride[i]) + offset``;
+    this undoes that. Every per-dim loop-index symbol appears in exactly
+    one additive term with coefficient ``stride[i]`` (the same one-symbol-
+    per-term linearity every coordinate-recovery helper in this package
+    already assumes), so dividing each matched term by its own stride
+    recovers ``idx[i]`` directly; a size-1 dim contributes no term, so its
+    coordinate is simply 0.
 
-    Two distinct dims sharing the same non-zero stride literal (a
-    degenerate/unusual layout, not observed against any fixture in this
-    repo, but not structurally impossible either) would make
-    ``remaining.coeff(st)`` silently SUM both dims' coefficients into one
-    merged coordinate instead of raising -- exactly the kind of silent
-    wrong-answer this module exists to prevent elsewhere. Guard against it
-    explicitly: raise rather than let two dims collide on one recovered
-    coordinate.
+    A dim's coordinate can also be a compile-time-constant integer rather
+    than a loop-index symbol -- e.g. an unrolled Python-level ``t[j]``
+    select. ``sympy.expand`` folds such a term into a bare integer, so
+    ``.coeff(stride[i])`` can't find it: ``Expr.coeff(n)`` for a plain
+    integer ``n`` only recognizes an explicit multiplicative term, e.g.
+    ``(16384).coeff(8192)`` is ``0``, not ``2``. Left unguarded, every such
+    dim would recover coordinate 0 regardless of its true value (issue
+    #5311: ``t[1][j]`` for ``j >= 2`` read ``t[1][0]``'s data instead).
+    Only dims with no surviving free symbol need their constant decomposed
+    separately -- peeled apart in decreasing-stride order, the same
+    mixed-radix approach ``tile.py``'s ``compute_tile_offset`` uses.
+
+    Raises ``AssertionError`` if two dims share a non-zero stride, if the
+    constant portion doesn't decompose evenly across the constant dims, or
+    if a recovered digit is out of bounds for its dim's size -- all three
+    indicate the one-symbol/one-stride-per-term assumption above doesn't
+    hold for this index.
     """
     remaining = sympy.expand(index - offset)
-    coords: list[sympy.Expr] = []
+    free_syms = remaining.free_symbols
+    # The portion of `remaining` not tied to any loop-index symbol: every
+    # constant-coordinate dim's own contribution lives somewhere in here.
+    const_total_expr = remaining.xreplace({s: sympy.S.Zero for s in free_syms})
+    if not const_total_expr.is_Integer:
+        raise AssertionError(
+            f"_delinearize_index: constant portion of index {index!r} "
+            f"(offset {offset!r}) is {const_total_expr!r}, not an integer; "
+            "cannot decompose it into per-dim coordinates."
+        )
+    const_total = int(const_total_expr)
+    symbolic_remaining = sympy.expand(remaining - const_total)
+
+    coords: list[sympy.Expr | None] = []
     seen_strides: dict[sympy.Expr, int] = {}
+    const_dims: list[int] = []
     for i, (sz, st) in enumerate(zip(size, stride)):
         if sz == 1:
             coords.append(sympy.Integer(0))
@@ -527,15 +542,47 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
             )
         if st != 0:
             seen_strides[st] = i
-        # A size>1 broadcast dim (stride 0) contributes no term to
-        # `remaining` and its coordinate is always 0 -- but that must be
-        # special-cased rather than falling into the general
-        # `remaining.coeff(st)` branch below: sympy's `.coeff(0)` does not
-        # mean "coefficient of the constant term" here, it returns the
-        # WHOLE `remaining` expression unchanged. Using `remaining.coeff(st)`
-        # unconditionally would silently smuggle the entire remaining sum
-        # into this one dim's "coordinate" instead of 0.
-        coords.append(remaining.coeff(st) if st != 0 else sympy.Integer(0))
+        if st == 0:
+            # A size>1 broadcast dim contributes no term to `remaining` and
+            # its coordinate is always 0 -- special-cased because sympy's
+            # `.coeff(0)` does not mean "coefficient of the constant term"
+            # here, it returns the WHOLE expression unchanged.
+            coords.append(sympy.Integer(0))
+            continue
+        sym_coeff = symbolic_remaining.coeff(st)
+        if sym_coeff != 0:
+            coords.append(sym_coeff)
+        else:
+            # No surviving symbol carries this dim's stride: either it is
+            # genuinely absent (coordinate 0) or its coordinate is a literal
+            # constant folded into const_total above. Resolved below, once
+            # every constant dim is known, by peeling const_total apart from
+            # the largest stride down.
+            const_dims.append(i)
+            coords.append(None)
+
+    const_residual = const_total
+    for i in sorted(const_dims, key=lambda d: stride[d], reverse=True):
+        st = int(stride[i])
+        digit, const_residual = divmod(const_residual, st)
+        if digit < 0 or digit >= size[i]:
+            raise AssertionError(
+                f"_delinearize_index: recovered coordinate {digit} for dim "
+                f"{i} is out of bounds for size {size[i]!r} (index "
+                f"{index!r}, offset {offset!r}, const_total {const_total!r})."
+            )
+        coords[i] = sympy.Integer(digit)
+    if const_residual != 0:
+        raise AssertionError(
+            f"_delinearize_index: {const_residual} left over after "
+            f"decomposing the constant portion of index {index!r} (offset "
+            f"{offset!r}) across const dims {const_dims!r}; cannot recover "
+            "distinct per-dim coordinates for this index."
+        )
+    assert all(c is not None for c in coords), (
+        f"_delinearize_index: unresolved coordinate for index {index!r} "
+        f"(size {size!r}, stride {stride!r}, offset {offset!r})"
+    )
     return coords
 
 
@@ -558,7 +605,7 @@ def _marker_substitution(
     ``get_read_writes()`` and let the caller substitute into it -- the same
     "index expressions are symbolic, substitute don't re-execute"
     discipline this module and ``coarse_tile.py`` already follow
-    everywhere else (see CLAUDE.md's "wrap, never reconstruct").
+    everywhere else (see AGENTS.md's "wrap, never reconstruct").
 
     Returns the marker's own single MemoryDep read's ``(name, index)``,
     where ``index`` is expressed in terms of the marker's own WRITE dep's
@@ -617,7 +664,7 @@ class _InlineMarkerHandler(WrapperHandler):
     -- a pure sympy substitution, never a live re-execution of the
     marker's ``inner_fn`` (see ``_marker_substitution``'s docstring for why
     that would be wrong). This keeps the "wrap, never reconstruct"
-    convention (CLAUDE.md, issue #2797): the marker's ORIGINAL index
+    convention (AGENTS.md, issue #2797): the marker's ORIGINAL index
     expression is reused verbatim, never re-derived by hand -- only the
     free variables are substituted, exactly as any other index-composition
     in this codebase already does.
@@ -792,7 +839,7 @@ def _consume_tile_dim_markers(
       Pointwise/Reduction/Scan/Sort body): the read surfaces as a
       ``MemoryDep`` named after the marker in ``get_read_writes().reads``.
       Erased via ``_inline_marker_into_consumer``, which wraps (never
-      reconstructs, per CLAUDE.md) the inner_fn with ``_InlineMarkerHandler``
+      reconstructs, per AGENTS.md) the inner_fn with ``_InlineMarkerHandler``
       so every load of the marker re-issues the MARKER'S OWN inner_fn
       (``marker_op.data.make_loader()``) at the consumer's load-site index,
       rather than merely renaming past it. A plain name-swap
@@ -844,8 +891,7 @@ def _consume_tile_dim_markers(
     convention in this codebase for using ``id()`` instead of the object).
     But ``id(op)`` itself is NOT safe here the way it is for that other
     convention's own single-pass, single-object lifetime: a *later*
-    coarse-tiling sub-pass (e.g. ``_insert_all_read_copy_ops`` /
-    ``_patch_consumer_to_read_copy``) can rebuild this exact consumer
+    coarse-tiling sub-pass (e.g. ``_patch_consumers``) can rebuild this exact consumer
     AGAIN via ``replace_computed_buffer_body`` -- for a completely
     unrelated read of the same op -- minting a new object with a new
     ``id()`` before ``lookup_marker_dim`` is ever called from
@@ -1109,9 +1155,7 @@ def _consume_tile_dim_markers(
             # it out of `group_ops` breaks that contiguity check for any
             # group whose block the marker sits inside. Passes that must not treat a
             # surviving marker as an ordinary tile op instead guard on
-            # `_marker_dim(op) is not None` individually (see
-            # _plan_read_copies in coarse_tile.py for the first such guard)
-            # -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
+            # `_marker_dim(op) is not None` individually -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
             # matters, on `_marker_resolution(op)`.
             marker_op.tile_marker_resolution = MarkerResolution.INLINE_ERASED
             operations.remove(marker_op)
@@ -1292,16 +1336,16 @@ def _stamp_direct_loop_info(
 
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
-    lookup_marker_dim. Never calls coarse_tile_pre_stickify: the program
+    lookup_marker_dim. Never goes through coarse_tile.py's group planning: the program
     already states trip count, loop var, tile dim, and carry roles as
     ground truth, so re-deriving them via double-blind per-level
-    coarse_tile_pre_stickify inference is unnecessary and unsafe -- one
+    inference is unnecessary and unsafe -- one
     level's committed metadata (e.g. tiled_dims_per_read computed against a
     provisional buffer name) can go stale once a later-spliced nested level
     renames or rewires the buffers it depended on. propagation is never
     produced -- every CoarseTileInfo built here leaves it None -- because
     PropagationPlan has zero consumers outside coarse_tile.py's own Pass
-    1/2/3, which while_loop groups skip entirely.
+    2/3, which while_loop groups skip entirely.
 
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
@@ -3108,7 +3152,7 @@ def splice_while_loops(graph) -> None:
     Directly constructs and stamps CoarseTileInfo per accepted group from
     ground truth (trip count, loop var, tile_dim_marker resolution, carry
     roles) via _stamp_direct_loop_info -- never hands the group to
-    coarse_tile_pre_stickify for re-inference, since coarse_tile_pre_stickify's
+    coarse_tile.py's planner for re-inference, since its
     index-coefficient inference runs once per nesting level, blind to prior
     runs, and a level's committed metadata can go stale once a later-spliced
     nested level renames or rewires the buffers it depended on (see
@@ -3301,12 +3345,10 @@ def splice_while_loops(graph) -> None:
     # squeezed_advance_per_read (mirroring coarse_tile.py's own
     # _point_splice_advance_for_dep -- see that function's docstring), but
     # leaves the read's index itself unrebased (e.g. paged attention's
-    # in-body page index, dep.index == 32*u0). main reaches
-    # _rebase_point_splice_reads for this same shape via
-    # coarse_tile_pre_stickify (_coarse_tile_common calls it unconditionally
-    # at the end of planning), which this branch never calls for
-    # WhileLoop-splice groups -- see this function's own docstring. Without
-    # this call the raw indirect symbol survives into
+    # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
+    # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
+    # splice groups never go through it -- see this function's own docstring.
+    # Without this call the raw indirect symbol survives into
     # propagate_spyre_tensor_layouts, which rejects it (not an
     # iteration_space key). Run once, after every level's stamping has been
     # merged in above, so squeezed_advance_per_read reflects each op's final,

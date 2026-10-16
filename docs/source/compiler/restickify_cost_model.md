@@ -132,7 +132,16 @@ operations and representative model workloads.
 - DL16 source DMA calibration. Fully local transports and other device formats
   remain unchanged. HBM-to-LX uses the same source-request estimate, not a
   separate absolute-latency model.
-- Non-affine/sub-stick accesses are not calibrated. Unsupported core counts are
-  neutral rather than assigned an invented measured rate.
+- Non-affine/sub-stick accesses are not calibrated. For a plain copy, unsupported
+  core counts are neutral rather than assigned an invented measured rate.
+- Every arithmetic op with one input and one output, in any graph, issues the same
+  source requests as a copy, so its read run is priced by the same law
+  (`transport_compute_read`). The price is nonzero only where the per-core run is
+  short (under about 1 KB); a longer run costs nothing extra. Such an op may run
+  on a core count no copy was calibrated at, so it takes the rate of the largest
+  calibrated count not above its own (22 cores stream like 16). This is an
+  assumption, not a measurement; without it a split of the stick axis into
+  128-byte runs costs nothing at an odd count and the planner cannot tell it from
+  a split along rows.
 - Output burst fragmentation and interactions between independent operations in
   a fused bundle are not separately modelled by this term.

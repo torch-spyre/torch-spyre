@@ -128,29 +128,25 @@ class DtypeOpTable:
 
     _FP32_TO_INT32_DTYPES = [
         (torch.float32, torch.int32),
+        (torch.float32, torch.int64),
     ]
 
     _INT32_TO_FP32_DTYPES = [
         (torch.int32, torch.float32),
+        (torch.int64, torch.float32),
     ]
 
     _TYPECAST_OPS_TABLE = {
-        **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
-        **{pair: DL16TOFP32_OP for pair in _FP16_TO_FP32_DTYPES},
-        **{pair: FP32TODL16_OP for pair in _FP32_TO_FP16_DTYPES},
-        **{pair: FP8TODL16_OP for pair in _FP8_TO_FP16_DTYPES},
-        **{pair: FP32TOINT32_OP for pair in _FP32_TO_INT32_DTYPES},
-        **{pair: INT32TOFP32_OP for pair in _INT32_TO_FP32_DTYPES},
+        **dict.fromkeys(_IDENTITY_DTYPES, IDENTITY_OP),
+        **dict.fromkeys(_FP16_TO_FP32_DTYPES, DL16TOFP32_OP),
+        **dict.fromkeys(_FP32_TO_FP16_DTYPES, FP32TODL16_OP),
+        **dict.fromkeys(_FP8_TO_FP16_DTYPES, FP8TODL16_OP),
+        **dict.fromkeys(_FP32_TO_INT32_DTYPES, FP32TOINT32_OP),
+        **dict.fromkeys(_INT32_TO_FP32_DTYPES, INT32TOFP32_OP),
     }
 
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
     _TYPECAST_OP_DTYPES = set(_TYPECAST_OPS_TABLE.keys())
-
-    # Typecast ops that change the physical stick element ordering, as opposed to
-    # IDENTITY_OP (a same-width byte copy). Reading a reordering op's output back
-    # over a DMA-copied host buffer with a different HBM ordering yields shuffled
-    # elements, so host bool InputBuffers feeding one must fall back to CPU.
-    _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
 
     _FP16_TYPES = [torch.float16, torch.bfloat16]
     _EA_MAP = _build_ea_map(_FP16_TYPES)
@@ -178,41 +174,21 @@ class DtypeOpTable:
         return cls.get_operator(equivalent_src_dtype, dst_dtype)
 
     @classmethod
-    def bool_host_conversion_reorders_sticks(cls, dst_dtype: torch.dtype) -> bool:
-        """Whether converting a host (fp16-format) bool to dst_dtype reorders sticks.
-
-        Host bool InputBuffers are DMA-copied in the fp16 physical format
-        (SEN169_FP16). A reordering typecast (e.g. DL16TOFP32 for bool->fp32)
-        reads that DMA layout back shuffled, so the caller must fall back to CPU;
-        an IDENTITY byte-copy (e.g. bool->fp16) is safe.
-        """
-        op = cls.get_bool_src_operator(DataFormats.SEN169_FP16, dst_dtype)
-        return op in cls._STICK_REORDERING_OPS
-
-    @classmethod
     def is_supported(cls, src_dtype: torch.dtype, dst_dtype: torch.dtype) -> bool:
         """Whether Spyre can natively perform this dtype conversion.
 
         For torch.bool sources this is a *static* gate with no access to the
-        tensor's real device_dtype, so it accepts the pair if *some* physical
-        format could convert to dst_dtype (see get_bool_src_operator). The
-        codegen (spyre_kernel.to_dtype) instead resolves from the one real
-        device_dtype.
-
-        The looseness is structural, not an oversight: this runs from the
-        convert_element_type lowering, which decides the CPU fallback before
-        layout propagation has assigned any device_dtype. Keying on the real
-        format would mean deferring that fallback decision to a later pass.
-
-        This "any format" looseness is safe only while every dst reachable from
-        a bool resolves to a supported op under *both* SEN169_FP16 (fp16) and
-        IEEE_FP32 (fp32) -- true for the current table, so the predicate and its
-        consumer never disagree. If a future op supports a dst under one bool
-        equivalent but not the other, this could accept a conversion the codegen
-        cannot then lower; tighten to key on the real device_dtype at that point.
+        tensor's real device_dtype: it runs from the convert_element_type
+        lowering, which decides the CPU fallback before layout propagation has
+        assigned one. A bool may be stored in any of its equivalent formats
+        (see get_bool_src_operator), so the pair is accepted only if *every*
+        format converts to dst_dtype; the codegen (spyre_kernel.to_dtype),
+        which resolves from the one real device_dtype, then always finds an op.
+        bool -> int32/int64 has an op only from float32, so the to_dtype
+        lowering converts through float32 instead.
         """
         if src_dtype == torch.bool:
-            return any(
+            return all(
                 cls.get_bool_src_operator(fmt, dst_dtype) is not None
                 for fmt in _BOOL_EQUIVALENT_DTYPES
             )

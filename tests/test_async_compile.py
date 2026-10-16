@@ -15,8 +15,10 @@
 """Device-free tests for parallel backend compilation."""
 
 from concurrent.futures import Future
+import importlib.util
 import os
 from pathlib import Path
+import sys
 from typing import Any
 from unittest.mock import patch
 
@@ -28,6 +30,7 @@ from torch._inductor.async_compile import shutdown_compile_workers
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre.execution import async_compile as async_compile_mod
+from torch_spyre.execution import kernel_cache
 
 
 class _RecordingPool:
@@ -46,11 +49,89 @@ def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
     return name, code_dir, kernel_provenance, symbol_kinds
 
 
-def test_single_worker_compiles_inline_without_starting_pool():
+def _load_config(monkeypatch):
+    # Exercise import-time environment resolution without replacing the config
+    # module used by other tests or launching a fresh Python for every spelling.
+    name = "_test_loop_unroll_config"
+    spec = importlib.util.spec_from_file_location(name, spyre_config.__file__)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("0", False),
+        ("false", False),
+        (" NO ", False),
+        ("1", True),
+        ("TRUE", True),
+        ("yes", True),
+    ],
+)
+def test_loop_unroll_environment_and_cache_key(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("SPYRE_BACKEND_LOOP_UNROLL", raising=False)
+    else:
+        monkeypatch.setenv("SPYRE_BACKEND_LOOP_UNROLL", value)
+    config = _load_config(monkeypatch)
+    assert config.backend_loop_unroll is expected
+
+    with (
+        patch.object(
+            kernel_cache, "_get_backend_compiler_version", return_value="test"
+        ),
+        patch.object(kernel_cache, "_get_torch_spyre_version", return_value="test"),
+        spyre_config.patch(backend_loop_unroll=config.backend_loop_unroll),
+    ):
+        resolved = kernel_cache.compute_specs_hash([])
+        assert resolved == kernel_cache.compute_specs_hash(
+            [], backend_loop_unroll=expected
+        )
+        assert resolved != kernel_cache.compute_specs_hash(
+            [], backend_loop_unroll=not expected
+        )
+
+
+@pytest.mark.parametrize("value", ["", "2", "invalid"])
+def test_loop_unroll_rejects_invalid_environment(monkeypatch, value):
+    monkeypatch.setenv("SPYRE_BACKEND_LOOP_UNROLL", value)
+    with pytest.raises(ValueError, match="SPYRE_BACKEND_LOOP_UNROLL must be"):
+        _load_config(monkeypatch)
+
+
+@pytest.mark.parametrize("unroll", [False, True])
+def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll):
+    code_dir = tmp_path / "spyreCodeDir"
+    code_dir.mkdir()
+    (code_dir / "spyrecode.json").write_text("{}")
+    # A worker's environment and imported config may disagree with the parent.
+    env = {"SPYRE_BACKEND_LOOP_UNROLL": str(int(not unroll))}
+    with (
+        spyre_config.patch(backend_loop_unroll=not unroll),
+        patch.object(async_compile_mod, "_check_backend_compiler_on_path"),
+        patch.object(async_compile_mod.subprocess, "run") as run,
+    ):
+        assert async_compile_mod._run_backend_compiler(
+            "kernel", str(tmp_path), env, unroll
+        ) == str(tmp_path)
+    args = run.call_args.args[0]
+    flags = [arg for arg in args if arg.startswith("--enable-loop-unroll=")]
+    assert flags == [f"--enable-loop-unroll={int(unroll)}"]
+    assert run.call_args.kwargs["env"] == env
+
+
+@pytest.mark.parametrize("unroll", [False, True])
+def test_single_worker_compiles_inline_without_starting_pool(unroll):
     compiler = async_compile_mod.SpyreAsyncCompile()
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
+        spyre_config.patch(backend_loop_unroll=unroll),
         patch.object(compiler, "wait_pool_ready") as wait_ready,
         patch.object(compiler, "process_pool") as pool,
         patch.object(async_compile_mod, "_run_backend_compiler") as compile_backend,
@@ -60,7 +141,9 @@ def test_single_worker_compiles_inline_without_starting_pool():
     assert task is None
     wait_ready.assert_not_called()
     pool.assert_not_called()
-    compile_backend.assert_called_once_with("sdsc_0", "/tmp/kernel", dict(os.environ))
+    compile_backend.assert_called_once_with(
+        "sdsc_0", "/tmp/kernel", dict(os.environ), unroll
+    )
 
 
 def test_sdsc_submits_all_backend_jobs_before_wait():
@@ -131,13 +214,20 @@ def test_async_cache_commit_is_deferred_until_wait():
     compiler = async_compile_mod.SpyreAsyncCompile()
     fake_symbol_kinds = [SymbolKind.kernel(0), SymbolKind.kernel(1)]
 
+    def generate_bundle(*args, **kwargs):
+        # Changing config after hashing must not change the submitted setting.
+        spyre_config.backend_loop_unroll = True
+        return fake_symbol_kinds
+
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True, "backend_loop_unroll": False}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
-        patch.object(async_compile_mod, "compute_specs_hash", return_value="key"),
+        patch.object(
+            async_compile_mod, "compute_specs_hash", return_value="key"
+        ) as hash_specs,
         patch.object(async_compile_mod, "get_cached_kernel_dir", return_value=None),
         patch.object(
             async_compile_mod, "allocate_compile_dir", return_value="/tmp/key.tmp"
@@ -145,9 +235,7 @@ def test_async_cache_commit_is_deferred_until_wait():
         patch.object(
             async_compile_mod, "commit_compile_dir", return_value="/cache/key"
         ) as commit,
-        patch.object(
-            async_compile_mod, "generate_bundle", return_value=fake_symbol_kinds
-        ),
+        patch.object(async_compile_mod, "generate_bundle", side_effect=generate_bundle),
         patch.object(async_compile_mod, "save_symbol_kinds"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
@@ -156,6 +244,8 @@ def test_async_cache_commit_is_deferred_until_wait():
         patch.object(async_compile_mod, "SpyreSDSCKernelRunner", side_effect=_runner),
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+        assert hash_specs.call_args.kwargs["backend_loop_unroll"] is False
+        assert pool.calls[0][1][-1] is False
         commit.assert_not_called()
 
         pool.futures[0].set_result("compiled")
@@ -343,7 +433,7 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
         "    a.split('=', 1)[1] for a in sys.argv[1:]\n"
         "    if a.startswith('--export-dir=')\n"
         ")\n"
-        "(marker_dir / Path(export_dir).name).touch()\n"
+        "(marker_dir / Path(export_dir).name).write_text('\\n'.join(sys.argv[1:]))\n"
         # The caller treats a missing spyrecode.json as a failure even on exit 0.
         "code_dir = Path(export_dir) / 'spyreCodeDir'\n"
         "code_dir.mkdir(parents=True, exist_ok=True)\n"
@@ -371,10 +461,14 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
             ),
         ):
             compiler = async_compile_mod.SpyreAsyncCompile()
-            tasks = [
-                compiler._submit_backend_compile(f"sdsc_{index}", str(compile_dir))
-                for index, compile_dir in enumerate(compile_dirs)
-            ]
+            tasks = []
+            for index, compile_dir in enumerate(compile_dirs):
+                with spyre_config.patch(backend_loop_unroll=bool(index)):  # type: ignore[attr-defined]
+                    tasks.append(
+                        compiler._submit_backend_compile(
+                            f"sdsc_{index}", str(compile_dir)
+                        )
+                    )
             assert all(task is not None for task in tasks)
             for task in tasks:
                 assert task is not None
@@ -383,3 +477,6 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
         shutdown_compile_workers()
 
     assert {path.name for path in marker_dir.iterdir()} == {"kernel0", "kernel1"}
+    for index in range(2):
+        args = (marker_dir / f"kernel{index}").read_text().splitlines()
+        assert f"--enable-loop-unroll={index}" in args

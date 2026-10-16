@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -29,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include "flex/flex.hpp"
 #include "job_plan.h"
 #include "logging.h"
 #include "module.h"
@@ -172,7 +172,8 @@ void SpyreStream::copyProgramAsync(
     void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+  copyAsyncImpl(prog_cpu_ptr, /*cpu_storage_bytes=*/0, device_address, nullptr,
+                /*host2device=*/true);
 }
 
 void SpyreStream::copyAsync(const at::Tensor& src,
@@ -192,6 +193,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   if (host2device || device2host) {
     // Host-to-device or device-to-host copy
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+    const size_t cpu_storage_bytes = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
@@ -199,8 +201,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
-                  host2device);
+    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
+                  get_composite_address(*dev_tensor), &dci, host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -224,7 +226,7 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr,
+void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
                                 bool host2device) const {
@@ -239,43 +241,58 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     launchH2D(params);
     flex::destroyDmaParams(params);
   } else {
+    // Pass the true host buffer capacity so flex can give ConvertData the
+    // correct out_capacity_bytes for dtype-upscaling D2H transfers (e.g.
+    // bf16→fp32), where the host buffer is larger than the device staging
+    // buffer.
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
+                              host2device, device_address, std::move(dci_ptr),
+                              /*iova=*/nullptr, /*use_compute_pipeline=*/false,
+                              /*pipeline_barrier=*/false, /*skip_hazard=*/false,
+                              /*host_capacity_bytes=*/cpu_storage_bytes);
     launchD2H(params);
     flex::destroyDmaParams(params);
   }
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::H2D))
+      << "launchH2D called with params tagged as D2H — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->launchOperationH2D(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  TORCH_DCHECK_EQ(static_cast<int>(params->getType()),
+                  static_cast<int>(flex::RuntimeOperationType::D2H))
+      << "launchD2H called with params tagged as H2D — check createDmaParams' "
+         "to_device argument";
   RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->launchOperationD2H(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launchOperationCompute(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
-  resolveRuntimeHandle()->launchOperationHostCallback(params);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
-void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
-                            DataFormats dtype, bool use_dmai) const {
+void SpyreStream::launchFillAsync(flex::FillAsyncParams* params) const {
   RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+  resolveRuntimeHandle()->launchOperation(params);
 }
 
-void SpyreStream::launchHostCompute(flex::HostComputeParams* params) const {
+flex::HostComputeBuffer* SpyreStream::launchHostCompute(
+    flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
-  resolveRuntimeHandle()->launchHostCompute(params);
+  return resolveRuntimeHandle()->launchOperation(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
@@ -289,8 +306,10 @@ void SpyreStream::launch(const JobPlan& plan,
 
   // Two-stream overlap topology:
   //   S_dev  = this stream (the default) — Compute (+ D2H).
-  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
-  // Compute overlaps HC/H2D because they run on different streams; every op
+  //   S_prep = the persistent host-compute stream — HostCompute + separate H2D.
+  // Batched correction uploads instead travel with their compute on S_dev.
+  // HostCompute runs inline on the caller; only uploads and compute are queued.
+  // S_dev compute can overlap preparation for subsequent launches. Every op
   // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
   // persistent flex handle each launch: getHostComputeStreamById is a pure
   // lookup of the handle registered once in initializeStreamPoolImpl.
@@ -303,16 +322,44 @@ void SpyreStream::launch(const JobPlan& plan,
   // JobPlanStepHostCompute::construct can capture it by value without an extra
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
+  const size_t max_corrections =
+      s_dev.resolveRuntimeHandle()->maxProgramCorrections();
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
   // single-stream floor). Routing keys on role(), so all-Dev plans never split.
+  // This switch controls stream splitting only: eligible correction batching is
+  // enabled in both topologies, including the single-stream path.
   const bool should_split = get_hazard_tracker_enabled();
-  for (const auto& step : plan.steps) {
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    const auto& step = plan.steps[i];
+    const auto kind = classifyStep(*step);
+    // Group by operation kind: Prep also includes standalone H2D steps, which
+    // must not be collected as host corrections. Pin the role assumptions used
+    // by the routing below so new step variants cannot silently change them.
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(kind != StepKind::HostCompute ||
+                                     step->role() == StreamRole::Prep);
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(kind != StepKind::Compute ||
+                                     step->role() == StreamRole::Dev);
+    if (max_corrections > 0 && kind == StepKind::HostCompute &&
+        (i == 0 || classifyStep(*plan.steps[i - 1]) != StepKind::HostCompute)) {
+      size_t end = i + 1;
+      while (end < plan.steps.size() &&
+             classifyStep(*plan.steps[end]) == StepKind::HostCompute) {
+        ++end;
+      }
+      // Flex reports the supported correction count for the consuming stream.
+      // Keep the whole group on separate uploads when it cannot be batched.
+      ctx.batch_program_corrections =
+          end - i <= max_corrections && end < plan.steps.size() &&
+          classifyStep(*plan.steps[end]) == StepKind::Compute;
+    }
     const SpyreStream& target =
         (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
     step->construct(ctx, target);
   }
+  TORCH_CHECK(ctx.program_corrections.empty(),
+              "Program correction has no consuming compute step");
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

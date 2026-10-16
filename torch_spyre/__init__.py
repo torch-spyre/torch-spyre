@@ -138,10 +138,14 @@ class _SpyreImpl:
         return default_generator.initial_seed()
 
     def is_available(self) -> bool:
+        # A process that doesn't own the card (forked, or started with
+        # IS_INDUCTOR_SPAWNED_SUBPROCESS=1) never starts the runtime, so it has
+        # no usable device. Reporting one makes torch.accelerator callers (e.g.
+        # Dynamo's stream tracking on every compile) reach stream code that
+        # needs the runtime, and the process aborts even for CPU-only code.
         if self._is_in_bad_fork():
-            return True
-        else:
-            return self.device_count() > 0
+            return False
+        return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()

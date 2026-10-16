@@ -82,6 +82,17 @@ jobs:
       pytorch_build_seconds: ${{ steps.compute_durations.outputs.pytorch_build_seconds }}
       torch_spyre_build_seconds: ${{ steps.compute_durations.outputs.torch_spyre_build_seconds }}
     steps:
+      # First, and independent of every checkout/build step, so rh_job_name in the
+      # always-run "Report build completed" step is populated even when an
+      # earlier step (e.g. the pytorch checkout) fails.
+      - name: Detect RHEL and GCC versions
+        id: os_info
+        run: |
+          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
+          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
+          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -103,18 +114,11 @@ jobs:
         uses: ./.github/actions/checkout-pytorch
         with:
           sha: ${{ inputs.pytorch_sha }}
+          submodules: 'true'
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      - name: Detect RHEL and GCC versions
-        id: os_info
-        run: |
-          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
-          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
-          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
-          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -269,7 +273,8 @@ jobs:
   # "success" even when tests failed, so the JUnit counts are the only
   # trustworthy signal.
   #
-  # if: always() at the job level so the reporting steps still run even
+  # if: !cancelled() at the job level (not always(), which would ignore a
+  # cancel for up to the 660-min timeout) so the reporting steps still run
   # when `build` failed -- the dispatch/wait step is individually gated on
   # needs.build.result == 'success' so it doesn't attempt to use wheels
   # that were never produced.
@@ -277,7 +282,7 @@ jobs:
   test:
     name: Run upstream-beta test matrix and report results
     needs: build
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on:
       - x86_64
       - spyre_pf_x0

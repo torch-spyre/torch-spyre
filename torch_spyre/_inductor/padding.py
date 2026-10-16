@@ -78,7 +78,6 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
-    _is_compact_node,
     lower_pad_sequence,
     patch_env,
     redirect_computed_buffer_reads,
@@ -130,7 +129,7 @@ class _PaddedLoadHandler(WrapperHandler):
     into host coordinates against y's layout and re-composed with the padded
     buffer's indexer.
 
-    This wraps the live index (see CLAUDE.md "Compiler Pass Conventions")
+    This wraps the live index (see AGENTS.md "Compiler Pass Conventions")
     rather than re-deriving y's coordinates from the matmul's dim order, so
     any view stays correct by construction.
     """
@@ -180,7 +179,7 @@ def _rebuild_matmul(
     y's host dims are [.., K, N] in the common case, but need not be: a
     transposed ``nn.Linear`` weight is [N, K] (issue #4208), and a coarse-tile
     read-copy buffer for a loop-invariant y can be transposed and column-major
-    (see test_bmm_read_copy_y_unaligned_k_pads).  Re-striding the live load
+    (see test_bmm_invariant_y_unaligned_k_pads_for_each_tile).  Re-striding the live load
     index covers all of these without knowing which position K occupies.
     """
     reduction = op.data
@@ -468,8 +467,6 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     if not isinstance(out_layout, FixedTiledLayout):
         return False
     if not isinstance(op.data, Pointwise):
-        return False
-    if _is_compact_node(op):
         return False
 
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)

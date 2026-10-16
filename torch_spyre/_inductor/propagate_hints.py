@@ -34,7 +34,7 @@ logger = get_inductor_logger("propagate_hints")
 @dataclasses.dataclass
 class DimHint:
     dim_names: list[str]  # e.g. ["A"]
-    split_count: int  # from slices={"A": 4}, e.g. 4
+    split_count: int  # tile count; 1 for a for_each_tile level (see loop_var_range)
     loop_var: "sympy.Symbol | None"  # the loop variable (e.g. c0, c1) for this dim;
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
@@ -55,17 +55,15 @@ class DimHint:
 
 # op.dim_hints: list[DimHint]
 #
-# One entry per hinted dimension, ordered outermost hint scope first.
-# Outer hint IDs are smaller than inner hint IDs (guaranteed by spyre_hint
-# counter order), so sorting by hint ID gives outermost-first ordering.
+# One entry per tiled dimension, ordered outermost loop level first.  Built by
+# for_each_tile's lowering (one per nesting level, with loop_var_range set) and
+# by the span-overflow planner.  Sorting by hint ID gives outermost-first
+# ordering.
 #
-# Example — two nested hints on one op:
-#   with spyre_hint(slices={"A": 2}):      # outer scope → smaller hint ID
-#       with spyre_hint(slices={"B": 4}):  # inner scope → larger hint ID
-#           y = a + b
+# Example — a two-level span-overflow tiling of one op:
 #
 # dim_hints = [DimHint(dim_names=["A"], split_count=2, loop_var=c0, ...),
-#                 DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
+#              DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
@@ -94,10 +92,38 @@ def get_id():
     return counter, torch.empty(0, device="cpu")
 
 
+# The keys a spyre_hint scope can carry.  Tiling is expressed with for_each_tile,
+# so the former tiling keys are rejected rather than silently ignored: an old
+# annotation would otherwise compile to an untiled graph with no signal.
+_VALID_HINT_KEYS = frozenset(
+    {"work_div", "named_dims", "expected_named_dims", "expected_reduction_dims"}
+)
+_REMOVED_TILING_KEYS = frozenset({"num_tiles_per_dim", "tiles", "slices"})
+
+
+def _validate_hint_keys(kwargs: dict[str, Any]) -> None:
+    for key in kwargs:
+        if key in _REMOVED_TILING_KEYS:
+            raise ValueError(
+                f"spyre_hint({key}=...) has been removed; express tiled loops with "
+                f"for_each_tile (torch_spyre._inductor.wsr.for_each_tile) instead"
+            )
+        if key not in _VALID_HINT_KEYS:
+            raise ValueError(
+                f"spyre_hint() got an unrecognized key {key!r}; accepted keys: "
+                f"{sorted(_VALID_HINT_KEYS)}"
+            )
+
+
 def spyre_hint(**kwargs: Any):
     """
     Attach a hint and a unique hint id to every FX node in scope.
+
+    Accepted keys: ``work_div`` (per-dimension core split), ``named_dims`` (dimension
+    names for the ops in scope) and the assertions ``expected_named_dims`` /
+    ``expected_reduction_dims``.  Anything else raises ``ValueError``.
     """
+    _validate_hint_keys(kwargs)
     if torch.compiler.is_compiling():
         _id, _ = get_id()
     else:

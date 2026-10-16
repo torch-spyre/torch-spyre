@@ -29,7 +29,6 @@ import pytest
 from unittest.mock import patch
 
 import torch
-import torch.nn.functional as F
 from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
@@ -793,17 +792,8 @@ def test_two_mutations_read_between_writes_minimal_copy_():
     _compare(fn, a, b, acc)
 
 
-@pytest.mark.skip(
-    reason="crashes in _clone_layout (propagate_layouts) before the conflicting-layout "
-    "assert fires: `return snapshot * acc` forces a flat 1D clone of acc (size=[32768]) "
-    "between the two writes; device_coordinates on the col-stick acc via that flat index "
-    "produces the unsupported stick expr floor((Mod(d0,16384))/256). Issue #4093"
-)
 def test_two_mutations_read_between_writes_v2_copy_f():
     # write / read / write returning snapshot * acc (both outputs live).
-    # Skipped: `return snapshot * acc` forces a flat 1D clone of acc between the
-    # two writes; device_coordinates on the col-stick acc via that flat index
-    # produces an unsupported stick expression in _clone_layout.
     M, N = 128, 256
     a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
     b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
@@ -914,45 +904,6 @@ def test_opt_chained_matmuls():
     """(a @ b) @ c — no restickify needed."""
     a, b, c = _make_tensors(3, S, S)
     _compare(lambda a, b, c: (a @ b) @ c, a, b, c, optimal_cost=0)
-
-
-def test_fused_attention_projection_uses_exact_flat_m_layout():
-    """Issue #4746: a fused shared-weight o_proj must not retain B,L BMM axes."""
-    B, H, L, D = 2, 2, 64, 64
-    M, K = B * L, H * D
-    q, k, v = _make_tensors(3, B, H, L, D)
-    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
-
-    def fn(q, k, v, weight):
-        attention = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, scale=D**-0.5
-        )
-        flat = attention.transpose(1, 2).reshape(M, K)
-        return F.linear(flat, weight)
-
-    result, plan = _compile_and_run_plan_capture(fn, q, k, v, weight)
-    target_stls = [
-        entry.target_layout.device_layout
-        for entries in plan.values()
-        for entry in entries
-    ]
-
-    assert any(
-        list(layout.device_size) == [K // 64, M, 64]
-        and list(layout.stride_map) == [64, K, 1]
-        for layout in target_stls
-    ), f"expected an exact flat-M restickify target, got {target_stls}"
-    compare_with_cpu(
-        fn,
-        q,
-        k,
-        v,
-        weight,
-        target=result,
-        run_eager=False,
-        atol=0.2,
-        rtol=0.2,
-    )
 
 
 def test_opt_two_independent_conflicts():
@@ -2732,7 +2683,7 @@ def test_nonstick_no_reorder_when_large_dim_already_at_slot():
 
     assert not nonstick_log, (
         "Expected no reorder when large dim is already at slot, "
-        f"but got: {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"but got: {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
     )
 
 
@@ -2767,20 +2718,72 @@ def test_nonstick_reorder_pointwise_into_matmul():
     # x=[2,55,2] → device_size=[55,2,2,64] → outer_stick=1, slot=2 → [2,2,55,64].
     assert nonstick_log, "Expected nonstick_reorder_log to be non-empty"
     reordered_any = False
-    for buf_name, stl_list in nonstick_log.items():
-        for stl in stl_list:
-            device_size = list(stl.device_size)
-            if len(device_size) < 3:
-                continue
-            nonstick = device_size[:-1]
-            # For the 2D-stick shape used here (4 device dims, outer_stick=1,
-            # slot=2), the sandwich slot is device_size[-2].  Only check
-            # buffers where the slot dim is actually the largest — buffers
-            # whose idc couldn't be resolved are left unchanged.
-            if device_size[-2] != max(nonstick):
-                continue
-            reordered_any = True
+    for buf_name, stl in nonstick_log.items():
+        device_size = list(stl.device_size)
+        if len(device_size) < 3:
+            continue
+        nonstick = device_size[:-1]
+        # For the 2D-stick shape used here (4 device dims, outer_stick=1,
+        # slot=2), the sandwich slot is device_size[-2].  Only check
+        # buffers where the slot dim is actually the largest — buffers
+        # whose idc couldn't be resolved are left unchanged.
+        if device_size[-2] != max(nonstick):
+            continue
+        reordered_any = True
     assert reordered_any, (
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
-        f"nonstick_log={[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+        f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_flat_dense_projection_collapses_outer_dims():
+    """NDO collapses a fused SDPA output from [B,L,H,D] to flat [M,K] for o_proj.
+
+    A fused attention producer retains a higher-rank host view [B, H, L, D]
+    that the downstream dense projection reads as the flat 2-D matrix [M, K]
+    where M=B*L and K=H*D. Without the flat-M transform, the backend encodes
+    this as a BMM. NDO must detect the pattern and collapse committed_stl to
+    the canonical flat-M shape.
+    """
+    import torch.nn.functional as F
+
+    B, H, L, D = 2, 2, 64, 64
+    M, K = B * L, H * D
+
+    q, k, v = _make_tensors(3, B, H, L, D)
+    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=D**-0.5
+        )
+        flat = attention.transpose(1, 2).reshape(M, K)
+        return F.linear(flat, weight)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        q.to(DEVICE),
+        k.to(DEVICE),
+        v.to(DEVICE),
+        weight.to(DEVICE),
+    )
+
+    assert nonstick_log, "expected NDO to rewrite at least one buffer"
+    flat_m_found = any(
+        list(stl.device_size) == [K // 64, M, 64] for stl in nonstick_log.values()
+    )
+    assert flat_m_found, (
+        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
+        f"got {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
     )

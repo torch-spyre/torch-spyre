@@ -14,10 +14,10 @@
 
 """Unit tests for scatter layout enforcement helper functions.
 
-Tests the core layout-checking logic in enforce_indirect_access_layout.py:
+Tests the core layout-checking logic in nonstick_dim_order.py:
 - _dim_order_is_compliant: checks if indirect dim is at device position 0
 - _indirect_stride_idx: finds which coordinate carries IndirectAccess
-- _build_required_stl: constructs compliant layout by rotating dimensions
+- _ia_rotate_stl: constructs compliant layout by rotating dimensions
 """
 
 import unittest
@@ -28,9 +28,11 @@ import torch
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.enforce_indirect_access_layout import (
     _dense_scatter_source_stl,
+)
+from torch_spyre._inductor.nonstick_dim_order import (
     _dim_order_is_compliant,
+    _ia_rotate_stl,
     _indirect_stride_idx,
-    _build_required_stl,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -131,8 +133,8 @@ class TestIndirectStrideIdx(unittest.TestCase):
         self.assertEqual(stride_idx, 2)
 
 
-class TestBuildRequiredStl(unittest.TestCase):
-    """Tests for _build_required_stl."""
+class TestIaRotateStl(unittest.TestCase):
+    """Tests for _ia_rotate_stl."""
 
     def test_rotate_indirect_to_position_0(self):
         """Rotates indirect dim from position 2 to position 0."""
@@ -141,7 +143,7 @@ class TestBuildRequiredStl(unittest.TestCase):
             stride_map=[256, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=2)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=2)
 
         # Should move dim 2 (size 8) to position 0
         self.assertEqual(required_stl.device_size[0], 8)
@@ -157,7 +159,7 @@ class TestBuildRequiredStl(unittest.TestCase):
             stride_map=[128, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=0)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=0)
 
         self.assertEqual(required_stl.device_size, original_stl.device_size)
         self.assertEqual(required_stl.stride_map, original_stl.stride_map)
@@ -169,7 +171,7 @@ class TestBuildRequiredStl(unittest.TestCase):
             stride_map=[512, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
         )
-        required_stl = _build_required_stl(original_stl, indirect_device_pos=1)
+        required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
 
         # Dim 1 (size 8) moves to position 0
         self.assertEqual(required_stl.device_size[0], 8)
