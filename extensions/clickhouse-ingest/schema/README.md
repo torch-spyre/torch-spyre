@@ -27,6 +27,7 @@ Applying them in filename order works from an empty database.
 | `55-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers`, `v_feed_events` (parameterized), `v_dispatch_targets` | 20, 25, 26, 49, 50 |
 | `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
+| `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
