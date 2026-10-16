@@ -593,6 +593,19 @@ class TestStickConstraints(unittest.TestCase):
             validate_op_specs([op], stage=STICK_STAGE)
         self.assertIn("different stick loop variables", str(ctx.exception))
 
+    def test_conv_different_sticks_passes(self):
+        """Conv args stick on different dims by design; not an all-same op."""
+        for conv_op in sorted(constants.CONV_OPS):
+            c_other = Symbol("c_other")
+            op = _make_valid_op_spec(conv_op, is_reduction=True)
+            op.iteration_space[c_other] = (Integer(64), 1)
+            op.args[1] = dataclasses.replace(
+                op.args[1],
+                device_coordinates=[_C_COL // 64, _C_ROW, sympy.Mod(c_other, 64)],
+            )
+            with self.subTest(op=conv_op):
+                validate_op_specs([op], stage=STICK_STAGE)
+
     def test_restickify_different_sticks_passes(self):
         c_other = Symbol("c_other")
         op = _make_valid_op_spec("ReStickifyOpHBM")

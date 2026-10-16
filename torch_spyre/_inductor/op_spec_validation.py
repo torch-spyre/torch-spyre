@@ -653,6 +653,12 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_topk(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
+    elif op in constants.CONV_OPS:
+        # Convolution args stick on different dims by design (input on
+        # in-channel, weight on its own dim, output on out-channel), so the
+        # all-same rule below does not apply.
+        # TODO: add a conv-specific stick check.
+        return
     elif op in _pointwise_ops() | DTYPE_OPS | REDUCTION_OPS:
         # avgpoolfwd is in REDUCTION_OPS but its full constraint (window dims
         # must not appear in the stick) is deferred — _check_stick_all_same
