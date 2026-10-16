@@ -964,12 +964,13 @@ class TestSpyre(TestCase):
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
         from torch_spyre.ops.fallbacks import FallbackWarning
 
-        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        # int8 has a device format but no conversion op.
+        source_cpu = (torch.arange(128) % 100).to(torch.int8).reshape(2, 64)
         source = source_cpu.to("spyre")
 
         with self.assertWarnsRegex(
             FallbackWarning,
-            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+            r"conversion from torch\.int8 to torch\.float16 is falling back to cpu",
         ):
             actual = source.to(torch.float16)
 
