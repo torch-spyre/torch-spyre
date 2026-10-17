@@ -2494,6 +2494,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 129)),
                     cached_randn((129, 64)),
                 ),
+                "10x20_add_transpose_fp32": (
+                    cached_randn((10, 20), dtype=torch.float32),
+                    cached_randn((20, 10), dtype=torch.float32),
+                ),
+                "7x13_add_transpose_fp32": (
+                    cached_randn((7, 13), dtype=torch.float32),
+                    cached_randn((13, 7), dtype=torch.float32),
+                ),
+                "64x129_add_transpose_fp32": (
+                    cached_randn((64, 129), dtype=torch.float32),
+                    cached_randn((129, 64), dtype=torch.float32),
+                ),
+                "10x20_add_transpose_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int32),
+                ),
+                "7x13_add_transpose_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int32),
+                ),
+                "64x129_add_transpose_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int32),
+                ),
+                "10x20_add_transpose_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int64),
+                ),
+                "7x13_add_transpose_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int64),
+                ),
+                "64x129_add_transpose_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int64),
+                ),
+            },
+            "expect_fail": {
+                "10x20_add_transpose_int32": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+                "7x13_add_transpose_int32": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+                "64x129_add_transpose_int32": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+                "10x20_add_transpose_int64": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+                "7x13_add_transpose_int64": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+                "64x129_add_transpose_int64": "native IEEE_INT32 or IEEE_INT64 add is not supported yet (torch-spyre PR #4462)",
+            },
+        },
+        ("test_restickify_clone", "test_restickify_clone_cpu"): {
+            "param_sets": {
+                "10x20_clone_fp16": (cached_randn((10, 20)),),
+                "7x13_clone_fp16": (cached_randn((7, 13)),),
+                "64x129_clone_fp16": (cached_randn((64, 129)),),
+                "10x20_clone_fp32": (cached_randn((10, 20), dtype=torch.float32),),
+                "7x13_clone_fp32": (cached_randn((7, 13), dtype=torch.float32),),
+                "64x129_clone_fp32": (cached_randn((64, 129), dtype=torch.float32),),
+                "10x20_clone_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                ),
+                "7x13_clone_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                ),
+                "64x129_clone_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                ),
+                "10x20_clone_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                ),
+                "7x13_clone_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                ),
+                "64x129_clone_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
+                ),
             }
         },
         ("test_cmp", "test_binary_op_cpu"): {
@@ -9626,6 +9698,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, a, b, run_eager=False)
 
+    def test_restickify_clone_cpu(self, a):
+        def fn(a):
+            return a.t().clone()
+
+        self.compare_with_cpu(fn, a, run_eager=False)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_transpose_patterns_cpu(self, variant, execution_mode, *args):
         if variant == "attn_qkv_projection":
@@ -11901,51 +11979,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
-
-    @expects_raise
-    def test_restickify_fp32_unsupported(self):
-        """An op that needs a restickify has no feasible layout for FP32.
-
-        ``x.t() + y`` needs a restickify, which only exists for the DL16 format
-        (fp16 and bf16; both compile and match the CPU). With FP32 operands the
-        layout optimizer finds no feasible layout. That is its generic "no
-        mechanism to resolve stick incompatibility" error, which also fires for
-        other causes (unaligned re-offsets, #1377), so the fragment pins the FP32
-        device dtype that the message lists for each input.
-        """
-        x = torch.randn((128, 128), dtype=torch.float32)
-        y = torch.randn((128, 128), dtype=torch.float32)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
-
-    @expects_raise
-    def test_restickify_int64_unsupported(self):
-        """The same, for INT64: there is no feasible layout without a restickify.
-
-        int64 is stored as IEEE_INT32 on device and now uses the native
-        addi32toi32 path, so the error message names IEEE_INT32 for the
-        operands (not IEEE_FP32 as in the fp32 case above).
-        """
-        x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_INT32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
 
     def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""

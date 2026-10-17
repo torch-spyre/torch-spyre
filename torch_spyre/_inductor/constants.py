@@ -14,11 +14,22 @@
 
 import torch
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+
+# Relative restickify cost per device dtype, for the same logical tensor.
+# 32-bit formats cost 4x the fp16 restickify. Single source of truth for the
+# supported dtypes below.
+RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT = {
+    DataFormats.SEN169_FP16: 1,
+    DataFormats.IEEE_FP32: 4,
+    DataFormats.IEEE_INT32: 4,
+    DataFormats.SENUINT32: 4,
+}
+RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT)
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
