@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-FFDC trigger — exercises kernel_runner.py exception paths on real hardware.
+"""FFDC trigger — exercises kernel_runner.py exception paths on hardware.
 
-Drives SpyreSDSCKernelRunner and SpyreUnimplementedRunner through their
-real exception paths so FFDC fires on a genuine traceback with real
-hardware state and compiler artifacts.
+Scenario A uses a fake ``code_dir``. ``SpyreSDSCKernelRunner.__init__``
+calls unhooked ``prepare_kernel``, so that path does not emit
+``runtime_launch``. Scenario B drives ``SpyreUnimplementedRunner.run``
+(``@with_ffdc(CATEGORY_UNIMPLEMENTED)``).
 
 Run from repo root with:
     TORCH_SPYRE_FFDC=1 TORCH_COMPILE_DEBUG=1 python3 tools/ffdc_trigger.py
@@ -62,36 +62,28 @@ def main():
     reports = []
     os.environ.setdefault("TORCH_SPYRE_FFDC", "1")
 
-    # ── Scenario A: runtime_launch failure ──────────────────────────────────────
-    # SpyreSDSCKernelRunner.__init__ calls prepare_kernel(); with a fake code_dir
-    # that fails or run() fails in launch_jobplan, FFDC should capture
-    # CATEGORY_RUNTIME_LAUNCH.
+    # ── Scenario A: fake code_dir fails in unhooked prepare_kernel ───────────────
+    # SpyreSDSCKernelRunner.__init__ calls prepare_kernel() with no with_ffdc.
+    # This does not emit CATEGORY_RUNTIME_LAUNCH (deferred gap in ffdc.md).
     os.environ.pop("DUMP_SPYRE_CODE", None)
 
-    print("Scenario A: SpyreSDSCKernelRunner.run() → launch_kernel() raises")
-    runner = SpyreSDSCKernelRunner(
-        name="test_kernel_add",
-        code_dir="/tmp/fake_spyre_code_dir",
-    )
+    print("Scenario A: SpyreSDSCKernelRunner.__init__ → prepare_kernel")
     t0 = time.time()
     try:
-        runner.run()
-    except RuntimeError as e:
-        print(f"  Exception re-raised (expected): {e}")
-    else:
-        raise AssertionError(
-            "Expected RuntimeError from runner.run() but none was raised"
+        SpyreSDSCKernelRunner(
+            name="test_kernel_add",
+            code_dir="/tmp/fake_spyre_code_dir",
         )
+    except RuntimeError as e:
+        print(f"  Exception (expected; prepare_kernel is unhooked): {e}")
+    else:
+        raise AssertionError("Expected failure from prepare_kernel but none was raised")
 
     report_path = _newest_since(str(FFDC_OUT / "ffdc_runtime_launch_*.json"), t0)
     if report_path:
-        with open(report_path) as f:
-            report = json.load(f)
-        reports.append(("runtime_launch", report))
-        print(f"  Report written: {report_path}")
-        _print_collector_stats(report["collector"])
+        print(f"  Unexpected runtime_launch report: {report_path}")
     else:
-        print("  [WARN] No report found — check FFDC output_dir")
+        print("  [ok] No runtime_launch report (prepare_kernel is unhooked)")
 
     # ── Scenario B: unimplemented op failure ────────────────────────────────────
     print(
