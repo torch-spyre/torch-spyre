@@ -591,8 +591,8 @@ utilization). Remaining gaps:
 - **No performance model.** The "honor compute-bound ops, search the
   rest" rule is still a heuristic; the trade between compute throughput
   and memory traffic is not scored.
-- **Coarse-tiling integration**: landed for CP-SAT (`#4768`), partially landed for simulated
-  annealing — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
+- **Coarse-tiling integration**: landed for CP-SAT (`#4768`) and simulated annealing
+  (`#4456`-`#4894`) — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
   for current status.
 
 The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
@@ -655,8 +655,8 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`), partially
-  landed for simulated annealing — see
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`) and simulated
+  annealing (`#4456`-`#4894`) — see
   [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
   current status.
 

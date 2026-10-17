@@ -342,7 +342,7 @@ symbols: the loop reaches the price mainly through the operands it re-reads, bes
 residency the tiling makes possible. Its chosen tilings are applied the same way, and its
 placement stands: there is no second solve.
 
-**Status: landed for both solvers, off by default; SA fixes still landing.** `CoreDivision.tiling`
+**Status: landed for both solvers, off by default.** `CoreDivision.tiling`
 / `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
 `scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
 `DimHint`s — applies the chosen tilings, both shared by the two solvers:
@@ -356,19 +356,16 @@ placement stands: there is no second solve.
   and the allocation is solved again over the now-tiled graph, with no further tilings
   offered — that second plan is the one committed.
 
-- **Simulated annealing**: a 7-PR stack (`#4456` through `#4894`) adds this; the first six
-  are merged. `OpSplitSpace`'s `TilingSpace` half offers each op its tilings; the **flip** move
-  shifts a tiled run's boundary, and the **recolor** move (it floods a coordinated division
-  change across a connected region of buffers) carries a tiling along with it. `#4602`
-  applies the chosen tilings before the divisions are committed, keeping the anneal's
-  placement; a tiling the apply refuses raises rather than falling back. `#4611` prices the
-  HBM traffic of the full-extent companion buffer the apply mints for a tiled op whose output
-  escapes its run. `#4770` prices the loop a tiling introduces, through tile-count symbols in
-  `cost_expr`, and refuses LX to a buffer a tiled op reads across its run's boundary. Still to
-  come: `#4894` fixes the gaps between what the search may tile and
-  what the apply builds that surface once tilings are applied, as compile failures or
-  mis-scaled reads. Until `#4894` lands, keep `auto_coarse_tiling` off under simulated
-  annealing. See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
+- **Simulated annealing**: landed via `#4456` through `#4894`. `OpSplitSpace`'s `TilingSpace`
+  half offers each op its tilings; the **flip** move shifts a tiled run's boundary, and the
+  **recolor** move (it floods a coordinated division change across a connected region of
+  buffers) carries a tiling along with it. Besides the tile-count symbols in `cost_expr`, the
+  anneal prices the HBM traffic of the full-extent companion buffer the apply mints for a tiled
+  op whose output escapes its run, outside that expression. A buffer a tiled op reads from
+  outside its run is refused LX. The chosen tilings are applied before the divisions are
+  committed, keeping the anneal's placement. A tiling the apply refuses raises rather than
+  falling back, since `OpSplitSpace.admits` is meant to offer only tilings the apply can build.
+  See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
 
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
 here for current status, rather than carrying their own stale claim.
@@ -412,8 +409,9 @@ Two useful flags:
 - `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line per
   solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
   per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
-  chose, every term evaluated under those bindings, and the alternative divisions each buffer
-  could have taken instead — a self-describing record of one solve, meant to be read without
+  chose, every term evaluated under those bindings, the terms the solver adds outside the
+  expression and the total it minimized, and the alternative divisions each buffer could have
+  taken instead — a self-describing record of one solve, meant to be read without
   needing to know which flags produced it. This one is specific to a *co-optimized* solve.
 
 ### Keeping the model honest: recalibrating against real hardware
@@ -593,9 +591,10 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ### Tiling-related:
 
-- SA's coarse-tiling stack (`#4456` through `#4894`) is 6 of 7 merged — update [b) LX
-  placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
-  above (and `scratchpad_planning.md`'s pointers to it) again as `#4894` lands.
+- Simulated annealing decides by its own objective whether a tiling pays, and can decide
+  against it: `test_solver_auto_coarse_tiling.py`'s MLP stays untiled under simulated annealing
+  (`sa_may_stay_untiled`). How closely the tile-count symbols track the device is not covered
+  by the sweep plan (see the sweep-coverage item above).
 - The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
   tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
   core-division splits for matmuls "the matmuls' tilings." The code no longer does:

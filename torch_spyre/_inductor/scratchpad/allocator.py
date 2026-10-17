@@ -3123,6 +3123,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     bundle_terms,
                     result,
                     _COST_PARAMS,
+                    solver.off_expression_ns(),
+                    solver.score_ns(),
                     context=context,
                 ),
             )
@@ -3243,6 +3245,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         commit_divisions(graph, allocation, self._live_splits)
+        # After the commit, and before the views below are derived from it: a
+        # copy-out the apply mints is not in ``allocation``, so nothing above gave
+        # it a division and it would be judged against its tiled op's as a mismatch.
+        self._commit_copy_out_divisions(graph, allocation, tiled)
         commit_lx_views(
             graph,
             allocation,
@@ -3734,6 +3740,49 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
 
+    def _commit_copy_out_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Iterable[str],
+    ) -> None:
+        """Give each copy-out the apply minted its tiled op's core division.
+
+        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
+        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
+        keeps no division of its own -- one core -- while the tiled op commits
+        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
+        mismatch and withholds the tiled buffer's view, and a resident one
+        raises in :meth:`_post_solve`.
+
+        The copy's iteration symbols are the tiled op's output symbols in order
+        (``iteration_space_from_op`` lists reductions after), so the splits map
+        positionally and only a reduction split is dropped.
+        """
+        by_name = {b.name: b for b in allocation}
+        ops = {getattr(op, "name", None): op for op in graph.operations}
+        for source in tiled:
+            # Named as ``_insert_copy_op`` names it.
+            copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
+            buffer = by_name[source]
+            if copy is None:
+                # Expected when the op's output stays inside its tiling group.
+                logger.debug("%s: no copy-out to give its core division", source)
+                continue
+            if buffer.chosen_division is None:
+                continue
+            splits = self._live_splits(
+                source, buffer.core_divisions[buffer.chosen_division].splits
+            )
+            symbols = list(iteration_space_from_op(copy))
+            source_symbols = list(iteration_space_from_op(graph.get_buffer(source)))
+            mapped = {
+                symbols[position]: factor
+                for position, symbol in enumerate(source_symbols)
+                if position < len(symbols) and (factor := splits.get(symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(copy, mapped)
+
     def _check_priced_footprints(
         self,
         graph: GraphLowering,
@@ -3930,6 +3979,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name = {op.name: op for op in graph.operations}
         position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
+        readers_by_name: dict[str, list[ComputedBuffer]] = {}
+        if self._solver_chooses_tilings:
+            for reader in graph.operations:
+                if isinstance(reader, ComputedBuffer):
+                    for name in {read.name for read in reader.get_read_writes().reads}:
+                        readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
@@ -4164,7 +4219,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and output_name in division_map.enumerated
                 and self._solver_generates_divisions
             ):
-                buffer.division_space = self._division_space(op)
+                buffer.division_space = self._division_space(
+                    op, readers_by_name.get(output_name, ())
+                )
             if self._solver_chooses_tilings and isinstance(op, ComputedBuffer):
                 buffer.tile_reads = self._tile_reads(graph, op, op_by_name)
             buffers.append(buffer)
@@ -4356,8 +4413,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             and self.layout_planning.generates_divisions()
         )
 
-    def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
-        """The op's split space.
+    def _division_space(
+        self, op: Operation, readers: Sequence[ComputedBuffer] = ()
+    ) -> Optional[OpSplitSpace]:
+        """The op's split space; ``readers`` are the ops reading its output.
 
         The tiling half is attached only for the solver that can use it (see
         :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
@@ -4368,7 +4427,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # imports this module.
         from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 
-        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        tiling = (
+            build_tiling_space(op, readers=readers)
+            if self._solver_chooses_tilings
+            else None
+        )
         return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(

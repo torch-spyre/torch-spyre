@@ -1396,6 +1396,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             outside_reads = size * outside if addresses[idx] is not None else 0
             yield (lo, hi), copy_read + copy_write + outside_reads
 
+    def _companions(self, addresses: Sequence[Optional[int]]) -> int:
+        """:meth:`_score`'s term outside ``cost_expr``, in its fixed-point units."""
+        return utils.to_fixed_us(
+            self._companion_bytes(addresses) / self._hbm_bytes_per_us
+        )
+
+    def off_expression_ns(self) -> dict[str, float]:
+        if not self._bufs:
+            return {}
+        ns = 1000.0 / utils.US_FIXED_POINT_SCALE
+        return {"companions": self._companions(self.packer.addresses) * ns}
+
+    def score_ns(self) -> Optional[float]:
+        if not self._bufs:
+            return None
+        return self._score() * 1000.0 / utils.US_FIXED_POINT_SCALE
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is
@@ -1413,9 +1430,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Both add :meth:`_companion_bytes` at the HBM rate.
         """
         addresses = self.packer.addresses
-        companions = utils.to_fixed_us(
-            self._companion_bytes(addresses) / self._hbm_bytes_per_us
-        )
+        companions = self._companions(addresses)
         if self._score_fn is not None:
             resident = frozenset(
                 b.name

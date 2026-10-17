@@ -246,7 +246,9 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # Append one JSON record per co-optimized graph to this file: the symbolic cost
 # objective the solver minimized (per-bundle terms and relayout charges as sympy
 # ``srepr`` strings), the symbol values the solve chose, and each term evaluated
-# under them. Read by the summarize-sdsc skill. Empty = off.
+# under them, plus any terms the engine adds outside the expression and the
+# total it minimized (see ``cost_expr_record``). Read by the summarize-sdsc
+# skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.
