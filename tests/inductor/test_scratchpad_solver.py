@@ -32,8 +32,10 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     ScratchpadAllocator,
+    _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -196,6 +198,51 @@ class TestLxPlanningContract(TestCase):
                         ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
                     ):
                         _lx_planning_size()
+
+
+class TestCoarseTileLoopTripCount(TestCase):
+    """_coarse_tile_loop_trip_count: the same-group relayout cost multiplier
+    (cyang49's PR #5057 review -- a same-group candidate's price must scale
+    by the loop's real trip count, not price one tile's worth as if it ran
+    once).
+    """
+
+    @staticmethod
+    def _tiled(loop_count):
+        return CoarseTileInfo(
+            loop_group_id=(0,) * len(loop_count),
+            loop_count=loop_count,
+            loop_tiled_dims=[[] for _ in loop_count],
+            loop_tiled_reduction_dims=[[] for _ in loop_count],
+        )
+
+    def test_untiled_op_is_one_trip(self):
+        op = types.SimpleNamespace(loop_info=None)
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_single_level_concrete_count(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_nested_levels_multiply(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
+
+    def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
+        """A dynamic-shape loop bound (for_each_tile_lowering.py's
+        _extract_trip_count) can stamp an unresolved sympy.Symbol into
+        loop_count instead of a concrete int. int() on that raises TypeError;
+        the multiplier must fall back to 1 for that level rather than
+        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
+        float, consumed by min()/round() elsewhere in the solver)."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
 
 class TestDrainLifetimeBoundary(TestCase):

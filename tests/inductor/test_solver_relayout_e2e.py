@@ -584,14 +584,28 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
     )
 
 
-def test_coarse_tiled_edges_are_never_offered(monkeypatch):
-    """A coarse-tiled graph must enumerate NO relayout candidates.
+def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
+    """A coarse-tiled edge that crosses for_each_tile scopes must enumerate NO
+    relayout candidates, even though a same-group coarse-tiled edge now can
+    (see test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip
+    below, torch-spyre#5057).
 
-    Both ops sit in one for_each_tile body, so the producer's buffer is
-    per-tile scratch and the edge lives inside the loop. The fitted law has
-    no loop_trip factor and the committed-path planner forbids in-loop
-    relayouts; the solver path must decline at enumeration (loop_info gate),
-    not merely decline to fire."""
+    The producer sits in one for_each_tile body and the consumer in a
+    separate, sibling body with its own loop_group_id, so this is a true
+    cross-group edge, not merely two ops that happen to both be tiled. A
+    relayout taken at that seam would still be stale on the next outer
+    iteration the same way an in-loop one would be; the solver path must
+    decline at enumeration (loop_info gate), not merely decline to fire.
+
+    The two for_each_tile calls tile different axes of the intermediate (dim
+    0 then dim 1) specifically to force two genuinely distinct loop scopes.
+    Verified empirically, not just by inspection: equal tile_size/dims
+    siblings over the same shape fuse into one shared while_loop body (both
+    intermediates named ``while_loop_body_graph_0_0_*``); giving the second
+    call a different tile_size ALONE (same dim) still fuses the same way,
+    byte-identical candidate list. Only a different tiled axis keeps the
+    splicer from inlining the producer directly into the consumer's body --
+    which is not the cross-group case this test means to cover."""
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
@@ -620,11 +634,16 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     torch._dynamo.reset()
 
     def fn(t, u):
-        def body(_, ops):
-            t_tile, u_tile = ops
-            return None, (torch.abs(t_tile) + u_tile) * 2
+        def abs_body(_, ops):
+            (t_tile,) = ops
+            return None, torch.abs(t_tile)
 
-        return for_each_tile(body, (t, u), dims=(0, 0), tile_size=128, out_dim=0)[1]
+        def add_body(_, ops):
+            v_tile, u_tile = ops
+            return None, (v_tile + u_tile) * 2
+
+        _, v = for_each_tile(abs_body, (t,), dims=(0,), tile_size=128, out_dim=0)
+        return for_each_tile(add_body, (v, u), dims=(1, 1), tile_size=64, out_dim=1)[1]
 
     torch.manual_seed(0)
     ha = torch.randn(512, 256, dtype=torch.float16)
@@ -639,8 +658,108 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     ):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
-    assert tables == [], f"coarse-tiled edges were offered relayout: {tables}"
+    # Graph-global, same as the test this replaces: also covers each body's
+    # own within-scope edges, which happen to offer nothing for this graph's
+    # shapes. A future same-group change that makes one of those offer could
+    # fail this assert looking like a cross-group regression when it isn't;
+    # the printed table disambiguates by parent/consumer name.
+    assert tables == [], (
+        f"cross-group coarse-tiled edges were offered relayout: {tables}"
+    )
     assert recorded == []
+    ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
+
+
+def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch):
+    """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
+    relayout candidate (the same-group exception in
+    ``solver_relayout_edge_context``, torch-spyre#5057), and that candidate's
+    cost must carry the loop's own trip-count multiplier
+    (``_coarse_tile_loop_trip_count``, see TestCoarseTileLoopTripCount in
+    test_scratchpad_solver.py) -- a relayout taken once but paid on every
+    tile iteration is not priced the same as one taken once, and the fitted
+    law has no loop_trip factor of its own to account for that.
+
+    Before #5057, this exact graph was asserted to offer NO candidates
+    (test_coarse_tiled_edges_are_never_offered). #5367 unskipped that test on
+    main after confirming the #3810 crash it cited was gone, and the
+    invariant genuinely held on main as it stood then; #5057 is what
+    deliberately narrows it to the cross-group case covered by
+    test_cross_group_coarse_tiled_edges_are_never_offered above."""
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+    tile_size = 128
+
+    def fn(t, u):
+        def body(_, ops):
+            t_tile, u_tile = ops
+            return None, (torch.abs(t_tile) + u_tile) * 2
+
+        return for_each_tile(body, (t, u), dims=(0, 0), tile_size=tile_size, out_dim=0)[
+            1
+        ]
+
+    torch.manual_seed(0)
+    ha = torch.randn(512, 256, dtype=torch.float16)
+    hb = torch.randn(512, 256, dtype=torch.float16)
+    loop_trip_count = ha.shape[0] // tile_size
+
+    def run_and_collect_candidates():
+        tables = []
+        orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+
+        def spy_tables(self, *args, **kwargs):
+            out = orig_tables(self, *args, **kwargs)
+            if out:
+                tables.append(out)
+            return out
+
+        with monkeypatch.context() as m:
+            m.setattr(
+                alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
+            )
+            torch._inductor.codecache.FxGraphCache.clear()
+            torch._dynamo.reset()
+            a = ha.to("spyre")
+            b = hb.to("spyre")
+            with config.patch(
+                {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+            ):
+                out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
+        candidates = [c for table in tables for cs in table.values() for c in cs]
+        return out, candidates
+
+    def _key(c):
+        return (c.parent, c.consumer, c.source_division, c.consumer_division, c.group)
+
+    out, scaled_candidates = run_and_collect_candidates()
+    assert scaled_candidates, "same-group coarse-tiled edge was not offered relayout"
+    scaled_by_key = {_key(c): c.cost_ns for c in scaled_candidates}
+    assert len(scaled_by_key) == len(scaled_candidates), (
+        "candidate key collided -- some candidates were dropped from the comparison"
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(alloc_mod, "_coarse_tile_loop_trip_count", lambda op: 1)
+        _, unscaled_candidates = run_and_collect_candidates()
+    assert unscaled_candidates, "forcing trip count to 1 should not remove candidates"
+    unscaled_by_key = {_key(c): c.cost_ns for c in unscaled_candidates}
+    assert len(unscaled_by_key) == len(unscaled_candidates), (
+        "candidate key collided -- some candidates were dropped from the comparison"
+    )
+
+    assert scaled_by_key.keys() == unscaled_by_key.keys()
+    for key, scaled_cost in scaled_by_key.items():
+        unscaled_cost = unscaled_by_key[key]
+        # pair_cost itself carries no trip-count factor (that is the whole point
+        # of multiplying it in locally), so both runs share the same
+        # deterministic base and the scaling must be exact, not approximate.
+        assert scaled_cost == unscaled_cost * loop_trip_count, (
+            f"candidate {key} cost {scaled_cost} is not the per-trip cost "
+            f"{unscaled_cost} scaled by the loop trip count ({loop_trip_count})"
+        )
+
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
