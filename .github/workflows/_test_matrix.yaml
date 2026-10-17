@@ -1061,6 +1061,8 @@ jobs:
           # config are all under 'Qwen 2.5 7B Spyre'. Dropping it would fork the series.
           - name: Qwen 2.5 7B
             config: Qwen2.5-7B-Instruct.yaml
+          - name: Granite Embedding 278M Multilingual
+            config: granite-embedding-278m-multilingual-Embed.yaml
     steps:
       # Same reasoning as the perf job: the action DEFINITIONS must be in the
       # workspace even in prebaked mode, so .github is always checked out fresh.
