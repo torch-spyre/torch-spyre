@@ -664,6 +664,7 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "unlisted_test_mode": entry.get("unlisted_test_mode", "xfail"),
                 "tests": list(entry.get("tests") or []),
                 "labels": list(entry.get("labels") or []),
+                "exclude_platforms": list(entry.get("exclude_platforms") or []),
             }
         else:
             existing = merged[path]
@@ -684,6 +685,10 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for lbl in entry.get("labels") or []:
                 if lbl not in existing["labels"]:
                     existing["labels"].append(lbl)
+
+            for plat in entry.get("exclude_platforms") or []:
+                if plat not in existing["exclude_platforms"]:
+                    existing["exclude_platforms"].append(plat)
 
             for test_block in entry.get("tests") or []:
                 block_names = frozenset(
@@ -797,9 +802,11 @@ def merge_yaml_configs(
     all_file_entries: List[Dict[str, Any]] = []
     for suite in suites:
         suite_labels = suite.get("labels") or []
+        suite_excluded_platforms = suite.get("exclude_platforms") or []
         for f in suite.get("files") or []:
             f = dict(f)
             f["labels"] = list(suite_labels)
+            f["exclude_platforms"] = list(suite_excluded_platforms)
             all_file_entries.append(f)
 
     merged_files = _merge_file_entries(all_file_entries)

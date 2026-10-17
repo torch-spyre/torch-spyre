@@ -77,6 +77,33 @@ def load_labels(config_files: list[Path]) -> dict[Path, list | None]:
     return result
 
 
+def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
+    """
+    Read test_suite_config.exclude_platforms from each config file.
+
+    Parameters
+    ----------
+    config_files : list[Path]
+        Paths to OOT YAML config files.
+
+    Returns
+    -------
+    dict[Path, list]
+        Maps each config file to its declared exclude_platforms list
+        (empty list when absent).
+    """
+    result: dict[Path, list] = {}
+    for cf in config_files:
+        try:
+            cfg = yaml.safe_load(cf.read_text()) or {}
+        except Exception as e:
+            _warn(f"Cannot load {cf}: {e}")
+            continue
+        tsc = cfg.get("test_suite_config") or {}
+        result[cf] = list(tsc.get("exclude_platforms") or [])
+    return result
+
+
 def _warn(msg: str) -> None:
     import sys
 

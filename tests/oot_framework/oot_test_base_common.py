@@ -73,6 +73,7 @@ from oot_framework.oot_test_utilities import (
     _select_entry_by_op_index,
     _select_entry_for_variant,
     _extract_op_name_from_method,
+    _OOT_PLATFORM_ARCH,
 )
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
@@ -152,6 +153,13 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     # Drives the testtype__<label> pytest markers (see _OOTTestTypeMarkerPatcher).
     TEST_SUITE_LABELS: List[str] = []
 
+    # test_suite_config.exclude_platforms from the YAML, lower-cased.
+    # _should_run() skips the whole file when the current arch matches.
+    # Evaluated here (on the actual test-execution machine) rather than only
+    # in filter_configs.py, which runs during CI matrix generation on an
+    # x86_64 runner and so never sees a non-x86_64 arch to exclude.
+    TEST_SUITE_EXCLUDED_PLATFORMS: List[str] = []
+
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
@@ -230,6 +238,12 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         cls.TEST_SUITE_LABELS = list(
             file_entry.labels or config.test_suite_config.labels
         )
+
+        # Same file_entry-wins-else-suite-level fallback as TEST_SUITE_LABELS.
+        excluded_platforms = (
+            file_entry.exclude_platforms or config.test_suite_config.exclude_platforms
+        )
+        cls.TEST_SUITE_EXCLUDED_PLATFORMS = [str(p).lower() for p in excluded_platforms]
 
         # Build the exact-name lookup map and the regex-pattern list.
         # Regex patterns (names containing regex metacharacters) go into
@@ -415,6 +429,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         Returns (enabled: bool, reason: Optional[str], xfail: bool, strict: bool)
         """
+        # Suite-wide platform exclusion, independent of the resolved entry.
+        if _OOT_PLATFORM_ARCH.lower() in cls.TEST_SUITE_EXCLUDED_PLATFORMS:
+            return False, f"Excluded on platform {_OOT_PLATFORM_ARCH!r}", False, False
+
         # If entry was not pre-resolved by the caller, fall back to the old
         # single-entry lookup for backward compatibility.
         if entry is None:

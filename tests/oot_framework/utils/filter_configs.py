@@ -50,6 +50,16 @@ unlabeled config is a gap to close by adding one (see
 tests/scripts/check_oot_configs.py, which fails CI on missing labels), not a
 signal to widen matching.
 
+Platform exclusion
+-------------------
+A config may declare test_suite_config.exclude_platforms: [<arch>, ...], where
+<arch> is a value platform.machine() can return (e.g. "ppc64le", "s390x").
+A config is dropped whenever the arch this script itself runs on (not the
+remote runner label) appears in that list -- used for suites that depend on
+hardware/network resources (e.g. a model download) unavailable on that
+architecture. Matching is case-insensitive. Absent or empty, no arch is
+excluded.
+
 Output formats
 --------------
   paths         Space-separated list of absolute paths (Makefile / bash use).
@@ -88,6 +98,7 @@ Usage
 
 import argparse
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -125,12 +136,26 @@ def _display_name(config_path: Path, config_dir: Path) -> str:
     return _title(parts[-1])
 
 
-def _load_labels(path: Path) -> list:
-    """Read test_suite_config.labels from a YAML config; no labels means no match."""
+def _load_tsc(path: Path) -> dict:
+    """Read test_suite_config from a YAML config file; absent/empty means {}."""
     with path.open() as fh:
         raw = yaml.safe_load(fh) or {}
-    tsc = raw.get("test_suite_config") or {}
+    return raw.get("test_suite_config") or {}
+
+
+def _load_labels(tsc: dict) -> list:
+    """Extract labels from an already-parsed test_suite_config dict."""
     return list(tsc.get("labels") or [])
+
+
+def _load_excluded_platforms(tsc: dict) -> list:
+    """Extract exclude_platforms from an already-parsed test_suite_config dict."""
+    return [str(p).lower() for p in (tsc.get("exclude_platforms") or [])]
+
+
+def _excluded_on_this_platform(excluded_platforms: list) -> bool:
+    """True when this process's own arch (platform.machine()) is in the exclude list."""
+    return platform.machine().lower() in excluded_platforms
 
 
 def _load_path_map(map_path: str) -> dict:
@@ -283,9 +308,12 @@ def main() -> None:
 
     results = []
     skipped_covered = 0
+    skipped_platform = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
         try:
-            labels = _load_labels(cfg)
+            tsc = _load_tsc(cfg)
+            labels = _load_labels(tsc)
+            excluded_platforms = _load_excluded_platforms(tsc)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: skipping {cfg} ({exc})", file=sys.stderr)
             continue
@@ -293,6 +321,9 @@ def main() -> None:
             continue
         if _already_covered(labels, exclude_tiers):
             skipped_covered += 1
+            continue
+        if _excluded_on_this_platform(excluded_platforms):
+            skipped_platform += 1
             continue
         rel = str(cfg.relative_to(config_dir))
         results.append(
@@ -309,6 +340,13 @@ def main() -> None:
         print(
             f"delta: skipped {skipped_covered} config(s) whose tiers are all already "
             f"covered ({','.join(exclude_tiers)})",
+            file=sys.stderr,
+        )
+
+    if skipped_platform:
+        print(
+            f"platform: skipped {skipped_platform} config(s) excluded on "
+            f"{platform.machine()!r} (test_suite_config.exclude_platforms)",
             file=sys.stderr,
         )
 

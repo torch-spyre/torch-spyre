@@ -58,6 +58,10 @@ IGNORED_TEST_FILES=(
   # lane provides, so it is skip-only in CI. Revisit when a KTIR/mlir_ktdp lane
   # exists.
   "inductor/test_ktir_emitter.py"
+  # Unit tests for tests/oot_framework/utils/filter_configs.py itself (the
+  # CI-selection helper) — not a device/op test suite, so it has no YAML
+  # config to be wired into.
+  "test_filter_configs.py"
 )
 
 # ── Ignore list: config files ─────────────────────────────────────────────────
