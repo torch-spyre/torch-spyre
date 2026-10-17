@@ -50,14 +50,21 @@ section for how this plays out in practice.
 |------|-------|
 | Python thread runs; GIL is already held | GIL ✓ |
 | Crosses the pybind11 boundary into C++ | GIL ✓ |
-| `SpyreAllocator::allocate()` → `FlexAllocator::allocate()` acquires `allocator_mutex_` | GIL ✓, mutex ✓ |
-| Normal allocation succeeds; mutex released | — |
+| `SpyreAllocator::allocate()` releases the GIL (`py::gil_scoped_release`) before calling `FlexAllocator::allocate()` | — |
+| `FlexAllocator::allocate()` acquires `allocator_mutex_` | mutex ✓ |
+| Normal allocation succeeds; mutex released; GIL re-acquired on return | — |
 
-**Lock order**: `GIL → allocator_mutex_`
+**Lock order**: neither lock is held at the same time as the other.
 
-**Why it is safe**: The GIL is *already held on entry* — it is never acquired
-while the mutex is held. If memory pressure fires, the callback releases the
-mutex before touching the GIL (Path 2 below).
+**Why it is safe**: `SpyreAllocator::allocate()` releases the GIL *before*
+calling into `FlexAllocator::allocate()`, so the calling Python thread never
+blocks inside the native allocation call while still holding the GIL. This
+matters because if memory pressure fires, whichever thread ends up running
+`memoryPressureCallback()` needs the GIL to call `PyGC_Collect()` (Path 2
+below) — if the original caller kept holding the GIL while blocked on
+`allocator_mutex_`, that acquire could never succeed, deadlocking the two
+threads against each other. Releasing the GIL up front removes that
+possibility entirely.
 
 ### Path 2 — Memory pressure callback
 
@@ -186,7 +193,7 @@ Any memory-pressure callback that acquires the GIL must:
 
 | Call-site context | Action required |
 |---|---|
-| From Python (GIL already held) | None — GIL is already held on entry; callback will release the mutex before re-acquiring the GIL. |
+| From Python (GIL already held) | None — `SpyreAllocator::allocate()` releases the GIL before entering `FlexAllocator::allocate()`; callback will release the mutex before re-acquiring the GIL. |
 | From C++ without GIL | None — callback acquires and releases the GIL internally. |
 | From C++ with GIL explicitly held | Ensure `allocator_mutex_` is not held when acquiring the GIL elsewhere in the same frame. |
 
