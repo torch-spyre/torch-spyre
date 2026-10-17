@@ -1,4 +1,5 @@
 name: tests
+# Cloud Logs stdout-capture E2E probe 2026-09-17: empty trigger, DO NOT MERGE.
 
 # One of torch-spyre's four "trunk" (push-to-main) workflows -- see
 # model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
