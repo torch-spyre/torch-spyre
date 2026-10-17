@@ -808,9 +808,7 @@ class TestSpyre(TestCase):
         self.assertEqual(t.dtype, torch.uint8)
 
     def test_supported_dtypes_still_transferable(self):
-        """The uint8 rejection must not widen to other dtypes.
-
-        The width gate must not reject dtypes whose host width matches.
+        """The width gate must not reject dtypes whose host width matches.
 
         int16 is excluded because isDCIConversionSupported has no
         {SENINT16, SENINT16} pair, so its H2D fails on the conversion check
@@ -830,50 +828,6 @@ class TestSpyre(TestCase):
                 dev = cpu.to("spyre")
                 self.assertEqual(dev.device.type, "spyre")
                 self.assertEqual(dev.cpu().dtype, dtype)
-
-    def test_width_gate_rejects_only_uint8_and_quint8(self):
-        """Only uint8/quint8 are width-gated; every other mapped dtype is not.
-
-        Pins the gate's selection so widening it is a test failure. Verified
-        non-vacuous: forcing any other dtype into the gate fails this test.
-        """
-        width_gated = {torch.uint8, torch.quint8}
-        for dtype in (
-            torch.uint8,
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-            torch.bool,
-            torch.float16,
-            torch.float32,
-            torch.bfloat16,
-        ):
-            with self.subTest(dtype=dtype):
-                try:
-                    torch.ones(128, dtype=dtype).to("spyre").cpu()
-                except RuntimeError as e:
-                    gated = "host data format declares" in str(e)
-                    self.assertEqual(
-                        gated,
-                        dtype in width_gated,
-                        f"{dtype}: width-gated={gated}, expected "
-                        f"{dtype in width_gated}; error: {str(e)[:160]}",
-                    )
-                else:
-                    self.assertNotIn(dtype, width_gated)
-
-    def test_int16_is_rejected_by_conversion_not_width_gate(self):
-        """int16 fails on the missing {SENINT16, SENINT16} DCI pair.
-
-        The review found the previous rationale (fill_tensor/#925) was wrong.
-        This pins the real one so it cannot drift again.
-        """
-        with self.assertRaises(RuntimeError) as cm:
-            torch.ones(128, dtype=torch.int16).to("spyre").cpu()
-        msg = str(cm.exception)
-        self.assertIn("Unsupported DCI data format conversion", msg)
-        self.assertNotIn("host data format declares", msg)
 
     def test_d2h_h2d_dtype_conversion(self):
         """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.

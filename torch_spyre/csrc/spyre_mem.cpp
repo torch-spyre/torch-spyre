@@ -424,15 +424,15 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // claims 4 bytes for a 1-byte buffer), and the resulting ConvertData throw
   // lands on the stream worker and shuts the stream down. Refuse up front.
   // Allocation is untouched: torch.distributed allocates uint8 internally.
+  // TODO(#5493): the uint8 half of this gate goes away with the SENUINT8 remap.
   const size_t host_bytes = hostFormatBytes(cpu_format_host);
-  TORCH_CHECK(host_bytes == 0 ||
-                  host_bytes == c10::elementSize(cpu_tensor->scalar_type()),
+  const size_t torch_bytes = c10::elementSize(cpu_tensor->scalar_type());
+  TORCH_CHECK(host_bytes == 0 || host_bytes == torch_bytes,
               "Spyre backend does not support dtype ",
               cpu_tensor->scalar_type(),
               " for host transfers: its host data format declares ", host_bytes,
-              " byte(s) per element but PyTorch stores ",
-              c10::elementSize(cpu_tensor->scalar_type()),
-              ". See deeptools issue 4843.");
+              " byte(s) per element but PyTorch stores ", torch_bytes,
+              ". See https://github.com/torch-spyre/torch-spyre/issues/1588");
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",
