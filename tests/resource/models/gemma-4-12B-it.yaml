@@ -2536,7 +2536,7 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - value: 30.0
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1329 in forward,
       code: logits = logits * final_logit_softcapping'
