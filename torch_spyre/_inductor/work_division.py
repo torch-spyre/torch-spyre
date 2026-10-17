@@ -16,12 +16,12 @@
 import builtins
 import dataclasses
 import itertools
-import sympy
 import logging
 import math
 from collections.abc import Callable, Iterable, Sequence
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
+import sympy
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -37,7 +37,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
@@ -56,20 +56,21 @@ from .op_spec import IndirectAccess
 from .pass_utils import (
     PerCoreView,
     SchedNodeArg,
+    _per_core_view_from_prep,
+    _prepare_per_core_view,
+    commit_iteration_space_ownership,
     compute_granularity,
     compute_max_size,
     concretize_expr,
     device_coordinates,
     finite_upper_or_none,
     get_mem_deps_from_rw,
+    host_coordinates,
     input_layout_for_operation,
     invert_per_core_view,
     iteration_space_from_op,
-    commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
-    _per_core_view_from_prep,
-    _prepare_per_core_view,
     tile_ownership_view,
 )
 from .propagate_hints import get_op_hints
@@ -383,6 +384,19 @@ def multi_dim_iteration_space_split(
     return splits
 
 
+def _qfp8wt_stick_coords(td: TensorDep) -> list[Expr]:
+    """Coordinates spanned by a QFP8WT tensor's 2D stick: its K and N dims.
+
+    For a rank-2 weight [K, N] these are the last two device coordinates. Once
+    the weight has batch dims ([..., K, N]) the generic stick layout puts the
+    outermost host dim at device position -2, so that slice names a batch dim
+    instead of K; read K and N off the host coordinates there.
+    """
+    if len(td.layout.size) <= 2:
+        return td.device_coords[-2:]
+    return host_coordinates(td.layout, td.dep, None)[-2:]
+
+
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
@@ -424,10 +438,10 @@ def adjust_it_space_for_sticks(
             hasattr(td.layout.device_layout, "element_arrangement")
             and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
         ):
-            # For QFP8WT, last two device dimensions are the 2D stick [2, 64]
+            # For QFP8WT, the 2D stick [2, 64] spans the weight's K and N dims.
             # Both need to be treated as atomic 128-byte units
             stick_vars = []
-            for coord in td.device_coords[-2:]:
+            for coord in _qfp8wt_stick_coords(td):
                 if len(coord.free_symbols) == 1:
                     var = next(iter(coord.free_symbols))
                     if var in adjusted_space:
@@ -2202,6 +2216,8 @@ _HBM_BW_GBS = 204.8  # LPDDR5 aggregate peak bandwidth
 _DTYPE_BYTES = 2  # fp16
 _STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
 _PSUM_PER_CORE_ELEM_US = 1.0e-3
+# FP8 dtypes that carry 128 elements/stick; used in _cost_model_matmul_planner.
+_FP8_DTYPES = (DataFormats.SEN143_FP8, DataFormats.SEN152_FP8)
 _BMM_PSUM_PER_CORE_ELEM_US = 1.0e-4
 _COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
 _COHORT_PENALTY_EXPONENT = 0.75
@@ -2633,11 +2649,28 @@ def _cost_model_matmul_planner(
     # output is FP16 (64 elems/stick) while N/K count FP8 sticks (128), so
     # source elems_per_stick from the QFP8WT weight input instead (issue #4466).
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
+        # Prefer the QFP8WT input (2D-stick weight) for elems_per_stick; its
+        # 128 elems/stick matches the hardware counting for N and K.
+        # Fallback 1: any SEN143/SEN152 FP8 dtype input (e.g. QFP8CH activation).
+        # Fallback 2: output td (FP16, 64 elems/stick — conservative undercount, never crashes).
         fp8_weight_td = next(
-            td
-            for td in input_tds
-            if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+            (
+                td
+                for td in input_tds
+                if td.layout.device_layout.element_arrangement
+                == ElementArrangement.QFP8WT
+            ),
+            None,
         )
+        if fp8_weight_td is None:
+            fp8_weight_td = next(
+                (
+                    td
+                    for td in input_tds
+                    if td.layout.device_layout.device_dtype in _FP8_DTYPES
+                ),
+                output_td,
+            )
         fp8_device_dtype = fp8_weight_td.layout.device_layout.device_dtype
         elems_per_stick = fp8_device_dtype.elems_per_stick()
     else:
