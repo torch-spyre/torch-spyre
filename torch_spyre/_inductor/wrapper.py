@@ -200,6 +200,7 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
             """
                 from sympy import sympify
                 from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre._inductor.codegen.kernel_launchspec import LaunchArg, LaunchArgLayout
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
                 import subprocess
