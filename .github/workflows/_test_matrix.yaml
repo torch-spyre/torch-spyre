@@ -240,6 +240,10 @@ jobs:
       covered_runs: ${{ steps.filter.outputs.covered_runs }}
       # Scopes failed-suite descriptors to this call; artifacts are run-scoped and nightly calls this workflow twice.
       call_id: ${{ steps.call_id.outputs.call_id }}
+      # {"suite":[{name,config},...]} for the model_ops job, discovered from
+      # tests/configs/model_ops_tests/ rather than hardcoded. Empty on tiers that
+      # do not reach that job.
+      model_ops_matrix: ${{ steps.model_ops.outputs.matrix }}
     steps:
       - name: Generate per-call id
         id: call_id
@@ -253,7 +257,7 @@ jobs:
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
           # trunk and config_dir scan the whole tests/configs/ tree; every other tier stays scoped to torch_spyre_tests.
           sparse-checkout: |
-            ${{ ((inputs.test_type || 'regression') == 'trunk' || inputs.config_dir != '') && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
+            ${{ ((inputs.test_type || 'regression') == 'trunk' || inputs.config_dir != '' || (inputs.test_type || 'regression') == 'capability') && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
             .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
@@ -393,6 +397,67 @@ jobs:
           # trimmed raw input directly.
           resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
           echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
+
+      # Model-ops suites, discovered from the config dir instead of a hardcoded list, so a
+      # config added to tests/configs/model_ops_tests/ runs without a second edit here. The
+      # previous list had already drifted: granite-3.3-8b-instruct-with-device-layout.yaml sat
+      # in the tree but in no matrix entry, so it ran only through the label-driven config_dir
+      # path and never in the capability tier.
+      #
+      # The job NAME is what parse_model_ops_logs.py turns into suite_name, and the v1
+      # model_ops_* series is keyed on it, so the display names below are pinned to the ones
+      # already in use rather than derived from the filename. A config with no entry here gets
+      # a title-cased fallback; renaming an existing one would fork its series.
+      - name: Discover model-ops suites
+        id: model_ops
+        if: ${{ (inputs.test_type || 'regression') == 'capability' }}
+        env:
+          MODEL_OPS_DIR: tests/configs/model_ops_tests
+        run: |
+          set -euo pipefail
+          matrix=$(python3 - <<'EOF'
+          import json, os, pathlib, re
+          # config filename -> the job name already recorded in ClickHouse.
+          PINNED = {
+              "gpt-oss-20b.yaml": "GPT OSS 20B",
+              "granite-3.3-8b-instruct-fms.yaml": "Granite 3.3 8B Instruct FMS",
+              "granite-3.3-8b-instruct.yaml": "Granite 3.3 8B Instruct",
+              "granite-3.3-8b-instruct-with-device-layout.yaml": "Granite 3.3 8B Instruct With Device Layout",
+              "granite-4.1-8b.yaml": "Granite 4.1 8B",
+              "Meta-Llama-3.1-8B-Instruct.yaml": "Meta Llama 3.1 8B Instruct",
+              "Ministral-3-14B-Instruct-2512.yaml": "Ministral 3 14B Instruct 2512",
+              "Mistral-Small-3.2-24B-Instruct-2506.yaml": "Mistral Small 3.2 24B Instruct 2506",
+              "gemma-4-26B-A4B-it.yaml": "Gemma 4 26B A4B IT",
+              "gemma-4-12B-it.yaml": "Gemma 4 12B Instruct",
+              # "7B" not "7B Instruct": prod's rows for this config are all under
+              # 'Qwen 2.5 7B Spyre'.
+              "Qwen2.5-7B-Instruct.yaml": "Qwen 2.5 7B",
+          }
+
+          def fallback(stem: str) -> str:
+              # Readable label for a config added without a PINNED entry; keeps the
+              # model's own capitalisation where it already has some.
+              words = re.split(r"[-_.]", stem)
+              return " ".join(w if any(c.isupper() for c in w) else w.capitalize() for w in words if w)
+
+          d = pathlib.Path(os.environ["MODEL_OPS_DIR"])
+          suites = []
+          for path in sorted(d.glob("*.yaml")) + sorted(d.glob("*.yml")):
+              if not path.is_file():
+                  continue
+              name = PINNED.get(path.name) or fallback(path.stem)
+              suites.append({"name": name, "config": path.name})
+          print(json.dumps({"suite": suites}))
+          EOF
+          )
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          python3 -c "
+          import json, os, sys
+          m = json.loads(os.environ['M'])
+          print(f\"### Model-ops suites discovered: {len(m['suite'])}\")
+          for s in m['suite']:
+              print(f\"- \`{s['config']}\` -> {s['name']} Spyre\")
+          " M="${matrix}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # push-to-clickhouse.yaml runs on workflow_run and cannot receive a dispatch input, so the
       # orchestrator's uuid rides an artifact it already enumerates. Skipped when empty (a
@@ -1016,6 +1081,8 @@ jobs:
       !cancelled() &&
       github.event_name != 'pull_request' &&
       needs.generate_matrix.outputs.resolved_test_type == 'capability' &&
+      needs.generate_matrix.outputs.model_ops_matrix != '' &&
+      needs.generate_matrix.outputs.model_ops_matrix != '{"suite": []}' &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
     runs-on:
@@ -1029,38 +1096,12 @@ jobs:
       # a mix of fallbacks and decompositions. Blanked, as the other suites do.
       CI: ''
     strategy:
-      fail-fast: false   # one model's failure must not hide the other nine
-      # -----------------------------------------------------------------------
-      # To add a suite: append an entry here.
-      #   - name: <label shown in the GHA UI>
-      #     config: <filename inside tests/configs/model_ops_tests/>
-      # The JUnit report is named after the config (granite-4.1-8b.yaml ->
-      # granite-4.1-8b.xml).
-      # -----------------------------------------------------------------------
-      matrix:
-        suite:
-          - name: GPT OSS 20B
-            config: gpt-oss-20b.yaml
-          - name: Granite 3.3 8B Instruct FMS
-            config: granite-3.3-8b-instruct-fms.yaml
-          - name: Granite 3.3 8B Instruct
-            config: granite-3.3-8b-instruct.yaml
-          - name: Granite 4.1 8B
-            config: granite-4.1-8b.yaml
-          - name: Meta Llama 3.1 8B Instruct
-            config: Meta-Llama-3.1-8B-Instruct.yaml
-          - name: Ministral 3 14B Instruct 2512
-            config: Ministral-3-14B-Instruct-2512.yaml
-          - name: Mistral Small 3.2 24B Instruct 2506
-            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
-          - name: Gemma 4 26B A4B IT
-            config: gemma-4-26B-A4B-it.yaml
-          - name: Gemma 4 12B Instruct
-            config: gemma-4-12B-it.yaml
-          # "7B" kept: suite_name is derived from the job name, and prod's 3,096 rows for this
-          # config are all under 'Qwen 2.5 7B Spyre'. Dropping it would fork the series.
-          - name: Qwen 2.5 7B
-            config: Qwen2.5-7B-Instruct.yaml
+      fail-fast: false   # one model's failure must not hide the others
+      # Discovered by generate_matrix from tests/configs/model_ops_tests/: to add a
+      # suite, add its config (and a display name in that step's PINNED map if the
+      # fallback label is not what the series should be called). The JUnit report is
+      # named after the config (granite-4.1-8b.yaml -> granite-4.1-8b.xml).
+      matrix: ${{ fromJSON(needs.generate_matrix.outputs.model_ops_matrix) }}
     steps:
       # Same reasoning as the perf job: the action DEFINITIONS must be in the
       # workspace even in prebaked mode, so .github is always checked out fresh.
