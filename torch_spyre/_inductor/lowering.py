@@ -1285,10 +1285,13 @@ def clone(x, *, memory_format=None):
     # Fix: freeze the layout to the requested stride order so that
     # decide_layout() respects the memory_format contract.
     if memory_format is not None and memory_format != torch.preserve_format:
+        # The shape env orders symbolic strides (e.g. s0*s1 vs s0) under
+        # dynamic=True; without it sympy cannot compare them.
         stride_order = ir.get_stride_order(
             ir.FlexibleLayout.stride_ordered_for_memory_format(
                 result.get_size(), memory_format
-            )
+            ),
+            V.graph.sizevars.shape_env,
         )
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)

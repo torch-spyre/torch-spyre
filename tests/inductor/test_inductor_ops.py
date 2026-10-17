@@ -2258,6 +2258,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "the card in StreamError",
             },
         },
+        # Nearest upsample by integer factors decomposes into per-axis row
+        # repeats; the stick axis is transposed into the row position first
+        # (see _spyre_upsample_nearest). Fractional factors are rejected.
+        ("test_upsample_nearest", "test_upsample_nearest_cpu"): {
+            "param_sets": {
+                "2d_x2": ({"scale_factor": 2}, cached_randn((1, 4, 20, 20))),
+                "2d_x2_aligned": ({"scale_factor": 2}, cached_randn((1, 4, 8, 64))),
+                "2d_x2_unaligned": ({"scale_factor": 2}, cached_randn((1, 2, 5, 67))),
+                "2d_x3": ({"scale_factor": 3}, cached_randn((1, 2, 7, 9))),
+                "2d_x5": ({"scale_factor": 5}, cached_randn((1, 2, 4, 13))),
+                "2d_x2_3": ({"scale_factor": (2, 3)}, cached_randn((1, 2, 7, 9))),
+                "2d_x3_5": ({"scale_factor": (3, 5)}, cached_randn((1, 2, 3, 7))),
+                "2d_x2_float": ({"scale_factor": 2.0}, cached_randn((1, 3, 6, 10))),
+                "2d_size": ({"size": (15, 21)}, cached_randn((2, 3, 5, 7))),
+                "2d_h_only": ({"size": (10, 64)}, cached_randn((1, 2, 5, 64))),
+                "2d_w_only": ({"size": (5, 64)}, cached_randn((1, 2, 5, 32))),
+                "2d_batch3": ({"scale_factor": 2}, cached_randn((3, 5, 6, 6))),
+                "2d_1x1": ({"scale_factor": 2}, cached_randn((1, 8, 1, 1))),
+                "2d_identity": ({"scale_factor": 1}, cached_randn((1, 2, 4, 64))),
+                "2d_yolov5_p4": ({"scale_factor": 2}, cached_randn((1, 256, 20, 20))),
+                "2d_yolov5_p3": ({"scale_factor": 2}, cached_randn((1, 128, 40, 40))),
+                "1d_x2": ({"scale_factor": 2}, cached_randn((2, 8, 33))),
+                "1d_x5": ({"scale_factor": 5}, cached_randn((1, 4, 13))),
+                "1d_size": ({"size": 192}, cached_randn((1, 4, 64))),
+                "2d_x1_5": ({"scale_factor": 1.5}, cached_randn((1, 3, 6, 10))),
+                "2d_x0_5": ({"scale_factor": 0.5}, cached_randn((1, 2, 8, 12))),
+                # x2.1 rounds to exactly 2x, but the scale still changes the
+                # 1-D CPU index.
+                "1d_x2_1": ({"scale_factor": 2.1}, cached_randn((1, 2, 6))),
+            },
+            "expect_raise": dict.fromkeys(
+                ["2d_x1_5", "2d_x0_5", "1d_x2_1"], "only integer upsampling factors"
+            ),
+        },
         ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
                 "dim_0_2": (
@@ -9601,6 +9635,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # descending index (see spyre_flip); the arange building that index
         # falls back to CPU, hence the filtered FallbackWarning.
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
+
+    def test_upsample_nearest_cpu(self, kwargs, x):
+        self.compare_with_cpu(lambda x: F.interpolate(x, mode="nearest", **kwargs), x)
+
+    def test_upsample_nearest_dynamic(self):
+        # The stick-axis transpose lowers to a clone of a symbolic-shaped view,
+        # whose stride order needs the shape env under dynamic=True.
+        for scale in (2, 3, (2, 3)):
+            for shape in ((1, 4, 8, 64), (1, 128, 20, 20)):
+                torch._dynamo.reset()
+                x = torch.randn(shape, dtype=torch.float16)
+
+                def fn(t):
+                    return F.interpolate(t, scale_factor=scale, mode="nearest")
+
+                result = torch.compile(fn, dynamic=True)(x.to("spyre")).cpu()
+                torch.testing.assert_close(result, fn(x), atol=0.005, rtol=0.005)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)

@@ -4066,3 +4066,51 @@ def spyre_triu(
     mask = torch.ops.spyre.triu_mask(h, w, diagonal, input.dtype, input.device)
     # Masking +/-inf this way works on device but would produce NaN under IEEE
     return input * mask
+
+
+def _spyre_upsample_nearest(input, output_size, scales):
+    """Nearest upsample by integer factors, as one broadcast repeat per axis.
+
+    The upstream decomposition gathers with one index tensor per axis, which
+    the backend rejects. For an integer factor ``s`` the source index is just
+    ``j // s``, so each axis is moved to dim -2 (a transpose for the stick
+    axis), repeated with ``expand`` and moved back.
+    """
+    out = input
+    first = input.dim() - len(output_size)
+    # Stick axis first, while the tensor is smallest.
+    for dim in reversed(range(first, input.dim())):
+        in_size, out_size = input.shape[dim], output_size[dim - first]
+        s = out_size // in_size
+        # A scale off the size ratio (x2.1 giving 2x) changes the 1-D CPU index.
+        if out_size != s * in_size or scales[dim - first] not in (None, s):
+            raise Unsupported(
+                f"nearest upsample {in_size} -> {out_size}: "
+                "only integer upsampling factors"
+            )
+        if s > 1:
+            rows = out.movedim(dim, -2).unsqueeze(-2)
+            rows = rows.expand(*rows.shape[:-2], s, rows.shape[-1])
+            out = rows.flatten(-3, -2).movedim(-2, dim)
+    # aten.upsample_* always returns a fresh tensor.
+    return out.contiguous() if out is not input else out.clone()
+
+
+@register_spyre_decompositions(
+    [
+        torch.ops.aten.upsample_nearest1d.default,
+        torch.ops.aten.upsample_nearest2d.default,
+    ]
+)
+def spyre_upsample_nearest(input, output_size, *scales):
+    return _spyre_upsample_nearest(input, output_size, [*scales, None, None])
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.upsample_nearest1d.vec, torch.ops.aten.upsample_nearest2d.vec]
+)
+def spyre_upsample_nearest_vec(input, output_size, scale_factors):
+    osize = decomp.decompositions.upsample_compute_output_size(
+        input.size(), output_size, scale_factors
+    )
+    return _spyre_upsample_nearest(input, osize, scale_factors or [None, None])
