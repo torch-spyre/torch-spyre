@@ -219,9 +219,74 @@ class TestLoadModelToSpyre(TestCase):
 
         layout = get_spyre_tensor_layout(device_weight)
         self.assertEqual(list(layout.device_size), [3, 64, 2, 64])
+        self.assertEqual(list(layout.stride_map), [8192, 128, 64, 1])
         torch.testing.assert_close(
             device_weight.cpu(), weight, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
         )
+
+    @requires_spyre
+    def test_moe_expert_weight_contract_contiguous_layout(self):
+        """Down weights stay expert-major with contract rows adjacent."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        weight = torch.randn(3, 64, 128, dtype=torch.float16)
+        gathered = dma_moe_expert_weight_to_spyre(weight)
+        contract_weight = dma_moe_expert_weight_to_spyre(
+            weight, layout="contract_contiguous"
+        )
+
+        layout = get_spyre_tensor_layout(contract_weight)
+        self.assertEqual(contract_weight.shape, weight.shape)
+        self.assertEqual(list(layout.device_size), [3, 2, 64, 64])
+        self.assertEqual(list(layout.stride_map), [8192, 64, 128, 1])
+        torch.testing.assert_close(
+            contract_weight.cpu(), gathered.cpu(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            contract_weight.cpu(), weight, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
+        )
+
+    @requires_spyre
+    def test_moe_expert_weight_contract_contiguous_noncontiguous_and_dtype(self):
+        """Contiguity and target dtype are resolved before layout construction."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        weight = torch.randn(3, 128, 64, dtype=torch.float32).transpose(1, 2)
+        device = torch.device("spyre", torch.spyre.current_device())
+        device_weight = dma_moe_expert_weight_to_spyre(
+            weight,
+            target_dtype=torch.float16,
+            device=device,
+            layout="contract_contiguous",
+        )
+
+        layout = get_spyre_tensor_layout(device_weight)
+        self.assertEqual(device_weight.device, device)
+        self.assertEqual(device_weight.dtype, torch.float16)
+        self.assertEqual(list(layout.device_size), [3, 2, 64, 64])
+        self.assertEqual(list(layout.stride_map), [8192, 64, 128, 1])
+        torch.testing.assert_close(
+            device_weight.cpu(),
+            weight.to(torch.float16),
+            rtol=DLFLOAT16_RTOL,
+            atol=DLFLOAT16_ATOL,
+        )
+
+    @parametrize("layout", ["gather", "contract_contiguous"])
+    @requires_spyre
+    def test_moe_expert_weight_misaligned_free_dim_falls_back(self, layout):
+        """Alignment follows the target dtype in both transfer modes."""
+        weight = torch.randn(3, 64, 96, dtype=torch.float32)
+        with self.assertWarnsRegex(UserWarning, "MoE expert-weight free dim 96"):
+            device_weight = dma_moe_expert_weight_to_spyre(
+                weight, target_dtype=torch.float16, layout=layout
+            )
+        self.assertIsNone(device_weight)
+
+    def test_moe_expert_weight_rejects_unknown_layout(self):
+        weight = torch.randn(3, 64, 128, dtype=torch.float16)
+        with self.assertRaisesRegex(ValueError, "Unsupported MoE expert-weight layout"):
+            dma_moe_expert_weight_to_spyre(weight, layout="unknown")
 
     @requires_spyre
     def test_moe_per_expert_scale_layout(self):
