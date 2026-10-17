@@ -226,18 +226,6 @@ _FACTORY_OPS: Set[str] = {
     "torch.empty",
 }
 
-# Ops whose output holds uninitialized memory. Their element values are
-# non-deterministic, so CPU and Spyre results can never be compared by value;
-# only tensor metadata (shape, dtype, layout) is checked for these.
-_UNINITIALIZED_OUTPUT_OPS: Set[str] = {
-    "torch.empty",
-    "torch.empty_like",
-    "torch.empty_strided",
-    "torch.empty_permuted",
-    "torch.new_empty",
-    "torch.new_empty_strided",
-}
-
 
 def _normalize_out(out: Any) -> Any:
     if torch.is_tensor(out):
@@ -265,7 +253,7 @@ def _confirm_device(x: Any, expected: torch.device) -> bool:
 
 def _assert_same_metadata(
     ref: torch.Tensor,
-    got: torch.Tensor,
+    got: Any,
     *,
     case_name: str,
     description: Optional[str],
@@ -274,8 +262,15 @@ def _assert_same_metadata(
 
     Used for ops such as ``torch.empty_like`` whose output holds uninitialized
     memory: the values are non-deterministic by definition, so only
-    shape/dtype/layout are meaningful to check.
+    shape/dtype/layout/stride are meaningful to check.
     """
+    if not torch.is_tensor(got):
+        raise AssertionError(
+            f"{case_name} FAILED: output type does not match reference\n"
+            f"type: expected {type(ref).__name__}, got {type(got).__name__}\n"
+            f"location: {description}\n"
+        )
+
     mismatches = []
     if tuple(got.shape) != tuple(ref.shape):
         mismatches.append(f"shape: expected {tuple(ref.shape)}, got {tuple(got.shape)}")
@@ -283,6 +278,8 @@ def _assert_same_metadata(
         mismatches.append(f"dtype: expected {ref.dtype}, got {got.dtype}")
     if got.layout != ref.layout:
         mismatches.append(f"layout: expected {ref.layout}, got {got.layout}")
+    if got.stride() != ref.stride():
+        mismatches.append(f"stride: expected {ref.stride()}, got {got.stride()}")
 
     if mismatches:
         details = "\n".join(mismatches)
@@ -632,7 +629,7 @@ class TestSpyreModelOps(TestCase):
                 rtol=rtol,
                 case_name=method_name,
                 description=description,
-                metadata_only=op_name in _UNINITIALIZED_OUTPUT_OPS,
+                metadata_only=adapter.uninitialized_output,
             )
             ran = True
         finally:
