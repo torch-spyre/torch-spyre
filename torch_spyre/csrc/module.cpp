@@ -820,6 +820,34 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
+  // Debug hooks for multi-domain (interleaved) placement tests
+  // (tests/test_interleaved_copy.py). Chunk geometry comes from
+  // get_composite_address; these add only what it does not expose.
+  m.def(
+      "_spyre_debug_set_emulate_interleave",
+      [](bool enabled) {
+        return spyre::SpyreAllocator::debugSetEmulateInterleave(enabled);
+      },
+      py::arg("enabled"),
+      "DEBUG: enable/disable interleaved tensor placement for the "
+      "rest of this process; returns the previous setting.");
+
+  m.def(
+      "_spyre_debug_num_memory_domains",
+      []() { return spyre::SpyreAllocator::debugNumMemoryDomains(); },
+      "DEBUG: number of memory domains flex reports (4 under "
+      "FLEX_DEVICE=EMUL1p5, else 1); 0 if the runtime is not started.");
+
+  m.def(
+      "_spyre_debug_chunk_segment_ids",
+      [](const at::Tensor& tensor) {
+        return spyre::SpyreAllocator::debugChunkSegmentIds(tensor);
+      },
+      py::arg("tensor"),
+      "DEBUG: hardware segment id of each chunk of a Spyre "
+      "tensor's allocation, in get_composite_address(tensor).chunks() order; "
+      "None where the chunk's region has no tensor segment.");
+
   // ── Typed stream error API ───────────────────────────────────────────────
 
   py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")

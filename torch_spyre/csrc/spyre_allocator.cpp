@@ -15,16 +15,62 @@
  */
 #include "spyre_allocator.h"
 
+#include <atomic>
+#include <cstdlib>  // std::getenv
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <string_view>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include "logging.h"
 #include "module.h"
+#include "spyre_composite_address.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
+
+namespace {
+
+// Env gate that makes every *tensor* storage allocation interleave across all
+// memory domains flex reports, e.g. under flex's emulated 4-domain topology:
+//
+//   FLEX_DEVICE=EMUL1p5 TORCH_SPYRE_EMULATE_INTERLEAVE=1
+//
+// It is not an eligibility policy: it interleaves every tensor storage.
+//
+// Scope:
+//  - Only the c10::Allocator entry point (`allocate(nbytes)`) consults it, so
+//    it affects tensor storages only. The program allocation uses the
+//    directive-taking overload with its own Bind{0} (prepare_kernel.cpp) and is
+//    untouched.
+//  - Interleaved tensors are usable on the **eager copy path only**. The
+//    compiled JobPlan builder requires single-chunk addresses, so do not set
+//    this in a process that compiles kernels.
+//  - Off (the default) leaves behavior byte-for-byte identical to Bind{0}.
+//
+// The env var seeds the initial value, but the flag is a process-global that
+// `debugSetEmulateInterleave` can flip at runtime. That matters: only one
+// process may hold the Spyre device, so a test cannot compare an interleaved
+// run against a Bind{0} baseline by spawning a second process — both
+// placements have to be exercised in the same process, under the same topology.
+std::atomic<bool>& emulateInterleaveFlag() {
+  static std::atomic<bool> flag{[]() {
+    const char* env = std::getenv("TORCH_SPYRE_EMULATE_INTERLEAVE");
+    return env != nullptr && std::string_view(env) != "" &&
+           std::string_view(env) != "0";
+  }()};
+  return flag;
+}
+
+bool emulateInterleaveEnabled() {
+  return emulateInterleaveFlag().load(std::memory_order_relaxed);
+}
+
+}  // namespace
 
 SpyreAllocator::SpyreAllocator() {
   // Callback registration is deferred until first allocation
@@ -183,6 +229,26 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id,
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
+  // See emulateInterleaveEnabled(). Skipped for nbytes == 0 so the empty
+  // allocation keeps returning early below without touching the runtime.
+  if (nbytes != 0 && emulateInterleaveEnabled()) {
+    auto flex_alloc = getFlexAllocator();
+    const size_t num_domains =
+        flex_alloc ? flex_alloc->topology().num_domains() : 1;
+    if (num_domains > 1) {
+      std::vector<uint32_t> domain_ids(num_domains);
+      std::iota(domain_ids.begin(), domain_ids.end(), 0U);
+      flex::AllocationDirective interleaved(flex::PlacementPolicy::Interleave,
+                                            std::move(domain_ids), std::nullopt,
+                                            flex::MemoryType::Tensor);
+      SPYRE_RUNTIME_DEBUG()
+          << "TORCH_SPYRE_EMULATE_INTERLEAVE: interleaving " << nbytes
+          << " (bytes) across " << num_domains << " memory domains";
+      return SpyreAllocator::allocate(nbytes, interleaved);
+    }
+    // num_domains == 1: no domains to stripe across, fall through to Bind{0}.
+  }
+
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
                                       std::nullopt, flex::MemoryType::Tensor);
   return SpyreAllocator::allocate(nbytes, directive);
@@ -263,6 +329,56 @@ uint64_t SpyreAllocator::compositeAddressToDeviceAddress(
     const flex::CompositeAddress& addr) const {
   return flex::compositeAddressToDeviceAddress(
       addr, getFlexAllocator()->getIdToRegionMap());
+}
+
+// Flip the interleave gate for the rest of this process; returns the previous
+// value so a caller can restore it. See emulateInterleaveFlag().
+bool SpyreAllocator::debugSetEmulateInterleave(bool enabled) {
+  return emulateInterleaveFlag().exchange(enabled, std::memory_order_relaxed);
+}
+
+// Number of memory domains flex reports (4 under FLEX_DEVICE=EMUL1p5, else 1),
+// so a test can skip cleanly instead of asserting on a single-domain topology.
+size_t SpyreAllocator::debugNumMemoryDomains() {
+  auto flex_alloc = getFlexAllocator();
+  return flex_alloc ? flex_alloc->topology().num_domains() : 0;
+}
+
+// Hardware segment of each chunk of a Spyre tensor's allocation, in
+// get_composite_address(tensor).chunks() order; std::nullopt for a chunk whose
+// region has no tensor segment (flex's UNMAPPED_SEGMENT_ID), which must never
+// be dispatched.
+//
+// flex does not export MemoryRegion, so the segment is read back through the
+// public addressing API instead: each chunk is encoded as a single-chunk
+// device address and decoded again. A region beyond the tensor-segment budget
+// encodes to a segment id past max_tensor_segment_id(), so it reads as
+// unmapped.
+std::vector<std::optional<uint32_t>> SpyreAllocator::debugChunkSegmentIds(
+    const at::Tensor& tensor) {
+  const flex::CompositeAddress* addr = get_composite_address(tensor);
+  auto flex_alloc = getFlexAllocator();
+  const auto& region_map = flex_alloc->getIdToRegionMap();
+  const uint64_t max_segment =
+      flex_alloc->topology().max_tensor_segment_id().value_or(UINT32_MAX);
+
+  std::vector<std::optional<uint32_t>> out;
+  out.reserve(addr->chunks().size());
+  for (const auto& chunk : addr->chunks()) {
+    // Built from a bare Chunk, so it has no allocator and frees nothing.
+    const flex::CompositeAddress single(chunk);
+    const uint64_t device_address =
+        flex::compositeAddressToDeviceAddress(single, region_map);
+    const uint64_t segment =
+        std::get<0>(flex::decodeDevicePointer(device_address));
+    // Segment 0 is never a tensor segment on 1p0.
+    if (segment >= 1 && segment <= max_segment) {
+      out.emplace_back(static_cast<uint32_t>(segment));
+    } else {
+      out.emplace_back(std::nullopt);
+    }
+  }
+  return out;
 }
 
 void SpyreAllocator::memoryPressureCallback(
