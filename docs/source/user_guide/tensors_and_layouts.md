@@ -414,6 +414,10 @@ yields a tensor with the tiling inverted:
 SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
+See the [tensor layout example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/tensor_layout.py) for a runnable
+script that builds a `SpyreTensorLayout` with an explicit `dim_order` and
+moves a tensor to the device with `.to(device_layout=...)`.
+
 ## Layout Compatibility
 
 Spyre operations impose **hard constraints** on the memory layout of
