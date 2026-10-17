@@ -521,6 +521,21 @@ class RelayoutCharge(sympy.Function):
         i = int(round(division))
         return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
 
+    def _sympystr(self, printer):
+        """``str()`` names the priced divisions only, ``prices={4: 65, 12: 147}``:
+        the table is mostly zeros (a copy is priced on few of its source's
+        divisions), and positional prices make the reader count to find which
+        division a price belongs to. ``srepr`` is untouched, so the dump stays
+        lossless."""
+        is_lx, division, *prices = self.args
+        priced = ", ".join(
+            f"{i}: {printer._print(p)}" for i, p in enumerate(prices) if p != 0
+        )
+        return (
+            f"{self.func.__name__}({printer._print(is_lx)}, "
+            f"{printer._print(division)}, prices={{{priced}}})"
+        )
+
 
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1

@@ -111,6 +111,27 @@ def test_record_evaluates_every_term_under_the_solved_plan():
     assert back.free_symbols == {copy.sym_is_lx, p.sym_division}
 
 
+def test_relayout_charge_prints_only_the_priced_divisions():
+    """``str()`` keys each nonzero price by its division; ``srepr`` keeps the
+    full positional table, so the dump still round-trips."""
+    is_lx = sympy.Symbol("is_lx_copy", integer=True, nonnegative=True)
+    division = sympy.Symbol("division_P", integer=True, nonnegative=True)
+    charge = RelayoutCharge(is_lx, division, 0, 0, 65, 0, 147)
+    assert str(charge) == (
+        "RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147})"
+    )
+    assert str(2 * charge + 1) == (
+        "2*RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147}) + 1"
+    )
+    assert str(RelayoutCharge(is_lx, division, 0, 0)) == (
+        "RelayoutCharge(is_lx_copy, division_P, prices={})"
+    )
+    back = sympy.parse_expr(
+        sympy.srepr(charge), local_dict={"RelayoutCharge": RelayoutCharge}
+    )
+    assert back == charge
+
+
 def test_a_bundle_names_its_buffers_after_the_boundary_rewrite(monkeypatch):
     """The dump's join key survives ``charge_boundary_reads_once``.
 
