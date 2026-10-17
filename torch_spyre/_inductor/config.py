@@ -36,6 +36,7 @@ def _backend_loop_unroll_from_env() -> bool:
 backend_loop_unroll: bool = _backend_loop_unroll_from_env()
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
+cp_sat_tiebreak: bool = os.environ.get("CP_SAT_TIEBREAK", "0") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
