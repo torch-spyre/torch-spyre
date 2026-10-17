@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import math
 import torch
 import torch.distributed as dist
 import os
@@ -20,7 +21,7 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(comm_rank, comm_size, async_op=False):
+def run_test(comm_rank, comm_size, async_op=False, num_elements=128):
     """Run a reduce test where all ranks contribute and root receives the sum.
 
     Args:
@@ -28,10 +29,10 @@ def run_test(comm_rank, comm_size, async_op=False):
         comm_size: Total number of processes
         async_op: If True, launch the collective asynchronously and overlap CPU
                   work with the hardware operation before calling work.wait().
+        num_elements: Number of elements per rank tensor. Reduce this to lower
+                      the peak float16 magnitude when testing at large world sizes.
     """
     global DEVICE
-
-    num_elements = 128
 
     # Create contiguous range for this rank: rank 0 gets [0..num_elements-1],
     # rank 1 gets [num_elements..2*num_elements-1], etc.
@@ -83,7 +84,20 @@ def run_test(comm_rank, comm_size, async_op=False):
         print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
         print(f"  Expected values: {expected_tensor[:10]} .. {expected_tensor[-10:]}")
 
-        if torch.allclose(result, expected_tensor):
+        # Tolerance: ceil(log2(comm_size)) ULPs of float16 at the maximum expected value.
+        # A binary tree reduction of depth d = ceil(log2(N)) can accumulate up to d
+        # rounding errors, each bounded by 1 ULP at the running partial-sum magnitude.
+        # ULP of float16 at value v = 2^(floor(log2(v)) - 10).
+        max_expected = float(expected_tensor.max())
+        ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
+        tree_depth = math.ceil(math.log2(comm_size)) if comm_size > 1 else 1
+        atol = tree_depth * ulp
+        print(
+            f"  Tolerance: atol={atol} "
+            f"({tree_depth} ULP(s) of float16 at max expected {max_expected})"
+        )
+
+        if torch.allclose(result, expected_tensor, atol=atol, rtol=0.0):
             print(f"[{comm_rank} of {comm_size}] Reduced tensor is correct")
         else:
             raise RuntimeError(
@@ -104,6 +118,16 @@ if __name__ == "__main__":
         default=False,
         help="Launch reduce asynchronously (async_op=True)",
     )
+    parser.add_argument(
+        "--num-elements",
+        dest="num_elements",
+        type=int,
+        default=128,
+        help=(
+            "Number of elements per rank tensor (default: 128). "
+            "Reduce this to lower peak float16 magnitude at large world sizes."
+        ),
+    )
     args = parser.parse_args()
 
     # Check that the c10d backend was loaded properly
@@ -122,6 +146,6 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(comm_rank, comm_size, async_op=args.async_op)
+    run_test(comm_rank, comm_size, async_op=args.async_op, num_elements=args.num_elements)
 
     dist.destroy_process_group()
