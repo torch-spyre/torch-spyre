@@ -21,8 +21,8 @@ cases:
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L965 in get_placeholder_mask,
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks: constant
-  - name: torch.or_.1
-    op: torch.or_
+  - name: torch.bitwise_or.1
+    op: torch.bitwise_or
     inputs:
       - tensor:
           shape: [1, 24]
@@ -2559,8 +2559,8 @@ cases:
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L965 in get_placeholder_mask,
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks: constant
-  - name: torch.or_.2
-    op: torch.or_
+  - name: torch.bitwise_or.2
+    op: torch.bitwise_or
     inputs:
       - tensor:
           shape: [1, 1]
