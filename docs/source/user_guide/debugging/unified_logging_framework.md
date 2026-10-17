@@ -6,6 +6,7 @@
 
 - [Spyre Unified Logging Framework (ULF) Guide](#spyre-unified-logging-framework-ulf-guide)
   - [Table of Contents](#table-of-contents)
+  - [What unified logging is](#what-unified-logging-is)
   - [Quick Start](#quick-start)
   - [1. Overview](#1-overview)
     - [Migrating from Legacy Variables](#migrating-from-legacy-variables)
@@ -56,6 +57,26 @@
     - [Thread Safety](#thread-safety)
   - [Appendix C: C++ LogLevel Enum Reference](#appendix-c-c-loglevel-enum-reference)
   - [Appendix D: Design Rationale — Naming](#appendix-d-design-rationale--naming)
+
+---
+
+## What unified logging is
+
+torch-spyre writes log output from two places: the Python compiler passes and
+the C++ device runtime. That output used to be controlled by several separate
+environment variables, with the Python and C++ sides configured independently.
+The Unified Logging Framework replaces those with one control.
+
+You name a subsystem, for example the Inductor compiler or the device runtime,
+and set how much it logs. The same setting applies to both the Python and C++
+code for that subsystem. A single environment variable, `TORCH_LOGS`, drives
+all of it, through the same mechanism PyTorch already uses for its own logs.
+Subsystems form a hierarchy, so one setting on a parent reaches all of its
+children.
+
+The rest of this guide is how to use it. Section 1 describes the component
+model and how it replaces the legacy variables, and the later sections cover
+the Python API, the C++ macros, and how the two stay in sync.
 
 ---
 
