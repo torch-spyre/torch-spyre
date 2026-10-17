@@ -34,6 +34,7 @@ from torch_spyre.ops.fallbacks import fallback_ops
 
 from . import config
 from .constants import (
+    ABSMAX_OP,
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
@@ -2501,7 +2502,7 @@ def lower_any_dim(x, dim, keepdim=False):
         x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
     )
     result = Reduction.create(
-        reduction_type="absmax",
+        reduction_type=ABSMAX_OP,
         input_node=x,
         **kwargs,
     )
@@ -2517,7 +2518,7 @@ def lower_any_def(x):
         x, axis=None, keepdims=None, dtype=x.dtype, override_return_dtype=None
     )
     result = Reduction.create(
-        reduction_type="absmax",
+        reduction_type=ABSMAX_OP,
         input_node=x,
         **kwargs,
     )

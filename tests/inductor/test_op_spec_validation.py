@@ -202,6 +202,29 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
         self.assertTrue(names)
         self.assertLessEqual(names, _all_known_ops())
 
+    def test_lowered_reduction_types_are_known(self):
+        """Every reduction_type lowering.py creates must be a known op.
+
+        These reach the validator as OpSpec ops without going through a
+        ``ReductionOp`` literal in SpyreOpFuncs (e.g. ``absmax``).
+        """
+        import ast
+        import inspect
+
+        from torch_spyre._inductor import lowering
+
+        tree = ast.parse(inspect.getsource(lowering))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.keyword) or node.arg != "reduction_type":
+                continue
+            if isinstance(node.value, ast.Constant):
+                names.add(node.value.value)
+            elif isinstance(node.value, ast.Name) and hasattr(constants, node.value.id):
+                names.add(getattr(constants, node.value.id))
+        self.assertIn(constants.ABSMAX_OP, names)
+        self.assertLessEqual(names, _all_known_ops())
+
     def test_tiled_symbols_valid(self):
         op = _make_valid_op_spec()
         op.tiled_symbols = [[_C_ROW]]

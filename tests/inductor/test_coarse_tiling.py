@@ -6464,6 +6464,12 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # These tests check MLIR symbol/argument plumbing with synthetic
+        # one-tensor specs and made-up op names, which are not valid specs
+        # for any real op, so skip OpSpec validation.
+        patcher = config.patch({"validate_op_specs": False})
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
 
     def tearDown(self):
         import shutil
