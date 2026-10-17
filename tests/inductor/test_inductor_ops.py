@@ -1901,6 +1901,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_topk", "test_topk_cpu"): {
+            # 4d_k32_dim2: incorrect output mapping due to tensor size; see #5101
+            "skip": ["4d_k32_dim2"],
             "param_sets": {
                 "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
@@ -1983,6 +1985,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((256, 64), dim=0),
                     128,
                     0,
+                ),
+                "2d_k8_dim1_fp16": (
+                    unique_randn_along_dim((128, 64), dim=1),
+                    8,
+                    1,
+                ),
+                "2d_k32_dim1_fp16": (
+                    unique_randn_along_dim((128, 64), dim=1),
+                    32,
+                    1,
+                ),
+                "2d_k8_dim0_fp32": (
+                    unique_randn_along_dim((128, 64), dim=0, dtype=torch.float32),
+                    8,
+                    0,
+                ),
+                "3d_k8_dim1_fp32": (
+                    unique_randn_along_dim((4, 128, 64), dim=1, dtype=torch.float32),
+                    8,
+                    1,
+                ),
+                "3d_k32_dim1_fp32": (
+                    unique_randn_along_dim((4, 128, 64), dim=1, dtype=torch.float32),
+                    32,
+                    1,
+                ),
+                "3d_k8_dim2_fp16": (
+                    unique_randn_along_dim((4, 128, 64), dim=2),
+                    8,
+                    2,
                 ),
             },
         },
