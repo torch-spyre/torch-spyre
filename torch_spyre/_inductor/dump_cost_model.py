@@ -19,11 +19,11 @@ Walks ``graph.operations`` and builds :class:`cost_model.OpFeatures` per op
 then a dump hook (``SPYRE_DUMP_COST=1``) prints the features and the predicted
 device latency so it can be compared against the measured value on hardware.
 
-The standalone dump has no candidate menu and omits the menu-dependent loop-delivery
-estimate. Its looped-matmul totals can therefore differ from the allocator's objective;
-it does not reconstruct candidate divisions from the committed plan. A looped matmul's
-operand DMA requests are priced there in full, since the estimate they compose with
-(by ``max``) is absent.
+The standalone dump prices the committed division only. The loop-delivery estimate
+depends on that division alone (whether it partitions the read), so the dump charges it,
+and composes it with a looped matmul's operand DMA requests by ``max``, exactly as the
+allocator does for that division. It does not reconstruct the other candidate divisions
+from the committed plan.
 
 Extraction is best-effort and defensive: anything it can't resolve falls back to
 a safe default and never raises into compilation. The numbers must be validated
@@ -143,6 +143,21 @@ def _replication(index, slices: dict):
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
     return math.prod(split for sym, split in slices.items() if sym not in present)
+
+
+def _partitions(index, slices: dict):
+    """How many distinct slices of this read the op's cores load: the product of the
+    op's core splits on iteration symbols the read index contains, the complement of
+    ``_replication`` (``partitions * replication == cores``). 1 when the read is not
+    split, or when the index or the split map is unknown. A sympy expression when the
+    splits are solver symbols."""
+    if index is None or not slices:
+        return 1
+    try:
+        present = set(getattr(index, "free_symbols", ()) or ())
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return 1
+    return math.prod(split for sym, split in slices.items() if sym in present)
 
 
 def _real_layout(layout):
@@ -1270,21 +1285,6 @@ def _relayout_logger():
     return get_inductor_logger("dump_cost_model")
 
 
-def _has_partitioning_candidate(index, candidate_work_slices) -> bool:
-    """Whether the caller's legal menu contains a split of this read's index.
-
-    The menu is already filtered by the existing division machinery. Inspect it,
-    do not manufacture candidates from shape or infer them from the current split.
-    Unknown indices, absent menus and symbolic factors provide no positive proof.
-    """
-    indexed: set[sympy.Symbol] = getattr(index, "free_symbols", set())
-    return any(
-        symbol in indexed and isinstance(factor, (int, sympy.Integer)) and factor > 1
-        for candidate in candidate_work_slices or ()
-        for symbol, factor in candidate.items()
-    )
-
-
 def extract_op_features(
     op,
     work_slices=None,
@@ -1313,9 +1313,9 @@ def extract_op_features(
 
     ``candidate_work_slices`` is the caller's existing legal menu on this op's
     symbol basis, held constant across symbolic and concrete candidate evaluation.
-    It supplies positive evidence for the loop-delivery estimate's applicability.
-    Without it that estimate is omitted, including in standalone diagnostic calls;
-    the extractor never re-enumerates divisions or treats one chosen split as a menu.
+    A matmul operand's stick-split geometry is proven only when every candidate of
+    it keeps whole sticks (``_split_stick_axes``); the extractor never re-enumerates
+    divisions or treats one chosen split as a menu.
 
     Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
     graph boundary, resolved against the arg's own role, so a buffer that is both a
@@ -1624,7 +1624,7 @@ def extract_op_features(
                 loop_factor=in_loop_factor,
                 is_boundary=(None if graph_inputs is None else name in graph_inputs),
                 # Walked by a for_each_tile variable at some level (the loop-delivery
-                # term also needs loop_factor 1 and a partitioning candidate). A
+                # term also needs loop_factor 1 and a partitioned read). A
                 # read walked only by a tiled dim of the op is a coarse-loop read,
                 # which that term leaves out.
                 # Complete stamps decide traffic at coarse levels too. Delivery
@@ -1633,9 +1633,7 @@ def extract_op_features(
                     advances and var is not None
                     for advances, var in zip(read_advances, _loop_vars)
                 ),
-                has_partitioning_candidate=_has_partitioning_candidate(
-                    index, candidate_work_slices
-                ),
+                partitions=_partitions(index, slices),
                 replication=replication,
                 # Proven per-trip matmul geometry takes precedence. Otherwise
                 # retain the general read-burst extraction from main.

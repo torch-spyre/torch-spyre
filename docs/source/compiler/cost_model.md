@@ -337,7 +337,7 @@ looped matmul only when all three hold:
    per-read verdict: its stamp, else a nonzero coefficient on the variable. This is the
    same verdict that sets the read's loop factor;
 2. the loop walks the read once (loop factor 1);
-3. some division in the allocator's legal menu splits a dimension the read indexes.
+3. the division being priced splits a dimension the read indexes (`partitions > 1`).
 
 The excess is `bytes / (cores * rate) - bytes / peak`, and never below zero. Three reads
 look similar but are not eligible: a read whose index contains the variable but does not
@@ -345,19 +345,21 @@ advance with it (the tests use the synthetic index `4096 * FloorDiv(u0, 2)`; no 
 kernel is known to produce such a read); a read walked only by a coarse-tiled dimension
 of the op; a read re-entered every trip.
 
-Condition 3 applies to the whole legal menu, not to the selected division's replication.
-Once it holds, even a candidate that replicates the read receives this estimate, using
-the op's total core count. Its existing replica or shared-load delivery charge remains
-additive. The expert-region screens support plan selection on the tested shapes; they
-do not separately calibrate this sum for replicated looped reads or establish whether
-the underlying costs overlap. Treat the sum as an empirical ranking proxy, not a
-measurement of separate physical costs. The `max(delivery, requests)` rule below combines
+Condition 3 is a property of the priced division alone, like `replication`: a division
+that fully replicates the read receives no estimate, and on the co-optimizing path the
+gate is a `Piecewise` on the solver's split variables. A division that partitions the
+read but also replicates it (splits on dimensions it does and does not index) receives
+the estimate at the op's total core count, and its existing replica or shared-load
+delivery charge remains additive. The expert-region screens support plan selection on
+the tested shapes; they do not separately calibrate this sum for partially replicated
+looped reads or establish whether the underlying costs overlap. Treat the sum as an
+empirical ranking proxy, not a measurement of separate physical costs. The `max(delivery, requests)` rule below combines
 only the loop-delivery and request estimates; it does not include the replica or
 shared-load delivery charge.
 
-The report leaves this estimate out. It extracts features without the legal menu, so
-condition 3 never holds there, and its totals need not rank eligible looped-matmul plans
-the way the allocator does.
+The report prices the committed division by the same rule, so it charges the estimate
+the allocator charged for that division. An op with no division partitions nothing and
+receives none.
 
 The loop estimate reuses the single-pass rate, selected by the 32/128/512-token
 expert-loop sweep. Scaling it by replication did not improve that screen; a
@@ -412,8 +414,7 @@ Where it does not apply:
   pricing where the general burst term charged zero. A matmul never enters the
   transport term.
 
-The report has no menu, so the delivery estimate is absent there and the report charges
-the whole request excess. Two things are assumptions, not measurements: the rate at core
+The report applies the same `max` on the committed division. Two things are assumptions, not measurements: the rate at core
 counts the calibration never visited, and that the two bottlenecks combine by `max`
 rather than adding.
 

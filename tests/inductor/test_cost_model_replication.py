@@ -394,9 +394,7 @@ def _expert_loop_projection(cores, *, trips=4, **fields):
     op.args = [
         dataclasses.replace(a, loop_factor=trips)
         if a.role == "input" and a.elems != W_ELEMS
-        else dataclasses.replace(
-            a, advances_with_loop_var=True, has_partitioning_candidate=True
-        )
+        else dataclasses.replace(a, advances_with_loop_var=True, partitions=2)
         if a.role == "input"
         else a
         for a in op.args
@@ -456,7 +454,7 @@ def test_a_for_each_tile_loop_prices_the_operand_it_walks_and_nothing_else():
     for change in (
         {"advances_with_loop_var": False},
         {"loop_factor": 4},
-        {"has_partitioning_candidate": False},
+        {"partitions": 1},
     ):
         unpriced = _expert_loop_projection(25)
         unpriced.args[2] = dataclasses.replace(unpriced.args[2], **change)
@@ -512,9 +510,7 @@ def test_an_unpartitionable_loop_read_keeps_the_price_without_delivery_estimatio
     cores = sympy.Symbol("cores", integer=True, positive=True)
     for c in (8, 16, 32, cores):
         op = dataclasses.replace(_expert_loop_projection(1), cores=c)
-        op.args = [
-            dataclasses.replace(a, has_partitioning_candidate=False) for a in op.args
-        ]
+        op.args = [dataclasses.replace(a, partitions=1) for a in op.args]
         assert _partitioned_operand_read_excess([op], _COST_PARAMS) == 0
         difference = sympy.simplify(
             predict_ops([op], _COST_PARAMS) - predict_ops([op], off)

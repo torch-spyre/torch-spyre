@@ -237,10 +237,11 @@ class ArgTraffic:
     # for an operand it walks, so this flag, not the factor, says which kind of loop
     # the operand advances with. Read by ``_partitioned_operand_read_excess`` only.
     advances_with_loop_var: bool = False
-    # Positive evidence from the existing legal candidate menu: at least one
-    # candidate splits a symbol this read indexes. This is menu-wide, not a
-    # property of the selected candidate. Missing menu evidence leaves it False.
-    has_partitioning_candidate: bool = False
+    # How many distinct slices of this read the op's cores load under THIS division:
+    # the product of its core splits on symbols the read indexes, the complement of
+    # ``replication``. 1 = not partitioned (also the answer when unknown). A sympy
+    # expression on the co-optimizing path. Read by ``_partitioned_operand_terms``.
+    partitions: int = 1
     # This arg's traffic crosses the GRAPH boundary, so LX residency cannot remove it:
     # a read of a graph input, or the externally-visible write of a graph output. The
     # scratchpad planner pins such a buffer by CLONING it (allocator._push_allocation),
@@ -1596,10 +1597,10 @@ def _partitioned_operand_read_excess(ops: list, p: "CostParams"):
     """Delivery time beyond bytes/peak for eligible matmul operands.
 
     Price an unreused, partitioned operand only in an all-single-pass bundle,
-    or a once-walked ``for_each_tile`` operand with a legal partitioning choice.
-    The latter eligibility is menu-wide: replicated candidates keep this proxy
-    in addition to their existing replica/shared-load charges. Coarse loops and
-    unknown eligibility do not receive the loop-delivery estimate.
+    or a once-walked ``for_each_tile`` operand that the division partitions across
+    cores. A partially replicated read keeps this proxy in addition to its replica
+    or shared-load charge. Coarse loops and unknown eligibility do not receive the
+    loop-delivery estimate.
 
     Residency removes a read; shared graph inputs are charged once. See
     ``docs/source/compiler/cost_model.md`` for the applicability rules,
@@ -1625,15 +1626,21 @@ def _partitioned_operand_terms(ops: list, p: "CostParams"):
             if arg.role != "input":
                 continue
             if looped:
-                # The loop walks this operand once, and its legal menu offers a
-                # partitioning choice. All candidates then use the same proxy.
-                if not (
-                    arg.advances_with_loop_var
-                    and arg.loop_factor == 1
-                    and arg.has_partitioning_candidate
-                ):
+                # The loop walks this operand once, and this division partitions it
+                # across cores. A fully replicated read keeps its replica price only.
+                if not (arg.advances_with_loop_var and arg.loop_factor == 1):
                     continue
-                partitioned = 1
+                if (
+                    isinstance(arg.partitions, sympy.Basic)
+                    and arg.partitions.free_symbols
+                ):
+                    partitioned = sympy.Piecewise(
+                        (0, sympy.Eq(arg.partitions, 1)), (1, True)
+                    )
+                elif arg.partitions != 1:
+                    partitioned = 1
+                else:
+                    continue
             else:
                 # Single-pass class: whole bundle single-pass, operand unreused.
                 # A MAC count that is unknown (0) or symbolic does not prove the
@@ -2543,8 +2550,9 @@ def _loop_operand_request_excess(ops: list, p: "CostParams"):
     the part E_part does not already charge, ``owned(max(E_part, E_req)) -
     owned(E_part)``, which is never negative.
 
-    Scope: looped matmuls only (``operand_request_cost_available``). Where the
-    report extracts without the legal menu, E_part is omitted and this is E_req.
+    Scope: looped matmuls only (``operand_request_cost_available``). E_part is zero
+    for a read the priced division does not partition (``partitions == 1``), so
+    there this is E_req. The report prices its committed division the same way.
     Uses only existing calibrated parameters; adds no constant.
     """
     # _partitioned_operand_terms yields the original ArgTraffic objects, retained
