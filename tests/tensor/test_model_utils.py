@@ -85,6 +85,7 @@ class TestLoadModelToSpyre(TestCase):
         with self.assertRaises(AssertionError):
             _dma_to_spyre_dim_order_swapped(torch.randn(4, dtype=torch.float16))
 
+    @requires_spyre
     def test_dma_helpers_accept_an_explicit_device(self):
         """All DMA helpers target another device and restore current."""
         from torch_spyre._C import get_spyre_tensor_layout
@@ -133,6 +134,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(list(get_spyre_tensor_layout(scale).device_size), [3, 1, 64])
         self.assertEqual(torch.spyre.current_device(), previous)
 
+    @requires_spyre
     def test_low_level_layout_allocation_uses_explicit_device(self):
         """The layout allocator targets its device without changing the caller's."""
         from torch_spyre._C import SpyreTensorLayout, spyre_empty_with_layout
@@ -152,6 +154,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(tensor.device, device)
         self.assertEqual(torch.spyre.current_device(), previous)
 
+    @requires_spyre
     def test_dma_helpers_accept_an_integer_device(self):
         """Integer destinations are normalized before entering the C++ binding."""
         device_index = torch.spyre.current_device()
