@@ -47,6 +47,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.floor` | Y | Y | Spyre | |
+| `torch.trunc` | Y | Y | Spyre | Lowered as `floor(\|x\|) * clip(x, -1, 1)`; a negative fraction gives `0.0`, not `-0.0` |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
