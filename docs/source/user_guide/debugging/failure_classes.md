@@ -116,7 +116,9 @@ python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" my_reproducer.py
 ```
 
 Filter on the class, not on `UserWarning`, which would also catch unrelated
-warnings. The on-device operations are registered in `torch_spyre/ops/eager.py`
+warnings. `FallbackWarning` is defined in `torch_spyre/ops/warning_types.py`
+and re-exported from `torch_spyre/ops/fallbacks.py`, so the filter path above
+resolves. The on-device operations are registered in `torch_spyre/ops/eager.py`
 and the host fallbacks in `torch_spyre/ops/fallbacks.py`, per overload, so
 `aten.mm` and `aten.mm.out` can differ. A fallback inside a steady-state loop
 is also a performance problem, since it performs a host round trip on every
@@ -197,7 +199,8 @@ Each class maps to code or a worked case you can read.
   mask and `-65504`/`65504` for a reduction identity
   ([PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234)).
 - Silent CPU fallback: the `FallbackWarning` class in
-  `torch_spyre/ops/fallbacks.py`, and the on-device registry in
+  `torch_spyre/ops/warning_types.py` (re-exported from
+  `torch_spyre/ops/fallbacks.py`), and the on-device registry in
   `torch_spyre/ops/eager.py`.
 - Scratchpad residency: the `LX_PLANNING` and `HBM_POOL_PLANNING` flags in
   `torch_spyre/_inductor/config.py`; the slice-derived buffer case
