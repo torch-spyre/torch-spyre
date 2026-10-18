@@ -51,8 +51,13 @@ for name, out in [("eager", eager), ("compiled", compiled)]:
     print(name, "matches CPU" if ok else "DIVERGES")
 ```
 
-A tolerance of `0.1` is the standard starting point for `float16`. The next
-two sections explain how to choose it rather than guess it.
+The tolerance here is not arbitrary. It has to cover the fp16 accumulation
+error of this computation, which is larger than the transfer floor of a bare
+copy because a matmul plus softmax accumulates over 128 elements. The next two
+sections show how to set it from the measured floor and the shape of the
+mismatch rather than guess. The project test helper `compare_with_cpu` uses
+`atol=rtol=0.1` as its fp16 default, which is a loose upper bound chosen to
+pass real kernels; tighten it toward the floor when you can.
 
 ## Measure the transfer floor first
 
@@ -101,19 +106,30 @@ assert torch.equal(got.cpu(), expected)   # bit-for-bit, no tolerance
 ```
 
 A poisoned-lane probe catches a padding or layout bug. The device pads the
-stick dimension, and the unused tail of a stick should never reach the
-result. Fill that tail with a value that correct output cannot contain, then
-assert it never appears:
+stick dimension (64 elements at `float16`) to a full stick, and those padding
+lanes should never reach the result. Make the padding explicit by over-sizing
+the real data to a stick multiple, fill the tail with a finite sentinel that
+correct output cannot contain, run only over the real region, and check that
+the sentinel does not appear in the valid output:
 
 ```python
-xi = x.view(torch.int16)
-xi[..., real_len:] = 0x7FFF     # a sentinel correct output cannot produce
-y = op(x.to("spyre")).cpu()
-assert not (y.view(torch.int16) == 0x7FFF).any()
+real_len = 65                       # the real data length
+STICK = 64                          # float16 elements per stick
+padded = ((real_len + STICK - 1) // STICK) * STICK   # 128
+
+x = torch.zeros(padded, dtype=torch.float16)
+x[:real_len] = torch.rand(real_len, dtype=torch.float16)
+x[real_len:] = 30000.0              # finite sentinel in the padding lanes
+
+y = op(x.to("spyre"))[:real_len].cpu()   # read only the real region
+assert (y.abs() < 1e4).all()             # sentinel magnitude must not leak in
 ```
 
-If the sentinel appears in the output, the computation read a padding lane.
-See [Common Failure Classes](failure_classes.md) for the layout and padding
+A finite sentinel is used rather than `0x7FFF`, because that bit pattern is a
+`NaN` and a device `NaN` need not round-trip bit-for-bit, so an exact `==`
+check on it is unreliable. If the sentinel's magnitude appears in the valid
+output, the computation read a padding lane. See
+[Common Failure Classes](failure_classes.md) for the layout and padding
 classes this detects.
 
 ## In the test suite

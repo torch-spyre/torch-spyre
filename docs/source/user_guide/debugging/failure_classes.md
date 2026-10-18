@@ -18,7 +18,7 @@ assignment ahead of time.
 | Zeros or stale values past the first stick | [Layout and stick alignment](#layout-and-stick-alignment) | `copy_range` and layout in the `sdsc` artifact |
 | `NaN` where CPU gives a finite number | [Special values, inf and NaN](#special-values-inf-and-nan) | print the mask or identity constant |
 | A warning, a slower run, and a changed dtype | [Silent CPU fallback](#silent-cpu-fallback) | promote `FallbackWarning` to an error |
-| An "unsupported dtype" error, or an int64 downcast warning | [dtype and downcast](#dtype-and-downcast) | dtypes in `fx_graph_readable.py` |
+| An `Unsupported(...)` error on a float32 op, or an int64 downcast warning | [dtype and downcast](#dtype-and-downcast) | dtypes in `fx_graph_readable.py` |
 | Correct with planning off, wrong with it on | [Scratchpad residency and planning](#scratchpad-residency-and-planning) | rerun with `LX_PLANNING=0` |
 | Result changes between identical runs | [Nondeterminism](#nondeterminism) | disable caches, pin `SENCORES` |
 
@@ -36,32 +36,34 @@ sticks:
 
 A `float16` tensor of 65 elements occupies two sticks. The second stick holds
 element 64 and 63 padding lanes. `is_contiguous()` returns true, so a
-stride-based check does not see the padding tail.
+stride-based check does not describe the padding tail.
 :::
 
 Operations on shapes that are not stick-aligned, slices that start partway
-through a stick, and transposed weights all depend on the layout being
-materialized correctly. The failure is a value that is wrong, or stale, past
-the first stick, while the first stick is correct.
+through a stick, and transposed weights all depend on the codegen handling the
+tiled layout and padding correctly. When it does not, the symptom is a value
+that is wrong or stale past the first stick, while the first stick is correct.
 
-A `float16` tensor also reports `is_contiguous() == True` here even though it
-spans two sticks with a nonzero offset into the second, so a stride-based
-check does not detect this and `.contiguous()` does not fix it. A copy that
-must be correct needs a real materialization, such as `.clone()`.
+A point to keep in mind while reading such a result: a `float16` tensor spans
+two sticks with a nonzero offset into the second, yet `is_contiguous()` still
+returns true, so a stride-based check does not describe the device layout.
 
-To confirm, read the `copy_range` and `device_size` in the kernel's `sdsc`
-artifact. See [Inductor Artifacts](inductor_artifacts.md) and the worked clone
-example in the [debugging overview](index.md). For the layout model itself,
-see [Tensor Layouts](../tensors_and_layouts.md).
+To localize one of these, read the `copy_range` and `device_size` in the
+kernel's `sdsc` artifact and compare them against the padded size. See
+[Inductor Artifacts](inductor_artifacts.md) for how to read the artifact, and
+the worked example in the [debugging overview](index.md). For the layout model
+itself, see [Tensor Layouts](../tensors_and_layouts.md).
 
 ## Special values, inf and NaN
 
-The device float format does not represent IEEE infinities the way CPU
-`float16` does. A mask built from `-inf` encodes to a `NaN` bit pattern,
-because the device format has no infinity. That `NaN` then propagates through
-the entire reduction that reads it, not only the masked positions. The symptom
-is a `NaN` where CPU produces a finite number, often appearing only as the
-masked region grows.
+A mask built from `-inf` reaches the device through `encode_constant()`
+(`deeptools::FloatToFp16Bin`), which encodes IEEE `±inf` as a `NaN` bit
+pattern rather than the fp16 infinity encoding. The masked position therefore
+holds `NaN`, and that `NaN` propagates through the entire reduction or `exp()`
+that reads it, not only the masked positions. The symptom is a `NaN` where CPU
+produces a finite number, often appearing only as the masked region grows.
+This is the encoder behaviour fixed in
+[PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234).
 
 :::{figure} ../../_static/images/mask-nan.svg
 :alt: With a -inf mask, the masked position encodes to NaN and the reduction output is NaN at every position. With a -1e4 mask, the output stays finite.
@@ -78,8 +80,11 @@ mask_value      = -1e4                              # for an exp or softmax mask
 reduce_identity = torch.finfo(torch.float16).min    # for a max-reduction identity
 ```
 
-To confirm, print the mask for a small case and check that masked positions
-hold the finite value you intended and unmasked positions hold zero.
+`-1e4` is finite, so it encodes correctly and `exp()` still underflows to 0 in
+fp16. `±65504` are the most extreme finite fp16 values, so they lose or win
+against any real score while encoding correctly. To confirm, print the mask for
+a small case and check that masked positions hold the finite value you intended
+and unmasked positions hold zero.
 
 ## Silent CPU fallback
 
@@ -117,21 +122,24 @@ call.
 
 ## dtype and downcast
 
-The validated device path is `float16`. A `float32` intermediate that reaches
-the device raises an "unsupported dtype" error, which the FX graph shows as
-the dtype on the offending node. An `int64` index is downcast to `int32`,
-which emits the warning "Backend Spyre does not support int64; downcasting to
-int32 may change values outside the 32-bit range." Silence it with the
-environment variable, or programmatically with
-`spyre.set_downcast_warning(False)`, once you have confirmed the index range
-fits in `int32`:
+The default compute dtype is `float16`. Other dtypes, including `float32`,
+`bfloat16`, and the fp8 variants, are supported in the runtime but have
+narrower op coverage on the compiled path, where explicit fp32-to-fp16 cast
+ops handle conversions. When the compiled path reaches a `float32` op or
+conversion it cannot lower, it raises `Unsupported(...)` (for example
+`Unsupported(f"type conversion from {src_dtype} to {dtype}")`), and the op
+either moves to the host as a fallback or stops the compile. Read the dtypes in
+`fx_graph_readable.py` to find where a `float32` value entered the graph.
+
+An `int64` index is a separate case: Spyre has no 64-bit integer type, so it is
+downcast to `int32`, which emits the warning "Backend Spyre does not support
+int64; downcasting to int32 may change values outside the 32-bit range."
+Silence it once you have confirmed the index range fits in `int32`, with the
+environment variable or `torch.spyre.set_downcast_warning(False)`:
 
 ```bash
 TORCH_SPYRE_DOWNCAST_WARN=0 python my_reproducer.py   # suppress once understood
 ```
-
-Read the dtypes in `fx_graph_readable.py` to find where a `float32` value
-entered the graph.
 
 ## Scratchpad residency and planning
 
@@ -175,19 +183,22 @@ fixing these first.
 Each class maps to code or a worked case you can read.
 
 - Layout and stick alignment: the layout model in
-  [Tensor Layouts](../tensors_and_layouts.md); the clone case in
-  [issue #524](https://github.com/torch-spyre/torch-spyre/issues/524); the
-  mid-stick `torch.cat` case (PR #3875) and transposed-weight K padding
-  (PR #4225).
+  [Tensor Layouts](../tensors_and_layouts.md); the mid-stick `torch.cat` case
+  ([PR #3875](https://github.com/torch-spyre/torch-spyre/pull/3875)) and
+  transposed-weight K padding
+  ([PR #4225](https://github.com/torch-spyre/torch-spyre/pull/4225)).
 - Special values: the finite mask and reduction constants, `-1e4` for an exp
-  mask and `-65504`/`65504` for a reduction identity (PR #4234).
+  mask and `-65504`/`65504` for a reduction identity
+  ([PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234)).
 - Silent CPU fallback: the `FallbackWarning` class in
   `torch_spyre/ops/fallbacks.py`, and the on-device registry in
   `torch_spyre/ops/eager.py`.
 - Scratchpad residency: the `LX_PLANNING` and `HBM_POOL_PLANNING` flags in
-  `torch_spyre/_inductor/config.py`; the slice-derived buffer case (PR #2683).
+  `torch_spyre/_inductor/config.py`; the slice-derived buffer case
+  ([PR #2683](https://github.com/torch-spyre/torch-spyre/pull/2683)).
 - Nondeterminism: the fix that makes LX planning independent of
-  `PYTHONHASHSEED` (PR #4196).
+  `PYTHONHASHSEED`
+  ([PR #4196](https://github.com/torch-spyre/torch-spyre/pull/4196)).
 
 ## Next steps
 
