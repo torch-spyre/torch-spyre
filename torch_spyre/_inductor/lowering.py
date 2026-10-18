@@ -34,6 +34,7 @@ from torch_spyre.ops.fallbacks import fallback_ops
 
 from . import config
 from .constants import (
+    ABSMAX_OP,
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
@@ -1833,25 +1834,28 @@ def lower_constant_pad_nd(
     return output
 
 
-def _trunc(x):
-    """Truncate a float32 tensor, as a cast to an integer dtype does.
+@register_spyre_lowering(torch.ops.aten.trunc.default)
+def lower_trunc(x):
+    """Truncate toward zero, for torch.trunc and a float32 -> int cast.
 
-    The device converts float32 to int32 with floor, but a cast truncates
-    (C-style, like rounding_mode="trunc"), so a float32 -> int cast truncates
-    first; the conversion of the integer-valued result is then exact.
-    clip(x, -1, 1) is the sign of x wherever floor(|x|) is nonzero, so the product
-    needs no compare or select, which split_multi_ops cannot replay in a fused body.
+    The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
+    with no compare or select. A negative fraction gives 0.0 rather than -0.0,
+    since the device multiply makes no negative zero. Integers and bools are
+    returned as is.
 
-    The result is realized with an origin of its own. The product reads x twice,
-    and as the last op of its own body it may: split_multi_ops refuses only an
-    intermediate that combines a view load with another operand, so fused into
-    the conversion it would refuse a source read through a view.
+    The clip is Spyre's single clip op (lower_clamp). It and the product are
+    realized with origins of their own, so split_multi_ops can split the bodies
+    that read them: the product reads x twice, which split_multi_ops allows over
+    a view only as a body's last op.
     """
-    result = lowering.mul(lowering.floor(lowering.abs(x)), lowering.clamp(x, -1.0, 1.0))
+    if not x.get_dtype().is_floating_point:
+        return x
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
-    _ensure_synthetic_origin(
-        result, torch.ops.aten.trunc.default, () if origin is None else (origin,)
-    )
+    origin_args = () if origin is None else (origin,)
+    sign = lower_clamp(x, -1.0, 1.0)
+    _ensure_synthetic_origin(sign, torch.ops.aten.clamp.default, origin_args)
+    result = lowering.mul(lowering.floor(lowering.abs(x)), sign)
+    _ensure_synthetic_origin(result, torch.ops.aten.trunc.default, origin_args)
     return result
 
 
@@ -1892,7 +1896,7 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
         and dst_dtype in (torch.int32, torch.int64)
         and not skip_trunc
     ):
-        x = _trunc(x)
+        x = lower_trunc(x)
 
     # Do not realize the result or stamp an origin on it here. split_multi_ops
     # materializes a fused conversion over its source buffer; realizing it here
@@ -2501,7 +2505,7 @@ def lower_any_dim(x, dim, keepdim=False):
         x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
     )
     result = Reduction.create(
-        reduction_type="absmax",
+        reduction_type=ABSMAX_OP,
         input_node=x,
         **kwargs,
     )
@@ -2517,7 +2521,7 @@ def lower_any_def(x):
         x, axis=None, keepdims=None, dtype=x.dtype, override_return_dtype=None
     )
     result = Reduction.create(
-        reduction_type="absmax",
+        reduction_type=ABSMAX_OP,
         input_node=x,
         **kwargs,
     )

@@ -226,6 +226,8 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
+# max(|x|) reduction; torch.any/all lower to it (see lowering.lower_any_*).
+ABSMAX_OP = "absmax"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
 POOL_OPS = {AVGPOOL2D_OP}
@@ -254,11 +256,22 @@ DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
 # Single-input reductions: everything store_reduction dispatches to its
 # fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
 # reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
-# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
-# of supported reduction_type strings to derive this from, so it is written
-# down here explicitly.
+# ops (exx2, topkvalue/topkindex, avgpoolfwd, absmax, quantscalepertokenfp8) --
+# there is no upstream registry of supported reduction_type strings to derive
+# this from, so it is written down here explicitly.
 SINGLE_INPUT_REDUCTION_OPS = frozenset(
-    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+    {
+        "sum",
+        "mean",
+        "max",
+        "min",
+        "prod",
+        "exx2",
+        *TOPK_OPS,
+        AVGPOOL2D_OP,
+        ABSMAX_OP,
+        QUANTSCALEPERTOKENFP8_OP,
+    }
 )
 
 # Populate more valid labels from deeptools here if needed
