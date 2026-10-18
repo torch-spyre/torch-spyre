@@ -72,6 +72,7 @@ Usage::
 """
 
 import warnings
+from typing import Literal
 
 import torch
 from torch import nn
@@ -298,13 +299,20 @@ def dma_moe_expert_weight_to_spyre(
     target_dtype: torch.dtype | None = None,
     *,
     device: torch.device | str | int | None = None,
+    layout: Literal["gather", "contract_contiguous"] = "gather",
 ) -> torch.Tensor | None:
-    """Transfer ``[E, C, F]`` weights in a gather- and matmul-friendly layout.
+    """Transfer ``[E, C, F]`` weights with an expert-major device layout.
 
-    The device layout is ``[E, C, F // eps, eps]``. Returns ``None`` when
-    ``F`` does not span complete sticks.
+    ``layout="gather"`` stores ``[E, C, F // eps, eps]``. Use
+    ``layout="contract_contiguous"`` for ``[E, F // eps, C, eps]``, placing
+    contraction rows adjacent within each free-dimension stick block. The
+    PyTorch shape remains ``[E, C, F]`` in both modes. Returns ``None`` when
+    ``F`` does not span complete sticks for the target dtype.
+    An unsupported ``layout`` value raises ``ValueError``.
     """
     assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
+    if layout not in ("gather", "contract_contiguous"):
+        raise ValueError(f"Unsupported MoE expert-weight layout: {layout}")
     device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
@@ -322,14 +330,24 @@ def dma_moe_expert_weight_to_spyre(
         )
         return None
 
-    layout = SpyreTensorLayout(
-        [experts, contract, free // eps, eps],
-        [contract * free, free, eps, 1],
-        get_device_dtype(dev_dtype),
-        {(0,): experts, (1,): contract, (2, 3): free},
-    )
+    if layout == "contract_contiguous":
+        # [E, F // eps, C, eps]: keep experts separate, with contraction
+        # rows adjacent within each free-dimension stick block.
+        device_layout = SpyreTensorLayout(
+            [experts, free // eps, contract, eps],
+            [contract * free, eps, free, 1],
+            get_device_dtype(dev_dtype),
+            {(0,): experts, (1, 3): free, (2,): contract},
+        )
+    else:
+        device_layout = SpyreTensorLayout(
+            [experts, contract, free // eps, eps],
+            [contract * free, free, eps, 1],
+            get_device_dtype(dev_dtype),
+            {(0,): experts, (1,): contract, (2, 3): free},
+        )
     dst = spyre_empty_with_layout(
-        weight.size(), weight.stride(), dev_dtype, layout, device=device
+        weight.size(), weight.stride(), dev_dtype, device_layout, device=device
     )
     copy_tensor(weight, dst, non_blocking=False)
     return dst

@@ -414,6 +414,17 @@ yields a tensor with the tiling inverted:
 SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
+For a rank-3 MoE expert stack with host shape `[E, C, F]`,
+`torch_spyre.model_utils.dma_moe_expert_weight_to_spyre(weight)` defaults to
+`layout="gather"`, with device layout `[E, C, F / stick, stick]`. Pass
+`layout="contract_contiguous"` for `[E, F / stick, C, stick]`, where the
+contraction rows are adjacent within each free-dimension stick block. Both
+retain the host tensor's logical shape and values; the choice changes only
+device storage order. `F` must span whole sticks for the target dtype. If it
+does not, the helper warns and returns `None` in either mode, allowing the
+caller to use the default transfer. Model loading does not opt into
+`contract_contiguous` automatically.
+
 ## Layout Compatibility
 
 Spyre operations impose **hard constraints** on the memory layout of
