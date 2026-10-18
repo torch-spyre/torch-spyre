@@ -62,8 +62,10 @@ pattern rather than the fp16 infinity encoding. The masked position therefore
 holds `NaN`, and that `NaN` propagates through the entire reduction or `exp()`
 that reads it, not only the masked positions. The symptom is a `NaN` where CPU
 produces a finite number, often appearing only as the masked region grows.
-This is the encoder behaviour fixed in
-[PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234).
+The encoder still behaves this way;
+[PR #4234](https://github.com/torch-spyre/torch-spyre/pull/4234) worked around
+it by switching the padding and reduction masks to the finite constants below,
+so an `-inf` mask is not safe to reintroduce.
 
 :::{figure} ../../_static/images/mask-nan.svg
 :alt: With a -inf mask, the masked position encodes to NaN and the reduction output is NaN at every position. With a -1e4 mask, the output stays finite.
@@ -125,10 +127,14 @@ call.
 The default compute dtype is `float16`. Other dtypes, including `float32`,
 `bfloat16`, and the fp8 variants, are supported in the runtime but have
 narrower op coverage on the compiled path, where explicit fp32-to-fp16 cast
-ops handle conversions. When the compiled path reaches a `float32` op or
-conversion it cannot lower, it raises `Unsupported(...)` (for example
-`Unsupported(f"type conversion from {src_dtype} to {dtype}")`), and the op
-either moves to the host as a fallback or stops the compile. Read the dtypes in
+ops handle conversions. An op the backend cannot lower at all is routed to the
+host as a fallback at lowering time (`fallback_ops` in
+`torch_spyre/_inductor/lowering.py`); see
+[Silent CPU fallback](#silent-cpu-fallback). An op that lowers but then hits a
+`float32` form codegen cannot handle raises `Unsupported` from
+`torch_spyre/_inductor/errors.py` during code generation, for example
+`Unsupported(f"type conversion from {src_dtype} to {dtype}")` in
+`spyre_kernel.py`, which stops that compile. Read the dtypes in
 `fx_graph_readable.py` to find where a `float32` value entered the graph.
 
 An `int64` index is a separate case: Spyre has no 64-bit integer type, so it is

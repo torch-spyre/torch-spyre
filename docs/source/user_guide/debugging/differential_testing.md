@@ -105,30 +105,29 @@ An exact comparison catches a single misplaced element:
 assert torch.equal(got.cpu(), expected)   # bit-for-bit, no tolerance
 ```
 
-A poisoned-lane probe catches a padding or layout bug. The device pads the
-stick dimension (64 elements at `float16`) to a full stick, and those padding
-lanes should never reach the result. Make the padding explicit by over-sizing
-the real data to a stick multiple, fill the tail with a finite sentinel that
-correct output cannot contain, run only over the real region, and check that
-the sentinel does not appear in the valid output:
+A poisoned-lane probe catches a padding or layout bug in an op that mixes
+values along the padded axis, such as a reduction or a softmax. Give the
+device the unpadded tensor, for example 65 elements, so the device creates the
+padding lanes itself (64 elements per stick, so the second stick has 63). Those
+lanes should contribute nothing. The CPU reference runs on the clean 65
+elements and never sees them, so comparing the two shows whether the device
+read a padding lane:
 
 ```python
-real_len = 65                       # the real data length
-STICK = 64                          # float16 elements per stick
-padded = ((real_len + STICK - 1) // STICK) * STICK   # 128
+x = torch.rand(65, dtype=torch.float16)
 
-x = torch.zeros(padded, dtype=torch.float16)
-x[:real_len] = torch.rand(real_len, dtype=torch.float16)
-x[real_len:] = 30000.0              # finite sentinel in the padding lanes
+ref = x.sum()                     # CPU reference over the real 65 elements
+got = x.to("spyre").sum().cpu()   # device sums over its own padded stick
 
-y = op(x.to("spyre"))[:real_len].cpu()   # read only the real region
-assert (y.abs() < 1e4).all()             # sentinel magnitude must not leak in
+torch.testing.assert_close(got, ref, atol=0.1, rtol=0.1)
 ```
 
-A finite sentinel is used rather than `0x7FFF`, because that bit pattern is a
-`NaN` and a device `NaN` need not round-trip bit-for-bit, so an exact `==`
-check on it is unreliable. If the sentinel's magnitude appears in the valid
-output, the computation read a padding lane. See
+If the device includes a padding lane, `got` differs from `ref` by that lane's
+contribution. The padding is normally zero, so a bug is easiest to see when the
+device leaves stale data there. A finite sentinel makes a leak obvious, but it
+has to be written on the device after the transfer, since the host tensor has
+no padding to fill; `0x7FFF` is a poor sentinel either way, because that bit
+pattern is a `NaN` that need not round-trip bit-for-bit. See
 [Common Failure Classes](failure_classes.md) for the layout and padding
 classes this detects.
 
