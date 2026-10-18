@@ -1810,6 +1810,26 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
             out.float(), values.float().sum(0) + 1, atol=0.05, rtol=0.05
         )
 
+    @expects_raise
+    def test_carried_sum_rejects_a_split_that_does_not_divide_the_rows(self):
+        """A ``work_div`` that does not divide the output rows is an error.
+
+        The hint-driven carried reduction raised here; the ``for_each_tile``
+        carry must not quietly pick another split, which would leave the
+        accumulator's init and update on different row splits.
+        """
+        from torch._inductor.exc import InductorError
+
+        values = self._linspace_values(2)
+        for split in (3, 7):
+            with self.subTest(work_div=split):
+                with self.assertRaisesRegex(
+                    InductorError, "work_division_hint:.*dim d0 size=64"
+                ):
+                    self._compile(
+                        lambda v: carried_expert_sum_fn(v, split), self._named(values)
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
