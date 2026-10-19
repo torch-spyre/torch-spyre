@@ -20,7 +20,6 @@ import functools
 import os
 import random
 import sys
-import pytest
 import torch
 import unittest
 
@@ -158,10 +157,9 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
-    sa_may_stay_untiled:
-        Why the SA co-optimizer's own objective prices this model untiled, so
-        its *auto* mode is an expected failure rather than a broken search;
-        ``None`` where tiling pays.
+    stays_untiled:
+        Why the cost model prices this model untiled, so the *auto* mode must
+        leave it untiled; ``None`` where tiling pays.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -173,7 +171,7 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
-    sa_may_stay_untiled: Optional[str] = None
+    stays_untiled: Optional[str] = None
 
     @property
     def explicit_nest(self) -> _Counts:
@@ -377,8 +375,10 @@ class AutomatedCoarseTilingTests(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self._assert_matches_cpu(case, device, cpu)
-        if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
-            pytest.xfail(case.sa_may_stay_untiled)
+        if case.stays_untiled:
+            if tiling:
+                self.fail(f"{case.stays_untiled}, but:\n{_describe(tiling)}")
+            return
         self.assertTrue(
             tiling,
             "Auto tiling is on and no loops were written, but no op was "
@@ -475,9 +475,8 @@ class AutomatedCoarseTilingTests(
             atol=0.02,
             rtol=0.05,
             # Tiling buf5 two ways on dim 1 gains nothing in the expression and
-            # adds a 5120 ns copy-out; the SA tiled it only where its anneal
-            # stopped short, and #5103's burst term moved that stop.
-            sa_may_stay_untiled="the SA's objective prices this MLP untiled",
+            # adds a 5120 ns copy-out, which both solvers price.
+            stays_untiled="the cost model prices this MLP untiled",
         )
 
     def _swiglu_case(self) -> "_TilingCase":

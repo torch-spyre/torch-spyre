@@ -139,6 +139,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     _check_in_place_relationships,
 )
+from torch_spyre._inductor.scratchpad.utils import hbm_bytes_per_us
 from torch_spyre._inductor import config
 
 __all__ = ["CpSatLayoutSolver"]
@@ -150,6 +151,19 @@ logger = logging.getLogger(__name__)
 # there was no room once higher-value buffers were placed. Shared so the DEBUG
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
+
+
+@dataclass(frozen=True)
+class _Cut:
+    """A buffer's cut literal and the consumers its copy-out serves: one
+    ``apart`` literal per consumer that may share its nest, true when it does
+    not, plus ``outside`` consumers that never can."""
+
+    name: str
+    literal: Any
+    apart: tuple
+    outside: int
+
 
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
@@ -178,6 +192,14 @@ class _PlacementUnit:
     end_time: int
     original_offset: int  # offset the solver chose, before bottom-justify
     justified_offset: int = 0  # final justified offset
+
+
+def _implied_by_all(model: "cp_model.CpModel", literals: Sequence[Any]) -> Any:
+    """A bool forced true when every one of ``literals`` is. Only the lower bound
+    is constrained, which is exact under an objective that charges it."""
+    var = model.new_bool_var("")
+    model.add_bool_or([*(lit.negated() for lit in literals), var])
+    return var
 
 
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
@@ -1542,10 +1564,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def replans_after_tiling(cls) -> bool:
         return True
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return True
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
@@ -1568,6 +1586,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # contract does not change. Empty until a solve, so a reader can tell
         # "not recorded" from "no solve".
         self.last_solve_stats: dict = {}
+        # The objective's terms outside ``cost_expr`` and the total minimized,
+        # for the same dump; empty / None unless the cost solve priced cuts.
+        self._off_expression_ns: dict[str, float] = {}
+        self._score_ns: Optional[float] = None
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
@@ -1689,6 +1711,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver: "cp_model.CpSolver",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         cost_expr: sympy.Expr,
+        companions: Optional["cp_model.LinearExpr"] = None,
     ) -> Optional["cp_model.CpSolverStatus"]:
         sym_map = {}
         buffer_map = {}
@@ -1719,6 +1742,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
+            if companions is not None:
+                cp_cost = cp_cost + companions
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
@@ -1751,7 +1776,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> list["cp_model.IntVar"]:
+    ) -> list[_Cut]:
         """One bool per buffer, true when that buffer is a coarse-tiling *cut*.
 
         A cut is a tiled op whose value has to be published into a full-sized
@@ -1811,6 +1836,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             unshareable = (
                 getattr(divided[name].buffer, "boundary", None) == BufferType.Output
             )
+            outside = 0
             seg = segment.get(name)
             for child, pairs in children_of.get(name, []):
                 # A consumer with no divisions of its own (placement-only), or
@@ -1818,6 +1844,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # share its nest, so reading it is always a cut.
                 if seg is None or segment.get(child) != seg:
                     unshareable = True
+                    outside += 1
                     continue
                 d = model.new_bool_var(f"apart_{name}_{child}")
                 model.add(group[name] != group[child]).only_enforce_if(d)
@@ -1842,8 +1869,50 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.add_bool_or(
                     [is_tiled.negated(), any_diff.negated()]
                 ).only_enforce_if(cut.negated())
-            cuts.append(cut)
+            cuts.append(_Cut(name, cut, tuple(diffs), outside))
         return cuts
+
+    def _companion_ns(
+        self,
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        cuts: Sequence[_Cut],
+    ) -> Optional["cp_model.LinearExpr"]:
+        """HBM time, in ns, of what each cut's copy-out moves that ``cost_expr``
+        does not count: the expression is built from the untiled graph, so the
+        full buffer the apply mints for a cut is not in it.
+
+        The quantity ``SaCoOptimizingSolver._companion_charges`` adds, per cut
+        of ``size`` bytes: the copy's read of the tile when the tile is spilled;
+        its write of the full buffer, which for a graph output replaces a write
+        already charged, so only when spilled; and each outside consumer's read
+        of the full buffer when the tile is resident, since spilled the
+        expression already charges it. ``None`` without a cut to price.
+        """
+        ns_per_byte = 1000.0 / hbm_bytes_per_us()
+        terms = []
+        for cut in cuts:
+            sb = tensors[cut.name]
+            size_ns = round(sb.buffer.size * self.alignment * ns_per_byte)
+            if size_ns == 0:
+                continue
+            spilled = _implied_by_all(model, [cut.literal, sb.in_buffer.negated()])
+            resident = _implied_by_all(model, [cut.literal, sb.in_buffer])
+            is_output = getattr(sb.buffer, "boundary", None) == BufferType.Output
+            terms.append(size_ns * spilled)
+            terms.append(size_ns * (spilled if is_output else cut.literal))
+            terms.append(size_ns * cut.outside * resident)
+            terms.extend(
+                size_ns * _implied_by_all(model, [resident, apart])
+                for apart in cut.apart
+            )
+        return sum(terms) if terms else None
+
+    def off_expression_ns(self) -> dict[str, float]:
+        return dict(self._off_expression_ns)
+
+    def score_ns(self) -> Optional[float]:
+        return self._score_ns
 
     @staticmethod
     def _tiling_group_ids(
@@ -2017,7 +2086,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Loop-group boundaries the tiling implies, as solver variables, so the
         # ladder below can rank them. Empty unless the joint solve is actually
         # choosing tilings, which makes the cut stage inert.
-        cut_terms = self._cut_literals(model, tensors, children_of)
+        cuts = self._cut_literals(model, tensors, children_of)
+        cut_terms = [cut.literal for cut in cuts]
         if cut_terms:
             logger.debug(
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
@@ -2040,12 +2110,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
             return result
 
+        self._off_expression_ns, self._score_ns = {}, None
         if cost_expr is not None:
-            # Only reached with auto_coarse_tiling off: the allocator withholds the
-            # expression when tiling is a solver axis, because the cost model is
-            # flat in tile size and cut count. Unchanged behaviour otherwise --
-            # a successful cost solve returns here and the ladder is skipped.
-            status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
+            # The expression prices tile counts but not the copy-out a cut adds,
+            # so that rides beside it. A successful cost solve skips the ladder.
+            companions = self._companion_ns(model, tensors, cuts)
+            status = self._minimize_cost_expr(
+                model, solver, tensors, cost_expr, companions
+            )
+            if status is not None and companions is not None:
+                self._off_expression_ns = {
+                    "companions": float(solver.Value(companions))
+                }
+                self._score_ns = solver.ObjectiveValue()
 
         if status is None:
             # TODO: Update objective to a maxmin optimization to optimize overall

@@ -1679,6 +1679,49 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         )
         self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
 
+    def _priced_cut(self, size: int):
+        # a's tiled candidate is the two-core one, which ``cost_expr`` prices
+        # 500 ns below the untiled one. Its consumer can never share a nest, so
+        # tiling a is a cut whose copy-out moves ``size`` bytes at least twice.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        a = CoreDivisionBuffer(
+            "a",
+            size,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec),
+            ],
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [1],
+            core_divisions=_whole(),
+            parents=["a"],
+            cd_parent_matches={"a": [(0, 0), (1, 0)]},
+        )
+        solver = self.solver_class([a, sink], size=1 << 24, alignment=1)
+        (planned,) = [
+            b
+            for b in solver.plan_layout_and_core_divisions(1000 / a.sym_cores)
+            if b.name == "a"
+        ]
+        return solver, planned.core_divisions[planned.chosen_division].tiling
+
+    def test_cost_solve_prices_a_cut_above_what_tiling_saves(self):
+        from torch_spyre._inductor.scratchpad.utils import hbm_bytes_per_us
+
+        # Two passes over the buffer cost well over the 500 ns tiling saves.
+        size = round(hbm_bytes_per_us())
+        _, tiling = self._priced_cut(size)
+        self.assertTrue(tiling.is_untiled)
+
+    def test_cost_solve_tiles_where_the_cut_is_cheaper(self):
+        solver, tiling = self._priced_cut(4096)
+        self.assertFalse(tiling.is_untiled)
+        self.assertGreater(solver.off_expression_ns()["companions"], 0)
+
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the
         # divisor cannot contain 0"): a reciprocal-of-cores cost term (as the

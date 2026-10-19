@@ -3022,33 +3022,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
-        if (
-            config.auto_coarse_tiling
-            and solver.chooses_tilings()
-            and solver.linear_cost_only()
-        ):
-            # The cost model is flat in both axes the tiling search moves along:
-            # it has no term for tile size and none for cut count, so every
-            # candidate tiling scores identically and the choice falls to
-            # whichever optimum the multi-worker portfolio reaches first (the
-            # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
-            # objective value). Worse, it is not merely uninformative there --
-            # #3810 makes it raise on symbolic args once an op is output-tiled,
-            # so the re-plan silently loses the runtime term anyway, and it
-            # prices residency the scheduler later revokes. Hand the solver no
-            # cost expression at all and let its lexicographic ladder rank
-            # residency, cuts, parallelism and division shape instead. Off this
-            # path the expression is unchanged and still the objective.
-            logger.debug(
-                "cost objective skipped: auto_coarse_tiling makes tile size and "
-                "cut count decision axes the cost model cannot score"
-            )
-            result = solver.plan_layout_and_core_divisions(None)
-            assert not any(buffer.lx_relayout_plans for buffer in result), (
-                "CoOptimizingAllocator does not support LX relayout"
-            )
-            return result
-
         bundle_terms: list = []
         # Feature extraction runs inside the same fallback: a candidate tiling
         # can raise Unsupported (an axis with no resolvable loop variable) or

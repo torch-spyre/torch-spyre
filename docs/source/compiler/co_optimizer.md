@@ -327,20 +327,20 @@ represented and survives scheduling and codegen — is implemented and documente
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-At a high level: both solvers decide tiling jointly with LX placement and work division, but
-rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
-objective. When `auto_coarse_tiling` is on,
-`cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
-cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
-step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
-apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
-second joint solve, not a continuation of the first, since tiling is no longer offered as a
-choice at that point. Simulated annealing picks a tiling jointly with division too, through
-`OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its tile-count
-symbols: the loop reaches the price mainly through the operands it re-reads, beside the
-residency the tiling makes possible. Its chosen tilings are applied the same way, and its
-placement stands: there is no second solve.
+At a high level: both solvers decide tiling jointly with LX placement and work division, and
+both rank it by `cost_expr`, which prices the tiling through its tile-count symbols: the loop
+reaches the price mainly through the operands it re-reads, beside the residency the tiling
+makes possible. Beside that expression, both add the HBM traffic of the full-extent companion
+buffer the apply mints for a tiled op whose output escapes its run, which the expression, built
+from the untiled graph, cannot see. CP-SAT decides tiling in the *same* constraint model as
+residency and division. Should the expression fail to lower, it falls back to an ordered
+sequence of tie-breaks: residency first, then fewest tiling cuts, then parallelism, then
+division shape, then tile count, each one only resolving ties the step before leaves open.
+Once that solve picks a tiling, the graph is physically rewritten to apply it, and residency
+and division are solved jointly *again* over the now-tiled graph — a second joint solve, not a
+continuation of the first, since tiling is no longer offered as a choice at that point.
+Simulated annealing picks a tiling jointly with division too, through `OpSplitSpace`. Its
+chosen tilings are applied the same way, and its placement stands: there is no second solve.
 
 **Status: landed for both solvers, off by default.** `CoreDivision.tiling`
 / `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
@@ -351,8 +351,10 @@ placement stands: there is no second solve.
   output-axis tilings, each with its own division menu; a producer/consumer pair is only
   compatible if they agree on which slice of the shared buffer each tile and core owns.
   Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
-  inside one must be compatible. The solve ranks plans with the lexicographic ladder described
-  above, not `cost_expr`. Once it picks a tiling, `CoarseTilingPass` applies it to the graph
+  inside one must be compatible. The solve minimizes `cost_expr` plus each cut's companion
+  traffic (`CpSatLayoutSolver._companion_ns`), falling back to the lexicographic ladder
+  described above only when the expression cannot be lowered. Once it picks a tiling,
+  `CoarseTilingPass` applies it to the graph
   and the allocation is solved again over the now-tiled graph, with no further tilings
   offered — that second plan is the one committed.
 
@@ -591,10 +593,10 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ### Tiling-related:
 
-- Simulated annealing decides by its own objective whether a tiling pays, and can decide
-  against it: `test_solver_auto_coarse_tiling.py`'s MLP stays untiled under simulated annealing
-  (`sa_may_stay_untiled`). How closely the tile-count symbols track the device is not covered
-  by the sweep plan (see the sweep-coverage item above).
+- Both solvers decide by the cost model whether a tiling pays, and can decide against it:
+  `test_solver_auto_coarse_tiling.py`'s MLP stays untiled (`stays_untiled`). How closely
+  the tile-count symbols track the device is not covered by the sweep plan (see the
+  sweep-coverage item above).
 - The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
   tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
   core-division splits for matmuls "the matmuls' tilings." The code no longer does:

@@ -94,10 +94,6 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     def replans_after_tiling(cls) -> bool:
         return False
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
