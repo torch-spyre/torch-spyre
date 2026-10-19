@@ -3720,6 +3720,11 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
             # still work, but skipping avoids an empty/degenerate gather.
             continue
         index = torch.arange(size - 1, -1, -1, device=out.device, dtype=torch.int32)
+        # TODO: drop the clamp once the gather ignores its index's padding
+        # (#5588). The gather dereferences the padding lanes of the index's last
+        # stick, where a device-built descending ramp continues to -1, -2, ...
+        # and faults the card; the clamp keeps every lane a row of ``out``.
+        index = index.clamp(0, size - 1)
         out = torch.index_select(out, dim, index)
         reversed_any = True
     # aten.flip always returns a fresh tensor; clone so the no-op case does

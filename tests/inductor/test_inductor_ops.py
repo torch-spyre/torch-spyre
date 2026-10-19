@@ -9782,8 +9782,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_flip_cpu(self, dims, x):
         # Spyre decomposes aten.flip into index_select gathers with a
-        # descending index (see spyre_flip); the arange building that index
-        # falls back to CPU, hence the filtered FallbackWarning.
+        # descending index (see spyre_flip).
         self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
