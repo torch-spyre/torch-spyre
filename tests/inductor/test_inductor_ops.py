@@ -5013,17 +5013,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                 ),
                 "2d_bool": (cached_randint((4, 64), high=1) >= 0, -1),
-                # Narrower than one float32 stick, rejected for now.
-                # TODO: serve these once the padding write can be placed
-                # (a float32 restickify), then make them positive cases.
                 "1d_bool_substick": (
                     torch.tensor([True, False, True, True, False, False, True, True]),
                     0,
                 ),
+                # Narrower than one float32 stick: the padding write lands in a
+                # fresh zero fill, so it stays in place.
                 "2d_fp32_substick": (cached_randn((64, 8), dtype=torch.float32), -1),
-            },
-            "expect_raise": {
-                "2d_fp32_substick": "narrower than one stick",
+                "1d_int64_one": (torch.tensor([7]), -1),
             },
         },
         ("test_triu_int", "test_triu_int_cpu"): {

@@ -4542,14 +4542,6 @@ def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
         # it assumes a broadcast drops only leading dims, so a tensor both
         # transposed and lifted to rank 3 has no feasible assignment.
         stick = get_elem_in_stick(compute_dtype)
-        if cols < stick:
-            # TODO: serve widths below one stick. The padding write then covers
-            # part of a stick, and placing it needs a restickify that float32
-            # lacks; a write into a fresh zero fill could stay in place instead.
-            raise Unsupported(
-                f"cumsum over {cols} columns of {compute_dtype}, narrower than "
-                f"one stick ({stick} elements)"
-            )
         padded_cols = ((cols + stick - 1) // stick) * stick
         if padded_cols > cols:
             # Pad to a stick boundary for the float32 reduction, scattering
