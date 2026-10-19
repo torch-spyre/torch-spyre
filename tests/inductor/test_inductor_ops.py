@@ -4857,9 +4857,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_bf16_multi_block": (
                     cached_randn((512, 512), dtype=torch.bfloat16),
                 ),
-                # int64 masks at float32, so a small payload round-trips exactly.
+                # The integer types mask at float32, so a small payload
+                # round-trips exactly.
                 "2d_int64": (cached_randint((64, 64)),),
                 "2d_int64_unaligned": (cached_randint((100, 100)),),
+                "2d_int32": (cached_randint((64, 64), dtype=torch.int32),),
+                "2d_int32_unaligned": (cached_randint((100, 100), dtype=torch.int32),),
             }
         },
         ("test_triu", "test_triu_cpu"): {
@@ -4929,6 +4932,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randint((100, 100)),
                     -3,
                 ),
+                "2d_int32_diagonal": (
+                    cached_randint((128, 128), dtype=torch.int32),
+                    3,
+                ),
             }
         },
         ("test_eye", "test_eye_cpu"): {
@@ -4953,6 +4960,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "bf16_multi_block": (512, torch.bfloat16),
                 "int64": (64, torch.int64),
                 "int64_non_stick": (100, torch.int64),
+                "int32": (64, torch.int32),
+                "int32_non_stick": (100, torch.int32),
                 "fp32": (64, torch.float32),
             }
         },
@@ -5001,8 +5010,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "1d_bf16": (alternating_signs((128,), dtype=torch.bfloat16), 0),
                 "1d_fp32_unaligned": (cached_randn((100,), dtype=torch.float32), -1),
                 "1d_int64": (cached_randint((100,)), 0),
-                # int32 accumulates as int64, computed in float32.
+                # int32 accumulates as int64 unless a dtype is given, computed in
+                # float32 either way.
                 "2d_int32": (cached_randint((4, 64), dtype=torch.int32), -1),
+                "2d_int32_dtype": (
+                    cached_randint((4, 64), dtype=torch.int32),
+                    -1,
+                    torch.int32,
+                ),
+                # The offsets of a grouped matmul, from per-group counts.
+                "1d_int32_dtype": (
+                    cached_randint((128,), dtype=torch.int32),
+                    0,
+                    torch.int32,
+                ),
                 # A bool input accumulates as int64, the prefix count
                 # masked_scatter takes over its row mask. It runs on the host
                 # for now (see cumsum_decomp).
@@ -10708,9 +10729,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, needs_device=True, atol=0.0, rtol=0.0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_cumsum_cpu(self, x, dim):
+    def test_cumsum_cpu(self, x, dim, dtype=None):
         def fn(input, dim):
-            return torch.cumsum(input, dim)
+            return torch.cumsum(input, dim, dtype=dtype)
 
         self.compare_with_cpu(fn, x, dim)
 

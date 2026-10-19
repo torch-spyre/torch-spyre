@@ -4163,11 +4163,13 @@ def arange_start_decomp(
 #
 # Membership is also the served-dtype gate.  bfloat16's ramp is built at the
 # requested type and keeps 7 mantissa bits, so 258 collides (measured exact to
-# 257); int64 computes in float32, so it inherits that bound, not its own.
+# 257); the integer types compute in float32, so they inherit that bound, not
+# their own.
 _TRIANGULAR_BLOCK = {
     torch.float16: 1024,
     torch.bfloat16: 256,
     torch.float32: 1 << 24,
+    torch.int32: 1 << 24,
     torch.int64: 1 << 24,
 }
 
@@ -4180,10 +4182,10 @@ _MATMUL_DTYPES = frozenset({torch.float16, torch.bfloat16})
 def _mask_compute_dtype(dtype: torch.dtype) -> torch.dtype:
     """The type a coordinate mask of element type ``dtype`` computes at.
 
-    int64 reaches an exact-integer device comparison only through float32; every
-    other served type computes at its own width.
+    The integer types reach an exact-integer device comparison only through
+    float32; every other served type computes at its own width.
     """
-    return torch.float32 if dtype == torch.int64 else dtype
+    return torch.float32 if dtype in _RAMP_INTEGER_DTYPES else dtype
 
 
 @dataclasses.dataclass(frozen=True)
