@@ -770,16 +770,97 @@ def _single_arg_op_layout(
         ]
         if out_stl is not None
     ]
-    if output_stls:
-        return output_stls
-    return _candidate_output_stls(
-        out_coords,
-        output_dep,
-        c_size,
-        c_stride,
-        stick_expr,
-        out_dtype_for_layout,
+    if not output_stls:
+        output_stls = _candidate_output_stls(
+            out_coords,
+            output_dep,
+            c_size,
+            c_stride,
+            stick_expr,
+            out_dtype_for_layout,
+        )
+    return _keep_staggered_arrangement(
+        op, in_layout, dep, stl, output, output_dep, output_stls
     )
+
+
+def _reads_one_element_per_unit(
+    layout: FixedLayout, dep: MemoryDep, stl: SpyreTensorLayout
+) -> bool:
+    """Whether ``dep`` reads a single element of the stick dim, at a unit boundary.
+
+    Both staggered arrangements keep the first element of each stagger unit in
+    place, so such a read sees the same element whatever the arrangement.
+    """
+    stick_dim = _stagger_stick_dim(layout, stl)
+    if stick_dim is None:
+        return False
+    coord = host_coordinates(layout, dep, None)[stick_dim]
+    return (
+        not coord.free_symbols
+        and coord.is_Integer
+        and int(coord) % get_elem_in_stick(torch.float16) == 0
+    )
+
+
+class _StaggerNotKept(Unsupported):
+    """A staggered input layout from which an op cannot keep the arrangement."""
+
+
+def _keep_staggered_arrangement(
+    op: Operation,
+    in_layout: FixedLayout,
+    in_dep: MemoryDep,
+    in_stl: SpyreTensorLayout,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    out_stls: list[SpyreTensorLayout],
+) -> list[SpyreTensorLayout]:
+    """``out_stls`` tagged with ``in_stl``'s staggered arrangement.
+
+    The output layouts of a copy-like op are built from its host size and stride,
+    so they are STANDARD, while the op copies the input's elements in their
+    device order. A staggered input therefore keeps its arrangement on an output
+    whose stick runs along the input's stick dim, when the read covers whole
+    stagger units. Any other output would need a restickify, which cannot keep a
+    stagger, so it is dropped; with none left, or a read that splits a unit, it
+    raises ``Unsupported``. A caller with other candidate input layouts tries
+    those before giving up. A read of the first element of each unit is not
+    affected by the arrangement, so its STANDARD layouts are returned as they are.
+    """
+    arrangement = in_stl.element_arrangement
+    if arrangement not in STAGGERED_EAS:
+        return out_stls
+    if _reads_one_element_per_unit(in_layout, in_dep, in_stl):
+        # The output holds one element per unit, so it has no arrangement.
+        return out_stls
+    try:
+        _check_whole_stagger_units(f"{op.get_name()} reads", in_layout, in_dep, in_stl)
+    except Unsupported as e:
+        raise _StaggerNotKept(str(e).removeprefix("Spyre backend does not support: "))
+    in_dim = _stagger_stick_dim(in_layout, in_stl)
+    in_stick_var = (
+        host_coordinates(in_layout, in_dep, None)[in_dim].free_symbols
+        if in_dim is not None
+        else set()
+    )
+    out_coords = host_coordinates(output, output_dep, None)
+    kept = []
+    for out_stl in out_stls:
+        out_dim = _stagger_stick_dim(output, out_stl)
+        out_stick_var = (
+            out_coords[out_dim].free_symbols if out_dim is not None else set()
+        )
+        if out_stick_var == in_stick_var:
+            kept.append(out_stl.with_element_arrangement(arrangement))
+    if not kept:
+        # TODO: support a staggered input whose stick moves; needs a
+        # restickify that keeps the arrangement.
+        raise _StaggerNotKept(
+            f"{op.get_name()} moves the stick of its {arrangement.name} input "
+            f"{in_dep.name}; restickifying a staggered tensor is not supported"
+        )
+    return kept
 
 
 def _clone_layout(
@@ -829,7 +910,9 @@ def _clone_layout(
         # Case 1: No restickify insertion needed.
         # Use AnyInNode to produce the fixed output layout.
         op.restick_cost_fn = AnyInNode.from_args()
-        return [out_stl]
+        return _keep_staggered_arrangement(
+            op, args[0].layout, in_dep, in_stl, output, output_dep, [out_stl]
+        )
 
     # Case 2: Find alternative dimension to swap with the current stick dimension.
     # TODO: FixedInOutNode only supports a single required STL, so we select
@@ -2140,11 +2223,19 @@ def compute_layouts(
 
     # All other single arg ops
     layouts = []
+    staggered_error: _StaggerNotKept | None = None
     for stl in args[0].layouts:
-        result = _single_arg_op_layout(
-            op, output, output_dep, args[0].dep, args[0].layout, stl
-        )
+        try:
+            result = _single_arg_op_layout(
+                op, output, output_dep, args[0].dep, args[0].layout, stl
+            )
+        except _StaggerNotKept as e:
+            # Another candidate input layout may keep the arrangement.
+            staggered_error = staggered_error or e
+            continue
         layouts.extend(result)
+    if not layouts and staggered_error is not None:
+        raise staggered_error
     if any(stride == 0 for stride in output.stride):
         layouts = [_compact_broadcast_device_dims(stl) for stl in layouts]
     if not layouts:
@@ -2509,7 +2600,12 @@ def _fresh_allocation_layout(
         )
     stl = stl.with_element_arrangement(next(iter(staggered_eas)))
     for writer in writers:
-        _check_whole_stagger_units(writer, op.get_layout(), stl)
+        _check_whole_stagger_units(
+            f"{writer.get_name()} writes",
+            op.get_layout(),
+            next(iter(writer.get_read_writes().writes)),
+            stl,
+        )
     return stl
 
 
@@ -2534,49 +2630,63 @@ def _carries_element_arrangement(read, dtype: torch.dtype) -> bool:
     )
 
 
-def _check_whole_stagger_units(
-    writer: ComputedBuffer, target_layout: FixedLayout, target_stl: SpyreTensorLayout
-) -> None:
-    """Raise unless ``writer`` keeps whole stagger units of the stick dim.
+def _stagger_stick_dim(layout: FixedLayout, stl: SpyreTensorLayout) -> int | None:
+    """Host dim of ``layout`` that the device stick of ``stl`` runs along.
 
-    Both staggered arrangements interleave the elements of one fp16 stick (a
-    DL16_TO_FP32 stick pair, or one FP32_TO_DL16 stick), so a write at an offset
-    or with an extent inside such a unit cannot keep the arrangement. A write
-    that ends at the end of the stick dim can, partial last unit included, as
-    long as the generic layout allocates that unit whole: a DL16_TO_FP32 stick
-    dim spanning an odd number of fp32 sticks leaves out the second stick of its
-    last pair.
+    The device stick's host stride names the stick dim; a size-1 dim can share
+    that stride without being it. None for a stick on a size-1 or broadcast dim.
     """
-    c_size = [concretize_expr(s) for s in target_layout.size]
-    c_stride = [concretize_expr(s) for s in target_layout.stride]
-    # The device stick's host stride names the stick dim; a size-1 dim can share
-    # that stride without being it.
-    stick_dim = next(
+    c_size = [concretize_expr(s) for s in layout.size]
+    c_stride = [concretize_expr(s) for s in layout.stride]
+    return next(
         (
             d
             for d in reversed(range(len(c_size)))
-            if c_size[d] > 1 and c_stride[d] == target_stl.stride_map[-1]
+            if c_size[d] > 1 and c_stride[d] == stl.stride_map[-1]
         ),
         None,
     )
+
+
+def _check_whole_stagger_units(
+    access: str, layout: FixedLayout, dep: MemoryDep, stl: SpyreTensorLayout
+) -> None:
+    """Raise unless the access ``dep`` to ``layout`` keeps whole stagger units.
+
+    ``access`` names the access in the error, e.g. ``"buf3 writes"``. Both
+    staggered arrangements interleave the elements of one fp16 stick (a
+    DL16_TO_FP32 stick pair, or one FP32_TO_DL16 stick), so an access at an
+    offset or with an extent inside such a unit cannot keep the arrangement. An
+    access that ends at the end of the stick dim can, partial last unit included,
+    as long as the generic layout allocates that unit whole: a DL16_TO_FP32 stick
+    dim spanning an odd number of fp32 sticks leaves out the second stick of its
+    last pair.
+    """
+    stick_dim = _stagger_stick_dim(layout, stl)
     if stick_dim is None:
         return
+    c_size = [concretize_expr(s) for s in layout.size]
     unit = get_elem_in_stick(torch.float16)
-    output_dep = next(iter(writer.get_read_writes().writes))
-    coord = host_coordinates(target_layout, output_dep, None)[stick_dim]
+    coord = host_coordinates(layout, dep, None)[stick_dim]
     syms = coord.free_symbols
     offset = coord.subs({s: 0 for s in syms})
     extent: int | None
     if not syms:
         extent = 1
     elif len(syms) == 1 and coord - offset == next(iter(syms)):
-        extent = _concrete_int(output_dep.ranges.get(next(iter(syms))))
+        extent = _concrete_int(dep.ranges.get(next(iter(syms))))
     else:
         extent = None
     dim_size = c_size[stick_dim]
-    sticks_per_unit = unit // target_stl.elems_per_stick()
+    sticks_per_unit = unit // stl.elems_per_stick()
+    # Sticks the layout allocates along the stick dim: a size-1 stick count is
+    # not grown for the wider dtype, so it can hold half a DL16_TO_FP32 pair.
+    other_elems = math.prod(c_size) // dim_size
+    device_elems = math.prod(s for s in stl.device_size if s > 0)
+    allocated_sticks = device_elems // (stl.elems_per_stick() * max(other_elems, 1))
     allocates_whole_units = (
-        math.ceil(dim_size / target_stl.elems_per_stick()) % sticks_per_unit == 0
+        math.ceil(dim_size / stl.elems_per_stick()) % sticks_per_unit == 0
+        and allocated_sticks % sticks_per_unit == 0
     )
     keeps_whole_units = (
         extent is not None
@@ -2587,9 +2697,8 @@ def _check_whole_stagger_units(
     if not (allocates_whole_units and keeps_whole_units):
         # TODO: support writes that split a stagger unit.
         raise Unsupported(
-            f"{writer.get_name()} writes {target_stl.element_arrangement.name} "
-            f"data at stick-dim coordinate {coord}, not whole units of {unit} "
-            f"elements"
+            f"{access} {stl.element_arrangement.name} data at stick-dim "
+            f"coordinate {coord}, not whole units of {unit} elements"
         )
 
 
@@ -3122,6 +3231,15 @@ def propagate_spyre_tensor_layouts(
                 )
                 if alt_stl is not None:
                     assert isinstance(target_layout, FixedLayout)
+                    if target_stl.element_arrangement in STAGGERED_EAS:
+                        # TODO: support relocating a staggered target; needs a
+                        # restickify that keeps the arrangement.
+                        raise Unsupported(
+                            f"{op.get_name()} writes {target_name} at an offset "
+                            f"its {target_stl.element_arrangement.name} layout "
+                            f"cannot address; relocating the target means "
+                            f"restickifying a staggered tensor"
+                        )
                     if graph_input is not None:
                         write_stick = device_coordinates(target_stl, output_dep, None)[
                             -1
