@@ -64,6 +64,7 @@ _OPS_WITH_CONSTANT_ARGS = frozenset(
         "softplus",
         "bitwise_left_shift",
         "bitwise_right_shift",
+        "rotl16i16",
     }
 )
 

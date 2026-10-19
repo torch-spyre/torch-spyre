@@ -356,6 +356,11 @@ class SpyreOpFuncs:
         return PointwiseOp(I16TOFP32_OP, [x])
 
     @staticmethod
+    def rotl16i16(x, n):
+        amount = n.value if isinstance(n, Constant) else n
+        return PointwiseOp("rotl16i16", [x], {"constants": {"shamt": int(amount)}})
+
+    @staticmethod
     def qfp8wt(x):
         return PointwiseOp("qfp8wt", [x])
 

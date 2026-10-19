@@ -878,6 +878,24 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.shape, dtype=torch.float32, device=input.device)
 
 
+@torch.library.custom_op("spyre::rotl16i16", mutates_args=(), device_types="spyre")
+def rotl16i16(x: torch.Tensor, n: int) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Rotate every int16 element left by the constant n (1..15) within 16 bits.
+
+    rotl(x, n) = (x << n) | (x >>> (16 - n)), one fused SFP kernel instead of
+    the four of shift, shift, and, or.
+
+    Maps to: deeptools ROTL16I16 operation (rotli16.smc)
+    """
+    pass
+
+
+@rotl16i16.register_fake
+def _(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.new_empty(x.size())
+
+
 
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
 # four-step pipeline; the only difference is the final format-conversion kernel:
