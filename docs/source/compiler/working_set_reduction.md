@@ -125,6 +125,28 @@ tiles have no axis to concatenate; return a length-one tensor instead.
 As with `scan`, output leaves must not alias inputs or one another: returning
 `(y, y)` for a computed tile `y` is invalid; use `(y, y.clone())` instead.
 
+A functional `index_copy` into a carried output preserves its caller's initializer.
+The compiler removes a full carry clone only when its addresses, shape, strides
+and offset are unchanged, including the scatter target's view, and no other body
+operation still reads the old carry placeholder. Later readers of the old value
+are redirected to a pre-update snapshot by `splice_while_loop` before this check.
+If the scatter destination needs a layout conversion, both the copy-in and
+copy-back remain inside the counted loop so other carry readers see each update.
+
+For a counted loop over an int32 index table `[trips, rows]`, each visited row
+must begin at a stick boundary and its sticks must be adjacent. With `rows` a
+multiple of 32, use a `SpyreTensorLayout` with
+`device_size=[trips, rows // 32, 32]` and `stride_map=[rows, 32, 1]`. A default
+interleaved layout such as `[rows // 32, trips, 32]` inserts other trips between
+the row's sticks and is unsupported when both outer axes have extent greater
+than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
+code generation; it previously could produce incorrect rows without an error.
+
+Partial scatter carries deliberately have no `LoopCarryRecord`: that record
+opts full-buffer accumulators into LX residency. Scatter destinations remain
+in HBM, with mutation dependencies preserving their lifetime across iterations,
+including when `LX_PLANNING=1` and `HBM_POOL_PLANNING=1`.
+
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values
 `1`/`true`/`yes` enable it and `0`/`false`/`no` disable it (case-insensitive).

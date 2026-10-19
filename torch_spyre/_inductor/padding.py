@@ -436,6 +436,25 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
     return None
 
 
+def _written_extent(stl: SpyreTensorLayout, write_dep, device_dim: int, sym) -> int:
+    """Number of positions the write covers along ``device_dim``.
+
+    Normally that dim's coordinate is ``sym`` alone, so its extent is the range of
+    ``sym``.  A collapsed factorized dim (for example the contraction dim K of a
+    ``[N, heads, D]`` weight, coordinate ``128*heads + D``) is written by several
+    loop variables together; its extent is the highest coordinate written, plus
+    one.  Those variables' ranges must be used, or the write looks like a slice of
+    the dim.
+    """
+    coord = device_coordinates(stl, write_dep)[device_dim]
+    if len(coord.free_symbols) <= 1:
+        return concretize_expr(write_dep.ranges[sym])
+    last = coord.xreplace(
+        {v: concretize_expr(write_dep.ranges[v]) - 1 for v in coord.free_symbols}
+    )
+    return int(last) + 1
+
+
 def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
     """Return dep's within-stick device coordinate's free symbol against stl,
     or None if it has none (e.g. a symbol-free size-1 stick, or a scalar /
@@ -588,7 +607,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     #
     # TODO: support this by restickifying into a fresh temp buffer sized to a stick
     # multiple, then cloning that buffer into the slice.
-    host_dim_size = concretize_expr(write_dep.ranges[old_sym])
+    host_dim_size = _written_extent(stl, write_dep, device_dim, old_sym)
     if host_dim_size < unpadded_dim_size:
         raise Unsupported(
             f"insert_restickify_padding: sliced output on {op.get_name()} "

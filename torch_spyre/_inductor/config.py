@@ -246,7 +246,9 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # Append one JSON record per co-optimized graph to this file: the symbolic cost
 # objective the solver minimized (per-bundle terms and relayout charges as sympy
 # ``srepr`` strings), the symbol values the solve chose, and each term evaluated
-# under them. Read by the summarize-sdsc skill. Empty = off.
+# under them, plus any terms the engine adds outside the expression and the
+# total it minimized (see ``cost_expr_record``). Read by the summarize-sdsc
+# skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.
@@ -395,9 +397,9 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 #
 # Under the SA co-optimizer, anything the apply refuses raises rather than
 # falling back, so any gap between what the search believes it may tile and
-# what ``coarse_tile`` accepts is a compile failure. And nothing yet prices the
-# loop cost above the split cap, so the search has no downward pressure on the
-# tiling axis and takes as much of it as the divisor lattice offers.
+# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
+# search sees is only part of what ``predict_ops`` charges a real tiling, so it
+# is not yet a calibrated brake on the tiling axis.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out

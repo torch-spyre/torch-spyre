@@ -41,6 +41,7 @@ test_suite_config:
             - TestOps::test_reduction_with_to_dtype.*
             - TestOps::test_float32_to_int_(truncates|saturates).*
             - TestOps::test_gather_staggered_index_lane0.*
+            - TestOps::test_trunc_.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported

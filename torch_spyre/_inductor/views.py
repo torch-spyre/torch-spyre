@@ -416,6 +416,13 @@ def compute_coordinates(
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.xreplace({var: 1})
         limit = term.xreplace({var: range_val})
+        if sympy.sympify(step).is_positive and term == var * step:
+            # A positive linear term reaches step * (range_val - 1), not
+            # step * range_val. Keep an exclusive upper bound for add_term's
+            # strict comparisons so a value exactly at a boundary still
+            # produces the required modulo and carry. Other expressions keep
+            # the existing bound; their last value need not be their maximum.
+            limit = step * (range_val - 1) + 1
 
         add_term(var=var, step=step, limit=limit)
 
@@ -686,11 +693,29 @@ def normalize_coordinates(
             inner.num = sympy.S.One
             if len(split_dim_terms) == 1:
                 if inner.dim_size % stride != 0:
-                    raise Unsupported(
-                        f"strided coordinate {coordinate} walks a dim of size "
-                        f"{dim_size} in steps of {stride}, which does not divide it"
-                    )
-                inner.dim_size //= stride
+                    # An incomplete final group is addressable on the outermost
+                    # physical axis: rounding its descriptive extent does not
+                    # change any enclosing stride. Keep the iteration count
+                    # unchanged, and prove that every selected coordinate is
+                    # inside the original allocation before adding the gap.
+                    count = var_ranges.get(inner.var)
+                    start = stride * inner.offset + residual_offset
+                    if not (
+                        all(s == 1 for s in size[:dim_idx])
+                        and count is not None
+                        and sympy.sympify(count).is_Integer
+                        and count > 0
+                        and coordinate == stride * inner.var + start
+                        and start >= 0
+                        and start + stride * (count - 1) < dim_size
+                    ):
+                        raise Unsupported(
+                            f"strided coordinate {coordinate} walks a dim of size "
+                            f"{dim_size} in steps of {stride}, which does not divide it"
+                        )
+                    inner.dim_size = (inner.dim_size + stride - 1) // stride
+                else:
+                    inner.dim_size //= stride
             var = synthetic_var_fn()
             var_ranges[var] = 1
             terms.append(
