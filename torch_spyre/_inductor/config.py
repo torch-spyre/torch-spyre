@@ -325,12 +325,17 @@ layout_solver: Literal[
 # unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
 allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
 
-# Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
-# objective or to each phase of the fallback lexicographic objective, not the
-# whole compilation. A timeout can return a feasible plan without proving
-# optimality; without an incumbent it raises SolveError and scratchpad_planning
-# falls back to greedy placement. Override for difficult graphs; 0 disables
-# the limit.
+# Wall-clock budget for one CP-SAT solve, in seconds, not for the whole pass.
+# The co-optimizing allocator passes a cost expression (unless
+# AUTO_COARSE_TILING is on), which is minimized in a single solve
+# (CpSatLayoutSolver._minimize_cost_expr). Without one, or when it cannot be
+# lowered, CpSatLayoutSolver._run solves a lexicographic ladder instead
+# (residency, cut count, parallelism, division shape, tile count). Each stage
+# that runs gets the full budget, so a graph that times out in every stage takes
+# a multiple of it. A solve that times out with an incumbent returns that
+# feasible but unproven plan and logs a warning; one without an incumbent raises
+# SolveError, and scratchpad_planning falls back to greedy placement. Raise it
+# for graphs that warn or fall back; 0 disables it.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )

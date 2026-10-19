@@ -281,8 +281,7 @@ def _pin_op(name, reads=(), target=None, write_offset=0):
     layout = None
     if target is not None:
         layout = mock.MagicMock(spec=MutationLayoutSHOULDREMOVE)
-        layout.target = mock.MagicMock()
-        layout.target.get_name.return_value = target
+        layout.get_buffer.return_value.get_name.return_value = target
     rw = SimpleNamespace(
         reads=[_pin_dep(r) for r in reads], writes=[_pin_dep(name, write_offset)]
     )
