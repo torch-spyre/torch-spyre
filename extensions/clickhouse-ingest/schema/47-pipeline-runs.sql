@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS pipeline_runs
     repo              LowCardinality(String) DEFAULT '',
     pr_number         UInt32 DEFAULT 0,
     sha               String DEFAULT '',
+    -- JSON array of the Test-With companions this run honored ({host, owner, repo, pr, state, sha, ...});
+    -- '' when it had none. Internal: full PR refs on both hosts, so never surface it on a public page.
+    test_with         String DEFAULT '',
 
     -- component-build: the component it built. arches: canonical names (x86_64, ppc64le, s390x),
     -- the targets of an orchestrator or the platforms of one build.

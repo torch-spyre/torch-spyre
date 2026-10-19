@@ -176,6 +176,27 @@ def _serialize_value(v):
         return repr(v)
 
 
+def _has_int32_operands(*operands: RValue) -> bool:
+    """Whether the operands are loaded IEEE_INT32 tensors.
+
+    The add/mul lowerings apply default type promotion, so int32 never meets
+    another format here; a mix means that invariant was broken upstream.
+    """
+    kinds = [
+        x.layout.device_layout.device_dtype if isinstance(x, TensorAccess) else None
+        for x in operands
+    ]
+    if DataFormats.IEEE_INT32 not in kinds:
+        return False
+    if any(kind != DataFormats.IEEE_INT32 for kind in kinds):
+        described = [
+            str(kind) if kind is not None else f"non-tensor {type(x).__name__}"
+            for kind, x in zip(kinds, operands)
+        ]
+        raise Unsupported(f"IEEE_INT32 operand mixed with other operands: {described}")
+    return True
+
+
 class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -189,6 +210,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def add(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("addi32toi32", [a, b])
         return PointwiseOp("add", [a, b])
 
     @staticmethod
@@ -255,6 +278,13 @@ class SpyreOpFuncs:
         return PointwiseOp("mul", [x, y])
 
     @staticmethod
+    def logical_or(x, y):
+        # Upstream Inductor's logical_or lowering casts operands to 0/1 bool
+        # (convert_input_to_bool=True), and on 0/1 values maximum(a, b) == a OR b.
+        # This mirrors logical_and above, which uses mul for the same reason.
+        return PointwiseOp("maximum", [x, y])
+
+    @staticmethod
     def lt(a, b):
         return PointwiseOp("lesserthan", [a, b])
 
@@ -268,6 +298,8 @@ class SpyreOpFuncs:
 
     @staticmethod
     def mul(a, b):
+        if _has_int32_operands(a, b):
+            return PointwiseOp("muli32toi32", [a, b])
         return PointwiseOp("mul", [a, b])
 
     @staticmethod
@@ -276,6 +308,9 @@ class SpyreOpFuncs:
 
     @staticmethod
     def neg(a):
+        # NOTE (follow-up): int64 neg has the same fp32 round-trip limitation as
+        # sub (see lower_sub); it could be expressed as mul by -1 on the native
+        # muli32toi32 path together with the sub rewrite.
         return PointwiseOp("neg", [a])
 
     @staticmethod
@@ -331,7 +366,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def square(x):
-        return PointwiseOp("mul", [x, x])
+        return SpyreOpFuncs.mul(x, x)
 
     @staticmethod
     def sub(a, b):
@@ -878,7 +913,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         return tensor_arg
 
     def _check_indirect_index_step(self, idx_arg: TensorArg) -> None:
-        """Refuse an indirect index whose per-trip advance is sub-stick.
+        """Require aligned starts and adjacent sticks in counted-loop index rows.
 
         Scoped to indirect index operands: their per-trip start must remain
         stick-aligned. Reuses ``coeff_through_floor`` on
@@ -894,6 +929,25 @@ class SpyreKernel(Kernel[CSEVariable]):
         expr = idx_arg.device_tile_advance_expr
         if expr is None:
             return
+        # The indirect row walker advances through adjacent physical sticks.
+        # An interleaved trip/batch axis between the row's outer-stick and
+        # inner-stick axes introduces a gap that the walker does not encode.
+        coords = idx_arg.device_coordinates
+        if coords:
+            for axis, coord in enumerate(coords[:-1]):
+                for symbol in coord.free_symbols & coords[-1].free_symbols:
+                    if any(
+                        size != 1 and symbol not in middle.free_symbols
+                        for size, middle in zip(
+                            idx_arg.device_size[axis + 1 : -1],
+                            coords[axis + 1 : -1],
+                        )
+                    ):
+                        raise Unsupported(
+                            "counted-loop indirect index rows require adjacent "
+                            "physical sticks; put the trip/batch axes outside "
+                            "all index-row axes in SpyreTensorLayout"
+                        )
         # Read the index's committed device format rather than assuming int32
         # (same query as pass_utils' dev_layout.device_dtype.elems_per_stick()).
         elems_per_stick = idx_arg.device_dtype.elems_per_stick()
@@ -962,7 +1016,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # op's own iteration space entirely (no d{i} symbol survives), so it
         # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
         # only advance via squeezed_advance_per_read/squeezed_advance_output
-        # (see coarse_tile.py's _insert_all_read_copy_ops, the "d not in
+        # (see coarse_tile.py's _insert_copy_op, the "d not in
         # squeeze_pos" branch). _general_tile_advance already mints/uses a
         # level symbol from squeezed_advance_per_level regardless of
         # loop_tiled_dims, so has_any_tiled_dim must check the same fields —

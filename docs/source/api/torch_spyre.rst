@@ -787,25 +787,17 @@ Environment Variables
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
-   * - ``TORCH_SPYRE_NATIVE_PACKER``
-     - Use the C++ permutation-layout packer accelerator in the
-       simulated-annealing layout solver (default ``1``; set ``0`` to force
-       the pure-Python packer). No effect unless
-       ``LAYOUT_SOLVER=simulated_annealing``.
-       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
-   * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
-       work-division hints, hint-based working-set reduction, and
-       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
+     - Ignore ``spyre_hint(work_div={...})`` work-division hints and use
+       the automatic work-distribution planner (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
-     - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
-       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
-       span-overflow coarse tiling.
+     - Ignore the compiler-generated span-overflow coarse-tiling hints.
+       Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
+       automatic span-overflow coarse tiling.
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -845,8 +837,9 @@ Environment Variables
        leaves the graph unchanged (default ``1``; set ``0`` to disable)
    * - ``SPYRE_DUMP_COST_EXPR_FILE``
      - Append one JSON record per co-optimized graph with the symbolic cost
-       objective the solver minimizes, the chosen symbol values, and each
-       term evaluated under them (default empty)
+       objective, the chosen symbol values, each term evaluated under them,
+       the terms the solver adds outside the expression, and the total it
+       minimized (default empty)
    * - ``SPYRE_DUMP_COST_FILE``
      - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
        stderr (default empty)
@@ -863,6 +856,13 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``1``; set ``0`` to disable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
      - CPUs CP-SAT uses to size its search worker pool (config
        ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When

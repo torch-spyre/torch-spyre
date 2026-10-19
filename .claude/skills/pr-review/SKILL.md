@@ -106,7 +106,7 @@ Ensure tests cover the affected path(s).
 - Tests use `ParameterizedTestMeta` for parameterized cases
 - Building-block tests for module-level changes
 
-**Test expectations** (the "Test Invariants" section of `CLAUDE.md`). For any PR that
+**Test expectations** (the "Test Invariants" section of `AGENTS.md`). For any PR that
 adds, changes or removes an `xfail`, `skip`, `expect_*` key or `pytest.raises` in a test:
 
 - No `pytest.xfail(...)` in a test body or helper, and no `try`/`except` that turns an

@@ -812,6 +812,24 @@ def _insert_mutation_relayout_copy(
     operations.remove(buf_copyback)
     operations.insert(mutation_op_index + 2, buf_copyback)
 
+    # A loop-carried destination changes on every trip, even though its base
+    # address is fixed. Both full-buffer copies must stay inside the scatter's
+    # loop so other carry readers observe the preceding iteration's updates.
+    loop_info = getattr(mutation_op, "loop_info", None)
+    if loop_info is not None:
+        from .loop_info import CoarseTileInfo
+
+        for copy_op in (buf_tmp, buf_copyback):
+            depth = len(loop_info.loop_count)
+            copy_op.loop_info = CoarseTileInfo(
+                loop_group_id=loop_info.loop_group_id,
+                loop_count=list(loop_info.loop_count),
+                loop_tiled_dims=[[] for _ in range(depth)],
+                loop_tiled_reduction_dims=[[] for _ in range(depth)],
+                tiled_dims_per_read=[[[] for _ in range(depth)]],
+                output_tiled_dims=[[] for _ in range(depth)],
+            )
+
     logger.info(
         "nonstick_dim_order: inserted mutation relayout copy for %s "
         "(copy-in %s -> %s, copy-back %s -> %s)",
