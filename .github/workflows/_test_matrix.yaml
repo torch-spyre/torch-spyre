@@ -1244,6 +1244,8 @@ jobs:
             config: distributed_tests/test_kv_offload.yaml
           - name: Test Multi-Spyre SharedHostPool
             config: distributed_tests/test_shared_host_pool.yaml
+          - name: Test Multi-Spyre AllToAll Compiled
+            config: distributed_tests/test_alltoall_compiled.yaml
           - name: Test Multi-Spyre Profiler Coll Metadata
             config: distributed_tests/test_profiler_coll_metadata.yaml
 
