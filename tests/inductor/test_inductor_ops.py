@@ -1986,6 +1986,87 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # (x, bins, min, max), all 1-D. The MoE router case is int32 expert ids with
+        # min=0, max=bins-1 (gemma-4-26B-A4B: 24 tokens x top-8 = 192 ids, 128
+        # experts).
+        ("test_histc", "test_histc_cpu"): {
+            "param_sets": {
+                "int32_gemma_192_sorted": (
+                    torch.randint(0, 128, (192,), dtype=torch.int32).sort().values,
+                    128,
+                    0,
+                    127,
+                ),
+                # One decode token: a partial stick.
+                "int32_decode_8": (
+                    torch.randint(0, 128, (8,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # Off the 64-element boundary, with ids >= bins (expert-parallel
+                # sentinels) that histc must drop.
+                "int32_65_with_sentinels": (
+                    torch.randint(0, 136, (65,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # One bin past 1024 (beyond exact 16-bit counting), at value == max.
+                "int32_4096_all_in_last_bin": (
+                    torch.full((4096,), 127, dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # The general rule for integers: several values per bin, and
+                # values below min and above max.
+                "int32_range_0_50": (
+                    torch.randint(-5, 60, (192,), dtype=torch.int32),
+                    10,
+                    0,
+                    50,
+                ),
+                # Every bin edge, one float step either side of it, NaN and +-inf.
+                "fp32_edges_nan_inf": (
+                    torch.cat(
+                        [
+                            torch.linspace(0, 1, 11),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(2.0)),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(-2.0)),
+                            torch.tensor([float("nan"), float("inf"), -float("inf")]),
+                        ]
+                    ),
+                    10,
+                    0,
+                    1,
+                ),
+                # min == max: the data's own range.
+                "fp32_auto_range": (torch.randn((256,)), 20, 0, 0),
+                # topk indices are int64 in most router code.
+                "int64_192": (
+                    torch.randint(0, 128, (192,), dtype=torch.int64),
+                    128,
+                    0,
+                    127,
+                ),
+                "int32_bins_2048": (
+                    torch.randint(0, 2048, (512,), dtype=torch.int32),
+                    2048,
+                    0,
+                    2047,
+                ),
+                "2d_input": (torch.rand((4, 64)), 10, 0, 1),
+                # TODO: fp16 needs fp16 <-> fp32 conversions of every length on
+                # device (#3999, #5361, #4714); when they land this becomes a
+                # positive case.
+                "fp16_input": (torch.rand((192,)).to(torch.float16), 10, 0, 1),
+            },
+            "expect_raise": {
+                "2d_input": "histc: only 1-D input is supported",
+                "fp16_input": "histc: float16 input is not supported yet",
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -9189,6 +9270,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # aten::topk is not registered for Spyre eager dispatch.
         self.compare_with_cpu(
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
+        )
+
+    def test_histc_cpu(self, x, bins: int, min: float, max: float):
+        # CPU histc has no integer kernel, so the reference counts the fp32 copy
+        # and is cast back; counts are whole numbers, so the comparison is exact.
+        ref = torch.histc(x.float(), bins=bins, min=min, max=max).to(x.dtype)
+        self.compare_with_cpu(
+            lambda x: torch.histc(x, bins=bins, min=min, max=max),
+            x,
+            atol=0,
+            rtol=0,
+            cpu_eager_result=ref,
+            cpu_compile=False,
         )
 
     @expects_raise

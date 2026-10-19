@@ -88,6 +88,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
 | `torch.min` | | Y | Spyre | `min.dim` via custom decomposition; eager `aten::min.dim_min` is not yet supported; int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
+| `torch.histc` | Y | Y | Spyre | 1-D int32, int64 or float32 input, any `bins`/`min`/`max` (`min == max` uses the data's range); counts have the input's dtype. Custom decomposition (torch's bin rule in fp32) + `spyre::histc_count` lowering (compare table, fp32 restickify). Time grows with N x bins: fast for short inputs at any bin count, slower than the CPU for long inputs with many bins (N=8192, bins=1024: 1.36 ms vs 0.29 ms). N-D and float16 input raise `Unsupported` |
 | `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
