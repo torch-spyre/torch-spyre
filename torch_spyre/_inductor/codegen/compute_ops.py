@@ -1836,7 +1836,6 @@ def generate_sdsc(
                 # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
                 **(
                     {
-                        "dimToSymbolMappingOpcodeCorrection_": {},
                         "inputSymbolsAndTags_": {
                             str(sym_id): pytorch_sym
                             for pytorch_sym, sym_id in dim_local_symbols.items()
