@@ -5004,7 +5004,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # int32 accumulates as int64, computed in float32.
                 "2d_int32": (cached_randint((4, 64), dtype=torch.int32), -1),
                 # A bool input accumulates as int64, the prefix count
-                # masked_scatter takes over its row mask.
+                # masked_scatter takes over its row mask. It runs on the host
+                # for now (see cumsum_decomp).
                 "1d_bool": (
                     torch.tensor(
                         [True, False, True, True, False, False, True, True] * 4
@@ -5022,7 +5023,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_fp32_substick": (cached_randn((64, 8), dtype=torch.float32), -1),
             },
             "expect_raise": {
-                "1d_bool_substick": "narrower than one stick",
                 "2d_fp32_substick": "narrower than one stick",
             },
         },

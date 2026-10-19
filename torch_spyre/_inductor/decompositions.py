@@ -4485,9 +4485,9 @@ def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
     ``out[.., i] = sum(v[.., j] for j <= i)`` is a contraction with
     ``M[j][i] = 1 if j <= i``, so the prefix sum needs no scan primitive and the
     accumulation lands in the matmul. Served along the last dim of a 1-D or 2-D
-    operand; everything else declines to the host fallback (see
-    ``_triangular_decomp``). An integral input, ``bool`` included, accumulates
-    as ``int64``, as aten's does, computed in the result type's compute type.
+    operand; everything else, a ``bool`` input included, declines to the host
+    fallback (see ``_triangular_decomp``). An integral input accumulates as
+    ``int64``, as aten's does, computed in the result type's compute type.
 
     An exact mask does not make the result exact: the matmul accumulates in
     DLFloat16, so a row sum past 1024 rounds, which bounds what a test may
@@ -4497,7 +4497,12 @@ def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
     TODO: serve a leading-dimension ``dim`` by transposing into the last one.
     TODO: serve rank > 2, untested.
     """
-    # aten accumulates an integral input, bool included, as int64.
+    # TODO: serve a bool input. A bool stored in the float16 format converts to
+    # a staggered float32, which the float32 contraction combines with the
+    # standard mask without refusing it, giving wrong sums.
+    if self.dtype == torch.bool:
+        return NotImplemented
+    # aten accumulates an integral input as int64.
     if dtype is not None:
         out_dtype = dtype
     elif self.dtype.is_floating_point:
