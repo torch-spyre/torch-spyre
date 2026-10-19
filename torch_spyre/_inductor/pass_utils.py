@@ -104,24 +104,32 @@ def register_operation_after_graph_edit(graph: GraphLowering, op: Operation) -> 
     same name.  The scheduler subsequently resolves a dependency to the wrong
     producer (or to one that occurs later) and fails while computing ancestors.
 
-    Keep upstream's naming convention, but find the first name that is not
-    currently registered.  Most removals keep the removed op in ``name_to_op``,
-    but ``dedup_and_promote_constants`` drops it, so its name can be reissued.
+    Keep upstream's naming convention, but find the first name that was never
+    issued during this compile.  Checking ``name_to_op`` alone is insufficient:
+    ``dedup_and_promote_constants`` pops a merged constant's entry, so its name
+    appears free even though a live op still carries it.  ``_unique_operation_names``
+    stamps ``_spyre_issued_op_names`` on the graph before the first registration;
+    that set accumulates every name ever handed out and is never modified by
+    graph-pruning passes, so freed names cannot be reissued.
+
     Scratchpad edits use this helper because they run late in the lowering
     pipeline, after graph-pruning passes.
     """
     assert op.operation_name is None, f"Operation registered twice: {op}"
 
+    issued = getattr(graph, "_spyre_issued_op_names", graph.name_to_op)
     index = len(graph.operations)
     while True:
         name = graph.qualify_name(f"op{index}")
-        if name not in graph.name_to_op:
+        if name not in issued:
             break
         index += 1
 
     graph.operations.append(op)
     graph.name_to_op[name] = op
     op.operation_name = name
+    if issued is not graph.name_to_op:
+        issued.add(name)
     return name
 
 
