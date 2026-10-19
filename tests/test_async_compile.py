@@ -95,6 +95,23 @@ def test_loop_unroll_environment_and_cache_key(monkeypatch, value, expected):
         assert resolved != kernel_cache.compute_specs_hash(
             [], backend_loop_unroll=not expected
         )
+        if value is None:
+            # Cover the other resolved backend config in this existing cache
+            # test: default and equivalent spellings reuse, a changed split
+            # invalidates even an identical OpSpec tree.
+            monkeypatch.delenv("DXP_LX_FRAC_AVAIL", raising=False)
+            default_fraction = _load_config(monkeypatch).dxp_lx_frac_avail
+            default_key = kernel_cache.compute_specs_hash(
+                [], backend_lx_fraction=default_fraction
+            )
+            monkeypatch.setenv("DXP_LX_FRAC_AVAIL", "0.20")
+            equivalent_fraction = _load_config(monkeypatch).dxp_lx_frac_avail
+            with spyre_config.patch(dxp_lx_frac_avail=equivalent_fraction):
+                assert kernel_cache.compute_specs_hash([]) == default_key
+            monkeypatch.setenv("DXP_LX_FRAC_AVAIL", "0.3")
+            changed_fraction = _load_config(monkeypatch).dxp_lx_frac_avail
+            with spyre_config.patch(dxp_lx_frac_avail=changed_fraction):
+                assert kernel_cache.compute_specs_hash([]) != default_key
 
 
 @pytest.mark.parametrize("value", ["", "2", "invalid"])
@@ -142,7 +159,13 @@ def test_single_worker_compiles_inline_without_starting_pool(unroll):
     wait_ready.assert_not_called()
     pool.assert_not_called()
     compile_backend.assert_called_once_with(
-        "sdsc_0", "/tmp/kernel", dict(os.environ), unroll
+        "sdsc_0",
+        "/tmp/kernel",
+        dict(
+            os.environ,
+            DXP_LX_FRAC_AVAIL=str(float(spyre_config.dxp_lx_frac_avail) + 0.0),
+        ),
+        unroll,
     )
 
 
@@ -217,11 +240,18 @@ def test_async_cache_commit_is_deferred_until_wait():
     def generate_bundle(*args, **kwargs):
         # Changing config after hashing must not change the submitted setting.
         spyre_config.backend_loop_unroll = True
+        spyre_config.dxp_lx_frac_avail = 0.2
         return fake_symbol_kinds
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"spyre_kernel_cache": True, "backend_loop_unroll": False}),
+        spyre_config.patch(
+            {
+                "spyre_kernel_cache": True,
+                "backend_loop_unroll": False,
+                "dxp_lx_frac_avail": 0.3,
+            }
+        ),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -245,6 +275,8 @@ def test_async_cache_commit_is_deferred_until_wait():
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
         assert hash_specs.call_args.kwargs["backend_loop_unroll"] is False
+        assert hash_specs.call_args.kwargs["backend_lx_fraction"] == 0.3
+        assert pool.calls[0][1][-2]["DXP_LX_FRAC_AVAIL"] == "0.3"
         assert pool.calls[0][1][-1] is False
         commit.assert_not_called()
 

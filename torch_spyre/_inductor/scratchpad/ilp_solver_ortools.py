@@ -61,11 +61,18 @@ constraint model over :class:`CoreDivisionBuffer`s:
   reduce its core count. Op shape is not yet visible to the solver, so this is a
   proxy for balance rather than a full cost model.
 
-After the solve, ``_justify`` slides each in-place-merged placement unit down to
-the lowest free address, squeezing out float gaps the search leaves. It coarsens
-a merged unit to one rectangle over the union of its members' lifetimes, which is
-conservative enough that the squeeze can occasionally need more room than the
-solver's own answer; when it would not fit, the solver's offsets are kept.
+After the solve, ``_extract`` places the resident buffers again, from the
+residency and divisions alone. The objective does not price where a buffer sits
+or which in-place merges fire, so the multi-worker search returns other offsets
+and other merges from run to run. The frontend packs within its fixed LX
+reservation; the backend protects that entire prefix in every phase. To make
+placement stable, ``_extract`` takes every in-place merge the solved divisions allow (``merge_allowed``, settled in a fixed order by
+``_settle_handoffs``), and ``_justify`` packs the placement units at the lowest
+free addresses, the longest-lived first. It coarsens a merged unit to one
+rectangle over the union of its members' lifetimes, which is conservative
+enough that the packing can occasionally need more room than the solver's own
+answer. It then logs a warning and keeps the solver's merges in the solver's
+stacking order, or the solver's offsets when even that would not fit.
 
 **LX relayouts** ride on the same machinery. The allocator hands the solver one
 ``RelayoutCopyBuffer`` per relayout group (a source and one destination per-core
@@ -103,7 +110,7 @@ from collections import Counter
 import logging
 import math
 import operator
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import cache
@@ -331,6 +338,11 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         is fixed: ``_check_in_place_relationships`` already checks the child
         fits in the parent's slot."""
 
+    def merge_allowed(self, solver: "cp_model.CpSolver", parent) -> bool:
+        """Whether ``constrain_merge`` lets this buffer take over ``parent``'s
+        slot at the solved values (residency is checked by the caller)."""
+        return True
+
     # ------------------------------- extract -------------------------------
     def footprint(self, solver: "cp_model.CpSolver") -> int:
         return self.buffer.size
@@ -540,6 +552,14 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
             self.division,
             edge,
         )
+
+    def merge_allowed(self, solver, parent) -> bool:
+        """``constrain_merge`` at the solved divisions: equal per-core
+        footprints and a division pair from ``cd_parent_matches``."""
+        pair = (solver.Value(parent.division), solver.Value(self.division))
+        return self.footprint(solver) == parent.footprint(solver) and pair in {
+            tuple(p) for p in self.match_pairs(parent.name)
+        }
 
     def footprint(self, solver: "cp_model.CpSolver") -> int:
         t = self.buffer
@@ -2246,6 +2266,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         outgoing: dict[str, list] = {}
         for dst, c in bufs.items():
             for src, edge in c.merge_vars.items():
+                if src not in bufs:
+                    # A foreign parent has no protected lifetime or placement
+                    # in this solve, so its storage cannot be taken over.
+                    model.add(edge == 0)
+                    continue
                 src_v, dst_v = bufs[src], bufs[dst]
                 # active merge => shared base and both endpoints resident
                 model.add(src_v.offset == dst_v.offset).OnlyEnforceIf(edge)
@@ -2396,10 +2421,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffer, whose division was fixed upstream) and, when resident, its LX
         ``address`` (in alignment units, as the solver works them; the caller
         scales to bytes). A spilled buffer gets ``address = None``. When
-        bottom_justify is set, each in-place-merged placement unit is slid down
-        to the lowest free address (preserving merges); if that squeeze cannot
-        keep every unit inside capacity the solver's own offsets are kept, since
-        those are always legal."""
+        bottom_justify is set, every in-place merge the solved divisions allow
+        is taken (``_settle_handoffs``) and the placement units are packed
+        longest-lived first (``_justify``), so the addresses depend on the
+        residency and divisions only. If that packing cannot keep every unit
+        inside capacity, a warning says so and the solver's own merges are
+        squeezed in its stacking order; if that does not fit either, the
+        solver's own offsets are kept, since those are always legal."""
         by_name = {name: sb.buffer for name, sb in bufs.items()}
         spilled = {
             name for name, sb in bufs.items() if not solver.BooleanValue(sb.in_buffer)
@@ -2411,38 +2439,73 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # justify pass slides them with everything else and can never move a
         # buffer into a copy's space.
         if self._bottom_justify:
-            # A placement unit is a connected component of active merge edges: its
+            # A placement unit is a connected component of merge edges: its
             # members share one base (the merge equalities), so the component
             # slides as a single block and in-place reuse is preserved.
             resident = [n for n in by_name if n not in spilled]
-            parent = {n: n for n in resident}
 
-            def find(x: str) -> str:
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
+            def placement_units(merges: list[tuple[str, str]]) -> list[_PlacementUnit]:
+                parent = {n: n for n in resident}
 
-            for dst, c in bufs.items():
-                for src, edge in c.merge_vars.items():
-                    if solver.BooleanValue(edge):
-                        parent[find(src)] = find(dst)
+                def find(x: str) -> str:
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
 
-            components: dict[str, list[str]] = {}
-            for n in resident:
-                components.setdefault(find(n), []).append(n)
+                for src, dst in merges:
+                    parent[find(src)] = find(dst)
 
-            units = [
-                _PlacementUnit(
-                    members=names,
-                    footprint=max(footprint[n] for n in names),
-                    start_time=min(by_name[n].start_time for n in names),
-                    end_time=max(by_name[n].end_time for n in names),
-                    original_offset=solver.Value(bufs[names[0]].offset),
-                )
-                for names in components.values()
+                components: dict[str, list[str]] = {}
+                for n in resident:
+                    components.setdefault(find(n), []).append(n)
+
+                return [
+                    _PlacementUnit(
+                        members=names,
+                        footprint=max(footprint[n] for n in names),
+                        start_time=min(by_name[n].start_time for n in names),
+                        end_time=max(by_name[n].end_time for n in names),
+                        original_offset=solver.Value(bufs[names[0]].offset),
+                    )
+                    for names in components.values()
+                ]
+
+            # The objective is indifferent to which allowed merges fire, so the
+            # search returns an arbitrary subset of them: take them all.
+            allowed = [
+                (src, dst)
+                for dst, c in bufs.items()
+                for src in c.merge_vars
+                if dst not in spilled
+                and src in bufs
+                and src not in spilled
+                and c.merge_allowed(solver, bufs[src])
             ]
+            units = placement_units(_settle_handoffs(allowed, by_name))
             offsets = self._justify(units, self._capacity_units)
+            if offsets is None:
+                solved = [
+                    (src, dst)
+                    for dst, c in bufs.items()
+                    for src, edge in c.merge_vars.items()
+                    if src in resident and dst in resident and solver.BooleanValue(edge)
+                ]
+                offsets = self._justify(
+                    placement_units(solved),
+                    self._capacity_units,
+                    key=lambda u: (u.original_offset, u.start_time),
+                )
+                logger.warning(
+                    "[CP-SAT layout solver] the longest-first LX packing of %d "
+                    "placement units does not fit in %d bytes; keeping the "
+                    "solver's %s, so LX placement depends on this search",
+                    len(units),
+                    self.limit,
+                    "merges in its stacking order"
+                    if offsets is not None
+                    else "offsets",
+                )
 
         if offsets is None:
             offsets = {
@@ -2462,7 +2525,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Read back the relayouts: a consumer whose served literal is set reads
         # its parent from that copy, under the division pair the literal
         # pinned. Recorded on the consumer with the copy's FINAL address (after
-        # the justify slide) for the commit path.
+        # the packing) for the commit path.
         for name, sb in bufs.items():
             for source_name, reads in sb.relayout_reads.items():
                 fired = [copy_w for lit, copy_w in reads if solver.BooleanValue(lit)]
@@ -2489,25 +2552,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     @staticmethod
     def _justify(
-        units: list[_PlacementUnit], capacity: int
+        units: list[_PlacementUnit],
+        capacity: int,
+        key: Optional[Callable[[_PlacementUnit], Any]] = None,
     ) -> Optional[dict[str, int]]:
-        """Slide each placement unit down to the lowest free address. Processing
-        in current-base order and giving each the lowest non-conflicting slot
-        preserves the relative stacking, so it mostly squeezes out the float gaps
-        the search leaves. Returns a name -> address map, or ``None`` if the
-        result would not fit in ``capacity``.
+        """Give each placement unit, in ``key`` order, the lowest free address.
+        Returns a name -> address map, or ``None`` if the result would not fit in
+        ``capacity``.
+
+        Without ``key`` the longest-lived units go first
+        (``_longest_lived_first``). Placing long-lived units at the bottom leaves
+        the upper addresses reusable by shorter-lived units and makes equal
+        residency/division choices pack consistently. The fallback in ``_extract`` passes the
+        solver's stacking order instead (current base first), which keeps the
+        relative stacking and only squeezes out the float gaps the search
+        leaves.
 
         A merged unit is coarsened to one rectangle spanning the union of its
         members' lifetimes at their largest footprint, which is conservative: it
         can make two units conflict here that did not conflict in the model, and
         the bump that resolves that conflict can push a unit's top past capacity.
-        The caller then keeps the solver's own offsets, which the model
-        constrained to fit. Returning ``None`` rather than clamping keeps this a
-        pure optimisation -- it never decides residency, and never hands back an
-        address outside the scratchpad."""
+        (In the joint model a merge needs equal per-core footprints, so there
+        the rectangle is exact.) Returning ``None`` rather than clamping keeps
+        this a pure optimisation -- it never decides residency, and never hands
+        back an address outside the scratchpad."""
         placed: list[_PlacementUnit] = []
         offsets = {}
-        for u in sorted(units, key=lambda u: (u.original_offset, u.start_time)):
+        for u in sorted(units, key=key or _longest_lived_first):
             # lowest base whose [base, base+footprint) clears every already-placed
             # unit that overlaps this one in time. We don't need to worry about
             # tied offsets because blocks cannot have the same offset and also
@@ -2530,3 +2601,35 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for n in u.members:
                 offsets[n] = base
         return offsets
+
+
+def _longest_lived_first(u: _PlacementUnit) -> tuple[int, int, int, str]:
+    """``_justify``'s packing order: the longest lifetime first, then the
+    earlier start, the larger footprint and the name. It reads the graph only,
+    never the offsets the search returned, so equal plans pack the same."""
+    return (u.start_time - u.end_time, u.start_time, -u.footprint, min(u.members))
+
+
+def _settle_handoffs(
+    allowed: list[tuple[str, str]], buffers: dict[str, LifetimeBoundBuffer]
+) -> list[tuple[str, str]]:
+    """The in-place merges to apply, from the ``allowed`` (parent, child) edges.
+
+    A slot is handed off once, as in the in-place relaxation: at most one merge
+    into a buffer and one out of it. The edges are taken oldest parent first,
+    then oldest child, then by name, so the choice follows from the graph alone.
+    Two parents a child may take over both die at its first tick, so the one
+    that started first has held its slot the longest, and the child extends its
+    chain."""
+    taken: list[tuple[str, str]] = []
+    merged_into: set[str] = set()
+    handed_off: set[str] = set()
+    for src, dst in sorted(
+        (edge for edge in allowed if edge[0] in buffers and edge[1] in buffers),
+        key=lambda e: (buffers[e[0]].start_time, buffers[e[1]].start_time, e),
+    ):
+        if dst not in merged_into and src not in handed_off:
+            taken.append((src, dst))
+            merged_into.add(dst)
+            handed_off.add(src)
+    return taken

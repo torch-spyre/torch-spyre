@@ -418,6 +418,7 @@ class SpyreAsyncCompile(AsyncCompile):
         compile_dir: str,
         *,
         backend_loop_unroll: bool | None = None,
+        backend_lx_fraction: float | None = None,
     ) -> Future[str] | None:
         """Submit the backend compile to Inductor's pool, or compile inline."""
         # Everything before this call is frontend work and _run_backend_compiler
@@ -429,6 +430,13 @@ class SpyreAsyncCompile(AsyncCompile):
         )
         if backend_loop_unroll is None:
             backend_loop_unroll = _spyre_config.backend_loop_unroll
+        if backend_lx_fraction is None:
+            backend_lx_fraction = _spyre_config.dxp_lx_frac_avail
+        # Use the same resolved share as planning and cache identity, including
+        # config.patch overrides. Workers must not pick up a later environment
+        # change after the key was computed.
+        env = dict(os.environ)
+        env["DXP_LX_FRAC_AVAIL"] = str(float(backend_lx_fraction) + 0.0)
         if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
@@ -439,14 +447,12 @@ class SpyreAsyncCompile(AsyncCompile):
                     _run_backend_compiler,
                     kernel_name,
                     compile_dir,
-                    dict(os.environ),
+                    env,
                     backend_loop_unroll,
                 )
 
         with timing_recorder.stage(_BACKEND_STAGE, kernel=kernel_name, tool="dbo-opt"):
-            _run_backend_compiler(
-                kernel_name, compile_dir, dict(os.environ), backend_loop_unroll
-            )
+            _run_backend_compiler(kernel_name, compile_dir, env, backend_loop_unroll)
         return None
 
     def _compile_future(
@@ -511,6 +517,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # Keep cache identity and the worker's compiler argument on the same
         # config snapshot, including overrides made with config.patch.
         backend_loop_unroll = _spyre_config.backend_loop_unroll
+        backend_lx_fraction = _spyre_config.dxp_lx_frac_avail
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches
@@ -532,6 +539,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     kernel_name=kernel_name,
                     pool_size=pool_size,
                     backend_loop_unroll=backend_loop_unroll,
+                    backend_lx_fraction=backend_lx_fraction,
                 )
             except RuntimeError as e:
                 logger.warning(
@@ -572,6 +580,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_name,
                         compile_dir,
                         backend_loop_unroll=backend_loop_unroll,
+                        backend_lx_fraction=backend_lx_fraction,
                     )
                     if task is not None:
                         return self._compile_future(
@@ -601,7 +610,10 @@ class SpyreAsyncCompile(AsyncCompile):
         if _spyre_config.frontend_only:
             return _skip_backend(kernel_name, output_dir, "dbo-opt")
         task = self._submit_backend_compile(
-            kernel_name, output_dir, backend_loop_unroll=backend_loop_unroll
+            kernel_name,
+            output_dir,
+            backend_loop_unroll=backend_loop_unroll,
+            backend_lx_fraction=backend_lx_fraction,
         )
         if task is not None:
             return self._compile_future(

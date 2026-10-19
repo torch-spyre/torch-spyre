@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import sympy
+import pytest
 from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
@@ -2870,3 +2871,73 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+@pytest.mark.skipif(not _HAS_ORTOOLS, reason="ortools not installed")
+@pytest.mark.parametrize("case", ["matched_asymmetric", "unmatched", "unequal_span"])
+def test_packing_respects_asymmetric_handoff_contract(case):
+    """Packing may merge only the solved ownership pair and equal spans."""
+    harness = TestCpSatJointDivision()
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _settle_handoffs
+
+    local = harness.make_buffer("local", 100, [0, 5], first_use_is_read=True)
+    assert (
+        _settle_handoffs(
+            [("external", "local"), ("local", "external")], {"local": local}
+        )
+        == []
+    )
+    if case == "matched_asymmetric":
+        x = CoreDivisionBuffer(
+            "x", 100, [0, 5], core_divisions=_whole(), first_use_is_read=True
+        )
+        r = CoreDivisionBuffer(
+            "r",
+            100,
+            [5, 9],
+            core_divisions=[CoreDivision(splits={"x": 2}), CoreDivision()],
+            parents=["x"],
+            in_place_parents=["x", "external"],
+            cd_parent_matches={"x": [(0, 1)]},
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [9],
+            core_divisions=_whole(),
+            parents=["r"],
+            cd_parent_matches={"r": [(1, 0)]},
+        )
+        from copy import deepcopy
+
+        reversed_inputs = deepcopy([sink, r, x])
+        res = {
+            b.name: b
+            for b in harness.solver_class(
+                [x, r, sink], size=1000, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        reversed_res = {
+            b.name: b.address
+            for b in harness.solver_class(
+                reversed_inputs, size=1000, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        assert reversed_res == {name: b.address for name, b in res.items()}
+        assert res["x"].chosen_division == 0
+        assert res["r"].chosen_division == 1
+        assert res["x"].address is not None
+        assert res["r"].address == res["x"].address
+        return
+    x = harness.make_buffer("x", 100, [0, 5], first_use_is_read=True)
+    r = harness.make_buffer(
+        "r",
+        50 if case == "unequal_span" else 100,
+        [5, 9],
+        in_place_parents=["x"],
+    )
+    r.cd_parent_matches["x"] = [] if case == "unmatched" else [(0, 0)]
+    res = {b.name: b for b in harness.solve([x, r], size=1000)}
+    assert res["x"].address is not None
+    assert res["r"].address is not None
+    assert res["r"].address != res["x"].address

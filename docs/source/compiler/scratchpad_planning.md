@@ -555,6 +555,16 @@ guard runs exactly as PR3683 shipped it and the new pass is never registered. It
 either/or, not a partial toggle, so old and new behavior stay directly comparable while the new
 mechanism earns trust in production; removing the guard entirely is a follow-up once it does.
 
+## Stable LX placement after solving
+
+After the CP-SAT solve, the engine takes the in-place merges permitted by the
+solved divisions and packs resident buffers at the lowest free addresses,
+longest-lived first. Fixed tie-breaks make placement depend on the residency,
+divisions and graph, rather than the solver's arbitrary offsets and merges.
+If that packing does not fit, it logs a warning and falls back to the solver's
+merges in their stacking order, or to its original offsets. Residency,
+divisions and relayout choices remain unchanged.
+
 ## Current limitations
 
 ### Greedy single-pass, no lookahead (default solver)
