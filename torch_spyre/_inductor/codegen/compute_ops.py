@@ -1563,11 +1563,6 @@ def generate_sdsc(
                                 # the future, key by (i, tensor.layout) instead.
                                 for i, tensor in enumerate(sdsc_spec.args)
                             },
-                            **(
-                                {"pdsRelation_": {"isPdsReuse": 1}}
-                                if sdsc_spec.pds_reuse
-                                else {}
-                            ),
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
