@@ -1694,7 +1694,6 @@ def generate_sdsc(
                                         "dataFormat_": sdsc_spec.data_format.name,
                                         "fidelity_": "regular",
                                     },
-                                    "location": "Inner",
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
