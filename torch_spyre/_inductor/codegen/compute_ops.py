@@ -1340,12 +1340,10 @@ def generate_sdsc(
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
         }
-        # dsOffset / allocateNode_ are part of the forward-conv (#3284) and
-        # general memOrg contract; depthwise conv (#3510) intentionally omits
-        # them. Restore them for every non-depthwise op so forward conv2d
-        # matches its golden SDSC.
+        # allocateNode_ is part of the forward-conv (#3284) and general memOrg
+        # contract; depthwise conv (#3510) intentionally omits it. Restore it
+        # for every non-depthwise op so forward conv2d matches its golden SDSC.
         if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP:
-            extra["dsOffset"] = 0
             extra["allocateNode_"] = alloc_node
         return extra
 
