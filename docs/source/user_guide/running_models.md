@@ -6,7 +6,8 @@ using `torch.compile` and the Torch-Spyre backend.
 To run a stock HuggingFace Transformers checkpoint without writing your own
 model code, see [Running HuggingFace models on Spyre](running_hf_models.md),
 which covers the [hf-adapters](https://github.com/torch-spyre/hf-adapters)
-project.
+project. See the [HuggingFace model example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/hf_model.py) for a
+short end-to-end generation script.
 
 ## Using `torch.compile`
 
@@ -25,6 +26,9 @@ compiled_model = torch.compile(model)
 x = torch.rand(1, 3, 224, 224, dtype=torch.float16).to(DEVICE)
 output = compiled_model(x)
 ```
+
+See the [MLP example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/mlp.py) for a compiled SwiGLU feed-forward
+block.
 
 ## Supported Operations
 
@@ -50,7 +54,7 @@ Valid values: 1–32 (default: 32). See
 
 Full working examples are listed on the [Examples](examples/index.md)
 page. It has single-op scripts (`tensor_allocate.py`, `softmax.py`,
-`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `spyre_hints.py`), a
+`gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `for_each_tile.py`), a
 `distributed/` set covering the collective ops (allgather, allreduce,
 broadcast, gather, reduce, barrier) plus a multi-rank broadcast
 walkthrough, and a `scratchpad/` set that models the LX layout solver in

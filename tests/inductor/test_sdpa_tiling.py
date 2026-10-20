@@ -21,6 +21,7 @@ from unittest import mock
 
 import torch
 import torch.nn.functional as F
+from torch._inductor.test_case import fresh_cache
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
@@ -928,6 +929,70 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    # (query heads, kv heads, head tiles): the geometries on which hint-driven q_h
+    # tiling over fused SDPA silently returned wrong values (errors up to NaN) or
+    # failed to compile, while the for_each_tile decomposition was correct (#5441).
+    GQA_HEAD_TILED = (
+        (12, 12, 3),
+        (12, 2, 2),
+        (8, 2, 2),
+        (16, 4, 2),
+        (16, 4, 4),
+        (2, 2, 2),
+        (4, 2, 2),
+        (6, 3, 3),
+    )
+
+    def test_gqa_head_tiled_numerics_across_group_sizes(self):
+        """Head-tiled fused GQA attention is right for every group size.
+
+        Lq=Lk=64, D=128 at fp16 against an fp32 reference.  The group size runs
+        from 1 to 6 and the head counts include ones that are not powers of two.
+        The default strategy does not tile these shapes, so the head tiling is
+        forced, and each case asserts a loop really formed.
+        """
+        B, LQ, LK, D = 1, 64, 64, 128
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q, k, v, scale=D**-0.5, enable_gqa=True
+            )
+
+        for hq, hkv, tiles in self.GQA_HEAD_TILED:
+            with self.subTest(query_heads=hq, kv_heads=hkv, head_tiles=tiles):
+                generator = torch.Generator().manual_seed(0)
+                q = torch.randn(B, hq, LQ, D, dtype=torch.float16, generator=generator)
+                k = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                v = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                expected = sdpa(q.float(), k.float(), v.float())
+
+                def force_head_tiles(tiles=tiles, **kwargs):
+                    return dataclasses.replace(
+                        _select_sdpa_tiling(**kwargs), num_head_tiles=tiles
+                    )
+
+                # A fresh cache: the patched selector is not part of the compile
+                # cache key, so a cached compile of the same graph would be reused.
+                with (
+                    fresh_cache(),
+                    mock.patch.object(
+                        _decompositions,
+                        "_select_sdpa_tiling",
+                        side_effect=force_head_tiles,
+                    ),
+                ):
+                    torch._dynamo.reset()
+                    actual, sources = run_and_get_code(
+                        torch.compile(sdpa, fullgraph=True, dynamic=False),
+                        q.to("spyre"),
+                        k.to("spyre"),
+                        v.to("spyre"),
+                    )
+                self.assertIn("LoopSpec(", "\n".join(sources))
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected, atol=0.05, rtol=0.05
+                )
+
     def test_mapped_single_block_gqa_with_broadcast_mask(self):
         """Outer maps must preserve stable SDPA across query and head tiles."""
 
@@ -1183,20 +1248,31 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
         )
 
     def test_decode_o_proj_after_sdpa(self):
-        """M=1 SDPA decode followed by the o_proj linear.
+        """M=1 SDPA decode with head tiling, followed by the o_proj linear.
 
-        SDPA's attention output [B, H, 1, D] carries a factorized tiled layout
-        from its head tiling.  After transpose+reshape to [B, 1, H*D], the
-        combined H*D dim is the K dimension of the o_proj bmm, whose x then
-        reads host coordinates ``[0, 32*d0 + floor(d1/D), 0, Mod(d1, D)]``:
-        an outer tile variable alongside the contraction variable.  Before the
-        fix, ``_canonical_stl_from_collapsed_host`` rejected this with
-        "batchmatmul: cannot canonicalize factorized x_var".
+        Head-tiled SDPA leaves its output [B, H, 1, D] in a factorized layout.
+        After transpose+reshape to [B, 1, H*D], the combined H*D dim is the K
+        dimension of the o_proj bmm, whose x then reads a mixed-radix function
+        of the contraction variable alone, here ``[floor(d1/512),
+        floor(Mod(d1, 512)/128), 0, Mod(d1, 128)]`` for eight head tiles, which
+        ``_canonical_stl_from_collapsed_host`` must collapse into one logical K
+        dimension.
 
-        NOTE: with the current SDPA strategy this shape compiles WITHOUT a
-        loop (no ``LoopSpec``), so it no longer forms the factorized x it was
-        written for; it remains a compile-and-numerics check of the decode ->
-        o_proj chain.  Re-shape it if that factorized layout needs a guard.
+        The default ``decode`` strategy no longer tiles the heads of this shape,
+        so the test forces eight head tiles, and asserts that a loop really
+        formed so a strategy change cannot quietly turn it back into a plain
+        compile-and-numerics check.
+
+        This test does NOT guard the case it was first written for, where an
+        outer tile variable appears alongside the contraction variable
+        (``[0, 32*d0 + floor(d1/D), 0, Mod(d1, D)]``, which needed o_proj to
+        sit inside SDPA's loop).  SDPA no longer places o_proj there, so
+        restoring the strict pre-fix check in ``propagate_layouts`` does not
+        fail this test.  That relaxation is guarded at the layout level by
+        ``test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain``
+        in ``tests/tensor/test_coordinates.py``, and a split-K-over-heads
+        ``for_each_tile`` is covered by ``test_split_k_over_head_groups`` in
+        ``test_for_each_tile_e2e.py``.
         """
         B, H, Lq, Lk, D = 1, 32, 1, 2048, 128
         hidden = H * D
@@ -1211,11 +1287,27 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
             x = attn_out.transpose(1, 2).reshape(B, Lq, hidden)
             return F.linear(x, w)
 
-        expected = fn(q, k, v, w)
-        actual = torch.compile(fn, fullgraph=True, dynamic=False)(
-            q.to("spyre"), k.to("spyre"), v.to("spyre"), w.to("spyre")
-        )
+        def force_head_tiles(**kwargs):
+            return dataclasses.replace(_select_sdpa_tiling(**kwargs), num_head_tiles=8)
 
+        expected = fn(q, k, v, w)
+        # A fresh cache: the patched selector is not part of the compile cache
+        # key, so a cached unforced compile of the same graph would be reused.
+        with (
+            fresh_cache(),
+            mock.patch.object(
+                _decompositions, "_select_sdpa_tiling", side_effect=force_head_tiles
+            ),
+        ):
+            actual, sources = run_and_get_code(
+                torch.compile(fn, fullgraph=True, dynamic=False),
+                q.to("spyre"),
+                k.to("spyre"),
+                v.to("spyre"),
+                w.to("spyre"),
+            )
+
+        self.assertIn("LoopSpec(", "\n".join(sources))
         torch.testing.assert_close(
             actual.cpu().float(), expected.float(), atol=0.2, rtol=0.2
         )

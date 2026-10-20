@@ -23,6 +23,7 @@ from unittest.mock import patch as mock_patch
 import torch
 import os
 import pytest
+import regex as re
 from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
@@ -1084,3 +1085,112 @@ def mock_op_split_space(
     # a domain is the real context's business.
     space._context = lambda tiling: context  # type: ignore[method-assign]
     return space
+
+
+def opspec_summaries(source: str) -> list[dict[str, Any]]:
+    """One summary per ``OpSpec`` in generated kernel source, in source order.
+
+    Each dict has ``op`` (the op name), ``allocations`` (the allocation kind --
+    ``hbm``, ``lx`` or ``hbm_pool`` -- of each ``TensorArg``, in argument
+    order) and ``splits`` (the per-core split of each iteration-space axis).
+    Lets a test say where a value lives and how cores divide an op without
+    matching the whole OpSpec text.
+    """
+    summaries = []
+    for chunk in source.split("OpSpec(\n")[1:]:
+        op = re.search(r"op='(\w+)'", chunk)
+        space = re.search(r"iteration_space=\{(.*?)\},\n", chunk)
+        splits = (
+            [
+                int(split)
+                for _, split in re.findall(
+                    r"\(sympify\('(\d+)'\), (\d+)\)", space.group(1)
+                )
+            ]
+            if space
+            else []
+        )
+        summaries.append(
+            {
+                "op": op.group(1) if op else None,
+                "allocations": re.findall(r"allocation=\{'(\w+)'", chunk),
+                "splits": splits,
+            }
+        )
+    return summaries
+
+
+def ir_input_loader(name: str, size: list[int]) -> Callable:
+    """A loader over a float32 CPU ``InputBuffer`` registered with the active
+    graph handler."""
+    from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
+    from torch._inductor.virtualized import V
+
+    inp = InputBuffer(
+        name=name, layout=FixedLayout(torch.device("cpu"), torch.float32, size)
+    )
+    V.graph.name_to_buffer[name] = inp
+    return TensorBox(StorageBox(inp)).make_loader()
+
+
+def ir_computed_buffer(
+    name: str,
+    ranges: list[int],
+    inner_fn: Callable,
+    reduction_ranges: list[int] | None = None,
+) -> tuple[Callable, Any]:
+    """``(loader, op)`` for a ``ComputedBuffer`` -- a ``Pointwise``, or a sum
+    ``Reduction`` over ``reduction_ranges`` -- registered with the active graph
+    handler. It computes on the CPU and is laid out as a row-major fp16 Spyre
+    tensor, so per-core and per-tile views of it can be built."""
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FlexibleLayout,
+        Pointwise,
+        Reduction,
+        StorageBox,
+        TensorBox,
+    )
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    cpu = torch.device("cpu")
+    if reduction_ranges is None:
+        box = Pointwise.create(
+            device=cpu, dtype=torch.float32, inner_fn=inner_fn, ranges=ranges
+        )
+    else:
+        box = Reduction.create(
+            device=cpu,
+            dst_dtype=torch.float32,
+            src_dtype=torch.float32,
+            inner_fn=inner_fn,
+            ranges=ranges,
+            reduction_ranges=reduction_ranges,
+            reduction_type="sum",
+        )
+    stride = [int(st) for st in FlexibleLayout.contiguous_strides(ranges)]
+    device_layout = SpyreTensorLayout(
+        list(ranges), stride, torch.float16, list(range(len(ranges)))
+    )
+    op = ComputedBuffer(
+        name=name,
+        layout=FixedTiledLayout(
+            "spyre:0", torch.float16, ranges, stride, device_layout
+        ),
+        data=box.data.data,
+    )
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return TensorBox(StorageBox(op)).make_loader(), op
+
+
+def patch_row_major_out_coords() -> Any:
+    """Patch ``coarse_tiling.op_out_coords``: the host coords of a row-major
+    layout are the write's own loop vars."""
+    return mock_patch(
+        "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+        side_effect=lambda op: list(next(iter(op.get_read_writes().writes)).var_names),
+    )

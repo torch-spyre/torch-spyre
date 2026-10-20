@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -43,6 +44,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
+    SPYRE_INT32_OPS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
@@ -263,19 +265,34 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
-_POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+
+_PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
+    "max": {
+        DataFormats.SEN169_FP16: _FP16_MIN,
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "min": {
+        DataFormats.SEN169_FP16: _FP16_MAX,
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "exp": {
+        DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    },
 }
 
+_POINTWISE_PADDING_OPS: set[str] = {"exp"}
 
-def _get_mask_value(op: str) -> float:
-    if op == "max":
-        return _FP16_MIN
-    if op == "min":
-        return _FP16_MAX
-    if op in _POINTWISE_PADDING_MASK_VALUE:
-        return _POINTWISE_PADDING_MASK_VALUE[op]
-    return 0
+
+def _get_mask_value(
+    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
+) -> float:
+    return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
 def _get_coordinate_mask(
@@ -286,7 +303,7 @@ def _get_coordinate_mask(
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
-    # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
+    # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
     #
     # SAMV coordinate masking is limited to <=16-bit element types by the
     # backend compiler ("Coordinate masking is supported only up to 16bit
@@ -308,7 +325,7 @@ def _get_coordinate_mask(
     # #3290 (padded-stick-state layout enum, the principled replacement for this
     # bandage).
     mask_pointwise = (
-        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+        op in _POINTWISE_PADDING_OPS and arg.data_format != DataFormats.IEEE_FP32
     )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
@@ -1121,30 +1138,32 @@ def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
 
 
 def _get_data_format(op, device_dtype):
-    """Re-label int32 tensor data formats to fp32 for SDSC compatibility.
+    """Return the SDSC descriptor format for a tensor.
 
-    NOTE: This is NOT a data conversion.
-    This is only a temporary re-labeling of the same 32 bit data.
-    The underlying data remains unchanged.
-
-    In the long term, SDSC should accept int32 as the data format.
-    Such re-labeling will become unnecessary.
-    See backend issue deeptools#4307.
+    This is metadata relabeling only; the underlying 32-bit data is unchanged.
+    Native integer add/mul (``addi32toi32`` / ``muli32toi32``) use SENUINT32
+    tensor descriptors in the SDSC DDL.  Identity retains its fp32 relabeling.
     """
-    if device_dtype == DataFormats.IEEE_INT32 and op == IDENTITY_OP:
-        return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32:
+        if op in SPYRE_INT32_OPS:
+            return DataFormats.SENUINT32
+        if op == IDENTITY_OP:
+            # In the long term, SDSC should accept int32 as the data format.
+            # Such re-labeling will become unnecessary.
+            # See backend issue deeptools#4307.
+            return DataFormats.IEEE_FP32
     return device_dtype
 
 
 def _get_sdsc_spec_data_format(op, arg_data_format):
-    """Re-label int32 ops' SDSC spec data_format to fp32 for backend compatibility.
+    """Return the SDSC compute format for an operation.
 
-    For fp32<->int32 dtype-conversion ops, the SDSC spec must report fp32 as
-    the op's data format, but unlike `_get_data_format`'s IDENTITY_OP case,
-    the int32 tensor descriptor itself stays int32.
+    dtype-conversion ops (fp32↔int32) and native int32 ops (addi32toi32,
+    muli32toi32) must report IEEE_FP32 as the SDSC spec's compute format;
+    all other ops pass the tensor format through unchanged.
     See backend issue deeptools#4307.
     """
-    if op in (FP32TOINT32_OP, INT32TOFP32_OP):
+    if op in (FP32TOINT32_OP, INT32TOFP32_OP, *SPYRE_INT32_OPS):
         return DataFormats.IEEE_FP32
     return arg_data_format
 
@@ -1657,7 +1676,16 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
-def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+def _get_op_func(
+    op: str,
+    is_reduction: bool,
+    output_scales: dict,
+) -> str:
+    """Return the SDSC opfunc string for an operation.
+
+    Non-stick reductions append the ``nonstick`` suffix.  All other ops map to
+    their op name unchanged.
+    """
     if _is_pool(op) or _is_conv(op):
         return op
     # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
@@ -2362,7 +2390,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output
@@ -2483,13 +2511,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
 
+    # Indirect operations place the index tensor first.
+    value_arg_index = 1 if indirect_access_indices else 0
+    opfunc = (
+        "shuffle"
+        if is_relayout
+        else _get_op_func(
+            op_spec.op,
+            op_spec.is_reduction,
+            args[-1].scales,
+        )
+    )
+
     return (
         SDSCSpec(
-            opfunc=(
-                "shuffle"
-                if is_relayout
-                else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
-            ),
+            opfunc=opfunc,
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
             # matmul; depthwise conv2d (#3510) runs on the "sfp" unit. `is_conv`
             # matches both, so dispatch forward explicitly and leave depthwise
@@ -2498,9 +2534,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if (is_matmul or op_spec.op == CONV2D_FWD_OP)
             else "sfp",
             data_format=_get_sdsc_spec_data_format(
-                op_spec.op,
-                args[1 if indirect_access_indices else 0].data_format,
-            ),  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
+                opfunc,
+                args[value_arg_index].data_format,
+            ),
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,

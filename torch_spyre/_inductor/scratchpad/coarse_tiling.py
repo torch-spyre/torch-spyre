@@ -22,7 +22,7 @@ that chooses among tilings live elsewhere.
 
 The pass mints hint ids and a group-id offset from bases derived off the graph
 (never a reserved constant), so a tiling applied here cannot collide with a
-hint-driven group already stamped pre-stickification at pass 430. It reuses the
+for_each_tile group already stamped pre-stickification at pass 430. It reuses the
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
 ops that run the same loop nest.
@@ -425,8 +425,8 @@ def derive_tiling_groups(
 ) -> list[tuple[list[Operation], tuple[int, ...]]]:
     """Group consecutive ops that run the same non-empty loop nest.
 
-    Mirrors ``hints_to_coarse_tile_groups``' consecutive-run shape, keyed by
-    each op's nest (:attr:`TileSpec.level_counts`) instead of the hint: a run
+    Groups are consecutive runs, keyed by each op's nest
+    (:attr:`TileSpec.level_counts`): a run
     breaks whenever an op is untiled (absent from ``choices`` or mapped to the
     empty spec) or its nest differs from the run's. Contiguity is a hard
     requirement, not an optimization -- ``validate_coarse_tile_groups`` and
@@ -458,8 +458,9 @@ def derive_tiling_groups(
     the group boundary. The stretch is every op since the nest last changed,
     not only the current group: that over-splits only where the producer is
     already in an earlier group, and it keeps where a group starts a function of
-    the ops between a consumer and what it reads, which a search re-tiling one
-    op at a time relies on. Returns ``(ops, level counts)`` per group.
+    the ops between a consumer and what it reads, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``). Returns
+    ``(ops, level counts)`` per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
@@ -577,11 +578,45 @@ def tile_misread(
     return None
 
 
+@dataclasses.dataclass
+class TileReads:
+    """Whether ``consumer`` reads ``producer`` tile by tile under a pair of
+    specs -- :func:`tile_misread` over every read of it, the question
+    :func:`derive_tiling_groups` asks of an edge in a stretch -- memoized per
+    pair, for a search that asks it per move."""
+
+    graph: GraphLowering
+    producer: Operation
+    consumer: Operation
+    _memo: dict[tuple[TileSpec, TileSpec], bool] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+
+    def aligned(self, producer_spec: TileSpec, consumer_spec: TileSpec) -> bool:
+        key = (producer_spec, consumer_spec)
+        if key not in self._memo:
+            name = self.producer.get_name()
+            self._memo[key] = all(
+                tile_misread(
+                    self.graph,
+                    self.producer,
+                    producer_spec,
+                    self.consumer,
+                    consumer_spec,
+                    read,
+                )
+                is None
+                for read in op_read_writes(self.consumer).reads
+                if read.name == name
+            )
+        return self._memo[key]
+
+
 def _derive_hint_id_base(graph: GraphLowering) -> int:
     """``max(hint_id present in the graph, default=-1) + 1``.
 
     Derived, never a reserved constant: whatever hint ids a pre-stickification
-    hint-driven group already minted, this pass mints strictly above them, so
+    for_each_tile group already minted, this pass mints strictly above them, so
     ``validate_coarse_tile_groups`` can never see a hint id in two groups.
     """
     ids = [h.hint_id for op in graph.operations for h in getattr(op, "dim_hints", [])]
@@ -591,7 +626,7 @@ def _derive_hint_id_base(graph: GraphLowering) -> int:
 def _derive_group_idx_offset(graph: GraphLowering) -> int:
     """``max(loop_group_id[0] present, default=-1) + 1`` -- the same derivation
     ``_maybe_coarse_tile_span_overflow`` uses to avoid a ``loop_group_id``
-    collision with a hint-driven group stamped pre-stickification."""
+    collision with a for_each_tile group stamped pre-stickification."""
     used = [
         op.loop_info.loop_group_id[0]
         for op in graph.operations
@@ -655,7 +690,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                     "which a for_each_tile loop already tiles."
                 )
         # Both bases are derived off the graph *before* this pass stamps any of
-        # its own hints/groups, so pre-existing (hint-driven) ids are avoided
+        # its own hints/groups, so pre-existing (for_each_tile) ids are avoided
         # and the ids this pass mints increase monotonically.
         next_hint_id = _derive_hint_id_base(graph)
         group_idx_offset = _derive_group_idx_offset(graph)
@@ -676,9 +711,8 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout. Use the
-        # post-stickify entry point (run_read_copies=False): a read copy-in here
-        # would only be a useless HBM-to-HBM copy, exactly as the sibling
-        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        # post-stickify entry point, exactly as the sibling post-stickify
+        # consumer (_maybe_coarse_tile_span_overflow) does.
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )

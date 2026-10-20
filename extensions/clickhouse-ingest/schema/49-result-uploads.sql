@@ -26,14 +26,14 @@ CREATE TABLE IF NOT EXISTS result_uploads
     CONSTRAINT chk_state  CHECK state IN ('published', 'failed', 'retracted'),
     CONSTRAINT chk_linked CHECK artifact_id != toUUID('00000000-0000-0000-0000-000000000000')
                             AND run_id != toUUID('00000000-0000-0000-0000-000000000000'),
-    CONSTRAINT chk_format CHECK format IN ('junit', 'vllm', 'sendnn'),
+    CONSTRAINT chk_format CHECK format IN ('junit', 'vllm', 'sendnn', 'benchmarks'),
     -- Same lists as artifact_results.chk_result_kind / chk_test_type; they move together.
     CONSTRAINT chk_result_kind CHECK result_kind IN
         ('functional','performance','capability'),
     CONSTRAINT chk_test_type   CHECK test_type   IN
-        ('smoke','unit','integration','regression','trunk','perf',
+        ('smoke','unit','integration','regression','trunk','perf','quality',
          'fvt','fvt-static','fvt-dynamic','svt','svt-static','svt-dynamic',
-         'model_ops','model_modules','model_support')
+         'model_ops','model_modules','model_support','model_serving')
 )
 ENGINE = MergeTree()
 ORDER BY (upload_id, ts);

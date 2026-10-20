@@ -145,8 +145,8 @@ default input, so no `--from-ktir` is passed; that flag selects the KTIR
 frontend instead. (The bundle itself is produced
 earlier, in Python, by `generate_bundle(...)`.) Each kernel gets its own output
 directory created with `tempfile.mkdtemp` under `<cache_dir>/inductor-spyre`,
-so the bundles are stored separately from Inductor's content-addressed
-Python/Triton cache.
+so each compile's bundles stay separate from both Inductor's content-addressed
+Python/Triton cache and the persistent Spyre kernel cache described below.
 
 Independent kernels compile in parallel through Inductor's compile-worker
 process pool whenever `TORCHINDUCTOR_COMPILE_THREADS` is greater than `1`.
@@ -154,6 +154,46 @@ Bundle generation stays in the parent process; workers invoke `dbo-opt`, and
 the generated wrapper resolves their results at `async_compile.wait()` before
 execution. Set `TORCHINDUCTOR_COMPILE_THREADS=1` to compile inline. There is no
 separate Spyre feature flag.
+
+## Kernel cache
+
+Compiled kernels are cached on disk and reused across compiles and across
+processes. The cache is content-addressed and is stored under
+`<cache_dir>/inductor-spyre-cache`, separate from the `inductor-spyre` scratch
+directory that holds a single compile's output. The cache functions are in the
+`torch_spyre/execution/` layer alongside `async_compile` and `kernel_runner`.
+
+:::{figure} ../_static/images/kernel-cache-flow.svg
+:alt: Kernel cache flow. When SPYRE_KERNEL_CACHE is on and LIB_VERSION_FILE is set, compute_specs_hash forms the key; a hit loads the kernel while a miss compiles into a temporary directory committed with an atomic rename.
+:width: 70%
+:align: center
+
+The compiled-kernel cache flow. A hit loads the kernel without running bundle
+generation or the backend compiler; a miss compiles into a temporary directory
+inside the cache root that is committed with an atomic rename.
+:::
+
+The cache key is a SHA-256 hash computed in memory from the finalized specs,
+before any bundle is written, by `compute_specs_hash`
+([`execution/kernel_cache.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/execution/kernel_cache.py)).
+It covers the JSON of every `sdsc_N.json` (op structure, iteration space,
+tiling, shapes, dtypes), each `LoopSpec` trip count, the baked symbol offsets
+and total pool size, the active compile config, and the versions of torch,
+torch_spyre, and the deeptools/flex toolchain. The toolchain version is read
+from the file named by `LIB_VERSION_FILE`; when that variable is unset the key
+cannot be formed, so caching is disabled for that kernel with a warning (set
+`SPYRE_KERNEL_CACHE=0` to silence it).
+
+On a cache hit, `get_cached_kernel_dir` finds a directory that holds every
+required artifact and the kernel loads directly: neither `generate_bundle` nor
+the backend compiler runs. On a miss, the kernel compiles into a temporary
+directory inside the cache root, which `commit_compile_dir` then renames into
+place atomically, so concurrent compiles of the same key do not corrupt each
+other. Caching is controlled by `SPYRE_KERNEL_CACHE` (default off) and is
+skipped in frontend-only mode, where a hit would record no frontend work.
+`clear_cache()` empties the cache, and `get_cache_stats()` reports the number of
+cached kernels and the total cache size. Per-key hit and miss counts are tracked
+separately in the process-global kernel registry (`get_kernel_registry()`).
 
 ## Further Reading
 
