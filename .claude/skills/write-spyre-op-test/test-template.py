@@ -60,7 +60,7 @@ class TestMyOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # --- Recording a case that does not work today ---
         # Run the case with the expectation off first (see the write-spyre-op-test
-        # skill and "Test Invariants" in CLAUDE.md), then add the matching key to
+        # skill and "Test Invariants" in AGENTS.md), then add the matching key to
         # the entry above, next to "param_sets":
         #   "expect_raise": {"case_name": "message fragment"},  # stable rejection
         #   "expect_fail": {"case_name": "reason, #issue"},  # wrong values or a bug

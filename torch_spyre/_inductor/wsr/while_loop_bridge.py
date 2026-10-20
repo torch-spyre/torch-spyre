@@ -1023,9 +1023,9 @@ def _rewire_accumulator_output(
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
     real zeros-filling ``ComputedBuffer`` that runs before the loop, which is
-    exactly the "fill" step WSR's ``CarriedReductionRecord`` pattern wants;
-    reusing it avoids synthesizing a second fill (and a second buffer) that
-    would then have to be kept consistent with it.
+    exactly the "fill" step an accumulator needs; reusing it avoids
+    synthesizing a second fill (and a second buffer) that would then have to be
+    kept consistent with it.
 
     The outside consumer is reached through the ``WhileLoop``'s
     ``MultiOutput`` child for this carry index -- the object
@@ -1040,6 +1040,11 @@ def _rewire_accumulator_output(
     place, preserving order).
     """
     from torch._inductor import ir
+
+    from torch_spyre._inductor.pass_utils import (
+        identity_load,
+        redirect_computed_buffer_reads,
+    )
 
     while_out_name = None
     for child in graph.operations:
@@ -1070,6 +1075,46 @@ def _rewire_accumulator_output(
         )
         return body_ops
 
+    partial_update = False
+    updates = [
+        op
+        for op in body_ops
+        if isinstance(op, ir.ComputedBuffer)
+        and isinstance(op.layout, ir.MutationLayoutSHOULDREMOVE)
+        and op.layout.get_buffer().get_name() == body_output_name
+    ]
+    if len(updates) == 1 and isinstance(updates[0].data, ir.Scatter):
+        # A private carry needs no full clone before an index_copy scatter
+        # when the clone preserves every address, size, stride and offset.
+        # splice_while_loop snapshots later old-value readers first. Require
+        # exclusive placeholder readership here too, so this local elision
+        # never introduces an unprotected read-after-write.
+        identity = identity_load(producer)
+        body_graph = while_op.body_subgraph.graph
+        placeholder_name = list(body_graph.graph_inputs)[binding.carry_index]
+        placeholder_layout = body_graph.graph_inputs[placeholder_name].get_layout()
+        clone_layout = producer.get_layout()
+        update_layout = updates[0].layout.target.get_layout()
+        if (
+            identity is not None
+            and identity[0] == placeholder_name
+            and list(producer.data.ranges) == list(placeholder_layout.size)
+            and clone_layout.size == placeholder_layout.size == update_layout.size
+            and clone_layout.stride == placeholder_layout.stride == update_layout.stride
+            and clone_layout.offset == placeholder_layout.offset == update_layout.offset
+            and clone_layout.dtype == placeholder_layout.dtype == update_layout.dtype
+            and identity[1] == placeholder_layout.make_indexer()(identity[2])
+            and updates[0].layout.make_indexer()(identity[2]) == identity[1]
+            and all(
+                _operation_reads_buffer(op, placeholder_name) is False
+                for op in body_ops
+                if op is not producer
+            )
+        ):
+            body_ops = [op for op in body_ops if op is not producer]
+            producer = updates[0]
+            partial_update = True
+
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
@@ -1083,13 +1128,35 @@ def _rewire_accumulator_output(
     # same recursive view/box unwrapping used when resolving mutation storage.
     storage = mutation_layout.get_buffer()
     storage_name = storage.get_name()
-    record = LoopCarryRecord(
-        storage_name=storage_name,
-        update_name=producer.get_name(),
-        loop_origin=_validated_loop_origin(graph, while_op),
-    )
-    storage._loop_carry_record = record
-    producer._loop_carry_record = record
+    # LoopCarryRecord opts full-buffer accumulators into LX residency. A
+    # scatter must retain its whole destination in HBM, including untouched
+    # rows; ordinary mutation dependencies carry its lifetime across trips.
+    if not partial_update:
+        record = LoopCarryRecord(
+            storage_name=storage_name,
+            update_name=producer.get_name(),
+            loop_origin=_validated_loop_origin(graph, while_op),
+        )
+        storage._loop_carry_record = record
+        producer._loop_carry_record = record
+
+    # In-body readers must use carry storage: the former producer is now a
+    # mutation operation without an independent allocation.
+    body_ops = [
+        redirect_computed_buffer_reads(
+            op,
+            {body_output_name: storage_name},
+            body_ops,
+            pass_name="splice_while_loops",
+            reason="redirect in-body reads of an updated carry to its storage",
+        )
+        if isinstance(op, ir.ComputedBuffer)
+        and (op is not producer or partial_update)
+        and any(d.name == body_output_name for d in op.get_read_writes().reads)
+        else op
+        for op in body_ops
+    ]
+    _substitute_direct_input_refs(body_ops, {body_output_name: target})
 
     if while_out_name is not None:
         _repoint_refs_to_buffer(graph, while_out_name, target)
@@ -1116,7 +1183,7 @@ def _repoint_refs_to_buffer(
     over the name, not an object reference reachable via ``.inputs`` at all
     (same class of hazard as the in-body carry reads this bridge already
     redirects via ``redirect_computed_buffer_reads``/``NameSwapHandler``,
-    per CLAUDE.md's "wrap, never reconstruct" rule; see
+    per AGENTS.md's "wrap, never reconstruct" rule; see
     ``splice_while_loop``'s own ``name_map`` rewrite for the body-side
     counterpart of this same mechanism). Patch every such consumer still in
     ``graph.operations`` the same way, or its dependency on ``old_name``
@@ -1226,7 +1293,7 @@ def splice_while_loop(
     Two distinct read shapes exist in the body and both need rewiring:
     ComputedBuffer.inner_fn issues ops.load(name, index) calls (name-based
     -- handled by redirect_computed_buffer_reads/NameSwapHandler, per
-    CLAUDE.md's "wrap, never reconstruct" rule); DynamicScalar/
+    AGENTS.md's "wrap, never reconstruct" rule); DynamicScalar/
     ExternKernelOut hold direct Python object references to the
     placeholder buffer in `.inputs` (object-based -- handled by
     _substitute_direct_input_refs, since no name_map rename can reach a

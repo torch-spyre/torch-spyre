@@ -45,7 +45,7 @@ every step of turning one into tiled, schedulable ops:
    (from the prover), loop var (from the spliced body), and tiled-dim
    position (from lookup_marker_dim, or a structural fallback anchored on
    the op's own output coordinates when no marker resolves it). This never
-   calls coarse_tile_pre_stickify: re-deriving tiling from index
+   goes through coarse_tile.py's group planning: re-deriving tiling from index
    coefficients independently at each nesting level risks a level's already-
    committed metadata going stale once a later-spliced, more-deeply-nested
    level renames or rewires the buffers that metadata depended on.
@@ -76,7 +76,7 @@ inner_fn's closure cells (an internal, unstable implementation detail of
 torch._inductor.ir.make_pointwise/ops_wrapper), this module *runs* inner_fn
 once under a small recording ops handler that intercepts `load`/`constant`
 and returns opaque placeholders for everything else. This is the same "wrap
-the ops handler, don't reconstruct index expressions" pattern CLAUDE.md
+the ops handler, don't reconstruct index expressions" pattern AGENTS.md
 mandates for ComputedBuffer.inner_fn elsewhere in this codebase (see issue
 #2797), applied here for read-only shape recognition rather than mutation.
 """
@@ -98,7 +98,7 @@ from torch._inductor.virtualized import V
 from .. import timing_recorder
 from ..deadcode_elimination import deadcode_elimination
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import format_operations
+from ..pass_utils import identity_load, format_operations
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -145,27 +145,6 @@ class _CondInnerFnRecorder(DefaultHandler):
         # the op name so the caller can decline with a useful reason.
         self.compare_ops.append(f"unexpected:{name}")
         return f"__unexpected_{name}__"
-
-
-class _IdentityLoadRecorder(DefaultHandler):
-    """Recognize a Pointwise body that returns exactly one load.
-
-    ``WhileLoop.create`` uses such bodies to repair an input's strides before
-    handing it to the loop body.  After a for_each_tile WhileLoop is spliced,
-    that otherwise-benign whole-input materialization sits inside the counted
-    loop.  This recorder lets the post-splice contraction below prove the copy
-    is an identity without inspecting ``inner_fn`` closures.
-    """
-
-    def __init__(self) -> None:
-        self.value = object()
-        self.loads: list[tuple[str, Any]] = []
-
-    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        if name != "load" or self.loads:
-            raise ValueError("not a single-load identity")
-        self.loads.append((args[0], args[1]))
-        return self.value
 
 
 def _first_placeholder_name(cond_graph) -> str | None:
@@ -605,7 +584,7 @@ def _marker_substitution(
     ``get_read_writes()`` and let the caller substitute into it -- the same
     "index expressions are symbolic, substitute don't re-execute"
     discipline this module and ``coarse_tile.py`` already follow
-    everywhere else (see CLAUDE.md's "wrap, never reconstruct").
+    everywhere else (see AGENTS.md's "wrap, never reconstruct").
 
     Returns the marker's own single MemoryDep read's ``(name, index)``,
     where ``index`` is expressed in terms of the marker's own WRITE dep's
@@ -664,7 +643,7 @@ class _InlineMarkerHandler(WrapperHandler):
     -- a pure sympy substitution, never a live re-execution of the
     marker's ``inner_fn`` (see ``_marker_substitution``'s docstring for why
     that would be wrong). This keeps the "wrap, never reconstruct"
-    convention (CLAUDE.md, issue #2797): the marker's ORIGINAL index
+    convention (AGENTS.md, issue #2797): the marker's ORIGINAL index
     expression is reused verbatim, never re-derived by hand -- only the
     free variables are substituted, exactly as any other index-composition
     in this codebase already does.
@@ -764,6 +743,7 @@ def _inline_marker_into_consumer(
     (the closed-over ``capture`` is rebound to None) so later re-evaluations of
     this long-lived inner_fn stop recording.
     """
+    from torch._inductor.ir import Scatter
     from torch._inductor.virtualized import V
 
     from torch_spyre._inductor.pass_utils import (
@@ -783,6 +763,16 @@ def _inline_marker_into_consumer(
             return _orig_inner(*args)
 
     object.__setattr__(consumer_op.data, "inner_fn", new_inner_fn)
+    if isinstance(consumer_op.data, Scatter):
+        orig_indexer = consumer_op.data.output_indexer
+
+        def new_output_indexer(*args, _orig_indexer=orig_indexer):
+            with V.set_ops_handler(
+                _InlineMarkerHandler(V.ops, marker_name, marker_op, capture)
+            ):
+                return _orig_indexer(*args)
+
+        object.__setattr__(consumer_op.data, "output_indexer", new_output_indexer)
     _invalidate_body_caches(consumer_op.data)
 
     result = replace_computed_buffer_body(
@@ -839,7 +829,7 @@ def _consume_tile_dim_markers(
       Pointwise/Reduction/Scan/Sort body): the read surfaces as a
       ``MemoryDep`` named after the marker in ``get_read_writes().reads``.
       Erased via ``_inline_marker_into_consumer``, which wraps (never
-      reconstructs, per CLAUDE.md) the inner_fn with ``_InlineMarkerHandler``
+      reconstructs, per AGENTS.md) the inner_fn with ``_InlineMarkerHandler``
       so every load of the marker re-issues the MARKER'S OWN inner_fn
       (``marker_op.data.make_loader()``) at the consumer's load-site index,
       rather than merely renaming past it. A plain name-swap
@@ -891,8 +881,7 @@ def _consume_tile_dim_markers(
     convention in this codebase for using ``id()`` instead of the object).
     But ``id(op)`` itself is NOT safe here the way it is for that other
     convention's own single-pass, single-object lifetime: a *later*
-    coarse-tiling sub-pass (e.g. ``_insert_all_read_copy_ops`` /
-    ``_patch_consumer_to_read_copy``) can rebuild this exact consumer
+    coarse-tiling sub-pass (e.g. ``_patch_consumers``) can rebuild this exact consumer
     AGAIN via ``replace_computed_buffer_body`` -- for a completely
     unrelated read of the same op -- minting a new object with a new
     ``id()`` before ``lookup_marker_dim`` is ever called from
@@ -1156,9 +1145,7 @@ def _consume_tile_dim_markers(
             # it out of `group_ops` breaks that contiguity check for any
             # group whose block the marker sits inside. Passes that must not treat a
             # surviving marker as an ordinary tile op instead guard on
-            # `_marker_dim(op) is not None` individually (see
-            # _plan_read_copies in coarse_tile.py for the first such guard)
-            # -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
+            # `_marker_dim(op) is not None` individually -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
             # matters, on `_marker_resolution(op)`.
             marker_op.tile_marker_resolution = MarkerResolution.INLINE_ERASED
             operations.remove(marker_op)
@@ -1339,16 +1326,16 @@ def _stamp_direct_loop_info(
 
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
-    lookup_marker_dim. Never calls coarse_tile_pre_stickify: the program
+    lookup_marker_dim. Never goes through coarse_tile.py's group planning: the program
     already states trip count, loop var, tile dim, and carry roles as
     ground truth, so re-deriving them via double-blind per-level
-    coarse_tile_pre_stickify inference is unnecessary and unsafe -- one
+    inference is unnecessary and unsafe -- one
     level's committed metadata (e.g. tiled_dims_per_read computed against a
     provisional buffer name) can go stale once a later-spliced nested level
     renames or rewires the buffers it depended on. propagation is never
     produced -- every CoarseTileInfo built here leaves it None -- because
     PropagationPlan has zero consumers outside coarse_tile.py's own Pass
-    1/2/3, which while_loop groups skip entirely.
+    2/3, which while_loop groups skip entirely.
 
     Called once per while_loop nesting level, in group_idx-ascending
     (outermost-first) order -- see splice_while_loops's own docstring for
@@ -1973,46 +1960,6 @@ def _recordable_op_names(group_ops: list["ir.Operation"]) -> list[str]:
     return _walk(group_ops, nested=False)
 
 
-def _identity_load(
-    op: "ir.Operation",
-) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]] | None:
-    """Return the sole load performed by a pure pointwise identity.
-
-    The generated exact-stride normalizations this recognizes are ordinary
-    Pointwise buffers, not a dedicated IR node.  Run their body under a
-    recording handler so accepting one is based on behavior (one load whose
-    value is returned unchanged), not an origin name or a fragile graph
-    pattern.
-    """
-    from torch._inductor import ir
-
-    if not isinstance(op, ir.ComputedBuffer) or not isinstance(op.data, ir.Pointwise):
-        return None
-
-    indices = tuple(
-        sympy.Symbol(f"_fet_identity_i{i}", integer=True)
-        for i in range(len(op.data.ranges))
-    )
-    recorder = _IdentityLoadRecorder()
-    try:
-        with V.set_ops_handler(recorder):
-            result = op.data.inner_fn(indices)
-    except Exception:  # noqa: BLE001
-        # This is a speculative recognizer over arbitrary pointwise bodies.
-        # Any body that cannot execute under the recording handler is simply
-        # not the generated single-load identity this optimization needs.
-        return None
-    # V.ops is an OpsWrapper, so scalar handler results normally come back as
-    # OpsValue(value).  Accept the unwrapped form too for direct unit tests.
-    if (
-        getattr(result, "value", result) is not recorder.value
-        or len(recorder.loads) != 1
-    ):
-        return None
-    name, index = recorder.loads[0]
-    return name, sympy.sympify(index), indices
-
-
 class _IdentityChainLoadHandler(WrapperHandler):
     """Inline a chain of affine identity loads into one consumer load."""
 
@@ -2377,7 +2324,7 @@ def _contract_cross_scope_input_materializations(
         identities = {
             op.get_name(): identity
             for op in operations
-            if (identity := _identity_load(op)) is not None
+            if (identity := identity_load(op)) is not None
         }
         roots = [
             name
@@ -2740,7 +2687,7 @@ def _contract_exact_stride_input_materializations(
         identities = {
             op.get_name(): identity
             for op in operations
-            if (identity := _identity_load(op)) is not None
+            if (identity := identity_load(op)) is not None
         }
         if not identities:
             continue
@@ -3036,7 +2983,7 @@ def _contract_exact_stride_input_materializations(
     identities = {
         op.get_name(): identity
         for op in operations
-        if (identity := _identity_load(op)) is not None
+        if (identity := identity_load(op)) is not None
     }
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)
@@ -3155,7 +3102,7 @@ def splice_while_loops(graph) -> None:
     Directly constructs and stamps CoarseTileInfo per accepted group from
     ground truth (trip count, loop var, tile_dim_marker resolution, carry
     roles) via _stamp_direct_loop_info -- never hands the group to
-    coarse_tile_pre_stickify for re-inference, since coarse_tile_pre_stickify's
+    coarse_tile.py's planner for re-inference, since its
     index-coefficient inference runs once per nesting level, blind to prior
     runs, and a level's committed metadata can go stale once a later-spliced
     nested level renames or rewires the buffers it depended on (see
@@ -3348,12 +3295,10 @@ def splice_while_loops(graph) -> None:
     # squeezed_advance_per_read (mirroring coarse_tile.py's own
     # _point_splice_advance_for_dep -- see that function's docstring), but
     # leaves the read's index itself unrebased (e.g. paged attention's
-    # in-body page index, dep.index == 32*u0). main reaches
-    # _rebase_point_splice_reads for this same shape via
-    # coarse_tile_pre_stickify (_coarse_tile_common calls it unconditionally
-    # at the end of planning), which this branch never calls for
-    # WhileLoop-splice groups -- see this function's own docstring. Without
-    # this call the raw indirect symbol survives into
+    # in-body page index, dep.index == 32*u0). coarse_tile_post_stickify
+    # reaches _rebase_point_splice_reads for this same shape, but WhileLoop-
+    # splice groups never go through it -- see this function's own docstring.
+    # Without this call the raw indirect symbol survives into
     # propagate_spyre_tensor_layouts, which rejects it (not an
     # iteration_space key). Run once, after every level's stamping has been
     # merged in above, so squeezed_advance_per_read reflects each op's final,

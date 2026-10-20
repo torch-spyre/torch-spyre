@@ -56,6 +56,9 @@ from indirect_access_common import (  # noqa: E402
 )
 
 from torch_spyre._C import DataFormats  # noqa: E402
+from torch_spyre._inductor.indirect_access import (
+    compute_indirect_max_dim_sizes,
+)
 from torch_spyre._inductor.op_spec import (  # noqa: E402
     IndirectAccess,
     LoopSpec,
@@ -331,6 +334,64 @@ class TestDetectionHelpers(IndirectAccessTestCase):
         a = self._op([_tensor_arg(True, [IndirectAccess(sympy.Symbol("ia"))])])
         b = self._op([_tensor_arg(True, [IndirectAccess(sympy.Symbol("ib"))])])
         self.assertEqual(indirect_access_target_names([a, b]), {"ia", "ib"})
+
+
+class TestIndirectAllocationBounds(IndirectAccessTestCase):
+    def test_index_table_singleton_uses_per_trip_extent(self):
+        row, width, visit = sympy.symbols("row width visit")
+        mb, x, out = sympy.symbols("mb x out")
+        mapping = {row: mb, width: x, visit: out}
+        for capacity in (4, 16, 2048):
+            for is_input in (False, True):
+                with self.subTest(capacity=capacity, gather=is_input):
+                    indices = TensorArg(
+                        is_input=True,
+                        arg_index=0,
+                        device_dtype=DataFormats.IEEE_INT32,
+                        device_size=[1, capacity, 2, 32],
+                        device_coordinates=[
+                            sympy.Integer(0),
+                            visit,
+                            sympy.floor(row / 32),
+                            sympy.Mod(row, 32),
+                        ],
+                        allocation={},
+                        name="indices",
+                    )
+                    values = TensorArg(
+                        is_input=is_input,
+                        arg_index=1,
+                        device_dtype=DataFormats.SEN169_FP16,
+                        device_size=[1, 1, 129, 64],
+                        device_coordinates=[
+                            sympy.floor(width / 64),
+                            visit,
+                            IndirectAccess(sympy.Symbol("indices")),
+                            sympy.Mod(width, 64),
+                        ],
+                        allocation={},
+                    )
+                    op = OpSpec(
+                        op="identity",
+                        is_reduction=False,
+                        iteration_space={row: (64, 2), width: (64, 1), visit: (1, 1)},
+                        args=[indices, values],
+                        op_info={},
+                    )
+                    self.assertEqual(
+                        compute_indirect_max_dim_sizes(
+                            1, out, x, 1, 1, op, mapping, {0}, {}, None
+                        ),
+                        1,
+                    )
+                    # A real multi-row index dimension must retain its bound.
+                    op.iteration_space[visit] = (capacity, 1)
+                    self.assertEqual(
+                        compute_indirect_max_dim_sizes(
+                            1, out, x, 1, capacity, op, mapping, {0}, {}, None
+                        ),
+                        capacity,
+                    )
 
 
 # ===========================================================================

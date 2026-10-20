@@ -82,6 +82,30 @@ for compute-heavy matmul layers.
 prof.export_chrome_trace("spyre_trace.json")
 ```
 
+The standard Kineto export includes CPU-to-`aiuSubmitToHardware` flow arrows,
+using external correlation IDs carried through the runtime queue. Each
+submission has a zero-duration `aiuCpuLaunch` marker on its originating CPU
+operation's lane and timestamp. These markers allow one CPU operation to link
+to multiple hardware batches without changing the CPU operation or its timing.
+Separate flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
+to the device activity.
+
+Missing CPU origins, calibration traffic, and correlation IDs that Kineto's
+32-bit lookup cannot represent do not receive CPU-to-submit arrows. The full
+external correlation ID remains in the runtime event metadata. No links are
+inferred from timestamp proximity.
+
+JSON, `.json.gz`, and scheduled exports all use the normal PyTorch API, for
+example `on_trace_ready=lambda p: p.export_chrome_trace(f"trace-{p.step_num}.json")`.
+
+Runtime activities use OS thread IDs, matching PyTorch's CPU lanes. Calibration
+activities share a logical `Spyre calibration (device N)` lane; their
+`host_thread` metadata preserves the actual emitting thread. Its DMA activity
+is calibration traffic, not model input transfer.
+
+These runtime records require matching Flex, libaiupti, and torch-spyre builds.
+Rebuild all three together after changing the activity record layout.
+
 See [Trace analysis](trace_analysis.md) for viewing.
 
 ### Compiled-kernel provenance names
@@ -138,6 +162,21 @@ metadata:
   IDs are strings, and JavaScript consumers must keep them as strings rather
   than coercing them to numbers.
 
+Kernel and memcpy events include `args.timestamp_source`, with the value
+`calibrated` or `estimated (host completion, 1 ns/tick)`. Before device clock
+calibration is ready, the decoder estimates placement by anchoring elapsed device
+ticks (assuming 1 ns per tick) at host completion; absolute placement is approximate.
+Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
+calibration during model loading/warmup when calibrated timings are needed from
+the beginning of the capture. The default starts calibration on a profiling session.
+
+Memory management events use `args.timestamp_source = "host"`. This includes
+`Memset (Device)` (libaiupti's representation of memory allocation),
+`Memory (Release)`, and the `[memory]` instant events. Their timestamps come from
+the host clock and do not depend on device-clock calibration. Libaiupti's memset
+and memory records therefore do not carry the `timestamps_estimated` flag used
+by compute and memcpy records.
+
 Kernel events (and, once counters are available, memcpy events) carry
 `args.cycles_ts`, a JSON array of five raw device timestamps
 `[TS1, TS2, TS3, TS4, TS5]` recorded at the pipeline stage boundaries:
@@ -183,17 +222,23 @@ wrong attribution rather than an explicit missing join.
 The full reference is in the upstream
 [PyTorch profiler documentation][torch-profiler-docs]:
 
-- `record_function` — annotate named spans
-- `schedule` — skip warmup, sample a bounded window
-- `on_trace_ready` — stream to TensorBoard-compatible JSON
-- `with_stack` — include file and line for Python ops
+- `record_function`: annotate named spans
+- `schedule`: skip warmup, sample a bounded window
+- `on_trace_ready`: stream to TensorBoard-compatible JSON
+- `with_stack`: include file and line for Python ops
 
 ## Communication events
+
+Queue waits, manager setup, HDMA resets, and socket barriers have separate
+`aiuComms*` spans.
 
 Host-side communication spans emitted by spyre-comms appear in the trace
 under `aiuComms*` names. Collectives such as allreduce, allgather, and
 broadcast, together with the send, receive, and transfer operations beneath
-them, are recorded alongside compute kernels on multi-AIU runs.
+them, are recorded alongside compute kernels on multi-AIU runs. These spans and
+the per-launch `aiuSubmitToHardware` marker are host-side runtime activities, so
+they render on `Thread {N}` rows rather than the `Stream {N}` compute rows; see
+[Trace analysis](trace_analysis.md) for the row layout.
 
 ## See also
 

@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS artifact_subscriptions
     payload_fields  Array(String),
     credential_id   String DEFAULT '',
     owner           String DEFAULT '',
+    updated_by      String DEFAULT '',       -- the login that wrote this version
     notes           String DEFAULT '',
     props           Map(LowCardinality(String), String),
     audit_uuid      UUID DEFAULT generateUUIDv7(),
@@ -75,6 +76,50 @@ CREATE TABLE IF NOT EXISTS artifact_subscriptions
 )
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY subscription_id;
+
+-- Every version ever written: artifact_subscriptions merges older ones away.
+CREATE TABLE IF NOT EXISTS artifact_subscription_versions
+(
+    subscription_id String,
+    updated_at      DateTime64(3, 'UTC'),
+    enabled         Bool,
+    event_types     Array(LowCardinality(String)),
+    tag_family      LowCardinality(String),
+    tag_pattern     String,
+    tag_props       Map(String, String),
+    exclude_families     Array(String),
+    exclude_tag_patterns Array(String),
+    result_test_types    Array(String),
+    result_states        Array(String),
+    component       LowCardinality(String),
+    arch            LowCardinality(String),
+    kind            LowCardinality(String),
+    artifact_name   String,
+    not_before      DateTime64(3, 'UTC'),
+    require         Array(String),
+    unless_exists   Array(String),
+    max_per_hour    UInt32,
+    max_per_day     UInt32,
+    coalesce_minutes UInt32,
+    target_type     LowCardinality(String),
+    target          String,
+    params          Map(String, String),
+    payload_fields  Array(String),
+    credential_id   String,
+    owner           String,
+    updated_by      String,
+    notes           String,
+    props           Map(LowCardinality(String), String),
+    audit_uuid      UUID,
+    audit_timestamp DateTime64(3)
+)
+ENGINE = MergeTree()
+ORDER BY (subscription_id, updated_at);
+
+-- SELECT *, not a column list: the applier creates MVs before migrations add columns to the source.
+CREATE MATERIALIZED VIEW IF NOT EXISTS artifact_subscription_versions_mv
+TO artifact_subscription_versions AS
+SELECT * FROM artifact_subscriptions;
 
 
 -- Human or pipeline-initiated runs: "run this subscription against this artifact". Append-only;

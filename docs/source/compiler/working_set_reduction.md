@@ -89,7 +89,8 @@ def for_each_tile(
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of each returned output leaf. Tiles may be a tensor or a pytree of
+            tensors. ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
 
     Returns:
@@ -117,6 +118,34 @@ that a purely elementwise tiling doesn't need: `init` threads a **carry**
 each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently: a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
+
+Output leaves may have different ranks; `out_dim` is normalized separately for
+each leaf and must name an existing axis in every output tile. Scalar output
+tiles have no axis to concatenate; return a length-one tensor instead.
+As with `scan`, output leaves must not alias inputs or one another: returning
+`(y, y)` for a computed tile `y` is invalid; use `(y, y.clone())` instead.
+
+A functional `index_copy` into a carried output preserves its caller's initializer.
+The compiler removes a full carry clone only when its addresses, shape, strides
+and offset are unchanged, including the scatter target's view, and no other body
+operation still reads the old carry placeholder. Later readers of the old value
+are redirected to a pre-update snapshot by `splice_while_loop` before this check.
+If the scatter destination needs a layout conversion, both the copy-in and
+copy-back remain inside the counted loop so other carry readers see each update.
+
+For a counted loop over an int32 index table `[trips, rows]`, each visited row
+must begin at a stick boundary and its sticks must be adjacent. With `rows` a
+multiple of 32, use a `SpyreTensorLayout` with
+`device_size=[trips, rows // 32, 32]` and `stride_map=[rows, 32, 1]`. A default
+interleaved layout such as `[rows // 32, trips, 32]` inserts other trips between
+the row's sticks and is unsupported when both outer axes have extent greater
+than one. `SpyreKernel._check_indirect_index_step` rejects this layout during
+code generation; it previously could produce incorrect rows without an error.
+
+Partial scatter carries deliberately have no `LoopCarryRecord`: that record
+opts full-buffer accumulators into LX residency. Scatter destinations remain
+in HBM, with mutation dependencies preserving their lifetime across iterations,
+including when `LX_PLANNING=1` and `HBM_POOL_PLANNING=1`.
 
 Set `SPYRE_BACKEND_LOOP_UNROLL=0` before importing torch-spyre to preserve counted
 loops in the SDSC-bundle backend. Unrolling is enabled by default. Values

@@ -148,12 +148,6 @@ class DtypeOpTable:
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
     _TYPECAST_OP_DTYPES = set(_TYPECAST_OPS_TABLE.keys())
 
-    # Typecast ops that change the physical stick element ordering, as opposed to
-    # IDENTITY_OP (a same-width byte copy). Reading a reordering op's output back
-    # over a DMA-copied host buffer with a different HBM ordering yields shuffled
-    # elements, so host bool InputBuffers feeding one must fall back to CPU.
-    _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
-
     _FP16_TYPES = [torch.float16, torch.bfloat16]
     _EA_MAP = _build_ea_map(_FP16_TYPES)
 
@@ -180,18 +174,6 @@ class DtypeOpTable:
         return cls.get_operator(equivalent_src_dtype, dst_dtype)
 
     @classmethod
-    def bool_host_conversion_reorders_sticks(cls, dst_dtype: torch.dtype) -> bool:
-        """Whether converting a host (fp16-format) bool to dst_dtype reorders sticks.
-
-        Host bool InputBuffers are DMA-copied in the fp16 physical format
-        (SEN169_FP16). A reordering typecast (e.g. DL16TOFP32 for bool->fp32)
-        reads that DMA layout back shuffled, so the caller must fall back to CPU;
-        an IDENTITY byte-copy (e.g. bool->fp16) is safe.
-        """
-        op = cls.get_bool_src_operator(DataFormats.SEN169_FP16, dst_dtype)
-        return op in cls._STICK_REORDERING_OPS
-
-    @classmethod
     def is_supported(cls, src_dtype: torch.dtype, dst_dtype: torch.dtype) -> bool:
         """Whether Spyre can natively perform this dtype conversion.
 
@@ -202,6 +184,8 @@ class DtypeOpTable:
         (see get_bool_src_operator), so the pair is accepted only if *every*
         format converts to dst_dtype; the codegen (spyre_kernel.to_dtype),
         which resolves from the one real device_dtype, then always finds an op.
+        bool -> int32/int64 has an op only from float32, so the to_dtype
+        lowering converts through float32 instead.
         """
         if src_dtype == torch.bool:
             return all(

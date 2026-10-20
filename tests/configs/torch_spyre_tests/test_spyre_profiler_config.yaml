@@ -1,6 +1,8 @@
 test_suite_config:
   labels: [trunk]
   files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_trace_export.py
+      unlisted_test_mode: mandatory_success
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_spyre_profiler.py
       unlisted_test_mode: mandatory_success
       tests:
@@ -33,4 +35,5 @@ test_suite_config:
             - test_find_duplicate_kernel_start_timestamps
             - test_find_duplicate_kernel_start_timestamps_invalid_events
             - test_duplicate_kernel_start_timestamps
+            - test_non_collective_activities_have_no_coll_args
           mode: mandatory_success
