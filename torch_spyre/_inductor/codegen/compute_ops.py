@@ -1587,9 +1587,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
@@ -1605,9 +1602,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
