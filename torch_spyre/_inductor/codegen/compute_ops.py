@@ -1802,7 +1802,6 @@ def generate_sdsc(
                             str(sym_id): pytorch_sym
                             for pytorch_sym, sym_id in dim_local_symbols.items()
                         },
-                        "symbolDefinitions_": {},
                     }
                     if symbolic_dims
                     else {}
