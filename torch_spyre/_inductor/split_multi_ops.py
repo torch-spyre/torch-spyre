@@ -65,6 +65,7 @@ _OPS_WITH_CONSTANT_ARGS = frozenset(
         "bitwise_left_shift",
         "bitwise_right_shift",
         "rotl16i16",
+        "rotlxori16",
     }
 )
 
