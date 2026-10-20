@@ -37,6 +37,7 @@ FP32TOINT32_OP = "fp32toint32"
 INT32TOFP32_OP = "int32tofp32"
 I16TOFP32_OP = "i16tofp32"
 ROTL16I16_OP = "rotl16i16"
+ROTLXORI16_OP = "rotlxori16"
 
 DEVICE_NAME = "spyre"
 
@@ -197,6 +198,7 @@ SPYRE_INT16_OPS = [
     "to_dtype",
     I16TOFP32_OP,
     ROTL16I16_OP,
+    ROTLXORI16_OP,
 ]
 
 # FP8 E4M3 numeric limits

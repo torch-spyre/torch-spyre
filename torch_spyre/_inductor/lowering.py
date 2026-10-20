@@ -2536,6 +2536,25 @@ def lower_rotl16i16(x, n):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.rotlxori16)
+def lower_rotlxori16(x, y, n):
+    fn = lowering.ops_wrapper(torch.ops.spyre.rotlxori16.__name__)
+
+    def inner_fn(index):
+        return fn(x.make_loader()(index), y.make_loader()(index), n)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """
