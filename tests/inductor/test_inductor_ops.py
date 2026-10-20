@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import functools
 import math
 import os
@@ -9636,28 +9635,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         fn, call_args = _pattern_resolve(variant, args)
         atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
-        # The ViT attention with a CLS token has an unaligned token dim. In eager
-        # mode the planner splits it across cores for the softmax kernel, and the
-        # backend cannot mask that (#5285), so dbo-opt rejects it. Compiled, the
-        # softmax ops are no longer pinned by the padding's offset write, so the
-        # co-optimizing allocator divides them over batch and heads instead.
-        with (
-            pytest.raises(
-                Exception,
-                match="Cannot currently apply coordinate masking for dimensions "
-                "split across cores",
-            )
-            if variant == "vit_attention_cls_token" and execution_mode == "eager"
-            else contextlib.nullcontext()
-        ):
-            compare_with_cpu(
-                fn,
-                *call_args,
-                atol=atol,
-                rtol=rtol,
-                run_compile=(execution_mode == "compiled"),
-                run_eager=(execution_mode == "eager"),
-            )
+        compare_with_cpu(
+            fn,
+            *call_args,
+            atol=atol,
+            rtol=rtol,
+            run_compile=(execution_mode == "compiled"),
+            run_eager=(execution_mode == "eager"),
+        )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
