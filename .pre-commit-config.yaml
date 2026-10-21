@@ -14,7 +14,7 @@ repos:
     rev: v0.9.31
     hooks:
       - id: pymarkdown
-        exclude: .*\.inc\.md|\.claude/skills/.*
+        exclude: .*\.inc\.md|\.claude/skills/.*|\.agents/skills/.*
         args: [fix]
   # v1.7.7 enforced the OLD workflow_dispatch cap of 10 inputs; GitHub raised it to 25 in
   # Dec 2025. v1.7.12 knows the current limit, and additionally rejects `type:` on composite
@@ -92,6 +92,13 @@ repos:
         types: [python]
         pass_filenames: false
         additional_dependencies: [regex]
+      - id: check-agent-context
+        name: Validate agent context structure
+        entry: python tools/check_agent_context.py
+        language: python
+        additional_dependencies: [PyYAML, regex]
+        files: (^|/)(AGENTS\.md|CLAUDE\.md|\.pre-commit-config\.yaml)|(^|/)\.claude/skills/.*|(^|/)\.agents/.*
+        pass_filenames: false
       # Keep `suggestion` last
       - id: suggestion
         name: Suggestion

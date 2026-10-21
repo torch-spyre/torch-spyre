@@ -33,6 +33,7 @@ import contextlib
 import getpass
 import hashlib
 import json
+import math
 import netrc
 import os
 import platform
@@ -56,20 +57,29 @@ FAILED, REJECTED, INCOMPLETE = 1, 2, 3
 STATUS = {FAILED: "failed", REJECTED: "rejected", INCOMPLETE: "incomplete"}
 MANUAL_PREFIX = "manual:"
 # kind -> the extension of its results/ files.
-KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt"}
+KINDS = {"junit": ".xml", "vllm": ".json", "sendnn": ".txt", "benchmarks": ".json"}
 # kinds whose test_type is always perf
 PERF_KINDS = ("vllm", "sendnn")
+# A benchmarks bundle's tiers: perf numbers, or accuracy evals.
+BENCHMARK_TEST_TYPES = ("perf", "quality")
 VLLM_COMPONENT = "spyre-inference"
-RUN_MODES = ("latency", "throughput", "serve")
+# serving: a concurrency sweep (serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>).
+RUN_MODES = ("latency", "throughput", "serve", "serving")
+# Name token prefix -> identity key, as vllm.parse_input_shapes reads it; the last four only
+# in sweep names, so they key a benchmark only there.
+SHAPE_PREFIXES = (
+    ("tp", "tensor_parallel"), ("in", "input_len"), ("out", "output_len"),
+    ("c", "concurrency"), ("n", "num_prompts"), ("len", "max_model_len"), ("seqs", "max_num_seqs"),
+)  # fmt: skip
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
 VLLM_SIGNATURES = (
     "avg_latency", "requests_per_second", "tokens_per_second", "request_throughput",
     "output_throughput",
 )  # fmt: skip
 ARTIFACT_KEYS = ("artifact_id", "image", "artifact")
-BASE_URL = "https://na.artifactory.swg-devops.com/artifactory"
-REPO = "sys-ai-sw-accel-team-cos-dev-generic-local"
-ROOT = "zsp/next/{arch}/v2-results"
+ENV_BASE_URL = "ARTIFACTORY_BASE_URL"
+ENV_REPO = "ARTIFACTORY_V2_RESULTS_REPO"
+ENV_ROOT = "ARTIFACTORY_V2_RESULTS_ROOT"  # a path template with {arch}
 WAIT_MINUTES = 40
 POLL_SECONDS = 30
 
@@ -187,11 +197,24 @@ def bundle_name(meta: dict, digest: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", key) + "-" + meta["test_type"]
 
 
-def upload_path(meta: dict, digest: str, inbox: str = "inbox") -> str:
+def setting(value: str, flag: str, env: str) -> str:
+    """`value`, else $env; a deployment-specific setting has no built-in default."""
+    value = value or os.environ.get(env, "")
+    if not value:
+        raise BundleError(f"no {flag}: pass it or set ${env}", FAILED)
+    return value
+
+
+def results_root(meta: dict, root: str = "") -> str:
+    """The v2-results folder for the bundle's arch; a placeholder when unconfigured, for display."""
+    root = root or os.environ.get(ENV_ROOT, "") or f"<{ENV_ROOT}>"
+    return root.format(arch=meta.get("arch") or "any")
+
+
+def upload_path(meta: dict, digest: str, inbox: str = "inbox", root: str = "") -> str:
     """Its inbox folder under the generic repo; a .tgz goes at this path + .tgz."""
     key = meta.get("artifact_id") or min(inbox_keys(meta), default="<artifact_id>")
-    root = ROOT.format(arch=meta.get("arch") or "any")
-    return f"{root}/{inbox}/{key}/{bundle_name(meta, digest)}"
+    return f"{results_root(meta, root)}/{inbox}/{key}/{bundle_name(meta, digest)}"
 
 
 def sha256(path: Path) -> str:
@@ -250,14 +273,11 @@ def read_records(path: Path) -> list:
 
 
 def shapes(name: str) -> dict:
-    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len}, as the ingest reads them."""
+    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len} (and a sweep's c/n/len/seqs),
+    as the ingest reads them."""
     out = {}
     for token in name.split("_"):
-        for prefix, key in (
-            ("tp", "tensor_parallel"),
-            ("in", "input_len"),
-            ("out", "output_len"),
-        ):
+        for prefix, key in SHAPE_PREFIXES:
             rest = token[len(prefix) :]
             if token.startswith(prefix) and rest.isdigit():
                 out[key] = rest
@@ -282,6 +302,76 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
         clash = [k for k in got if perf.get(k, got[k]) != got[k]]
         if clash:
             raise BundleError(f"{p}: its name's {clash} differ from perf {clash}")
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def benchmark_entries(path: Path) -> list:
+    """A benchmarks results file's rows, each checked; raises BundleError on the first bad one."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise BundleError(f"{path.name}: not JSON: {err}") from None
+    rows = data.get("benchmarks") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise BundleError(f'{path.name}: needs a non-empty "benchmarks" list')
+    for i, b in enumerate(rows):
+        where = f"{path.name} benchmarks[{i}]"
+        if (
+            not isinstance(b, dict)
+            or not isinstance(b.get("name"), str)
+            or not b["name"].strip()
+        ):
+            raise BundleError(f"{where}: needs a name")
+        unknown = set(b) - {
+            "name",
+            "props",
+            "backend",
+            "measurements",
+            "iterations",
+            "run_props",
+            "tags",
+        }
+        if unknown:
+            raise BundleError(f"{where}: unknown key(s) {sorted(unknown)}")
+        for key in ("props", "run_props"):
+            m = b.get(key, {})
+            if not isinstance(m, dict) or not all(
+                isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                for v in m.values()
+            ):
+                raise BundleError(f"{where}: {key} maps names to strings or numbers")
+        m = b.get("measurements")
+        if not isinstance(m, dict) or not m:
+            raise BundleError(f"{where}: needs measurements")
+        for k, v in m.items():
+            values = v if isinstance(v, list) else [v]
+            if not values or not all(_finite(x) for x in values):
+                raise BundleError(
+                    f"{where}: measurements[{k!r}] must be finite numbers"
+                )
+        if not isinstance(b.get("backend", ""), str) or not isinstance(
+            b.get("tags", []), list
+        ):
+            raise BundleError(f"{where}: backend is a string and tags a list")
+        n = b.get("iterations", 0)
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise BundleError(f"{where}: iterations is a count")
+    return rows
+
+
+def check_benchmarks(root: Path, meta: dict, results: list) -> None:
+    """Each results/*.json is a list of generic benchmark rows, for a perf or quality tier."""
+    if meta["test_type"] not in BENCHMARK_TEST_TYPES:
+        raise BundleError(
+            f"a benchmarks bundle is test_type {' or '.join(BENCHMARK_TEST_TYPES)}"
+        )
+    if not meta.get("component"):
+        raise BundleError("a benchmarks bundle names its component (the suite's owner)")
+    for p in results:
+        benchmark_entries(root / p)
 
 
 def check_sendnn(root: Path, meta: dict, results: list) -> None:
@@ -327,6 +417,10 @@ def check(root: Path) -> dict:
         raise BundleError(f"{BUNDLE_FILE}: needs artifact_id or image")
     if meta.get("image") and not meta.get("artifact_id") and not meta.get("arch"):
         errors.append("an image names its artifact only with arch")
+    if meta.get("create_artifact") and not (meta.get("image") and meta.get("arch")):
+        errors.append(
+            "create_artifact records an image: it needs image (by digest) and arch"
+        )
     kind = meta.get("kind", "junit")
     meta["test_type"] = meta.get("test_type") or ("perf" if kind in PERF_KINDS else "")
     if not meta["test_type"]:
@@ -382,6 +476,8 @@ def check(root: Path) -> dict:
         check_vllm(root, meta, results)
     elif kind == "sendnn":
         check_sendnn(root, meta, results)
+    elif kind == "benchmarks":
+        check_benchmarks(root, meta, results)
     elif sum(count_cases(root / p) for p in results) == 0:
         raise BundleError(
             "no <testcase> in any results/*.xml: the bundle records nothing"
@@ -466,7 +562,13 @@ def _arch(value: str) -> str:
 def write(args) -> Path:
     """The bundle these `results` flags describe, written to --out (a folder, or a .tgz)."""
     kind = "vllm" if (args.kind == "vllm" or args.vllm_results_dir) else args.kind
-    if kind == "sendnn":
+    if getattr(args, "benchmarks_dir", ""):
+        kind = "benchmarks"
+    if kind == "benchmarks":
+        if not args.benchmarks_dir:
+            raise BundleError("--kind benchmarks needs --benchmarks-dir")
+        results, extra = sorted(Path(args.benchmarks_dir).glob("*.json")), []
+    elif kind == "sendnn":
         if not args.sendnn_report:
             raise BundleError("--kind sendnn needs --sendnn-report <report_sendnn.txt>")
         results, extra = [Path(args.sendnn_report)], []
@@ -539,7 +641,7 @@ def write(args) -> Path:
         file=sys.stderr,
     )
     print(
-        f"[info] inbox path: {upload_path(checked, dig, args.inbox)}{'.tgz' if tgz else '/'}",
+        f"[info] inbox path: {upload_path(checked, dig, args.inbox, args.root)}{'.tgz' if tgz else '/'}",
         file=sys.stderr,
     )
     return out
@@ -566,7 +668,8 @@ class Artifactory:
     """PUT and GET against the generic repo, with retries; auth from a token or ~/.netrc."""
 
     def __init__(self, base: str, repo: str, token: str = ""):
-        self.base, self.repo = base.rstrip("/"), repo
+        self.base = setting(base, "--base-url", ENV_BASE_URL).rstrip("/")
+        self.repo = setting(repo, "--repo", ENV_REPO)
         user = os.environ.get("ARTIFACTORY_USER", "")
         token = token or os.environ.get("ARTIFACTORY_TOKEN", "")
         if not token:
@@ -630,9 +733,10 @@ class Artifactory:
 def upload(path: Path, args) -> str:
     """PUT the bundle into its inbox (a .tgz, unless --as-folder); returns where it went."""
     art = Artifactory(args.base_url, args.repo, args.token)
+    results = setting(args.root, "--root", ENV_ROOT)
     with opened(path) as root:
         meta, dig = check(root), digest(root)
-        dest = upload_path(meta, dig, args.inbox)
+        dest = upload_path(meta, dig, args.inbox, results)
         if args.as_folder:
             # bundle.json last: the relay takes a folder only once it is there.
             for p in [*bundle_files(root), BUNDLE_FILE]:
@@ -647,19 +751,17 @@ def upload(path: Path, args) -> str:
                 )
     print(f"[info] uploaded {url}", file=sys.stderr)
     if args.wait:
-        return wait(art, meta, dig, args.wait, args.as_folder, args.inbox)
+        return wait(art, meta, dig, args.wait, args.as_folder, args.inbox, results)
     return json.dumps({"status": "uploaded", "url": url, "bundle_sha256": dig})
 
 
 def wait(
-    art, meta: dict, dig: str, minutes: int, as_folder=False, inbox="inbox"
+    art, meta: dict, dig: str, minutes: int, as_folder=False, inbox="inbox", results=""
 ) -> str:
     """Poll until the relay has moved the bundle to processed/ or rejected/, beside the inbox."""
     key = meta.get("artifact_id") or min(inbox_keys(meta))
     parent = inbox.rpartition("/")[0]
-    root = ROOT.format(arch=meta.get("arch") or "any") + (
-        f"/{parent}" if parent else ""
-    )
+    root = results_root(meta, results) + (f"/{parent}" if parent else "")
     stem = bundle_name(meta, dig)
     name = stem if as_folder else stem + ".tgz"
     deadline = time.time() + minutes * 60
@@ -715,13 +817,17 @@ def add_offline_options(parser) -> None:
         default="",
         help="Artifactory token; default $ARTIFACTORY_TOKEN, else ~/.netrc",
     )
-    g.add_argument("--base-url", default=BASE_URL)
+    g.add_argument(
+        "--base-url", default="", help=f"Artifactory URL; default ${ENV_BASE_URL}"
+    )
     g.add_argument(
         "--inbox",
         default="inbox",
-        help="under v2-results/; a trial uses inbox-test/inbox",
+        help="under the results root; a trial uses inbox-test/inbox",
     )
-    g.add_argument("--repo", default=REPO)
+    g.add_argument("--repo", default="", help=f"generic repo; default ${ENV_REPO}")
+    g.add_argument("--root", default="",
+                   help=f"results folder template with {{arch}}; default ${ENV_ROOT}")  # fmt: skip
     g.add_argument("--kind", choices=tuple(KINDS), default="junit")
     g.add_argument(
         "--vllm-results-dir", default="", help="vLLM bench *.json (implies --kind vllm)"
@@ -730,6 +836,11 @@ def add_offline_options(parser) -> None:
         "--sendnn-report",
         default="",
         help="--kind sendnn: the perf suite's report_sendnn.txt",
+    )
+    g.add_argument(
+        "--benchmarks-dir",
+        default="",
+        help='--kind benchmarks: *.json of {"benchmarks": [...]} rows (implies --kind benchmarks)',
     )
     g.add_argument("--perf", action="append", type=_pair, default=[],
                    help="vllm run context k=v: model, tensor_parallel, input_len, output_len, cards, "

@@ -1008,13 +1008,6 @@ class _GatherScenarios:
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
 
-    @pytest.mark.skip(
-        reason=(
-            "backend compiler crash: std::out_of_range (map::at) — "
-            "multiple gathers sharing the same index tensor in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_multiple_indices_same_kernel(self):
         """Test x[i] + y[i] - multiple gathers with same index in one kernel.
 
@@ -1031,13 +1024,6 @@ class _GatherScenarios:
 
         self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "RuntimeError: StreamInErrorState — cannot launch D2H; "
-            "multiple gathers with different index tensors in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_different_indices_same_kernel(self):
         """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
 

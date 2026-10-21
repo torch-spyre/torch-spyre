@@ -461,7 +461,18 @@ _DEVICE_INTEGRAL_DTYPES = [
     pytest.param(torch.int32, False, id="int32"),
     pytest.param(torch.int64, True, id="int64"),
     pytest.param(torch.int8, True, id="int8"),
-    pytest.param(torch.bool, True, id="bool"),
+    pytest.param(
+        torch.bool,
+        False,
+        id="bool",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=AssertionError,
+            reason="the float32 result is staggered and read back without "
+            "restoring its order (#4393), and its 17-wide rows are not padded to "
+            "whole stick pairs (#3999)",
+        ),
+    ),
 ]
 
 
@@ -475,8 +486,8 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     runs on device for every integral dtype and only the *input cast* differs.
     int32 -> fp32 is element-size preserving, so no stick reordering is emitted
     and the promotion costs nothing in layout terms -- nothing offloads at all.
-    int64 / int8 -> fp32 and bool -> fp32 do offload the cast, for reasons that
-    differ per dtype and none of which is cos/sin's:
+    int64 / int8 -> fp32 do offload the cast, for reasons that differ per dtype
+    and neither of which is cos/sin's:
 
     * int64 has no *distinct* device representation today: int32 is its only
       physical form (H2D downcasts it -- "Backend Spyre does not support int64" in
@@ -498,14 +509,9 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
       is the plain one: ``DtypeOpTable`` carries no int8 -> fp32 entry at all, so
       the cast has nowhere to go but CPU.  The promoted polynomial still runs on
       device and the result matches aten.
-    * bool -> fp32 *is* supported (``is_supported`` returns True, via
-      ``dl16tofp32``).  It offloads here because these inputs are *host* bools:
-      a DMA-copied bool InputBuffer has a different HBM element ordering, and
-      ``dl16tofp32`` reorders sticks, so ``to_dtype`` in
-      ``_inductor/lowering.py`` deliberately routes that one case to CPU rather
-      than read the buffer back shuffled.  A device-computed bool takes the
-      native path, and bool -> fp16 is an IDENTITY byte copy that is safe even
-      from host.  So this offload is a correctness guard, not a gap.
+    * bool -> fp32 runs on device (``dl16tofp32``) and does not offload, but its
+      float32 result is staggered, and a staggered graph output is read back
+      without restoring its order (#4393), so the bool case is a strict xfail.
 
     The split is visible in ``output_code.py`` under ``TORCH_COMPILE_DEBUG=1``,
     and it is the *only* difference between these dtypes: the FX graph is
@@ -513,8 +519,8 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     ``prims.convert_element_type(arg0_1, torch.float32)`` node ahead of the
     polynomial nodes -- so the divergence is entirely in how that one node
     lowers.  int32 fuses it into the kernel as ``OpSpec(op='int32tofp32')`` at op
-    #0, widening ``IEEE_INT32`` straight into LX at no HBM cost; int64 / int8 /
-    host-bool instead emit
+    #0, widening ``IEEE_INT32`` straight into LX at no HBM cost; int64 / int8
+    instead emit
     ``buf0 = torch.ops.spyre.to_dtype_cpu.default(arg0_1, torch.float32)`` in
     ``call()`` ahead of the kernel, whose OpSpec list then starts at ``mul``.
     Recorded for future reference rather than as a task: it is a D2H+H2D round
@@ -525,8 +531,8 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
 
     ``cast_offloads`` records which dtypes offload, and the allowance is by
     warning text so a cos/sin offload still fails the test.  Either way it is the
-    cast op's business, not this decomposition's: cos/sin of an int64 or bool
-    tensor works, and the assertions below check dtype and value against aten.
+    cast op's business, not this decomposition's: cos/sin of an int64 tensor
+    works, and the assertions below check dtype and value against aten.
     For int64 the only real caveat is the range Spyre supports at all, since H2D
     truncates int64 to int32 before any op sees the tensor.
 

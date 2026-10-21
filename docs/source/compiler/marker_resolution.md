@@ -32,10 +32,10 @@ via the `_marker_resolution` accessor -- same attribute-on-op pattern as
 
 ## Why the distinction matters (issue #4581)
 
-Three sites test for "is this a marker" via `_marker_dim(op) is not None`:
-`coarse_tile.py`'s coarse-tile planning and read-copy-planning sites
-correctly mean "any marker, either kind" (a kept marker has nothing for
-either of those passes to do). `_synthesize_dim_hints_for_group`
+Several sites test for "is this a marker" via `_marker_dim(op) is not None`:
+`coarse_tile.py`'s coarse-tile planning site correctly means "any marker,
+either kind" (a kept marker has nothing for that pass to do).
+`_synthesize_dim_hints_for_group`
 (`for_each_tile_lowering.py`) means something narrower -- "skip only a
 marker whose transform has already been fused elsewhere" -- but used the
 same broad test, silently starving a `STAR_DEP_KEPT` marker's own upstream

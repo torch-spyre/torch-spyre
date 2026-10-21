@@ -98,6 +98,20 @@ def test_the_excess_is_linear_in_symbolic_residency_and_can_be_disabled():
     assert _loop_repeated_read_excess_ns([_carry_reader(resident=False)], off) == 0
 
 
+def test_the_excess_follows_a_candidate_tile_count():
+    # The co-optimizer prices a tileable op with its undecided tile count, so an
+    # invariant input's loop factor is a tile-count symbol.
+    tiles = sympy.Symbol("tile_buf21_o0", integer=True, positive=True)
+    p = CostParams()
+    excess = _loop_repeated_read_excess_ns(
+        [_carry_reader(resident=False, loop_factor=tiles)], p
+    )
+    assert excess.subs(tiles, 1) == 0
+    assert excess.subs(tiles, TRIPS) == _loop_repeated_read_excess_ns(
+        [_carry_reader(resident=False)], p
+    )
+
+
 def test_predict_and_explain_include_the_excess():
     p = CostParams()
     spilled, resident = _carry_reader(resident=False), _carry_reader(resident=True)
@@ -247,7 +261,7 @@ def test_burst_price_agrees_before_and_after_replication_is_chosen(broadcast):
 
 def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     replication, split = sympy.symbols(
         "split_bmm_m split_bmm_n", integer=True, positive=True
@@ -374,6 +388,16 @@ def test_unbatched_or_disabled_batch_split_costs_nothing(monkeypatch):
     cm, op = _bmm(monkeypatch, 16, 8, 1024, 1)
     off = dataclasses.replace(CostParams(), mm_batch_split_ns_per_step=0.0)
     assert cm._matmul_batch_split_ns([op], off) == 0
+
+
+def test_batch_split_cost_scales_with_a_candidate_tile_count(monkeypatch):
+    # The co-optimizer prices a tileable op with its undecided tile count.
+    tiles = sympy.Symbol("tiles", integer=True, positive=True)
+    p = CostParams()
+    cm, op = _bmm(monkeypatch, 16, 4, 1024, 2, loop_trip=tiles)
+    assert (
+        cm._matmul_batch_split_ns([op], p) == p.mm_batch_split_ns_per_step * tiles * 2
+    )
 
 
 def test_batch_split_cost_follows_symbolic_splits(monkeypatch):

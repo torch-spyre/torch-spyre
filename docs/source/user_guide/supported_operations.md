@@ -6,6 +6,13 @@ This page lists the PyTorch operations that Torch-Spyre supports via
 For details on how operations are implemented and how to add new ones,
 see [Adding Operations](../compiler/adding_operations.md).
 
+Runnable scripts for several of these operations are in the examples
+directory. See the [attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/attention.py) and the
+[flash attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/flash_attention.py) for scaled
+dot-product attention, the [RMS norm example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/rms_norm.py), the
+[embedding example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/embedding.py), and the
+[FP8 quantization example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fp8.py).
+
 ## Operations Table
 
 | Operation | Eager | Compiled | Execution | Notes |
@@ -15,6 +22,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.matmul` | Y | Y | Spyre | Decomposes to `mm`/`bmm`, both of which have eager kernels |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
+| `torch._grouped_mm` | Y | Y | Spyre | All four upstream shape variants; the ragged ones pack/`bmm`/unpack with host-computed routing tables. BF16 only; `offs` must be a Spyre tensor; raises if routing is too skewed for the static per-expert capacity. |
 | `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
 | `torch.ops.spyre.quantscalepertokenfp8` | | Y | Spyre | Compiled only; no eager fallback. Fused per-token amax + scale computation for FP8 activation quantization |
 | `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Quantize FP16 activation to FP8 using a pre-computed scale (`qfp8ch` layout) |

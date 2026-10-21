@@ -45,13 +45,21 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# The add is correct, but int8 and bool go through a CPU fallback for the conversion to
+# The add is correct, but int8 goes through a CPU fallback for the conversion to
 # float32, which warns, and the helper asserts no warning (#5364).
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="the int8/bool to float32 conversion falls back to the CPU and warns, "
+    reason="the int8 to float32 conversion falls back to the CPU and warns, "
     "and the test asserts no warning (#5364)",
+)
+
+
+# A float16-format bool's float32 or integer result is staggered on device.
+_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="a staggered result is read back without restoring its order (#4393)",
 )
 
 
@@ -302,7 +310,7 @@ class TestSpyre(TestCase):
             )
             self._assert_zero_dim_roundtrip(x, x_cpu, dtype)
 
-    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8/bool: the conversion to float32 warns (#5364).
+    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8: the conversion to float32 warns (#5364).
     # float8: SEN143_FP8 unsupported. float16/float32: pass; ignore known full() CPU fallback warn.
     @parametrize(
         "dtype, scalar_factory, ignored_warning_message",
@@ -315,7 +323,6 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.bool, lambda: torch.tensor(True, dtype=torch.bool), None),
                 name="bool",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
@@ -401,6 +408,30 @@ class TestSpyre(TestCase):
                 x, expect_warning=dtype in dtypes_with_downcast_warning
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(
+                dtype,
+                name=str(dtype).removeprefix("torch."),
+                decorators=[_EAGER_BOOL_READBACK_XFAIL],
+            )
+            for dtype in (torch.float32, torch.int32, torch.int64)
+        ],
+    )
+    def test_eager_bool_to_dtype_readback(self, dtype):
+        # An eager bool converts on device, and the result is read back directly.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = mask.to("spyre").to(dtype).cpu()
+        torch.testing.assert_close(out, mask.to(dtype), atol=0, rtol=0)
+
+    def test_eager_bool_to_float32_consumed(self):
+        # Converting the float32 back to float16 on device restores the order.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = (mask.to("spyre").to(torch.float32) * 2).to(torch.float16).cpu()
+        expected = (mask.to(torch.float32) * 2).to(torch.float16)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
     def test_cross_device_inplace_error_msg(self):
         # Mirrors upstream test_cross_device_inplace_error_msg: the CPU tensor is the write target, so it must raise despite the scalar exemption below.

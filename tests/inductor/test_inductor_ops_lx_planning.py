@@ -182,9 +182,11 @@ def _copy_canonical_tests(
 
 INHERITED_TEST_ATTRIBUTES = [
     "is_dtype_supported",
+    "_run_clamp_cpu",
     # Shared body for the direct-path conv3d cases; the im2col conv3d and gate
     # tests are self-contained, but test_conv3d_via_conv2d_base delegates here.
     "_run_conv3d_via_conv2d",
+    "_assert_bool_to_int_on_device",
 ]
 
 POINTWISE_TEST_FAILURES = []

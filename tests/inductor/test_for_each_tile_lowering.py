@@ -45,8 +45,11 @@ import operator
 import unittest
 from unittest import mock
 
+import pytest
 import torch
 from torch._inductor.virtualized import V
+
+from utils_inductor import expects_raise
 
 from for_each_tile_fixtures import (
     PAGE_HS,
@@ -292,6 +295,50 @@ class TestIndirectIndexStepGuard(unittest.TestCase):
 
         SpyreKernel._check_indirect_index_step(None, self._arg(None))
 
+    @expects_raise
+    def test_interleaved_multi_stick_index_row_is_refused(self):
+        import sympy
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        row, level = sympy.symbols("row L0", integer=True)
+        arg = self._arg(32 * level)
+        arg.device_size = [2, 4, 32]
+        arg.device_coordinates = [
+            sympy.floor(row / 32),
+            sympy.S.Zero,
+            sympy.Mod(row, 32),
+        ]
+        with self.assertRaisesRegex(
+            Unsupported, "index rows require adjacent physical sticks"
+        ):
+            SpyreKernel._check_indirect_index_step(None, arg)
+
+    def test_adjacent_multi_stick_index_row_is_allowed(self):
+        import sympy
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        row, level = sympy.symbols("row L0", integer=True)
+        for sizes, coordinates in (
+            ([4, 2, 32], [0, sympy.floor(row / 32), sympy.Mod(row, 32)]),
+            ([2, 1, 32], [sympy.floor(row / 32), 0, sympy.Mod(row, 32)]),
+            (
+                [2, 2, 32],
+                [
+                    sympy.floor(row / 64),
+                    sympy.Mod(sympy.floor(row / 32), 2),
+                    sympy.Mod(row, 32),
+                ],
+            ),
+        ):
+            with self.subTest(sizes=sizes):
+                arg = self._arg(64 * level)
+                arg.device_size = sizes
+                arg.device_coordinates = [sympy.sympify(c) for c in coordinates]
+                SpyreKernel._check_indirect_index_step(None, arg)
+
 
 class TestPerTripIndex(unittest.TestCase):
     """``per_trip_index`` pins a spliced loop's trip counter to zero.
@@ -359,6 +406,150 @@ class TestPerTripIndex(unittest.TestCase):
 
 
 class TestSpliceWhileLoop(unittest.TestCase):
+    def test_scatter_clone_elision_requires_identity_and_exclusive_reader(self):
+        from torch._inductor import ir
+        from torch._inductor.sizevars import SizeVarAllocator
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        for case in (
+            "identity",
+            "computed_value",
+            "other_input",
+            "ranges",
+            "clone_size",
+            "update_size",
+            "clone_stride",
+            "update_stride",
+            "clone_offset",
+            "update_offset",
+            "dtype",
+            "update_dtype",
+            "indexer",
+            "extra_reader",
+            "unknown_reader",
+            "two_updates",
+        ):
+            with self.subTest(case=case):
+
+                def layout():
+                    return ir.FixedLayout(
+                        torch.device("cpu"), torch.float32, [4, 8], [8, 1]
+                    )
+
+                placeholder = ir.InputBuffer(name="carry", layout=layout())
+                storage = ir.InputBuffer(name="storage", layout=layout())
+                clone_layout = layout()
+                update_layout = layout()
+                if case.startswith("clone_") or (
+                    case.startswith("update_") and case != "update_dtype"
+                ):
+                    which, field = case.split("_")
+                    changed = clone_layout if which == "clone" else update_layout
+                    setattr(
+                        changed,
+                        field,
+                        {"size": [8, 4], "stride": [1, 4], "offset": 1}[field],
+                    )
+                if case == "dtype":
+                    clone_layout.dtype = torch.float16
+                if case == "update_dtype":
+                    update_layout.dtype = torch.float16
+
+                def load(index):
+                    value = V.ops.load(
+                        "other" if case == "other_input" else "carry",
+                        8 * index[0] + index[1] + int(case == "indexer"),
+                    )
+                    return V.ops.neg(value) if case == "computed_value" else value
+
+                clone = ir.ComputedBuffer(
+                    name="clone",
+                    layout=clone_layout,
+                    data=ir.Pointwise(
+                        device=torch.device("cpu"),
+                        dtype=clone_layout.dtype,
+                        inner_fn=load,
+                        ranges=[2, 8] if case == "ranges" else [4, 8],
+                    ),
+                )
+                clone.operation_name = "clone_op"
+                graph = mock.Mock()
+                graph.sizevars = SizeVarAllocator()
+                graph.operations = []
+                graph.graph_outputs = []
+                graph.name_to_buffer = {
+                    "carry": placeholder,
+                    "storage": storage,
+                    "clone": clone,
+                }
+                graph.name_to_op = {"clone_op": clone}
+                graph.get_dtype = lambda name: graph.name_to_buffer[name].get_dtype()
+                while_op = mock.Mock()
+                while_op.body_subgraph.graph.graph_inputs = {"carry": placeholder}
+
+                with V.set_graph_handler(graph):
+                    update = ir.ComputedBuffer(
+                        name="scatter",
+                        layout=ir.MutationLayoutSHOULDREMOVE(
+                            ir.ReinterpretView(
+                                data=ir.StorageBox(clone), layout=update_layout
+                            )
+                        ),
+                        data=ir.Scatter(
+                            device=torch.device("cpu"),
+                            dtype=torch.float32,
+                            ranges=[2, 8],
+                            inner_fn=lambda index: V.ops.load(
+                                "values", 8 * index[0] + index[1]
+                            ),
+                            output_indexer=lambda index: [
+                                V.ops.indirect_indexing(
+                                    V.ops.load("ids", index[0]), 4, check=False
+                                ),
+                                index[1],
+                            ],
+                        ),
+                    )
+                    update.operation_name = "scatter_op"
+                    body = [clone, update]
+                    if case in ("extra_reader", "unknown_reader"):
+                        reader = ir.ComputedBuffer(
+                            name="reader",
+                            layout=layout(),
+                            data=ir.Pointwise(
+                                device=torch.device("cpu"),
+                                dtype=torch.float32,
+                                inner_fn=lambda index: V.ops.load(
+                                    "carry", 8 * index[0] + index[1]
+                                ),
+                                ranges=[4, 8],
+                            ),
+                        )
+                        reader.operation_name = "reader_op"
+                        if case == "unknown_reader":
+                            reader = mock.Mock(spec=["get_read_writes", "inputs"])
+                            reader.inputs = []
+                            reader.get_read_writes = mock.Mock(
+                                side_effect=NotImplementedError
+                            )
+                        body.append(reader)
+                    if case == "two_updates":
+                        body.append(update)
+                    binding = bridge.CarryBinding(0, storage, clone, "scratch")
+                    result = bridge._rewire_accumulator_output(
+                        graph, while_op, binding, body, storage
+                    )
+
+                if case == "identity":
+                    self.assertEqual(result, [update])
+                    self.assertIs(update.layout.get_buffer(), storage)
+                    self.assertFalse(hasattr(storage, "_loop_carry_record"))
+                else:
+                    self.assertIs(result[0], clone)
+                    self.assertIs(clone.layout.get_buffer(), storage)
+                    self.assertEqual(storage._loop_carry_record.update_name, "clone")
+
     def test_accumulator_view_tags_backing_storage(self):
         """A view-backed carry records ownership on its mutable Buffer."""
         from torch._inductor import ir
@@ -1538,7 +1729,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1570,7 +1761,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1609,13 +1800,13 @@ class TestSpliceWhileLoops(unittest.TestCase):
                     self.assertEqual(dep.index.coeff(loop_var), 0)
 
             non_identity_readers = [
-                reader for reader in direct_readers if _identity_load(reader) is None
+                reader for reader in direct_readers if identity_load(reader) is None
             ]
             self.assertEqual(
                 len(non_identity_readers),
                 1,
                 [
-                    (reader.get_name(), _identity_load(reader))
+                    (reader.get_name(), identity_load(reader))
                     for reader in direct_readers
                 ],
             )
@@ -1640,7 +1831,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1682,7 +1873,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1746,7 +1937,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1789,7 +1980,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1900,7 +2091,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
     def test_identity_recognition_declines_an_untraceable_pointwise(self):
         from torch._inductor import ir
 
-        from torch_spyre._inductor.wsr.for_each_tile_lowering import _identity_load
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import identity_load
 
         def unsupported_inner(_index):
             raise RuntimeError("not executable by the identity recorder")
@@ -1918,7 +2109,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             ),
         )
 
-        self.assertIsNone(_identity_load(op))
+        self.assertIsNone(identity_load(op))
 
     def test_identity_chain_declines_a_flat_slice_offset(self):
         import sympy
@@ -2603,6 +2794,32 @@ class TestDrainMaterialization(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_host_counter_stays_integer_under_spyre_comparison_lowering(self):
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _extract_trip_count
+
+        with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+            counter = torch.empty((), dtype=torch.int64, device="cpu")
+            gm = make_fx(lambda i: (i < 16,))(counter)
+            graph = GraphLowering(
+                gm, example_inputs=[counter], shape_env=fake_mode.shape_env
+            )
+            with (
+                V.set_graph_handler(graph),
+                V.set_fake_mode(fake_mode),
+                enable_spyre_lowerings(),
+            ):
+                graph.run(counter)
+                self.assertEqual(_extract_trip_count(graph), 16)
+                self.assertEqual(len(graph.operations), 1)
+                self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
@@ -2778,6 +2995,108 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
             graph.run(*placeholders)
         return graph
+
+    def test_scatter_indexer_preserves_marker_advance_and_read_redirection(self):
+        from for_each_tile_fixtures import scatter_carry_fn
+        from torch._inductor import config, ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.pass_utils import (
+            _scatter_index_buf_names_ordered,
+            redirect_computed_buffer_reads,
+        )
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        args = (
+            torch.randn(4, 32, 64),
+            torch.arange(128).reshape(4, 32),
+            torch.full((192, 64), 3.0),
+        )
+        with (
+            mock.patch("torch.accelerator.is_available", return_value=False),
+            config.patch("force_disable_caches", True),
+        ):
+            graph = self._run_graph(scatter_carry_fn, args)
+
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        proof = try_prove_for_each_tile(while_op)
+        self.assertTrue(proof.accepted)
+        loop_var = _body_loop_var(while_op)
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group = splice_while_loop(
+                graph, while_op, carries, trip_count=proof.trip_count
+            )
+            scatter = next(
+                op
+                for op in group
+                if isinstance(op, ir.ComputedBuffer) and isinstance(op.data, ir.Scatter)
+            )
+            destination = scatter.layout.get_buffer()
+            self.assertEqual(destination.get_name(), graph.graph_outputs[0].get_name())
+            self.assertNotIn(destination, group)
+            self.assertFalse(
+                any(
+                    isinstance(op, ir.ComputedBuffer)
+                    and not isinstance(op.data, ir.Scatter)
+                    and list(op.data.ranges) == [192, 64]
+                    for op in group
+                ),
+                "the output carry must not copy all rows on every trip",
+            )
+            for dep in scatter.get_read_writes().reads:
+                if isinstance(dep, MemoryDep):
+                    self.assertNotIsInstance(
+                        graph.get_buffer(dep.name).get_layout(),
+                        ir.MutationLayoutSHOULDREMOVE,
+                    )
+            (marker_name,) = _scatter_index_buf_names_ordered(scatter)
+            marker = graph.name_to_buffer[marker_name]
+            self.assertEqual(marker.tile_marker_dim, 0)
+            (upstream,) = [
+                dep
+                for dep in marker.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(upstream.index.coeff(loop_var), 32)
+
+            _consume_tile_dim_markers(group, graph.operations)
+            scatter = graph.name_to_buffer[scatter.get_name()]
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [upstream.name])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == upstream.name
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(marker_name, {op.get_name() for op in group})
+
+            # Read renames must also reach the separate destination indexer.
+            renamed = "renamed_scatter_indices"
+            graph.name_to_buffer[renamed] = graph.get_buffer(upstream.name)
+            scatter = redirect_computed_buffer_reads(
+                scatter, {upstream.name: renamed}, graph.operations, pass_name="test"
+            )
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [renamed])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == renamed
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(
+                upstream.name, {d.name for d in scatter.get_read_writes().reads}
+            )
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
         """Marker resolution for split_m_fn's StarDep-shaped matmul consumer.
@@ -4137,7 +4456,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from for_each_tile_fixtures import (
@@ -4179,7 +4497,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from for_each_tile_fixtures import (
@@ -5089,6 +5406,477 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
             if any(dep.name == clone_name for dep in n.unmet_dependencies)
         ]
         self.assertTrue(readers)
+
+
+class TestRecoverSpyreHints(unittest.TestCase):
+    """collect_spyre_hints/recover_spyre_hints: scan<->while_loop_body hint
+    recovery through decompose_scan_to_while_loop's retrace.
+    """
+
+    def test_one_unhinted_scan_does_not_block_the_other(self):
+        """Two sibling for_each_tile scans (paged_gather_kv_fn's K/V-page
+        gather + Q@K^T, P@V shape, matching spyre-inference's real
+        page_attn_head_major_prefill_kernel block_body); only the second
+        carries a spyre_hint.
+
+        Pins cyang49's PR #5057 review blocker: collect_spyre_hints used to
+        skip snapshotting a scan with no hint, which desynced the positional
+        pairing recover_spyre_hints relies on against `body_nodes` (always
+        one entry per scan) -- so the one unhinted sibling scan here used to
+        make recovery skip the *other*, hinted scan's body too, not just its
+        own. collect_spyre_hints must snapshot every scan unconditionally for
+        this pairing to hold.
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import (
+            paged_gather_kv_inputs,
+            paged_gather_kv_one_hinted_fn,
+        )
+
+        k_pages, v_pages, table, q = paged_gather_kv_inputs()
+        k_pages = k_pages.to(DEVICE_NAME)
+        v_pages = v_pages.to(DEVICE_NAME)
+        table = table.to(DEVICE_NAME)
+        q = q.to(DEVICE_NAME)
+
+        _out, gm = capture_post_grad_while_loop(
+            paged_gather_kv_one_hinted_fn, (k_pages, v_pages, table, q)
+        )
+
+        body_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "get_attr" and "while_loop_body_graph" in n.target
+        ]
+        self.assertEqual(len(body_nodes), 2, "expected one body per scan site")
+
+        # body_nodes is in graph.nodes ENCOUNTER order, which is what positional
+        # pairing promises -- not the numeric name suffix (verified: the first-
+        # encountered body here is actually named "..._0_1", the second
+        # "..._0_0", scrambled relative to call order). The fixture's first
+        # for_each_tile call (plain_body) is unhinted, its second (hinted_body)
+        # carries the hint, so the FIRST body in this list must be the unhinted
+        # one and the SECOND must be the hinted one -- asserted in that order,
+        # not sorted, so a hint landing on the wrong body would fail this test
+        # instead of passing by coincidence (cyang49's review suggestion).
+        unhinted_body, hinted_body_node = body_nodes
+
+        def hinted_nodes_of(body_node):
+            sub_gm = getattr(gm, body_node.target)
+            return [
+                n
+                for n in sub_gm.graph.nodes
+                if n.op == "call_function" and n.meta.get("custom")
+            ]
+
+        self.assertEqual(
+            hinted_nodes_of(unhinted_body),
+            [],
+            f"{unhinted_body.target} is the unhinted sibling scan's body and "
+            "must recover no hints",
+        )
+
+        hinted_nodes = hinted_nodes_of(hinted_body_node)
+        self.assertEqual(
+            len(hinted_nodes),
+            3 + 4,
+            f"{hinted_body_node.target} is the hinted scan's body: expected "
+            "the gather+squeeze pair x2, the transpose+mm pair, and the final "
+            "mm to all recover their hint",
+        )
+        # Verify actual hint CONTENT, not just a count: hinted_body_fn's three
+        # spyre_hint(...) blocks each get their own hint id (_hint_0/1/2), and
+        # the gather/squeeze pair's work_div must specifically be {"Lq": 4} --
+        # a hint recovered from the wrong snapshot entry could still produce
+        # the right count with the wrong content.
+        gather_squeeze = [
+            n for n in hinted_nodes if n.target in (torch.ops.aten.index.Tensor,)
+        ]
+        self.assertTrue(gather_squeeze, "expected at least one recovered gather")
+        for n in gather_squeeze:
+            self.assertEqual(
+                n.meta["custom"].get("_hint_0", {}).get("work_div"),
+                {"Lq": 4},
+                f"{n.target} recovered the wrong hint content",
+            )
+
+    def test_nested_scan_hint_recovers(self):
+        """A spyre_hint inside a nested for_each_tile's INNER body survives to
+        the final compiled graph.
+
+        The inner for_each_tile is compiled as its own unit and embedded as FX
+        in the outer combine-fn; its collect_spyre_hints ran but its
+        recover_spyre_hints never did (only the outermost compile reaches the
+        scheduler where recovery lives), so the outer compile's collect first
+        recovers those orphaned snapshots -- before its own
+        decompose_scan_to_while_loop retrace, which then copies the recovered
+        custom meta into the active replacement bodies.
+
+        Counts hints ONLY inside active replacement bodies (while_loop bodies
+        whose call carries the _SCAN_SNAPSHOT_SEQ_KEY stamp, recursively): the
+        pre-decomposition combine subgraphs stay behind as dead-but-not-DCE'd
+        modules that still carry _hint_* metadata (their own originals, plus
+        the dead-side copies the orphan recovery writes), so a graph-wide
+        get_attr walk could satisfy the count without the live bodies
+        recovering anything. That is not hypothetical -- it is exactly how
+        this test passed before the orphan recovery existed (cyang49's PR
+        #5057 review inference, confirmed empirically: the graph-wide walk
+        found both hinted nodes in the dead inner combine module while the
+        active bodies held zero).
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+        from torch_spyre._inductor.propagate_hints import _SCAN_SNAPSHOT_SEQ_KEY
+
+        from for_each_tile_fixtures import M, K, N, nested_split_m_then_k_hinted_fn
+
+        X = torch.randn(M, K, dtype=torch.float16, device=DEVICE_NAME)
+        Y = torch.randn(K, N, dtype=torch.float16, device=DEVICE_NAME)
+
+        _out, gm = capture_post_grad_while_loop(nested_split_m_then_k_hinted_fn, (X, Y))
+
+        def find_hinted_nodes(graph_module):
+            # Walk only ACTIVE replacement bodies: a while_loop call carrying
+            # the stamp is scan-derived (the stamp rides replace_by_example's
+            # meta["custom"] transfer), so its body is live; recursion goes
+            # through stamped bodies only, never through the dead combine
+            # modules a graph-wide get_attr walk would also reach.
+            #
+            # The stamped-body target set must be complete BEFORE the
+            # recursion pass: a while_loop's body_fn get_attr precedes its
+            # call in FX node order, so building the set and recursing in one
+            # pass would skip every stamped body.
+            stamped_body_targets = {
+                node.args[1].target
+                for node in graph_module.graph.nodes
+                if node.op == "call_function"
+                and node.target is torch.ops.higher_order.while_loop
+                and isinstance(node.meta.get("custom"), dict)
+                and _SCAN_SNAPSHOT_SEQ_KEY in node.meta["custom"]
+                and len(node.args) > 1
+                and isinstance(node.args[1], torch.fx.Node)
+                and node.args[1].op == "get_attr"
+            }
+            found = []
+            for node in graph_module.graph.nodes:
+                # Only _hint_* keys are recovered spyre hints: replacement
+                # nodes also carry the _SCAN_SNAPSHOT_SEQ_KEY stamp in their
+                # custom dict, so "custom is non-empty" alone would count
+                # those too.
+                if node.op == "call_function" and any(
+                    k.startswith("_hint_") for k in node.meta.get("custom") or {}
+                ):
+                    found.append(node)
+                if node.op == "get_attr" and node.target in stamped_body_targets:
+                    body = getattr(graph_module, node.target, None)
+                    if isinstance(body, torch.fx.GraphModule):
+                        found.extend(find_hinted_nodes(body))
+            return found
+
+        hinted_nodes = find_hinted_nodes(gm)
+        self.assertEqual(
+            len(hinted_nodes),
+            2,
+            "expected the inner for_each_tile's acc + x @ y to recover its "
+            "hint on both aten.mm.default and aten.add.Tensor inside the "
+            "active replacement bodies",
+        )
+        for n in hinted_nodes:
+            self.assertEqual(
+                n.meta["custom"].get("_hint_0", {}).get("work_div"),
+                {"K": 2},
+                f"{n.target} recovered the wrong hint content",
+            )
+
+    def test_non_scan_hop_subgraph_is_not_collected(self):
+        """A torch.cond branch alongside a scan must not be snapshotted as if it
+        were a scan combine-fn.
+
+        Pins cyang49's PR #5057 review blocker: the old _is_hop_subgraph_getattr
+        matched "any get_attr whose target is a GraphModule", not specifically a
+        scan's combine_fn -- so a torch.cond branch (or any other HOP subgraph)
+        still present in the graph at collection time would inflate
+        collect_spyre_hints's snapshot count past what
+        _recover_hop_subgraph_hints's while_loop_body_graph-only count could ever
+        match, abandoning recovery for every scan in the graph, not just the
+        unrelated cond. Exercised directly against a hand-built FX graph (no
+        compile needed) since there is no existing fixture combining
+        for_each_tile with a torch.cond left in the graph at collection time.
+        """
+        from torch_spyre._inductor.propagate_hints import _scan_combine_subgraphs
+
+        root = torch.nn.Module()
+
+        scan_sub_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        sg = scan_sub_gm.graph
+        carry = sg.placeholder("carry")
+        x = sg.placeholder("x")
+        add = sg.call_function(torch.ops.aten.add.Tensor, (carry, x))
+        sg.output((add, None))
+        scan_sub_gm.recompile()
+
+        cond_sub_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_sub_gm.graph
+        p = cg.placeholder("x")
+        neg = cg.call_function(torch.ops.aten.neg.default, (p,))
+        cg.output(neg)
+        cond_sub_gm.recompile()
+
+        root.scan_combine_graph_0 = scan_sub_gm
+        root.cond_true_graph_0 = cond_sub_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        pred = graph.placeholder("pred")
+        scan_combine_attr = graph.get_attr("scan_combine_graph_0")
+        graph.call_function(
+            torch.ops.higher_order.scan,
+            (scan_combine_attr, [init], [xs], []),
+        )
+        cond_true_attr = graph.get_attr("cond_true_graph_0")
+        cond_false_attr = graph.get_attr("cond_true_graph_0")
+        graph.call_function(
+            torch.ops.higher_order.cond,
+            (pred, cond_true_attr, cond_false_attr, [init]),
+        )
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        found = _scan_combine_subgraphs(gm.graph)
+        self.assertEqual(
+            found,
+            [scan_sub_gm],
+            "expected only the scan's combine_fn, not the cond branch sharing "
+            "the graph",
+        )
+
+    def test_unrelated_while_loop_body_name_does_not_block_recovery(self):
+        """A GraphModule attribute named like a while_loop body, but with no
+        actual while_loop HOP call pointing at it, must not be counted as a
+        recovery target.
+
+        Pins cyang49's PR #5057 review blocker: the old discovery walked every
+        get_attr node whose *target name* contained "while_loop_body_graph" --
+        upstream PyTorch's generic naming for any while_loop body, scan-decomposed
+        or not. A get_attr with that name but no corresponding while_loop call (or
+        a plain, independently-authored torch.while_loop coexisting with a scan's)
+        would inflate body_nodes past subgraph_snapshots and abandon recovery for
+        every real scan site, not just the unrelated one. Discovery must instead
+        match on the while_loop HOP call's own body_fn arg, the same way
+        _scan_combine_subgraphs matches scan calls instead of a name substring.
+
+        The while_loop call carries the _SCAN_SNAPSHOT_SEQ_KEY stamp a real
+        scan-derived replacement gets from decompose_scan_to_while_loop's
+        meta["custom"] transfer -- without it, recovery (which pairs on that
+        stamp) would correctly ignore this loop as not scan-derived.
+        """
+        from torch_spyre._inductor.propagate_hints import (
+            _SCAN_SNAPSHOT_SEQ_KEY,
+            _recover_hop_subgraph_hints,
+        )
+
+        root = torch.nn.Module()
+
+        # The scan's combine-fn body, with one hinted node to recover.
+        body_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        bg = body_gm.graph
+        carry = bg.placeholder("carry")
+        x = bg.placeholder("x")
+        add = bg.call_function(torch.ops.aten.add.Tensor, (carry, x))
+        bg.output((add, None))
+        body_gm.recompile()
+        root.while_loop_body_graph_0 = body_gm
+
+        # An unrelated GraphModule attribute that merely shares the name
+        # fragment "while_loop_body_graph" -- no while_loop HOP call anywhere
+        # in the root graph points at it.
+        decoy_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        dg = decoy_gm.graph
+        p = dg.placeholder("x")
+        neg = dg.call_function(torch.ops.aten.neg.default, (p,))
+        dg.output(neg)
+        decoy_gm.recompile()
+        root.unrelated_while_loop_body_graph_decoy = decoy_gm
+
+        # A trivial cond_fn for the real while_loop call.
+        cond_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_gm.graph
+        cp = cg.placeholder("carry")
+        cg.placeholder("x")
+        lt = cg.call_function(torch.ops.aten.lt.Scalar, (cp, 4))
+        cg.output(lt)
+        cond_gm.recompile()
+        root.while_loop_cond_graph_0 = cond_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        cond_attr = graph.get_attr("while_loop_cond_graph_0")
+        body_attr = graph.get_attr("while_loop_body_graph_0")
+        while_loop_call = graph.call_function(
+            torch.ops.higher_order.while_loop,
+            (cond_attr, body_attr, (init, xs)),
+        )
+        # The stamp collect_spyre_hints leaves on the scan node, which
+        # decompose_scan_to_while_loop transfers onto this replacement.
+        while_loop_call.meta.setdefault("custom", {})[_SCAN_SNAPSHOT_SEQ_KEY] = 0
+        # The decoy is still reachable from the root graph (as any
+        # not-yet-DCE'd subgraph would be) but nothing calls it.
+        graph.get_attr("unrelated_while_loop_body_graph_decoy")
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        snapshot = [(add.target, {"_hint_0": {"work_div": {"K": 2}}})]
+        _recover_hop_subgraph_hints(gm.graph, [snapshot])
+
+        recovered = [n for n in body_gm.graph.nodes if n.meta.get("custom")]
+        self.assertEqual(
+            len(recovered),
+            1,
+            "expected the scan's real while_loop body to recover its hint "
+            "despite the decoy attribute sharing its name fragment",
+        )
+        self.assertEqual(
+            recovered[0].meta["custom"], {"_hint_0": {"work_div": {"K": 2}}}
+        )
+
+    def test_user_while_loop_does_not_block_scan_hint_recovery(self):
+        """A plain, user-authored torch.while_loop coexisting with hinted
+        scans must not consume -- or make recovery abandon -- any scan's
+        hints.
+
+        Pins the PR #5057 follow-up review finding: a user torch.while_loop
+        traces to the same higher_order.while_loop(cond_fn, body_fn,
+        carried) call with get_attr subgraphs that decompose_scan_to_
+        while_loop builds when replacing a scan, so recovery that pairs by
+        position (Nth while_loop in graph.nodes order <-> Nth scan
+        snapshot) counts this extra loop's body too, sees more bodies than
+        snapshots, and skips hint recovery for every scan in the graph.
+        Recovery must instead pair through the spyre_scan_snapshot_seq stamp
+        collect_spyre_hints leaves on each scan -- decompose_scan_to_
+        while_loop transfers meta["custom"] (a torch.fx.proxy._COPY_META_
+        FIELDS entry) from the matched scan node onto the replacement, so
+        the stamp survives the retrace -- and ignore unstamped while_loops
+        entirely, wherever they sit.
+
+        Exercised directly against a hand-built FX graph (no compile): a
+        user torch.while_loop cannot currently compile through the spyre
+        backend at all (standalone it dies on unsupported lesserthan on
+        IEEE_INT32; alongside a scan it crashes lx_context_switching on a
+        buffer with empty origins), so no end-to-end fixture can produce
+        this shape. The loops are built in the exact shape dynamo traces
+        torch.while_loop to. The scan-derived loops are also placed in
+        REVERSED stamp order (seq 1 before seq 0) with different hint
+        contents per snapshot, so a pairing that fell back to encounter
+        order among the stamped loops would cross-assign the snapshots and
+        fail the content asserts below.
+        """
+        from torch_spyre._inductor.propagate_hints import (
+            _SCAN_SNAPSHOT_SEQ_KEY,
+            _recover_hop_subgraph_hints,
+        )
+
+        root = torch.nn.Module()
+
+        def make_body_gm(name: str, op) -> torch.fx.GraphModule:
+            gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+            g = gm.graph
+            carry = g.placeholder("carry")
+            x = g.placeholder("x")
+            out = g.call_function(op, (carry, x))
+            g.output((out, None))
+            gm.recompile()
+            setattr(root, name, gm)
+            return gm
+
+        add_body = make_body_gm("scan_body_add", torch.ops.aten.add.Tensor)
+        sub_body = make_body_gm("scan_body_sub", torch.ops.aten.sub.Tensor)
+        mul_body = make_body_gm("user_body_mul", torch.ops.aten.mul.Tensor)
+        stray_bool_body = make_body_gm("stray_bool_body", torch.ops.aten.mul.Tensor)
+
+        # One cond subgraph shared by all three loops; recovery only inspects
+        # the body_fn arg's shape, and no cond ever executes here.
+        cond_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_gm.graph
+        cp = cg.placeholder("carry")
+        cg.placeholder("x")
+        lt = cg.call_function(torch.ops.aten.lt.Scalar, (cp, 4))
+        cg.output(lt)
+        cond_gm.recompile()
+        root.shared_cond_graph = cond_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        cond_attr = graph.get_attr("shared_cond_graph")
+
+        def add_loop(body_attr_name: str, stamp: int | None) -> None:
+            body_attr = graph.get_attr(body_attr_name)
+            call = graph.call_function(
+                torch.ops.higher_order.while_loop,
+                (cond_attr, body_attr, (init, xs)),
+            )
+            if stamp is not None:
+                call.meta.setdefault("custom", {})[_SCAN_SNAPSHOT_SEQ_KEY] = stamp
+
+        # Graph order: the user loop first, then the scan-derived loops in
+        # reversed stamp order.
+        add_loop("user_body_mul", None)
+        add_loop("scan_body_sub", 1)
+        add_loop("scan_body_add", 0)
+        # A stray boolean stamp: bool is an int subclass and True == 1, so a
+        # validation that only checks isinstance(seq, int) would let it
+        # alias seq 1 past the coverage check (sorted([0, 1, True]) ==
+        # [0, 1]); it must be ignored like an unstamped loop instead.
+        add_loop("stray_bool_body", True)
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        # subgraph_snapshots[i] pairs with the scan stamped seq i: seq 0 is
+        # the add body, seq 1 the sub body.
+        snapshot_add = [
+            (torch.ops.aten.add.Tensor, {"_hint_0": {"work_div": {"K": 2}}})
+        ]
+        snapshot_sub = [
+            (torch.ops.aten.sub.Tensor, {"_hint_0": {"work_div": {"L": 3}}})
+        ]
+        _recover_hop_subgraph_hints(gm.graph, [snapshot_add, snapshot_sub])
+
+        def recovered_custom(body: torch.fx.GraphModule) -> list[dict]:
+            return [
+                n.meta["custom"]
+                for n in body.graph.nodes
+                if n.op == "call_function"
+                and any(k.startswith("_hint_") for k in n.meta.get("custom") or {})
+            ]
+
+        self.assertEqual(
+            recovered_custom(add_body),
+            [{"_hint_0": {"work_div": {"K": 2}}}],
+            "the seq-0 scan's body must recover its own hint",
+        )
+        self.assertEqual(
+            recovered_custom(sub_body),
+            [{"_hint_0": {"work_div": {"L": 3}}}],
+            "the seq-1 scan's body must recover its own hint despite "
+            "preceding the seq-0 loop in graph order",
+        )
+        self.assertEqual(
+            recovered_custom(mul_body),
+            [],
+            "the user while_loop's body must not receive any scan hint",
+        )
+        self.assertEqual(
+            recovered_custom(stray_bool_body),
+            [],
+            "a stray boolean stamp must be ignored, not aliased to seq 1",
+        )
 
 
 if __name__ == "__main__":
