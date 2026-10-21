@@ -329,6 +329,11 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
             "stick_dim_order": list(dim_order),
             "stick_size": [2, 64],
         }
+    if sdsc_spec.opfunc == "i16_to_uniform" and layout_info["stick_size"] != [32]:
+        return {
+            **layout_info,
+            "stick_size": [32],
+        }
     return layout_info
 
 

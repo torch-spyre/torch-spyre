@@ -940,6 +940,38 @@ def _(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
     return torch.empty(lo.shape, dtype=torch.float32, device=lo.device)
 
 
+@torch.library.custom_op("spyre::i16_to_uniform", mutates_args=())
+def i16_to_uniform(input: torch.Tensor) -> torch.Tensor:
+    """
+    Directly converts an int16 tensor into fp32 uniforms in (0, 1) by reinterpreting
+    packed (lo, hi) pairs in each 32-bit lane as an int32 and converting to fp32.
+
+    Input shape: (..., N), dtype torch.int16 (N % 64 == 0)
+    Output shape: (..., N // 2), dtype torch.float32
+
+    Maps to: deeptools I16_TO_UNIFORM operation (i16_to_uniform.smc)
+    """
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    u16 = input.cpu().to(torch.int32) & 0xFFFF
+    lo = u16[..., 0::2]
+    hi = u16[..., 1::2]
+    raw32 = (lo | (hi << 16)).to(torch.int32)
+    bias = float(torch.tensor([0x3F000001], dtype=torch.int32).view(torch.float32)[0])
+    s = raw32.to(torch.float32)
+    u = s * (2.0**-32) + bias
+    return u.to(input.device)
+
+
+@i16_to_uniform.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    out_shape = list(input.shape)
+    out_shape[-1] = out_shape[-1] // 2
+    return torch.empty(out_shape, dtype=torch.float32, device=input.device)
+
+
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
 # four-step pipeline; the only difference is the final format-conversion kernel:
 #   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
