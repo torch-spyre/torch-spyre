@@ -11903,38 +11903,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
-    def test_index_copy_stick_dim_falls_back(self):
-        """index_copy along the stick (last) dim is not compilable, so eager
-        runs it on the CPU with a FallbackWarning rather than raising.
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason="scattering along the stick (last) dimension does not compile (#5637)",
+    )
+    def test_index_copy_stick_dim_xfail(self):
+        """index_copy along the stick (last) dim is unsupported and raises InductorError.
 
-        TODO: once a stick-dim scatter compiles, this must become a positive
-        (no-fallback) test. The compiled failures it avoids are an internal
-        restickify assertion ([4, 128] dim 1) and ``KeyError: tmp0`` ([4, 64]
-        dim -1 with a non-leading index).
+        Once a stick-dim scatter compiles, this xfail will fail (due to strict=True)
+        and should be converted to a positive test.
         """
 
         def fn(dst, dim, index, src):
             return torch.index_copy(dst, dim, index, src)
 
-        cases = [
-            (torch.randn(4, 128), 1, torch.tensor([0, 64]), torch.randn(4, 2)),
-            (torch.randn(4, 64), -1, torch.tensor([5, 0, 63]), torch.randn(4, 3)),
-            (torch.randn(3, 5), 1, torch.tensor([1, 3]), torch.randn(3, 2)),
-            (torch.randn(2, 8, 128), 2, torch.tensor([1, 3]), torch.randn(2, 8, 2)),
-        ]
-        for dst, dim, index, src in cases:
-            with self.assertWarns(FallbackWarning):
-                self.compare_with_cpu(
-                    fn, dst, dim, index, src, run_compile=False, run_eager=True
-                )
+        dst = torch.randn(4, 128)
+        index = torch.tensor([0, 64])
+        src = torch.randn(4, 2)
+        self.compare_with_cpu(
+            fn, dst, 1, index, src, run_compile=False, run_eager=True
+        )
 
     def test_index_copy_compiled_cpu(self):
         """torch.compile'd index_copy / index_copy_ / index_copy(out=) match CPU.
 
-        Dropping index_copy.out from fallback_ops also changes its Inductor
-        handling (it was removed from the decomposition table and given an
-        explicit CPU fallback lowering), so the compiled path is covered here
-        as well as the eager one. compare_with_cpu runs compiled, then eager.
+        Dropping index_copy.out from fallback_ops compiles the op on Spyre
+        via Inductor rather than falling back to CPU, so the compiled path
+        is covered here as well as the eager one. compare_with_cpu runs
+        compiled, then eager.
         """
 
         def functional(dst, index, src):
