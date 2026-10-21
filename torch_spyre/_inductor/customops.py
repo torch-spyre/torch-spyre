@@ -914,6 +914,32 @@ def _(x: torch.Tensor, y: torch.Tensor, n: int) -> torch.Tensor:
     return x.new_empty(x.size())
 
 
+@torch.library.custom_op(
+    "spyre::lo_hi_to_uniform", mutates_args=(), device_types="spyre"
+)
+def lo_hi_to_uniform(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    """
+    Fuse the fp32 halfword sticks produced by i16tofp32 into a uniform in (0, 1).
+
+    lo and hi hold unsigned 16-bit values (0..65535) as fp32 and have the same
+    shape. u = (hi * 65536 + lo + 0.5) * 2^-32, computed on the device as two
+    FMAs: hi * 2^-16 + (lo * 2^-32 + 2^-33).
+
+    Maps to: deeptools LO_HI_TO_UNIFORM operation (lo_hi_to_uniform.smc)
+    """
+    assert lo.dtype == torch.float32 and hi.dtype == torch.float32
+    assert lo.shape == hi.shape
+    # float64 holds the exact sum (< 2^34 distinct steps), so one rounding to
+    # fp32 matches the fused device arithmetic.
+    u = (hi.cpu().double() * 65536.0 + lo.cpu().double() + 0.5) * 2.0**-32
+    return u.to(torch.float32).to(lo.device)
+
+
+@lo_hi_to_uniform.register_fake
+def _(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    return torch.empty(lo.shape, dtype=torch.float32, device=lo.device)
+
+
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
 # four-step pipeline; the only difference is the final format-conversion kernel:
 #   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)

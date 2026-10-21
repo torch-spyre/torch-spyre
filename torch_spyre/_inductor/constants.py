@@ -38,6 +38,7 @@ INT32TOFP32_OP = "int32tofp32"
 I16TOFP32_OP = "i16tofp32"
 ROTL16I16_OP = "rotl16i16"
 ROTLXORI16_OP = "rotlxori16"
+LO_HI_TO_UNIFORM_OP = "lo_hi_to_uniform"
 
 DEVICE_NAME = "spyre"
 
@@ -152,7 +153,6 @@ SPYRE_FP32_OPS = [
     "abs",
     "neg",
     "exp",
-    "log",
     "sigmoid",
     "silu",
     "exx2",
@@ -175,6 +175,7 @@ SPYRE_FP32_OPS = [
     "notequal",
     "prod",
     "log",
+    LO_HI_TO_UNIFORM_OP,
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when

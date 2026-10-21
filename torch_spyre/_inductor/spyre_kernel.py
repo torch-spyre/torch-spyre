@@ -366,6 +366,10 @@ class SpyreOpFuncs:
         return PointwiseOp("rotlxori16", [x, y], {"constants": {"shamt": int(amount)}})
 
     @staticmethod
+    def lo_hi_to_uniform(lo, hi):
+        return PointwiseOp("lo_hi_to_uniform", [lo, hi], {})
+
+    @staticmethod
     def qfp8wt(x):
         return PointwiseOp("qfp8wt", [x])
 
