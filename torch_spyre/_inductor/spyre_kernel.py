@@ -44,7 +44,7 @@ from .constants import (
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     I16TOFP32_OP,
-    I16_TO_UNIFORM_OP,
+    I16_PAIR_TO_FP32_OP,
     IDENTITY_OP,
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
@@ -357,8 +357,8 @@ class SpyreOpFuncs:
         return PointwiseOp(I16TOFP32_OP, [x])
 
     @staticmethod
-    def i16_to_uniform(x):
-        return PointwiseOp("i16_to_uniform", [x])
+    def i16_pair_to_fp32(x):
+        return PointwiseOp("i16_pair_to_fp32", [x])
 
     @staticmethod
     def rotl16i16(x, n):
@@ -1044,7 +1044,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16
                 )
                 or (
-                    op in (I16TOFP32_OP, I16_TO_UNIFORM_OP)
+                    op in (I16TOFP32_OP, I16_PAIR_TO_FP32_OP)
                     and arg.device_dtype in (DataFormats.IEEE_FP32, DataFormats.IEEE_INT32, DataFormats.SENINT16)
                 )
                 or arg.device_dtype == DataFormats.SEN169_FP16
@@ -1351,7 +1351,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     override_layout = None
-                    if value.op == I16_TO_UNIFORM_OP:
+                    if value.op == I16_PAIR_TO_FP32_OP:
                         eff_size = [
                             int(s) if idx != len(input.layout.size) - 1 else int(s) // 2
                             for idx, s in enumerate(input.layout.size)

@@ -491,10 +491,10 @@ def _i16sticks_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTenso
     )
 
 
-def _i16_to_uniform_stl(
+def _i16_pair_to_fp32_stl(
     stl: SpyreTensorLayout, out_dtype: torch.dtype
 ) -> SpyreTensorLayout:
-    """Output layout of ``i16_to_uniform``: int16 (64/stick) -> fp32 (32/stick).
+    """Output layout of ``i16_pair_to_fp32``: int16 (64/stick) -> fp32 (32/stick).
 
     One input stick of 64 int16 elements yields one output stick of 32 fp32
     elements. The stick count is preserved; stick depth changes from 64 to 32.
@@ -768,10 +768,10 @@ def _single_arg_op_layout(
             # two sticks out (lo, hi): output layout doubles the num-sticks dim.
             return [_i16sticks_stl(stl, output.dtype)]
 
-        case spyreop.i16_to_uniform.default:
+        case spyreop.i16_pair_to_fp32.default:
             # int16 (64 elems/stick) -> fp32 (32 elems/stick), one stick in and
             # one stick out: stick count is preserved.
-            return [_i16_to_uniform_stl(stl, output.dtype)]
+            return [_i16_pair_to_fp32_stl(stl, output.dtype)]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].

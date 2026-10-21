@@ -2576,13 +2576,13 @@ def lower_lo_hi_to_uniform(lo, hi):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.i16_to_uniform)
-def lower_i16_to_uniform(x):
+@register_spyre_lowering(torch.ops.spyre.i16_pair_to_fp32)
+def lower_i16_pair_to_fp32(x):
     """
-    Lower i16_to_uniform - directly converts packed int16 pairs into fp32 uniforms.
+    Lower i16_pair_to_fp32 - directly converts packed int16 pairs into fp32 uniforms.
     Output shape has last dimension N // 2.
     """
-    fn = lowering.ops_wrapper(torch.ops.spyre.i16_to_uniform.__name__)
+    fn = lowering.ops_wrapper(torch.ops.spyre.i16_pair_to_fp32.__name__)
     x_loader = x.make_loader()
 
     def inner_fn(index):

@@ -940,8 +940,8 @@ def _(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
     return torch.empty(lo.shape, dtype=torch.float32, device=lo.device)
 
 
-@torch.library.custom_op("spyre::i16_to_uniform", mutates_args=())
-def i16_to_uniform(input: torch.Tensor) -> torch.Tensor:
+@torch.library.custom_op("spyre::i16_pair_to_fp32", mutates_args=())
+def i16_pair_to_fp32(input: torch.Tensor) -> torch.Tensor:
     """
     Directly converts an int16 tensor into fp32 uniforms in (0, 1) by reinterpreting
     packed (lo, hi) pairs in each 32-bit lane as an int32 and converting to fp32.
@@ -949,7 +949,7 @@ def i16_to_uniform(input: torch.Tensor) -> torch.Tensor:
     Input shape: (..., N), dtype torch.int16 (N % 64 == 0)
     Output shape: (..., N // 2), dtype torch.float32
 
-    Maps to: deeptools I16_TO_UNIFORM operation (i16_to_uniform.smc)
+    Maps to: deeptools I16_PAIR_TO_FP32 operation (i16_pair_to_fp32.smc)
     """
     assert input.dtype == torch.int16
     assert input.shape[-1] % 64 == 0
@@ -963,7 +963,7 @@ def i16_to_uniform(input: torch.Tensor) -> torch.Tensor:
     return u.to(input.device)
 
 
-@i16_to_uniform.register_fake
+@i16_pair_to_fp32.register_fake
 def _(input: torch.Tensor) -> torch.Tensor:
     assert input.dtype == torch.int16
     assert input.shape[-1] % 64 == 0
