@@ -11840,17 +11840,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @staticmethod
-    def _no_fallback(fn):
-        """Wrap ``fn`` so a CPU fallback anywhere inside it fails the test."""
-
-        def run(*args):
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", FallbackWarning)
-                return fn(*args)
-
-        return run
-
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):
         """Eager torch.index_copy runs on Spyre (no CPU fallback) and matches CPU.
 
@@ -11863,7 +11853,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # Copy along dim 0 of a 2D tensor
         self.compare_with_cpu(
-            self._no_fallback(fn),
+            fn,
             torch.randn(5, 3),
             0,
             torch.tensor([0, 2, 4]),
@@ -11874,7 +11864,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # 3D tensor, copy along dim 0
         self.compare_with_cpu(
-            self._no_fallback(fn),
+            fn,
             torch.randn(4, 3, 2),
             0,
             torch.tensor([0, 2]),
@@ -11885,7 +11875,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # Non-stick dim of a stick-aligned 4D KV cache (negative dim)
         self.compare_with_cpu(
-            self._no_fallback(fn),
+            fn,
             cached_randn((1, 8, 64, 128)),
             -2,
             torch.tensor([3, 7, 9]),
@@ -11894,6 +11884,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_out_cpu(self):
         """index_copy(..., out=) writes into ``out`` on Spyre and returns it."""
 
@@ -11904,7 +11895,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return out
 
         self.compare_with_cpu(
-            self._no_fallback(fn),
+            fn,
             cached_randn((256, 1024)),
             torch.tensor([1, 10, 100]),
             cached_randn((3, 1024), differentiation="src"),
@@ -11967,6 +11958,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 torch._dynamo.reset()
                 self.compare_with_cpu(fn, dst, index, src)
 
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_inplace_prefill(self):
         """Test Tensor.index_copy_ prefill pattern from Ministral-3-14B-Instruct-2512.
 
@@ -11990,7 +11982,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         source = cached_randn((1, 8, 14, 128), differentiation="prefill")
 
         self.compare_with_cpu(
-            self._no_fallback(index_copy_fn),
+            index_copy_fn,
             cache,
             index,
             source,
@@ -11998,6 +11990,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
         )
 
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_inplace_decode(self):
         """Test Tensor.index_copy_ decode pattern from Ministral-3-14B-Instruct-2512.
 
@@ -12021,7 +12014,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         source = cached_randn((1, 8, 1, 128), differentiation="decode")
 
         self.compare_with_cpu(
-            self._no_fallback(index_copy_fn),
+            index_copy_fn,
             cache,
             index,
             source,
