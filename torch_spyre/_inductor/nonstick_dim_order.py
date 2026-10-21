@@ -867,7 +867,8 @@ def _apply_gather_ia_constraints(
     rotates the buffer's layout so the indirect dim is at device position 0.
     Graph inputs are recorded as _DeferredReorder entries (cannot update
     committed_stl in place). ComputedBuffers are rotated immediately.
-    ComputedBuffers without committed_stl (not yet restickified) are skipped.
+    ComputedBuffers without committed_stl were never restickified to a Spyre
+    layout by optimize_restickify_locations, so no constraint applies; skipped.
     """
     for dep in op.get_read_writes().reads:
         if not isinstance(dep, MemoryDep):
@@ -986,9 +987,9 @@ def _try_apply_flat_projection(
 ) -> bool:
     """Apply flat-M projection to buf as an activation input to op.
 
+    Precondition: buf is a read dependency of op.
     Returns True and updates buf.committed_stl and log[buf.get_name()] if the
-    projection fires. Returns False and modifies nothing otherwise.
-    Returns False immediately if buf is not a read dependency of op.
+    projection applies. Returns False and modifies nothing otherwise.
     """
     if not hasattr(buf, "committed_stl"):
         return False
@@ -1083,8 +1084,8 @@ def _apply_perf_reorders(
         for buf in bufs_to_reorder:
             name = buf.get_name()
             # Process each buffer at most once; when a buffer feeds multiple
-            # matmuls, the matmul latest in program order (first in this
-            # reversed traversal) determines the reorder.
+            # matmuls, the deepest matmul in program order (encountered first
+            # in this reversed traversal) determines the reorder.
             if name in already_reordered:
                 continue
             already_reordered.add(name)
@@ -1107,7 +1108,6 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
       V.graph.nonstick_deferred     — list[_DeferredReorder] consumed by
                                       reorder_nonstick_dims_mutation.
     """
-    V.graph.nonstick_reorder_log = {}
     V.graph.nonstick_deferred = []
     log: dict[str, SpyreTensorLayout] = {}
     pinned_dims = _apply_correctness_constraints(graph, log)
