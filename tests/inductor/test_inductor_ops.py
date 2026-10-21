@@ -11840,44 +11840,133 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_index_copy_cpu(self):
-        """Test torch.index_copy operation on Spyre matches CPU in eager mode.
+    @staticmethod
+    def _no_fallback(fn):
+        """Wrap ``fn`` so a CPU fallback anywhere inside it fails the test."""
 
-        Note: index_copy creates layout incompatibilities in compiled mode due to
-        its scatter pattern, so we only test eager mode execution.
+        def run(*args):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FallbackWarning)
+                return fn(*args)
+
+        return run
+
+    def test_index_copy_cpu(self):
+        """Eager torch.index_copy runs on Spyre (no CPU fallback) and matches CPU.
+
+        Compile is off: it is covered by test_indirect_access_scatter.py, and
+        these cases need the eager path (index_copy -> index_copy.out) anyway.
         """
 
         def fn(dst, dim, index, src):
-            # Use non-mutating version
             return torch.index_copy(dst, dim, index, src)
 
-        # Test case 1: Basic 2D tensor, copy along dim 0
-        dst1 = torch.randn(5, 3)
-        index1 = torch.tensor([0, 2, 4])
-        src1 = torch.randn(3, 3)
-        # Only run in eager mode - compiled mode has layout issues with scatter ops
+        # Copy along dim 0 of a 2D tensor
         self.compare_with_cpu(
-            fn, dst1, 0, index1, src1, run_compile=False, run_eager=True
+            self._no_fallback(fn),
+            torch.randn(5, 3),
+            0,
+            torch.tensor([0, 2, 4]),
+            torch.randn(3, 3),
+            run_compile=False,
+            run_eager=True,
         )
 
-        # Test case 2: Copy along dim 1
-        dst2 = torch.randn(3, 5)
-        index2 = torch.tensor([1, 3])
-        src2 = torch.randn(3, 2)
+        # 3D tensor, copy along dim 0
         self.compare_with_cpu(
-            fn, dst2, 1, index2, src2, run_compile=False, run_eager=True
+            self._no_fallback(fn),
+            torch.randn(4, 3, 2),
+            0,
+            torch.tensor([0, 2]),
+            torch.randn(2, 3, 2),
+            run_compile=False,
+            run_eager=True,
         )
 
-        # Test case 3: 3D tensor
-        dst3 = torch.randn(4, 3, 2)
-        index3 = torch.tensor([0, 2])
-        src3 = torch.randn(2, 3, 2)
+        # Non-stick dim of a stick-aligned 4D KV cache (negative dim)
         self.compare_with_cpu(
-            fn, dst3, 0, index3, src3, run_compile=False, run_eager=True
+            self._no_fallback(fn),
+            cached_randn((1, 8, 64, 128)),
+            -2,
+            torch.tensor([3, 7, 9]),
+            cached_randn((1, 8, 3, 128), differentiation="src"),
+            run_compile=False,
+            run_eager=True,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_out_cpu(self):
+        """index_copy(..., out=) writes into ``out`` on Spyre and returns it."""
+
+        def fn(dst, index, src):
+            out = torch.empty_like(dst)
+            res = torch.index_copy(dst, 0, index, src, out=out)
+            assert res.data_ptr() == out.data_ptr(), "out= result is not `out`"
+            return out
+
+        self.compare_with_cpu(
+            self._no_fallback(fn),
+            cached_randn((256, 1024)),
+            torch.tensor([1, 10, 100]),
+            cached_randn((3, 1024), differentiation="src"),
+            run_compile=False,
+            run_eager=True,
+        )
+
+    def test_index_copy_stick_dim_falls_back(self):
+        """index_copy along the stick (last) dim is not compilable, so eager
+        runs it on the CPU with a FallbackWarning rather than raising.
+
+        TODO: once a stick-dim scatter compiles, this must become a positive
+        (no-fallback) test. The compiled failures it avoids are an internal
+        restickify assertion ([4, 128] dim 1) and ``KeyError: tmp0`` ([4, 64]
+        dim -1 with a non-leading index).
+        """
+
+        def fn(dst, dim, index, src):
+            return torch.index_copy(dst, dim, index, src)
+
+        cases = [
+            (torch.randn(4, 128), 1, torch.tensor([0, 64]), torch.randn(4, 2)),
+            (torch.randn(4, 64), -1, torch.tensor([5, 0, 63]), torch.randn(4, 3)),
+            (torch.randn(3, 5), 1, torch.tensor([1, 3]), torch.randn(3, 2)),
+            (torch.randn(2, 8, 128), 2, torch.tensor([1, 3]), torch.randn(2, 8, 2)),
+        ]
+        for dst, dim, index, src in cases:
+            with self.assertWarns(FallbackWarning):
+                self.compare_with_cpu(
+                    fn, dst, dim, index, src, run_compile=False, run_eager=True
+                )
+
+    def test_index_copy_compiled_cpu(self):
+        """torch.compile'd index_copy / index_copy_ / index_copy(out=) match CPU.
+
+        Dropping index_copy.out from fallback_ops also changes its Inductor
+        handling (it was removed from the decomposition table and given an
+        explicit CPU fallback lowering), so the compiled path is covered here
+        as well as the eager one. compare_with_cpu runs compiled, then eager.
+        """
+
+        def functional(dst, index, src):
+            return torch.index_copy(dst, 2, index, src)
+
+        def inplace(dst, index, src):
+            dst = dst.clone()
+            dst.index_copy_(2, index, src)
+            return dst
+
+        def with_out(dst, index, src):
+            out = torch.empty_like(dst)
+            torch.index_copy(dst, 2, index, src, out=out)
+            return out
+
+        dst = cached_randn((1, 8, 64, 128))
+        index = torch.tensor([3, 7, 9])
+        src = cached_randn((1, 8, 3, 128), differentiation="src")
+        for fn in (functional, inplace, with_out):
+            with self.subTest(fn=fn.__name__):
+                torch._dynamo.reset()
+                self.compare_with_cpu(fn, dst, index, src)
+
     def test_index_copy_inplace_prefill(self):
         """Test Tensor.index_copy_ prefill pattern from Ministral-3-14B-Instruct-2512.
 
@@ -11901,10 +11990,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         source = cached_randn((1, 8, 14, 128), differentiation="prefill")
 
         self.compare_with_cpu(
-            index_copy_fn, cache, index, source, run_compile=False, run_eager=True
+            self._no_fallback(index_copy_fn),
+            cache,
+            index,
+            source,
+            run_compile=False,
+            run_eager=True,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_inplace_decode(self):
         """Test Tensor.index_copy_ decode pattern from Ministral-3-14B-Instruct-2512.
 
@@ -11928,7 +12021,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         source = cached_randn((1, 8, 1, 128), differentiation="decode")
 
         self.compare_with_cpu(
-            index_copy_fn, cache, index, source, run_compile=False, run_eager=True
+            self._no_fallback(index_copy_fn),
+            cache,
+            index,
+            source,
+            run_compile=False,
+            run_eager=True,
         )
 
     def test_repeat_cpu(self, x, *repeat_args):

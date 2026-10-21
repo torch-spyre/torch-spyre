@@ -15,7 +15,7 @@
 import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 from .warning_types import RetileWarning
 import warnings
 import contextlib
@@ -358,6 +358,32 @@ def _replace_tensor(x, old, new):
     return x
 
 
+def _index_copy_on_stick_dim(self, dim, index, source, *, out=None):
+    """True if ``index_copy`` scatters along the stick (last) dim of ``self``.
+
+    The compiled scatter writes ``dst[c0, tmp0]`` with the indirect index in
+    the within-stick coordinate, which does not compile today: it fails with
+    an internal restickify assertion, ``KeyError: tmp0`` or ``Unsupported``
+    depending on the shape. Every other dim compiles.
+    """
+    return self.dim() > 0 and maybe_wrap_dim(dim, self.dim()) == self.dim() - 1
+
+
+def _index_copy_out_cpu(self, dim, index, source, *, out):
+    warn_fallback(aten.index_copy.out)
+    out.copy_(torch.index_copy(self.cpu(), dim, index.cpu(), source.cpu()))
+    return out
+
+
+# Eager calls that the compiled kernel cannot run are sent to the CPU from the
+# dispatch, as ``(predicate, cpu_impl)``. This is deliberately not
+# ``register_fallback``: that adds the op to ``fallback_ops``, which also
+# removes its Inductor lowerings and replaces the compiled kernel for every call.
+_EAGER_CPU_ROUTES = {
+    aten.index_copy.out: (_index_copy_on_stick_dim, _index_copy_out_cpu),
+}
+
+
 def _make_offset_safe_dispatch(op):
     """Build a dispatch wrapper that keeps nonzero-offset Spyre tensors correct
     across the standalone-compiled kernel.
@@ -373,12 +399,15 @@ def _make_offset_safe_dispatch(op):
 
     Everything is a no-op for the common offset-0, canonical-layout case.
     """
+    cpu_route = _EAGER_CPU_ROUTES.get(op)
     write_positions, write_names = _write_arg_slots(op)
     # In-place/out variants return the caller's own buffer; rebuilding it would
     # break the aliasing the schema promises, so leave their results alone.
     normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
+        if cpu_route is not None and cpu_route[0](*args, **kwargs):
+            return cpu_route[1](*args, **kwargs)
         device, exempted = _check_same_device(
             [(a, i in write_positions) for i, a in enumerate(args)]
             + [(v, k in write_names) for k, v in kwargs.items()]
@@ -465,6 +494,7 @@ COMPILED_OPS = [
     aten.exp,
     aten.floor,
     aten.index_select,
+    aten.index_copy.out,
     aten.log,
     aten.mean,
     aten.mul,
