@@ -2760,6 +2760,134 @@ def spyre_sliding_window_attention(
     return output[:, :, pad_rows:, :] if pad_rows else output
 
 
+def _apply_feature_map(x: torch.Tensor, feature_map: str) -> torch.Tensor:
+    if feature_map == "elu":
+        return torch.nn.functional.elu(x) + 1.0
+    elif feature_map == "relu":
+        return torch.nn.functional.relu(x)
+    elif feature_map == "silu":
+        return torch.nn.functional.silu(x)
+    elif feature_map in ("identity", "none"):
+        return x
+    else:
+        raise Unsupported(f"Unsupported feature_map '{feature_map}' for linear_attention")
+
+
+@register_spyre_decompositions([torch.ops.spyre.linear_attention.default])
+def spyre_linear_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    feature_map: str = "elu",
+    scale: float | None = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linear attention decomposition for Spyre Inductor backend.
+
+    Computes linear attention via kernel feature maps:
+        Non-causal: Output = phi(Q) @ (phi(K)^T @ V) / (phi(Q) @ sum(phi(K))^T + eps)
+        Causal: Autoregressive cumulative sum scan over time.
+    """
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        raise Unsupported(
+            f"linear_attention: query, key, value must have rank 4, got "
+            f"query={query.dim()}, key={key.dim()}, value={value.dim()}"
+        )
+
+    batch_size, num_heads, seqlen_q, head_dim_k = query.shape
+    key_batch, num_kvheads, seqlen_kv, key_head_dim = key.shape
+    val_batch, val_kvheads, val_seqlen_kv, head_dim_v = value.shape
+
+    if batch_size != key_batch or batch_size != val_batch:
+        raise Unsupported(
+            f"linear_attention: batch sizes must match, got query={batch_size}, "
+            f"key={key_batch}, value={val_batch}"
+        )
+    if num_kvheads != val_kvheads:
+        raise Unsupported(
+            f"linear_attention: KV heads must match, got key={num_kvheads}, "
+            f"value={val_kvheads}"
+        )
+    if seqlen_kv != val_seqlen_kv:
+        raise Unsupported(
+            f"linear_attention: KV sequence lengths must match, got key={seqlen_kv}, "
+            f"value={val_seqlen_kv}"
+        )
+    if head_dim_k != key_head_dim:
+        raise Unsupported(
+            f"linear_attention: Query and Key head dim must match, got query={head_dim_k}, "
+            f"key={key_head_dim}"
+        )
+    if num_heads % num_kvheads != 0:
+        raise Unsupported(
+            f"linear_attention: Query heads ({num_heads}) must be a multiple of "
+            f"KV heads ({num_kvheads})"
+        )
+    if is_causal and seqlen_q != seqlen_kv:
+        raise Unsupported(
+            f"linear_attention: Causal linear attention requires seqlen_q == seqlen_kv, "
+            f"got seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}"
+        )
+
+    gqa_group_size = num_heads // num_kvheads
+    if gqa_group_size > 1:
+        key = torch.repeat_interleave(key, gqa_group_size, dim=1)
+        value = torch.repeat_interleave(value, gqa_group_size, dim=1)
+        if initial_state is not None and initial_state.size(1) == num_kvheads:
+            initial_state = torch.repeat_interleave(initial_state, gqa_group_size, dim=1)
+
+    if initial_state is not None:
+        expected_state_shape = (batch_size, num_heads, head_dim_k, head_dim_v)
+        if tuple(initial_state.shape) != expected_state_shape:
+            raise Unsupported(
+                f"linear_attention: initial_state shape {tuple(initial_state.shape)} "
+                f"must match {expected_state_shape}"
+            )
+
+    query_scale = scale
+    if query_scale is None:
+        query_scale = 1.0 / math.sqrt(head_dim_k)
+
+    q_scaled = query * query_scale
+    q_feat = _apply_feature_map(q_scaled, feature_map)
+    k_feat = _apply_feature_map(key, feature_map)
+
+    if is_causal:
+        # Causal linear attention: cumulative sum / prefix scan over sequence dimension
+        delta_s = k_feat.unsqueeze(-1) * value.unsqueeze(-2)  # [B, H, L, Dk, Dv]
+        causal_state = torch.cumsum(delta_s, dim=2)          # [B, H, L, Dk, Dv]
+
+        if initial_state is not None:
+            causal_state = causal_state + initial_state.unsqueeze(2)
+
+        final_state = causal_state[:, :, -1, :, :]  # [B, H, Dk, Dv]
+
+        q_expanded = q_feat.unsqueeze(-2)  # [B, H, L, 1, Dk]
+        out = torch.matmul(q_expanded, causal_state).squeeze(-2)  # [B, H, L, Dv]
+
+        k_cumsum = torch.cumsum(k_feat, dim=2)  # [B, H, L, Dk]
+        z = torch.sum(q_feat * k_cumsum, dim=-1, keepdim=True)  # [B, H, L, 1]
+        out = out / (z + eps)
+
+        return out.to(query.dtype), final_state.to(query.dtype)
+    else:
+        # Non-causal linear attention: O(N) matrix associativity
+        # k_feat.transpose(-2, -1): [B, H, Dk, Lkv], value: [B, H, Lkv, Dv] -> [B, H, Dk, Dv]
+        kv_state = torch.matmul(k_feat.transpose(-2, -1), value)
+        if initial_state is not None:
+            kv_state = kv_state + initial_state
+
+        out = torch.matmul(q_feat, kv_state)  # [B, H, Lq, Dv]
+
+        k_sum = torch.sum(k_feat, dim=-2, keepdim=True)  # [B, H, 1, Dk]
+        z = torch.matmul(q_feat, k_sum.transpose(-2, -1))  # [B, H, Lq, 1]
+        out = out / (z + eps)
+
+        return out.to(query.dtype), kv_state.to(query.dtype)
+
+
 @register_spyre_decompositions([torch.ops.aten.max.default])
 def spyre_max_default_decomp(input):
     """
