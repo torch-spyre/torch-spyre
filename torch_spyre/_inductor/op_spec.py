@@ -31,6 +31,25 @@ from .constants import IDENTITY_OP
 
 LX_RELAYOUT_INFO_KEY = "lx_relayout_certified"
 
+# Optional per-program frontend LX reservation, in bytes per core, reserving
+# [0, value) in the owning program's phase. Absent means the backend keeps its
+# configured default reservation.
+FRONTEND_LX_BYTES_INFO_KEY = "frontend_lx_bytes"
+
+
+def frontend_lx_bytes_attr_value(op_info: dict | None) -> int | None:
+    """Return a nonnegative signed-i64 bound, or None for absent or invalid data."""
+    if not op_info:
+        return None
+    value = op_info.get(FRONTEND_LX_BYTES_INFO_KEY)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value < (1 << 63)
+    ):
+        return int(value)
+    return None
+
 
 class IndirectAccess(Function):
     """Sympy function: IndirectAccess(tensor_name) — runtime index read from that tensor at the current iteration point.

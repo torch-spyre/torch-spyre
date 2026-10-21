@@ -388,6 +388,11 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
+    def per_core_size(self, division: int) -> int:
+        """Bytes per core for one output tile of the selected division."""
+        cd = self.core_divisions[division]
+        return ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+
     @property
     def min_footprint(self) -> int:
         """Smallest per-core footprint any candidate division allows. With no
@@ -802,7 +807,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     def per_core_footprint(self) -> int:
         """The destination span: what one core must hold for the copy to be
         resident (``size`` is that span times the destination core count)."""
-        return ceil_div(self.size, self.num_cores)
+        return self.per_core_size(0)
 
     @property
     def consumers(self) -> tuple[str, ...]:
@@ -1182,6 +1187,13 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
         """The total this engine minimized for the solved plan, in ns, where
         that is not ``cost_expr`` alone; the cost dump reports it."""
         return None
+
+    # The operation indices (the ``uses`` index space) of the graph's matmul
+    # programs, set by the allocator before the solve. An engine that packs
+    # addresses after its solve may keep these programs' front-end LX bound
+    # (``frontend_lx_bytes``) low: a matmul turns backend LX room into fewer
+    # passes over its LX input. Empty means unknown, and changes nothing.
+    matmul_ticks: frozenset[int] = frozenset()
 
     @abstractmethod
     def plan_layout_and_core_divisions(

@@ -119,6 +119,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_entry,
     counted_loop_group_path,
     counted_loop_lifetime_overrides,
+    publish_frontend_lx_footprints,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
@@ -208,6 +209,19 @@ _LX_TRACKER_CAPACITY_BYTES = (
     _LX_PHYSICAL_CAPACITY_BYTES - _LX_PROGRAM_DEBUG_RESERVATION_BYTES
 )
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
+
+
+def _placed_lx_footprint(buffer: LifetimeBoundBuffer) -> int:
+    """Return the allocator's packed LX bytes per core.
+
+    Joint buffers use the chosen division. A missing choice returns -1 so
+    the reservation check retains the default."""
+    if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
+        index = buffer.chosen_division
+        if index is None or not 0 <= index < len(buffer.core_divisions):
+            return -1
+        return buffer.per_core_size(index)
+    return buffer.size
 
 
 def _handoff_child_start(
@@ -1941,11 +1955,21 @@ class ScratchpadAllocator:
         op_by_name = {op.name: op for op in graph.operations} if drain_plans else {}
         buffers_by_name = {buf.name: buf for buf in buffers} if drain_plans else {}
 
+        # The packed per-core footprint of every buffer that keeps its LX
+        # placement, keyed by the name the final graph will use. Published for
+        # frontend_lx_high_water, which must not re-derive these from tensor
+        # sizes: relayout sources carry their source footprint and private
+        # destinations their rounded destination footprint. A joint-planner
+        # buffer is sized in total bytes, so its per-core span is the share of
+        # the division the solver chose (_placed_lx_footprint).
+        footprints: dict[str, int] = {}
+
         for b in buffers:
             if b.address is None or b.name.startswith("__spyre_lx_relayout__:"):
                 continue
 
             buf = graph.get_buffer(b.name)
+            footprint = _placed_lx_footprint(b)
             if b.name in inputs:
                 # A loop-invariant input clone runs once, before the counted
                 # loop its consumers run in, instead of on every trip.
@@ -1962,6 +1986,7 @@ class ScratchpadAllocator:
                 if hoist_before is not None:
                     _clear_loop_membership_metadata(new_buffer)
                 self._set_one_allocation(new_buffer, b.address, b.lx_view)
+                footprints[new_buffer.get_name()] = footprint
 
             elif b.name in outputs:
                 drain_plan = drain_plans.get(b.name)
@@ -1995,6 +2020,7 @@ class ScratchpadAllocator:
                     )
                 self._set_one_allocation(buf, b.address, b.lx_view)
                 graph_editor.change_graph_output(buf, new_buffer)
+                footprints[b.name] = footprint
 
             else:
                 drain_plan = drain_plans.get(b.name)
@@ -2018,10 +2044,58 @@ class ScratchpadAllocator:
                         drain_plan.collective, b.name, drained
                     )
                 self._set_one_allocation(buf, b.address, b.lx_view)
+                footprints[b.name] = footprint
 
         # Keep graph mutation last and in pre-scheduling: solver retries require
         # the original graph, and post-grad no-op elimination has already run.
         materialize_lx_relayouts(graph, accepted_lx_relayouts)
+
+        # A relayout destination is materialized under a fresh buffer name;
+        # resolve it through the registry to keep the footprint record on the
+        # name the final graph uses. The fixed-division path allocated it as
+        # plan.destination_name, the joint planner as the RelayoutCopyBuffer the
+        # plan names (plan.solver_copy_name). Either way the copy owns at least
+        # the plan's measured destination span, and the source keeps at least its
+        # measured source span.
+        by_name = {b.name: b for b in buffers}
+        registry = materialized_lx_relayouts(graph)
+        for plan in accepted_lx_relayouts:
+            entry = registry.get(plan.edge)
+            if entry is None:
+                continue
+            placed_name = plan.solver_copy_name or plan.destination_name
+            destination = by_name.get(placed_name)
+            if destination is None:
+                # No record: frontend_lx_high_water then refuses every bound.
+                continue
+            copy_name, _ = entry
+            placed = _placed_lx_footprint(destination)
+            measured = round_up_to_alignment(
+                plan.destination_footprint_bytes or 0,
+                _LX_ALLOCATION_GRANULARITY_BYTES,
+            )
+            footprints[copy_name] = placed if placed < 0 else max(placed, measured)
+            if footprints.get(plan.source_name, 0) > 0:
+                footprints[plan.source_name] = max(
+                    footprints[plan.source_name], plan.source_footprint_bytes or 0
+                )
+
+        # A counted-loop carry update writes in place into its carry's storage
+        # and shares that storage's layout (LoopCarryRecord, for_each_tile): it
+        # owns no LX of its own, but the final graph reads and writes it under
+        # its own name, so it carries the storage's record.
+        for op in graph.operations:
+            record = getattr(op, "_loop_carry_record", None)
+            if (
+                isinstance(record, LoopCarryRecord)
+                and record.update_name == op.get_name()
+                and record.storage_name in footprints
+            ):
+                footprints.setdefault(
+                    record.update_name, footprints[record.storage_name]
+                )
+
+        publish_frontend_lx_footprints(graph, footprints)
 
     def _set_one_allocation(
         self,
@@ -3100,6 +3174,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 key=lambda b: b.name,
             ):
                 cost_expr = cost_expr + copy.cost_term()
+        # For the packing after the solve, which keeps the matmul programs'
+        # front-end LX bounds low (CpSatLayoutSolver._justify). Indexed like the
+        # buffers' uses: the graph is not edited between the two.
+        solver.matmul_ticks = _matmul_ticks(graph)
         result = solver.plan_layout_and_core_divisions(cost_expr)
         if any(buffer.lx_relayout_plans for buffer in result):
             raise AssertionError("CoOptimizingAllocator does not support LX relayout")
@@ -5082,9 +5160,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ]
 
 
+def _matmul_ticks(graph: GraphLowering) -> frozenset[int]:
+    """Matmul indices in the final graph's liveness index space."""
+    return frozenset(
+        index for index, op in enumerate(graph.operations) if _is_matmul_op(op)
+    )
+
+
 def _cpsat_solver_class() -> type[MemoryPlanSolver]:
-    """``CpSatLayoutSolver``, or ``GreedyLayoutSolver`` when ortools is
-    unavailable.
+    """Select CP-SAT, or greedy when OR-Tools is unavailable.
+
 
     Resolved to a class once, when the allocator is selected, so the
     capabilities the allocator asks of it are the chosen solver's.

@@ -22,6 +22,8 @@ Each test class covers one category from the Hash Coverage Table:
   TestIterationSpaceHashed     — different iter-space sizes → different hash
   TestOpFuncHashed             — different op names → different hash
   TestDebugHandleStripped      — debug_handle_ is stripped before hashing
+  TestFrontendLxBytesHashed    — per-op frontend LX reservation changes the hash,
+                                 with the same semantics bundle emission uses
 """
 
 import json
@@ -64,6 +66,7 @@ def _make_op_spec(
     is_reduction: bool = False,
     tiled_symbols=None,
     tiled_symbol_trip_counts=None,
+    op_info=None,
 ):
     """Return a minimal OpSpec for a single-input elementwise op."""
     from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -96,7 +99,7 @@ def _make_op_spec(
         is_reduction=is_reduction,
         iteration_space=iteration_space,
         args=[in_arg, out_arg],
-        op_info={},
+        op_info={} if op_info is None else op_info,
         tiled_symbols=tiled_symbols or [],
         tiled_symbol_trip_counts=tiled_symbol_trip_counts or {},
     )
@@ -464,6 +467,104 @@ class TestFrontendPoolAllocationHashed(unittest.TestCase):
             self._hash_with_flag(True),
             "Same flag value must produce the same hash.",
         )
+
+
+# The effective per-op frontend LX reservation is hashed
+class TestFrontendLxBytesHashed(unittest.TestCase):
+    def test_reservation_is_part_of_cache_identity(self):
+        specs = [
+            _make_op_spec(op_info={"frontend_lx_bytes": b}) for b in (0, 131072, 262144)
+        ]
+        hashes = [_hash([op]) for op in specs]
+        self.assertEqual(len(set(hashes + [_hash([_make_op_spec()])])), 4)
+        self.assertEqual(_hash([specs[1]]), hashes[1])
+
+    def test_packed_live_bound_and_missing_or_excessive_record(self):
+        import torch
+        from types import SimpleNamespace
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+        from torch_spyre._inductor.scratchpad.utils import (
+            frontend_lx_high_water,
+            publish_frontend_lx_footprints,
+        )
+
+        d = Symbol("d0", integer=True, nonnegative=True)
+
+        def op(name, reads=(), writes=()):
+            rw = SimpleNamespace(
+                reads={MemoryDep(n, d, (d,), (64,)) for n in reads},
+                writes={MemoryDep(n, d, (d,), (64,)) for n in writes},
+            )
+            return SimpleNamespace(
+                get_operation_name=lambda: name, get_read_writes=lambda: rw
+            )
+
+        buffers = {}
+        for name, address in (("a", 0), ("b", 512)):
+            layout = FixedTiledLayout(
+                torch.device("cpu"),
+                torch.float16,
+                [64],
+                [1],
+                SimpleNamespace(device_size=[64]),
+                Integer(0),
+            )
+            layout.allocation["lx"] = address
+            buffers[name] = SimpleNamespace(layout=layout)
+        for span in (256, None, _lx_planning_size()):
+            with self.subTest(span=span):
+                graph = SimpleNamespace(
+                    operations=[
+                        op("write", writes=["a"]),
+                        op("handoff", ["a"], ["b"]),
+                        op("read", ["b"]),
+                    ],
+                    graph_input_names=[],
+                    try_get_buffer=buffers.get,
+                    get_buffer=buffers.__getitem__,
+                )
+                publish_frontend_lx_footprints(
+                    graph, {"a": 128, **({"b": span} if span else {})}
+                )
+                expected = (
+                    {"write": 128, "handoff": 768, "read": 768} if span == 256 else {}
+                )
+                self.assertEqual(frontend_lx_high_water(graph), expected)
+
+    def test_shared_program_uses_maximum_or_default_inside_loop(self):
+        import os
+        import tempfile
+        from unittest import mock
+        from torch_spyre._inductor.codegen.bundle import generate_bundle
+        from torch_spyre._inductor.op_spec import LoopSpec
+
+        def compile_op(idx, op, symbols, symbol_id_offset=0):
+            return {f"{idx}_{op.op}": {"op": op.op}}, [], [], []
+
+        for bounds, expected in (((131072, 262144), 262144), ((131072, None), None)):
+            with self.subTest(bounds=bounds), tempfile.TemporaryDirectory() as path:
+                specs = [
+                    _make_op_spec(op_info={} if b is None else {"frontend_lx_bytes": b})
+                    for b in bounds
+                ]
+                for spec in specs:
+                    spec.args = []
+                specs[1] = LoopSpec(count=Integer(4), body=[specs[1]])
+                with mock.patch(
+                    "torch_spyre._inductor.codegen.bundle.compile_op_spec", compile_op
+                ):
+                    generate_bundle("test_kernel", path, specs)
+                with open(os.path.join(path, "bundle.mlir")) as file:
+                    mlir = file.read()
+                self.assertEqual(mlir.count('sdsc_filename="sdsc_0.json"'), 2)
+                if expected is None:
+                    self.assertNotIn("frontend_lx_bytes", mlir)
+                else:
+                    self.assertEqual(
+                        mlir.count(f"frontend_lx_bytes = {expected} : i64"), 2
+                    )
 
 
 # Version strings affect hash (environment independence guard)
