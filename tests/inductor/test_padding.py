@@ -22,7 +22,6 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
-import pytest
 import sympy
 import torch
 import torch.fx as fx
@@ -840,23 +839,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "for_each_tile gives a silently wrong result (~64% of elements) for "
-            "a matmul with unaligned K=67 and a loop-invariant weight (#5440)"
-        ),
-    )
     def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
         """A loop-invariant weight with unaligned K inside a for_each_tile body.
 
         x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
-        compiled result is ~64% wrong (max abs error ~2.7e4) although the same
-        graph with K=64 or without the loop is correct.  Compiling does not
-        fail, so this is a silent wrong answer in the for_each_tile path
-        (#5440).  insert_bmm_padding must also pad the read-copy buffer for w,
-        which has no FX node of its own.
+        padding ops for w join the loop group, but must not inherit the
+        matmul's per-trip read advance: that record is positional in the
+        matmul's reads (the tiled x), so on the pad ops it advanced the read of
+        the invariant w and corrupted the padded copy on every trip after the
+        first, leaving ~64% of the result wrong (#5440).
         """
         dtype = torch.float16
         E, M, K, N = 3, 64, 67, 128
@@ -877,6 +868,39 @@ class TestInsertPaddingIR(unittest.TestCase):
         _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
         torch.testing.assert_close(
             torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_linear_invariant_weight_unaligned_k_pads_for_each_tile(self) -> None:
+        """An ``nn.Linear`` weight ``[N, K]`` with unaligned K, loop-invariant.
+
+        The same padding-op bug as the ``x @ w`` case above, on the most common
+        weight pattern: the weight is stored ``[N, K]``, padded, and restickified
+        for the matmul, all inside the loop group.  Over 70% of the result was
+        wrong before the padding ops stopped inheriting the matmul's read advance
+        (#5440).
+        """
+        import torch.nn.functional as F
+
+        dtype = torch.float16
+        E, M, K, N = 3, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(N, K, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, F.linear(x_tile, w_whole)
+
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            F.linear(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
         )
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:

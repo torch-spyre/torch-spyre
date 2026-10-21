@@ -272,6 +272,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
+| `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |

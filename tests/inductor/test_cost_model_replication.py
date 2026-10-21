@@ -635,7 +635,7 @@ def _solve_pinned(expr, menu, candidate, residency=None):
     buffer's candidate divisions, residency a solver variable -- and solve it
     with the division (and residency) pinned. Returns the objective value."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     model = cp_model.CpModel()
     division = model.new_int_var(0, len(menu) - 1, "div")
@@ -1088,7 +1088,7 @@ def _decode_buffer():
 @pytest.mark.parametrize("weight_lx", [False, True])
 def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
     expr = _decode_weight_delivery_excess(
@@ -1120,7 +1120,7 @@ def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
 
 def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
     assert _SympyExprToCpSat(cp_model.CpModel(), {}, {}).convert(expr) == 0
@@ -1128,7 +1128,7 @@ def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
 
 def test_cp_sat_gates_the_price_on_residency_without_a_product():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
     expr = _decode_weight_delivery_excess(
@@ -1156,7 +1156,7 @@ def test_cp_sat_gates_the_price_on_residency_without_a_product():
 @pytest.mark.parametrize("value", [-3, 0, 5])
 def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     b, x = sympy.symbols("b x", integer=True)
     model = cp_model.CpModel()
@@ -1175,7 +1175,7 @@ def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
 @pytest.mark.parametrize("value", [None, -3, 5])
 def test_cp_sat_bools_times_int_is_the_int_while_every_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     b1, b2, x = sympy.symbols("b1 b2 x", integer=True)
     model = cp_model.CpModel()

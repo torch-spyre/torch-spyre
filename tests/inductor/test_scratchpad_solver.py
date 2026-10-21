@@ -53,13 +53,13 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchS
 try:
     from ortools.sat.python import cp_model  # noqa: F401
 
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
-        CpSatLayoutSolver,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
     )
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     _HAS_ORTOOLS = True
 except ImportError:
