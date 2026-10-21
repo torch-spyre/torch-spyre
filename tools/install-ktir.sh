@@ -59,17 +59,7 @@ if [[ -z "${MLIR_DIR:-}" ]]; then
 fi
 echo "MLIR_DIR=${MLIR_DIR}"
 
-# A uv-created venv has no pip module, so fall back to uv's installer, pointed at
-# the same interpreter the checks above and below use.
-if python -m pip --version >/dev/null 2>&1; then
-    CMAKE_ARGS="-DMLIR_DIR=${MLIR_DIR}" python -m pip install "${SRC}"
-elif command -v uv >/dev/null 2>&1; then
-    CMAKE_ARGS="-DMLIR_DIR=${MLIR_DIR}" \
-        uv pip install --python "$(command -v python)" "${SRC}"
-else
-    echo "error: neither pip nor uv is available to install mlir_ktdp" >&2
-    exit 1
-fi
+CMAKE_ARGS="-DMLIR_DIR=${MLIR_DIR}" python -m pip install "${SRC}"
 
 # The emitter needs these specific dialect bindings, not just the package.
 python -c "from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, tensor" \
