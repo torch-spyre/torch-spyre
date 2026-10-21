@@ -14,11 +14,20 @@
 
 import torch
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+
+RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(
+    {
+        DataFormats.SEN169_FP16,
+        DataFormats.IEEE_FP32,
+        DataFormats.IEEE_INT32,
+        DataFormats.SENUINT32,
+    }
+)
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
@@ -170,6 +179,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "keepbyindex",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when

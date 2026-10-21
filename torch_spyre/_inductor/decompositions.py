@@ -1812,6 +1812,16 @@ def silu(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.silu(input)
 
 
+def _mask_extracted_indices(
+    x: torch.Tensor, indices: torch.Tensor, dim: int
+) -> torch.Tensor:
+    dim = dim % x.ndim
+    ones = torch.ones_like(x)
+    marker = torch.ops.spyre.keep_by_index(ones, indices, dim, 0.0)
+    masked = torch.where(marker == 1.0, float("-inf"), x)
+    return masked.clone()
+
+
 @register_spyre_decompositions([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
@@ -1820,16 +1830,84 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 128:
-        raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
-    # sorted=False is a no-op: our reduction always returns sorted output.
-    # Index stays in the input dtype (not int64) all the way out; topkindex's
-    # fake reports it so Dynamo traces it with no meta conflict.
-    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
-        input, k, dim
-    )
+    if dim is None:
+        dim = -1
+    dim = dim % input.dim()
+
+    if k <= 128:
+        # sorted=False is a no-op: our reduction always returns sorted output.
+        # Index stays in the input dtype (not int64) all the way out; topkindex's
+        # fake reports it so Dynamo traces it with no meta conflict.
+        return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
+            input, k, dim
+        )
+
+    # For k > 128, peel in chunks of at most 128 elements.
+    vals_list = []
+    idxs_list = []
+    curr_input = input
+    remaining_k = k
+
+    while remaining_k > 0:
+        chunk_k = min(remaining_k, 128)
+        v = torch.ops.spyre.topkvalue(curr_input, chunk_k, dim)
+        i = torch.ops.spyre.topkindex(curr_input, chunk_k, dim)
+        vals_list.append(v)
+        idxs_list.append(i)
+        remaining_k -= chunk_k
+        if remaining_k > 0:
+            curr_input = _mask_extracted_indices(curr_input, i, dim)
+
+    return torch.cat(vals_list, dim=dim), torch.cat(idxs_list, dim=dim)
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.sort.default, torch.ops.aten.sort.stable]
+)
+def spyre_sort(
+    input: torch.Tensor,
+    dim: int = -1,
+    descending: bool = False,
+    *,
+    stable: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sort`` as a full-length topk (k = size of ``dim``).
+
+    topk only returns the largest elements, so an ascending sort runs it on
+    ``-input`` and negates the values back. Among equal keys topk emits the
+    highest index first. That order is allowed unless ``stable=True``; then
+    the input is flipped along ``dim`` beforehand, so the highest flipped
+    index is the lowest original one (the stable order), and ``(n - 1) - i``
+    maps a flipped index back.
+    """
+    if input.numel() == 0:
+        return input.clone(), torch.empty_like(input, dtype=torch.int64)
+    if input.dim() == 0:
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    dim = dim % input.dim()
+    n = input.size(dim)
+    if n == 1:
+        return input.clone(), torch.zeros_like(input, dtype=torch.int64)
+    orig_dtype = input.dtype
+    if not input.dtype.is_floating_point:
+        # topkvalue/topkindex only bind fp16/fp32 in DeepTools;
+        # cast integer inputs to fp32 for sorting and cast values back.
+        input = input.to(torch.float32)
+    if any(isinstance(size, torch.SymInt) for size in input.shape):
+        raise Unsupported("sort with dynamic shapes")
+    key = torch.flip(input, [dim]) if stable else input
+    if not descending:
+        key = -key
+    values, indices = spyre_topk(key, n, dim=dim, largest=True, sorted=True)
+    if not descending:
+        values = -values
+    if not orig_dtype.is_floating_point:
+        values = values.to(orig_dtype)
+    if stable:
+        indices = (n - 1) - indices
+    return values, indices.to(torch.int64)
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])

@@ -1730,6 +1730,19 @@ def lower_cat(inputs, dim=0):
         lowering.mutate_to(sliced_output, input_tensor)
         offset += input_tensor.get_size()[dim]
 
+    # The output buffer is filled only through mutate_to, so its own body reads
+    # no buffer and never reaches name_to_users; the interpreter also drops the
+    # cat node's env entry after its last user is lowered. split_multi_ops
+    # resolves a fused body's loads to FX nodes through env by buffer name, so
+    # keep a durable entry (e.g. for the float32 -> int64 cast of a cat result).
+    fx_graph = V.graph.graph
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        fx_node = fx_graph.create_node("call_function", torch.ops.aten.cat.default, ())
+    with V.fake_mode:
+        fx_node.meta["val"] = ir.ir_node_to_tensor(output)
+    V.graph.env[fx_node] = output
+
     return output
 
 
