@@ -233,9 +233,16 @@ class GraphEditor:
             layout.device_layout,
             offset=layout.offset,
         )
+        # "First consumer" means first in the lowered order, not first in
+        # ``buffer_users``: callers may pass consumers in any order (relayout
+        # groups are name-sorted, so buf121 precedes buf59). A clone placed after
+        # a consumer that reads it breaks the topological order the Scheduler
+        # relies on.
+        operations = self.lowering.operations
+        first_user = min(buffer_users, key=operations.index) if buffer_users else None
         # Input buffers have no loop metadata, so input clones inherit it from
         # their consumer. Output clones inherit it from their producer.
-        metadata_source = buffer_users[0] if input else buffer
+        metadata_source = first_user if input else buffer
         assert isinstance(metadata_source, ComputedBuffer)
         clone_tb = clone_lowering(buffer)
         new_com_buf = ComputedBuffer(
@@ -329,7 +336,8 @@ class GraphEditor:
         else:
             # A hoisted input clone goes before its consumers' loop entry; any
             # other clone goes before its first consumer, as before.
-            before = lower_before if lower_before is not None else buffer_users[0]
+            before = lower_before if lower_before is not None else first_user
+            assert before is not None, "a clone with no consumers needs an anchor"
             self.lowering.operations.insert(
                 self.lowering.operations.index(before), new_com_buf
             )

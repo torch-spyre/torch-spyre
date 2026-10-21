@@ -74,11 +74,11 @@ reaches the search untiled: `span_reduction_pass` refuses it, unless the opt-in 
 has tiled it first, and an op already tiled is offered no tiling. So this search still only finds
 tilings that pay through LX residency.
 
-That payoff is not a cost term. Every tiling-sensitive term in the cost model is a derate bounded by
-1.0 and an untiled op has a working set of 0, so the objective can rank tilings against each other
-but never above not tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as
-well as `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid
-in the HBM traffic residency then frees.
+That payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0, and
+the objective's `_COST_PARAMS` pins them at 1.0 besides, so none can rank a tiling above not
+tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as well as
+`output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
+HBM traffic residency then frees.
 
 The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: a
 solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
@@ -131,6 +131,24 @@ Reproducible is not stable: the trajectory is chaotic, so compare two revisions 
 never one.
 :::
 
+### What the tiling costs, as an objective symbol
+
+`CoreDivisionBuffer.sym_tile_counts` declares one symbol per tileable axis, keyed
+`(host_dim, is_reduction)`. This engine's menu lists no tiling, so its keys are every output dim the
+buffer's division space may tile, and the annealer binds each through the chosen config's
+`TileSpec.count_for`, 1 for an axis it leaves untiled. `CoOptimizingAllocator._extract_op_features`
+resolves each axis to the op's loop variable and hands the symbols to the extractor as a candidate
+tiling (`dump_cost_model._candidate_tiling`). `tiles_output_dim` is then a condition over them, and
+every branch on it a `Piecewise` (`cost_model._select`). With the derates pinned and the loop
+re-read not double-counted (`_COST_PARAMS`), depth reaches the price mainly through the
+`loop_factor` of each operand the loop re-reads.
+
+### Residency across a tiling boundary
+
+A coarse-tiled op reading a buffer produced outside its run reads it at an address that advances
+per tile, which an LX address cannot: `_read_across_a_tiling_boundary` refuses that buffer LX.
+Nothing gives that residency back yet; a tile-local staging copy, placed by the anneal, could.
+
 ## The apply round
 
 `CoOptimizingAllocator._apply_chosen_tilings` runs `CoarseTilingPass` on the chosen `TileSpec`s
@@ -175,9 +193,10 @@ the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
 
 **Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
-writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group,
-which features extracted from the untiled graph do not see. It rides outside `cost_expr` because
-that expression has no symbol for a tiling; see `_companion_bytes`.
+writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group. It
+rides outside `cost_expr` because `op_features` is extracted from the untiled graph: the tile-count
+symbols price the loop over each op, but that buffer exists only once the apply has run; see
+`_companion_bytes`.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has

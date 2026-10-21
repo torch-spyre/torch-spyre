@@ -135,6 +135,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_info import (
+    CoarseTileInfo,
     LoopCarryRecord,
     ReadCopyElisionRecord,
 )
@@ -288,6 +289,31 @@ def _is_loop_carry_storage(op: Any) -> bool:
 
     record = getattr(op, "_loop_carry_record", None)
     return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
+
+def _coarse_tile_loop_trip_count(op: Any) -> int:
+    """Total trip count of ``op``'s coarse-tiling loop, or 1 when untiled.
+
+    ``CoarseTileInfo.loop_count`` is one entry per nesting level, outermost
+    first; the real total is their product. An entry can be a symbolic
+    ``sympy.Expr`` under dynamic shapes
+    (``for_each_tile_lowering.py``'s ``_extract_trip_count``) rather than a
+    concrete ``int`` -- coerced the same way ``dump_cost_model._loop_features``
+    does for this exact field: ``int()`` when it resolves to a concrete
+    value, 1 (not a propagated symbol that would later crash numeric code
+    expecting a plain float) when it doesn't.
+    """
+    loop_info = getattr(op, "loop_info", None)
+    if not isinstance(loop_info, CoarseTileInfo):
+        return 1
+
+    def _resolved(c) -> int:
+        try:
+            return int(c)
+        except (TypeError, ValueError):
+            return 1
+
+    return max(1, math.prod(_resolved(c) for c in loop_info.loop_count))
 
 
 @dataclass(frozen=True)
@@ -3123,6 +3149,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     bundle_terms,
                     result,
                     _COST_PARAMS,
+                    solver.off_expression_ns(),
+                    solver.score_ns(),
                     context=context,
                 ),
             )
@@ -3243,6 +3271,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         commit_divisions(graph, allocation, self._live_splits)
+        # After the commit, and before the views below are derived from it: a
+        # copy-out the apply mints is not in ``allocation``, so nothing above gave
+        # it a division and it would be judged against its tiled op's as a mismatch.
+        self._commit_copy_out_divisions(graph, allocation, tiled)
         commit_lx_views(
             graph,
             allocation,
@@ -3734,6 +3766,49 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
 
+    def _commit_copy_out_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Iterable[str],
+    ) -> None:
+        """Give each copy-out the apply minted its tiled op's core division.
+
+        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
+        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
+        keeps no division of its own -- one core -- while the tiled op commits
+        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
+        mismatch and withholds the tiled buffer's view, and a resident one
+        raises in :meth:`_post_solve`.
+
+        The copy's iteration symbols are the tiled op's output symbols in order
+        (``iteration_space_from_op`` lists reductions after), so the splits map
+        positionally and only a reduction split is dropped.
+        """
+        by_name = {b.name: b for b in allocation}
+        ops = {getattr(op, "name", None): op for op in graph.operations}
+        for source in tiled:
+            # Named as ``_insert_copy_op`` names it.
+            copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
+            buffer = by_name[source]
+            if copy is None:
+                # Expected when the op's output stays inside its tiling group.
+                logger.debug("%s: no copy-out to give its core division", source)
+                continue
+            if buffer.chosen_division is None:
+                continue
+            splits = self._live_splits(
+                source, buffer.core_divisions[buffer.chosen_division].splits
+            )
+            symbols = list(iteration_space_from_op(copy))
+            source_symbols = list(iteration_space_from_op(graph.get_buffer(source)))
+            mapped = {
+                symbols[position]: factor
+                for position, symbol in enumerate(source_symbols)
+                if position < len(symbols) and (factor := splits.get(symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(copy, mapped)
+
     def _check_priced_footprints(
         self,
         graph: GraphLowering,
@@ -3930,6 +4005,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name = {op.name: op for op in graph.operations}
         position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
+        readers_by_name: dict[str, list[ComputedBuffer]] = {}
+        if self._solver_chooses_tilings:
+            for reader in graph.operations:
+                if isinstance(reader, ComputedBuffer):
+                    for name in {read.name for read in reader.get_read_writes().reads}:
+                        readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
@@ -4038,16 +4119,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cd_parent_matches = self._cd_parent_matches(
                 residency_edges, buf_divisions, divisions
             )
-            cd_parent_relayouts = self._cd_parent_relayouts(
-                graph,
-                op,
-                buf_divisions,
-                parent_proj,
-                divisions,
-                op_by_name,
-                prep_cache,
-                residency_by_buf,
-            )
 
             # A for_each_tile update writes through a MutationLayout whose
             # dependency is named after the update op, even though the bytes
@@ -4056,6 +4127,27 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # the solver chooses identical physical ownership for the initial
             # storage and every update.  A relayout cannot satisfy an in-place
             # write, so this edge deliberately has match pairs only.
+            #
+            # Folded into cd_parent_matches BEFORE _cd_parent_relayouts runs
+            # (not after, as a prior version of this did): a sibling parent's
+            # own relayout candidates get capped against cd_parent_matches
+            # inside that call, and a cap that ran before the carry's matches
+            # existed could prune away the one candidate that would have let
+            # that sibling land on a division the carry already occupies for
+            # free (cyang49's PR #5057 review). original_parent_proj (the
+            # pre-carry snapshot) is what every "already a direct read"
+            # membership check below is against, so a storage this same op
+            # also reads directly keeps getting the intersected (update AND
+            # read) match pairs either block alone would have produced,
+            # independent of which block runs first -- and is what
+            # _cd_parent_relayouts is called with: no carry-touched storage
+            # name is ever added to parent_proj before that call, so it is
+            # never offered as a relayout candidate at all (a relayout copy
+            # taken before the update would be stale, whether or not the
+            # storage happens to also be an ordinary read). Carry-touched
+            # names are appended to the real parent_proj only afterward.
+            original_parent_proj = list(parent_proj)
+            carry_storage_names: list[str] = []
             carry_edge = carry_update_edges.get(output_name)
             if carry_edge is not None:
                 storage_name = carry_edge.buf_name
@@ -4063,7 +4155,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     divisions[storage_name],
                     buf_divisions,
                 )
-                if storage_name in parent_proj:
+                if storage_name in original_parent_proj:
                     # If the update also reads the carry directly, both that
                     # read and the aliased write must agree with its storage.
                     read_matches = cd_parent_matches.get(storage_name)
@@ -4072,10 +4164,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     else:
                         update_set = set(update_matches)
                         update_matches = [p for p in read_matches if p in update_set]
-                else:
-                    parent_proj.append(storage_name)
+                carry_storage_names.append(storage_name)
                 cd_parent_matches[storage_name] = update_matches
-                cd_parent_relayouts.pop(storage_name, None)
 
             # A read of a carry update reads the storage's bytes, so it must
             # agree with the storage's ownership too; otherwise a resident
@@ -4089,13 +4179,58 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     divisions[storage_name],
                     buf_divisions,
                 )
-                if storage_name in parent_proj:
+                # Also checks carry_storage_names, not just original_parent_proj:
+                # a storage that is THIS op's own carry-update target (recorded
+                # above) but not a direct read never enters original_parent_proj,
+                # so without this a self-overlap -- two sequential mutations of
+                # one carry, where this op both updates storage S and reads
+                # another update that also writes S -- would overwrite the
+                # update-edge's match_pairs with the unfiltered read-edge ones
+                # instead of intersecting them, same loss of constraint the
+                # direct-read branch above exists to prevent.
+                if storage_name in original_parent_proj or storage_name in (
+                    carry_storage_names
+                ):
                     known = set(cd_parent_matches.get(storage_name, []))
                     read_matches = [p for p in read_matches if p in known]
-                else:
-                    parent_proj.append(storage_name)
+                if storage_name not in carry_storage_names:
+                    carry_storage_names.append(storage_name)
                 cd_parent_matches[storage_name] = read_matches
-                cd_parent_relayouts.pop(storage_name, None)
+
+            relayout_parent_names = [
+                parent for parent in parent_proj if parent not in carry_storage_names
+            ]
+            # Merge clone-supplied free divisions BEFORE the call: the
+            # cap-and-rank step inside _cd_parent_relayouts pins the candidate
+            # group that would let a parent join a division another parent
+            # already occupies for free, and an input clone's reusable slot
+            # (#3212) is one such free division -- merged only after the call,
+            # a positive lx_solver_relayout_groups_per_edge cap could prune the
+            # one group matching it and silently drop a residency option
+            # (cyang49's PR #5057 review). The carry branch above has already
+            # run, so the intersection it applies to a carry storage's
+            # match_pairs is unaffected by this merge; the re-merge after
+            # the call below stays for carry storages that only join
+            # parent_proj between the two points.
+            for input_name in parent_proj:
+                if input_name in input_clone_matches:
+                    cd_parent_matches[input_name] = input_clone_matches[input_name][
+                        output_name
+                    ]
+            cd_parent_relayouts = self._cd_parent_relayouts(
+                graph,
+                op,
+                buf_divisions,
+                relayout_parent_names,
+                divisions,
+                op_by_name,
+                prep_cache,
+                residency_by_buf,
+                cd_parent_matches,
+            )
+            for storage_name in carry_storage_names:
+                if storage_name not in parent_proj:
+                    parent_proj.append(storage_name)
 
             for input_name in parent_proj:
                 if input_name in input_clone_matches:
@@ -4164,7 +4299,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and output_name in division_map.enumerated
                 and self._solver_generates_divisions
             ):
-                buffer.division_space = self._division_space(op)
+                buffer.division_space = self._division_space(
+                    op, readers_by_name.get(output_name, ())
+                )
             if self._solver_chooses_tilings and isinstance(op, ComputedBuffer):
                 buffer.tile_reads = self._tile_reads(graph, op, op_by_name)
             buffers.append(buffer)
@@ -4356,8 +4493,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             and self.layout_planning.generates_divisions()
         )
 
-    def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
-        """The op's split space.
+    def _division_space(
+        self, op: Operation, readers: Sequence[ComputedBuffer] = ()
+    ) -> Optional[OpSplitSpace]:
+        """The op's split space; ``readers`` are the ops reading its output.
 
         The tiling half is attached only for the solver that can use it (see
         :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
@@ -4368,7 +4507,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # imports this module.
         from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 
-        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        tiling = (
+            build_tiling_space(op, readers=readers)
+            if self._solver_chooses_tilings
+            else None
+        )
         return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(
@@ -4550,6 +4693,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         candidates: list[RelayoutCandidate],
         consumer_divs: list[CoreDivision],
         consumer_costs: dict[int, float] | None = None,
+        pinned_consumer_divisions: frozenset[int] = frozenset(),
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
         cheapest destination views of one (source, consumer) edge.
@@ -4565,6 +4709,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         a consumer division without a copy is treated exactly like an unpriced
         pair (match for free or spill), and every fired relayout is still
         certified at materialization.
+
+        ``pinned_consumer_divisions`` (divisions another parent already
+        matches for free, per ``_cd_parent_matches``) are kept regardless of
+        cost rank: cost alone can't see that reaching one of them lets every
+        parent land on the same division, so the cap must not drop it.
         """
         cap = config.lx_solver_relayout_groups_per_edge
         if cap <= 0 or not candidates:
@@ -4574,6 +4723,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             by_group.setdefault(candidate.group, []).append(candidate)
         if len(by_group) <= cap:
             return candidates
+
+        pinned_groups = {
+            group
+            for group, members in by_group.items()
+            if any(c.consumer_division in pinned_consumer_divisions for c in members)
+        }
 
         def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
             group, members = item
@@ -4589,13 +4744,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
-        kept = {group for group, _ in sorted(by_group.items(), key=rank)[:cap]}
+        remaining = cap - len(pinned_groups)
+        ranked = [item for item in by_group.items() if item[0] not in pinned_groups]
+        cost_kept = {
+            group for group, _ in sorted(ranked, key=rank)[: max(remaining, 0)]
+        }
+        kept = pinned_groups | cost_kept
         logger.debug(
-            "[lx solver relayout] %s -> %s: keeping %d of %d destination views",
+            "[lx solver relayout] %s -> %s: keeping %d of %d destination views"
+            " (%d pinned by a sibling parent match)",
             parent,
             consumer,
             len(kept),
             len(by_group),
+            len(pinned_groups),
         )
         return [c for c in candidates if c.group in kept]
 
@@ -4644,6 +4806,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
+        cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]] = None,
     ) -> dict[str, list[RelayoutCandidate]]:
         """Priced relayout candidates for each divided producer this op reads.
 
@@ -4657,6 +4820,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on the
         solver's ``decides_lx_relayouts``.
+
+        ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
+        gives each parent's cap-and-rank step the other parents' already-free
+        divisions, so it won't drop the one group that would let this parent
+        join them.
         """
         if not self._decides_lx_relayouts or config.ktir_emitter:
             return {}
@@ -4718,16 +4886,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 return projected[key]
 
             # A coarse-tiled CANDIDATE can never host a relayout, for the same
-            # reasons a coarse-tiled op cannot (the fitted law has no
-            # loop-trip factor, and a tiled candidate's buffer is per-tile
-            # scratch). The loop_info edge gate covers hint-materialized
-            # tiling decided before the solve; once the unified-tiling work
-            # (#3923) makes tiling a per-candidate solver choice, cd.tiling
-            # is the only marker. Written via getattr so it is inert until
-            # that lands.
+            # reasons a coarse-tiled op cannot in general (a tiled candidate's
+            # buffer is per-tile scratch). The loop_info edge gate covers
+            # hint-materialized tiling decided before the solve; once the
+            # unified-tiling work (#3923) makes tiling a per-candidate solver
+            # choice, cd.tiling is the only marker. Written via getattr so it
+            # is inert until that lands.
             def _candidate_tiled(cd) -> bool:
                 tiling = getattr(cd, "tiling", None)
                 return tiling is not None and not getattr(tiling, "is_untiled", True)
+
+            # solver_relayout_edge_context's same-tile-group exception admits a
+            # coarse-tiled parent/consumer pair: that candidate's copy runs
+            # once per loop trip, not once total, so its price must scale by
+            # the loop's own trip count or the solver sees an under-priced
+            # option that could out-rank a correctly-priced alternative whose
+            # real total cost is actually lower (cyang49's PR #5057 review).
+            loop_trip_count = _coarse_tile_loop_trip_count(parent_op)
 
             # The per-core LX span of a view (#3440's reservation for a relayout
             # member). Unavailable (non-standard arrangement, an unsplittable
@@ -4830,6 +5005,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cost = pair_cost[key]
                     if cost is None:
                         continue
+                    # pair_cost is a graph-wide cache keyed on geometry alone
+                    # (shared across parents), so the trip multiplier is
+                    # applied to this candidate's own cost, never written
+                    # back into the cached value.
+                    cost = cost * loop_trip_count
                     candidates.append(
                         RelayoutCandidate(
                             parent=parent,
@@ -4858,12 +5038,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         consumer_op.get_name(),
                         exc,
                     )
+            sibling_pinned = frozenset(
+                j
+                for other_parent, pairs in (cd_parent_matches or {}).items()
+                if other_parent != parent
+                for _, j in pairs
+            )
             candidates = self._cap_relayout_groups(
                 parent,
                 consumer_op.get_name(),
                 candidates,
                 consumer_divs,
                 consumer_costs,
+                sibling_pinned,
             )
             if candidates:
                 relayouts[parent] = candidates

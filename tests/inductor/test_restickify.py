@@ -2813,3 +2813,61 @@ def test_bounded_nonstick_slice(shape, step, start, dtype):
 
     got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to("spyre")).cpu()
     torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
+
+
+def test_matmul_weight_with_factorized_contraction_dim():
+    """A computed weight ``[N, Ht, D]`` reshaped to ``[N, Ht * D]`` feeds a matmul.
+
+    The contraction dim K is factorized over two host dims, so K appears in more
+    than one outer device coordinate once the stick moves to N.  The restickify
+    target must keep both dims (here 8 heads), and the matmul needs K collapsed
+    into one outer dim.  Issue #5550: the target layout used to overwrite the
+    heads dim, giving a layout with 8x too many elements and wrong values.
+    """
+    import torch.nn.functional as F
+
+    hidden, Ht, D = 4096, 8, 128
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, Ht * D, dtype=torch.float16, generator=generator)
+    w3 = torch.randn(hidden, Ht, D, dtype=torch.float16, generator=generator) * 0.05
+
+    def fn(x, w3):
+        # ``+ 0`` makes the weight a computed buffer with layout [N, Ht, D].
+        return F.linear(x, (w3 + 0).reshape(hidden, Ht * D))
+
+    compare_with_cpu(fn, x, w3, run_eager=False)
+
+
+def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
+    """Moving the stick off a factorized contraction var is not computable.
+
+    The weight ``[N, 8, 128]`` has its K var ``d1`` on the heads dim, the D-high
+    dim and the stick.  There is no single outer dim to repurpose when the stick
+    moves to N, and repurposing the first one overwrites the heads dim.  The
+    target must be reported infeasible (``None``) instead of a layout whose device
+    size no longer matches the tensor (issue #5550).
+    """
+    import sympy
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    host = FixedLayout(DEVICE, torch.float16, [4096, 8, 128], [1024, 128, 1])
+    stl = _CSTL(
+        [8, 2, 4096, 64],
+        [128, 64, 1024, 1],
+        DataFormats.SEN169_FP16,
+        {(0,): 8, (1, 3): 128, (2,): 4096},
+    )
+    host_coords = [d0, sympy.floor(d1 / 128), sympy.Mod(d1, 128)]
+    device_coords = [
+        sympy.floor(d1 / 128),
+        sympy.floor(sympy.Mod(d1, 128) / 64),
+        d0,
+        sympy.Mod(d1, 64),
+    ]
+    assert (
+        compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
+        is None
+    )

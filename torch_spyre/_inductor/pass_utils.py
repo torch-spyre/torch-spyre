@@ -80,6 +80,13 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .pass_counters import (
+    COUNTERS,
+    DEVICE_COORDINATES,
+    HOST_COORDINATES,
+    READ_WRITES_MISSES,
+    READ_WRITES_REQUESTS,
+)
 from .provenance import preserve_provenance
 from .views import (
     AlignmentInputs,
@@ -104,24 +111,32 @@ def register_operation_after_graph_edit(graph: GraphLowering, op: Operation) -> 
     same name.  The scheduler subsequently resolves a dependency to the wrong
     producer (or to one that occurs later) and fails while computing ancestors.
 
-    Keep upstream's naming convention, but find the first name that is not
-    currently registered.  Most removals keep the removed op in ``name_to_op``,
-    but ``dedup_and_promote_constants`` drops it, so its name can be reissued.
+    Keep upstream's naming convention, but find the first name that was never
+    issued during this compile.  Checking ``name_to_op`` alone is insufficient:
+    ``dedup_and_promote_constants`` pops a merged constant's entry, so its name
+    appears free even though a live op still carries it.  ``_unique_operation_names``
+    stamps ``_spyre_issued_op_names`` on the graph before the first registration;
+    that set accumulates every name ever handed out and is never modified by
+    graph-pruning passes, so freed names cannot be reissued.
+
     Scratchpad edits use this helper because they run late in the lowering
     pipeline, after graph-pruning passes.
     """
     assert op.operation_name is None, f"Operation registered twice: {op}"
 
+    issued = getattr(graph, "_spyre_issued_op_names", graph.name_to_op)
     index = len(graph.operations)
     while True:
         name = graph.qualify_name(f"op{index}")
-        if name not in graph.name_to_op:
+        if name not in issued:
             break
         index += 1
 
     graph.operations.append(op)
     graph.name_to_op[name] = op
     op.operation_name = name
+    if issued is not graph.name_to_op:
+        issued.add(name)
     return name
 
 
@@ -263,8 +278,12 @@ def op_read_writes(op: Operation) -> ReadWrites:
     we cache it under a private key only this helper reads -- a non-planner
     caller (e.g. later-pass codegen) still goes through the real method.
     """
+    if COUNTERS.enabled:
+        COUNTERS.bump(READ_WRITES_REQUESTS)
     rw = op.__dict__.get("_ts_cached_read_writes")
     if rw is None:
+        if COUNTERS.enabled:
+            COUNTERS.bump(READ_WRITES_MISSES)
         rw = op.get_read_writes()
         op.__dict__["_ts_cached_read_writes"] = rw
     return rw
@@ -1220,6 +1239,8 @@ def host_coordinates(
     Returns:
         One coordinate expression per host dimension.
     """
+    if COUNTERS.enabled:
+        COUNTERS.bump(HOST_COORDINATES)
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
     # coordinate expressions remain symbolic.
@@ -1486,6 +1507,13 @@ def device_coordinates(
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
+    if COUNTERS.enabled:
+        # Defined as constructions, not asks: a reader treats the count as the
+        # work because nothing memoizes this today. #4245 adds a shared memo, and
+        # whichever of the two lands second must bump this only on the miss path
+        # and count asks under a separate ``device_coordinates.requests`` -- a
+        # single counter spanning both stops measuring either.
+        COUNTERS.bump(DEVICE_COORDINATES)
     index = per_trip_index(op, dep.index) if op is not None else dep.index
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
     if check_stick_expr:
@@ -2314,8 +2342,16 @@ def compute_restickify_target_layout(
     old_var = next(iter(old_stick_expr.free_symbols))
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
+    old_var_outer_dims = [
+        j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
+    ]
+    if len(old_var_outer_dims) > 1:
+        # The old stick variable is spread over several outer device dims (a
+        # factorized layout): there is no single dim to repurpose, and picking
+        # one overwrites an unrelated dim.
+        return None
     old_sd_outer_dim = next(
-        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
+        iter(old_var_outer_dims),
         next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
     )
     if old_sd_outer_dim is None:

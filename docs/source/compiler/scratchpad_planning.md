@@ -272,6 +272,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
+| `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
@@ -591,8 +592,8 @@ utilization). Remaining gaps:
 - **No performance model.** The "honor compute-bound ops, search the
   rest" rule is still a heuristic; the trade between compute throughput
   and memory traffic is not scored.
-- **Coarse-tiling integration**: landed for CP-SAT (`#4768`), partially landed for simulated
-  annealing — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
+- **Coarse-tiling integration**: landed for CP-SAT (`#4768`) and simulated annealing
+  (`#4456`-`#4894`) — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
   for current status.
 
 The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
@@ -655,8 +656,8 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`), partially
-  landed for simulated annealing — see
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`) and simulated
+  annealing (`#4456`-`#4894`) — see
   [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
   current status.
 

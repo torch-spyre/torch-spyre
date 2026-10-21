@@ -50,6 +50,8 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+import dataclasses
+
 import sympy
 import torch
 from sympy import Expr
@@ -234,6 +236,27 @@ def _rebuild_matmul(
     )
 
 
+def _loop_info_without_advance(info, new_op):
+    """Loop group membership of ``info`` with no per-trip advance on ``new_op``.
+
+    ``tiled_dims_per_read`` and ``squeezed_advance_per_read`` are positional in the
+    op's own reads.  A padding op reads different buffers than the matmul it pads
+    for, so the matmul's records would land on the wrong reads (for example the
+    tiled ``x``'s advance on the loop-invariant ``y`` being padded).  The padding
+    op re-runs identical work every trip, so it advances nothing.
+    """
+    n_reads = len([d for d in new_op.get_read_writes().reads if hasattr(d, "name")])
+    levels = len(info.loop_count)
+    return dataclasses.replace(
+        info,
+        tiled_dims_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        output_tiled_dims=[[] for _ in range(levels)],
+        squeezed_advance_per_read=[[[] for _ in range(levels)] for _ in range(n_reads)],
+        squeezed_advance_output=[[] for _ in range(levels)],
+        propagation=None,
+    )
+
+
 def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
@@ -368,7 +391,9 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if hasattr(op, "loop_info"):
             for new_op in y_new_ops:
                 if isinstance(new_op, ComputedBuffer):
-                    new_op.loop_info = op.loop_info  # type: ignore[attr-defined]
+                    new_op.loop_info = _loop_info_without_advance(  # type: ignore[attr-defined]
+                        op.loop_info, new_op
+                    )
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
@@ -434,6 +459,25 @@ def _device_dim_carrying_sym(stl: SpyreTensorLayout, write_dep, sym) -> int | No
         if sym in device_coords[dim].free_symbols:
             return dim
     return None
+
+
+def _written_extent(stl: SpyreTensorLayout, write_dep, device_dim: int, sym) -> int:
+    """Number of positions the write covers along ``device_dim``.
+
+    Normally that dim's coordinate is ``sym`` alone, so its extent is the range of
+    ``sym``.  A collapsed factorized dim (for example the contraction dim K of a
+    ``[N, heads, D]`` weight, coordinate ``128*heads + D``) is written by several
+    loop variables together; its extent is the highest coordinate written, plus
+    one.  Those variables' ranges must be used, or the write looks like a slice of
+    the dim.
+    """
+    coord = device_coordinates(stl, write_dep)[device_dim]
+    if len(coord.free_symbols) <= 1:
+        return concretize_expr(write_dep.ranges[sym])
+    last = coord.xreplace(
+        {v: concretize_expr(write_dep.ranges[v]) - 1 for v in coord.free_symbols}
+    )
+    return int(last) + 1
 
 
 def _stick_symbol(stl: SpyreTensorLayout, dep) -> object | None:
@@ -588,7 +632,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     #
     # TODO: support this by restickifying into a fresh temp buffer sized to a stick
     # multiple, then cloning that buffer into the slice.
-    host_dim_size = concretize_expr(write_dep.ranges[old_sym])
+    host_dim_size = _written_extent(stl, write_dep, device_dim, old_sym)
     if host_dim_size < unpadded_dim_size:
         raise Unsupported(
             f"insert_restickify_padding: sliced output on {op.get_name()} "
