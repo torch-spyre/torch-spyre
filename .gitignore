@@ -409,32 +409,3 @@ tools/cost_model/sweep_records.json.part
 # OpSpec lab outputs
 captured/
 op_spec_out/
-
-
-# Working files and folders
-CONV2D_PADDING_AND_SPATIAL_SPLIT_2026-10-07.md
-CONV_POOL_PADDING_ANALYSIS_2026-10-01.md
-CONV_TRANSPOSE2D_COL2IM_2026-10-14.md
-KTIR_MLIR_RAMPUP_PLAN_2026-10-15.md
-KTIR_PATHWAY_2026-10-15.md
-KTIR_POOL_CONV_ASSESSMENT_2026-10-15.md
-MAXPOOL2D_SESSION_SUMMARY_2026-09-03.md
-MAXPOOL_DWCONV_PADDING_ANALYSIS_2026-10-06.md
-POOL_COORD_OVERFLOW_ERROR_2026-10-07.md
-PR3838_DEPTHWISE_LAYOUTS_REMOVAL_2026-10-13.md
-SDSC_BUNDLE_DBO_FLOW_2026-10-01.md
-docs/source/user_guide/examples/conv.tar
-docs/source/user_guide/examples/convolution/
-docs/source/user_guide/examples/maxpool.tar
-docs/source/user_guide/examples/maxpool/
-docs/source/user_guide/examples/sendnn.tar
-docs/source/user_guide/examples/sendnn/
-docs/source/user_guide/examples/topk_size1.py
-ktir_probe_2026-10-15/
-sav2.py
-save.py
-torch_spyre/_inductor/CONV1D.propagate_layouts.py
-torch_spyre/_inductor/SAV.propagate_layouts.py
-torch_spyre/_inductor/maxpool.lowering.py
-torch_spyre/_inductor/maxpool.superdsc.py
-torch_spyre/_inductor/maxpool.views.py
