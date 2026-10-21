@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch  # noqa: F401
+from torch._inductor.utils import fresh_cache
 
 from torch_spyre._inductor import config, timing_recorder
 from torch_spyre.execution import async_compile as ac
@@ -27,6 +28,13 @@ from torch_spyre.execution.kernel_runner import (
     SpyreFrontendOnlyRunner,
     SpyreSDSCKernelRunner,
 )
+
+@pytest.fixture(autouse=True)
+def _isolated_kernel_cache():
+    # The kernel cache is on by default, so these compiles write cache entries;
+    # keep them out of the developer's real cache.
+    with fresh_cache():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +46,20 @@ def _clean_recorder():
     yield
     timing_recorder.RECORDER._reset()
     ac._warned_frontend_only = False
+
+def _fake_dbo_opt(cmd, **_kwargs):
+    """Stand-in for dbo-opt: write spyrecode.json where ``--export-dir=`` says.
+
+    The export dir is the output dir with the kernel cache off and a cache tmp
+    dir with it on, so the stub must follow the command line rather than assume
+    one of them.
+    """
+    export_dir = next(a.split("=", 1)[1] for a in cmd if a.startswith("--export-dir="))
+    code_dir = os.path.join(export_dir, "spyreCodeDir")
+    os.makedirs(code_dir, exist_ok=True)
+    with open(os.path.join(code_dir, "spyrecode.json"), "w") as fh:
+        fh.write("{}")
+    return MagicMock(stderr="")
 
 
 def _compile_one_kernel(tmp_path):
@@ -76,7 +98,7 @@ def _compile_one_kernel(tmp_path):
             ac, "build_kernel_provenance_descriptor", return_value=None
         ) as provenance,
         patch.object(ac, "find_unimplemented", return_value=None),
-        patch.object(ac.subprocess, "run") as subprocess_run,
+        patch.object(ac.subprocess, "run", side_effect=_fake_dbo_opt) as subprocess_run,
         patch.object(ac, "SpyreSDSCKernelRunner", autospec=True) as sdsc_runner,
     ):
         runner = compiler.sdsc("fused_add_0", [MagicMock()])
