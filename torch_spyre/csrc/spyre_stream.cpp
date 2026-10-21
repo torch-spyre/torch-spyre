@@ -318,11 +318,45 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
+  // A pinned CPU source/destination skips flex's IOMMU shadow-buffer path:
+  // the pre-mapped pinned buffer is submitted directly. The allocation state
+  // rides along as host_lifetime so the buffer outlives in-flight DMA even if
+  // the caller drops the tensor right after a non-blocking copy.
+  auto* allocator =
+      static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+  const auto pinned_allocation = allocator->retain(cpu_ptr);
+
   // Create and launch operation through SpyreStream's typed launch methods.
   if (host2device) {
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
+    flex::DmaParams* params = nullptr;
+    if (pinned_allocation) {
+      TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
+                  "H2D host storage exceeds pinned allocation capacity: ",
+                  host_capacity, " vs ", pinned_allocation.capacity, " bytes");
+      host_lifetime = std::static_pointer_cast<void>(pinned_allocation.owner);
+      params = flex::createDmaParamsWithPinnedBuffer(
+          pinned_allocation.buffer, pinned_allocation.offset, host_capacity,
+          device_address->total_size(), host2device, device_address,
+          std::move(dci_ptr),
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else if (host_capacity > 0) {
+      params = flex::createDmaParamsWithHostCapacity(
+          cpu_ptr, device_address->total_size(), host2device, device_address,
+          host_capacity, std::move(dci_ptr),
+          /*iova=*/nullptr,
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else {
+      // host_capacity == 0 means the caller cannot state the accessible
+      // extent (program uploads assume the buffer matches the device
+      // allocation); skip the bounds-checked factory, as before.
+      params = flex::createDmaParams(cpu_ptr, device_address->total_size(),
+                                     host2device, device_address,
+                                     std::move(dci_ptr));
+    }
     try {
       launchH2D(params);
     }
@@ -332,9 +366,6 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
     }
     flex::destroyDmaParams(params);
   } else {
-    auto* allocator =
-        static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
-    const auto pinned_allocation = allocator->retain(cpu_ptr);
     flex::DmaParams* params = nullptr;
     if (pinned_allocation) {
       TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
@@ -357,6 +388,11 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
           /*pipeline_barrier=*/false,
           /*skip_hazard=*/false, std::move(host_lifetime));
     }
+    // Neither factory forwards the D2H conversion out-buffer capacity: flex's
+    // handleDmaDataConversionD2H reads host_capacity_bytes (falling back to
+    // the device-format dma_size, which under-reports the host buffer for
+    // dtype-upscaling conversions like bf16 -> fp32).
+    params->host_capacity_bytes = host_capacity;
     try {
       launchD2H(params);
     }
