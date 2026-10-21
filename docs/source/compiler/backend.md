@@ -189,8 +189,8 @@ required artifact and the kernel loads directly: neither `generate_bundle` nor
 the backend compiler runs. On a miss, the kernel compiles into a temporary
 directory inside the cache root, which `commit_compile_dir` then renames into
 place atomically, so concurrent compiles of the same key do not corrupt each
-other. Caching is controlled by `SPYRE_KERNEL_CACHE` (default off) and is
-skipped in frontend-only mode, where a hit would record no frontend work.
+other. Caching is controlled by `SPYRE_KERNEL_CACHE` (default on; set it to `0`
+to disable) and is skipped in frontend-only mode, where a hit would record no frontend work.
 `clear_cache()` empties the cache, and `get_cache_stats()` reports the number of
 cached kernels and the total cache size. Per-key hit and miss counts are tracked
 separately in the process-global kernel registry (`get_kernel_registry()`).

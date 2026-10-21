@@ -605,11 +605,6 @@ class TestKernelProvenancePropagation:
         runner = object()
 
         with (
-            # patch.object(
-            ##    SpyreAsyncCompile,
-            #    "_get_compile_dir",
-            #    return_value="/tmp/kernel",
-            # ),
             patch(
                 "torch_spyre.execution.async_compile.get_output_dir",
                 return_value="/tmp/kernel",

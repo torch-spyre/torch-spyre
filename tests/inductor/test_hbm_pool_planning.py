@@ -834,8 +834,8 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             output_dirs_by_kernel.setdefault(kernel_name, code_dir)
             return real_runner_cls(kernel_name, code_dir, **kwargs)
 
-        # from torch_spyre.ops.fallbacks import FallbackWarning
-        # warnings.resetwarnings()
+        # No pytest.warns(UserWarning) here: the fallback warning is not
+        # guaranteed to fire when the compile is served from a cache.
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
@@ -848,7 +848,6 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
                 "SpyreSDSCKernelRunner",
                 side_effect=_recording_runner,
             ),
-            # pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
         src = source_codes[0]
@@ -907,15 +906,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
-        # from torch_spyre.ops.fallbacks import FallbackWarning
-
-        # warnings.resetwarnings()
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
-            #mock_patch("subprocess.run"),
-            # pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
         src = source_codes[0]

@@ -17,6 +17,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1240,29 +1241,16 @@ class TestFfdcAsyncCompile:
         monkeypatch.setattr(mod, "get_output_dir", lambda name, prefix=None: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
-        return mod, out_dir
-        """
-        # Cache-miss path (SPYRE_KERNEL_CACHE=1): stub every cache function so
-        # the compile always lands in out_dir and no real filesystem side-effects
-        # (cache-root creation, symbol_kinds.json write, failed-dir rename) occur
-        # inside the test sandbox.
+        # With the kernel cache on, sdsc() compiles into a cache temp dir. Stub the
+        # cache so the compile still lands in out_dir; unused when the cache is off.
         monkeypatch.setattr(mod, "compute_specs_hash", lambda *a, **k: "fakehash")
         monkeypatch.setattr(mod, "get_cached_kernel_dir", lambda cache_key: None)
-        monkeypatch.setattr(mod, "allocate_compile_dir", lambda cache_key: out_dir)
+        monkeypatch.setattr(mod, "allocate_compile_dir", lambda *a, **k: out_dir)
         monkeypatch.setattr(mod, "save_symbol_kinds", lambda *a, **k: None)
-        monkeypatch.setattr(mod, "commit_compile_dir", lambda tmp_dir, cache_key: out_dir)
         monkeypatch.setattr(mod, "_move_to_failed_dir", lambda path: None)
- 
-        monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
-        monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
-        monkeypatch.setattr(
-            mod.SpyreAsyncCompile,
-            "_get_compile_dir",
-            lambda self, kernel_name, cache_key=None: out_dir,
-        )
- 
+        monkeypatch.setattr(mod, "record_kernel_name", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "get_kernel_registry", lambda: MagicMock())
         return mod, out_dir
-        """
 
     @torch._inductor.config.patch(compile_threads=1)
     def test_sdsc_dxp_failure_triggers_ffdc_collect(self, monkeypatch, tmp_path):

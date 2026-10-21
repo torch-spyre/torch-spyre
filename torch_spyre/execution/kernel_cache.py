@@ -171,6 +171,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
     """Return the process-global kernel hash registry."""
     return _registry
 
+
 # Module-level state for _get_backend_compiler_version():
 #   _backend_compiler_version_cache - stores the result string after a successful read
 #                          so the components file is opened at most once.
@@ -178,7 +179,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
 #                          set" warnings when caching is enabled but the env
 #                          var is absent (e.g. in test / dev environments).
 
-#_dxp_version_cache: Optional[str] = None
+# _dxp_version_cache: Optional[str] = None
 _backend_compiler_version_cache: Optional[str] = None
 _lib_version_warning_emitted: bool = False
 
@@ -1005,15 +1006,6 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
-
-    if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy, but first
-        # merge our recorded kernel names into the winner's file so no name
-        # is lost.
-        _merge_kernel_names(tmp_dir, cached_dir)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
-        return cached_dir
 
     try:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)

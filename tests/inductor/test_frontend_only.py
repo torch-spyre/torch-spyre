@@ -29,6 +29,7 @@ from torch_spyre.execution.kernel_runner import (
     SpyreSDSCKernelRunner,
 )
 
+
 @pytest.fixture(autouse=True)
 def _isolated_kernel_cache():
     # The kernel cache is on by default, so these compiles write cache entries;
@@ -46,6 +47,7 @@ def _clean_recorder():
     yield
     timing_recorder.RECORDER._reset()
     ac._warned_frontend_only = False
+
 
 def _fake_dbo_opt(cmd, **_kwargs):
     """Stand-in for dbo-opt: write spyrecode.json where ``--export-dir=`` says.

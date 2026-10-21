@@ -1133,30 +1133,6 @@ def capture_backend_output_dirs():
         ),
     ):
         yield output_dirs
-    """
-    def _capture_(kernel_name):
-        d = _real_get_output_dir(kernel_name)
-        output_dirs.append(Path(d))
-        return d
-
-    def _capture_miss(tmp_dir, cache_key):
-        d = _real_commit(tmp_dir, cache_key)
-        output_dirs.append(Path(d))
-        return d
-
-    def _capture_hit(cache_key):
-        d = _real_get_cached(cache_key)
-        if d is not None:
-            output_dirs.append(Path(d))
-        return d
-
-    with (
-        mock_patch.object(async_compile_module, "get_output_dir", _capture_no_cache),
-        mock_patch.object(async_compile_module, "commit_compile_dir", _capture_miss),
-        mock_patch.object(async_compile_module, "get_cached_kernel_dir", _capture_hit),
-    ):
-        yield output_dirs
-    """
 
 
 def mock_op_split_space(
