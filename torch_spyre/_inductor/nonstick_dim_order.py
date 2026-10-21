@@ -676,7 +676,6 @@ def _qfp8wt_k_rotation(
     return _permute_stl(stl, order)
 
 
-
 def _try_scatter_ia_constraint(
     buf: ComputedBuffer | InputBuffer,
     op: ComputedBuffer,
@@ -844,7 +843,9 @@ def _compute_gather_ia_constraint(
     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
     if _dim_order_is_compliant(stl, stride_idx):
         return None
-    new_stl = _ia_required_stl(stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes)
+    new_stl = _ia_required_stl(
+        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -876,11 +877,11 @@ def _apply_gather_ia_constraints(
         key = (dep.name, op.get_name())
         if key in seen:
             continue
+        seen.add(key)
         buf = V.graph.get_buffer(dep.name)
         result = _compute_gather_ia_constraint(buf, dep, op, sizes, access_subs)
         if result is None:
             continue
-        seen.add(key)
         new_stl, pinned = result
         if not isinstance(buf, ComputedBuffer):
             # Graph input: cannot update committed_stl in place —
@@ -937,9 +938,11 @@ def _apply_scatter_ia_constraint(
     # _insert_mutation_relayout_copy a no-op copy.
     dest_stl = _buf_stl(dest_buf)
     pinned_dims.setdefault(dest_buf.get_name(), set()).update(pinned)
-    if dest_stl is not None and _is_permutation_of(
-        dest_stl, new_stl
-    ) and _can_mutate_producer_in_place(dest_buf, output_names):
+    if (
+        dest_stl is not None
+        and _is_permutation_of(dest_stl, new_stl)
+        and _can_mutate_producer_in_place(dest_buf, output_names)
+    ):
         V.graph.nonstick_deferred.append(
             _DeferredReorder(op, dest_buf.get_name(), new_stl, "producer_rewrite")
         )
@@ -987,9 +990,9 @@ def _try_apply_flat_projection(
 ) -> bool:
     """Apply flat-M projection to buf as an activation input to op.
 
-    Precondition: buf is a read dependency of op.
     Returns True and updates buf.committed_stl and log[buf.get_name()] if the
     projection applies. Returns False and modifies nothing otherwise.
+    Returns False immediately if buf is not a read dependency of op.
     """
     if not hasattr(buf, "committed_stl"):
         return False
@@ -1084,7 +1087,7 @@ def _apply_perf_reorders(
         for buf in bufs_to_reorder:
             name = buf.get_name()
             # Process each buffer at most once; when a buffer feeds multiple
-            # matmuls, the deepest matmul in program order (encountered first
+            # matmuls, the last matmul in program order (encountered first
             # in this reversed traversal) determines the reorder.
             if name in already_reordered:
                 continue
