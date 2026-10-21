@@ -149,6 +149,163 @@ class _DeferredReorder(NamedTuple):
     kind: Literal["copy", "producer_rewrite"]
 
 
+def _is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
+    """Return True if (size, stride) describes a dense row-major contiguous tensor.
+
+    A dimension of size 1 may carry any stride value; all other dimensions must
+    carry the product of all dimensions to their right.
+    """
+    expected = 1
+    for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
+        if dim_size != 1 and dim_stride != expected:
+            return False
+        expected *= dim_size
+    return True
+
+
+def _has_flat_projection_structure(
+    x: PropArg,
+    y: PropArg,
+    output: FixedLayout,
+    m_size: int,
+    n_size: int,
+) -> bool:
+    """Return True if the shapes and formats satisfy flat-MM collapse preconditions.
+
+    Checks matrix sizes, host ranks, and device format.  Does not inspect
+    strides or index expressions.
+    """
+    return (
+        m_size > 1
+        and n_size > 1
+        and len(output.size) == 2
+        and len(x.layout.size) > 2
+        and len(y.layout.size) == 2
+        and bool(x.layouts)
+        and x.layouts[0].element_arrangement == ElementArrangement.STANDARD
+        and x.layouts[0].device_dtype == DataFormats.SEN169_FP16
+    )
+
+
+class _FlatMMVars:
+    """The loop variables and their sizes for a flat-MM access pattern."""
+
+    __slots__ = (
+        "row_var",
+        "contraction_var",
+        "generated_var",
+        "row_size",
+        "contraction_size",
+        "generated_size",
+    )
+
+    def __init__(
+        self,
+        row_var: sympy.Symbol,
+        contraction_var: sympy.Symbol,
+        generated_var: sympy.Symbol,
+        row_size: int,
+        contraction_size: int,
+        generated_size: int,
+    ) -> None:
+        self.row_var = row_var
+        self.contraction_var = contraction_var
+        self.generated_var = generated_var
+        self.row_size = row_size
+        self.contraction_size = contraction_size
+        self.generated_size = generated_size
+
+
+def _extract_mm_vars(
+    x_dep: MemoryDep,
+    output_dep: MemoryDep,
+    contraction_var: sympy.Symbol,
+) -> _FlatMMVars | None:
+    """Identify row and generated loop variables from x and output dep expressions.
+
+    Given that contraction_var is the known reduction variable, finds the single
+    remaining active variable in x_dep (the row variable) and the single remaining
+    active variable in output_dep (the generated variable).  Returns None if the
+    active variable counts do not match a flat 2-D MM (exactly one row variable
+    in x, exactly one generated variable in the output that is not the row variable).
+    """
+    active_x_vars = set(x_dep.index.free_symbols) & set(x_dep.ranges)
+    row_candidates = active_x_vars - {contraction_var}
+    if contraction_var not in active_x_vars or len(row_candidates) != 1:
+        return None
+    (row_var,) = row_candidates
+
+    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
+    generated_candidates = active_out_vars - {row_var}
+    if row_var not in active_out_vars or len(generated_candidates) != 1:
+        return None
+    (generated_var,) = generated_candidates
+
+    return _FlatMMVars(
+        row_var=row_var,
+        contraction_var=contraction_var,
+        generated_var=generated_var,
+        row_size=concretize_expr(x_dep.ranges[row_var]),
+        contraction_size=concretize_expr(x_dep.ranges[contraction_var]),
+        generated_size=concretize_expr(output_dep.ranges[generated_var]),
+    )
+
+
+def _confirms_flat_mm_access(
+    x_dep: MemoryDep,
+    y_dep: MemoryDep,
+    output_dep: MemoryDep,
+    mm_vars: _FlatMMVars,
+    x_size: list[int],
+    y_size: list[int],
+    out_size: list[int],
+    m_size: int,
+    n_size: int,
+) -> bool:
+    """Return True if sizes and index expressions confirm a flat row-major 2-D MM.
+
+    Checks two coupled properties that together answer one question — is this
+    provably a flat MM rather than a BMM:
+    - Element counts: dep-extracted sizes agree with the op's declared M/N, and
+      total elements in each tensor equal the expected matrix product.
+    - Index structure: x reads at K*row + contraction, output writes at N*row +
+      generated, and y carries no row variable.
+    """
+    if (
+        mm_vars.row_size != m_size
+        or mm_vars.generated_size != n_size
+        or math.prod(x_size) != mm_vars.row_size * mm_vars.contraction_size
+        or math.prod(y_size) != mm_vars.contraction_size * mm_vars.generated_size
+        or math.prod(out_size) != m_size * n_size
+        or mm_vars.row_var in y_dep.index.free_symbols
+        or {mm_vars.contraction_var, mm_vars.generated_var}
+        != (set(y_dep.index.free_symbols) & set(y_dep.ranges))
+    ):
+        return False
+
+    expected_x_index = (
+        mm_vars.contraction_size * mm_vars.row_var + mm_vars.contraction_var
+    )
+    expected_out_index = (
+        mm_vars.generated_size * mm_vars.row_var + mm_vars.generated_var
+    )
+    return (
+        sympy.simplify(x_dep.index - expected_x_index) == 0
+        and sympy.simplify(output_dep.index - expected_out_index) == 0
+    )
+
+
+def _build_flat_mm_stl(mm_vars: _FlatMMVars, device_dtype) -> SpyreTensorLayout:
+    """Build a canonical flat-M STL from the identified loop variables and dtype."""
+    return SpyreTensorLayout(
+        [mm_vars.row_size, mm_vars.contraction_size],
+        [mm_vars.contraction_size, 1],
+        device_dtype,
+        [0, 1],
+        ElementArrangement.STANDARD,
+    )
+
+
 def _flat_dense_projection_x_layout(
     x: PropArg,
     y: PropArg,
@@ -166,16 +323,7 @@ def _flat_dense_projection_x_layout(
     to encode the op as a BMM rather than a flat MM. Collapse only when the
     access is provably one dense row-major 2-D matrix and the weight is rank-2.
     """
-    if (
-        m_size <= 1
-        or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
-        or len(y.layout.size) != 2
-        or not x.layouts
-        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
-        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
-    ):
+    if not _has_flat_projection_structure(x, y, output, m_size, n_size):
         return None
 
     x_size = [concretize_expr(s) for s in x.layout.size]
@@ -184,61 +332,21 @@ def _flat_dense_projection_x_layout(
     out_size = [concretize_expr(s) for s in output.size]
     out_stride = [concretize_expr(s) for s in output.stride]
 
-    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
-        expected = 1
-        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
-            if dim_size != 1 and dim_stride != expected:
-                return False
-            expected *= dim_size
-        return True
-
-    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
+    if not _is_dense_contiguous(x_size, x_stride) or not _is_dense_contiguous(
         out_size, out_stride
     ):
         return None
 
-    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
-    row_vars = active_x_vars - {reduction_var}
-    if reduction_var not in active_x_vars or len(row_vars) != 1:
+    mm_vars = _extract_mm_vars(x.dep, output_dep, reduction_var)
+    if mm_vars is None:
         return None
-    (row_var,) = row_vars
 
-    row_size = concretize_expr(x.dep.ranges[row_var])
-    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
-    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
-    generated_vars = active_out_vars - {row_var}
-    if row_var not in active_out_vars or len(generated_vars) != 1:
-        return None
-    (generated_var,) = generated_vars
-    generated_size = concretize_expr(output_dep.ranges[generated_var])
-
-    if (
-        row_size != m_size
-        or generated_size != n_size
-        or math.prod(x_size) != row_size * reduction_size
-        or math.prod(y_size) != reduction_size * generated_size
-        or math.prod(out_size) != m_size * n_size
-        or row_var in y.dep.index.free_symbols
-        or {reduction_var, generated_var}
-        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
+    if not _confirms_flat_mm_access(
+        x.dep, y.dep, output_dep, mm_vars, x_size, y_size, out_size, m_size, n_size
     ):
         return None
 
-    expected_x_index = reduction_size * row_var + reduction_var
-    expected_out_index = generated_size * row_var + generated_var
-    if (
-        sympy.simplify(x.dep.index - expected_x_index) != 0
-        or sympy.simplify(output_dep.index - expected_out_index) != 0
-    ):
-        return None
-
-    return SpyreTensorLayout(
-        [row_size, reduction_size],
-        [reduction_size, 1],
-        x.layout.dtype,
-        [0, 1],
-        ElementArrangement.STANDARD,
-    )
+    return _build_flat_mm_stl(mm_vars, x.layout.dtype)
 
 
 def _try_flat_m_projection(
