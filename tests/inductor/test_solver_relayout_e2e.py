@@ -470,6 +470,48 @@ def test_relayout_into_a_matmul_x_operand(monkeypatch):
     torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
+def test_permutation_past_split_8_fires(monkeypatch):
+    """The row-split normalization geometry on a hinted pointwise pair: neg
+    hinted {R: 32} (16 whole rows per core, as a row reduction needs) feeds
+    relu hinted {R: 4, H: 8}. Logical [512, 4096] fp16 lays out as
+    [64 sticks, 512 rows, 64], so the pair's governing split is 32 (a run of
+    16 * 64 elements); both views are complete partitions of the 32 cores, so
+    the move is a permutation, and each destination gathers its 128 rows from
+    8 sources, inside the shuffle budget. The relayout law is measured for
+    permutations up to split 32, so the solver is offered the pair at the law's
+    price and fires it on economics alone (a shuffle of a few microseconds
+    against a 4 MB HBM write and re-read). Read-only spies."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.dump_cost_model import governing_run_split
+
+    observed = _Observed(monkeypatch, force=False)
+    recorded = observed.plans
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 32}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(512, 4096, dtype=torch.float16)
+    for name, size in (("R", 512), ("H", 4096)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "H"])
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = recorded
+    assert plan.num_cores == 32
+    assert governing_run_split(
+        plan.source_view, plan.destination_view, [64, 512, 64]
+    ) == (1024, 32)
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
 def test_two_relayout_edges_into_one_consumer(monkeypatch):
     """add(neg(a), abs(b)) with both edges forced: two destination rectangles
     at the consumer's tick, and two clones inserted before one consumer."""

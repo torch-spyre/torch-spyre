@@ -1145,10 +1145,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _per_core_size(self, idx: int, config: DivisionConfig) -> int:
         """Per-core footprint of buffer ``idx`` under ``config``:
-        ``ceil_div(total_size, output_partition * output_tile_count)``, using
-        the substrate's integer helper so this rounds identically to every
-        other footprint-division site -- ``CoreDivisionBuffer.min_footprint``
-        divides by the same product.
+        ``ceil_div(total_size, output_partition * output_tile_count)``, as
+        :meth:`CoreDivisionBuffer.per_core_size` computes for a menu position.
+        It is computed from ``config`` because a generated config has no
+        position (``menu_index`` is ``None``).
 
         The tile count is the whole payoff channel for tiling. Every
         tiling-sensitive term in the cost model is a derate bounded by 1.0, and

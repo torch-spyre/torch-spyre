@@ -417,9 +417,8 @@ class OpFeatures:
     # producer and its consumers own an LX buffer under different per-core divisions.
     # Its traffic is entirely LX, which this model charges at zero -- calibrated for
     # ops whose LX traffic rides beside a larger HBM stream, and exactly wrong for the
-    # one op that is nothing but LX traffic. Measured on 53 configurations it costs
-    # 2.3-24.2 us at 2.1 MB / 8 cores depending on slice geometry alone, so it gets an
-    # additive term (see ``relayout_ns`` in predict_ops) keyed on these features.
+    # one op that is nothing but LX traffic. Use an additive term
+    # (see ``relayout_ns`` in predict_ops) keyed on these features.
     # ``is_lx_relayout`` derives from the planner's materialization registry, never
     # inferred; the other two are 0 when it is False. The bytes moved are NOT a
     # separate feature: a relayout copy is an identity clone, so they are exactly
@@ -692,34 +691,18 @@ class CostParams:
     # This is compute-side execution throughput, not another byte stream: applying
     # the LX spill/underfill derates to it would count the same bottleneck twice.
     fused_reduction_elems_per_core_ns: float = 1.5
-    # LX RELAYOUT (shuffle) term: per-core serial descriptor cost plus a stride-limited
-    # walk. Fitted 2026-08-17 on 21 direct per-kernel rows (main @ 65508a02, fp16,
-    # BUNDLE_SYMBOLIC_ARGS=0 -- a method #3741 has since removed; re-measuring needs
-    # the fused swap estimator at ~+/-8%): mean +2.5%, RMS 10.0% over bytes 0.52-4.19
-    # MB, cores 4-32, run 128-4096 B, split 2-8.
-    #
-    #   relayout_ns = runs_per_core * (a + b*log2(split)) + span_per_core / K
-    #     runs_per_core = bytes/cores / run_bytes
-    #     span_per_core = bytes/cores * split   (the engine walks the whole strided
-    #                                            span; a core keeps 1/split of it --
-    #                                            BW*split measured 588/540/549, so K
-    #                                            is per-core and split-invariant)
-    #
-    # The log2 in the per-run cost is FITTED, no mechanism behind it. VALID FOR SPLITS
-    # 2..8 ONLY: past 8 the law over-predicts 12-40% (measured at split 16), so the
-    # term clamps split into [2, 8] rather than extrapolate. Carries a +/-25% error
-    # bar from the non-governing side of the view pair -- reproducible scatter with no
-    # consistent direction (destination sweep, 10 pairs x 15 reps), so it is an error
-    # bar and not a term. Fanout was measured NOT to be a term (2/4/8 at fixed
-    # geometry, no trend). NO loop_trip factor: a relayout inside a coarse-tiling loop
-    # is structurally impossible today (the planner rejects coarse_tile_copy
-    # consumers).
-    # The negative intercept is the fitted value, not a typo: a small-run
-    # extrapolation artifact of the linear-in-log2(split) per-run form. The
-    # split clamp to [2, 8] keeps the per-run term positive over its domain.
+    # LX relayout cost: serial descriptor cost plus a stride-limited walk.
+    # relayout_ns = runs_per_core * (a + b*log2(split)) + span_per_core / K
+    # runs_per_core = bytes/cores / run_bytes
+    # span_per_core = bytes/cores * split
+    # Permutations use measured splits 2..32. Grouped movements keep the solver's
+    # existing split limit; their cost was not fitted.
+    # The fitted negative intercept is valid with the split floor of 2.
     relayout_run_a_ns: float = -1.14  # per-run cost intercept
     relayout_run_b_ns: float = 3.92  # per-run cost log2(split) slope
     relayout_span_gbps: float = 547.0  # per-core stride-limited walk rate
+    relayout_split_min: int = 2  # measured governing split range, low end
+    relayout_split_max: int = 32  # measured governing split range, high end
     # Matmul operand RE-READ (tile spill): the per-core OUTPUT-accumulator tile has area
     # (M/m)*(N/n); once it exceeds the on-chip capacity (~64K fp16 elems/core) it no
     # longer stays resident, so the operands are re-streamed from HBM. The re-read
@@ -1335,21 +1318,21 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     evaluates THIS function per candidate division and folds the result into an
     AddElement table -- one source of truth for both paths.
 
-    The split is clamped into [2, 8], the fitted range. Below 2 cannot occur for a
-    real ownership change (and would turn the fitted intercept negative); above 8
-    the law over-predicts by 12-40% (measured at split 16), so the clamp bounds the
-    error instead of extrapolating an unmeasured log2.
+    The split is clamped into the measured range [``relayout_split_min``,
+    ``relayout_split_max``] = [2, 32]. Below 2 cannot occur for a real ownership
+    change (and would turn the fitted intercept negative). Inside the range the law
+    is evaluated at the true split.
     """
     if not o.is_lx_relayout or o.out_elems <= 0:
         return 0.0
     if o.relayout_run_elems <= 0 or o.cores <= 0:
         return 0.0
+    p = params or CostParams()
     # Bytes moved == the copy's device bytes: a relayout is an identity clone.
     per_core = o.out_elems * o.dtype_bytes / o.cores
     run_bytes = o.relayout_run_elems * o.dtype_bytes
-    split = min(8, max(2, o.relayout_split))
+    split = min(p.relayout_split_max, max(p.relayout_split_min, o.relayout_split))
     runs = per_core / run_bytes
-    p = params or CostParams()
     return (
         runs * (p.relayout_run_a_ns + p.relayout_run_b_ns * math.log2(split))
         + per_core * split / p.relayout_span_gbps
@@ -2897,8 +2880,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # allocator's half-tick lifetime scheme depends on exactly that) -- so it ADDS to
     # the kernel time rather than overlapping, and sits OUTSIDE the compute/memory
     # overlap term below. Measured directly: fusing never recovers it (fused total
-    # == unfused sum +/- 2%), and it costs its full time beside a 223 us bmm exactly
-    # as beside a 25 us relu, so it does not hide behind PT-array work either. See
+    # == unfused sum +/- 2%), so it does not hide behind PT-array work either. See
     # relayout_ns() and the CostParams note for the fitted law and its validity range.
     rel_ns = sum(relayout_ns(o, p) for o in ops)
     # INPUT CLONE-IN: the clone of a resident graph input is likewise its own DSC, a
