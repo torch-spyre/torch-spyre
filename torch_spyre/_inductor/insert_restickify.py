@@ -218,7 +218,7 @@ def _create_restickify_node(
     (old_buffer_name, new_computed_buffer).
 
     For synthetically-created buffers that have no FX node (e.g.
-    coarse_tile_read_copy_* buffers created by coarse_tile.py), the FX env
+    coarse_tile_copy_* buffers created by coarse_tile.py), the FX env
     lookup is skipped and lower_restickify is called directly with a TensorBox
     wrapping the ComputedBuffer.
     """
@@ -246,7 +246,7 @@ def _create_restickify_node(
     first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
 
     if fx_arg_node is None:
-        # Synthetically-created buffers (e.g. coarse_tile_read_copy_*) have no
+        # Synthetically-created buffers (e.g. coarse_tile_copy_*) have no
         # FX node. Build a TensorBox from the buffer and call lower_restickify
         # directly; realize() inside lower_restickify registers the output in
         # graph.buffers and graph.operations.

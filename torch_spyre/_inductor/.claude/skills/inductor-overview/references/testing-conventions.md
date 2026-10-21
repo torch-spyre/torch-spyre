@@ -38,7 +38,7 @@ constraint above. For a local "did I break anything nearby" pass on
   regardless of which pass you touched.
 - The test file(s) that correspond to the specific pass/module you
   modified, if one exists — e.g. touching `wsr/coarse_tile.py` warrants
-  `tests/inductor/test_coarse_tile_e2e.py`, `test_coarse_tiling.py`; a
+  `tests/inductor/test_for_each_tile_e2e.py`, `test_coarse_tiling.py`; a
   scratchpad allocator change warrants whatever exercises
   `torch_spyre/_inductor/scratchpad/`, etc. Match by name/import, not by
   habit — don't run a fixed list left over from someone else's feature
