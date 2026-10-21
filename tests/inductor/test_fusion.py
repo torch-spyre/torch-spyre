@@ -30,7 +30,12 @@ import torch
 from torch._inductor.ir import ComputedBuffer
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import DEVICE_NAME
-from torch_spyre._inductor.fusion import estimate_bundles, group_contiguous_fusable
+from torch_spyre._inductor import fusion
+from torch_spyre._inductor.fusion import (
+    _compute_span,
+    estimate_bundles,
+    group_contiguous_fusable,
+)
 
 
 def _is_even(x: int) -> bool:
@@ -93,6 +98,42 @@ class TestGroupContiguousFusable(unittest.TestCase):
         # Every item appears exactly once, in the original order.
         groups = group_contiguous_fusable(items, _is_even)
         self.assertEqual([item for group in groups for item in group], items)
+
+
+class TestComputeSpan(unittest.TestCase):
+    """The span a bundle is trimmed to, which decides whether an allocation folds.
+
+    An allocation is worth absorbing only where it would otherwise split a run of
+    compute. ``_compute_span`` is checked with plain markers, patching
+    ``_is_compute_node`` to read them, since the trim consults nothing else.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            fusion, "_is_compute_node", lambda node: node == "C"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_interior_allocation_is_kept(self):
+        # A cat destination: the compute that fills it follows, so folding it
+        # removes a real split.
+        self.assertEqual(_compute_span(["C", "A", "C"]), (0, 3))
+
+    def test_leading_allocation_is_trimmed(self):
+        # Coarse tiling hoists its accumulators ahead of a loop group, where they
+        # split nothing.
+        self.assertEqual(_compute_span(["A", "A", "C"]), (2, 3))
+
+    def test_trailing_allocation_is_trimmed(self):
+        self.assertEqual(_compute_span(["C", "A", "A"]), (0, 1))
+
+    def test_allocation_only_run_has_an_empty_span(self):
+        # No member carries an iteration space, so there is no bundle to describe.
+        self.assertEqual(_compute_span(["A", "A"]), (0, 0))
+
+    def test_empty_run_has_an_empty_span(self):
+        self.assertEqual(_compute_span([]), (0, 0))
 
 
 def _buffer(tag: str, device: str) -> ComputedBuffer:

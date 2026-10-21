@@ -76,6 +76,7 @@ from .ir import (
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
 )
@@ -2354,6 +2355,29 @@ def _is_substick_write(
     return dim_size % stick_size == 0 and dim_size > extent
 
 
+def _is_zero_filled(target_buffer) -> bool:
+    """Whether ``target_buffer`` is a copy of a ``full`` whose fill value is zero.
+
+    ``slice_scatter`` lowers its base to a copy of the base, so a ``zeros`` base
+    reaches here as a pointwise reading a pointwise ``full``, which in turn reads
+    the 0-dim constant holding the fill value.
+    """
+    buffer = target_buffer
+    for _ in range(2):
+        if not isinstance(buffer, ComputedBuffer) or not isinstance(
+            buffer.data, Pointwise
+        ):
+            return False
+        reads = [r for r in buffer.get_read_writes().reads if isinstance(r, MemoryDep)]
+        if len(reads) != 1 or reads[0].name in V.graph.graph_inputs:
+            return False
+        source = V.graph.try_get_buffer(reads[0].name)
+        if isinstance(source, SpyreConstantFallback):
+            return float(source.constant_args[0]) == 0.0
+        buffer = source
+    return False
+
+
 def _align_single_source_producer(
     target_buffer,
     alt_stl: SpyreTensorLayout,
@@ -2438,7 +2462,10 @@ def _scan_mutation_layout_inputs(
         if target_stl is None:
             target_stl = generic_layout(target_buffer)
         is_graph_input = name in V.graph.graph_inputs
-        for op in group:
+        # A native sub-stick write zeroes the rest of its sticks, which is exact
+        # when they already hold zeros: the first write into a zero fill.
+        zero_tail = not is_graph_input and _is_zero_filled(target_buffer)
+        for index, op in enumerate(group):
             rw = op.get_read_writes()
             output_dep = next(iter(rw.writes))
             # Only the first read is offered, and strict=False drops it when it
@@ -2450,7 +2477,11 @@ def _scan_mutation_layout_inputs(
             in_args = _get_prop_args([first_read], strict=False)
             in_arg = in_args[0] if in_args else None
             alt_stl = _find_alt_target_stl(
-                target_layout, target_stl, output_dep, in_arg
+                target_layout,
+                target_stl,
+                output_dep,
+                in_arg,
+                substick_allowed=zero_tail and index == 0,
             )
             if alt_stl is None:
                 continue
@@ -2598,13 +2629,15 @@ def _find_alt_target_stl(
     target_stl: SpyreTensorLayout,
     output_dep: MemoryDep,
     in_arg: PropArg | None = None,
+    substick_allowed: bool = False,
 ) -> SpyreTensorLayout | None:
     """Alt SpyreTensorLayout with an offset-free stick expression for a mutation
     target, or None if the current layout already works; raises Unsupported if no
     alternative exists.
 
     An offset write, or an offset-free sub-stick write (see
-    ``_is_substick_write``), needs its stick dim relocated. The first candidate
+    ``_is_substick_write``) unless ``substick_allowed``, needs its stick dim
+    relocated. The first candidate
     reachable from the write's input stick wins, meaning one an ordinary
     stick-permutation restickify can produce, so a degenerate ``stick=0``
     candidate cannot win a pairing the cost model would reject as a scatter.
@@ -2613,8 +2646,9 @@ def _find_alt_target_stl(
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
     write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size) and not (
-        _is_substick_write(write_stick, target_layout, output_dep, stick_size)
+    if is_stick_expr_offset_free(write_stick, stick_size) and (
+        substick_allowed
+        or not _is_substick_write(write_stick, target_layout, output_dep, stick_size)
     ):
         return None
 
@@ -3233,6 +3267,12 @@ def propagate_spyre_tensor_layouts(
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, AllGatherAsyncFallback):
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, SpyreArangeFallback):
+            # A coordinate's device layout is fixed at construction, so it offers
+            # no alternatives to propagate; committing it here lets consumers read
+            # the stick constraint like they would from a graph input.
+            op.layouts = [op.get_layout().device_layout]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
