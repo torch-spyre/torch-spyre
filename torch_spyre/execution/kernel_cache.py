@@ -526,12 +526,20 @@ def compute_specs_hash(
                 # IDs in sdsc_N.json, so they must be hashed separately to
                 # distinguish graphs that differ only in their offsets.
                 if use_symbols:
-                    for sk in local_symbol_kinds:
+                    for sk, sym_key in zip(
+                        local_symbol_kinds, local_sym_values
+                    ):  # in local_symbol_kinds:
                         if sk.kind == "pool":
-                            tag = f"pool:{sk.offset}"
+                            # tag = f"pool:{sk.offset}"
+                            tag = f"pool:{sym_key[1]}"
                             content_parts.append(tag.encode())
                             _debug_pool_offsets.append(tag)
-                            logger.debug("  [hash]   pool offset=%d", sk.offset)
+                            logger.debug("  [hash]   pool offset=%d", sym_key[1])
+                        elif sk.kind == "kernel":
+                            tag = f"kernel:arg{sk.arg_index}"
+                            content_parts.append(tag.encode())
+                            _debug_pool_offsets.append(tag)
+                            logger.debug("  [hash]   kernel arg%d", sk.arg_index)
                         elif sk.kind == "kernel_slice":
                             tag = f"slice:arg{sk.arg_index}:{sk.offset}"
                             content_parts.append(tag.encode())

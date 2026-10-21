@@ -233,6 +233,73 @@ class TestSymbolKindTagging(unittest.TestCase):
             "different offsets produce different hashes even with use_symbols=False.",
         )
 
+    def test_pool_layout_changes_hash_when_sdsc_json_identical(self):
+        """Same SDSC JSON, same ops, but the pool offsets are assigned to the ops
+        in a different order (e.g. fused ops whose buffers are swapped, as in
+        left-pad vs right-pad). The pool offsets only reach bundle.mlir, so the
+        hash must cover them or the second kernel is served the first one's
+        cache entry."""
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+        def _fake_compile(offsets):
+            def fake(idx, entry, symbols, symbol_id_offset):
+                keys = [("pool", o) for o in offsets]
+                kinds = [SymbolKind.pool() for _ in offsets]
+                return {"same": "json"}, keys, [], kinds
+
+            return fake
+
+        specs = [_make_op_spec()]
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([0, 128, 256]),
+        ):
+            h_low = _hash(specs, use_symbols=True)
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([384, 512, 640]),
+        ):
+            h_high = _hash(specs, use_symbols=True)
+
+        self.assertNotEqual(
+            h_low,
+            h_high,
+            "Pool offsets that appear only in bundle.mlir must change the hash.",
+        )
+
+    def test_kernel_arg_wiring_changes_hash_when_sdsc_json_identical(self):
+        """Same SDSC JSON, but the op reads different kernel args (e.g. arg_0 and
+        arg_3 vs arg_3 and arg_4). The wiring only reaches bundle.mlir, so the
+        hash must cover it."""
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+        def _fake_compile(arg_indices):
+            def fake(idx, entry, symbols, symbol_id_offset):
+                keys = [("kernel", a) for a in arg_indices]
+                kinds = [SymbolKind.kernel(arg_index=a) for a in arg_indices]
+                return {"same": "json"}, keys, [], kinds
+
+            return fake
+
+        specs = [_make_op_spec()]
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([0, 3]),
+        ):
+            h_a = _hash(specs, use_symbols=True)
+        with patch(
+            "torch_spyre._inductor.codegen.superdsc.compile_op_spec",
+            _fake_compile([3, 4]),
+        ):
+            h_b = _hash(specs, use_symbols=True)
+
+        self.assertNotEqual(
+            h_a,
+            h_b,
+            "Kernel argument wiring that appears only in bundle.mlir must change "
+            "the hash.",
+        )
+
 
 class TestAffineStridesHashed(unittest.TestCase):
     """affine_strides (per-level tile byte strides) must be included in
