@@ -29,9 +29,11 @@ from typing import (
 )
 
 import regex
-import torch
 import sympy
+import torch
 from sympy import Expr, Symbol
+from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -49,12 +51,11 @@ from torch._inductor.ir import (
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
-from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
-from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._ordered_set import OrderedSet
+
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -66,16 +67,16 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
-from .core_mapping import (
-    core_to_slice_mapping,
-    decompose_fused_split_view,
-    same_owner_maps,
-)
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
     TOPK_OPS,
+)
+from .core_mapping import (
+    core_to_slice_mapping,
+    decompose_fused_split_view,
+    same_owner_maps,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
@@ -2049,7 +2050,10 @@ def splits_by_index_coeff(
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
     """
-    skip = lambda v: v <= 1  # noqa: E731
+
+    def skip(v):
+        return v <= 1
+
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
     # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {

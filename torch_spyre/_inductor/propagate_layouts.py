@@ -13,15 +13,15 @@
 # limitations under the License.
 
 
+import logging
+import math
 from collections import Counter
 from typing import NamedTuple
 
-import logging
-import math
-
 import sympy
 import torch
-from .logging_utils import get_inductor_logger
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -30,22 +30,19 @@ from torch._inductor.ir import (
     FixedLayout,
     InputBuffer,
     Layout,
+    MultiOutput,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
-    MultiOutput,
-    ReinterpretView,
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
-from torch._inductor.dependencies import MemoryDep
-from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
-from . import config
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
@@ -53,16 +50,11 @@ from torch_spyre._C import (
     get_device_dtype,
     get_elem_in_stick,
 )
-from .dtype_ops import (
-    bool_equivalent_dtype,
-    bool_layout_dtype,
-    resolve_output_formats,
-    DtypeOpTable,
-)
-from .errors import Unsupported
+
+from . import config
 from .constants import (
-    BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
@@ -70,35 +62,43 @@ from .constants import (
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
+from .dtype_ops import (
+    DtypeOpTable,
+    bool_equivalent_dtype,
+    bool_layout_dtype,
+    resolve_output_formats,
+)
+from .errors import Unsupported
 from .ir import (
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
+    BroadcastAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
-    BroadcastAsyncFallback,
     WaitWorkFallback,
 )
+from .logging_utils import get_inductor_logger
+from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    device_coordinates,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
     get_matmul_n_size,
-    identify_matmul_inputs,
     host_coordinates,
-    device_coordinates,
-    try_device_coordinates,
+    identify_matmul_inputs,
     indirect_info_from_op,
     is_keep_by_index,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
     rescale_stl_for_dtype,
+    try_device_coordinates,
 )
-from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
@@ -471,15 +471,21 @@ def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
 ) -> SpyreTensorLayout:
-    """Propagate special FP8 tensor with 2D stick [2, 64]
+    """Propagate special FP8 tensor with 2D stick [2, 64].
 
     The QFP8WT weight (KERNEL) tensor requires stick dimensions of [2, 64].  This
     function propagates the output layout for both aligned and unaligned input tensors.
 
-    Outer dimensions and strides are preserved from output layout, with the innermost
-    stride always set to 1. For unaligned inputs where input stick size is not a
-    multiple of input stick size, the last dimension is padded to the stick size.  For
-    aligned inputs, it retains the concrete output size.
+    Outer dimensions and strides are preserved from the output layout, with the
+    innermost stride always set to 1.  For unaligned inputs where the last
+    dimension is not a multiple of the FP8 stick size, the last dimension is
+    padded to the stick size.  For aligned inputs, it retains the concrete
+    output size.
+
+    The caller is responsible for passing a contiguous input (e.g. calling
+    ``.contiguous()`` after any ``permute``) so that the output ``FixedLayout``
+    carries the intended stride ordering.  Non-contiguous permuted views would
+    produce misleading strides that this function cannot safely interpret.
 
     Args:
         output: Inductor ``FixedLayout`` for the op's output tensor.
@@ -488,11 +494,17 @@ def _qfp8wt_stl(
     in_eps = get_elem_in_stick(in_layout.dtype)
     stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
+    last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
+
+    # Standard N-inner: N (last dim) is innermost at stride=1.
+    # For a 3D weight [KV, K=D, N=BS] this naturally produces:
+    #   c_size=[KV, D, BS], c_stride=[D*BS, BS, 1]
+    #   → layoutDimOrder_=["mb","in","out"], stickSize_=[2,64]  ✓
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
-    last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
     c_size = outer_sizes + [last_dim]
     c_stride = outer_strides + [1]
+
     return SpyreTensorLayout(
         c_size,
         c_stride,
@@ -1374,13 +1386,29 @@ def _matmul_layouts(
         x_req_stl = find_stick_compatible_input_layout(
             x, reduction_var, data.reduction_type, "x"
         )
-        y_dim_order = list(range(len(y.layout.size))) + [-1]
-        y_req_stl = SpyreTensorLayout(
-            [concretize_expr(s) for s in y.layout.size],
-            [concretize_expr(s) for s in y.layout.stride],
-            y.layout.dtype,
-            y_dim_order,
+        # If y already carries a non-STANDARD EA (e.g. QFP8WT from a KV-cache
+        # gather), pass it through directly.  The hardware's batchmatmulfp8
+        # op understands the 2D-stick weight layout regardless of N size;
+        # building a STANDARD sparse-stick STL here would produce a dense→sparse
+        # scatter incompatibility in the beam search.
+        _y_non_std = next(
+            (
+                stl
+                for stl in y.layouts
+                if stl.element_arrangement != ElementArrangement.STANDARD
+            ),
+            None,
         )
+        if _y_non_std is not None:
+            y_req_stl = _y_non_std
+        else:
+            y_dim_order = list(range(len(y.layout.size))) + [-1]
+            y_req_stl = SpyreTensorLayout(
+                [concretize_expr(s) for s in y.layout.size],
+                [concretize_expr(s) for s in y.layout.stride],
+                y.layout.dtype,
+                y_dim_order,
+            )
         # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
@@ -2138,6 +2166,24 @@ def compute_layouts(
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
 
+    if aten_op == spyreop.qfp8wt.default:
+        # _qfp8wt_stl derives the output entirely from the host FixedLayout
+        # (output, in_layout), never from the device STL.  Any input stick
+        # layout is acceptable — the hardware can absorb a preceding restickify
+        # at the same cost as the quantisation itself.  Using AnyInNode avoids
+        # spurious stick-scatter incompatibilities when the input tensor carries
+        # a factored (tiled) candidate STL that would otherwise be paired against
+        # the QFP8WT sparse-stick output and fail the beam search.
+        #
+        # The input must be contiguous before quantize_weight_fp8_with_scale is
+        # called (callers use .contiguous() after permute).  _qfp8wt_stl reads
+        # output.size/stride to build the STL; non-contiguous permuted strides
+        # would give a misleading stride ordering.
+        in_layout = args[0].layout
+        out_stl = _qfp8wt_stl(output, in_layout)
+        op.restick_cost_fn = AnyInNode.from_args()
+        return [out_stl]
+
     # All other single arg ops
     layouts = []
     for stl in args[0].layouts:
@@ -2382,6 +2428,16 @@ def _align_single_source_producer(
     if not isinstance(producer, ComputedBuffer):
         return
     if not isinstance(producer.data, Pointwise):
+        return
+    # Do not overwrite a producer whose layout already carries a non-STANDARD
+    # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
+    # the mutation target is always STANDARD; forcing it onto the producer strips
+    # the arrangement and causes the codegen to misread the HBM layout.
+    if any(
+        getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
+        != ElementArrangement.STANDARD
+        for stl in getattr(producer, "layouts", [])
+    ):
         return
     producer.layouts = [alt_stl]
 
@@ -3152,6 +3208,34 @@ def propagate_spyre_tensor_layouts(
                         )
                     op._restickify_plan = (target_name, target_stl, alt_stl)
                     target_stl = alt_stl
+
+                # When the scatter source carries QFP8WT EA (i.e. the value
+                # being written was produced by quantize_weight_fp8_with_scale),
+                # promote the destination to QFP8WT so that:
+                #   1. reorder_nonstick_dims sees QFP8WT on k_cache and the
+                #      deferred IA-rotate entry records QFP8WT EA.
+                #   2. _ia_rotate_stl (with EA preservation) propagates QFP8WT
+                #      into the required_stl of the _DeferredReorder.
+                #   3. _insert_mutation_relayout_copy creates buf_tmp with
+                #      QFP8WT EA so the scatter writes in 2D-stick addressing.
+                source_is_qfp8wt = any(
+                    any(
+                        stl.element_arrangement == ElementArrangement.QFP8WT
+                        for stl in a.layouts
+                    )
+                    for a in args
+                    if a.dep.name != target_name
+                )
+                if source_is_qfp8wt:
+                    qfp8wt_stl = target_stl.with_element_arrangement(
+                        ElementArrangement.QFP8WT
+                    )
+                    if graph_input is not None:
+                        graph_input.layouts = [qfp8wt_stl]
+                    elif target_buf is not None:
+                        target_buf.layouts = [qfp8wt_stl]
+                    target_stl = qfp8wt_stl
+
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
@@ -3194,10 +3278,7 @@ def propagate_spyre_tensor_layouts(
             # (MultiOutputLayout / NoneLayout both raise from get_layout()).
             # The trailing MultiOutputs are handled in their own branch below.
             pass
-        elif isinstance(op, MultiOutput):
-            op.layouts = [generic_layout(op)]
-            op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, SpyreConstantFallback):
+        elif isinstance(op, (MultiOutput, SpyreConstantFallback)):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreEmptyFallback):

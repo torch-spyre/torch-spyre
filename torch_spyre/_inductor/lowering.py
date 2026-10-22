@@ -16,16 +16,20 @@
 import logging
 import math
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any, Callable, Union
+from typing import Any
 from warnings import warn
 
 import sympy
 import torch
-import torch._inductor.ir as ir
-import torch._inductor.lowering as lowering
+from torch._inductor import ir, lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    elementwise_dtypes,
+)
 from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
@@ -60,11 +64,6 @@ from .ir import (
 )
 from .logging_utils import get_inductor_logger
 
-from torch._prims_common import (
-    ELEMENTWISE_TYPE_PROMOTION_KIND,
-    elementwise_dtypes,
-)
-
 logger = get_inductor_logger("lowering")
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
@@ -73,7 +72,7 @@ _lowerings_nesting = 0
 
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
-spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+spyre_lowerings: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 
 
 def register_spyre_lowering(
@@ -2484,11 +2483,12 @@ def lower_qfp8ch(x):
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """
-    Lower qfp8wt operation - weight FP8 format conversion.
+    Lower qfp8wt operation — weight FP8 format conversion.
 
-    Pointwise format conversion only (no scaling).
+    Pointwise format conversion only (no scaling).  Callers must pass a
+    contiguous input (e.g. ``.contiguous()`` after ``permute``) so that the
+    output stride reflects the intended layout.
     """
-
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
     x_loader = x.make_loader()
 

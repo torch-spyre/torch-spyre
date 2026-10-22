@@ -12,34 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
 import itertools
+import logging
 import math
-from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Callable, Self, Sequence, Tuple, Union
 
-import torch
 import sympy
-
-from torch_spyre._C import DataFormats, ElementArrangement
-
-from torch._inductor.scheduler import SchedulerNode
+import torch
 from torch._inductor.codegen.common import (
+    REMOVED,
     CSEVariable,
     Kernel,
-    REMOVED,
 )
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
-from torch.utils._ordered_set import OrderedSet
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.provenance import build_debug_handle
 
+from . import config as _spyre_config
 from .constants import (
-    SPYRE_FP32_OPS,
-    SPYRE_INT32_OPS,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -47,9 +46,10 @@ from .constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    SPYRE_FP32_OPS,
+    SPYRE_INT32_OPS,
     TWO_INPUT_REDUCTION_OPS,
 )
-from . import config as _spyre_config
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
@@ -57,38 +57,38 @@ from .core_mapping import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .scratchpad.lx_relayout import (
-    materialized_lx_relayout_for_destination,
-    work_division_from_view,
-)
-from .pass_utils import (
-    concretize_expr,
-    compute_symbolic_bounds,
-    finite_upper_or_none,
-    iteration_space,
-    iteration_space_with_splits,
-    indirect_access_subs_from_kernel,
-    input_layout_for_operation,
-    is_restickify_coords,
-    alignment_coordinates,
-    per_trip_index,
-)
-from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
 from .op_spec import (
-    IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
+    IndirectAccess,
     LoopSpec,
     OpSpec,
     TensorArg,
     TensorWorkDivision,
-    UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
 )
+from .op_spec import (
+    UnimplementedOp as OpSpecUnimplementedOp,
+)
 from .op_spec_validation import validate_op_specs
-from torch_spyre._inductor.provenance import build_debug_handle
-import logging
+from .pass_utils import (
+    alignment_coordinates,
+    compute_symbolic_bounds,
+    concretize_expr,
+    finite_upper_or_none,
+    indirect_access_subs_from_kernel,
+    input_layout_for_operation,
+    is_restickify_coords,
+    iteration_space,
+    iteration_space_with_splits,
+    per_trip_index,
+)
+from .scratchpad.lx_relayout import (
+    materialized_lx_relayout_for_destination,
+    work_division_from_view,
+)
+from .views import align_tensors, tiling_expr_to_device_expr
 
 logger = get_inductor_logger("spyre_kernel")
 
@@ -1097,7 +1097,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # call site too so an unexpected node shape can't fail create_op_spec.
         try:
             debug_handle = build_debug_handle(ir_node)
-        except Exception:  # noqa: BLE001 - provenance must never fail the build
+        except Exception:
             logger.warning(
                 "debug_handle construction failed for op %s; continuing without "
                 "provenance",
@@ -1296,16 +1296,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            # Compute which indirect variables THIS operation actually uses:
-            # - For gather: check source index for indirect symbols
-            # - For scatter: check destination index for indirect symbols
-            # Use the same filtering logic as PointwiseOp to avoid duplication.
+            # Use gather_first=True so that a co-fused scatter's indirect sym
+            # cannot leak into a gather's output SDSC role (see _indirect_syms_used).
             indirect_syms_used = (
                 _indirect_syms_used(
                     value,
                     self.indirect_vars,
                     src_index=value.index,
                     dst_index=dst.index,
+                    gather_first=True,
                 )
                 if self.indirect_vars
                 else set()
@@ -1576,12 +1575,20 @@ def _indirect_syms_used(
     indirect_vars: "dict[sympy.Symbol, TensorAccess]",
     src_index: "sympy.Expr | None" = None,
     dst_index: "sympy.Expr | None" = None,
+    gather_first: bool = False,
 ) -> "set[sympy.Symbol]":
     """Return the subset of indirect_vars keys that appear in value's indices.
 
     For PointwiseOp: checks all argument indices (via value.arguments).
     If src_index is provided (for gather source indices), also checks it.
     If dst_index is provided (for scatter destination indices), also checks it.
+
+    When ``gather_first=True`` (used for TensorAccess dataops), the function
+    applies gather-before-scatter discrimination: src_index is checked first,
+    and dst_index is only checked when src carries no indirect symbols.  This
+    prevents a co-fused scatter's indirect sym from leaking into a gather's
+    output SDSC role (which would flip value_tensor / no_indirection and
+    produce all-zeros from hardware).
     """
     syms = set()
     if hasattr(value, "arguments"):
@@ -1592,6 +1599,16 @@ def _indirect_syms_used(
             for s in inp.index.free_symbols
             if s in indirect_vars
         }
+    if gather_first:
+        if src_index is not None:
+            src_syms = {s for s in src_index.free_symbols if s in indirect_vars}
+            if src_syms:
+                # Gather: sym found in source — never propagate to dst.
+                return syms | src_syms
+        if dst_index is not None:
+            # Scatter (or plain copy): sym is in the destination write index.
+            syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
+        return syms
     if src_index is not None:
         syms.update(s for s in src_index.free_symbols if s in indirect_vars)
     if dst_index is not None:

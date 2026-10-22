@@ -62,9 +62,9 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 """
 
 import math
-import sympy
 from typing import Literal, NamedTuple
 
+import sympy
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -79,17 +79,28 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
+from . import config
 from .constants import MATMUL_REDUCTION_OPS
+
+# Helpers shared with enforce_indirect_access_layout.
+# enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
+# import is safe at module level.
+from .enforce_indirect_access_layout import (
+    _insert_relayout_copy,
+    _real_layout,
+    _resolve_mutation_target,
+    _scatter_access_subs_and_sizes,
+)
 from .errors import Unsupported
 from .insert_restickify import (
+    RestickifyArgInfo,
     _create_restickify_node,
     _fixed_tiled,
-    RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
-from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
@@ -102,16 +113,6 @@ from .pass_utils import (
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
-
-# Helpers shared with enforce_indirect_access_layout.
-# enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
-# import is safe at module level.
-from .enforce_indirect_access_layout import (
-    _insert_relayout_copy,
-    _real_layout,
-    _resolve_mutation_target,
-    _scatter_access_subs_and_sizes,
-)
 
 logger = get_inductor_logger("nonstick_dim_order")
 
@@ -415,6 +416,7 @@ def _ia_rotate_stl(
         device_size=[device_size[i] for i in order],
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+        element_arrangement=stl.element_arrangement,
     )
 
 
@@ -764,6 +766,20 @@ def _insert_mutation_relayout_copy(
         f"got {type(target_layout).__name__}"
     )
 
+    # If the target already has exactly the required layout, no copy-in/copy-back
+    # is needed — the scatter can write directly into the target buffer.
+    # This is the QFP8WT case: after propagate_layouts promotes k_cache to QFP8WT
+    # and finalize_layouts assigns FixedTiledLayout(QFP8WT), the required_stl
+    # (QFP8WT, slot-dim-first from _ia_rotate_stl) already matches target_layout.
+    if target_layout.device_layout == required_stl:
+        logger.info(
+            "nonstick_dim_order: scatter target %s already has required layout "
+            "(%s) — skipping copy-in/copy-back",
+            target_name,
+            required_stl,
+        )
+        return
+
     buf_tmp_layout = _fixed_tiled(target_layout, required_stl)
     orig_stl_layout = target_layout
 
@@ -855,7 +871,25 @@ def reorder_nonstick_dims_mutation(graph: GraphLowering) -> None:
         if entry.kind == "producer_rewrite":
             _rewrite_producer_layout(buf, entry.required_stl)
         elif entry.kind == "copy":
-            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
+            if isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE) and (
+                entry.required_stl.element_arrangement != ElementArrangement.STANDARD
+            ):
+                # Non-STANDARD EA (e.g. QFP8WT): the scatter source and destination
+                # share a physical element layout (2D-stick) that cannot be
+                # transcoded by a plain byte-copy restickify.  Instead, rewrite the
+                # mutation target's layout in-place to the required (rotated) STL so
+                # the scatter writes directly into the target buffer with the correct
+                # 2D-stick addressing — no copy-in / copy-back needed.
+                #
+                # For graph inputs, try_get_buffer returns TensorBox(StorageBox(buf))
+                # which has no writable .layout.  Unwrap to reach the InputBuffer.
+                real_buf = buf
+                if isinstance(real_buf, TensorBox) and isinstance(
+                    real_buf.data, StorageBox
+                ):
+                    real_buf = real_buf.data.data
+                _rewrite_producer_layout(real_buf, entry.required_stl)
+            elif isinstance(entry.op.layout, MutationLayoutSHOULDREMOVE):
                 _insert_mutation_relayout_copy(graph, entry.op, entry.required_stl)
             else:
                 layout = _real_layout(buf)
