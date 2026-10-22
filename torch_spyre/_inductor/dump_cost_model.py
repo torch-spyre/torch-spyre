@@ -1369,6 +1369,7 @@ def extract_op_features(
     # set above, from the committed loop_info or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
     _li = getattr(op, "loop_info", None)
+    _rw = None
     try:
         _rw = op.get_read_writes()
         _write_index = next(iter(_rw.writes)).index
@@ -1518,8 +1519,10 @@ def extract_op_features(
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
     # layout -- so a reduction's reduced input is naturally full-sized (no separate
     # reduction scaling), and a broadcast operand carries its real (one-row) size.
+    # No dependencies change during feature extraction. Reuse the output snapshot,
+    # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = op.get_read_writes().reads
+        reads = (_rw if _rw is not None else op.get_read_writes()).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)

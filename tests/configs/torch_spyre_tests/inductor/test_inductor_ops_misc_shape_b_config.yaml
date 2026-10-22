@@ -40,6 +40,9 @@ test_suite_config:
             - TestOps::test_round_trip_to_dtype.*
             - TestOps::test_reduction_with_to_dtype.*
             - TestOps::test_float32_to_int_(truncates|saturates).*
+            - TestOps::test_float16_to_int_.*
+            - TestOps::test_int_to_(float16|bool)_.*
+            - TestOps::test_int32_int64_.*
             - TestOps::test_gather_staggered_index_lane0.*
             - TestOps::test_trunc_.*
             - TestOps::test_add_constant.*

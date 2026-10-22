@@ -388,24 +388,22 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
+    def per_core_size(self, division: int) -> int:
+        """Bytes per core after output partitioning and output tiling.
+
+        Reduction splits retain a full output part.
+        """
+        cd = self.core_divisions[division]
+        return ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+
     @property
     def min_footprint(self) -> int:
-        """Smallest per-core footprint any candidate division allows. With no
+        """Smallest :meth:`per_core_size` any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on).
-
-        A tiled candidate's own buffer is per-tile scratch, so its footprint
-        shrinks by the output tile count as well as the core count -- this is
-        the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); where no
-        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
-        ``ceil_div(size, output_partition)`` exactly."""
+        (the placement-only case ``_wrap`` also dispatches on)."""
         if not self.core_divisions:
             return self.size
-        return min(
-            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
-            for cd in self.core_divisions
-        )
+        return min(self.per_core_size(i) for i in range(len(self.core_divisions)))
 
     @property
     def sym_cores(self) -> sympy.Symbol:
@@ -802,7 +800,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     def per_core_footprint(self) -> int:
         """The destination span: what one core must hold for the copy to be
         resident (``size`` is that span times the destination core count)."""
-        return ceil_div(self.size, self.num_cores)
+        return self.per_core_size(0)
 
     @property
     def consumers(self) -> tuple[str, ...]:
