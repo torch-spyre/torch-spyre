@@ -3160,7 +3160,10 @@ def _is_direct_conv_supported(
     the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
     downstream as a hard Unsupported, not silent wrong numerics.
     """
-    kH, kW = weight_shape[-2], weight_shape[-1]
+    # A rank-3 (conv1d) weight is [C_out, C_in_per_group, K_w], so shape[-2] is
+    # the input-channel count, not a kernel height. For conv1d, kH is always 1
+    kH = 1 if len(weight_shape) == 3 else weight_shape[-2]
+    kW = weight_shape[-1]
     C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
@@ -3169,7 +3172,8 @@ def _is_direct_conv_supported(
         and all(p == 0 for p in padding)
         and all(d == 1 for d in dilation)
         and groups == 1
-        and len(input_shape) == 4
+        # Expand acceptable dim count to include 3 to support conv1d
+        and len(input_shape) in (3, 4)
         and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
@@ -3260,7 +3264,7 @@ def conv2d_via_bmm_decomp(
     #
     # NOTE: this first call passes the *original* input shape, so for a
     # 5-dimensional (Conv3D) input it always returns False -- _is_direct_conv_
-    # supported gates on len(input_shape) == 4. The direct deferral for a
+    # supported gates on len(input_shape) in (3, 4). The direct deferral for a
     # temporal-1 Conv3D is decided later, by the *second* call below on the
     # folded 4D shapes; here a 5D input simply proceeds into the fold branch.
     if _will_lower_conv2d_direct(
@@ -3282,6 +3286,49 @@ def conv2d_via_bmm_decomp(
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")
 
+    # conv1d (rank-3 activation) splits by whether it is depthwise.
+    #
+    # Depthwise goes to spyre.conv2d, which handles a rank-3 activation natively.
+    #
+    # The general case (C_in != C_out, or any grouping that is not depthwise) is
+    # direct-lowered at rank 3 too when _is_direct_conv_supported accepts it.
+    #
+    # This function is reached only when direct lowering returns NotImplemented
+    #
+    # That leaves the im2col+matmul fallback, which needs rank 4, so needed expansion
+    # is performed via unsqueeze.
+    if input.dim() == 3:
+        C_in = input.shape[1]
+        C_out = weight.shape[0]
+        if C_in == groups == C_out:
+            return torch.ops.spyre.conv2d_with_bias(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"conv2d_via_bmm: conv1d expects 1-element stride/padding/"
+                f"dilation, got stride={stride}, padding={padding}, "
+                f"dilation={dilation}"
+            )
+        input = input.unsqueeze(2)
+        weight = weight.unsqueeze(2)
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+        # The trailing reshape below restores rank 4 as (N, C_out, 1, W_out);
+        # squeeze the degenerate height back out so the result matches the
+        # rank-3 shape aten.convolution promises for a 1-D conv.
+        return conv2d_via_bmm_decomp(
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        ).squeeze(2)
     if input.dim() == 5:
         # A Conv3D with a unit temporal (depth) kernel is a *batched* Conv2d:
         # with kD == 1 (and unit depth stride, zero depth pad, unit depth
@@ -3561,11 +3608,14 @@ def spyre_conv2d_with_bias_decomp(
 
     # If bias is present, add it
     if bias is not None:
-        # Get output shape
-        N, C_out, H_out, W_out = output.shape
-        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
-        # This avoids stick layout issues by expanding before adding
-        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        # Reshape bias to a channel vector with unit spatial dims, then expand to
+        # the output shape; expanding before the add avoids stick layout issues.
+        # The rank follows the output's: 4 for conv2d, 3 for a depthwise conv1d
+        # so the shapes are built from output.shape.
+        out_shape = list(output.shape)
+        C_out = out_shape[1]
+        bias_shape = [1, C_out] + [1] * (len(out_shape) - 2)
+        bias_expanded = bias.reshape(bias_shape).expand(out_shape)
         output = output + bias_expanded
 
     return output
