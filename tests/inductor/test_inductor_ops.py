@@ -8330,71 +8330,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # can register `prod` in CORE_REDUCTION_OPS_DICT like other reduction ops.
         ("test_prod", "test_prod_cpu"): {
             "param_sets": {
-                "int64_dim0": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    0,
-                    False,
-                ),
-                "int64_dim0_keepdim": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    0,
-                    True,
-                ),
-                "int64_dim1": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_2x2": (
-                    torch.randint(2, 10, (2, 2), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_keepdim": (
-                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
-                    -1,
-                    True,
-                ),
-                "int64_dim0_2": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    0,
-                    False,
-                ),
-                "int64_dim0_2_keepdim": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    0,
-                    True,
-                ),
-                "int64_dim1_2": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    -1,
-                    False,
-                ),
-                "int64_dim1_2_keepdim": (
-                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
-                    -1,
-                    True,
-                ),
-                "fp16_dim0": (torch.randn((128, 64), dtype=torch.float16), 0, False),
-                "fp16_dim0_keepdim": (
-                    torch.randn((128, 64), dtype=torch.float16),
-                    0,
-                    True,
-                ),
-                "fp16_dim1": (torch.randn((128, 64), dtype=torch.float16), -1, False),
-                "fp16_dim1_keepdim": (
-                    torch.randn((128, 64), dtype=torch.float16),
-                    -1,
-                    True,
-                ),
-            },
-            "expect_fail": {
-                "int64_dim1": (
-                    "output size [1] triggers _make_output_stl c_size[stick_dim]==1 guard"
-                ),
-                "int64_dim1_keepdim": (
-                    "output size [1,1] triggers _make_output_stl c_size[stick_dim]==1 guard"
-                ),
+                "int64_dim0": ((1, 2), torch.int64, 0, False),
+                "int64_dim0_keepdim": ((1, 2), torch.int64, 0, True),
+                "int64_dim1": ((1, 2), torch.int64, -1, False),
+                "int64_dim1_2x2": ((2, 2), torch.int64, -1, False),
+                "int64_dim1_keepdim": ((1, 2), torch.int64, -1, True),
+                "int64_dim0_2": ((64, 32), torch.int64, 0, False),
+                "int64_dim0_2_keepdim": ((64, 32), torch.int64, 0, True),
+                "int64_dim1_2": ((64, 32), torch.int64, -1, False),
+                "int64_dim1_2_keepdim": ((64, 32), torch.int64, -1, True),
+                # The only other dim has size 1 (Mistral-Small-3.2 position ids).
+                "fp16_1x64_dim1": ((1, 64), torch.float16, -1, False),
+                "fp16_1x64_dim1_keepdim": ((1, 64), torch.float16, -1, True),
+                "fp16_1x1x128_dim2": ((1, 1, 128), torch.float16, -1, False),
+                "fp16_dim0": ((128, 64), torch.float16, 0, False),
+                "fp16_dim0_keepdim": ((128, 64), torch.float16, 0, True),
+                "fp16_dim1": ((128, 64), torch.float16, -1, False),
+                "fp16_dim1_keepdim": ((128, 64), torch.float16, -1, True),
             },
         },
         ("test_unfold", "test_unfold_cpu"): {
@@ -13096,7 +13048,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ):
             compiled(x_multi.to("spyre"))
 
-    def test_prod_cpu(self, x, dim, keepdim):
+    def test_prod_cpu(self, shape, dtype, dim, keepdim):
+        # Entries in {-1, 1}: every product is exact, and its sign depends on every
+        # element, so a dropped or repeated element changes the result.
+        x = (torch.randint(0, 2, shape) * 2 - 1).to(dtype)
+
         def fn(a):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
