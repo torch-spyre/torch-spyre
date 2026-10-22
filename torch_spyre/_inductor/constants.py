@@ -226,12 +226,22 @@ LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
+# Most extreme *finite* fp16 values, used as max/min reduction identities.
+#
+# Used by codegen for reduction padding masks (_get_mask_value) and by the
+# max_pool2d lowering to fill the explicitly-materialized pad halo.
+# See codegen/superdsc.py for more details
+FP16_MAX = 65504.0
+FP16_MIN = -65504.0
+
 AVGPOOL2D_OP = "avgpoolfwd"
+MAXPOOL2D_OP = "maxpoolfwd"
+# Pool opfunc names, mirroring TOPK_OPS. Add minpool here as it lands so
 # max(|x|) reduction; torch.any/all lower to it (see lowering.lower_any_*).
 ABSMAX_OP = "absmax"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
-POOL_OPS = {AVGPOOL2D_OP}
+POOL_OPS = {AVGPOOL2D_OP, MAXPOOL2D_OP}
 
 # Conv opfunc names. conv2d is a two-input reduction (activation + weight) with
 # windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
@@ -269,7 +279,7 @@ SINGLE_INPUT_REDUCTION_OPS = frozenset(
         "prod",
         "exx2",
         *TOPK_OPS,
-        AVGPOOL2D_OP,
+        *POOL_OPS,
         ABSMAX_OP,
         QUANTSCALEPERTOKENFP8_OP,
     }
