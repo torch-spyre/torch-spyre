@@ -12001,7 +12001,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         strict=True,
         raises=InductorError,
-        reason="scattering along the stick (last) dimension does not compile (#5637)",
+        reason="scattering along the stick (last) dimension does not compile (#4404)",
     )
     def test_index_copy_stick_dim_xfail(self):
         """index_copy along the stick (last) dim is unsupported and raises InductorError.
@@ -12016,9 +12016,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dst = torch.randn(4, 128)
         index = torch.tensor([0, 64])
         src = torch.randn(4, 2)
-        self.compare_with_cpu(
-            fn, dst, 1, index, src, run_compile=False, run_eager=True
-        )
+        self.compare_with_cpu(fn, dst, 1, index, src, run_compile=False, run_eager=True)
 
     def test_index_copy_compiled_cpu(self):
         """torch.compile'd index_copy / index_copy_ / index_copy(out=) match CPU.
