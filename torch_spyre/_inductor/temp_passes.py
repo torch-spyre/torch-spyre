@@ -14,9 +14,11 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
+import contextlib
 from math import prod
 
 import torch
+from torch._guards import detect_fake_mode
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch._inductor.pattern_matcher import (
     Arg,
@@ -40,6 +42,7 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+broadcast_gather_pass = PatternMatcherPass(pass_name="broadcast_gather_to_row_gather")
 
 
 def _node_shape(node: torch.fx.Node) -> tuple | None:
@@ -170,6 +173,124 @@ def _unflatten_mm_to_bmm(
     graph.erase_node(node)
     if not lhs.users:
         graph.erase_node(lhs)
+
+
+def _is_row_broadcast_gather(x, dim: int, index) -> bool:
+    """Whether ``gather(x, dim, index)`` selects whole trailing slabs of ``x``.
+
+    True when ``index`` matches ``x`` on every dim but ``dim`` and is broadcast
+    (stride 0) along the dims after ``dim``, e.g. ``pos.view(-1, 1, 1).expand(-1,
+    1, V)``. Every trailing entry then repeats one index, so each output slab is
+    one whole slab of ``x.reshape(-1, *x.shape[dim+1:])``. Requires static
+    shapes and at least one real broadcast dim; anything else keeps the generic
+    gather lowering.
+    """
+    if not isinstance(x, torch.Tensor) or not isinstance(index, torch.Tensor):
+        return False
+    ndim = x.dim()
+    if ndim < 2 or index.dim() != ndim or index.dtype not in (torch.int32, torch.int64):
+        return False
+    dim = dim % ndim
+    if dim == ndim - 1:
+        return False
+    if not all(isinstance(s, int) for s in (*x.shape, *index.shape, *index.stride())):
+        return False
+    if any(index.shape[k] != x.shape[k] for k in range(ndim) if k != dim):
+        return False
+    trailing = range(dim + 1, ndim)
+    if any(index.shape[k] != 1 and index.stride(k) != 0 for k in trailing):
+        return False
+    return any(index.shape[k] > 1 for k in trailing)
+
+
+def _emit_row_gather(call, x, index, dim, x_shape, n, index_dtype, index_device):
+    """Emit ``gather(x, dim, index)`` as a plain row gather, one aten op at a time.
+
+    With P = prod(x_shape[:dim]) and T = x_shape[dim], output slab (p, j) is slab
+    ``p * T + index[p, j]`` of ``x.reshape(P * T, *x_shape[dim+1:])``. Only the
+    dims up to ``dim`` are merged; the trailing dims, which hold the stick, keep
+    their shape, since merging into the stick dim is not a view on Spyre.
+
+    ``call(op, *args, **kwargs)`` applies one op: the pass passes a builder that
+    adds a graph node, and the unit test passes one that runs the op on tensors,
+    so both exercise this same sequence.
+    """
+    prefix, trailing = list(x_shape[:dim]), list(x_shape[dim + 1 :])
+    T, P = x_shape[dim], prod(prefix)
+    # The index repeats along the trailing dims, so keep one entry per slab.
+    idx = index
+    for _ in trailing:
+        idx = call(aten.select.int, idx, dim + 1, 0)
+    rows = call(aten.reshape.default, idx, [P, n])
+    if P > 1:
+        # Row offset of each prefix position. A stepped arange plus an int add
+        # keeps the index exact and avoids an int mul on the device.
+        base = call(
+            aten.arange.start_step, 0, P * T, T, dtype=index_dtype, device=index_device
+        )
+        rows = call(aten.add.Tensor, rows, call(aten.unsqueeze.default, base, 1))
+    rows = call(aten.reshape.default, rows, [P * n])
+    table = call(aten.reshape.default, x, [P * T, *trailing])
+    gathered = call(aten.index.Tensor, table, [rows])
+    return call(aten.reshape.default, gathered, [*prefix, n, *trailing])
+
+
+@register_graph_pattern(
+    CallFunction(aten.gather.default, Arg(), Arg(), Arg()),
+    pass_dict=broadcast_gather_pass,
+)
+def _broadcast_gather_to_row_gather(
+    match: Match, x_node: torch.fx.Node, dim: int, index_node: torch.fx.Node
+) -> None:
+    """Rewrite a gather with a trailing-broadcast index into a row gather (#4840).
+
+    ``logits.gather(1, pos.view(-1, 1, 1).expand(-1, 1, V))`` reads
+    ``x[b, IndirectAccess(pos[b]), v]``: the batch dim b drives the index load
+    and also addresses the value directly. The indirect-access SDSC encoding has
+    no slot for a dim in both roles, so the wrong rows come back without an
+    error. Computing the full row index first leaves an ``x2[rows]`` gather
+    whose index and value dims are disjoint, the form the embedding and
+    advanced-indexing gathers already use.
+    """
+    if not isinstance(dim, int):
+        return
+    x_val = x_node.meta.get("val") if isinstance(x_node, torch.fx.Node) else None
+    index_val = (
+        index_node.meta.get("val") if isinstance(index_node, torch.fx.Node) else None
+    )
+    if not _is_row_broadcast_gather(x_val, dim, index_val):
+        return
+    dim = dim % x_val.dim()
+
+    node = match.nodes[-1]
+    graph = node.graph
+    fake_mode = detect_fake_mode([x_val, index_val]) or contextlib.nullcontext()
+
+    def add_node(op, *args, **kwargs):
+        new_node = graph.call_function(op, args=args, kwargs=kwargs)
+        arg_vals, kwarg_vals = torch.fx.node.map_arg(
+            (args, kwargs), lambda a: a.meta["val"]
+        )
+        # Run the op on the inputs' fake values so the node's meta carries the
+        # real shape, stride, dtype and device.
+        with fake_mode:
+            new_node.meta["val"] = op(*arg_vals, **kwarg_vals)
+        copy_fx_custom_meta(node, new_node)
+        return new_node
+
+    with graph.inserting_before(node):
+        out = _emit_row_gather(
+            add_node,
+            x_node,
+            index_node,
+            dim,
+            tuple(x_val.shape),
+            index_val.shape[dim],
+            index_val.dtype,
+            index_val.device,
+        )
+    node.replace_all_uses_with(out)
+    graph.erase_node(node)
 
 
 def _is_batch_collapsing_reshape(node: torch.fx.Node) -> bool:
