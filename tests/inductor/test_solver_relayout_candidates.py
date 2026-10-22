@@ -24,6 +24,7 @@ drift apart.
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
+from torch_spyre._inductor.cost_model import OpFeatures, relayout_ns
 from torch_spyre._inductor.dump_cost_model import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
@@ -135,18 +136,55 @@ def test_gather_fanin_respects_shuffle_register_budget(fragments):
     assert (cost is not None) == supported
 
 
-def test_split_past_fitted_range_is_declined_not_clamped():
-    # Governing split 16 is outside the law's fitted range [2, 8], where it
-    # over-predicts 12-40%. The reporting path clamps (the shuffle already
-    # exists); the solver path must not OFFER an option at a price the law was
-    # never fitted for, so the pair is declined outright.
-    dims = [256, 8, 16, 64]
-    src16 = PerCoreView(((2, 16),), ((2, _CORE_ID),))
-    dst16 = PerCoreView(((0, 16),), ((0, _CORE_ID),))
-    assert governing_run_split(src16, dst16, dims) == (64, 16)
+# A row-split normalization's fp16 output on 32 cores: logical [1, 512, 4096]
+# in the stick-outer device layout [1, 64 stick columns, 512 rows, 64]. Its row
+# reduction needs whole rows on a core, so each core owns 16 rows of every stick
+# column: a run of 16 * 64 elements, governing split 32.
+_NORM_DIMS = [1, 64, 512, 64]
+_NORM_ELEMS = 64 * 512 * 64
+_ROWS32 = PerCoreView(((2, 32),), ((2, _CORE_ID),), num_cores=32)
+# An 8 x 4 tile of the same tensor on the same 32 cores (8 row groups, 4 stick
+# column groups): a complete partition, so moving to it is a permutation.
+_TILE8X4 = PerCoreView(
+    ((1, 4), (2, 8)),
+    ((1, floor(_CORE_ID / 8)), (2, Mod(_CORE_ID, 8))),
+    num_cores=32,
+)
+
+
+def _law(run_elems, split, out_elems=_NORM_ELEMS, cores=32):
+    return relayout_ns(
+        OpFeatures(
+            name="lx_relayout",
+            is_reduction=False,
+            out_elems=out_elems,
+            cores=cores,
+            dtype_bytes=_DTYPE_BYTES,
+            args=[],
+            is_lx_relayout=True,
+            relayout_run_elems=run_elems,
+            relayout_split=split,
+        )
+    )
+
+
+@pytest.mark.parametrize("groups", [8])
+def test_split_past_fitted_range_is_declined_not_clamped(groups):
+    # A GROUPED movement keeps the old range [2, 8]: the law is fitted on
+    # permutations, and a gather into a matmul's replicated operand measured
+    # 1.8-16x above it at every split. Here the row-split producer feeds the
+    # x view of a `groups` x (32 / groups) x 1 matmul cut: each row slice is held
+    # by 32 / groups cores (fan-in 4 or 8), governing split 32. The emitter can
+    # move it (movement_supported admits it), but the solver must not OFFER it
+    # at a price the law was not fitted for, so the pair is declined outright.
+    destination = PerCoreView(
+        ((2, groups),), ((2, Mod(_CORE_ID, groups)),), num_cores=32
+    )
+    assert governing_run_split(_ROWS32, destination, _NORM_DIMS) == (1024, 32)
+    assert lx_relayout.movement_supported(_ROWS32, destination, 32, 32)
     assert (
         solver_relayout_pair_cost(
-            src16, dst16, 16, dims, 256 * 8 * 16 * 64, _DTYPE_BYTES
+            _ROWS32, destination, 32, _NORM_DIMS, _NORM_ELEMS, _DTYPE_BYTES
         )
         is None
     )
