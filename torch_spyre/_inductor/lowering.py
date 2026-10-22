@@ -2603,6 +2603,62 @@ def lower_i16_pair_to_fp32(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.i16_low24_to_fp32)
+def lower_i16_low24_to_fp32(x):
+    """
+    Lower i16_low24_to_fp32 - converts the low 24 bits of every packed int16 pair
+    into the fp32 value (s + 1) * 2^-24.  Output shape has last dimension N // 2.
+    """
+    fn = lowering.ops_wrapper(torch.ops.spyre.i16_low24_to_fp32.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    out_ranges = list(x.get_size())
+    out_ranges[-1] = out_ranges[-1] // 2
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float32,
+        inner_fn=inner_fn,
+        ranges=out_ranges,
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.i16_top3_to_fp32)
+def lower_i16_top3_to_fp32(a, b, c):
+    """
+    Lower i16_top3_to_fp32 - builds a 24-bit value from the top byte of three lanes and
+    converts it into the fp32 value (s + 1) * 2^-24.  Output shape has last dimension N // 2.
+    """
+    fn = lowering.ops_wrapper(torch.ops.spyre.i16_top3_to_fp32.__name__)
+    a_loader = a.make_loader()
+    b_loader = b.make_loader()
+    c_loader = c.make_loader()
+
+    def inner_fn(index):
+        return fn(a_loader(index), b_loader(index), c_loader(index))
+
+    out_ranges = list(a.get_size())
+    out_ranges[-1] = out_ranges[-1] // 2
+
+    pw = Pointwise.create(
+        device=a.get_device(),
+        dtype=torch.float32,
+        inner_fn=inner_fn,
+        ranges=out_ranges,
+        origin_node=a.get_origin_node(),
+        traceback=a.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """

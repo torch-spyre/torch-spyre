@@ -37,6 +37,8 @@ FP32TOINT32_OP = "fp32toint32"
 INT32TOFP32_OP = "int32tofp32"
 I16TOFP32_OP = "i16tofp32"
 I16_PAIR_TO_FP32_OP = "i16_pair_to_fp32"
+I16_LOW24_TO_FP32_OP = "i16_low24_to_fp32"
+I16_TOP3_TO_FP32_OP = "i16_top3_to_fp32"
 ROTL16I16_OP = "rotl16i16"
 ROTLXORI16_OP = "rotlxori16"
 LO_HI_TO_UNIFORM_OP = "lo_hi_to_uniform"
@@ -178,6 +180,8 @@ SPYRE_FP32_OPS = [
     "log",
     LO_HI_TO_UNIFORM_OP,
     I16_PAIR_TO_FP32_OP,
+    I16_LOW24_TO_FP32_OP,
+    I16_TOP3_TO_FP32_OP,
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
@@ -201,6 +205,8 @@ SPYRE_INT16_OPS = [
     "to_dtype",
     I16TOFP32_OP,
     I16_PAIR_TO_FP32_OP,
+    I16_LOW24_TO_FP32_OP,
+    I16_TOP3_TO_FP32_OP,
     ROTL16I16_OP,
     ROTLXORI16_OP,
 ]

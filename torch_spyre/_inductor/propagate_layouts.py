@@ -768,7 +768,7 @@ def _single_arg_op_layout(
             # two sticks out (lo, hi): output layout doubles the num-sticks dim.
             return [_i16sticks_stl(stl, output.dtype)]
 
-        case spyreop.i16_pair_to_fp32.default:
+        case spyreop.i16_pair_to_fp32.default | spyreop.i16_low24_to_fp32.default:
             # int16 (64 elems/stick) -> fp32 (32 elems/stick), one stick in and
             # one stick out: stick count is preserved.
             return [_i16_pair_to_fp32_stl(stl, output.dtype)]
@@ -2162,6 +2162,23 @@ def compute_layouts(
                         f"  indirect value {arg.dep.name} STL[{j}]"
                         f"\n    d_coords={d_coords_str}"
                     )
+
+    if (
+        len(args) > 1
+        and isinstance(data, Pointwise)
+        and any(o.target == spyreop.i16_top3_to_fp32.default for o in data.origins)
+    ):
+        # Three int16 inputs of identical shape -> one fp32 output with half the
+        # last dim: each int16 stick (64) maps to one fp32 stick (32), as for
+        # i16_pair_to_fp32. AllSameNode makes every input match the output stick.
+        layouts = []
+        for arg in args:
+            for stl in arg.layouts:
+                cand = _i16_pair_to_fp32_stl(stl, output.dtype)
+                if cand not in layouts:
+                    layouts.append(cand)
+        op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep, op)
+        return layouts
 
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)

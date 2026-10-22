@@ -972,6 +972,76 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(out_shape, dtype=torch.float32, device=input.device)
 
 
+@torch.library.custom_op("spyre::i16_low24_to_fp32", mutates_args=())
+def i16_low24_to_fp32(input: torch.Tensor) -> torch.Tensor:
+    """
+    Converts the low 24 bits of every packed (lo, hi) int16 pair (one 32-bit lane) into
+    the fp32 value (s + 1) * 2^-24 in (0, 1], with s = lane mod 2^24.  Exact in fp32.
+    ``u == 1.0`` (s = 2^24 - 1) is not handled.
+
+    Input shape: (..., N), dtype torch.int16 (N % 64 == 0)
+    Output shape: (..., N // 2), dtype torch.float32
+
+    Maps to: deeptools I16_LOW24_TO_FP32 operation (i16_low24_to_fp32.smc)
+    """
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    u16 = input.cpu().to(torch.int32) & 0xFFFF
+    lo = u16[..., 0::2]
+    hi = u16[..., 1::2]
+    s = (lo | ((hi & 0xFF) << 16)).to(torch.float32)
+    u = (s + 1.0) * (2.0**-24)
+    return u.to(input.device)
+
+
+@i16_low24_to_fp32.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    assert input.dtype == torch.int16
+    assert input.shape[-1] % 64 == 0
+    out_shape = list(input.shape)
+    out_shape[-1] = out_shape[-1] // 2
+    return torch.empty(out_shape, dtype=torch.float32, device=input.device)
+
+
+@torch.library.custom_op("spyre::i16_top3_to_fp32", mutates_args=())
+def i16_top3_to_fp32(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
+    """
+    Builds the 24-bit value s = top8(a) * 2^16 + top8(b) * 2^8 + top8(c) from the top byte
+    of every 32-bit lane (the high byte of the odd int16 element) of three tensors, and
+    converts it into the fp32 value (s + 1) * 2^-24 in (0, 1].  Exact in fp32.
+    ``u == 1.0`` (s = 2^24 - 1) is not handled.
+
+    Input shapes: (..., N), dtype torch.int16 (N % 64 == 0), all equal
+    Output shape: (..., N // 2), dtype torch.float32
+
+    Maps to: deeptools I16_TOP3_TO_FP32 operation (i16_top3_to_fp32.smc)
+    """
+    for t in (a, b, c):
+        assert t.dtype == torch.int16
+        assert t.shape[-1] % 64 == 0
+        assert t.shape == a.shape
+
+    def top8(t: torch.Tensor) -> torch.Tensor:
+        hi = (t.cpu().to(torch.int32) & 0xFFFF)[..., 1::2]
+        return hi >> 8
+
+    s = (top8(a) * 65536 + top8(b) * 256 + top8(c)).to(torch.float32)
+    u = (s + 1.0) * (2.0**-24)
+    return u.to(a.device)
+
+
+@i16_top3_to_fp32.register_fake
+def _(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    assert a.dtype == b.dtype == c.dtype == torch.int16
+    assert a.shape == b.shape == c.shape
+    assert a.shape[-1] % 64 == 0
+    out_shape = list(a.shape)
+    out_shape[-1] = out_shape[-1] // 2
+    return torch.empty(out_shape, dtype=torch.float32, device=a.device)
+
+
 # Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
 # four-step pipeline; the only difference is the final format-conversion kernel:
 #   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)

@@ -45,6 +45,8 @@ from .constants import (
     DEPTHWISE_CONV_REDUCTION_OPS,
     I16TOFP32_OP,
     I16_PAIR_TO_FP32_OP,
+    I16_LOW24_TO_FP32_OP,
+    I16_TOP3_TO_FP32_OP,
     IDENTITY_OP,
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
@@ -359,6 +361,14 @@ class SpyreOpFuncs:
     @staticmethod
     def i16_pair_to_fp32(x):
         return PointwiseOp("i16_pair_to_fp32", [x])
+
+    @staticmethod
+    def i16_low24_to_fp32(x):
+        return PointwiseOp("i16_low24_to_fp32", [x])
+
+    @staticmethod
+    def i16_top3_to_fp32(a, b, c):
+        return PointwiseOp("i16_top3_to_fp32", [a, b, c])
 
     @staticmethod
     def rotl16i16(x, n):
@@ -1044,8 +1054,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                     op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16
                 )
                 or (
-                    op in (I16TOFP32_OP, I16_PAIR_TO_FP32_OP)
-                    and arg.device_dtype in (DataFormats.IEEE_FP32, DataFormats.IEEE_INT32, DataFormats.SENINT16)
+                    op
+                    in (
+                        I16TOFP32_OP,
+                        I16_PAIR_TO_FP32_OP,
+                        I16_LOW24_TO_FP32_OP,
+                        I16_TOP3_TO_FP32_OP,
+                    )
+                    and arg.device_dtype
+                    in (
+                        DataFormats.IEEE_FP32,
+                        DataFormats.IEEE_INT32,
+                        DataFormats.SENINT16,
+                    )
                 )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
@@ -1351,7 +1372,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     override_layout = None
-                    if value.op == I16_PAIR_TO_FP32_OP:
+                    if value.op in (
+                        I16_PAIR_TO_FP32_OP,
+                        I16_LOW24_TO_FP32_OP,
+                        I16_TOP3_TO_FP32_OP,
+                    ):
                         eff_size = [
                             int(s) if idx != len(input.layout.size) - 1 else int(s) // 2
                             for idx, s in enumerate(input.layout.size)

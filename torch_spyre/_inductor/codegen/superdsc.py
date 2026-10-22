@@ -37,6 +37,8 @@ from torch_spyre._inductor.constants import (
     INT32TOFP32_OP,
     I16TOFP32_OP,
     I16_PAIR_TO_FP32_OP,
+    I16_LOW24_TO_FP32_OP,
+    I16_TOP3_TO_FP32_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -1194,7 +1196,10 @@ def _get_data_format(op, device_dtype):
             # Such re-labeling will become unnecessary.
             # See backend issue deeptools#4307.
             return DataFormats.IEEE_FP32
-    if op == I16_PAIR_TO_FP32_OP and device_dtype == DataFormats.SENINT16:
+    if (
+        op in (I16_PAIR_TO_FP32_OP, I16_LOW24_TO_FP32_OP, I16_TOP3_TO_FP32_OP)
+        and device_dtype == DataFormats.SENINT16
+    ):
         return DataFormats.SENUINT32
     return device_dtype
 
@@ -1213,6 +1218,8 @@ def _get_sdsc_spec_data_format(op, arg_data_format):
         I16TOFP32_OP,
         I16_PAIR_TO_FP32_OP,
         *SPYRE_INT32_OPS,
+        I16_LOW24_TO_FP32_OP,
+        I16_TOP3_TO_FP32_OP,
     ):
         return DataFormats.IEEE_FP32
     return arg_data_format
@@ -2173,7 +2180,15 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if changes_stick_width and (op_dim_order == [] or op_dim_order == [op_stick_dim]):
         assert op_spec.op != IDENTITY_OP and (
             DtypeOpTable.is_dtype_op(op_spec.op)
-            or op_spec.op in ("qfp8ch", "qfp8wt", I16TOFP32_OP, I16_PAIR_TO_FP32_OP)
+            or op_spec.op
+            in (
+                "qfp8ch",
+                "qfp8wt",
+                I16TOFP32_OP,
+                I16_PAIR_TO_FP32_OP,
+                I16_LOW24_TO_FP32_OP,
+                I16_TOP3_TO_FP32_OP,
+            )
         ), f"{op_spec.op} changes the elements per stick but is not a conversion"
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}

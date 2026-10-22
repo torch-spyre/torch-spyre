@@ -397,6 +397,58 @@ def _cached_randint(shape, dtype):
     return torch.randint(0, 512, shape, dtype=dtype, generator=gen)
 
 
+# Edge lanes (uint32 of one packed (lo, hi) int16 pair) for spyre::i16_low24_to_fp32:
+# s = lane mod 2^24 hits 0, 1, 2^23 and 2^24 - 1 (u == 1.0), with every top byte.
+_I16_LOW24_EDGE_LANES = [
+    0x00000000,
+    0x00000001,
+    0x00800000,
+    0x00FFFFFF,
+    0x7F000000,
+    0x80000000,
+    0xFF000000,
+    0xFF7FFFFF,
+    0xFFFFFFFF,
+]
+_I16_TOP_BYTES = [0x00, 0x01, 0x7F, 0x80, 0xFF]
+
+
+def _as_int16(u16):
+    """Reinterpret values 0..65535 as torch.int16."""
+    return torch.where(u16 >= 32768, u16 - 65536, u16).to(torch.int16)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_i16_low24_input(n):
+    """int16 (n,) random bits, the first lanes replaced by the edge lanes."""
+    gen = utils_inductor._make_generator("i16_low24", n)
+    u16 = torch.randint(0, 65536, (n,), dtype=torch.int32, generator=gen)
+    for i, lane in enumerate(_I16_LOW24_EDGE_LANES):
+        u16[2 * i] = lane & 0xFFFF
+        u16[2 * i + 1] = lane >> 16
+    return _as_int16(u16)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_i16_top3_inputs(n):
+    """Three int16 (n,) random tensors whose first 125 lanes cover every combination of the
+    top-byte edge values (the remaining 24 bits of each lane stay random)."""
+    gen = utils_inductor._make_generator("i16_top3", n)
+    tops = [
+        (a, b, c)
+        for a in _I16_TOP_BYTES
+        for b in _I16_TOP_BYTES
+        for c in _I16_TOP_BYTES
+    ]
+    outs = []
+    for j in range(3):
+        u16 = torch.randint(0, 65536, (n,), dtype=torch.int32, generator=gen)
+        for i, t in enumerate(tops):
+            u16[2 * i + 1] = (u16[2 * i + 1] & 0x00FF) | (t[j] << 8)
+        outs.append(_as_int16(u16))
+    return tuple(outs)
+
+
 @functools.lru_cache(maxsize=None)
 def _cached_fp32_for_int32_cast(shape):
     """Generate fp32 tensor from truncated int32 values for testing fp32->int32.
@@ -2076,6 +2128,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     0,
                 ),
+            },
+        },
+        # Fused 24-bit conversions used by the 24bit Threefry exponential pipeline.
+        # The first lanes of every input are edge cases (see _cached_i16_*), so
+        # s = 2^24 - 1 (u == 1.0) is included. N must be a multiple of 64.
+        ("test_i16_low24_to_fp32", "test_i16_low24_to_fp32_cpu"): {
+            "param_sets": {
+                f"n{n}": (_cached_i16_low24_input(n),) for n in (256, 4096, 65536)
+            },
+        },
+        ("test_i16_top3_to_fp32", "test_i16_top3_to_fp32_cpu"): {
+            "param_sets": {
+                f"n{n}": _cached_i16_top3_inputs(n) for n in (256, 4096, 65536)
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -9735,6 +9800,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(route, dynamic=False)(probs.to("spyre")).cpu()
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_i16_low24_to_fp32_cpu(self, x):
+        # Exact in fp32 (s < 2^24, power-of-two scale), so no tolerance.
+        self.compare_with_cpu(
+            lambda a: torch.ops.spyre.i16_low24_to_fp32(a),
+            x,
+            atol=0.0,
+            rtol=0.0,
+            run_eager=False,
+        )
+
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_i16_top3_to_fp32_cpu(self, a, b, c):
+        self.compare_with_cpu(
+            lambda a, b, c: torch.ops.spyre.i16_top3_to_fp32(a, b, c),
+            a,
+            b,
+            c,
+            atol=0.0,
+            rtol=0.0,
+            run_eager=False,
+        )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
