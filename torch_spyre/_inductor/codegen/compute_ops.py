@@ -1361,16 +1361,10 @@ def generate_sdsc(
                     if sdsc_spec.debug_handle is not None
                     else None
                 ),
-                "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
-                "sdscFolds_": {
-                    "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
-                    "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
-                    "data_": {"[0]": "0"},
-                },
-                "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
-                "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
+                # The core, corelet and time folds and the core-to-DSC
+                # mapping and schedule are derived by the backend from
+                # coreIdsUsed_ below, so they are not emitted.
                 "numCoresUsed_": len(active_core_ids),
-                "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
                 # allocation coordinates below.
@@ -1379,9 +1373,6 @@ def generate_sdsc(
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
                 },
                 "coreIdToWkSlice_": core_id_to_wk_slice,
-                "coreIdToDscSchedule": {
-                    str(c): [[-1, 0, 0, 0]] for c in active_core_ids
-                },
                 "dscs_": [
                     {
                         sdsc_spec.opfunc: {

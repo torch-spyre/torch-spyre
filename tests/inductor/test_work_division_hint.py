@@ -2241,7 +2241,8 @@ def test_completed_reduction_relayout_device(
         root
         for root in roots
         if "shuffle" in root["dscs_"][0]
-        and set(root["coreIdToDsc_"]) == {str(c) for c in range(k - 1, 32, k)}
+        and set(next(iter(root["dscs_"][0].values()))["coreIdsUsed_"])
+        == set(range(k - 1, 32, k))
     ]
     assert len(copies) == int(enabled)
     if enabled:
@@ -2345,7 +2346,13 @@ def test_completed_reduction_can_copy_to_its_sixteen_consumers():
                 replace(spec, completed_producer_cores=invalid), "test"
             )
     root, allocations = _compile_spec(spec)
-    assert root["coreFoldProp_"]["factor_"] == 32
+    # The core fold spans every core on the system, not only the active ones.
+    assert {
+        attr["factor_"]
+        for allocation in allocations
+        for attr in allocation["startAddressCoreCorelet_"]["dim_prop_attr"]
+        if attr["label_"] == "core"
+    } == {32}
     assert "prodConsList" not in root
     source_map, destination_map = [
         allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
