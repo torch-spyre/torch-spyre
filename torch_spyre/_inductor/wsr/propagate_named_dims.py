@@ -491,7 +491,7 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         elif isinstance(op, SpyreConstantFallback):
             _set_no_named_dims(op)
         else:
-            logger.warning(f"unhandled operation type {type(op)}")
+            logger.debug(f"unhandled operation type {type(op)}")
             _set_no_named_dims(op)
 
     if logger.isEnabledFor(logging.INFO):

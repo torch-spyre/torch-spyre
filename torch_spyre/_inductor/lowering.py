@@ -1879,11 +1879,26 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # No bool format has an op to an integer, but float32 has one, and a bool's
-    # 0/1 values convert exactly through it.
-    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+    integer = (torch.int32, torch.int64)
+    float16_format = (torch.float16, torch.bfloat16)
+
+    # Only float32 has an op to an integer, so a float16-format source (float16,
+    # bfloat16, or a bool stored as either) converts through it. A bool's 0/1
+    # values need no trunc.
+    if src_dtype in (torch.bool, *float16_format) and dst_dtype in integer:
+        skip_trunc = skip_trunc or src_dtype == torch.bool
         as_float = to_dtype(x, torch.float32, use_compute_types)
-        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=skip_trunc)
+
+    # Likewise an integer has an op only to float32, which then converts to the
+    # float16 format.
+    if src_dtype in integer and dst_dtype in float16_format:
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types)
+
+    # A cast to bool tests against zero rather than converting a value.
+    if src_dtype in integer and dst_dtype == torch.bool:
+        return lower_ne_scalar(x, 0)
 
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
@@ -2215,10 +2230,9 @@ def _cmp_operand_dtype(tensors):
       Both branches are expect_fail in the tests.
     * int32 -> fp32 (int32tofp32) keeps the element byte size, so the EA is
       unchanged and the comparison runs entirely on device.
-    * int32/int64 -> fp16 is not in DtypeOpTable at all, so ``to_dtype`` falls
-      back to a host cast. Those pairs produce the right answer and raise no EA
-      question -- no stick reordering is emitted -- but at the cost of a D2H/H2D
-      round-trip, and the fallback is only visible as a FallbackWarning.
+    * int32/int64 -> fp16 converts through fp32, and its fp32todl16 step makes
+      the operand staggered, so it meets the STANDARD fp16 operand exactly as in
+      the fp16 <-> fp32 case above.
 
     All-``torch.bool`` operands are returned unchanged, deliberately diverging
     from torch (which would promote them to fp32). A device bool is already stored
