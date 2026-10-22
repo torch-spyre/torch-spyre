@@ -150,6 +150,69 @@ class TestExhaustiveSearchResidency(TestCase):
         self.assertIsNotNone(result["consumer"].address)
         self.assertEqual(result["producer"].spill_reason, "core div mismatch")
 
+    @staticmethod
+    def _four_output_cores():
+        return CoreDivision(splits={sympy.Symbol("output"): 4})
+
+    @staticmethod
+    def _solve(buffers, lx_size):
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            buffers, size=lx_size, alignment=1
+        )
+        return {b.name: b for b in solver.plan_layout_and_core_divisions()}
+
+    def test_tiled_candidates_are_rejected(self):
+        """A tile-sized reservation is unsafe without matching graph tiling."""
+        buffer = CoreDivisionBuffer(
+            "buffer",
+            1024,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(tiling=TileSpec((TileAxis(host_dim=0, count=4),))),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "requires untiled candidates"):
+            self._solve([buffer], lx_size=256)
+
+    def test_in_place_reuse_compares_per_core_sizes(self):
+        """In-place reuse compares the bytes that one core holds of each buffer."""
+        # In each case, the child starts at the last use of the parent. At that
+        # tick, both buffers are live.
+        with self.subTest("partitioned parent, whole child"):
+            parent = CoreDivisionBuffer(
+                "parent", 1024, [0, 1], core_divisions=[self._four_output_cores()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                512,
+                [1, 2],
+                core_divisions=[CoreDivision()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the parent. The 512-byte child
+            # cannot reuse that slot; both fit side by side in 768 bytes.
+            result = self._solve([parent, child], lx_size=768)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 256)
+
+        with self.subTest("whole parent, partitioned child"):
+            parent = CoreDivisionBuffer(
+                "parent", 512, [0, 1], core_divisions=[CoreDivision()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                1024,
+                [1, 2],
+                core_divisions=[self._four_output_cores()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the child, which fits in the
+            # parent's 512-byte slot. LX is full, so the child must reuse it.
+            result = self._solve([parent, child], lx_size=512)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 0)
+
 
 class TestAllocatorSpillReasons(TestCase):
     """The allocator reports spill reasons from the solved buffers alone."""

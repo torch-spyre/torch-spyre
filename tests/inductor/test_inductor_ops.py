@@ -535,13 +535,15 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
 # fp32 and int32 share a stick width, as does int64, which the device stores as
-# int32, so their conversions have no stick pairs to keep together and are exempt
-# from the shapes above.
+# int32, so conversions among them have no stick pairs to keep together and are
+# exempt from the shapes above.
 _SAME_WIDTH_PAIRS = [
     (torch.float32, torch.int32),
     (torch.int32, torch.float32),
     (torch.float32, torch.int64),
     (torch.int64, torch.float32),
+    (torch.int32, torch.int64),
+    (torch.int64, torch.int32),
 ]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
@@ -2932,15 +2934,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #                          and this runs entirely on device. The only
         #                          genuinely on-device mixed case here.
         #
-        #   int32 x fp16 -> fp16 : NOT a device conversion at all. int32 -> fp16 is
-        #                          absent from DtypeOpTable, so to_dtype takes its
-        #                          eager_fallback branch and the cast is done on the
-        #                          HOST ("conversion from torch.int32 to
-        #                          torch.float16 is falling back to cpu"). The EA
-        #                          question never comes up; the compare itself then
-        #                          runs on device in fp16. It passes, but the green
-        #                          means "correct via a host round-trip", NOT
-        #                          "supported on device".
+        #   int32 x fp16 -> fp16 : int32tofp32 then fp32todl16, the second of
+        #                          which reorders sticks, so the converted operand
+        #                          is staggered and meets the STANDARD fp16 one:
+        #                          rejected as mixed EA, like fp16 x fp32.
         #
         # Promoting to fp16 also inherits fp16's 11-bit significand, so integers
         # above 2048 lose their distinction. That is not a divergence: eager does
@@ -2965,6 +2962,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
                 "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
                 "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
+                "int32_fp16_1d256": "Multi-arg pointwise with mixed EA",
+                "fp16_int32_1d256": "Multi-arg pointwise with mixed EA",
+                "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
+                "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
+                "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
             },
             # The compare is right on the device, but its staggered result is read
             # back permuted with no error (#4393).
@@ -3021,8 +3023,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     torch.tensor(2.0, dtype=torch.float32),
                 ),
-                # int32 -> fp16 is unsupported on device: cast runs on the HOST
-                # (eager_fallback), the compare then runs on device in fp16
+                # int32 -> fp16 gives a staggered operand (see the header above)
                 "int32_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int32),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3054,8 +3055,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         cached_randn((4, 64), abs=True, scale=50.0, dtype=torch.float32)
                     ),
                 ),
-                # int64 x float16 -> float16: int64->fp16 absent from DtypeOpTable,
-                # cast runs on HOST (eager_fallback), compare on device in fp16
+                # int64 x float16 -> float16: staggered, as for int32
                 "int64_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int64),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3119,6 +3119,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "clamp": torch.clamp,
                 "clamp_min": torch.clamp_min,
                 "clamp_max": torch.clamp_max,
+            },
+            # TODO: the clamped int64 mask converts to fp16 on device, which makes
+            # it staggered, and it does not broadcast at the stick dim, so its
+            # product with the STANDARD fp16 operand is rejected as mixed EA.
+            "expect_raise": {
+                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
             },
             "param_sets": {
                 "fp16_1x64x64": (cached_randn((1, 64, 64)),),
@@ -11207,25 +11213,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
-    def _assert_bool_to_int_on_device(self, fn, *args):
-        """Compare fn exactly with CPU for int32 and int64, asserting fp32toint32 ran."""
-        for dst in (torch.int32, torch.int64):
-            with self.subTest(dst=dst):
-                with self.assertLogs(
-                    "spyre.inductor.spyre_kernel", level="DEBUG"
-                ) as logs:
-                    self.compare_with_cpu(
-                        functools.partial(fn, dst=dst),
-                        *args,
-                        atol=0.0,
-                        rtol=0.0,
-                        cpu_compile=False,
-                        run_eager=False,
+    def _assert_conversion_on_device(self, op, fn, *args, dsts=None):
+        """Compare fn exactly with CPU, asserting the device op ``op`` ran.
+
+        With ``dsts``, run one subtest per destination dtype, passing it to ``fn``
+        as ``dst``.
+        """
+        if dsts is not None:
+            for dst in dsts:
+                with self.subTest(dst=dst):
+                    self._assert_conversion_on_device(
+                        op, functools.partial(fn, dst=dst), *args
                     )
-                self.assertTrue(
-                    any("op_spec: fp32toint32," in m for m in logs.output),
-                    f"Expected an fp32toint32 op_spec, got: {logs.output}",
-                )
+            return
+        with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
+            self.compare_with_cpu(
+                fn, *args, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+            )
+        self.assertTrue(
+            any(f"op_spec: {op}," in m for m in logs.output),
+            f"Expected a {op} op_spec, got: {logs.output}",
+        )
 
     def test_float32_to_int_truncates_cpu(self):
         # A cast to an integer truncates, including a negative value with a
@@ -11396,7 +11404,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = (torch.arange(64) % 7).to(torch.float32)
         y = (torch.arange(64) % 5).to(torch.float32)
-        self._assert_bool_to_int_on_device(fn, x, y)
+        self._assert_conversion_on_device(
+            "fp32toint32", fn, x, y, dsts=(torch.int32, torch.int64)
+        )
 
     def test_bool_fp16_src_to_int_cpu(self):
         # A float16-format bool converts through float32 by DL16TOFP32, so the
@@ -11407,7 +11417,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = (torch.arange(128) % 7).to(torch.float16)
         y = (torch.arange(128) % 5).to(torch.float16)
-        self._assert_bool_to_int_on_device(fn, x, y)
+        self._assert_conversion_on_device(
+            "fp32toint32", fn, x, y, dsts=(torch.int32, torch.int64)
+        )
 
     def test_bool_fp16_src_to_int_consumed_cpu(self):
         # The DL16TOFP32 result is staggered, and so is the integer cast of it;
@@ -11417,7 +11429,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return (x > 2).to(dtype=dst).to(torch.float32).to(torch.float16)
 
         x = (torch.arange(128) % 7).to(torch.float16)
-        self._assert_bool_to_int_on_device(fn, x)
+        self._assert_conversion_on_device(
+            "fp32toint32", fn, x, dsts=(torch.int32, torch.int64)
+        )
 
     @pytest.mark.xfail(
         strict=True,
@@ -11440,7 +11454,88 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.to(dtype=dst).to(torch.float32).to(torch.float16)
 
         x = (torch.arange(4 * 128) % 3 == 0).reshape(4, 128)
-        self._assert_bool_to_int_on_device(fn, x)
+        self._assert_conversion_on_device(
+            "fp32toint32", fn, x, dsts=(torch.int32, torch.int64)
+        )
+
+    def test_float16_to_int_cpu(self):
+        # float16 and bfloat16 convert through float32 by DL16TOFP32, so the
+        # integer result is staggered; converting it back restores the order.
+        # Quarter steps of both signs check the truncation toward zero.
+        for src in (torch.float16, torch.bfloat16):
+            with self.subTest(src=src):
+
+                def fn(x, dst):
+                    return x.to(dtype=dst).to(torch.float32).to(src)
+
+                x = (((torch.arange(4 * 128) * 7) % 49) * 0.25 - 6.0).reshape(4, 128)
+                self._assert_conversion_on_device(
+                    "fp32toint32", fn, x.to(src), dsts=(torch.int32, torch.int64)
+                )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
+    def test_float16_to_int_readback_known_xfail(self):
+        def fn(x):
+            return x.to(dtype=torch.int32)
+
+        x = (((torch.arange(128) * 7) % 49) * 0.25 - 6.0).to(torch.float16)
+        self.compare_with_cpu(
+            fn, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
+
+    def test_int_to_float16_cpu(self):
+        # An integer converts to float32 by INT32TOFP32, then to the float16
+        # format by FP32TODL16, so the result is staggered; converting it back
+        # restores the order. Values stay within DLFloat16's exact integers.
+        x = ((torch.arange(4 * 128) * 37) % 2049 - 1024).reshape(4, 128)
+        for src in (torch.int32, torch.int64):
+            for dst in (torch.float16, torch.bfloat16):
+                with self.subTest(src=src, dst=dst):
+
+                    def fn(x):
+                        return x.to(dst).to(torch.float32).to(src)
+
+                    values = x if dst == torch.float16 else x // 8 * 8
+                    self._assert_conversion_on_device("fp32todl16", fn, values.to(src))
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason="a staggered result is read back without restoring its order (#4393)",
+    )
+    def test_int_to_float16_readback_known_xfail(self):
+        def fn(x):
+            return x.to(torch.float16)
+
+        x = (torch.arange(128) % 9 - 4).to(torch.int32)
+        self.compare_with_cpu(
+            fn, x, atol=0.0, rtol=0.0, cpu_compile=False, run_eager=False
+        )
+
+    def test_int32_int64_cpu(self):
+        # Both are stored as int32 on device, so either cast is an identity.
+        x = torch.tensor([0, 1, -1, 7, -7, 2**30, -(2**30), 2**31 - 1] * 8)
+        for src, dst in ((torch.int32, torch.int64), (torch.int64, torch.int32)):
+            with self.subTest(src=src, dst=dst):
+                self._assert_conversion_on_device(
+                    "identity",
+                    lambda x: x.to(dst),
+                    x.to(src),
+                )
+
+    def test_int_to_bool_cpu(self):
+        # A cast to bool is a test against zero, so every nonzero value maps to
+        # True, including those a float32 cannot hold exactly.
+        x = torch.tensor([0, 1, -1, 2, -3, 2**24 + 1, -(2**30), 0] * 8)
+        for src in (torch.int32, torch.int64):
+            with self.subTest(src=src):
+                self._assert_conversion_on_device(
+                    "notequal", lambda x: x.to(torch.bool), x.to(src)
+                )
 
     def test_bool_staggered_ea_src_to_fp16_cpu(self):
         # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA

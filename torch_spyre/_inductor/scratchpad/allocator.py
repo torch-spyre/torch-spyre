@@ -3844,7 +3844,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             assert buffer.chosen_division is not None
             partition = buffer.core_divisions[buffer.chosen_division].output_partition
             applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
-            priced = ceil_div(buffer.size, partition * tiling.output_tile_count)
+            priced = buffer.per_core_size(buffer.chosen_division)
             if applied < priced:
                 logger.debug(
                     "%s: applied per-core footprint %d bytes under tiling %s is "
