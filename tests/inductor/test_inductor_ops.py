@@ -7377,9 +7377,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # Genuinely grouped (non-depthwise) conv2d: groups=2 with
                 # C_in=16 -> C_in_per_group=8 and C_out=32 -> C_out_per_group=16.
                 # Since C_in != groups (not depthwise) and groups != 1, this
-                # rides conv2d_via_bmm_decomp's grouped im2col+matmul branch
-                # (spyre.unfold + a batched grouped matmul), the path the
-                # reviewer noted "can also handle groups != 1".
+                # rides conv2d_via_bmm_decomp's im2col+matmul branch as one
+                # dense conv with a block-diagonal weight, the path that
+                # "can also handle groups != 1".
                 "1x16x32_ksize3_groups2": (
                     cached_randn((1, 16, 32, 32)),
                     cached_randn((32, 8, 3, 3)),
@@ -7387,6 +7387,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     (1, 1),
                     2,
+                ),
+                # Strided conv whose windows do not cover the input exactly
+                # (33 and 31 rows/columns at stride 2), with bias.
+                "2x64x33x31_ksize3_stride2_pad1_bias": (
+                    cached_randn((2, 64, 33, 31)),
+                    cached_randn((96, 64, 3, 3)),
+                    cached_randn((96,)),
+                    (1, 1),
+                    (2, 2),
+                    1,
+                ),
+                # Unequal kernel and stride per axis.
+                "1x64x16x16_ksize2x3_stride2x1_bias": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 2, 3)),
+                    cached_randn((64,)),
+                    (0, 1),
+                    (2, 1),
+                    1,
+                ),
+                # H == 1 (a conv1d as conv2d): the im2col gathers its taps
+                # channel-last rather than through an H stick.
+                "2x16x1x64_ksize1x3_pad_bias": (
+                    cached_randn((2, 16, 1, 64)),
+                    cached_randn((32, 16, 1, 3)),
+                    cached_randn((32,)),
+                    (0, 1),
+                    (1, 1),
+                    1,
                 ),
             },
         },
@@ -11660,6 +11689,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x_nhwc = x.permute(0, 2, 3, 1).contiguous()
         self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
 
+    # The im2col+matmul decomposition runs on the device; any CPU fallback is a
+    # regression (#3053, #5134).
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
@@ -11775,6 +11807,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # conv2d SDSC.
         self._run_conv3d_via_conv2d(x, weight, bias, stride, direct_flag=True)
 
+    # The im2col+matmul decomposition runs on the device; any CPU fallback is a
+    # regression (#3053, #5134).
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_conv3d_via_conv2d_im2col_base(self, x, weight, bias, stride):
         # Temporal-1 Conv3D whose folded 2D conv is OUTSIDE the direct SDSC
         # envelope (kernel > 3 and/or C_in not 64-aligned, e.g. a ViT/Prithvi
@@ -11920,7 +11955,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # intentionally not asserted to raise.
 
                 # Temporal-1 passes the gate: it must NOT raise Unsupported. It
-                # proceeds into the fold, whose reshape_via_cpu has no CPU kernel
+                # proceeds into the fold, whose device ops have no CPU kernel
                 # in this pure-Python test, so a non-Unsupported error there is
                 # expected and ignored (the fold runs for real on hardware in the
                 # base test).
