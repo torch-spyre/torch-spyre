@@ -818,6 +818,43 @@ def lower_topkindex(x, k, dim):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.histc_count)
+def lower_histc_count(idx, bin_ids, bins, out_dtype):
+    """Broadcast idx to (bins_pad, n), restickify so the bins are on the stick,
+    compare with 0..bins_pad-1 and sum down the rows. Each intermediate is its
+    own realized op: split_multi_ops cannot split buffers built here."""
+    aten = torch.ops.aten
+    f32 = torch.float32
+    n = int(idx.get_size()[0])
+    bins_pad = int(bin_ids.get_size()[0])
+
+    def realized(fn, *args):
+        out = fn(*args)
+        out.realize()
+        return out
+
+    def cast(t, dtype, skip_trunc=False):
+        # Synthetic origin, so the layout pass applies its dtype-conversion rule.
+        out = realized(lambda a, d: to_dtype(a, d, skip_trunc=skip_trunc), t, dtype)
+        args = (n_, dtype) if (n_ := t.get_origin_node()) is not None else ()
+        _ensure_synthetic_origin(
+            out, torch.ops.prims.convert_element_type.default, args
+        )
+        return out
+
+    rows = realized(
+        lowering.clone, lowering.expand(lowering.unsqueeze(idx, 0), [bins_pad, n])
+    )
+    xb = lowering.permute(lower_restickify(rows), [1, 0])  # (n, bins_pad)
+    eq = lowering.lowerings[aten.eq.Tensor]
+    match = realized(eq, xb, lowering.unsqueeze(bin_ids, 0))
+    counts = realized(lowering.sum_, cast(match, f32), [0])  # (bins_pad,)
+    if out_dtype != f32:
+        # Whole numbers: no trunc needed.
+        counts = cast(counts, out_dtype, skip_trunc=True)
+    return lowering.slice_(counts, 0, 0, bins)
+
+
 @register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
 def lower_avg_pool2d(
     x,
@@ -2491,10 +2528,12 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
 
 @register_spyre_lowering(
-    torch.ops.spyre.prod_dim_int,
+    torch.ops.aten.prod.dim_int,
     type_promotion_kind=None,
 )
 def lower_prod_dim(x, dim, keepdim=False):
+    # int64 is not natively supported by the hardware prod reduction; convert to
+    # fp32 via with_int64_fallback and cast the output back to int64.
     def _prod_dim_impl(x):
         kwargs = lowering._make_reduction_inner(
             x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None

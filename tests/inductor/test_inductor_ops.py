@@ -2078,6 +2078,87 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # (x, bins, min, max), all 1-D. The MoE router case is int32 expert ids with
+        # min=0, max=bins-1 (gemma-4-26B-A4B: 24 tokens x top-8 = 192 ids, 128
+        # experts).
+        ("test_histc", "test_histc_cpu"): {
+            "param_sets": {
+                "int32_gemma_192_sorted": (
+                    torch.randint(0, 128, (192,), dtype=torch.int32).sort().values,
+                    128,
+                    0,
+                    127,
+                ),
+                # One decode token: a partial stick.
+                "int32_decode_8": (
+                    torch.randint(0, 128, (8,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # Off the 64-element boundary, with ids >= bins (expert-parallel
+                # sentinels) that histc must drop.
+                "int32_65_with_sentinels": (
+                    torch.randint(0, 136, (65,), dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # One bin past 1024 (beyond exact 16-bit counting), at value == max.
+                "int32_4096_all_in_last_bin": (
+                    torch.full((4096,), 127, dtype=torch.int32),
+                    128,
+                    0,
+                    127,
+                ),
+                # The general rule for integers: several values per bin, and
+                # values below min and above max.
+                "int32_range_0_50": (
+                    torch.randint(-5, 60, (192,), dtype=torch.int32),
+                    10,
+                    0,
+                    50,
+                ),
+                # Every bin edge, one float step either side of it, NaN and +-inf.
+                "fp32_edges_nan_inf": (
+                    torch.cat(
+                        [
+                            torch.linspace(0, 1, 11),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(2.0)),
+                            torch.linspace(0, 1, 11).nextafter(torch.tensor(-2.0)),
+                            torch.tensor([float("nan"), float("inf"), -float("inf")]),
+                        ]
+                    ),
+                    10,
+                    0,
+                    1,
+                ),
+                # min == max: the data's own range.
+                "fp32_auto_range": (torch.randn((256,)), 20, 0, 0),
+                # topk indices are int64 in most router code.
+                "int64_192": (
+                    torch.randint(0, 128, (192,), dtype=torch.int64),
+                    128,
+                    0,
+                    127,
+                ),
+                "int32_bins_2048": (
+                    torch.randint(0, 2048, (512,), dtype=torch.int32),
+                    2048,
+                    0,
+                    2047,
+                ),
+                "2d_input": (torch.rand((4, 64)), 10, 0, 1),
+                # TODO: fp16 needs fp16 <-> fp32 conversions of every length on
+                # device (#3999, #5361, #4714); when they land this becomes a
+                # positive case.
+                "fp16_input": (torch.rand((192,)).to(torch.float16), 10, 0, 1),
+            },
+            "expect_raise": {
+                "2d_input": "histc: only 1-D input is supported",
+                "fp16_input": "histc: float16 input is not supported yet",
+            },
+        },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
                 "2d_dim0": (
@@ -2585,6 +2666,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "64x129_add_transpose": (
                     cached_randn((64, 129)),
                     cached_randn((129, 64)),
+                ),
+                "10x20_add_transpose_fp32": (
+                    cached_randn((10, 20), dtype=torch.float32),
+                    cached_randn((20, 10), dtype=torch.float32),
+                ),
+                "7x13_add_transpose_fp32": (
+                    cached_randn((7, 13), dtype=torch.float32),
+                    cached_randn((13, 7), dtype=torch.float32),
+                ),
+                "64x129_add_transpose_fp32": (
+                    cached_randn((64, 129), dtype=torch.float32),
+                    cached_randn((129, 64), dtype=torch.float32),
+                ),
+                "10x20_add_transpose_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int32),
+                ),
+                "7x13_add_transpose_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int32),
+                ),
+                "64x129_add_transpose_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int32),
+                ),
+                "10x20_add_transpose_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int64),
+                ),
+                "7x13_add_transpose_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int64),
+                ),
+                "64x129_add_transpose_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int64),
+                ),
+            },
+        },
+        ("test_restickify_clone", "test_restickify_clone_cpu"): {
+            "param_sets": {
+                "10x20_clone_fp16": (cached_randn((10, 20)),),
+                "7x13_clone_fp16": (cached_randn((7, 13)),),
+                "64x129_clone_fp16": (cached_randn((64, 129)),),
+                "10x20_clone_fp32": (cached_randn((10, 20), dtype=torch.float32),),
+                "7x13_clone_fp32": (cached_randn((7, 13), dtype=torch.float32),),
+                "64x129_clone_fp32": (cached_randn((64, 129), dtype=torch.float32),),
+                "10x20_clone_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                ),
+                "7x13_clone_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                ),
+                "64x129_clone_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                ),
+                "10x20_clone_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                ),
+                "7x13_clone_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                ),
+                "64x129_clone_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
                 ),
             }
         },
@@ -7789,6 +7934,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     -1,
                     False,
                 ),
+                "int64_dim1_2x2": (
+                    torch.randint(2, 10, (2, 2), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
                 "int64_dim1_keepdim": (
                     torch.randint(2, 10, (1, 2), dtype=torch.int64),
                     -1,
@@ -7827,15 +7977,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
-            # int64 prod over the stick dim decomposes to select+mul, and a
-            # stick-dim select reads one element per stick, a layout only a
-            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
-            "expect_fail": [
-                "int64_dim1",
-                "int64_dim1_keepdim",
-                "int64_dim1_2",
-                "int64_dim1_2_keepdim",
-            ],
+            "expect_fail": {
+                "int64_dim1": (
+                    "output size [1] triggers _make_output_stl c_size[stick_dim]==1 guard"
+                ),
+                "int64_dim1_keepdim": (
+                    "output size [1,1] triggers _make_output_stl c_size[stick_dim]==1 guard"
+                ),
+            },
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -9225,6 +9374,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
+    def test_histc_cpu(self, x, bins: int, min: float, max: float):
+        # CPU histc has no integer kernel, so the reference counts the fp32 copy
+        # and is cast back; counts are whole numbers, so the comparison is exact.
+        ref = torch.histc(x.float(), bins=bins, min=min, max=max).to(x.dtype)
+        self.compare_with_cpu(
+            lambda x: torch.histc(x, bins=bins, min=min, max=max),
+            x,
+            atol=0,
+            rtol=0,
+            cpu_eager_result=ref,
+            cpu_compile=False,
+        )
+
     @expects_raise
     def test_topk_largest_false_rejected(self):
         # largest=False cannot be served by the topkvalue/topkindex reduction
@@ -9727,6 +9889,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a + b.t()
 
         self.compare_with_cpu(fn, a, b, run_eager=False)
+
+    def test_restickify_clone_cpu(self, a):
+        def fn(a):
+            return a.t().clone()
+
+        self.compare_with_cpu(fn, a, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_transpose_patterns_cpu(self, variant, execution_mode, *args):
@@ -12139,51 +12307,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
-
-    @expects_raise
-    def test_restickify_fp32_unsupported(self):
-        """An op that needs a restickify has no feasible layout for FP32.
-
-        ``x.t() + y`` needs a restickify, which only exists for the DL16 format
-        (fp16 and bf16; both compile and match the CPU). With FP32 operands the
-        layout optimizer finds no feasible layout. That is its generic "no
-        mechanism to resolve stick incompatibility" error, which also fires for
-        other causes (unaligned re-offsets, #1377), so the fragment pins the FP32
-        device dtype that the message lists for each input.
-        """
-        x = torch.randn((128, 128), dtype=torch.float32)
-        y = torch.randn((128, 128), dtype=torch.float32)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
-
-    @expects_raise
-    def test_restickify_int64_unsupported(self):
-        """The same, for INT64: there is no feasible layout without a restickify.
-
-        int64 is stored as IEEE_INT32 on device and now uses the native
-        addi32toi32 path, so the error message names IEEE_INT32 for the
-        operands (not IEEE_FP32 as in the fp32 case above).
-        """
-        x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_INT32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
 
     def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""

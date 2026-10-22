@@ -30,6 +30,7 @@ import math
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
+import numpy as np
 import torch
 import torch._decomp as decomp
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
@@ -1830,6 +1831,66 @@ def spyre_topk(
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
+
+
+def _histc_bin_index(x, lo, hi, width_den, bins):
+    """torch's histc bin index for fp32 ``x``: 0..bins-1 in range, negative or
+    -1 (never a bin) below ``lo``, above ``hi`` or NaN."""
+    valid = (x <= hi).to(torch.float32)
+    pos = torch.floor((x - lo) * float(bins) / width_den)
+    pos = pos - torch.relu(pos - (bins - 1.0))  # x == hi -> bins - 1
+    return pos * valid + (valid - 1.0)
+
+
+@register_spyre_decompositions([torch.ops.aten.histc.default])
+def spyre_histc(
+    input: torch.Tensor,
+    bins: int = 100,
+    min: float = 0,
+    max: float = 0,
+) -> torch.Tensor:
+    """1-D int32/int64/float32 histc: bin index per element, then
+    spyre::histc_count."""
+    if input.dtype == torch.float16:
+        # Needs fp16 <-> fp32 on device for every length: #3999, #5361, #4714.
+        raise Unsupported("histc: float16 input is not supported yet; use float32")
+    if input.dtype not in (torch.int32, torch.int64, torch.float32):
+        raise Unsupported(
+            f"histc: {input.dtype} input is not supported "
+            "(int32, int64 and float32 are)"
+        )
+    if input.dim() != 1:
+        raise Unsupported(f"histc: only 1-D input is supported, got {input.dim()}-D")
+    # torch's checks; eager dispatch skips its meta checks.
+    if bins <= 0:
+        raise RuntimeError(f"torch.histc(): bins must be > 0, but got {bins}")
+    lo, hi = float(min), float(max)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise RuntimeError(f"torch.histc: range of [{lo}, {hi}] is not finite")
+    if lo > hi:
+        raise RuntimeError("torch.histc: max must be larger than min")
+
+    # First, so this extern call does not split the kernels that follow.
+    stick = get_elem_in_stick(torch.float32)
+    bin_ids = torch.ops.spyre.histc_bin_ids((bins + stick - 1) // stick * stick)
+    x = input.to(torch.float32)
+    if lo == hi:
+        # min == max: the data's range, widened by 1 if constant, as torch does.
+        lo_t, hi_t = torch.amin(x), torch.amax(x)
+        same = lo_t == hi_t
+        lo_t = torch.where(same, lo_t - 1, lo_t)
+        hi_t = torch.where(same, hi_t + 1, hi_t)
+        idx = _histc_bin_index(x, lo_t, hi_t, hi_t - lo_t, bins)
+    else:
+        # Edges in fp32, as torch computes them.
+        idx = _histc_bin_index(
+            x,
+            float(np.float32(lo)),
+            float(np.float32(hi)),
+            float(np.float32(hi) - np.float32(lo)),
+            bins,
+        )
+    return torch.ops.spyre.histc_count(idx, bin_ids, bins, input.dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.gelu.default])
@@ -3725,20 +3786,6 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
     # aten.flip always returns a fresh tensor; clone so the no-op case does
     # not alias its input.
     return out if reversed_any else out.clone()
-
-
-@register_spyre_decompositions([torch.ops.aten.prod.dim_int])
-def spyre_prod_dim_int(
-    input: torch.Tensor, dim: int, keepdim: bool = False
-) -> torch.Tensor:
-    # All dtypes route through spyre.prod_dim_int.  For int64, lower_prod_dim
-    # uses with_int64_fallback which converts the input to fp32 via one CPU
-    # round-trip before the hardware reduction.  Stick-dim reductions fail at
-    # compile time (NotImplementedError "no mechanism to resolve stick
-    # incompatibility") until ReStickifyOpHBM supports fp32 (issue #2544; the
-    # CPU fallback is to be removed by issue #5126).  Those cases are
-    # expect_fail in test_prod_cpu; remove the entries when the issues land.
-    return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
 
 @register_spyre_decompositions(
