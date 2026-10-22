@@ -272,8 +272,20 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
+    // A DCI that describes a dense same-format copy is a no-op conversion.
+    // Dropping it skips flex's host-side staging (deeptools::ConvertData runs
+    // a per-element strided loop even for identical formats) and, on H2D,
+    // keeps a pinned source buffer attached -- attachStagedSource discards it
+    // when a conversion stages into a fresh pageable buffer.
+    const DataConversionInfo* dci_arg =
+        dci_is_identity_copy(dci) ? nullptr : &dci;
+
     const auto* allocation = get_composite_address(*dev_tensor);
-    if (device2host) {
+    // The narrowed-range path is a conversion-path optimization: it rebases
+    // the DCI onto the sticks covering the view. It has nothing to offer a
+    // stripped identity copy (the region is the whole allocation by then),
+    // so only take it when the DCI is kept.
+    if (device2host && dci_arg != nullptr) {
       if (auto range = narrowD2HRange(dci, stl, *allocation)) {
         // Flex clones the descriptor when enqueuing; the tensor continues to
         // own the underlying allocation, just as in the full-storage path.
@@ -286,7 +298,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     if (device2host) {
       host_lifetime = std::make_shared<at::Tensor>(*cpu_tensor);
     }
-    copyAsyncImpl(cpu_ptr, host_capacity, allocation, &dci, host2device,
+    copyAsyncImpl(cpu_ptr, host_capacity, allocation, dci_arg, host2device,
                   std::move(host_lifetime));
 
   } else {
