@@ -156,13 +156,16 @@ are not identical layouts.
 
 ### Cost model
 
-Restickify runtime is broadly linear in tensor size, so device element count
-is used as the cost metric. Each input edge carries an `EdgeCostMap` that
+Restickify runtime is broadly linear in tensor size, so the device size in bytes
+is used as the cost metric, scaled by a per-byte dtype weight
+(`RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT`): 1 for fp16, 2 for 32-bit formats
+(a 32-bit restickify takes 2 passes per stick, so it is 2x slower for the same
+number of bytes). Each input edge carries an `EdgeCostMap` that
 lazily computes the cost of pairing a producer's candidate STL with a
 consumer's candidate STL. The result is one of three values:
 
 - **0** — sticks are already compatible; no restickify needed
-- **element count** — a restickify is needed; cost is the total device element count of the input buffer
+- **weighted bytes** — a restickify is needed; cost is the device size in bytes of the input buffer times the dtype weight
 - **`INF`** — no restickify can make them compatible
 
 Costs are cached so the optimizer can query the same pair repeatedly without

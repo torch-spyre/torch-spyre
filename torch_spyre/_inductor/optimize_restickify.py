@@ -32,9 +32,14 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_size_in_bytes
+from .constants import (
+    RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+)
 from .pass_utils import (
     compute_restickify_needed,
+    compute_size1_restickify_target,
     device_coordinates,
     host_coordinates,
 )
@@ -90,7 +95,9 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input device size in bytes weighted by the
+        device dtype (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16
+        per byte) if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
@@ -104,9 +111,16 @@ class EdgeCostMap:
             if self._forbidden_stick_sym in stick_expr.free_symbols:
                 # Input stick contains a forbidden symbol (e.g. topk reduction
                 # var): this pairing is invalid even though stick_compatible
-                # accepted it. Mark as infeasible so the optimizer is forced to
-                # pick a different input candidate or output STL.
-                needed, tgt = True, None
+                # accepted it. The target's stick carries no input var, so
+                # move the input's stick onto a size-1 dim; if there is none,
+                # or ReStickifyOpHBM cannot lower the input's format (see
+                # RESTICKIFY_SUPPORTED_DEVICE_DTYPES), mark as infeasible so
+                # the optimizer picks another pairing.
+                needed = True
+                if in_stl.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
+                    tgt = compute_size1_restickify_target(
+                        in_stl, self._dep_layout, self.dep, self._op
+                    )
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -114,7 +128,10 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
             self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
-            cost = float(math.prod(in_stl.device_size))
+            cost = float(
+                get_device_size_in_bytes(in_stl)
+                * RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT[in_stl.device_dtype]
+            )
             self._layout[in_stl][target_stl] = tgt
         self._cost[in_stl][target_stl] = cost
 
