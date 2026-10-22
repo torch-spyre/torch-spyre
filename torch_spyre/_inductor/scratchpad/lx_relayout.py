@@ -798,7 +798,8 @@ def solver_relayout_edge_context(
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (
-        isinstance(producer_loop_info, CoarseTileInfo)
+        config.lx_same_tile_group_relayout
+        and isinstance(producer_loop_info, CoarseTileInfo)
         and isinstance(consumer_loop_info, CoarseTileInfo)
         and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
         and not (
