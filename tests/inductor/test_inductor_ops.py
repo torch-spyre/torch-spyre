@@ -35,6 +35,7 @@ from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
     cached_randn,
+    cached_randint,
     cached_xavier,
     compare_with_cpu,
     expects_raise,
@@ -255,6 +256,172 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
         -float("inf"),
         -1,
         cached_randn((3, 7, 9), dtype=torch.float32),
+    ),
+}
+
+
+CUMSUM_PARAM_SETS = {
+    # 1-D
+    "1d_4": (0, cached_randn((4,))),
+    "1d_64": (0, cached_randn((64,))),
+    "1d_256": (0, cached_randn((256,))),
+    "1d_512": (0, cached_randn((512,), scale=0.1)),  # small values avoid fp16 overflow
+    "1d_explicit": (
+        0,
+        torch.tensor([1.0, 2.0, 3.0, 4.0, -1.0, 0.5, -0.5, 1.5], dtype=torch.float16),
+    ),
+    # 0-D: no dim to scan, so CPU fallback
+    "0d": (0, cached_randn(())),
+    # 2-D
+    "2d_dim_0": (0, cached_randn((67, 256))),
+    "2d_dim_0_n1": (0, cached_randn((1, 256))),  # n=1 edge case: identity cumsum
+    "2d_dim_0_b2": (0, cached_randn((256, 2))),
+    "2d_dim_0_b3": (0, cached_randn((256, 3))),
+    "2d_dim_1_b1": (1, cached_randn((1, 256))),
+    "2d_dim_1_b2": (1, cached_randn((2, 256))),
+    "2d_dim_1_b3": (1, cached_randn((3, 256))),
+    "2d_dim_1_b4": (1, cached_randn((4, 256))),
+    "2d_dim_1_b8": (1, cached_randn((8, 256))),
+    "2d_dim_neg1": (-1, cached_randn((8, 256))),  # negative dim alias
+    # 3-D
+    "3d_dim_1": (1, cached_randn((4, 67, 256))),
+    "3d_dim_1_b2": (1, cached_randn((1, 67, 2))),
+    "3d_dim_2_b1": (2, cached_randn((1, 1, 256))),
+    "3d_dim_2_b2": (2, cached_randn((1, 2, 256))),
+    "3d_dim_2_b4": (2, cached_randn((2, 2, 256))),
+    # 4-D
+    "4d_dim_neg1": (-1, cached_randn((1, 48, 1, 256))),
+    "4d_dim_2": (2, cached_randn((4, 5, 67, 256))),
+    "4d_dim_0": (0, cached_randn((9, 2, 3, 128))),
+    "4d_dim_1": (1, cached_randn((2, 9, 3, 128))),
+    "4d_dim_3": (3, cached_randn((2, 3, 4, 256))),
+    # 5-D
+    "5d_dim_0": (0, cached_randn((4, 2, 3, 4, 128))),
+    "5d_dim_1": (1, cached_randn((2, 9, 3, 4, 128))),
+    "5d_dim_2": (2, cached_randn((2, 3, 9, 4, 128))),
+    "5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 128))),
+    "5d_dim_neg2": (-2, cached_randn((2, 3, 4, 128, 5))),
+    # n not a stick multiple
+    "pad_2d_dim_0": (0, cached_randn((63, 129))),
+    "pad_2d_dim_1": (1, cached_randn((63, 129))),
+    "pad_2d_dim_1_b1": (1, cached_randn((1, 129))),
+    "pad_2d_dim_1_b2": (1, cached_randn((2, 9))),
+    "pad_3d_dim_1": (1, cached_randn((3, 7, 9))),
+    "pad_3d_dim_2": (2, cached_randn((3, 7, 9))),
+    "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32))),
+    "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32))),
+    "pad_5d_dim_2": (2, cached_randn((2, 3, 7, 4, 128))),
+    "pad_5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 129))),
+    # -----------------------------------------------------------------------
+    # bf16 (same device format as fp16, so the same BMM path)
+    "1d_256_bf16": (0, cached_randn((256,), dtype=torch.bfloat16)),
+    "2d_dim_0_bf16": (0, cached_randn((67, 256), dtype=torch.bfloat16)),
+    "2d_dim_1_b2_bf16": (1, cached_randn((2, 256), dtype=torch.bfloat16)),
+    "3d_dim_1_bf16": (1, cached_randn((4, 67, 256), dtype=torch.bfloat16)),
+    "4d_dim_neg1_bf16": (-1, cached_randn((1, 48, 1, 256), dtype=torch.bfloat16)),
+    # bf16, n not a stick multiple
+    "pad_2d_dim_1_bf16": (1, cached_randn((63, 129), dtype=torch.bfloat16)),
+    "pad_3d_dim_2_bf16": (2, cached_randn((3, 7, 9), dtype=torch.bfloat16)),
+    # -----------------------------------------------------------------------
+    # fp32
+    # 2-D
+    "2d_dim_0_fp32": (0, cached_randn((67, 256), dtype=torch.float32)),
+    "2d_dim_1_fp32": (1, cached_randn((4, 256), dtype=torch.float32)),
+    "2d_dim_neg1_fp32": (-1, cached_randn((4, 64), dtype=torch.float32)),
+    # 3-D
+    "3d_dim_0_fp32": (0, cached_randn((9, 3, 64), dtype=torch.float32)),
+    "3d_dim_1_fp32": (1, cached_randn((4, 9, 64), dtype=torch.float32)),
+    "3d_dim_2_fp32": (2, cached_randn((4, 3, 64), dtype=torch.float32)),
+    "3d_dim_neg1_fp32": (-1, cached_randn((4, 3, 32), dtype=torch.float32)),
+    "3d_dim_neg2_fp32": (-2, cached_randn((4, 9, 64), dtype=torch.float32)),
+    # 4-D
+    "4d_dim_0_fp32": (0, cached_randn((4, 2, 3, 64), dtype=torch.float32)),
+    "4d_dim_1_fp32": (1, cached_randn((2, 9, 3, 64), dtype=torch.float32)),
+    "4d_dim_2_fp32": (2, cached_randn((2, 3, 7, 64), dtype=torch.float32)),
+    "4d_dim_3_fp32": (3, cached_randn((2, 3, 4, 32), dtype=torch.float32)),
+    "4d_dim_neg1_fp32": (-1, cached_randn((2, 3, 4, 64), dtype=torch.float32)),
+    "4d_dim_neg2_fp32": (-2, cached_randn((2, 3, 9, 32), dtype=torch.float32)),
+    # 5-D
+    "5d_dim_0_fp32": (0, cached_randn((4, 2, 3, 4, 32), dtype=torch.float32)),
+    "5d_dim_2_fp32": (2, cached_randn((2, 3, 9, 4, 32), dtype=torch.float32)),
+    "5d_dim_neg1_fp32": (-1, cached_randn((2, 3, 4, 5, 32), dtype=torch.float32)),
+    "5d_dim_neg2_fp32": (-2, cached_randn((2, 3, 4, 32, 5), dtype=torch.float32)),
+    # fp32, n not a stick multiple
+    "pad_2d_dim_0_fp32": (0, cached_randn((9, 17), dtype=torch.float32)),
+    "pad_2d_dim_1_fp32": (1, cached_randn((4, 17), dtype=torch.float32)),
+    "pad_3d_dim_1_fp32": (1, cached_randn((3, 7, 17), dtype=torch.float32)),
+    "pad_3d_dim_2_fp32": (2, cached_randn((3, 7, 17), dtype=torch.float32)),
+    # -----------------------------------------------------------------------
+    # int32 (torch.cumsum returns int64, so these fall back to CPU)
+    "2d_dim_0_int32": (0, cached_randint((9, 64))),
+    "2d_dim_1_int32": (1, cached_randint((4, 64))),
+    "2d_dim_neg1_int32": (-1, cached_randint((4, 32))),
+    "3d_dim_0_int32": (0, cached_randint((4, 3, 32))),
+    "3d_dim_1_int32": (1, cached_randint((4, 9, 32))),
+    "3d_dim_2_int32": (2, cached_randint((4, 3, 32))),
+    "4d_dim_1_int32": (1, cached_randint((2, 9, 3, 32))),
+    "4d_dim_3_int32": (3, cached_randint((2, 3, 4, 32))),
+    # int32, n not a stick multiple
+    "pad_2d_dim_0_int32": (0, cached_randint((9, 17))),
+    "pad_2d_dim_1_int32": (1, cached_randint((4, 17))),
+    "pad_3d_dim_1_int32": (1, cached_randint((3, 7, 17))),
+    "pad_3d_dim_2_int32": (2, cached_randint((3, 7, 17))),
+    # -----------------------------------------------------------------------
+    # int64 (stored as IEEE_INT32 on Spyre; prefix scan uses addi32toi32)
+    "2d_dim_0_int64": (0, cached_randint((9, 64), dtype=torch.int64)),
+    "2d_dim_1_int64": (1, cached_randint((4, 64), dtype=torch.int64)),
+    "2d_dim_neg1_int64": (-1, cached_randint((4, 32), dtype=torch.int64)),
+    "3d_dim_0_int64": (0, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "3d_dim_1_int64": (1, cached_randint((4, 9, 32), dtype=torch.int64)),
+    "3d_dim_2_int64": (2, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "4d_dim_1_int64": (1, cached_randint((2, 9, 3, 32), dtype=torch.int64)),
+    "4d_dim_3_int64": (3, cached_randint((2, 3, 4, 32), dtype=torch.int64)),
+    # int64, n not a stick multiple
+    "pad_2d_dim_0_int64": (0, cached_randint((9, 17), dtype=torch.int64)),
+    "pad_2d_dim_1_int64": (1, cached_randint((4, 17), dtype=torch.int64)),
+    "pad_3d_dim_1_int64": (1, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "pad_3d_dim_2_int64": (2, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "1d_17_int64": (0, cached_randint((17,), dtype=torch.int64)),
+    "2d_dim_0_neg_int64": (
+        0,
+        cached_randint((9, 64), low=-512, high=512, dtype=torch.int64),
+    ),
+    # Partial sums pass 2**24, which fp32 cannot hold exactly, and stay < 2**31.
+    "2d_dim_1_big_int64": (
+        1,
+        cached_randint((4, 128), low=2**22, high=2**23, dtype=torch.int64),
+    ),
+    # -----------------------------------------------------------------------
+    # bool (torch.cumsum returns int64, so these fall back to CPU)
+    "2d_dim_1_bool": (1, cached_randint((4, 64), high=2) > 0),
+    "3d_dim_0_bool": (0, cached_randint((4, 3, 32), high=2) > 0),
+    # -----------------------------------------------------------------------
+    # Multiple seeds: validates fp16 precision at natural scale (1.0).
+    "2d_dim_1_b2_seed1": (1, cached_randn((2, 256), differentiation=1)),
+    "2d_dim_1_b2_seed2": (1, cached_randn((2, 256), differentiation=2)),
+    "3d_dim_2_b2_seed1": (2, cached_randn((1, 2, 256), differentiation=1)),
+    "3d_dim_2_b2_seed2": (2, cached_randn((1, 2, 256), differentiation=2)),
+    "3d_dim_2_b2_seed3": (2, cached_randn((1, 2, 256), differentiation=3)),
+    "3d_dim_2_b3_seed1": (2, cached_randn((1, 3, 256), differentiation=1)),
+    "4d_dim_neg1_seed1": (-1, cached_randn((1, 48, 1, 256), differentiation=1)),
+    # Alternating +1/-1: cumsum oscillates near zero, stressing fp16 precision.
+    "2d_alternating_b1": (
+        1,
+        torch.tensor([[1.0, -1.0] * 128], dtype=torch.float16),
+    ),
+    "2d_alternating_b2": (
+        1,
+        torch.tensor([[1.0, -1.0] * 128, [-1.0, 1.0] * 128], dtype=torch.float16),
+    ),
+    # Positive block followed by equal negative block.
+    "2d_ramp_drop": (
+        1,
+        torch.tensor([[0.5] * 128 + [-0.5] * 128], dtype=torch.float16),
+    ),
+    # 3-D alternating pattern, A=2.
+    "3d_alternating_b2": (
+        2,
+        torch.tensor([[[1.0, -1.0] * 128], [[-1.0, 1.0] * 128]], dtype=torch.float16),
     ),
 }
 
@@ -8028,6 +8195,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
+        ("test_cumsum", "test_cumsum_cpu"): {
+            "param_sets": CUMSUM_PARAM_SETS,
+        },
+        # torch.cumsum(..., dtype=...). The last value says whether it runs on
+        # Spyre (same dtype, or a native same-width conversion) or on CPU.
+        ("test_cumsum_dtype", "test_cumsum_dtype_cpu"): {
+            "param_sets": {
+                "2d_int32_to_int32": (1, torch.int32, cached_randint((4, 64)), True),
+                "2d_dim_0_int64_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), dtype=torch.int64),
+                    True,
+                ),
+                # Halves in [-8, 8): the conversion truncates toward zero.
+                "2d_dim_0_fp32_to_int64": (
+                    0,
+                    torch.int64,
+                    cached_randint((9, 64), low=-16, high=16).to(torch.float32) / 2,
+                    True,
+                ),
+                "2d_dim_0_fp16_to_bf16": (
+                    0,
+                    torch.bfloat16,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    True,
+                ),
+                # No int64 -> int32 conversion op: CPU fallback.
+                "1d_int64_to_int32": (
+                    0,
+                    torch.int32,
+                    cached_randint((8,), dtype=torch.int64),
+                    False,
+                ),
+                # 16 -> 32 bit conversion: CPU fallback.
+                "2d_dim_0_fp16_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    False,
+                ),
+            },
+        },
         # torch.any / torch.all: single-dim reduction
         ("test_any_single_dim", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"any": torch.any},
@@ -9092,6 +9302,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_norm_keepdim1_cpu(self, op, ord, dim, x):
         _compare_op_with_cpu(lambda x: op(x, ord=ord, dim=dim, keepdim=True), op, x)
 
+    def test_cumsum_cpu(self, dim: int, x):
+        # Integer cumsum is exact; float inputs keep the default tolerance.
+        tol = {} if x.dtype.is_floating_point else {"atol": 0, "rtol": 0}
+        self.compare_with_cpu(
+            lambda t: torch.cumsum(t, dim=dim), x, run_eager=False, **tol
+        )
+
+    def test_cumsum_dtype_cpu(self, dim: int, dtype: torch.dtype, x, on_device: bool):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=dim, dtype=dtype),
+                x,
+                atol=0,
+                rtol=0,
+                run_eager=False,
+            )
+        fell_back = any(
+            "cumsum_cpu_fallback" in str(w.message)
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+        )
+        assert fell_back != on_device, f"on_device={on_device}, fell_back={fell_back}"
+
+    def test_cumsum_int64_on_device(self):
+        # The value tests would also pass via the CPU fallback; check that
+        # int64 runs on Spyre.
+        x = cached_randint((4, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=1), x, atol=0, rtol=0, run_eager=False
+            )
+        fallbacks = [
+            str(w.message) for w in captured if issubclass(w.category, FallbackWarning)
+        ]
+        assert not any("cumsum_cpu_fallback" in m for m in fallbacks), fallbacks
+
     def _get_core_reduction_invalid_dim_cases(self):
         x = cached_randn((3, 5, 64))
         ops = CORE_REDUCTION_OPS_DICT
@@ -10006,13 +10254,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_fallback_cpu(self, x):
         """
-        Verify that cumsum executes via the CPU fallback path and emits
-        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        Verify that cumsum emits FallbackWarnings and produces correct results.
+
+        For fp16 inputs, cumsum uses the on-device BMM decomposition (spyre_cumsum)
+        which internally calls three CPU-side ops: reshape_and_pad_via_cpu,
+        aten.tril, and slice_and_reshape_via_cpu.
         """
 
         def fn(t):
             t = torch.exp(t)
-            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
+            t = torch.cumsum(t.clamp(-1, 1), dim=-1)
             t = torch.exp(t.clamp(-1, 1))
             return t
 
@@ -10024,10 +10275,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             w
             for w in captured
             if issubclass(w.category, FallbackWarning)
-            and "aten.cumsum" in str(w.message)
+            and "reshape_and_pad_via_cpu" in str(w.message)
         ]
         assert len(fallback_warnings) > 0, (
-            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"Expected FallbackWarning from spyre_cumsum fp16 BMM path "
+            f"(reshape_and_pad_via_cpu). "
             f"All captured: {[str(w.message) for w in captured]}"
         )
 

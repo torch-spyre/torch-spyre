@@ -102,9 +102,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         )
 
         def fn(t):
-            # aten.cumsum is a CPU fallback (torch_spyre/ops/fallbacks.py);
-            # aten.sin no longer is -- it has a Spyre decomposition now.
-            t = torch.cumsum(t, dim=0)  # fallback op
+            # aten.cumsum now has a Spyre decomposition (spyre_cumsum).
+            # For fp16 input it uses the on-device BMM path, which internally
+            # calls three CPU-side ops that each emit a FallbackWarning:
+            # reshape_and_pad_via_cpu, aten.tril, slice_and_reshape_via_cpu.
+            t = torch.cumsum(t, dim=0)
             return t
 
         before_decomps = copy.deepcopy(decompositions)
@@ -116,14 +118,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
         with pytest.warns(torch_spyre.ops.fallbacks.FallbackWarning) as record:
-            # run_eager=False: the eager path also triggers a FallbackWarning
-            # (cumsum dispatches to the CPU fallback kernel), and pytest.warns
-            # overrides the module-level "once" filter, so we'd capture 2
-            # warnings instead of 1.  This test only cares about decomposition
-            # table integrity, so skip eager.
+            # run_eager=False: eager cumsum runs the same decomposition and
+            # emits the same FallbackWarnings again, and pytest.warns overrides
+            # the module-level "once" filter, so they would be counted twice.
+            # This test only cares about decomposition table integrity, so skip
+            # eager.
             compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
+        assert len(record) == 3, (
+            "Three FallbackWarnings expected from spyre_cumsum fp16 BMM path: "
+            "reshape_and_pad_via_cpu, aten.tril, slice_and_reshape_via_cpu"
+        )
 
         after_decomps = copy.deepcopy(decompositions)
         after_post_autograd_decomposition_table = copy.deepcopy(
