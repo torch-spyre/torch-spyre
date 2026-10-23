@@ -143,7 +143,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     _check_in_place_relationships,
 )
-from torch_spyre._inductor import config
+from torch_spyre._inductor import config, timing_recorder
 
 __all__ = ["CpSatLayoutSolver"]
 
@@ -1346,7 +1346,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Nothing else in the pipeline records this, so "why was that compile
         slow" currently has no artifact behind it.
         """
-        status = solver.Solve(model)
+        # The solver's own wall time, separated from the Python that built the
+        # model. Without this split a slow solve and a slow model build are the
+        # same number, and they need opposite fixes: a search bound (a time or
+        # stall limit) helps only the first.
+        with timing_recorder.stage(
+            "stage:Scratchpad:cpsat_solve",
+            # The input size beside the model size. Without it a bigger model and
+            # more variables per buffer read the same, and the fallback ladder
+            # sums both over the same solves, so variables/buffers holds however
+            # many stages ran.
+            buffers=len(self.buffers),
+            variables=len(model.proto.variables),
+            constraints=len(model.proto.constraints),
+            objective=objective,
+        ) as event:
+            status = solver.Solve(model)
+        event.meta["status"] = solver.StatusName(status)
+        event.meta["solver_wall_s"] = round(solver.WallTime(), 3)
         self.last_solve_stats = {
             "status": solver.StatusName(status),
             "solve_s": round(solver.WallTime(), 3),
