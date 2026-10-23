@@ -1219,6 +1219,36 @@ class _GatherMulticoreScenarios:
         self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
+    # -- index padding: lanes past the index length are never dereferenced --
+    def _gather_with_index_padding(self, dtype, pad):
+        """A partial-stick index whose padding lanes hold ``pad`` gathers exactly.
+
+        The index is the first 67 entries of a 96-entry device tensor, so its
+        third stick holds 29 padding lanes set to ``pad``. A gather that iterated
+        the whole last index stick would take them as table rows and, for an
+        invalid row, fault the card. The table values are exact in DLFloat16,
+        so the result is compared exactly.
+        """
+        n, cols = 67, 64
+        table = (torch.arange(n * cols) % 251).to(dtype).reshape(n, cols)
+        logical = torch.arange(n - 1, -1, -1, dtype=torch.int32)
+        padded = torch.cat([logical, torch.full((96 - n,), pad, dtype=torch.int32)])
+        fn = torch.compile(lambda t, i: torch.index_select(t, 0, i[:n]), dynamic=False)
+        got = fn(table.to("spyre"), padded.to("spyre")).cpu()
+        torch.testing.assert_close(got, table[logical.long()], atol=0, rtol=0)
+
+    def test_gather_index_padding_negative_fp16(self):
+        self._gather_with_index_padding(torch.float16, -1)
+
+    def test_gather_index_padding_past_table_fp16(self):
+        self._gather_with_index_padding(torch.float16, 1000)
+
+    def test_gather_index_padding_negative_fp32(self):
+        self._gather_with_index_padding(torch.float32, -1)
+
+    def test_gather_index_padding_past_table_fp32(self):
+        self._gather_with_index_padding(torch.float32, 1000)
+
     # -- shared value table: cross-core read correctness ------------------
     def test_gather_cross_core_shared_value(self):
         """Every output row gathers a value row in a DIFFERENT core's work slice,
