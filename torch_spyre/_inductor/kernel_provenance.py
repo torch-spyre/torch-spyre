@@ -87,6 +87,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "kernel_local": "bool",
     "replicated_scalar": "bool",
     "non_unified_shard_bytes": "int",
+    "stride_map": "list[int] | None",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -343,6 +344,8 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         result["replicated_scalar"] = True
     if arg.non_unified_shard_bytes:
         result["non_unified_shard_bytes"] = arg.non_unified_shard_bytes
+    # stride_map is left out: it only guides binding the coordinates, so its
+    # effect is already in device_coordinates.
     return result
 
 
