@@ -395,6 +395,13 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         """Write the chosen division back onto the buffer (nothing to record
         when the division is fixed)."""
 
+    def decision_variables(self) -> list:
+        """The CP-SAT variables that define this buffer's plan. The LX offset is
+        left out: no objective prices an address, so every legal shift of a
+        resident buffer would read as a tie."""
+        served = [lit for reads in self.relayout_reads.values() for lit, _ in reads]
+        return [self.in_buffer, *self.merge_vars.values(), *served]
+
 
 @dataclass
 class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
@@ -601,6 +608,9 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def record_division(self, solver: "cp_model.CpSolver") -> None:
         self.buffer.chosen_division = solver.Value(self.division)
 
+    def decision_variables(self) -> list:
+        return [*super().decision_variables(), self.division]
+
 
 class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
@@ -773,6 +783,42 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     # ------------------------------------------------------------------
     # Model build + solve
     # ------------------------------------------------------------------
+    def _is_unique_solution(
+        self,
+        model: "cp_model.CpModel",
+        solver: "cp_model.CpSolver",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+    ) -> bool:
+        """Whether the optimum ``solver`` holds is the only one over the plan's
+        decision variables (residency, merges, served relayouts and division,
+        not placement). False when a different plan costs the same, or when the
+        probe ends without proving either way.
+        """
+        decision = [v for sb in tensors.values() for v in sb.decision_variables()]
+        probe = model.clone()
+        differs = []
+        for var in decision:
+            lit = probe.new_bool_var(f"differs_{var.name}")
+            probe.add(var != solver.Value(var)).only_enforce_if(lit)
+            differs.append(lit)
+        probe.add_bool_or(differs)
+
+        probe_solver = cp_model.CpSolver()
+        probe_solver.parameters.copy_from(solver.parameters)
+
+        # Only a probe run to completion proves anything, so it has no time
+        # limit: OPTIMAL gives the runner-up's cost, INFEASIBLE means no other plan.
+        probe_solver.parameters.max_time_in_seconds = float("inf")
+        status = probe_solver.Solve(probe)
+        if status == cp_model.INFEASIBLE:
+            return True  # no other plan exists at all
+        if status != cp_model.OPTIMAL:
+            return False  # probe ran out of time we cannot prove uniqueness
+        best, runner_up = solver.ObjectiveValue(), probe_solver.ObjectiveValue()
+        if round(runner_up) <= round(best):
+            return False  # a different plan costs the same to within 1
+        return True  # another plan was found that is worse than the best one
+
     def _minimize_cost_expr(
         self,
         model: "cp_model.CpModel",
@@ -818,6 +864,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
+                )
+            if (
+                config.enable_uniqueness_check
+                and status == cp_model.OPTIMAL
+                and not self._is_unique_solution(model, solver, tensors)
+            ):
+                logger.warning(
+                    "[CP-SAT layout solver] CP-SAT cannot prove uniqueness of the "
+                    "optimal solution"
                 )
             return status
         except (RuntimeError, TypeError, ValueError) as exc:
