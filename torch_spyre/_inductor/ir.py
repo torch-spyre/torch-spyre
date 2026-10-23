@@ -105,6 +105,17 @@ class FixedTiledLayout(FixedLayout):
         self.allocation: dict[str, Any] = {}
         self.lx_view: Optional["PerCoreView"] = None
 
+    def unallocated_copy(self) -> "FixedTiledLayout":
+        """Copy host/device geometry without allocation or per-core ownership."""
+        return FixedTiledLayout(
+            self.device,
+            self.dtype,
+            list(self.size),
+            list(self.stride),
+            self.device_layout,
+            offset=self.offset,
+        )
+
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
         return (

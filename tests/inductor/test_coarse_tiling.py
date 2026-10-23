@@ -6693,6 +6693,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
         self.assertNotIn("sdsc_execute (%sym_1)", mlir)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_non_tensor_arg_symbols_remain_as_constants(self):
         c0 = Symbol("c0")
         op_a = self._make_op_spec_with_hbm_args("a", [0])
