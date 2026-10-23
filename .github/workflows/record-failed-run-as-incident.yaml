@@ -1,0 +1,82 @@
+name: record-failed-run-as-incident
+
+# Writes one incident_events row when a main-branch, scheduled or manual run of a CI workflow fails.
+# Pull-request runs are skipped: a red PR is the author's to fix, not an incident. Read-only on
+# GitHub; the only secrets are the ClickHouse ones the other push-* workflows already use.
+on:
+  workflow_run:
+    workflows:
+      - tests
+      - tests-nightly
+      - integration-tests
+      - model-ops-tests
+      - upstream-pytorch-tests
+      - clickhouse-schema
+    types: [completed]
+
+concurrency:
+  group: incident-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  record:
+    name: Record failed run
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 10
+    # Fail-open at every level: the ingest step always exits 0, and nothing here can fail the
+    # workflow it follows.
+    if: |
+      contains(fromJSON('["failure", "timed_out"]'), github.event.workflow_run.conclusion) &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.event != 'pull_request_target'
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/actions
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      - name: Gate on ClickHouse config
+        id: gate
+        run: |
+          if [ -z "${CLICKHOUSE_HOST}" ] || [ -z "${CLICKHOUSE_DB_V2}" ]; then
+            echo "::notice::ClickHouse v2 is not configured; nothing recorded."
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Setup spyre-clickhouse-ingest
+        id: setup
+        if: steps.gate.outputs.configured == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-clickhouse-ingest
+        with:
+          extra-scripts: ''
+
+      - name: Record incident
+        if: steps.gate.outputs.configured == 'true' && steps.setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          source .venv/bin/activate
+          python -m spyre_clickhouse_ingest incidents gha-failure --repo "${REPO}" --run-id "${RUN_ID}" || true
