@@ -654,6 +654,44 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     # ------------------------------------------------------------------
     # Model build + solve
     # ------------------------------------------------------------------
+    @staticmethod
+    def _tiebreak_term(
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+    ):
+        # Builds a CP-SAT expression to use as a final tiebreak objective.
+        # Minimizing it breaks ties left open by the quality ladder without
+        # trading any quality metric for determinism.
+        terms = []
+        # Sum of LX placement offsets — prefers packing buffers toward address 0.
+        for buf_name, t in sorted(tensors.items()):
+            terms.append(t.offset)
+        # Sum of division candidate ranks — for each buffer with multiple
+        # core-split candidates, assign a rank based on the sorted
+        # (dim_name, split_value) tuple and express the chosen rank as a
+        # CP-SAT variable via add_element.
+        for buf_name, t in sorted(tensors.items()):
+            if not isinstance(t, _CoreDivisionBufferWithCpVars):
+                continue
+            cds = t.buffer.core_divisions
+            if len(cds) <= 1:
+                continue
+            order = sorted(
+                range(len(cds)),
+                key=lambda i: tuple(
+                    sorted((str(k), int(v)) for k, v in cds[i].splits.items())
+                ),
+            )
+            rank_for = [0] * len(cds)
+            for rank, idx in enumerate(order):
+                rank_for[idx] = rank
+            rank_var = model.new_int_var(0, len(cds) - 1, f"_tb_rank_{buf_name}")
+            model.add_element(t.division, rank_for, rank_var)
+            terms.append(rank_var)
+        if not terms:
+            return None
+        return sum(terms)
+
     def _minimize_cost_expr(
         self,
         model: "cp_model.CpModel",
@@ -1108,6 +1146,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     model.add(sum(core_cost_terms) <= round(solver.ObjectiveValue()))
                     model.minimize(sum(tile_terms))
                     status = _solve_stage("tile count")
+
+        # Extra solve to break ties left open by the ladder above. The ladder
+        # locks each stage's optimum as a hard constraint, so the feasible
+        # region here contains only solutions at least as good as those optima.
+        # Minimizing the tiebreak term within that region picks the same
+        # solution every run, regardless of which parallel worker finds it first.
+        if status is not None and config.cp_sat_tiebreak:
+            tiebreak = self._tiebreak_term(model, tensors)
+            if tiebreak is not None:
+                model.minimize(tiebreak)
+                status = _solve_stage("tiebreak")
 
         final_tensors = self._extract(solver, tensors)
 
