@@ -185,11 +185,17 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
         changed = True
     if not changed:
         return stl
+    # Cap each group's count at the product of its new extents.  A collapsed
+    # broadcast dim has size 1, so any key containing it is capped to 1.
+    new_ve = {
+        key: min(val, math.prod(device_size[d] for d in key))
+        for key, val in stl.valid_elements.items()
+    }
     return SpyreTensorLayout(
         device_size,
         stride_map,
         stl.device_dtype,
-        forward_valid_elements(stl),
+        new_ve,
         stl.element_arrangement,
     )
 

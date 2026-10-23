@@ -40,6 +40,7 @@ from torch_spyre._inductor.pass_utils import (
     reorder_valid_elements,
     restickify_valid_elements,
 )
+from torch_spyre._inductor.propagate_layouts import _compact_broadcast_device_dims
 from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 from utils_inductor import DEVICE
 
@@ -570,6 +571,74 @@ def test_restickify_valid_elements_preserves_all_keys():
         new_sd_host_size=5,
     )
     assert result == {(0,): 3, (1,): 7, (2, 3): 5}
+
+
+def test_restickify_valid_elements_single_stick_fallback():
+    """Single-stick fallback: size-1 outer dim must not steal the new stick count.
+
+    src = SpyreTensorLayout([1, 32, 64], [2048, 64, 1], fp16, dim_order=[1, 0, 2])
+    tgt = same with dim_order=[2, 0, 1]
+    restickify_valid_elements(src, old_sd_outer_dim=0, old_sd_host_size=64,
+                              new_sd_outer_dim=2, new_sd_host_size=32)
+    must equal tgt.valid_elements, not give dim 0 a count of 32.
+    """
+    src = SpyreTensorLayout([1, 32, 64], [2048, 64, 1], _FP16, [1, 0, 2])
+    tgt = SpyreTensorLayout([1, 32, 64], [2048, 64, 1], _FP16, [2, 0, 1])
+    result = restickify_valid_elements(
+        src,
+        old_sd_outer_dim=0,
+        old_sd_host_size=64,
+        new_sd_outer_dim=2,
+        new_sd_host_size=32,
+    )
+    assert result == tgt.valid_elements
+
+
+def test_restickify_valid_elements_same_dim_returns_empty():
+    """When old and new stick outer dims coincide, return an empty map."""
+    stl = _stl([4, 8, 64], [512, 64, 1], {(0,): 4, (1, 2): 8})
+    result = restickify_valid_elements(
+        stl,
+        old_sd_outer_dim=1,
+        old_sd_host_size=8,
+        new_sd_outer_dim=1,
+        new_sd_host_size=8,
+    )
+    assert result == {}
+
+
+def test_restickify_valid_elements_oracle_transpose():
+    """Ordinary transpose matches postmath's oracle check.
+
+    src = SpyreTensorLayout([2, 256, 128], [32768, 128, 1], fp16, dim_order=[0, 1, 2])
+    tgt = same with dim_order=[0, 2, 1]
+    restickify_valid_elements(src, 1, 128, 0, 256) == tgt.valid_elements
+    """
+    src = SpyreTensorLayout([2, 256, 128], [32768, 128, 1], _FP16, [0, 1, 2])
+    tgt = SpyreTensorLayout([2, 256, 128], [32768, 128, 1], _FP16, [0, 2, 1])
+    result = restickify_valid_elements(
+        src,
+        old_sd_outer_dim=1,
+        old_sd_host_size=128,
+        new_sd_outer_dim=0,
+        new_sd_host_size=256,
+    )
+    assert result == tgt.valid_elements
+
+
+def test_compact_broadcast_device_dims_caps_valid_elements():
+    """Broadcast dim shrunk to size 1: its valid_elements count must be capped to 1.
+
+    SpyreTensorLayout([8, 100], [0, 1], fp16, [0, 1]) has device_size=[2, 8, 64],
+    stride_map=[64, 0, 1], valid_elements={(0, 2): 100, (1,): 8}.
+    After compaction dim 1 is size 1, so its count must become 1, not 8.
+    """
+    stl = SpyreTensorLayout([8, 100], [0, 1], _FP16, [0, 1])
+    result = _compact_broadcast_device_dims(stl)
+    assert result.device_size[1] == 1, "broadcast dim should be collapsed to 1"
+    assert result.valid_elements[(1,)] == 1, (
+        "collapsed broadcast dim count must be 1, not the original 8"
+    )
 
 
 # Propagation through compiled ops: send tensors to device, compile the op,
