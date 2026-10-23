@@ -2751,6 +2751,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (2, 3, 4, 44), dtype=torch.int64),
                     32,
                 ),
+                # 0-dim: regression guard for rank-0 integer compare promotion.
+                # INT_TO_FLOAT promotes int64 to fp32 before the compare, so the
+                # scalar must be < 2^24 to be represented exactly in fp32.
+                # Two fixed pairs: one equal, one not, so every op has a
+                # meaningful expected result (randint vs a constant can only
+                # ever hit one branch for eq/ne).
+                "0dim_scalar_eq": (
+                    torch.tensor(500, dtype=torch.int64),
+                    500,
+                ),
+                "0dim_scalar_ne": (
+                    torch.tensor(499, dtype=torch.int64),
+                    500,
+                ),
             },
         },
         # -----------------------------------------------------------------------
@@ -2836,6 +2850,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         [1, 1, 29, 1], [29, 29, 1, 1]
                     ),
                 ),
+                # 0-dim tensor-vs-tensor: regression for #5093.
+                "0dim_tensor_eq": (
+                    torch.tensor(500, dtype=torch.int64),
+                    torch.tensor(500, dtype=torch.int64),
+                ),
+                "0dim_tensor_ne": (
+                    torch.tensor(499, dtype=torch.int64),
+                    torch.tensor(500, dtype=torch.int64),
+                ),
             },
         },
         # -----------------------------------------------------------------------
@@ -2880,6 +2903,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 4-D
                 "4d_2x3x4x64_scalar500": (
                     torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 0-dim: regression guard for rank-0 integer compare promotion.
+                # INT_TO_FLOAT promotes int32 to fp32 before the compare, so the
+                # scalar must be < 2^24 to be represented exactly in fp32; 500 < 2^24.
+                # Two fixed pairs: one equal, one not.
+                "0dim_scalar_eq": (
+                    torch.tensor(500, dtype=torch.int32),
+                    500,
+                ),
+                "0dim_scalar_ne": (
+                    torch.tensor(499, dtype=torch.int32),
                     500,
                 ),
             },
@@ -2929,6 +2964,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (8,), dtype=torch.int32).as_strided(
                         [1, 1, 8, 1], [8, 8, 1, 1]
                     ),
+                ),
+                # 0-dim tensor-vs-tensor: regression for #5093.
+                "0dim_tensor_eq": (
+                    torch.tensor(500, dtype=torch.int32),
+                    torch.tensor(500, dtype=torch.int32),
+                ),
+                "0dim_tensor_ne": (
+                    torch.tensor(499, dtype=torch.int32),
+                    torch.tensor(500, dtype=torch.int32),
                 ),
             },
         },
@@ -3280,6 +3324,53 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int64_small": (
                     torch.tensor([1000, 1001] * 32, dtype=torch.int64),
                     torch.tensor([1001, 1000] * 32, dtype=torch.int64),
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # Regression: 0-dim integer compare inside a torch.cond branch.
+        #
+        # eq/ne/le/gt/ge promote the integer operand through INT_TO_FLOAT before
+        # comparing, so they run on device.  lt is still expected to fail (#5551):
+        # the same promotion guard that protects while_loop trip counters (which
+        # must stay integer) also applies to lt inside torch.cond branches.
+        # -----------------------------------------------------------------------
+        ("test_cmp_cond_subgraph", "test_cmp_cond_subgraph_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "expect_fail": {
+                "lt_int32_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
+                "lt_int32_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
+                "lt_int64_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
+                "lt_int64_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
+            },
+            "param_sets": {
+                # int32 0-dim inside a torch.cond branch.
+                "int32_eq": (
+                    torch.tensor(500, dtype=torch.int32),
+                    torch.ones(64, dtype=torch.float16),
+                ),
+                "int32_ne": (
+                    torch.tensor(499, dtype=torch.int32),
+                    torch.ones(64, dtype=torch.float16),
+                ),
+                # int64 0-dim inside a torch.cond branch.
+                # int64 is stored as int32 on Spyre, then INT_TO_FLOAT promotes
+                # it to fp32 on device -- exercises the non-lt subgraph path.
+                # Two pairs so every op has both a True and a False expected result.
+                "int64_eq": (
+                    torch.tensor(500, dtype=torch.int64),
+                    torch.ones(64, dtype=torch.float16),
+                ),
+                "int64_ne": (
+                    torch.tensor(499, dtype=torch.int64),
+                    torch.ones(64, dtype=torch.float16),
                 ),
             },
         },
@@ -9220,6 +9311,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_bigint_cpu(self, op, x, y):
         # Integers large enough that int→fp32 loses the distinction between them.
         self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_cmp_cond_subgraph_cpu(self, op, n, x):
+        # Regression: 0-dim int compare (eq/ne/le/gt/ge) inside a torch.cond
+        # branch must not be erroneously skipped by the trip-counter carve-out.
+        # Before the fix, _lower_cmp_impl checked only "inside SubgraphLowering"
+        # and passed the raw integer IR to Spyre, which has no integer compare.
+        def fn(n, x):
+            return torch.cond(
+                x.sum() > 0,
+                lambda n: op(n, 500),
+                lambda n: op(n, 500),
+                (n,),
+            )
+
+        self.compare_with_cpu(fn, n, x, run_eager=False)
 
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without

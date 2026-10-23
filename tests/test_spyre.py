@@ -1079,6 +1079,27 @@ class TestSpyre(TestCase):
         x[3, 3, 3] = y
         self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    @pytest.mark.xfail(
+        strict=False,  # Allows XPASS for now, will be changed to True to enforce later
+        raises=AssertionError,
+        reason="Sub-stick slices are not yet supported for DMA",
+    )
+    def test_h2d_copy_to_substick_sliced_destination(self, sizes):
+        """H2D sub-stick tensor slice"""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
+
         slice_sizes = [2]
         y = torch.rand(
             slice_sizes,
