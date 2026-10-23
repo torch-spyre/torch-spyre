@@ -93,6 +93,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Why the buffer cannot reside while its op is untiled, set instead of
+    # ``residency_reason`` when the solve may tile the op: the solver keeps the
+    # buffer out of LX unless it chooses a tiling for it.
+    untiled_bar: Optional[str] = None
     # Optional lifetime bounds for storage reused by a counted loop. Keep these
     # separate from ``uses``: they change address overlap, but must not
     # manufacture reads or inflate residency/spill benefit.
@@ -1023,13 +1027,6 @@ class MemoryPlanSolver(ABC):
 
     @classmethod
     @abstractmethod
-    def replans_after_tiling(cls) -> bool:
-        """Needs a second, placement-only solve over the graph once the tilings
-        it chose are applied, rather than its own placement standing
-        (``CoOptimizingAllocator._materialize_selection``)."""
-
-    @classmethod
-    @abstractmethod
     def linear_cost_only(cls) -> bool:
         """Can only minimize a cost expression that lowers to linear terms, so
         the objective must avoid the cost model's fractional powers."""
@@ -1040,7 +1037,6 @@ class MemoryPlanSolver(ABC):
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "replans_after_tiling",
         "linear_cost_only",
     )
 
@@ -1068,7 +1064,6 @@ class MemoryPlanSolver(ABC):
             ("chooses_tilings", "chooses_core_divisions"),
             ("linear_cost_only", "chooses_core_divisions"),
             ("tilings_from_menu", "chooses_tilings"),
-            ("replans_after_tiling", "chooses_tilings"),
         ):
             if getattr(cls, implied)() and not getattr(cls, prerequisite)():
                 raise TypeError(f"{cls.__name__}.{implied}() requires {prerequisite}()")
@@ -1106,6 +1101,9 @@ class MemoryPlanSolver(ABC):
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
             return buffer.residency_reason
+        if buffer.untiled_bar is not None and not self.tilings_from_menu():
+            # Only a solver choosing among the menu's tilings can lift it.
+            return buffer.untiled_bar
         if buffer.min_footprint > self.limit:
             return (
                 f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
