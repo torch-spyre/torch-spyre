@@ -57,8 +57,7 @@ page. It has single-op scripts (`tensor_allocate.py`, `softmax.py`,
 `gelu.py`, `mean.py`, `mul.py`, `softplus.py`, `for_each_tile.py`), a
 `distributed/` set covering the collective ops (allgather, allreduce,
 broadcast, gather, reduce, barrier) plus a multi-rank broadcast
-walkthrough, and a `scratchpad/` set that models the LX layout solver in
-isolation. The scripts are under
+walkthrough. The scripts are under
 [examples/](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples).
 
 ## Troubleshooting

@@ -52,11 +52,8 @@ structure the captures under-cover:
 from __future__ import annotations
 
 from cooptimization_capture_loader import CapturedGraph
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    BufferType,
-    CoreDivision,
-    CoreDivisionBuffer,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import BufferType, CoreDivision
+from buffer_spec import CoreDivisionBuffer
 
 _SIZE = 65536  # bytes; a plausible per-buffer footprint (mirrors capture scale)
 

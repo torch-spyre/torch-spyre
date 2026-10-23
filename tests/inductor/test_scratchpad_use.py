@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
-from unittest.mock import create_autospec, patch
+from unittest.mock import patch
 import torch
 
 from torch._inductor import config as t_inductor_config
@@ -43,6 +43,8 @@ from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
+from torch_spyre._inductor.scratchpad import residency_rules
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -50,16 +52,27 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
-    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
 
 Ts = TypeVarTuple("Ts")
 
-# One buffer's entry in an allocation fingerprint (keyed by buffer name):
-#   (location, size_bytes, (output_splits, reduction_splits))
-# where each split list is a sorted tuple of (iteration_space_stride, factor).
-_Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
-_AllocEntry = tuple[str, int, _Splits]
+
+@contextmanager
+def _recording_division_modes():
+    """The division mode of every ``ScratchpadAllocator.plan_allocation`` call,
+    in order: ``["open", "committed"]`` means the open solve failed and
+    ``scratchpad_planning`` replanned over the committed divisions."""
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+    modes: list[str] = []
+    original = ScratchpadAllocator.plan_allocation
+
+    def recording(allocator, graph):
+        modes.append(allocator.division_mode)
+        return original(allocator, graph)
+
+    with patch.object(ScratchpadAllocator, "plan_allocation", recording):
+        yield modes
 
 
 def _graph_editor_test_buffer(name: str) -> ComputedBuffer:
@@ -120,34 +133,6 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         GraphLowering._update_scheduler(graph)
 
     assert calls == [graph]
-
-
-def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
-    """Unsupported paired plans remain fail-closed under ``python -O``."""
-
-    import torch_spyre._inductor.scratchpad.allocator as allocator_module
-
-    solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
-    solver.buffers = []
-    solver.plan_layout_and_core_divisions.return_value = [
-        SimpleNamespace(lx_relayout_plans=[object()])
-    ]
-    allocator = allocator_module.CoOptimizingAllocator(
-        # Never built: the test hands _solve the mock directly.
-        layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
-            allocator_module.GreedyLayoutSolver
-        ),
-        size=0,
-    )
-    graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
-    with (
-        patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
-        unittest.TestCase().assertRaisesRegex(
-            AssertionError, "CoOptimizingAllocator does not support LX relayout"
-        ),
-    ):
-        allocator._solve(solver, graph)
-    solver.plan_layout_and_core_divisions.assert_called_once()
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -366,11 +351,6 @@ class _ParameterizedScratchpadMeta(type):
     the combo and check correctness, compare HBM off vs on, ...) is defined by
     the class, not baked into the metaclass.
 
-    A class may also define a static ``case_decorators(params) -> list`` hook.
-    Each decorator it returns is applied to the generated method for that combo
-    (e.g. mark the ``cpsat`` combos ``expectedFailure``). Absent hook -> no
-    per-case decoration.
-
     Generating methods rather than sibling classes keeps everything in the
     ``attrs`` dict handed to ``__new__`` — no module-namespace or ``sys.modules``
     access, so it is immune to the OOT runner's out-of-``sys.modules``
@@ -381,7 +361,6 @@ class _ParameterizedScratchpadMeta(type):
     # "<name><value>"; this keeps the curated short labels while letting new axes
     # added to ``parameter_axes`` work without editing this method.
     _AXIS_LABELS = {
-        "solver_method": lambda v: str(v),
         "tiling_mode": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
         "co_optimization": lambda v: "coopt" if v else "nocoopt",
@@ -410,18 +389,11 @@ class _ParameterizedScratchpadMeta(type):
                 ]
             else:
                 combos = [{}]
-            # Optional per-combo decorator hook (e.g. mark cpsat as expectedFailure).
-            decorators_for = attrs.get("case_decorators")
-            if isinstance(decorators_for, staticmethod):
-                decorators_for = decorators_for.__func__
             for params in combos:
                 suffix = mcs._combo_suffix(params)
                 for label, factory in models:
                     test_name = f"test_{label}__{suffix}" if suffix else f"test_{label}"
                     test_method = mcs._make_case(params, factory)
-                    if decorators_for is not None:
-                        for dec in decorators_for(params):
-                            test_method = dec(test_method)
                     attrs[test_name] = test_method
         return super().__new__(mcs, name, bases, attrs)
 
@@ -446,7 +418,7 @@ class ParameterizedScratchpadUsage(
     """Full cartesian product of the scratchpad-planning configuration knobs.
 
     Replaces the hand-written solver-variant classes: the metaclass injects a
-    ``test_<model>__<solver>_sc<n>_<coopt>_<clones>`` method for every model in
+    ``test_<model>__sc<n>_<coopt>_<clones>`` method for every model in
     ``parameter_models`` and every point in ``parameter_axes``. Edit
     ``parameter_axes`` to widen or narrow the sweep.
     """
@@ -465,13 +437,6 @@ class ParameterizedScratchpadUsage(
         return mlp, args, {"atol": 0.1, "rtol": 0.1}
 
     parameter_axes = {
-        "solver_method": (
-            "greedy",
-            "bestfit",
-            "firstfit",
-            "cpsat",
-            "simulated_annealing",
-        ),
         "sencores": (1, 32),
         "co_optimization": (False, True),
     }
@@ -483,14 +448,8 @@ class ParameterizedScratchpadUsage(
         the combo's config at the test-case level (the inherited setUp only
         applies invariants)."""
         with ts_inductor_config.patch(
-            layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
-            # greedy/bestfit/firstfit have no core-division-capable solver, so
-            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
-            # DFS fallback, which this sweep deliberately exercises. (No-op for
-            # cpsat/simulated_annealing, and for co_optimization=False.)
-            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -778,7 +737,6 @@ class TestCloneAtGraphBoundaries(
         return fn, (x,), {"assertion_fn": assertion_fn}
 
     parameter_axes = {
-        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
         "sencores": (1, 32),
         "co_optimization": (False, True),
     }
@@ -836,14 +794,8 @@ class TestCloneAtGraphBoundaries(
         the combo's config at the test-case level (the inherited setUp only
         applies invariants)."""
         with ts_inductor_config.patch(
-            layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
-            # greedy/bestfit/firstfit have no core-division-capable solver, so
-            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
-            # DFS fallback, which this sweep deliberately exercises. (No-op for
-            # cpsat, and for co_optimization=False.)
-            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -869,308 +821,11 @@ class TestCloneAtGraphBoundaries(
             )
 
 
-# TODO: Remove hard coded core division. This test exists to check for
-# regressions when operating on matmuls. There is likely a better
-# approach where we use a proxy to estimate the runtime perforamance
-# of given allocations.
-@unittest.skipUnless(
-    ts_inductor_config.co_optimizing_lx_planning, "co-optimization is not enabled"
-)
-class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
-    """Generic real-graph coverage for the co-optimising allocator.
-
-    DFS-based co-optimizing allocator (``co_optimizing_lx_planning=True``) searches
-    over candidate core divisions, commits the winning splits onto
-    ``op_it_space_splits``, then places buffers. These tests put real compiled
-    graphs through that path.
-
-    The prescribed-allocation tests encode the *desired* plan, which is the one
-    the DFS co-optimizer produces. These plans are brittle and are not unique but
-    are plans which achieve desirable performance. New plans should be profiled
-    before making these test more permissive.
-
-    NOTE: this suite is intentionally *disabled* today. Unlike
-    ``ParameterizedScratchpadUsage`` / ``TestCpSatAllocatorFallback`` it does not
-    set ``metaclass=_ParameterizedScratchpadMeta``, so no ``test_*`` methods are
-    generated and nothing is collected -- the co-optimization compiles are too
-    slow to run on every CI job. The ``parameter_axes`` / ``parameter_models`` /
-    ``case_decorators`` / ``run_case`` machinery below is ready; re-enable the
-    suite by attaching the metaclass once ``cpsat`` becomes the default
-    ``layout_solver``. (This omission is deliberate, not a dropped metaclass.)
-
-    When enabled: the acceptance criterion for each model (its prescribed
-    fingerprint) is defined *once* in that model's factory and swept over the
-    ``solver_method`` axis by ``_ParameterizedScratchpadMeta``. The prescribed
-    plans are the *greedy* co-optimization plans; the joint CP-SAT allocator
-    (``layout_solver="cpsat"``) optimises core division and placement jointly
-    and is expected to land on a different (not yet pinned-down) plan, so the
-    ``cpsat`` combos are marked ``expectedFailure`` via ``case_decorators``.
-    They guard against the CP-SAT path silently regressing to the greedy plan;
-    when CP-SAT's plans are profiled and stabilised, give ``cpsat`` its own
-    prescribed fingerprints.
-
-    It extends :class:`BaseTestScratchpadUsage` for the shared helpers
-    (``rand_device``, ``_simple_mlp``, ``pre_scheduling_iterating_pass`` and the
-    pre-scheduling-pass setup) and applies its own config patches at the
-    test-case level in ``_allocation_fingerprint`` (sencores=32 /
-    co-optimization / boundary clones); the solver is the swept axis.
-    """
-
-    def _allocation_fingerprint(
-        self,
-        model: Callable[[Unpack[Ts]], torch.Tensor],
-        args: tuple[Unpack[Ts]],
-        layout_solver: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _AllocEntry]]:
-        """Compile ``model`` through the allocator (sencores=32, lx_planning on)
-        and return ``(cpu_result, device_result, fingerprint)``.
-
-        The fingerprint maps each op's buffer name to its
-        ``(location, size_bytes, split)``. ``location`` is "LX"/"HBM"; ``split``
-        is the committed core division as
-        ``((output_splits...), (reduction_splits...))``, each a sorted tuple of
-        ``(iteration_space_stride, factor)`` pairs. We keep the full per-axis
-        split rather than the core-count product so that, e.g., a 32-way split
-        of one axis (``((1024, 32),)``) is distinguished from an 8x4 split across
-        two axes (``((1, 8), (1024, 4))``) even though both use 32 cores. The
-        buffer names and the values are both deterministic run-to-run, so the
-        per-buffer allocation can be prescribed exactly.
-        """
-        cpu_result = model(*(t.to("cpu") for t in args))
-
-        fingerprint: dict[str, _AllocEntry] = {}
-
-        def visitor(graph: GraphLowering) -> None:
-            fingerprint.clear()
-            for op in graph.operations:
-                layout = graph.get_buffer(op.name).get_layout()
-                device_layout = layout.device_layout
-                allocation = getattr(layout, "allocation", {})
-                out, red = getattr(op, "op_it_space_splits", ({}, {}))
-                split = (tuple(sorted(out.items())), tuple(sorted(red.items())))
-                fingerprint[op.name] = (
-                    "LX" if "lx" in allocation else "HBM",
-                    math.prod(device_layout.device_size[:-1]) * 128,
-                    split,
-                )
-
-        with self.pre_scheduling_iterating_pass(visitor):
-            with ts_inductor_config.patch(
-                layout_solver=layout_solver,
-                sencores=32,
-                co_optimizing_lx_planning=True,
-                _cpsat_warn_on_cost_expr=False,
-            ):
-                compiled = torch.compile(model, fullgraph=True)
-                device_result = compiled(*args).to("cpu")
-
-        return cpu_result, device_result, fingerprint
-
-    def _assert_prescribed_allocation(
-        self,
-        model: Callable[[Unpack[Ts]], torch.Tensor],
-        args: tuple[Unpack[Ts]],
-        expected: dict[str, _AllocEntry],
-        layout_solver: str,
-        atol: float = 0.1,
-        rtol: float = 0.1,
-    ) -> None:
-        cpu_result, device_result, fingerprint = self._allocation_fingerprint(
-            model, args, layout_solver=layout_solver
-        )
-        self.assertEqual(
-            fingerprint,
-            expected,
-            "allocation does not match the prescribed (desired greedy) plan "
-            "{buf: (location, size, split)}:\n"
-            f"  expected {expected}\n  got      {fingerprint}",
-        )
-        torch.testing.assert_close(
-            device_result,
-            cpu_result,
-            atol=atol,
-            rtol=rtol,
-            msg="prescribed-allocation result diverged from CPU",
-        )
-
-    # Model factories. Each returns ``(model, args, kwargs)`` where ``kwargs``
-    # carries the acceptance criterion for that model — its prescribed
-    # fingerprint (``expected``) plus optional tolerances — defined once and
-    # reused across every solver in ``parameter_axes``.
-    def _softmax_case(self):
-        """softmax(dim=0) over (512, 1024). The desired plan keeps only the
-        ``exp`` intermediate (buf1) resident in LX; the two reductions (buf0=max,
-        buf3=sum) and the normalised bodies (buf2, buf4) spill to HBM. The
-        reductions take a 16-way split of the stride-1 (column) axis with a 2-way
-        split of the reduced axis (``((1, 16),), ((1024, 2),)``); the pointwise
-        ops take a full 32-way split of the stride-1024 axis (``((1024, 32),)``).
-        """
-        return (
-            functools.partial(torch.softmax, dim=0),
-            (self.rand_device((512, 1024)),),
-            {
-                "expected": {
-                    "buf0": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
-                    "buf1": ("LX", 1048576, (((1024, 32),), ())),
-                    "buf2": ("HBM", 1048576, (((1024, 32),), ())),
-                    "buf3": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
-                    "buf4": ("HBM", 1048576, (((1024, 32),), ())),
-                }
-            },
-        )
-
-    def _mlp_case(self):
-        """Two-layer linear MLP (``nn.Linear -> silu -> nn.Linear``). With every
-        op LX-eligible, the plan keeps two of the three hidden-width activations
-        resident (buf0, buf1); the third hidden-width buffer (buf2), the two
-        output-width buffers (buf3, buf4) and the two Linear weight buffers
-        (buf5, buf6) spill to HBM. The resident hidden-width ops take an 8x4
-        split across two axes (``((1, 8), (1024, 4))``).
-        """
-        model, args = self._simple_mlp()
-        return (
-            model,
-            args,
-            {
-                "expected": {
-                    "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf2": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf3": ("HBM", 65536, (((1, 2), (256, 8)), ((1, 2),))),
-                    "buf4": ("HBM", 65536, (((256, 32),), ())),
-                    "buf5": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                    "buf6": ("HBM", 524288, (((1, 16), (1024, 2)), ())),
-                }
-            },
-        )
-
-    def _sdpa_case(self):
-        """4D scaled-dot-product attention. With every op LX-eligible, the plan
-        keeps most of the matmul -> softmax -> matmul chain resident (buf0,
-        buf2-buf7, all 32-way split); two matmul outputs (buf1, buf8), the empty
-        constant of the decomposition (buf9) and the final result (buf11) land in
-        HBM. The resident ops take single-axis 32-way splits; buf11 takes a 4x4
-        two-axis split (``((64, 4), (16384, 4))``) and the empty constant is
-        undivided.
-
-        Note: under PT 2.12 the SDPA decomposition graph has one fewer buffer
-        than PT 2.11 (12 vs 13); the buffers renumbered (former buf10/buf12 are
-        now buf9/buf11) and buf8 now spills to HBM. Numerics are unchanged
-        (verified against CPU); only the buffer plan shape changed with the
-        upstream decomposition.
-        """
-        batch, heads, seq_len, head_dim = 1, 4, 256, 64
-        return (
-            torch.nn.functional.scaled_dot_product_attention,
-            (
-                self.rand_device((batch, heads, seq_len, head_dim)),
-                self.rand_device((batch, heads, seq_len, head_dim)),
-                self.rand_device((batch, heads, seq_len, head_dim)),
-            ),
-            {
-                "expected": {
-                    "buf0": ("LX", 131072, (((64, 32),), ())),
-                    "buf1": ("HBM", 131072, (((64, 32),), ())),
-                    "buf2": ("LX", 524288, (((256, 32),), ())),
-                    "buf3": ("LX", 131072, (((1, 32),), ())),
-                    "buf4": ("LX", 524288, (((256, 32),), ())),
-                    "buf5": ("LX", 524288, (((256, 32),), ())),
-                    "buf6": ("LX", 131072, (((1, 32),), ())),
-                    "buf7": ("LX", 524288, (((256, 32),), ())),
-                    "buf8": ("HBM", 131072, (((64, 32),), ())),
-                    "buf9": ("HBM", 128, ((), ())),
-                    "buf11": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
-                }
-            },
-        )
-
-    def _swiglu_case(self):
-        """A single SwiGLU layer: two parallel ``nn.Linear`` projections (each a
-        ``mm`` GEMM plus a bias add) feeding ``silu(gate) * up``. The lowered
-        graph is eight buffers:
-
-          - buf6, buf7 -- restickified gate/up weights
-          - buf0 -- gate GEMM (``mm``, a Reduction), the input to SiLU
-          - buf1 -- gate + bias
-          - buf2 -- ``silu(buf1)``
-          - buf3 -- up GEMM (``mm``, a Reduction)
-          - buf4 -- up + bias
-          - buf5 -- ``buf2 * buf4``, the layer output
-
-        With every op LX-eligible, the plan keeps the whole hidden-width chain
-        resident in LX (buf0-buf4), each taking an 8x4 split across two axes
-        (``((1, 8), (1024, 4))``); the output (buf5) spills to HBM. The two
-        weight buffers (buf6, buf7) spill to HBM with a 2x16 split
-        (``((1, 2), (256, 16))``).
-
-        The shared input ``x`` is *not* LX-pinned: both GEMMs split it 8-way
-        along their free (N) dimension, which ``x`` does not have, so each
-        consumer's per-core view of ``x`` (a 4-way split of the shared M axis)
-        covers fewer cores than the GEMM runs. That is a broadcast read of a
-        per-core scratchpad buffer, which the single-base LX path cannot serve,
-        so the broadcast-read guard in ``get_ncores_for_buffers`` keeps ``x`` in
-        HBM.
-        """
-        model, args = self._swiglu()
-        return (
-            model,
-            args,
-            {
-                "expected": {
-                    "buf6": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                    "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf2": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf7": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                    "buf3": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf4": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                    "buf5": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
-                }
-            },
-        )
-
-    parameter_axes = {"solver_method": ("greedy", "cpsat")}
-    parameter_models = (
-        ("softmax_prescribed_allocation", _softmax_case),
-        ("mlp_prescribed_allocation", _mlp_case),
-        ("sdpa_prescribed_allocation", _sdpa_case),
-        ("swiglu_prescribed_allocation", _swiglu_case),
-    )
-
-    # TODO: Update this when we have matching alloctions with CP-SAT or equally optimal plans
-    @staticmethod
-    def case_decorators(params):
-        """The greedy plans are prescribed exactly; CP-SAT is expected to differ,
-        so mark its combos ``expectedFailure`` (and skip when ortools is absent
-        since the joint CP-SAT path needs it)."""
-        if params["solver_method"] == "cpsat":
-            return [
-                unittest.expectedFailure,
-                unittest.skipUnless(
-                    _HAS_ORTOOLS, "joint CP-SAT prescribed xfail needs ortools"
-                ),
-            ]
-        return []
-
-    def run_case(self, params: dict, factory: Callable) -> None:
-        """Compile the factory's model through the co-optimising allocator on the
-        combo's solver and assert it matches the model's prescribed fingerprint."""
-        model, args, kwargs = factory(self)
-        self._assert_prescribed_allocation(
-            model,
-            args,
-            kwargs["expected"],
-            layout_solver=params["solver_method"],
-            atol=kwargs.get("atol", 0.1),
-            rtol=kwargs.get("rtol", 0.1),
-        )
-
-
 class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
     """An *intermediate* buffer read partially (sliced) must not be LX-pinned.
 
     Companion to ``TestCloneAtGraphBoundaries``, which guards graph
-    input/output clones. ``ScratchpadAllocator._residency_reasons`` applies the
+    input/output clones. ``residency_rules._residency_reasons`` applies the
     same ``buffer_not_read_in_full`` guard to intermediate buffers: a buffer that is
     produced in full and then read over a sub-extent (an inner-dim slice that
     feeds a chained op) would be LX-pinned and mis-addressed by the single-base
@@ -1240,7 +895,6 @@ class TestIntermediateReadTwice(BaseTestScratchpadUsage):
         with ts_inductor_config.patch(
             lx_planning=True,
             co_optimizing_lx_planning=True,
-            layout_solver="cpsat",
             sencores=32,
         ):
             result, _ = self.compile_and_collect_mem_usage(fn, (x, y))
@@ -1298,122 +952,20 @@ class TestLivenessIndicesAreDistinct(BaseTestScratchpadUsage):
             self.assertEqual(uses, sorted(set(uses)), name)
 
 
-class TestCpSatAllocatorFallback(
-    BaseTestScratchpadUsage, metaclass=_ParameterizedScratchpadMeta
-):
-    """CP-SAT gracefully degrades to greedy placement when ortools is absent.
-
-    Forces the missing-ortools condition (``cp_model = None``) and drives the
-    ``layout_solver="cpsat"`` path over the model sweep, in both the joint
-    (``co_optimization=True``) and placement-only (``co_optimization=False``)
-    routings. In every combination the compile must succeed and LX planning must
-    still reduce HBM traffic (the greedy fallback is correct, just not
-    CP-SAT-optimal). The metaclass injects one ``test_<model>__<combo>`` method
-    per ``(model, config-combo)``.
-
-    Without ortools, ``cpsat`` degrades to greedy placement, which is not
-    core-division-capable; the ``co_optimization=True`` cases must therefore opt
-    into the ``ExhaustiveSearchSolver`` DFS fallback via
-    ``allow_exhaustive_search=True`` (see ``run_case`` below), which is exactly
-    the degraded routing this class exists to cover.
-    """
-
-    # Models swept by the parameterized suites, as ``(label, factory)`` where
-    # ``factory(self) -> (model, args, kwargs)``. ``kwargs`` are forwarded to the
-    # per-case body (e.g. relaxed tolerances for fp16 matmul). SDPA is intentionally
-    # omitted — it is too slow under co-optimization.
-    def _softmax_case(self):
-        f = functools.partial(torch.softmax, dim=0)
-        x = self.rand_device((512, 1024))
-        return f, (x,), {}
-
-    def _mlp_case(self):
-        mlp, args = self._simple_mlp()
-        return mlp, args, {"atol": 0.1, "rtol": 0.1}
-
-    parameter_axes = {
-        "solver_method": ("cpsat",),
-        "sencores": (32,),
-        "co_optimization": (False, True),
-    }
-
-    parameter_models = (("softmax", _softmax_case), ("mlp", _mlp_case))
-
-    @contextmanager
-    def _ortools_absent(self):
-        """Force the missing-ortools condition: CpSatLayoutSolver.__init__ raises
-        ImportError (so the allocator falls back) exactly when cp_model is None,
-        which is how a real missing install presents."""
-        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-
-        saved = ilp_solver_ortools.cp_model
-        ilp_solver_ortools.cp_model = None
-        try:
-            yield
-        finally:
-            ilp_solver_ortools.cp_model = saved
-
-    def run_case(self, params: dict, factory: Callable) -> None:
-        """Run ``factory``'s model for correctness under this combo, applying
-        the combo's config at the test-case level (the inherited setUp only
-        applies invariants)."""
-        with self._ortools_absent():
-            with ts_inductor_config.patch(
-                layout_solver=params["solver_method"],
-                sencores=params["sencores"],
-                co_optimizing_lx_planning=params["co_optimization"],
-                # Without ortools, cpsat degrades to greedy placement, which is
-                # not core-division-capable, so co_optimization=True can only
-                # proceed via the ExhaustiveSearchSolver DFS fallback -- the
-                # degraded routing this class exists to cover. (No-op for
-                # co_optimization=False.)
-                allow_exhaustive_search=True,
-                _cpsat_warn_on_cost_expr=False,
-            ):
-                model, args, kwargs = factory(self)
-                torch.compiler.reset()
-                with ts_inductor_config.patch(lx_planning=False):
-                    result_without_lx, hbm_without_lx = self.measure_hbm_transfers(
-                        model, args
-                    )
-                torch.compiler.reset()
-                with ts_inductor_config.patch(lx_planning=True):
-                    result_with_lx, hbm_with_lx = self.measure_hbm_transfers(
-                        model, args
-                    )
-
-        self.assertLess(
-            hbm_with_lx,
-            hbm_without_lx,
-            f"Expected LX planning to reduce HBM transfers, but it did not "
-            f"({hbm_with_lx} vs {hbm_without_lx} bytes)",
-        )
-        # LX placement only moves buffers, so on/off should match within fp16
-        # rounding (the difference is a couple of ULP). Tolerances come from the
-        # model's kwargs, matching how the correctness path compares elsewhere.
-        atol = kwargs.get("atol", 1e-4)
-        rtol = kwargs.get("rtol", 1e-5)
-        self.assertTrue(
-            torch.allclose(result_without_lx, result_with_lx, atol=atol, rtol=rtol),
-            "Results do not match between LX planning on and off",
-        )
-
-
 @unittest.skipUnless(
     _HAS_ORTOOLS, "forcing a CP-SAT timeout requires the real ortools solver"
 )
 class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
-    """CP-SAT gracefully degrades to greedy placement when the solve times out."""
+    """A CP-SAT solve that times out leaves the graph compilable: the open mode
+    replans over the committed divisions, and when that solve times out too,
+    nothing is placed in LX."""
 
     @contextmanager
     def _zero_solver_timeout(self):
         """Force every CP-SAT solve to run with a 0-second budget so it returns
-        ``UNKNOWN`` and ``CpSatLayoutSolver`` raises ``SolveError`` -- the timeout
-        condition that must drive ``scratchpad_planning``'s greedy fallback.
-        """
-        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        ``UNKNOWN`` and the solve raises ``SolveError``."""
+        from ortools.sat.python import cp_model
 
-        cp_model = ilp_solver_ortools.cp_model
         original_solve = cp_model.CpSolver.Solve
 
         def zero_timeout_solve(solver_self, *args, **kwargs):
@@ -1423,525 +975,173 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
         with patch.object(cp_model.CpSolver, "Solve", zero_timeout_solve):
             yield
 
-    @contextmanager
-    def _count_greedy_plan_layouts(self):
-        """Count ``GreedyLayoutSolver.plan_layout`` invocations while still running
-        the real method.
-        """
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+    def test_softmax_timeout_leaves_graph_unplanned(self):
+        """A reduction chain (softmax(dim=0)) compiles correctly with no LX
+        plan when both solves time out."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
 
-        original_plan_layout = GreedyLayoutSolver.plan_layout
-        calls = {"count": 0}
-
-        def counting_plan_layout(solver_self, *args, **kwargs):
-            calls["count"] += 1
-            return original_plan_layout(solver_self, *args, **kwargs)
-
-        with patch.object(GreedyLayoutSolver, "plan_layout", counting_plan_layout):
-            yield calls
-
-    def _assert_timeout_falls_back_to_greedy(
-        self,
-        model: Callable[[Unpack[Ts]], torch.Tensor],
-        args: tuple[Unpack[Ts]],
-        **kwargs,
-    ) -> None:
-        """Compile ``model`` on the CP-SAT solver with the solve forced to time
-        out, and assert the greedy fallback fires and still yields a correct,
-        HBM-reducing LX plan."""
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
         with ts_inductor_config.patch(
-            layout_solver="cpsat",
             sencores=32,
-            co_optimizing_lx_planning=False,
+            co_optimizing_lx_planning=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             torch.compiler.reset()
             with ts_inductor_config.patch(lx_planning=False):
-                result_without_lx, hbm_without_lx = self.measure_hbm_transfers(
-                    model, args
-                )
+                result_without_lx, _ = self.compile_and_collect_mem_usage(f, (x,))
             torch.compiler.reset()
             with (
                 self._zero_solver_timeout(),
-                self._count_greedy_plan_layouts() as greedy_calls,
+                _recording_division_modes() as modes,
+                self.assertLogs(allocator_module.logger, level="INFO") as logs,
                 ts_inductor_config.patch(lx_planning=True),
             ):
-                result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
+                result_with_lx, mem_usages = self.compile_and_collect_mem_usage(f, (x,))
 
-        self.assertGreater(
-            greedy_calls["count"],
-            0,
-            "Expected the CP-SAT timeout to trigger the greedy fallback, but "
-            "GreedyLayoutSolver.plan_layout was never called",
+        self.assertEqual(modes, ["open", "committed"])
+        self.assertIn("nothing is placed in LX", "\n".join(logs.output))
+        self.assertFalse(
+            [name for name, u in mem_usages.items() if u["location"] == "LX"],
+            "a failed solve must leave every buffer in HBM",
         )
-        self.assertLess(
-            hbm_with_lx,
-            hbm_without_lx,
-            f"Expected the greedy fallback to still reduce HBM transfers, but it "
-            f"did not ({hbm_with_lx} vs {hbm_without_lx} bytes)",
-        )
-        # LX placement only moves buffers, so on/off should match within fp16
-        # rounding (the difference is a couple of ULP).
-        atol = kwargs.get("atol", 1e-4)
-        rtol = kwargs.get("rtol", 1e-5)
+        # The unplanned graph is the LX-off graph, so the results agree within
+        # fp16 rounding.
         self.assertTrue(
-            torch.allclose(result_without_lx, result_with_lx, atol=atol, rtol=rtol),
+            torch.allclose(result_without_lx, result_with_lx, atol=1e-4, rtol=1e-5),
             "Results do not match between LX planning on and off",
         )
 
-    def test_softmax_timeout_falls_back_to_greedy(self):
-        """A reduction chain (softmax(dim=0)) falls back cleanly on timeout."""
-        f = functools.partial(torch.softmax, dim=0)
-        x = self.rand_device((512, 1024))
-        self._assert_timeout_falls_back_to_greedy(f, (x,))
-
 
 class TestSolveErrorFallback(unittest.TestCase):
-    """The greedy fallback after a SolveError keeps the failed allocator's
-    post-allocation passes. Pure dispatch, no device needed."""
+    """``scratchpad_planning`` after a ``SolveError``: an open-mode allocator
+    replans over the committed divisions and keeps its post-allocation passes;
+    when that fails too, or the failing allocator was already committed,
+    nothing is placed and the failure is logged at INFO.
+    Pure dispatch, no device needed."""
 
-    def test_fallback_keeps_lx_context_switching(self):
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-        from torch_spyre._inductor.scratchpad.lx_context_switching import (
-            LxContextSwitchingPass,
+    def _config(self, co_optimizing: bool):
+        return ts_inductor_config.patch(
+            co_optimizing_lx_planning=co_optimizing,
+            enable_lx_context_switching=True,
+            _cpsat_warn_on_cost_expr=False,
         )
+
+    def _plan_with_failing(self, failing, replan_side_effect=None):
+        """Run ``scratchpad_planning`` with ``failing`` raising ``SolveError``
+        and every other allocator's ``plan_allocation`` mocked."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad.plan_solver import SolveError
 
         graph = object()
-        with ts_inductor_config.patch(
-            layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
-            enable_lx_context_switching=True,
-            _cpsat_warn_on_cost_expr=False,
+        with (
+            patch.object(
+                failing, "plan_allocation", side_effect=SolveError("forced")
+            ) as failed,
+            patch.object(
+                allocator_module.ScratchpadAllocator,
+                "plan_allocation",
+                autospec=True,
+                side_effect=replan_side_effect,
+            ) as replan,
+            self.assertLogs(allocator_module.logger, level="INFO") as logs,
         ):
+            allocator_module.scratchpad_planning(graph, failing)
+        failed.assert_called_once_with(graph)
+        for call in replan.call_args_list:
+            self.assertIs(call.args[1], graph)
+        return replan, logs
+
+    def test_open_mode_replans_committed(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.lx_context_switching import (
+            LxContextSwitchingPass,
+        )
+
+        with self._config(co_optimizing=True):
             failing = allocator_module.select_allocator()
             post_passes = failing.post_optimization_passes
             self.assertTrue(
                 any(isinstance(p, LxContextSwitchingPass) for p in post_passes)
             )
-            with (
-                patch.object(
-                    failing, "plan_allocation", side_effect=SolveError("forced")
-                ) as failed,
-                patch.object(
-                    allocator_module.ScratchpadAllocator,
-                    "plan_allocation",
-                    autospec=True,
-                ) as fallback,
-                self.assertLogs(allocator_module.logger, level="INFO") as logs,
-            ):
-                allocator_module.scratchpad_planning(
-                    graph, failing, lx_relayout_plans=[]
-                )
+            replan, logs = self._plan_with_failing(failing)
+        replan.assert_called_once()
+        (committed, _) = replan.call_args.args
+        self.assertIs(type(committed), allocator_module.ScratchpadAllocator)
+        self.assertEqual(committed.division_mode, "committed")
+        self.assertIs(committed.post_optimization_passes, post_passes)
+        self.assertEqual([r.levelname for r in logs.records], ["INFO"])
+        self.assertIn(
+            "replanning with the committed work divisions",
+            "\n".join(logs.output),
+        )
 
-        failed.assert_called_once_with(graph, lx_relayout_plans=[])
-        fallback.assert_called_once()
-        greedy, replanned = fallback.call_args.args
-        self.assertIs(type(greedy), allocator_module.ScratchpadAllocator)
-        self.assertIs(greedy.layout_planning, GreedyLayoutSolver)
-        self.assertIs(greedy.post_optimization_passes, post_passes)
-        self.assertIs(replanned, graph)
-        self.assertEqual([record.levelname for record in logs.records], ["INFO"])
-        self.assertIn("falling back to greedy", "\n".join(logs.output))
+    def test_failed_committed_replan_places_nothing(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.plan_solver import SolveError
+
+        with self._config(co_optimizing=True):
+            failing = allocator_module.select_allocator()
+            replan, logs = self._plan_with_failing(
+                failing, replan_side_effect=SolveError("forced again")
+            )
+        replan.assert_called_once()
+        self.assertEqual([r.levelname for r in logs.records], ["INFO", "INFO"])
+        self.assertIn("nothing is placed in LX", logs.output[-1])
+        self.assertIn("forced again", logs.output[-1])
+
+    def test_committed_mode_failure_places_nothing(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        with self._config(co_optimizing=False):
+            failing = allocator_module.select_allocator()
+            replan, logs = self._plan_with_failing(failing)
+        replan.assert_not_called()
+        self.assertEqual([r.levelname for r in logs.records], ["INFO"])
+        self.assertIn("nothing is placed in LX", logs.output[0])
 
 
 class TestSelectAllocator(unittest.TestCase):
-    """select_allocator maps config -> (allocator, solver) so the allocators
-    never inspect config themselves. Pure dispatch, no device needed."""
+    """select_allocator maps config -> allocator so the allocator never
+    inspects config itself. Pure dispatch, no device needed."""
 
-    def test_dispatch_by_config(self):
+    def test_co_optimizing_opens_the_divisions(self):
         from torch_spyre._inductor.scratchpad.allocator import (
-            CoOptimizingAllocator,
-            ExhaustiveSearchSolver,
             ScratchpadAllocator,
             select_allocator,
         )
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-            BestFitLayoutSolver,
-            FirstFitLayoutSolver,
-        )
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
 
-        with ts_inductor_config.patch(
-            layout_solver="greedy", co_optimizing_lx_planning=False
-        ):
-            a = select_allocator()
-            self.assertIs(type(a), ScratchpadAllocator)
-            self.assertEqual(a.layout_planning, GreedyLayoutSolver)
-
-        with ts_inductor_config.patch(
-            layout_solver="bestfit", co_optimizing_lx_planning=False
-        ):
-            a = select_allocator()
-            self.assertIs(type(a), ScratchpadAllocator)
-            self.assertEqual(a.layout_planning, BestFitLayoutSolver)
-
-        with ts_inductor_config.patch(
-            layout_solver="firstfit", co_optimizing_lx_planning=False
-        ):
-            a = select_allocator()
-            self.assertIs(type(a), ScratchpadAllocator)
-            self.assertEqual(a.layout_planning, FirstFitLayoutSolver)
-
-        # greedy/bestfit/firstfit + co-optimization have no core-division-capable
-        # solver to co-optimize with, so they can only proceed by falling back to
-        # ExhaustiveSearchSolver -- disallowed unless allow_exhaustive_search is
-        # set. All three go through the same generic dict-driven dispatch in
-        # select_allocator(), so this exercises that shared path for each.
-        for solver_method, solver_cls in (
-            ("greedy", GreedyLayoutSolver),
-            ("bestfit", BestFitLayoutSolver),
-            ("firstfit", FirstFitLayoutSolver),
-        ):
-            with self.subTest(solver_method=solver_method):
+        for co_optimizing, mode in ((True, "open"), (False, "committed")):
+            with self.subTest(co_optimizing_lx_planning=co_optimizing):
                 with ts_inductor_config.patch(
-                    layout_solver=solver_method,
-                    co_optimizing_lx_planning=True,
-                    allow_exhaustive_search=False,
-                ):
-                    with self.assertRaises(ValueError):
-                        select_allocator()
-
-                with ts_inductor_config.patch(
-                    layout_solver=solver_method,
-                    co_optimizing_lx_planning=True,
-                    allow_exhaustive_search=True,
+                    co_optimizing_lx_planning=co_optimizing,
+                    _cpsat_warn_on_cost_expr=False,
                 ):
                     a = select_allocator()
-                    self.assertIsInstance(a, CoOptimizingAllocator)
-                    solver = a.layout_planning([], a.size)
-                    self.assertIsInstance(solver, ExhaustiveSearchSolver)
-                    self.assertIs(solver._inner_factory, solver_cls)
+                self.assertIs(type(a), ScratchpadAllocator)
+                self.assertEqual(a.division_mode, mode)
 
-        # cpsat + co-optimization routes to the joint allocator when ortools
-        # is present (CpSatLayoutSolver is core-division-capable and is used
-        # directly); without ortools cpsat resolves to its greedy fallback,
-        # which would need an ExhaustiveSearchSolver wrapper -- likewise
-        # disallowed unless allow_exhaustive_search is set.
-        with ts_inductor_config.patch(
-            layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
-            allow_exhaustive_search=False,
-            _cpsat_warn_on_cost_expr=False,
-        ):
-            if _HAS_ORTOOLS:
-                a = select_allocator()
-                self.assertIsInstance(a, CoOptimizingAllocator)
-                self.assertIs(a.layout_planning, CpSatLayoutSolver)
-            else:
-                with self.assertRaises(ValueError):
-                    select_allocator()
-
-        with ts_inductor_config.patch(
-            layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
-            allow_exhaustive_search=True,
-            _cpsat_warn_on_cost_expr=False,
-        ):
-            a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
-            solver = a.layout_planning([], a.size)
-            if _HAS_ORTOOLS:
-                self.assertIs(a.layout_planning, CpSatLayoutSolver)
-                self.assertIsInstance(solver, CpSatLayoutSolver)
-            else:
-                self.assertIsInstance(solver, ExhaustiveSearchSolver)
-                self.assertIs(solver._inner_factory, GreedyLayoutSolver)
-
-        # cpsat without co-optimization is placement-only: a ScratchpadAllocator
-        # driven by CpSatLayoutSolver (GreedyLayoutSolver when ortools is
-        # absent) on the pre-determined core divisions.
-        with ts_inductor_config.patch(
-            layout_solver="cpsat", co_optimizing_lx_planning=False
-        ):
-            a = select_allocator()
-            self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIs(
-                a.layout_planning,
-                CpSatLayoutSolver if _HAS_ORTOOLS else GreedyLayoutSolver,
-            )
-
-        # simulated_annealing + co-optimization routes to the joint allocator
-        # driven by the SA co-optimizer. This is a *different class* from the
-        # placement-only annealer below, not the same solver doing less work.
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
-            SaCoOptimizingSolver,
-        )
-        from torch_spyre._inductor.scratchpad.simulated_annealing import (
-            SimulatedAnnealingLayoutSolver,
-        )
-
-        with ts_inductor_config.patch(
-            layout_solver="simulated_annealing", co_optimizing_lx_planning=True
-        ):
-            a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
-            self.assertEqual(a.layout_planning, SaCoOptimizingSolver)
-
-        # Without co-optimization the same config value selects the layout-only
-        # annealer, placement-only -- deliberately NOT wrapped in
-        # ExhaustiveSearchSolver, which solves the layout once per enumerated
-        # division candidate.
-        with ts_inductor_config.patch(
-            layout_solver="simulated_annealing", co_optimizing_lx_planning=False
-        ):
-            a = select_allocator()
-            self.assertIs(type(a), ScratchpadAllocator)
-            self.assertEqual(a.layout_planning, SimulatedAnnealingLayoutSolver)
-            self.assertNotEqual(a.layout_planning, SaCoOptimizingSolver)
-
-        with ts_inductor_config.patch(
-            layout_solver="bogus", co_optimizing_lx_planning=False
-        ):
-            with self.assertRaises(ValueError):
-                select_allocator()
-
-    def test_exhaustive_search_guard_error_text(self):
-        """The ValueError raised for a non-core-division-capable solver names the
-        offending solver and every documented way out, regardless of host ortools
-        availability."""
+    def test_division_strategy_picks_the_encoding(self):
         from torch_spyre._inductor.scratchpad.allocator import select_allocator
-
-        for solver_method in ("greedy", "bestfit", "firstfit"):
-            with self.subTest(solver_method=solver_method):
-                with ts_inductor_config.patch(
-                    layout_solver=solver_method,
-                    co_optimizing_lx_planning=True,
-                    allow_exhaustive_search=False,
-                ):
-                    with self.assertRaises(ValueError) as ctx:
-                        select_allocator()
-                message = str(ctx.exception)
-                self.assertIn(solver_method, message)
-                self.assertIn("allow_exhaustive_search", message)
-                self.assertIn("co_optimizing_lx_planning", message)
-
-    def test_cpsat_co_optimization_guard_with_ortools_forced_absent(self):
-        """Forces the missing-ortools condition explicitly (rather than branching
-        on the host's actual ortools install) so this assertion runs the same way
-        on every machine: ``cpsat`` degrades to a greedy factory, which is not
-        core-division-capable, so co-optimization must raise unless
-        ``allow_exhaustive_search`` is set."""
-        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-        from torch_spyre._inductor.scratchpad.allocator import select_allocator
-
-        saved = ilp_solver_ortools.cp_model
-        ilp_solver_ortools.cp_model = None
-        try:
-            with ts_inductor_config.patch(
-                layout_solver="cpsat",
-                co_optimizing_lx_planning=True,
-                allow_exhaustive_search=False,
-                _cpsat_warn_on_cost_expr=False,
-            ):
-                with self.assertRaises(ValueError) as ctx:
-                    select_allocator()
-            self.assertIn("cpsat", str(ctx.exception))
-            self.assertIn("allow_exhaustive_search", str(ctx.exception))
-        finally:
-            ilp_solver_ortools.cp_model = saved
-
-    def test_cpsat_without_ortools_is_greedy_with_its_capabilities(self):
-        """Without ortools, placement-only ``cpsat`` is resolved to the greedy
-        class at selection, so the allocator asks greedy about its capabilities
-        -- and so collects committed relayout plans, as
-        ``layout_solver="greedy"`` does."""
-        from torch_spyre._inductor import logging_utils
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-
-        logging_utils._warned_once.discard(
-            (allocator_module.logger.name, "cpsat_unavailable")
+        from torch_spyre._inductor.scratchpad.encoding_strategy import (
+            PairTableStrategy,
+            EnumeratedStrategy,
         )
-        saved = ilp_solver_ortools.cp_model
-        ilp_solver_ortools.cp_model = None
-        try:
-            with (
-                ts_inductor_config.patch(
-                    layout_solver="cpsat", co_optimizing_lx_planning=False
-                ),
-                self.assertLogs(allocator_module.logger, level="WARNING") as logs,
-            ):
-                a = allocator_module.select_allocator()
-        finally:
-            ilp_solver_ortools.cp_model = saved
-        self.assertIs(a.layout_planning, GreedyLayoutSolver)
-        self.assertTrue(a.layout_planning.supports_paired_buffers())
-        self.assertIn("falling back to the default greedy", "\n".join(logs.output))
+        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-
-class TestSolverCapabilities(unittest.TestCase):
-    """The capability class methods every concrete solver answers, and the
-    definition-time checks ``MemoryPlanSolver.__init_subclass__`` makes."""
-
-    _NAMES = (
-        "chooses_core_divisions",
-        "supports_paired_buffers",
-        "decides_lx_relayouts",
-        "generates_divisions",
-        "chooses_tilings",
-        "tilings_from_menu",
-        "linear_cost_only",
-    )
-
-    def _answers(self, cls) -> dict[str, bool]:
-        return {name: getattr(cls, name)() for name in self._NAMES}
-
-    def test_production_solvers(self):
-        from torch_spyre._inductor.scratchpad.exhaustive_search import (
-            ExhaustiveSearchSolver,
-        )
-        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-            BestFitLayoutSolver,
-            FirstFitLayoutSolver,
-        )
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
-            SaCoOptimizingSolver,
-        )
-        from torch_spyre._inductor.scratchpad.simulated_annealing import (
-            SimulatedAnnealingLayoutSolver,
-        )
-
-        none = dict.fromkeys(self._NAMES, False)
-        joint = {**none, "chooses_core_divisions": True}
-        expected = {
-            GreedyLayoutSolver: {**none, "supports_paired_buffers": True},
-            FirstFitLayoutSolver: none,
-            BestFitLayoutSolver: none,
-            SimulatedAnnealingLayoutSolver: none,
-            SaCoOptimizingSolver: {
-                **joint,
-                "generates_divisions": True,
-                "chooses_tilings": True,
-            },
-            CpSatLayoutSolver: {
-                **joint,
-                "decides_lx_relayouts": True,
-                "chooses_tilings": True,
-                "tilings_from_menu": True,
-                "linear_cost_only": True,
-            },
-            ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
-        }
-        for cls, answers in expected.items():
-            with self.subTest(solver=cls.__name__):
-                self.assertEqual(self._answers(cls), answers)
-
-    def test_exhaustive_search_is_one_class_per_inner_solver(self):
-        from torch_spyre._inductor.scratchpad.exhaustive_search import (
-            ExhaustiveSearchSolver,
-        )
-        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-            FirstFitLayoutSolver,
-        )
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-
-        greedy = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)
-        self.assertIs(ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver), greedy)
-        self.assertIsNot(ExhaustiveSearchSolver.wrapping(FirstFitLayoutSolver), greedy)
-        self.assertIs(greedy([], 1)._inner_factory, GreedyLayoutSolver)
-        self.assertEqual(greedy.__module__, ExhaustiveSearchSolver.__module__)
-        self.assertEqual(
-            greedy.__qualname__, "ExhaustiveSearchSolver[GreedyLayoutSolver]"
-        )
-        with self.assertRaisesRegex(TypeError, "wrapping"):
-            ExhaustiveSearchSolver([], 1)
-
-    def test_definition_time_checks(self):
-        from torch_spyre._inductor.scratchpad.plan_solver import (
-            CoreDivisionLayoutSolver,
-            MemoryPlanSolver,
-        )
-
-        def placement(**answers):
-            return {
-                "plan_layout": lambda self, log_lx_usage=False: [],
-                **{
-                    name: classmethod(lambda cls, v=value: v)
-                    for name, value in answers.items()
-                },
-            }
-
-        all_false = dict.fromkeys(self._NAMES[1:], False)
-        # An abstract intermediate class answers nothing and is not checked.
-        type("StillAbstract", (MemoryPlanSolver,), {})
-        type("Placement", (MemoryPlanSolver,), placement(**all_false))
-
-        missing = placement(**all_false)
-        del missing["linear_cost_only"]
-        with self.assertRaisesRegex(TypeError, "must answer linear_cost_only"):
-            type("Missing", (MemoryPlanSolver,), missing)
-        for implied in ("decides_lx_relayouts", "generates_divisions"):
-            with (
-                self.subTest(implied=implied),
-                self.assertRaisesRegex(
-                    TypeError, f"{implied}\\(\\) requires chooses_core_divisions"
-                ),
-            ):
-                type(
-                    "WithoutDivisions",
-                    (MemoryPlanSolver,),
-                    placement(**{**all_false, implied: True}),
-                )
-
-        joint = placement(**all_false)
-        joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
-        with self.assertRaisesRegex(
-            TypeError, "tilings_from_menu\\(\\) requires chooses_tilings"
+        for strategy, cls in (
+            ("lazy", LazyStrategy),
+            ("enumerated", EnumeratedStrategy),
+            ("table", PairTableStrategy),
         ):
-            type(
-                "WithoutTilings",
-                (CoreDivisionLayoutSolver,),
-                {**joint, "tilings_from_menu": classmethod(lambda cls: True)},
-            )
-        with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
-            type(
-                "JointThatDenies",
-                (CoreDivisionLayoutSolver,),
-                {**joint, "chooses_core_divisions": classmethod(lambda cls: False)},
-            )
-
-
-class TestCpsatFallbackWarning(unittest.TestCase):
-    """Without ortools, ``_cpsat_solver_class`` falls back to greedy on every
-    call but warns only once per process, naming what failed to import."""
-
-    def test_two_resolutions_without_ortools_warn_once(self):
-        from torch_spyre._inductor import logging_utils
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-        from torch_spyre._inductor.scratchpad.allocator import GreedyLayoutSolver
-
-        logging_utils._warned_once.discard(
-            (allocator_module.logger.name, "cpsat_unavailable")
-        )
-        with (
-            patch.object(ilp_solver_ortools, "cp_model", None),
-            patch.object(
-                ilp_solver_ortools,
-                "_CP_MODEL_IMPORT_ERROR",
-                "No module named 'pandas'",
-            ),
-            self.assertLogs(allocator_module.logger, level="WARNING") as logs,
-        ):
-            solvers = [allocator_module._cpsat_solver_class() for _ in range(2)]
-        for solver in solvers:
-            self.assertIs(solver, GreedyLayoutSolver)
-        self.assertEqual(len(logs.records), 1, logs.output)
-        self.assertIn("No module named 'pandas'", logs.output[0])
+            with self.subTest(lx_division_strategy=strategy):
+                with ts_inductor_config.patch(lx_division_strategy=strategy):
+                    a = select_allocator()
+                self.assertIs(a.strategy_class, cls)
 
 
 class TestInplaceEdgeGate(unittest.TestCase):
-    """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
+    """Unit tests for ``residency_rules._inplace_edge_ok``, the sole predicate
     defining a legal in-place edge (shared by the normal producer path and the
     graph-input clone reverse-parent path, issue #3212)."""
 
@@ -1960,13 +1160,9 @@ class TestInplaceEdgeGate(unittest.TestCase):
         )
 
     def test_all_conditions_met(self):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
-        self.assertTrue(ScratchpadAllocator._inplace_edge_ok(**self._base_kwargs()))
+        self.assertTrue(residency_rules._inplace_edge_ok(**self._base_kwargs()))
 
     def test_each_condition_blocks_edge(self):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
         # Each entry flips exactly one of the five conditions to failing.
         for label, overrides in {
             "parent not a pointwise input": {"child_pointwise_inputs": []},
@@ -1979,18 +1175,16 @@ class TestInplaceEdgeGate(unittest.TestCase):
                 kwargs = self._base_kwargs()
                 kwargs.update(overrides)
                 self.assertFalse(
-                    ScratchpadAllocator._inplace_edge_ok(**kwargs),
+                    residency_rules._inplace_edge_ok(**kwargs),
                     f"edge should be forbidden when: {label}",
                 )
 
     def test_division_invariant_defers_size_and_core_div(self):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
         # Under division_invariant (the co-optimizing path), the per-core size match
         # and core-division check are deferred to the solver, so a mismatch there is
         # ignored -- but the division-invariant preconditions still gate.
         self.assertTrue(
-            ScratchpadAllocator._inplace_edge_ok(
+            residency_rules._inplace_edge_ok(
                 **{
                     **self._base_kwargs(),
                     "parent_size_per_core": 999,
@@ -2006,7 +1200,7 @@ class TestInplaceEdgeGate(unittest.TestCase):
         ):
             with self.subTest(str(overrides)):
                 self.assertFalse(
-                    ScratchpadAllocator._inplace_edge_ok(
+                    residency_rules._inplace_edge_ok(
                         **{
                             **self._base_kwargs(),
                             **overrides,
@@ -2021,8 +1215,7 @@ class TestInplaceEdgeGate(unittest.TestCase):
         The parent's last use and the child's first use abut at tick 5, but a
         loop-widened parent end or child start moves one of them off that tick.
         """
-        from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _handoff_child_start,
             _handoff_parent_end,
         )
@@ -2039,19 +1232,17 @@ class TestInplaceEdgeGate(unittest.TestCase):
                     "child_start": _handoff_child_start("c", lifetimes, starts),
                     "parent_end": _handoff_parent_end("p", lifetimes, ends),
                 }
-                self.assertIs(ScratchpadAllocator._inplace_edge_ok(**kwargs), expected)
+                self.assertIs(residency_rules._inplace_edge_ok(**kwargs), expected)
 
 
 class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
-    """Plain in-place mutations compile under the co-optimizing greedy path
+    """Plain in-place mutations compile under the co-optimizing path
     (issue #3940).
 
-    With ``co_optimizing_lx_planning=True`` and the default ``greedy`` solver,
-    ``ExhaustiveSearchSolver`` runs with ``prune=True``, so
-    ``_split_fits_sticks`` calls ``_output_stride_to_device_size`` on every op.
-    An op whose buffer is mutated in place carries
-    ``MutationLayoutSHOULDREMOVE``, which has no ``device_layout`` -- the
-    helper must unwrap it via ``real_layout()``. Sliced mutations
+    Candidate enumeration calls ``_output_stride_to_device_size`` (through
+    ``_split_fits_sticks``) on every op. An op whose buffer is mutated in place
+    carries ``MutationLayoutSHOULDREMOVE``, which has no ``device_layout`` --
+    the helper must unwrap it via ``real_layout()``. Sliced mutations
     (``x[:, 32:96] = ...``) never reach the helper because the
     offset-mutation component routes them to a fixed division first, which is
     exactly what masked this; hence the plain-mutation cases here."""
@@ -2062,9 +1253,7 @@ class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
         cpu_result = fn(*cpu_args)
         with ts_inductor_config.patch(
             lx_planning=True,
-            layout_solver="greedy",
             co_optimizing_lx_planning=True,
-            allow_exhaustive_search=True,
         ):
             device_result = torch.compile(fn, fullgraph=True)(*args).to("cpu")
         torch.testing.assert_close(device_result, cpu_result, atol=1e-2, rtol=1e-3)
@@ -2120,39 +1309,27 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
             dst.copy_(hop3)
             return dst + torch.amax(dst, dim=-1, keepdim=True), x
 
-        for solver in ("greedy", "cpsat"):
-            if solver == "cpsat" and not _HAS_ORTOOLS:
-                continue
-            with self.subTest(solver=solver):
-                args = (
-                    self.rand_device((128, 256)),
-                    self.rand_device((128, 64)),
-                    self.rand_device((128, 256)),
-                )
-                cpu_args = tuple(t.cpu() for t in args)
-                expected = fn(*cpu_args)
-                with ts_inductor_config.patch(
-                    lx_planning=True,
-                    co_optimizing_lx_planning=True,
-                    layout_solver=solver,
-                    allow_exhaustive_search=True,
-                ):
-                    result = torch.compile(fn, fullgraph=True)(*args)
-                for actual, reference in zip(result, expected):
-                    torch.testing.assert_close(
-                        actual.cpu(), reference, atol=1e-2, rtol=1e-3
-                    )
-                for actual, reference in zip(args, cpu_args):
-                    torch.testing.assert_close(
-                        actual.cpu(), reference, atol=1e-2, rtol=1e-3
-                    )
-                torch.compiler.reset()
+        args = (
+            self.rand_device((128, 256)),
+            self.rand_device((128, 64)),
+            self.rand_device((128, 256)),
+        )
+        cpu_args = tuple(t.cpu() for t in args)
+        expected = fn(*cpu_args)
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            co_optimizing_lx_planning=True,
+        ):
+            result = torch.compile(fn, fullgraph=True)(*args)
+        for actual, reference in zip(result, expected):
+            torch.testing.assert_close(actual.cpu(), reference, atol=1e-2, rtol=1e-3)
+        for actual, reference in zip(args, cpu_args):
+            torch.testing.assert_close(actual.cpu(), reference, atol=1e-2, rtol=1e-3)
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
     def test_attention_before_padded_ffn_keeps_division_candidates(self):
         """The #4990 pad must not pin the upstream attention's divisions."""
         from torch_spyre._inductor.pass_utils import _is_matmul_op
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
         from torch_spyre._inductor.scratchpad.utils import _writes_at_constant_offset
 
         def fn(q, k, v, gate_up, down):
@@ -2169,7 +1346,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
         )
         expected = fn(*(t.cpu() for t in args))
         captured = []
-        original = CoOptimizingAllocator._division_map
+        original = GraphBuilder._division_map
 
         def capture(allocator, graph, **kwargs):
             division_map = original(allocator, graph, **kwargs)
@@ -2192,11 +1369,10 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
             return division_map
 
         with (
-            patch.object(CoOptimizingAllocator, "_division_map", capture),
+            patch.object(GraphBuilder, "_division_map", capture),
             ts_inductor_config.patch(
                 lx_planning=True,
                 co_optimizing_lx_planning=True,
-                layout_solver="cpsat",
             ),
         ):
             result = torch.compile(fn, fullgraph=True)(*args)
@@ -2206,11 +1382,34 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
 
 
 class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
-    """In-place reuse of boundary-clone buffers in the greedy build path (#3212).
+    """In-place reuse of boundary-clone buffers by the solve's graph (#3212),
+    over the committed divisions and in the co-optimizing path.
 
-    These are assertion-style tests (they inspect the buffers the allocator builds
+    These are assertion-style tests (they inspect the graph the allocator builds
     and the final LX addresses), so they live in a plain non-parameterized class
     rather than the model-sweep ``TestCloneAtGraphBoundaries``."""
+
+    @staticmethod
+    def _in_place_parents(solve_graph) -> dict[str, set[str]]:
+        """Each node's in-place parents in a solve graph."""
+        return {
+            n.name: {e.src.name for e in n.inputs if e.in_place}
+            for n in solve_graph.get_nodes()
+        }
+
+    @contextmanager
+    def _capture_solve_graphs(self):
+        """The allocator's solve graphs, in either division mode."""
+        captured: list = []
+        orig = GraphBuilder._build_graph
+
+        def spy(inner_self, *a, **k):
+            result = orig(inner_self, *a, **k)
+            captured.append(result)
+            return result
+
+        with patch.object(GraphBuilder, "_build_graph", spy):
+            yield captured
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
     def test_division_invariant_edges_respect_per_input_pointwise(self):
@@ -2223,7 +1422,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         must never be offered as an in-place parent pre-solver. The assertion locks
         the shared gate into this path; index-specific eligibility is covered by
         PointwiseInPlaceInputsTest."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2238,7 +1436,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         violations: list[str] = []
         edge_count = [0]
         called = [False]
-        orig = CoOptimizingAllocator._determine_in_place_division_invariant
+        orig = GraphBuilder._determine_in_place_division_invariant
 
         def spy(self, graph):
             result = orig(self, graph)
@@ -2248,7 +1446,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 op = op_by_name.get(buf_name)
                 if op is None:
                     continue
-                eligible = self._op_inputs_good_for_lx_inplace(op)
+                eligible = residency_rules._op_inputs_good_for_lx_inplace(op)
                 for parent in parents:
                     edge_count[0] += 1
                     if parent not in eligible:
@@ -2256,13 +1454,12 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return result
 
         with patch.object(
-            CoOptimizingAllocator,
+            GraphBuilder,
             "_determine_in_place_division_invariant",
             spy,
         ):
             with ts_inductor_config.patch(
                 lx_planning=True,
-                layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
                 _cpsat_warn_on_cost_expr=False,
             ):
@@ -2283,48 +1480,40 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         The clone (buffer named after the graph input) is pinned to LX and dies at
         its last read; when that last reader is pointwise and writes a same-shape
-        buffer that is itself read again (a realized candidate),
-        ``_build_bound_buffers`` marks the clone as that consumer's in-place parent.
-        We capture the buffers the allocator builds and assert the reverse-parent
-        edge is present. Values must be unchanged.
+        buffer that is itself read again (a realized candidate), the solve's graph
+        (``GraphBuilder._build_graph``) marks the clone as that consumer's
+        in-place parent. We capture the graph the allocator builds and assert the
+        reverse-parent edge is present. Values must be unchanged.
 
         ``x * 2 + x * 3`` gives x two direct pointwise readers; the second (``x*3``)
         is x's last read and its output feeds the final add, so that output is a
         candidate that names the input clone as parent. (A shape like
         ``torch.abs(x) + x`` would instead have x's last reader be the graph output
         itself -- single-use, never a candidate -- so no edge, correctly.)"""
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
         def fn(x):
             return x * 2.0 + x * 3.0
 
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
-
-        with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-            # This test targets the base placement allocator's
-            # ``_build_bound_buffers``; with co-optimization now the default,
-            # pin the joint path off so ``select_allocator`` does not route to
-            # ``CoOptimizingAllocator`` (whose builder is ``_build_cd_bound_buffers``).
+        with self._capture_solve_graphs() as captured:
+            # Over the committed divisions; the co-optimizing path is the
+            # sibling test below.
             with ts_inductor_config.patch(
                 lx_planning=True, co_optimizing_lx_planning=False
             ):
                 compiled = torch.compile(fn, fullgraph=True)
                 result = compiled(x).to("cpu")
 
-        self.assertTrue(captured, "allocator._build_bound_buffers was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         edge_found = False
-        for bufs in captured:
-            # Input clones are exactly the buffers whose first access is a read.
-            input_clone_names = {b.name for b in bufs if b.first_use_is_read}
-            if any(set(b.in_place_parents) & input_clone_names for b in bufs):
+        for solve_graph in captured:
+            # Input clones are exactly the nodes whose first access is a read.
+            input_clone_names = {
+                n.name for n in solve_graph.get_nodes() if n.first_use_is_read
+            }
+            parents = self._in_place_parents(solve_graph).values()
+            if any(p & input_clone_names for p in parents):
                 edge_found = True
                 break
         self.assertTrue(
@@ -2341,8 +1530,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     def test_input_clone_reverse_parent_in_cooptimizing_path(self):
         """The co-optimizing (joint CP-SAT) path also lets an input clone's last
         consumer name it as an in-place parent, with the merge gate populated
-        (issue #3212). Mirrors the placement-path test above on the joint builder."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        (issue #3212). Mirrors the committed-division test above."""
         from torch_spyre._inductor.scratchpad.plan_solver import BufferType
 
         x = self.rand_device((64, 1024))
@@ -2350,31 +1538,31 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         def fn(x):
             return x * 2.0 + x * 3.0
 
-        captured: list[list] = []
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
-
-        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+        with self._capture_solve_graphs() as captured:
             with ts_inductor_config.patch(
                 lx_planning=True,
-                layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
                 _cpsat_warn_on_cost_expr=False,
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
-        self.assertTrue(captured, "_build_cd_bound_buffers was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         edge_found = False
-        for bufs in captured:
-            input_clones = {b.name for b in bufs if b.boundary == BufferType.Input}
-            for b in bufs:
-                merged = set(b.in_place_parents) & input_clones
-                # The CP-SAT merge also needs the division-match gate populated.
-                if merged and any(p in b.cd_parent_matches for p in merged):
+        for solve_graph in captured:
+            input_clones = {
+                n.name
+                for n in solve_graph.get_nodes()
+                if n.boundary == BufferType.Input
+            }
+            for child, parents in self._in_place_parents(solve_graph).items():
+                merged = parents & input_clones
+                # The CP-SAT merge also needs the division gate populated: a
+                # pair table, or the clone relation the derived encoding reads.
+                if any(
+                    e.src.name in merged
+                    and (e.pairs is not None or e.relation is not None)
+                    for e in solve_graph.nodes[child].inputs
+                ):
                     edge_found = True
                     break
         self.assertTrue(
@@ -2387,96 +1575,19 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             "co-opt input clone in-place reuse changed the numerical result",
         )
 
-    def test_input_clone_matches_visible_to_relayout_candidate_capping(self):
-        """Clone-supplied free divisions are merged into cd_parent_matches
-        BEFORE _cd_parent_relayouts runs, so its cap-and-rank sibling pinning
-        can preserve the candidate group that would let a parent join a
-        division an input clone already occupies for free (#3212's reverse
-        parent).
-
-        Merged only after the call, a positive
-        lx_solver_relayout_groups_per_edge cap could prune exactly that group
-        and silently drop a residency option (cyang49's PR #5057 review).
-        Pins the ordering -- what the pinning sees at call time -- not the
-        solver's eventual choice."""
-        import inspect
-
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            return x * 2.0 + x * 3.0
-
-        captured: list[set] = []
-        orig = CoOptimizingAllocator._cd_parent_relayouts
-
-        def spy(self, *a, **k):
-            bound = inspect.signature(orig).bind(self, *a, **k)
-            matches = bound.arguments.get("cd_parent_matches") or {}
-            captured.append(set(matches))
-            return orig(self, *a, **k)
-
-        # True input-clone names: the inputs that actually produced clone
-        # divisions are exactly the keys input_clone_matches ends up with.
-        # NOT every BufferType.Input buffer -- an ordinary (uncloned) graph
-        # input could appear in cd_parent_matches as a plain relayout
-        # parent and satisfy the ordering assertion without any clone being
-        # visible.
-        clone_names: set[str] = set()
-        orig_cdm = CoOptimizingAllocator._clone_divisions_and_matches
-
-        def spy_cdm(self, input_name, *a, **k):
-            divs, matches = orig_cdm(self, input_name, *a, **k)
-            if divs:
-                clone_names.add(input_name)
-            return divs, matches
-
-        with (
-            patch.object(CoOptimizingAllocator, "_cd_parent_relayouts", spy),
-            patch.object(
-                CoOptimizingAllocator, "_clone_divisions_and_matches", spy_cdm
-            ),
-        ):
-            with ts_inductor_config.patch(
-                lx_planning=True,
-                layout_solver="cpsat",
-                co_optimizing_lx_planning=True,
-                _cpsat_warn_on_cost_expr=False,
-            ):
-                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
-
-        self.assertTrue(captured, "_cd_parent_relayouts was not called")
-        self.assertTrue(
-            clone_names,
-            "expected at least one input clone with a valid core division",
-        )
-        self.assertTrue(
-            any(clone_names & seen for seen in captured),
-            "input-clone matches were not visible in cd_parent_matches at "
-            "_cd_parent_relayouts call time (merged only after the call, so "
-            "the cap-and-rank sibling pinning cannot preserve the group "
-            "matching the clone's free division)",
-        )
-        self.assertTrue(
-            torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
-            "clone-match ordering change altered the numerical result",
-        )
-
     def test_output_feeding_buffer_reused_in_place(self):
         """A buffer feeding a graph output participates in in-place merge via the
         normal computed-buffer path -- issue #3212's output side needs no dedicated
         metadata (unlike the input side).
 
         An LX-pinned buffer that is (or is cloned into) a graph output is a normal
-        op-backed ComputedBuffer, so ``_determine_in_place`` already gives it in-place
+        op-backed ComputedBuffer, so the solve's graph already gives it in-place
         parents (as a child of its producer's input) and lets consumers name it as a
         parent. Here ``y`` is a graph output also read internally; its pointwise
         consumer ``p`` (whose result is itself read, so it is a realized candidate)
         reuses ``y``'s slot -- i.e. the output-feeding buffer is an in-place parent.
         This is a regression guard: if output in-place ever breaks, it fails here."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2487,13 +1598,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, q
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2505,10 +1609,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-                # Base placement path targeted (see the input-clone test above);
-                # pin the joint path off so the default co-optimization flip does
-                # not route to ``CoOptimizingAllocator``.
+            with self._capture_solve_graphs() as captured:
+                # Over the committed divisions (see the input-clone test above).
                 with ts_inductor_config.patch(
                     lx_planning=True, co_optimizing_lx_planning=False
                 ):
@@ -2516,14 +1618,14 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     ry, rq = compiled(x)
                     ry, rq = ry.to("cpu"), rq.to("cpu")
 
-        self.assertTrue(captured, "allocator._build_bound_buffers was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         merged = False
-        for bufs in captured:
-            for b in bufs:
+        for solve_graph in captured:
+            for parents in self._in_place_parents(solve_graph).values():
                 # An output-feeding buffer is used as an in-place *parent*: some
-                # consumer names it in its in_place_parents (matches the docstring;
-                # the sibling aliasing test uses the same tighter check).
-                if set(b.in_place_parents) & output_feeders:
+                # consumer names it among its in-place parents (matches the
+                # docstring; the sibling aliasing test uses the same tighter check).
+                if parents & output_feeders:
                     merged = True
                     break
         self.assertTrue(
@@ -2553,7 +1655,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         reuse edge is actually offered (the hazard is exercised, not vacuous) and
         that both returned values are correct."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2566,13 +1667,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, u
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2583,10 +1677,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-                # Base placement path targeted (see the input-clone test above);
-                # pin the joint path off so the default co-optimization flip does
-                # not route to ``CoOptimizingAllocator``.
+            with self._capture_solve_graphs() as captured:
+                # Over the committed divisions (see the input-clone test above).
                 with ts_inductor_config.patch(
                     lx_planning=True, co_optimizing_lx_planning=False
                 ):
@@ -2597,7 +1689,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         # The hazard is real only if a returned (output-feeding) buffer is actually
         # named as an in-place parent by some consumer.
         reused = any(
-            set(b.in_place_parents) & output_feeders for bufs in captured for b in bufs
+            parents & output_feeders
+            for solve_graph in captured
+            for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
             reused,
@@ -2619,7 +1713,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         (joint CP-SAT) path: a returned buffer whose LX slot is reused in place must
         still be handed back to the caller intact (#3212)."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2632,13 +1725,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, u
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2649,10 +1735,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+            with self._capture_solve_graphs() as captured:
                 with ts_inductor_config.patch(
                     lx_planning=True,
-                    layout_solver="cpsat",
                     co_optimizing_lx_planning=True,
                     _cpsat_warn_on_cost_expr=False,
                 ):
@@ -2661,7 +1746,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     ry, ru = ry.to("cpu"), ru.to("cpu")
 
         reused = any(
-            set(b.in_place_parents) & output_feeders for bufs in captured for b in bufs
+            parents & output_feeders
+            for solve_graph in captured
+            for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
             reused,
@@ -2677,90 +1764,22 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             torch.allclose(ref_u, ru, atol=1e-2, rtol=1e-3), "output u changed"
         )
 
-    def test_input_clone_inplace_shares_lx_slot(self):
+    def _assert_input_clone_shares_lx_slot(self, co_optimizing: bool) -> None:
         """Peak-LX: the input clone reuses a slot rather than adding one (#3212).
 
-        End-to-end confirmation that the reverse-parent edge actually lowers peak LX:
-        the physical input clone shares its LX address with the consumer that reuses
-        it in place, so it does not occupy a dedicated slot. We read the final LX
-        allocations after the allocator runs and assert the input clone's address is
-        shared by another LX buffer (and values are correct)."""
-        from torch_spyre._inductor.pass_utils import op_short_name
-
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            return x * 2.0 + x * 3.0
-
-        input_names: set[str] = set()
-        per_op: dict[str, dict] = {}
-
-        def visit(graph: GraphLowering) -> None:
-            input_names.update(graph.graph_input_names)
-            for op in graph.operations:
-                alloc = getattr(
-                    graph.get_buffer(op.name).get_layout(), "allocation", {}
-                )
-                per_op[op.name] = {
-                    "short": op_short_name(op),
-                    "lx": alloc.get("lx"),
-                    "reads": [d.name for d in op.get_read_writes().reads],
-                }
-
-        with self.pre_scheduling_iterating_pass(visit):
-            # In-place reuse of boundary-clone buffers is a paired-buffer feature
-            # of the greedy build path (only the greedy solver
-            # supports_paired_buffers()), which lives on the base placement
-            # allocator. Pin greedy *and* co-optimization off so the slot-sharing
-            # assertion holds regardless of the default layout_solver and the
-            # default co-optimization flip.
-            with ts_inductor_config.patch(
-                lx_planning=True,
-                layout_solver="greedy",
-                co_optimizing_lx_planning=False,
-            ):
-                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
-
-        # Group LX-resident buffers by address; a shared address == in-place reuse.
-        addr_to_buffers: dict[int, list[str]] = {}
-        for name, info in per_op.items():
-            if info["lx"] is not None:
-                addr_to_buffers.setdefault(info["lx"], []).append(name)
-
-        # The physical input clone: a clone op reading a graph input, LX-resident.
-        input_clones = [
-            name
-            for name, info in per_op.items()
-            if info["short"] == "clone"
-            and info["lx"] is not None
-            and any(r in input_names for r in info["reads"])
-        ]
-        self.assertTrue(input_clones, "expected an LX-resident clone of a graph input")
-        self.assertTrue(
-            any(len(addr_to_buffers[per_op[c]["lx"]]) > 1 for c in input_clones),
-            "input clone occupies a dedicated LX slot -- expected it to share a slot "
-            "with the consumer that reuses it in place (no peak-LX reduction)",
-        )
-        self.assertTrue(
-            torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
-            "input clone slot sharing changed the numerical result",
-        )
-
-    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
-    def test_input_clone_inplace_shares_lx_slot_in_cooptimizing_path(self):
-        """
-        Tests that the co-optimizing path correctly prices input cloning
-        and in-place operations after PR4596
-        """
+        The physical input clone shares its LX address with the consumer that
+        reuses it in place, so it does not occupy a dedicated slot. A 2-slot LX
+        budget cannot hold the three LX-eligible buffers unmerged, so the solve
+        must take the merge. We read the final LX allocations after the
+        allocator runs and assert the input clone's address is shared by
+        another LX buffer (and values are correct)."""
         from torch_spyre._inductor.pass_utils import op_short_name
         from torch_spyre._inductor.scratchpad import allocator as alloc_mod
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
         sencores = 32
         x = self.rand_device((64, 1024))
         # Per-core footprint of each buffer at the 32-way split (fp16 -> 2 bytes),
-        # already 128-byte aligned; a 2-slot budget cannot hold the three
-        # LX-eligible buffers unmerged, forcing exactly one in-place merge.
+        # already 128-byte aligned.
         per_core_bytes = 64 * 1024 * 2 // sencores
         lx_budget = 2 * per_core_bytes
 
@@ -2782,34 +1801,22 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     "reads": [d.name for d in op.get_read_writes().reads],
                 }
 
-        # The joint solve is what this test is about, but ``scratchpad_planning``
-        # silently retries with greedy placement on SolveError -- and greedy also
-        # fires the merge (that is the sibling test), so without this the whole
-        # test would pass on the fallback path.
-        greedy_calls = {"count": 0}
-        original_greedy = GreedyLayoutSolver.plan_layout
-
-        def counting_greedy(solver_self, *args, **kwargs):
-            greedy_calls["count"] += 1
-            return original_greedy(solver_self, *args, **kwargs)
-
         with self.pre_scheduling_iterating_pass(visit):
-            with patch.object(alloc_mod, "_lx_planning_size", lambda: lx_budget):
-                with patch.object(GreedyLayoutSolver, "plan_layout", counting_greedy):
-                    with ts_inductor_config.patch(
-                        lx_planning=True,
-                        layout_solver="cpsat",
-                        co_optimizing_lx_planning=True,
-                        sencores=sencores,
-                    ):
-                        result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+            with (
+                patch.object(alloc_mod, "_lx_planning_size", lambda: lx_budget),
+                _recording_division_modes() as modes,
+                ts_inductor_config.patch(
+                    lx_planning=True,
+                    co_optimizing_lx_planning=co_optimizing,
+                    sencores=sencores,
+                ),
+            ):
+                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
-        self.assertEqual(
-            greedy_calls["count"],
-            0,
-            "CP-SAT fell back to greedy placement, so this test did not "
-            "exercise the joint co-optimizer",
-        )
+        # A failed open solve replans over the committed divisions, which is
+        # the sibling case; without this the co-optimizing case could pass on
+        # the replan.
+        self.assertEqual(modes, ["open" if co_optimizing else "committed"])
 
         # Group LX-resident buffers by address; a shared address == in-place reuse.
         addr_to_buffers: dict[int, list[str]] = {}
@@ -2817,6 +1824,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             if info["lx"] is not None:
                 addr_to_buffers.setdefault(info["lx"], []).append(name)
 
+        # The physical input clone: a clone op reading a graph input, LX-resident.
         input_clones = [
             name
             for name, info in per_op.items()
@@ -2827,131 +1835,23 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(input_clones, "expected an LX-resident clone of a graph input")
         self.assertTrue(
             any(len(addr_to_buffers[per_op[c]["lx"]]) > 1 for c in input_clones),
-            "co-opt input clone occupies a dedicated LX slot -- expected the joint "
-            "solver to reuse it in place under LX pressure (no peak-LX reduction)",
+            "input clone occupies a dedicated LX slot -- expected the solver to "
+            "reuse it in place under LX pressure (no peak-LX reduction)",
         )
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
-            "co-opt input clone slot sharing changed the numerical result",
+            "input clone slot sharing changed the numerical result",
         )
 
-
-class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
-    """The generation seam on real graphs: the per-candidate machinery the SA
-    co-optimizer asks instead of the enumerated menu and its pair table. The
-    unit tests for these seams (``test_work_division.py``) build their own
-    contexts and preps; what only a real compile can check is that the two
-    answers agree on *live* ops, which is what a generated division rests on."""
-
-    def _captured_buffers(self, fn, x):
-        """The buffer list the co-optimizing allocator built, plus the result.
-
-        The assertions run inside the spy: the split space and the residency
-        edges hold live Inductor IR, which needs the virtualized compile context
-        that ``torch.compile`` tears down on exit."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-
-        checked: set[str] = set()
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
-
-        def spy(inner_self, *args, **kwargs):
-            buffers = orig(inner_self, *args, **kwargs)
-            self._check_buffers(buffers, checked)
-            return buffers
-
-        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
-            with ts_inductor_config.patch(
-                lx_planning=True,
-                layout_solver="simulated_annealing",
-                co_optimizing_lx_planning=True,
-                sencores=32,
-                _cpsat_warn_on_cost_expr=False,
-            ):
-                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
-        return checked, result
-
-    def _check_buffers(self, buffers, checked):
-        """Every claim the engine makes about a live buffer, per buffer."""
-        by_name = {b.name: b for b in buffers}
-        for buf in buffers:
-            space = buf.division_space
-            if space is not None:
-                # The menu is exactly what the space admits, which is what makes
-                # a generated division one the enumeration would have carried.
-                for division in buf.core_divisions:
-                    self.assertTrue(
-                        space.admits(space.splits(division)),
-                        f"{buf.name}: menu entry {division.label} not admitted",
-                    )
-                menu = {division.label for division in buf.core_divisions}
-                for neighbour in space.neighbours(buf.core_divisions[0]):
-                    self.assertIn(neighbour.label, menu, buf.name)
-                checked.add("space")
-            # The pair table is a projection of the edges, so the two agree on
-            # every row -- and where both ends generate, so does the inverse
-            # that replaces the row.
-            self.assertEqual(
-                set(buf.residency_edges) - set(buf.cd_parent_matches),
-                set(),
-                buf.name,
-            )
-            for parent, edge in buf.residency_edges.items():
-                pairs = buf.cd_parent_matches[parent]
-                parent_divisions = by_name[parent].core_divisions
-                self.assertEqual(
-                    edge.match_pairs(parent_divisions, buf.core_divisions),
-                    pairs,
-                    f"{buf.name} <- {parent}",
-                )
-                checked.add("edge")
-                parent_space = by_name[parent].division_space
-                if parent_space is None or space is None:
-                    continue
-                for i, parent_division in enumerate(parent_divisions):
-                    constructed = edge.consumer_division_for(parent_division, space)
-                    compatible = [j for ip, j in pairs if ip == i]
-                    if constructed is None:
-                        self.assertFalse(
-                            compatible,
-                            f"{buf.name} <- {parent}: no inverse for candidate "
-                            f"{i}, but the table pairs it with {compatible}",
-                        )
-                        continue
-                    labels = [buf.core_divisions[j].label for j in compatible]
-                    # Identity, not only membership: the two relations may pick
-                    # different compatible entries (see ``_ViewRelation``), but
-                    # a change to which one a flood propagates should be
-                    # deliberate.
-                    self.assertEqual(
-                        constructed.label,
-                        labels[0] if labels else None,
-                        f"{buf.name} <- {parent}: inverse of candidate {i}",
-                    )
-                    checked.add("inverse")
+    @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+    def test_input_clone_inplace_shares_lx_slot(self):
+        self._assert_input_clone_shares_lx_slot(co_optimizing=False)
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
-    def test_generated_divisions_agree_with_the_enumeration_on_a_real_graph(self):
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            a = x + 1.0
-            b = a * 2.0
-            return torch.nn.functional.softmax(b, dim=-1)
-
-        kinds, result = self._captured_buffers(fn, x)
-        # Non-vacuity: all three claims have to have been made on something.
-        self.assertIn("space", kinds, "no buffer got a split space")
-        self.assertIn("edge", kinds, "no buffer got a residency edge")
-        self.assertIn("inverse", kinds, "no edge exercised the view inverse")
-        self.assertTrue(
-            torch.allclose(
-                torch.nn.functional.softmax((x.to("cpu") + 1.0) * 2.0, dim=-1),
-                result,
-                atol=1e-2,
-                rtol=1e-3,
-            ),
-            "generated core divisions changed the numerical result",
-        )
+    def test_input_clone_inplace_shares_lx_slot_in_cooptimizing_path(self):
+        """The co-optimizing path prices input cloning and in-place operations
+        (PR4596)."""
+        self._assert_input_clone_shares_lx_slot(co_optimizing=True)
 
 
 if __name__ == "__main__":

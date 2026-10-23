@@ -14,7 +14,7 @@
 
 """Rehydrate captured co-optimizer dumps into **real** substrate objects.
 
-The fixture JSON is produced by running the real ``CoOptimizingAllocator`` over
+The fixture JSON is produced by running the real the joint ``ScratchpadAllocator`` over
 softmax/mlp/swiglu/sdpa/... and serializing the buffers handed to the solver
 (candidate menus + ``cd_parent_matches`` + placement/cost fields) plus the
 solver's chosen division + address per buffer.
@@ -43,11 +43,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    BufferType,
-    CoreDivision,
-    CoreDivisionBuffer,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import BufferType, CoreDivision
+from buffer_spec import CoreDivisionBuffer
 
 DEFAULT_CAPTURE_PATH = Path(__file__).parent / "cooptimization_captures.json"
 LARGE_CAPTURE_PATH = Path(__file__).parent / "cooptimization_captures_large.json"
@@ -116,8 +113,7 @@ def load_captures(
 
 
 # The capture pins the committed/legacy division at ``core_divisions[0]`` (the
-# allocator's fixed-division seed), so the SA seed is ``chosen_division = 0`` for
-# every buffer, with pi from a FirstFit pass over the sizes.
+# allocator's fixed-division seed).
 SEED_DIVISION_INDEX = 0
 
 
@@ -138,4 +134,4 @@ if __name__ == "__main__":
             print(
                 f"{tag:8} {len(graphs):>6} {len(g.buffers):>7} {pinned:>6} {resident:>9}"
             )
-    print("(*resident = solved reference; the SA engine must re-derive it)")
+    print("(*resident = solved reference; a solve must re-derive it)")

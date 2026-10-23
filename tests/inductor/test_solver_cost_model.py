@@ -676,7 +676,7 @@ def _stamps(op, graph):
 
 def test_extractor_reads_residency_from_is_lx(monkeypatch):
     from torch._inductor.virtualized import V
-    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
+    from buffer_spec import CoreDivisionBuffer
 
     row, other, cores = sympy.symbols("row other cores", integer=True)
     output = CoreDivisionBuffer("buf1", 128, [0])

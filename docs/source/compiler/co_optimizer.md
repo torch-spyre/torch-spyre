@@ -3,7 +3,7 @@
 :::{admonition} Draft
 :class: warning
 
-This is a first draft assembled from `sa_co_optimization.md`, `scratchpad_planning.md`,
+This is a first draft assembled from `scratchpad_planning.md`,
 `work_division_planning.md`, and the current state of
 `torch_spyre/_inductor/scratchpad/`. It is meant as a jumping-off point for review, not a
 finished page — see the open questions in [Ongoing work](#ongoing-work)
@@ -14,8 +14,7 @@ This page is the map of **why** torch-spyre co-optimizes several compiler decisi
 instead of solving each one separately, **how** that joint search works in general, and
 **which** decisions it currently covers. For the full detail on any one piece, follow the links
 into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](work_division_planning.md),
-[Joint core-division + LX placement](sa_co_optimization.md), and
-[Analytical Cost Model](cost_model.md).
+and [Analytical Cost Model](cost_model.md).
 
 **Quick navigation:**
 
@@ -89,142 +88,46 @@ matmul gets a smaller additive correction — while every other op is treated as
 traffic. The data-transfer time is estimated by where each buffer lives (HBM or LX), using known
 or measured bandwidth for the target hardware. Rather than committing to one work division per
 op up front, it evaluates several combinations together and prices the communication cost that
-each one implies, then commits only the winning combination at the end of the search. A few
-different solver backends can drive this search; the sections below cover each in detail, and
-[Cost model](#cost-model) covers the model itself — how it plugs into the solvers, how to
-inspect it, and how to recalibrate it.
+each one implies, then commits only the winning combination at the end of the search. The
+search is one CP-SAT solve, covered below, and [Cost model](#cost-model) covers the model
+itself — how it plugs into the solve, how to inspect it, and how to recalibrate it.
 
-The co-optimizer is reached through `CoOptimizingAllocator`
-(`torch_spyre/_inductor/scratchpad/allocator.py`), gated by `config.co_optimizing_lx_planning`
-(env `CO_OPTIMIZING_LX_PLANNING`, **on by default**) and selected via `config.layout_solver`. It
+The co-optimizer is reached through `ScratchpadAllocator` in its open division mode
+(`division_mode="open"`, `torch_spyre/_inductor/scratchpad/allocator.py`), gated by
+`config.co_optimizing_lx_planning` (env `CO_OPTIMIZING_LX_PLANNING`, **on by default**). It
 runs as a pre-scheduling pass: `V.graph` is live but `V.graph.scheduler` is still `None`, so
 fusion hasn't happened yet. The cost model therefore can't read a kernel's real fused grouping
 off the scheduler — it has to *estimate* one from the flat, ordered operation list instead.
-Without `co_optimizing_lx_planning`, each solver can still be selected on its own, but then it
-only *places* buffers against divisions some earlier pass already fixed — it never searches
-divisions itself. The joint behavior is what `CoOptimizingAllocator` adds on top.
 
-`layout_solver`'s options are `"cpsat"`, `"simulated_annealing"`, `"greedy"`, `"firstfit"`, and
-`"bestfit"`, but only `"simulated_annealing"`, and `"cpsat"` *with `ortools` installed*, are
-natively core-division-capable and reach a purpose-built joint solver directly.
-`select_allocator()` rejects every other combination by default and raises `ValueError`
-**unless** `config.allow_exhaustive_search` (env `ALLOW_EXHAUSTIVE_SEARCH`) is also set, in
-which case `ExhaustiveSearchSolver` will perform a DFS search over
-`greedy`'s own division menu (see details below). **Note this DFS is exponential** — `K^N`
-leaves over the `N` buffers with a real choice — **and has no size cap or timeout of its own.**
-The reject-by-default behavior above is the only guard against that blow-up, so only opt in on
-a task small enough for the exponential compile-time cost to be acceptable. This fallback is
-not a general substitute for CP-SAT or SA.
+`select_allocator()` builds a `ScratchpadAllocator` and takes its division mode from
+`co_optimizing_lx_planning`. There is one solve path for both modes. In the committed mode
+(`co_optimizing_lx_planning` off) every op's candidate menu is the single division work
+division committed, so the same solve only places buffers. If an open-mode solve fails,
+`scratchpad_planning` replans once in the committed mode; if that fails too, nothing is placed
+in LX.
 
-### The simplest version: exhaustive search over greedy placement
+### The CP-SAT solve
 
-Before getting into the production solvers, it's worth seeing the simplest possible instance
-of "co-optimize divisions and placement jointly," because it makes the shape of the problem
-concrete without any annealing or constraint-solving machinery to explain first.
+The allocator builds the solve's graph from the IR (`GraphBuilder.prepare_graph`), the same
+graph for every encoding strategy, prices it (`pricing.cost_expr`), and calls
+`SpyreOptimizationGraph.solve` (`scratchpad/buffer_graph.py`) with the configured strategy
+(`LX_DIVISION_STRATEGY`), which derives its encoding from the graph. That posts the problem
+as one global constraint model to Google OR-Tools CP-SAT. Core-division candidates (and, where
+landed, tiling candidates) are decision variables, placement is a 2D no-overlap packing — each
+resident buffer an optional `[lifetime] × [address, address+size)` rectangle — and
+producer/consumer slicing-match constraints tie divisions together across edges. The solve
+returns the nodes with their decisions filled in, and `SolvedPlan` reads them.
 
-`ExhaustiveSearchSolver` (`torch_spyre/_inductor/scratchpad/exhaustive_search.py`) wraps the
-simplest placement-only solver, `GreedyLayoutSolver`, and brute-forces the other half of the
-problem — searching — around it. For every buffer it generates a few legitimate candidate
-division choices, then tries every combination with an exhaustive DFS, bounded by `K^N` leaves
-where `N` is the number of buffers with a real choice and `K` is each one's candidate count. At
-each leaf:
-
-1. Builds a fresh set of per-core buffer sizes implied by that combination of chosen divisions.
-2. Hands them to a brand-new instance of the wrapped placement solver (a solver is single-use)
-   and calls `plan_layout()`.
-3. Scores the leaf by summing the total size of every buffer the inner solver could *not* pin
-   to LX — the same differential-HBM-traffic idea the production solvers' memory-only
-   fallback uses.
-
-The combination with the lowest score wins; its divisions are committed to every buffer, and
-the wrapped solver runs once more to produce the final LX/HBM addresses.
-
-For example: a producer with 2 candidate divisions feeding a consumer with 2 of its own is a
-`2×2 = 4`-leaf DFS. Say only one of those four pairings avoids a `core_div_mismatch` between
-them, per `_cd_parent_matches()` (`allocator.py`) — the same relation the production solvers use
-to decide which combinations even make a buffer LX-eligible via its `cd_parent_matches` field,
-not a check bolted on separately here. The three mismatched leaves each spill one buffer to HBM
-and score accordingly; the matching leaf scores zero (both pin). `ExhaustiveSearchSolver` tries
-all four, picks the lowest-scoring leaf as the winner, and commits its divisions.
-
-Note this is a simplified scoring which only ever counts unpinned-HBM bytes — there is no
-compute-cost term anywhere in this solver (`plan_layout_and_core_divisions` even carries a
-`# TODO: use cost_expr here`), and it never generates a division of its own: it only indexes
-into the candidate divisions each buffer already carries in from the upstream work-division
-pass. So this simplest version implicitly assumes those upstream divisions are already the
-right call for each buffer's compute shape, and only searches for the pairing that keeps the
-most of them resident. For a memory-bound graph that's not always true: a division that's
-suboptimal for one op's matmul utilization could still lower the *overall* cost if it lets a
-shared buffer stay pinned, but this solver has no way to see that trade-off or reach for such a
-division unless it happens to already be on the menu. The production solvers below close part
-of this gap — CP-SAT and SA both weigh a compute-roofline term alongside HBM traffic — but even
-they choose only among divisions `enumerate_work_division_candidates()` offers, not an unbounded
-search over every possible division.
-
-This also shows why `ExhaustiveSearchSolver` isn't what ships by default: the compile-time cost
-is exponential in the number of buffers with a real choice. `select_allocator()` only reaches for
-it as a fallback — when `co_optimizing_lx_planning` is set but the configured `layout_solver`
-has no purpose-built core-division-capable solver to co-optimize with (i.e. anything other than
-`"cpsat"` with `ortools` installed, or `"simulated_annealing"`) — and only when the caller has
-opted in via `config.allow_exhaustive_search` (env `ALLOW_EXHAUSTIVE_SEARCH`); otherwise it
-raises rather than silently paying that cost. The two production solvers below exist to make
-the common case affordable; the rest of this section covers how `ExhaustiveSearchSolver` itself
-is kept affordable when it does run.
-
-**Pruning the DFS's candidate menu: `_enum_split_options`.** The example above assumed each
-buffer's candidate list — its "menu" — was already small (2 candidates). In practice,
-`select_allocator()` always pairs `ExhaustiveSearchSolver` with
-`CoOptimizingAllocator(prune=True)`, which controls exactly that menu: instead of
-`enumerate_work_division_candidates()`'s full, standalone-work-division-planner cross product,
-`_enum_split_options` (`allocator.py`) builds a much smaller, heuristic candidate list per op,
-dispatching on op type — the difference between a `2×2`-leaf DFS and one with every legal
-division for every buffer. CP-SAT and the SA solver never set `prune=True`; this pruning exists
-specifically to keep *this* DFS's exponential cost affordable, not as a third solving strategy
-alongside them.
-
-Generated alternatives are deduped and filtered down to ones that are actually legal (no
-stick-count overflow, no collapsed/broadcast dims, hard work-division constraints respected).
-Within that, pointwise ops get a handful of dim-flip variants and matmuls get each other's
-splits and a shared batch-major option, so that reconciling buffers across ops stays possible
-without blowing up the per-op menu size — the specific heuristics mirror the kind of
-compute-vs-locality trade-off [Why a co-optimizer](#why-a-co-optimizer) motivates, just applied
-per op type here instead of jointly. The leaf-scoring function is the same one described above
-(`_generate_buffers + plan_layout`, scored by unpinned HBM bytes), with some of its repeated
-work memoized across leaves.
-
-These heuristics are marked TEMP/TODO: the intent is for work division to assign consistent
-splits directly, at which point they can be removed. See
-[Co-optimization is still limited](scratchpad_planning.md#co-optimization-is-still-limited)
-for the remaining gaps in this path.
-
-### The production solvers
-
-Two solver backends implement the joint search at scale, differing in paradigm but sharing
-the same inputs and the same cost model:
-
-- **`CpSatLayoutSolver`** (`config.layout_solver = "cpsat"`, the default) models the problem as
-  one global constraint-satisfaction model via Google OR-Tools CP-SAT. Core-division candidates
-  (and, where landed, tiling candidates) are decision variables, placement is a 2D no-overlap
-  packing — each resident buffer an optional `[lifetime] × [address, address+size)` rectangle —
-  and producer/consumer slicing-match constraints tie divisions together across edges. CP-SAT
-  searches exactly, minimizing predicted HBM traffic.
-- **`SaCoOptimizingSolver`** (`config.layout_solver = "simulated_annealing"` with
-  `co_optimizing_lx_planning`) anneals a single joint state heuristically. The state is the pair
-  `(pi, W)`: the LX layout permutation `pi` (held in a composed `PermutationBasedLayoutSolver`)
-  and the division vector `W`, one candidate-menu index per buffer. It seeds every buffer at
-  menu index 0 with a FirstFit placement, then runs one geometric cool, a capped number of
-  steps per buffer, using three move types — **reorder** (re-place a buffer in `pi`,
-  weight 0.5), **flip** (change one buffer's division, or move a coarse-tiling boundary, weight
-  0.3), and **recolor** (flood a coordinated division change across a connected region via the
-  `cd_parent_matches` compatibility relation, weight 0.2) — and returns the best state seen, so
-  the result is never worse than the seed. See [Joint core-division + LX placement](sa_co_optimization.md) for the
-  full mechanics.
+`SPYRE_LX_BACKEND` picks the backend that runs the model (`scratchpad/backend.py`): `cpsat` by
+default, or `mip:<SCIP|HIGHS|CBC>`, `bruteforce`, or `anneal[:<budget s>]`. `backend.py` keeps
+`Mip`, `BruteForce` and `Annealing` as alternative backends for comparing
+solutions.
 
 ### Co-optimizer will honor `spyre_hint` for work divisions
 
 A resolved `spyre_hint(work_div=...)` is still honored under the co-optimizer, not overridden
-by the joint search. `allocator.py` collapses that op's candidate-division list to the single
-division the hint requested *before* either solver runs — the hint acts upstream of the search,
+by the joint search. `graph_builder.py` collapses that op's candidate-division list to the single
+division the hint requested *before* the solve runs — the hint acts upstream of the search,
 not as a rule the search itself has to learn or respect. Everything else in the graph stays
 co-optimized as usual; only that one op loses its freedom.
 
@@ -242,13 +145,10 @@ exactly that split, unperturbed.
 
 ### Symbolic cost formula
 
-Both production solvers are driven by a *single* cost expression (`cost_expr`), built once, up
+The solve is driven by a *single* cost expression (`cost_expr`), built once, up
 front, by `predict_by_bundle(graph.operations, op_features, ...)`. It's a sympy expression over
 two kinds of symbol, one pair per buffer: `sym_is_lx` (1 if the buffer ends up LX-resident, 0 if
-it spills to HBM) and `sym_core_divs` (which division was chosen). Simulated annealing, choosing
-coarse tilings, adds a third, `sym_tile_counts`: one tile count per axis the buffer's op may
-tile (see [b) LX placement, work division, and coarse
-tiling](#b-lx-placement-work-division-and-coarse-tiling)). `predict_ops`'s real model
+it spills to HBM) and `sym_core_divs` (which division was chosen). `predict_ops`'s real model
 has many more terms (turnaround, replicated-read pricing, access-pattern bandwidth overrides,
 and per-bundle dedup for a graph-boundary input a fused kernel's clone-in loads only once — see
 its docstring); simplified down to the shape that matters for co-optimization:
@@ -263,7 +163,7 @@ for op in ops:
 
 # Search: each candidate binds every buffer's symbols at once, then
 # evaluates the SAME cost_expr under that one joint guess.
-for candidate in candidates:  # CP-SAT's own solver vars, or SA's (chosen, placement) state
+for candidate in candidates:  # CP-SAT's own decision variables
     bindings = {sym: candidate[sym] for sym in cost_expr.free_symbols}
     real_cost = cost_expr.xreplace(bindings).evalf()
     if real_cost < best_cost:
@@ -276,27 +176,28 @@ roofline term keyed off the same `sym_core_divs`. The whole graph's `cost_expr` 
 double sum, built once as pure symbols before any decision is made.
 
 The search phase never changes that expression; it instead scores each candidate by
-substituting its guess into `cost_expr` and evaluating — CP-SAT's own decision variables, or
-SA's `(chosen, placement)` state, are a *different* representation of the same decisions. Once
+substituting its guess into `cost_expr` and evaluating — CP-SAT's own decision variables are a
+*different* representation of the same decisions. Once
 a winner is picked, only its guess is ever written back onto the buffers (as `.address` and
 `.chosen_division`), which is what finally pins down what `sym_is_lx` and `sym_core_divs`
 turned out to mean for that buffer.
 
-When no cost expression is usable (symbolic shapes, serialized captures, or a construction
-error), both solvers fall back to a cheaper **memory-only** objective: pure differential HBM
-traffic, where a resident buffer costs zero and only spills are summed — the compute-roofline
-term drops out entirely. This fallback is weaker — on a graph where everything already fits,
-every division scores identically and the search has nothing left to optimize on.
+When no cost expression is usable (symbolic shapes, serialized captures, a construction
+error, an expression CP-SAT cannot lower, or `auto_coarse_tiling` on), the solve falls back to
+a lexicographic ladder: LX residency first (HBM traffic, where a resident buffer costs zero and
+only spills are summed), then coarse-tiling cuts, parallelism, division shape, and tile count,
+each stage only breaking ties the one before leaves open. The compute-roofline term drops out
+entirely, so this fallback is weaker: on a graph where everything already fits, the residency
+stage scores every division identically. A priced solve breaks ties among divisions the cost
+model prices alike with the same later stages, holding the priced optimum.
 
 ## What gets co-optimized today
 
-**Controlling it**: `config.co_optimizing_lx_planning` and `config.layout_solver` gate both
-subsections below — see [How it works in general](#how-it-works-in-general) for their options,
-and for what happens with a non-core-division-capable `layout_solver` and the
-`ExhaustiveSearchSolver` fallback. Those two are all (a) needs; (b) adds one more on top,
-`config.auto_coarse_tiling` (env `AUTO_COARSE_TILING`, off by default) — the dedicated switch
-for adding coarse tiling to the pair in (a), inert unless `layout_solver` is `"cpsat"` or
-`"simulated_annealing"`.
+**Controlling it**: `config.co_optimizing_lx_planning` gates both subsections below — see
+[How it works in general](#how-it-works-in-general). That is all (a) needs; (b) adds one more
+on top, `config.auto_coarse_tiling` (env
+`AUTO_COARSE_TILING`, off by default) — the dedicated switch for adding coarse tiling to the
+pair in (a), inert unless `co_optimizing_lx_planning` is on.
 
 ### a) LX placement and work division
 
@@ -327,82 +228,51 @@ represented and survives scheduling and codegen — is implemented and documente
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-At a high level: both solvers decide tiling jointly with LX placement and work division, but
-rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
-objective. When `auto_coarse_tiling` is on,
+At a high level: the solve decides tiling jointly with LX placement and work division, in the
+*same* constraint model, just ranked by a different objective. When `auto_coarse_tiling` is on,
 `cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: HBM traffic first, then fewest
-tiling cuts, then parallelism, then division shape, then tile count, each one only resolving
-ties the step before leaves open. Simulated annealing picks a tiling jointly with division too,
-through `OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its
-tile-count symbols: the loop reaches the price mainly through the operands it re-reads, beside
-the residency the tiling makes possible. Either way there is one solve: once it picks a tiling,
-the graph is physically rewritten to apply it, the divisions the solve chose are committed onto
-the tiled graph's ops, and the placement stands.
+now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
+cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
+step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
+apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
+second joint solve, not a continuation of the first, since tiling is no longer offered as a
+choice at that point.
 
-**Status: landed for both solvers, off by default.** `CoreDivision.tiling`
-/ `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
-`scratchpad/coarse_tiling.py`'s `apply_tilings` — taking a `TileSpec` and lowering it to
-`DimHint`s — applies the chosen tilings, both shared by the two solvers:
-
-- **CP-SAT**: landed via `#4768` (`main` as of this update). Each op is offered a menu of
-  output-axis tilings, each with its own division menu; a producer/consumer pair is only
-  compatible if they agree on which slice of the shared buffer each tile and core owns.
-  Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
-  inside one must be compatible. The solve ranks plans with the lexicographic ladder described
-  above, not `cost_expr`. It places the graph its tilings produce: a *cut* (a tiled op whose
-  value must leave its nest) gets a copy op that drains each tile into a full-sized HBM
-  buffer, and the first ladder stage charges that copy's traffic. The tile itself stays an LX
-  candidate, but only under a division with no reduction split, since the copy reads it core
-  for core. A buffer a tiled op reads lives until that op's nest ends, and an input clone it
-  reads is held from the nest's start. Once it picks a tiling, `apply_chosen_tilings`
-  applies it and each op takes the division the solve chose for it, a cut's copy op that of
-  the op it drains. A division that splits a dim its tile no longer iterates raises
-  `Unsupported`: the tilings are already applied by then, so the greedy fallback, which
-  catches only `SolveError`, cannot replan the graph.
-
-- **Simulated annealing**: landed via `#4456` through `#4894`. `OpSplitSpace`'s `TilingSpace`
-  half offers each op its tilings; the **flip** move shifts a tiled run's boundary, and the
-  **recolor** move (it floods a coordinated division change across a connected region of
-  buffers) carries a tiling along with it. Besides the tile-count symbols in `cost_expr`, the
-  anneal prices the HBM traffic of the full-extent companion buffer the apply mints for a tiled
-  op whose output escapes its run, outside that expression. A buffer a tiled op reads from
-  outside its run is refused LX. The chosen tilings are applied before the divisions are
-  committed, keeping the anneal's placement. A tiling the apply refuses raises rather than
-  falling back, since `OpSplitSpace.admits` is meant to offer only tilings the apply can build.
-  See [The apply round](sa_co_optimization.md#the-apply-round) for the mechanics.
+**Status: landed via `#4768`, off by default.** `CoreDivision.tiling` / `min_footprint` in
+`plan_solver.py` account for a tiling if one is present. Each op is offered a menu of
+output-axis tilings, each with its own division menu; a producer/consumer pair is only
+compatible if they agree on which slice of the shared buffer each tile and core owns.
+Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge inside
+one must be compatible. The solve ranks plans with the lexicographic ladder described above, not
+`cost_expr`. Once it picks a tiling, `ScratchpadAllocator._materialize_selection` has
+`scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
+`DimHint`s — apply it to the graph, and the allocation is solved again over the now-tiled graph
+with tiling suppressed (`GraphBuilder.suppress_tiling`), so no further tilings are offered —
+that second plan is the one committed.
 
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
 here for current status, rather than carrying their own stale claim.
 
 ## Cost model
 
-Both production solvers share one cost model (`torch_spyre/_inductor/cost_model.py`) — the
+The solve uses one cost model (`torch_spyre/_inductor/cost_model.py`) — the
 same `predict_by_bundle` / `cost_expr` referenced throughout the sections above. See
 [Analytical Cost Model](cost_model.md) for the model in full: how a kernel is priced, every
 `SPYRE_DUMP_COST` output shape, the measure-and-score workflow, and the current accuracy
-table. This section covers only what's specific to the *co-optimizer's* use of it: how each
-solver consumes the same expression differently, and how to recalibrate it against real
-hardware.
+table. This section covers only what's specific to the *co-optimizer's* use of it: how the
+solve consumes the expression, and how to recalibrate it against real hardware.
 
-### How it's integrated: symbolic (CP-SAT) vs. compiled-and-evaluated (SA)
+### How it's integrated: symbolic, in CP-SAT
 
 [Symbolic cost formula](#symbolic-cost-formula) covered the shape of the search: build
-`cost_expr` once, then score each candidate by substituting its guess and evaluating. The two
-solvers differ in what "substitute and evaluate" compiles down to:
-
-- **CP-SAT (symbolic all the way through)**: `_minimize_cost_expr`
-  (`scratchpad/ilp_solver_ortools.py`) maps each sympy symbol straight onto a native OR-Tools
-  decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
-  `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
-  as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
-  searches the symbolic constraint space directly.
-- **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
-  (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
-  a plain Python function of `(chosen, resident)`, and calls that function fresh for every
-  candidate state the annealer visits — each move gets a real number back, not a symbolic
-  rewrite.
+`cost_expr` once, then score each candidate by substituting its guess and evaluating. In CP-SAT
+that substitution stays symbolic all the way through: `SpyreOptimizationGraph._minimize_cost_expr`
+(`scratchpad/buffer_graph.py`) takes the strategy's `cost_bindings()`, which map each sympy
+symbol straight onto a native OR-Tools decision variable
+(`sym_map[item.sym_is_lx.name] = v.in_buffer`, and similarly for `sym_core_divs`), then hands
+the whole expression, still unevaluated, to the constraint model as the objective to minimize
+via `cost_expr_to_cpsat(...)` (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates
+`cost_expr` in Python; it searches the symbolic constraint space directly.
 
 ### Inspecting a co-optimization decision
 
@@ -413,7 +283,7 @@ Two useful flags:
   examples — it applies unchanged here, since the co-optimizer calls the same `explain()`. A
   human-readable report, meant for reading at the terminal rather than parsing.
 - `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line per
-  solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
+  solve (`cost_expr_record` in `scratchpad/pricing.py`), recording the objective's
   per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
   chose, every term evaluated under those bindings, the terms the solver adds outside the
   expression and the total it minimized, and the alternative divisions each buffer could have
@@ -571,10 +441,8 @@ Open items from drafting this page that are worth resolving before calling it do
   `tools/cost_model/sweep_plan.json`, nor `eval_model.py` — the new tiling-candidate machinery
   has no sweep knob of its own yet, the same way `WD_M`/`WD_N`/`WD_K` is `mmwd`'s knob for
   forced work-division splits today. Its prediction accuracy is therefore unmeasured right now,
-  not hypothetically — nothing in [Accuracy](cost_model.md#accuracy)'s table covers it. The
-  same gap holds for simulated annealing's solver-chosen tiling (`#4456` through `#4894` —
-  see [b) LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)),
-  reachable behind the same flag since `#4602`. Combined with the point
+  not hypothetically — nothing in [Accuracy](cost_model.md#accuracy)'s table covers it.
+  Combined with the point
   above (no automatic coverage check), a new optimization axis landing without a deliberate
   sweep-plan update is a real way for its prediction accuracy to go unmeasured indefinitely
   rather than loudly missing.
@@ -597,21 +465,15 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ### Tiling-related:
 
-- Simulated annealing decides by its own objective whether a tiling pays, and can decide
-  against it: `test_solver_auto_coarse_tiling.py`'s MLP stays untiled under simulated annealing
-  (`sa_may_stay_untiled`). How closely the tile-count symbols track the device is not covered
-  by the sweep plan (see the sweep-coverage item above).
 - The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
   tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
-  core-division splits for matmuls "the matmuls' tilings." The code no longer does:
-  `sa_cooptimizer.py`'s `_flood_region`, whose division-menu index parameter was named `tiling`,
-  now takes a `DivisionConfig`. Worth a terminology pass across the documents, so
-  "division"/"split" and "tiling" stay consistently distinct.
+  core-division splits for matmuls "the matmuls' tilings." Worth a terminology pass across the
+  documents, so "division"/"split" and "tiling" stay consistently distinct.
 
 ### Solver performance:
 
 - Nothing memoizes a co-optimizer solve across compiles. Every `torch.compile` that reaches
-  `CoOptimizingAllocator` runs a full CP-SAT solve or SA anneal from scratch, even for a graph
+  the joint allocator runs a full CP-SAT solve from scratch, even for a graph
   shape the search has already solved before. The caching that does exist
   (`torch_spyre/execution/kernel_cache.py`) is a different thing: its hash
   (`compute_specs_hash`) covers the *already-resolved* `OpSpec`/`LoopSpec` tree — the solver's
@@ -619,23 +481,18 @@ Open items from drafting this page that are worth resolving before calling it do
   identical finished plan, never the search that produced it. A real "memorize the optimum"
   layer would need a cache keyed on something available *before* the solve (the graph's
   iteration-space shape and candidate menus, not the committed division), checked against a
-  cache before `plan_layout_and_core_divisions` runs, with a defined policy for a
+  cache before the solve runs, with a defined policy for a
   near-but-not-exact shape match (reuse as a warm start vs. require an exact key). No such
-  layer, warm-start or otherwise, exists today in `allocator.py`, `ilp_solver_ortools.py`, or
-  `sa_cooptimizer.py`.
+  layer, warm-start or otherwise, exists today in `allocator.py` or `buffer_graph.py`.
 
 ## Related documents
 
 - [Analytical Cost Model](cost_model.md) — the model in full: how a kernel is priced, every
   `SPYRE_DUMP_COST` output shape, the measure-and-score workflow, and the current accuracy
   table
-- [Scratchpad Planning](scratchpad_planning.md) — the allocator architecture, the solvers, LX
+- [Scratchpad Planning](scratchpad_planning.md) — the allocator architecture, the solve, LX
   eligibility rules, and the memory-hierarchy background
 - [Work Division Planning](work_division_planning.md) — the standalone work-division planner
   and the candidate space the co-optimizer searches
-- [Joint core-division + LX placement](sa_co_optimization.md) — the SA co-optimizer's search,
-  objective, and test fixtures in full detail
-- [Simulated Annealing Layout Planner](simulated_annealing_layout.md) — the placement-only
-  annealer, a different class from the joint SA co-optimizer
 - [Coarse-Tiling Loop IR for the Spyre Backend](coarse_tiling_loops.md) — how a tiled run is
   represented and survives scheduling and codegen, independent of who chooses the tiling

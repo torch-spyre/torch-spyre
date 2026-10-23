@@ -39,6 +39,15 @@ lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
+# How the solve encodes each op's work split and each edge's relation: "lazy"
+# posts a split's legality as constraints over the op's space where it can
+# (LazyStrategy); "enumerated" enumerates every op's legal divisions and picks
+# one from that menu (EnumeratedStrategy), the fallback when a Lazy space
+# misbehaves; "table" also relates every edge by a pair table over its two
+# ends' menus instead of deriving it (PairTableStrategy), the original model.
+lx_division_strategy: Literal["lazy", "enumerated", "table"] = os.environ.get(
+    "LX_DIVISION_STRATEGY", "lazy"
+)  # type: ignore[assignment]
 hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
     "1",
     "true",
@@ -134,17 +143,6 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "1",
     "true",
     "yes",
-)
-
-# How many destination views the CP-SAT relayout enumeration keeps per
-# (source, consumer) edge, cheapest first: a consumer with many equal-core
-# divisions induces one distinct destination partition (one relayout copy the
-# solver must place) per division, though it will read through at most one.
-# On the spyre_attn decode graph with 16 unrolled KV blocks the unbounded
-# enumeration built 5789 copies and CP-SAT's presolve outlived the time limit.
-# 0 keeps every view.
-lx_solver_relayout_groups_per_edge: int = int(
-    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
 )
 
 # Skip CP-SAT's presolve above this many free relayout copies in one solve;
@@ -293,43 +291,11 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
 sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 
-# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
-# Options:
-#  "greedy":       GreedyLayoutSolver,
-#  "bestfit":      BestFitLayoutSolver,
-#  "firstfit":     FirstFitLayoutSolver,
-#  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
-#              ``co_optimizing_lx_planning`` is set -- SaCoOptimizingSolver, the
-#              joint work-division + LX-placement annealer. Two different
-#              solvers sharing one config value, not one solver in two modes.
-#  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
-#              LX placement, minimizing HBM transfer traffic) (default).
-#
-# For "cpsat" and "simulated_annealing" the value names a solver *family* whose
-# joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
-# solvers, co-optimization instead requires wrapping them in
-# ExhaustiveSearchSolver -- see ``allow_exhaustive_search`` below, which gates
-# that wrapping.
-
-layout_solver: Literal[
-    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
-] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
-
-# co_optimizing_lx_planning requires a layout_solver whose solver is natively
-# core-division-capable ("cpsat" with ortools installed, or
-# "simulated_annealing"). Every other combination -- "greedy"/"bestfit"/
-# "firstfit", or "cpsat" without ortools -- can only participate in
-# co-optimization by wrapping the placement-only solver in
-# ExhaustiveSearchSolver, an expensive DFS over core-division candidates.
-# That is opt-in: select_allocator() raises ValueError for such a combination
-# unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
-allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
-
 # Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
 # objective or to each phase of the fallback lexicographic objective, not the
 # whole compilation. A timeout can return a feasible plan without proving
 # optimality; without an incumbent it raises SolveError and scratchpad_planning
-# falls back to greedy placement. Override for difficult graphs; 0 disables
+# replans with the committed divisions. Override for difficult graphs; 0 disables
 # the limit.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
@@ -390,16 +356,8 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
-# selects. Off by default, and inert unless a joint co-opt path is active
-# (co_optimizing_lx_planning, with layout_solver "cpsat" or
-# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
-# keep that tiling.
-#
-# Under the SA co-optimizer, anything the apply refuses raises rather than
-# falling back, so any gap between what the search believes it may tile and
-# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
-# search sees is only part of what ``predict_ops`` charges a real tiling, so it
-# is not yet a calibrated brake on the tiling axis.
+# selects. Off by default, and inert unless co_optimizing_lx_planning is on.
+# Ops a spyre_hint or for_each_tile loop already tiles keep that tiling.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out

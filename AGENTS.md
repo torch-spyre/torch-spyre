@@ -123,7 +123,7 @@ them with `PARAMS`, and `pr-review` checks them.
 | `SENCORES` | Number of Spyre cores (1–32, default 32) |
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
-| `LAYOUT_SOLVER` | LX layout solver: `greedy`, `firstfit`, `bestfit`, `cpsat` (default), `simulated_annealing` |
+| `LX_DIVISION_STRATEGY` | How the LX solve encodes work splits and edges: `lazy` (default, constraints over each op's split space), `enumerated` (pick from each op's enumerated divisions) or `table` (enumerated, plus a pair table on every edge) |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |

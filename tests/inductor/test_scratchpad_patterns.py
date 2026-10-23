@@ -13,36 +13,17 @@
 # limitations under the License.
 
 
-from collections import defaultdict
-import copy
 from dataclasses import dataclass
 from typing import Callable, ClassVar, Optional, Iterable
-from unittest import TestCase, expectedFailure
+from unittest import TestCase
 from enum import Enum
-import os
 
 import torch
 
-from torch_spyre._inductor.scratchpad.allocator import (
-    LifetimeBoundBuffer,
-    _lx_planning_size,
-)
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-    BestFitLayoutSolver,
-    FirstFitLayoutSolver,
-)
-from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingLayoutSolver,
-)
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    MemoryPlanSolver,
-    LifetimeBoundBuffer as Buffer,
-)
-from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from buffer_spec import LifetimeBoundBuffer as Buffer
 
 AVAILABLE_LX_SIZE = _lx_planning_size()
-
-BYPASS_XFAIL = os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1"
 
 
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
@@ -196,9 +177,6 @@ class PatternTests:
     Concrete subclasses are created with a ``role`` keyword:
     - ``role="verify"``  — generates ``test_verify_{name}_pattern`` methods that validate the
       good allocation defined in the pattern
-    - ``role="solver"``  — generates ``test_{name}_pattern`` methods that run the solver and
-      check it meets the good allocation; names in ``expected_failures`` are wrapped with
-      ``@expectedFailure``
     """
 
     PATTERNS: ClassVar[list[str]] = [
@@ -213,7 +191,6 @@ class PatternTests:
 
     def __init_subclass__(cls, role: str = "", **kwargs: object) -> None:
         # This creates tests like test_verify_moe_mlp_pattern
-        # and test_moe_mlp_pattern
         super().__init_subclass__(**kwargs)  # type: ignore[misc]
         if role == "verify":
             for name in PatternTests.PATTERNS:
@@ -222,18 +199,6 @@ class PatternTests:
                     self.verify_pattern(getattr(self, f"make_{_n}_pattern")())
 
                 setattr(cls, f"test_verify_{name}_pattern", _test_verify)
-        elif role == "solver":
-            xfails: frozenset[str] = getattr(cls, "expected_failures", frozenset())
-            for name in PatternTests.PATTERNS:
-
-                def _test_solve(self, _n: str = name) -> None:
-                    self.run_pattern(
-                        self.solver_type, getattr(self, f"make_{_n}_pattern")()
-                    )
-
-                if name in xfails and not BYPASS_XFAIL:
-                    _test_solve = expectedFailure(_test_solve)
-                setattr(cls, f"test_{name}_pattern", _test_solve)
 
     def setUp(self) -> None:
         super().setUp()
@@ -353,135 +318,6 @@ class PatternTests:
                     f"Buffer {sorted_allocations[-1].buffer} exceeds scratch pad size during "
                     f"operation {op.name}",
                 )
-
-    def verify_actual_run(
-        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
-    ):
-        # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
-        # during the entire liveness of the corresponding buffer.
-        liveness_start = {}
-        liveness_end = {}
-        for i, op in enumerate(pattern.operations):
-            for buffer_name in op.inputs + op.outputs:
-                if buffer_name not in liveness_start:
-                    liveness_start[buffer_name] = i
-                liveness_end[buffer_name] = i
-
-        # Sanity check -- every buffer should have a start and an end to its liveness.
-        self.assertTrue(set(liveness_start.keys()) == set(liveness_end.keys()))
-
-        allocate_at = defaultdict(list)
-        deallocate_at = defaultdict(list)
-        for buffer_name in liveness_start:
-            if buffer_name not in planned_buffers:
-                # This buffer is a graph input or output.
-                continue
-            addr = planned_buffers[buffer_name].address
-            if addr is None:
-                # This buffer resides in HBM.
-                continue
-            allocate_at[liveness_start[buffer_name]].append(buffer_name)
-            deallocate_at[liveness_end[buffer_name] + 1].append(buffer_name)
-
-        live_buffers = set()
-        for i, op in enumerate(pattern.operations):
-            live_buffers.update(allocate_at[i])
-            for buffer_name in op.inputs + op.outputs:
-                # Verify that buffer_name does not overlap with any allocated buffers at this point.
-                if buffer_name not in planned_buffers:
-                    # This buffer is a graph input or output.
-                    continue
-                addr = planned_buffers[buffer_name].address
-                if addr is None:
-                    # This buffer resides in HBM.
-                    continue
-                size = planned_buffers[buffer_name].size
-                self.assertLessEqual(
-                    addr + size,
-                    AVAILABLE_LX_SIZE,
-                    f"Buffer {buffer_name} exceeds scratch pad size during operation {op.name}",
-                )
-                for other_buffer_name in live_buffers:
-                    other_addr = planned_buffers[other_buffer_name].address
-                    if other_buffer_name == buffer_name or other_addr is None:
-                        continue
-                    other_size = planned_buffers[other_buffer_name].size
-                    if addr == other_addr:
-                        self.assertTrue(
-                            other_buffer_name
-                            in planned_buffers[buffer_name].in_place_parents
-                            or buffer_name
-                            in planned_buffers[other_buffer_name].in_place_parents,
-                            f"Buffers {buffer_name} and {other_buffer_name} overlap during operation {op.name}",
-                        )
-                    elif addr <= other_addr:
-                        self.assertLessEqual(
-                            addr + size,
-                            other_addr,
-                            f"Buffers {buffer_name} and {other_buffer_name} overlap during "
-                            f"operation {op.name}",
-                        )
-                    else:
-                        self.assertLessEqual(
-                            other_addr + other_size,
-                            addr,
-                            f"Buffers {buffer_name} and {other_buffer_name} overlap during "
-                            f"operation {op.name}",
-                        )
-            live_buffers.difference_update(deallocate_at[i + 1])
-
-    def hbm_usage_for_good_allocation(
-        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
-    ) -> int:
-        hbm_usage = 0
-        allocation = pattern.good_allocation
-
-        for op, alloc in zip(pattern.operations, allocation, strict=True):
-            for buffer_name in op.inputs + op.outputs:
-                if alloc[buffer_name].component == Component.HBM:
-                    hbm_usage += pattern.buffers[buffer_name].size
-
-        return hbm_usage
-
-    def hbm_usage_for_actual_run(
-        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
-    ) -> int:
-        hbm_usage = 0
-
-        # Count all usage for buffers not allocated in the scratchpad.
-        for op in pattern.operations:
-            for buffer_name in op.inputs + op.outputs:
-                if (
-                    buffer_name not in planned_buffers
-                    or planned_buffers[buffer_name].address is None
-                ):
-                    # This buffer is not allocated in the scratch pad, so it
-                    # must be loaded from HBM.
-                    hbm_usage += pattern.buffers[buffer_name].size
-
-        return hbm_usage
-
-    def run_pattern(self, solver_type: type[MemoryPlanSolver], pattern: Pattern):
-        buffers_to_plan = [
-            copy.deepcopy(buf)
-            for buf in pattern.buffers.values()
-            if buf.name not in pattern.inputs + pattern.outputs
-        ]
-        solver = solver_type(buffers_to_plan, AVAILABLE_LX_SIZE)
-        planned_buffers = solver.plan_layout()
-        planned_buffers = {buf.name: buf for buf in planned_buffers}
-        # Verify that the currently implemented allocation is indeed valid
-        self.verify_actual_run(pattern, planned_buffers)
-
-        # Verify that the currently implemented allocation is at least as good as the "good
-        # allocation" in terms of HBM usage.
-        current_hbm_usage = self.hbm_usage_for_actual_run(pattern, planned_buffers)
-        good_hbm_usage = self.hbm_usage_for_good_allocation(pattern, planned_buffers)
-        self.assertLessEqual(
-            current_hbm_usage,
-            good_hbm_usage,
-            f"Current allocation uses more HBM ({current_hbm_usage} bytes) than the good allocation ({good_hbm_usage} bytes). ",
-        )
 
     def make_simple_fragmentation_pattern(self) -> Pattern:
         """Allocate two buffers A and B that are each a third of the available scratchpad size,
@@ -1065,45 +901,6 @@ class PatternTests:
 
 class TestVerifyPatterns(PatternTests, TestCase, role="verify"):
     pass
-
-
-class TestGreedyPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = GreedyLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {
-            "simple_fragmentation",
-            "staircase",
-            "downward_staircase",
-            "simple_eviction",
-            "eviction_reallocation",
-        }
-    )
-
-
-class TestBestFitPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = BestFitLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {"eviction_reallocation", "simple_eviction"}
-    )
-
-
-class TestFirstFitPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = FirstFitLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {"eviction_reallocation", "simple_eviction"}
-    )
-
-
-class TestSimulatedAnnealingPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = SimulatedAnnealingLayoutSolver
-    # Simulated annealing is a permutation-based layout solver: it assigns each buffer a
-    # single fixed address for its whole lifetime and never evicts or reallocates.
-    # The two eviction patterns require moving a buffer to HBM and back (possibly
-    # at a different address), which this abstraction cannot express -- the same
-    # limitation shared by best-fit and first-fit.
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {"eviction_reallocation", "simple_eviction"}
-    )
 
 
 if __name__ == "__main__":

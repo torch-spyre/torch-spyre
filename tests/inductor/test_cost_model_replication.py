@@ -52,7 +52,9 @@ from torch_spyre._inductor.cost_model import (
     predict_ops,
 )
 from torch_spyre._inductor.dump_cost_model import _replication
-from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+from torch_spyre._inductor.scratchpad.pricing import (
+    _COST_PARAMS,
+)
 
 ELEMS = 4096
 BYTES = ELEMS * 2

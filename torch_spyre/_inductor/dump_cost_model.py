@@ -445,7 +445,7 @@ def _loop_factor_for_index(index, levels, advances=None) -> int:
 def _tiled_flag(counts):
     """Whether any of ``counts`` actually tiles its axis (is > 1): a bool when
     the counts are concrete, else a sympy condition over the solver's
-    tile-count symbols (``CoreDivisionBuffer.sym_tile_counts``)."""
+    tile-count symbols (``plan_solver.sym_tile_counts_for``)."""
     flag = sympy.Or(*(sympy.Gt(count, 1) for count in counts))
     if flag in (sympy.true, sympy.false):
         return bool(flag)

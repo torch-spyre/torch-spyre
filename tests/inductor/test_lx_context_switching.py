@@ -47,6 +47,7 @@ from torch_spyre._inductor.scratchpad.lx_context_switching import (
     mark_lx_safe,
 )
 from torch_spyre.ops.fallbacks import fallback_ops
+from torch_spyre._inductor.scratchpad import residency_rules
 
 
 def _pr3683_guard_disabled():
@@ -64,10 +65,9 @@ def _pr3683_guard_disabled():
     collecting TestMarkLxSafe/TestIsCpuOnlyFallback, which need neither
     allocator nor a device) doesn't require it to succeed.
     """
-    from torch_spyre._inductor.scratchpad import allocator as ts_allocator
 
     return patch.object(
-        ts_allocator, "_extern_kernel_in_live_range", lambda graph, uses: False
+        residency_rules, "_extern_kernel_in_live_range", lambda graph, uses: False
     )
 
 

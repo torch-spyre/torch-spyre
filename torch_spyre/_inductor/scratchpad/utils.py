@@ -36,7 +36,6 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
 # default. `convolution` is aten's direct-conv op name; it is listed because a
@@ -82,14 +81,13 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     ``1024*d0 + d1`` and at ``1024*d0 + d1 + 512`` -- contributes two deps naming
     it, and appending per dep would repeat that op's index.  A repeat is not
     meaningful here (``start_time``/``end_time`` bracket the list and cannot see
-    it) and it inflates ``read_count``, so it is dropped.  This is what lets
-    :class:`~torch_spyre._inductor.scratchpad.plan_solver.LifetimeBoundBuffer`
-    require strictly increasing ``uses``, and makes ``read_count == 0`` mean
-    exactly "written but never read" for a computed buffer.
+    it) and it inflates ``read_count``, so it is dropped.  This keeps ``uses``
+    strictly increasing, and makes ``read_count == 0`` mean exactly "written
+    but never read" for a computed buffer.
 
     Note: previously, unused graph inputs did not appear in the returned dict at
-    all.  Now they appear with an empty list, and ``_build_bound_buffers`` skips
-    them on ``not uses``."""
+    all.  Now they appear with an empty list, and the graph builder skips them on
+    ``not uses``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -772,79 +770,6 @@ def _would_produce_lx_back_gap(
                 if device_size[d] > covered:
                     return True
     return False
-
-
-def plot_buffers(buffers: list[LifetimeBoundBuffer], max_height: int):
-    """Visualize a scratchpad allocation layout.
-
-    Allocated buffers are shown in blue; buffers that exceed the capacity
-    limit are shown in gray.  In-place parent/child pairs that share an
-    address are highlighted: a dark overlay spans the combined lifetime and
-    a green marker indicates the handoff tick.
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-
-    name_to_index = {b.name: i for i, b in enumerate(buffers)}
-
-    fig, ax = plt.subplots()
-
-    for buffer in buffers:
-        addr = buffer.address
-        if addr is None:
-            continue
-        color = "b" if addr + buffer.size <= max_height else "lightgray"
-        rect = patches.Rectangle(
-            xy=(buffer.start_time, addr),
-            width=buffer.end_time - buffer.start_time,
-            height=buffer.size,
-            linewidth=0.3,
-            edgecolor="r",
-            facecolor=color,
-            fill=True,
-        )
-        ax.add_patch(rect)
-
-    for buffer in buffers:
-        addr = buffer.address
-        if addr is None:
-            continue
-        for p in buffer.in_place_parents:
-            pj = name_to_index.get(p)
-            if pj is None:
-                continue
-            parent = buffers[pj]
-            if parent.address is None:
-                continue
-            if addr == parent.address:
-                ax.add_patch(
-                    patches.Rectangle(
-                        xy=(parent.start_time, addr),
-                        width=buffer.end_time - parent.start_time,
-                        height=buffer.size,
-                        linewidth=0.3,
-                        edgecolor="r",
-                        facecolor="k",
-                        fill=True,
-                        alpha=0.25,
-                    )
-                )
-                ax.add_patch(
-                    patches.Rectangle(
-                        xy=(buffer.start_time, addr),
-                        width=1,
-                        height=buffer.size,
-                        linewidth=0.3,
-                        edgecolor="r",
-                        facecolor="g",
-                        fill=True,
-                    )
-                )
-
-    max_time = max((b.end_time for b in buffers), default=0)
-    ax.set_xlim(0, max_time)
-    ax.set_ylim(0, max_height)
-    return fig
 
 
 def quality_plot(

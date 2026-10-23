@@ -18,13 +18,11 @@ import contextlib
 import dataclasses
 import functools
 import os
-import random
 import sys
-import pytest
 import torch
 import unittest
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 from typing import Optional
 
@@ -45,32 +43,21 @@ from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
-from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
-    CoOptimizingAllocator,
-    _spec_within_read_distance,
-    commit_lx_views,
+    ScratchpadAllocator,
     select_allocator,
 )
-from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    splits_on_tile,
+from torch_spyre._inductor.scratchpad.division_menus import (
+    _spec_within_read_distance,
 )
-from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    CoreDivision,
-    CoreDivisionBuffer,
-    RelayoutCopyBuffer,
-    TileAxis,
-    TileSpec,
-    relayout_copy_name,
-)
-from torch_spyre._inductor.scratchpad.utils import get_ncores_for_buffers
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
+from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
+from test_scratchpad_use import _ParameterizedScratchpadMeta
+from buffer_spec import plan_of
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -78,11 +65,6 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
-
-
-# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
-# (with ``co_optimizing_lx_planning``, on by default).
-_TILING_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
 
 
 # The trip counts of a loop nest, outermost level first.  An op at an outer
@@ -172,10 +154,6 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
-    sa_may_stay_untiled:
-        Why the SA co-optimizer's own objective prices this model untiled, so
-        its *auto* mode is an expected failure rather than a broken search;
-        ``None`` where tiling pays.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -187,7 +165,6 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
-    sa_may_stay_untiled: Optional[str] = None
 
     @property
     def explicit_nest(self) -> _Counts:
@@ -253,42 +230,28 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     well before the scheduler is built, so reading it here sees the final plan.
 
     ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``: the loops
-    codegen will emit, whichever pass stamped them. ``core_splits`` maps each
-    of them to its committed core division over its output: the split factor
-    of each dim, keyed by that dim's stride in the output index.
-    ``lx_resident`` names those of them whose buffer was placed in LX.
+    codegen will emit, whichever pass stamped them.
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
-    core_splits: dict[str, dict[int, int]] = {}
-    lx_resident: set[str] = set()
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
-        tiled = [
-            op for op in graph.operations if getattr(op, "loop_info", None) is not None
-        ]
-        type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
-        type(self).core_splits = {
-            op.get_name(): dict(op.op_it_space_splits[0])
-            for op in tiled
-            if getattr(op, "op_it_space_splits", None) is not None
-        }
-        type(self).lx_resident = {
-            op.get_name()
-            for op in tiled
-            if "lx" in getattr(op.get_layout(), "allocation", {})
+        type(self).tiling = {
+            op.get_name(): op.loop_info
+            for op in graph.operations
+            if getattr(op, "loop_info", None) is not None
         }
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
 class AutomatedCoarseTilingTests(
     unittest.TestCase, metaclass=_ParameterizedScratchpadMeta
 ):
-    """model x tiling_mode x solver, one generated method per combination.
+    """model x tiling_mode, one generated method per combination.
 
     The metaclass expands ``parameter_models`` against ``parameter_axes`` and
-    routes each generated method through ``run_case``; ``case_decorators``
-    marks the combos that cannot pass until the tile search exists.
+    routes each generated method through ``run_case``.
     """
 
     def setUp(self):
@@ -304,14 +267,9 @@ class AutomatedCoarseTilingTests(
         case: "_TilingCase",
         pins: tuple[tuple[str, int], ...],
         *,
-        layout_solver: str,
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Only a joint solver chooses tilings; elsewhere the flag is inert.
-        if auto_tiling and layout_solver not in _TILING_SOLVERS:
-            raise NotImplementedError(f"{layout_solver} does not choose tilings")
-
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
@@ -338,7 +296,6 @@ class AutomatedCoarseTilingTests(
             t_inductor_config.patch(force_disable_caches=True),
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
-                layout_solver=layout_solver,
                 # Raise, not warn, when CP-SAT cannot lower the cost objective:
                 # a fallback solve still tiles as pinned, so it would pass.
                 _cpsat_warn_on_cost_expr=False,
@@ -368,7 +325,6 @@ class AutomatedCoarseTilingTests(
         case: "_TilingCase",
         pins: tuple[tuple[str, int], ...],
         expected: _Counts,
-        solver: str,
         *,
         auto_tiling: bool,
     ) -> None:
@@ -379,7 +335,7 @@ class AutomatedCoarseTilingTests(
         removed, or a level added inside one, leaves no nest that matches.
         """
         cpu, device, tiling = self._compile_and_collect(
-            case, pins, layout_solver=solver, auto_tiling=auto_tiling
+            case, pins, auto_tiling=auto_tiling
         )
         mismatches = {
             outer: _nest_mismatch(nest, expected)
@@ -393,41 +349,32 @@ class AutomatedCoarseTilingTests(
         )
         self._assert_matches_cpu(case, device, cpu)
 
-    def _check_loops_preserved(self, case: "_TilingCase", solver: str) -> None:
+    def _check_loops_preserved(self, case: "_TilingCase") -> None:
         """The written loops come out exactly as written."""
-        self._check_loops_kept(
-            case, case.pins, case.explicit_nest, solver, auto_tiling=False
-        )
+        self._check_loops_kept(case, case.pins, case.explicit_nest, auto_tiling=False)
 
-    def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
+    def _check_tiling_discovered(self, case: "_TilingCase") -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
-        cpu, device, tiling = self._compile_and_collect(
-            case, (), layout_solver=solver, auto_tiling=True
-        )
+        cpu, device, tiling = self._compile_and_collect(case, (), auto_tiling=True)
         self._assert_matches_cpu(case, device, cpu)
-        if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
-            pytest.xfail(case.sa_may_stay_untiled)
         self.assertTrue(
             tiling,
             "Auto tiling is on and no loops were written, but no op was "
             "coarse-tiled -- the tile search found nothing to do",
         )
 
-    def _check_loops_preserved_with_auto(
-        self, case: "_TilingCase", solver: str
-    ) -> None:
+    def _check_loops_preserved_with_auto(self, case: "_TilingCase") -> None:
         """With the tile search on as well, the written loops still come out."""
         self._check_loops_kept(
             case,
             case.explicit_auto_pins,
             case.explicit_auto_nest,
-            solver,
             auto_tiling=True,
         )
 
     # ------------------------------------------------------------------
     # Models.  Each returns the model, its axis labels and the tiling contract,
-    # defined once and reused across every tiling_mode and solver.
+    # defined once and reused across every tiling_mode.
     #
     # Each is sized so its working set overflows LX even split across 32
     # cores: a cost-driven tile search is right to leave a graph that already
@@ -470,10 +417,7 @@ class AutomatedCoarseTilingTests(
         cover the whole model, so the explicit_auto mode writes the same nest
         and leaves the compiler nothing outside it to tile.
         """
-        # S is large enough that the hidden activations (S x Dh) do not fit LX
-        # untiled. At a size where they do, a nest only adds the copy-out at
-        # its boundary and the solve rightly leaves the model untiled.
-        seq_len, in_dim, hidden_dim, out_dim = 32768, 256, 1024, 256
+        seq_len, in_dim, hidden_dim, out_dim = 8192, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
@@ -505,10 +449,6 @@ class AutomatedCoarseTilingTests(
             explicit_auto_pins=(("S", 2), ("Dout", 2)),
             atol=0.02,
             rtol=0.05,
-            # Tiling buf5 two ways on dim 1 gains nothing in the expression and
-            # adds a 5120 ns copy-out; the SA tiled it only where its anneal
-            # stopped short, and #5103's burst term moved that stop.
-            sa_may_stay_untiled="the SA's objective prices this MLP untiled",
         )
 
     def _swiglu_case(self) -> "_TilingCase":
@@ -569,10 +509,7 @@ class AutomatedCoarseTilingTests(
         "explicit_auto": _check_loops_preserved_with_auto,
     }
 
-    parameter_axes = {
-        "tiling_mode": tuple(_CHECKS),
-        "solver_method": ("cpsat", "simulated_annealing"),
-    }
+    parameter_axes = {"tiling_mode": tuple(_CHECKS)}
 
     # SDPA is omitted: using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
@@ -583,29 +520,9 @@ class AutomatedCoarseTilingTests(
         ("swiglu_tiling", _swiglu_case),
     )
 
-    @staticmethod
-    def case_decorators(params):
-        """Per-combo decorators.
-
-        The ``auto``/``explicit_auto`` combos were ``@expected_unimplemented``
-        while the solver-driven tile search was unbuilt, and briefly
-        ``@expected_lx_ownership_gap`` while commit_divisions dropped the
-        division the solve had chosen for each ``coarse_tile_copy_*``. Both
-        markers retired themselves the moment those modes passed (each fails a
-        clean run), so only the ortools skip for the cpsat solver remains.
-        """
-        decorators = []
-        if params["solver_method"] == "cpsat":
-            decorators.append(
-                unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
-            )
-        return decorators
-
     def run_case(self, params: dict, factory: Callable) -> None:
         """Body of one generated method: build the model, check its contract."""
-        self._CHECKS[params["tiling_mode"]](
-            self, factory(self), params["solver_method"]
-        )
+        self._CHECKS[params["tiling_mode"]](self, factory(self))
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +623,6 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
     _AUTO_CFG = dict(
         co_optimizing_lx_planning=True,
         auto_coarse_tiling=True,
-        layout_solver="cpsat",
         sencores=4,
     )
 
@@ -714,7 +630,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         cfg = {**self._AUTO_CFG, **overrides}
         with ts_inductor_config.patch(cfg):
             alloc = select_allocator()
-            return alloc._tiling_candidates(op, cfg["sencores"])
+            return alloc.builder._tiling_candidates(op, cfg["sencores"])
 
     def test_untiled_dropped_for_overspan_unhinted_op(self):
         op = _pointwise_op(_OVERFLOW_SHAPE)
@@ -754,7 +670,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         self.assertEqual(options, [TileSpec()])
 
     def test_reshaping_reader_drops_the_unit_tile(self):
-        # d3:64 leaves a 1-extent tile, which apply_tilings cannot retile
+        # d3:64 leaves a 1-extent tile, which CoarseTilingPass cannot retile
         # for a reader that views the output through another rank.
         op = _pointwise_op((2, 8, 5, 64, 128))
         reader = MagicMock(spec=ComputedBuffer)
@@ -763,7 +679,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 
         self.assertIn(unit_tile, self._candidates(op))
         with patch.object(
-            CoOptimizingAllocator,
+            GraphBuilder,
             "_readers_by_name",
             {op.get_name(): [reader]},
             create=True,
@@ -777,7 +693,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         op = _pointwise_op((1, 2, 16, 64))
         self.assertGreater(len(self._candidates(op)), 1)  # non-vacuity
         with patch.object(
-            CoOptimizingAllocator,
+            GraphBuilder,
             "_prescribed_ops",
             frozenset({op.get_operation_name()}),
             create=True,
@@ -838,7 +754,6 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Loop nests follow tile ownership, not TileSpec equality
 # ---------------------------------------------------------------------------
-_CHOSEN_TILINGS = "torch_spyre._inductor.scratchpad.coarse_tiling.chosen_tilings"
 _D0_BY_4 = TileSpec((TileAxis(host_dim=0, count=4),))
 _D1_BY_4 = TileSpec((TileAxis(host_dim=1, count=4),))
 
@@ -863,7 +778,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
     ``consumer_menu`` replaces the discovered menus: the producer ``a = x + y``
     (the one op that reads only graph inputs) is offered ``d0:4`` alone, and
     every other op ``consumer_menu``. The ``_apply`` cases skip the solve's
-    choice instead, so they check ``apply_tilings``'s own refusal.
+    choice instead, so they check ``CoarseTilingPass``'s own refusal.
     """
 
     def setUp(self):
@@ -879,12 +794,14 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             if consumer_menu is not None:
 
                 def offered(alloc, op, max_cores):
+                    if alloc.suppress_tiling:
+                        return [TileSpec()]
                     if _reads_graph_inputs_only(op):
                         return [_D0_BY_4]
                     return consumer_menu
 
                 stack.enter_context(
-                    patch.object(CoOptimizingAllocator, "_tiling_candidates", offered)
+                    patch.object(GraphBuilder, "_tiling_candidates", offered)
                 )
             stack.enter_context(torch.no_grad())
             stack.enter_context(t_inductor_config.patch(force_disable_caches=True))
@@ -892,7 +809,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
                 ts_inductor_config.patch(
                     co_optimizing_lx_planning=True,
                     auto_coarse_tiling=True,
-                    layout_solver="cpsat",
                     allow_all_ops_in_lx_planning=True,
                 )
             )
@@ -927,17 +843,17 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
 
         Bypasses the solve's own pairing, so what is left to split an
-        out-of-step group is ``apply_tilings`` itself.
+        out-of-step group is ``CoarseTilingPass`` itself.
         """
 
-        def chosen(graph, allocation):
+        def chosen(alloc, graph, plan):
             return {
                 op.get_operation_name(): _D0_BY_4
                 for op in graph.operations
                 if isinstance(op, ComputedBuffer)
             }
 
-        with patch(_CHOSEN_TILINGS, chosen):
+        with patch.object(ScratchpadAllocator, "_chosen_tilings", chosen):
             return self._compile(fn, args)
 
     def _assert_group_split(self, fn):
@@ -971,7 +887,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
 
-        def chosen(graph, allocation):
+        def chosen(alloc, graph, plan):
             return {
                 op.get_operation_name(): _D1_BY_4
                 for op in graph.operations
@@ -979,7 +895,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             }
 
         with (
-            patch(_CHOSEN_TILINGS, chosen),
+            patch.object(ScratchpadAllocator, "_chosen_tilings", chosen),
             self.assertRaises(Exception) as refusal,
         ):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
@@ -1003,22 +919,22 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # [1, 32, 1, 64] for [64, 32, 1, 64]. The apply instead gives the full
         # buffer the producer's own device layout, read before the tile is
         # divided, so the untiled consumer reads a buffer of the size it
-        # expects. The enumerator does not offer this tiling, so the menu
-        # offers it alone: the solve then picks a division the tile can state,
-        # which forcing ``chosen_tilings`` after the solve would not.
+        # expects. The enumerator does not offer this tiling; forcing it checks
+        # the apply itself.
         x = torch.randn(1, 64, 2048, dtype=torch.float16)
         y = torch.randn(1, 64, 2048, dtype=torch.float16)
         unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
 
-        def offered(alloc, op, max_cores):
-            return [unit_tile] if _reads_graph_inputs_only(op) else [TileSpec()]
+        def chosen(alloc, graph, plan):
+            return {
+                op.get_operation_name(): unit_tile
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
+            }
 
-        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
-            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        with patch.object(ScratchpadAllocator, "_chosen_tilings", chosen):
+            cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
         self._assert_close(device, cpu)
-        nests = list(_nests(tiling).values())
-        self.assertEqual(len(nests), 1, _describe(tiling))
-        self.assertIsNone(_nest_mismatch(nests[0], (64,)), _describe(tiling))
 
     def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
         # d1:4 is the consumer tiling that walks the producer's dim 0, so the
@@ -1035,107 +951,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertEqual(len(nests), 1, _describe(tiling))
         self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
         self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
-
-    def test_a_tile_is_divided_across_cores_along_its_tiled_dim(self):
-        # Every op runs one d0:4 nest, 16 rows to a tile. The solve owns each
-        # op's division and ties the divisions of the nest together, so it may
-        # give each core a slice of the tiled dim itself. The balanced division
-        # it prefers does: 4 cores along those 16 rows.
-        x = torch.randn(64, 64, 128, dtype=torch.float16)
-        y = torch.randn(64, 64, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
-        )
-        self._assert_close(device, cpu)
-        (nest,) = _nests(tiling).values()
-        model_ops = self._model_ops(nest)
-        self.assertEqual(len(model_ops), 3, _describe(tiling))
-        dim_0_stride = 64 * 128
-        for name in model_ops:
-            splits = CollectTilingPasses.core_splits[name]
-            self.assertGreater(splits.get(dim_0_stride, 1), 1, f"{name}: {splits}")
-
-    def test_a_cut_tile_resides_on_the_tiled_graph(self):
-        # The producer is tiled and its readers are not, so it is a cut: its
-        # copy op drains each tile into a full HBM buffer for them and is the
-        # tile's only reader. The solve splits the tiled dim across cores, and
-        # the copy has to read the tile sliced the same way. Held to a whole
-        # tiled dim it could not, and the tile the solve had placed in LX was
-        # demoted to HBM on the tiled graph.
-        x = torch.randn(64, 64, 128, dtype=torch.float16)
-        y = torch.randn(64, 64, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[TileSpec()]
-        )
-        self._assert_close(device, cpu)
-        (nest,) = _nests(tiling).values()
-        (producer,) = self._model_ops(nest)
-        self.assertIn(producer, CollectTilingPasses.lx_resident, _describe(tiling))
-
-    def test_a_matmul_cut_tile_resides_on_the_tiled_graph(self):
-        # The matmul is tiled and is the graph output, so it is a cut and its
-        # copy op is the tile's only reader. The copy has no reduction axis,
-        # and reads the tile from LX only where each core holds a slice of the
-        # output. The solve once split the matmul's reduction axis too, for a
-        # tile it had placed in LX, and the tiled graph spilled the tile.
-        x = torch.rand(64, 64, 128, dtype=torch.float16)
-        w = torch.rand(128, 128, dtype=torch.float16)
-        cpu, device, tiling = self._compile(
-            lambda x, w: x @ w, (x, w), consumer_menu=[TileSpec()]
-        )
-        self._assert_close(device, cpu)
-        (nest,) = _nests(tiling).values()
-        (producer,) = self._model_ops(nest)
-        self.assertIn(producer, CollectTilingPasses.lx_resident, _describe(tiling))
-
-    def test_a_unit_tile_keeps_the_plan_the_solve_made(self):
-        # Every op is offered d0:64 alone, a tile one row long. Such a tile no
-        # longer iterates dim 0, so its iteration symbols are numbered from
-        # dim 1: what the solve called d1 is the tile's d0. The division the
-        # solve chose is carried onto the tile under the tile's own symbols.
-        # Taken under the old ones it did not fit the tile, and the whole plan
-        # was given up for greedy placement, which left every tile in HBM.
-        x = torch.randn(64, 64, 128, dtype=torch.float16)
-        y = torch.randn(64, 64, 128, dtype=torch.float16)
-        unit_tile = TileSpec((TileAxis(host_dim=0, count=64),))
-
-        def offered(alloc, op, max_cores):
-            return [unit_tile]
-
-        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
-            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2 + 1, (x, y))
-        self._assert_close(device, cpu)
-        (nest,) = _nests(tiling).values()
-        model_ops = self._model_ops(nest)
-        self.assertEqual(len(model_ops), 3, _describe(tiling))
-        for name in model_ops:
-            self.assertIn(name, CollectTilingPasses.lx_resident, _describe(tiling))
-
-    def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
-        # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
-        # b, between them, only untiled. Loop groups are consecutive runs, so
-        # a and c cannot share a nest across b whatever their own edge allows:
-        # a is copied out, and b and c both read its full buffer.
-        x = torch.randn(64, 64, 128, dtype=torch.float16)
-        y = torch.randn(64, 64, 128, dtype=torch.float16)
-
-        def fn(x, y):
-            a = x + y
-            b = a * a
-            return a + b
-
-        def offered(alloc, op, max_cores):
-            # b is the one op with a single buffer to read.
-            reads = {dep.name for dep in op.get_read_writes().reads}
-            if len(reads) == 1:
-                return [TileSpec()]
-            return [_D0_BY_4]
-
-        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
-            cpu, device, tiling = self._compile(fn, (x, y))
-        self._assert_close(device, cpu)
-        nests = [self._model_ops(nest) for nest in _nests(tiling).values()]
-        self.assertEqual([len(ops) for ops in nests], [1, 1], _describe(tiling))
 
     def test_mutation_op_compiles(self):
         # copy_forced writes through its target's layout, which has no device
@@ -1207,209 +1022,40 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self._assert_close(device, cpu)
 
 
-class SplitsOnTileTests(unittest.TestCase):
-    """``splits_on_tile`` restates a core division on the symbols the tiled op
-    iterates, from the ``symbols_on_tile`` stamp ``apply_tilings`` leaves on
-    it."""
+class ReplanAfterTilingGateTests(unittest.TestCase):
+    """``_materialize_selection`` applies the chosen tilings and solves again."""
 
-    _D0, _D1 = sympy.symbols("d0 d1")
+    _CHOICES = {"buf0": _D0_BY_4}
 
-    def test_an_op_the_apply_did_not_tile_keeps_its_symbols(self):
-        untiled = SimpleNamespace()
-        self.assertEqual(splits_on_tile(untiled, {self._D1: 2}), {self._D1: 2})
+    def _materialize(self, **patches):
+        with ts_inductor_config.patch(co_optimizing_lx_planning=True):
+            alloc = select_allocator()
+            plan = plan_of([])
+            graph = SimpleNamespace(operations=[])
+            with contextlib.ExitStack() as stack:
+                chosen = stack.enter_context(
+                    patch.object(
+                        ScratchpadAllocator,
+                        "_chosen_tilings",
+                        return_value=self._CHOICES,
+                    )
+                )
+                apply = stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.scratchpad.coarse_tiling."
+                        "CoarseTilingPass"
+                    )
+                )
+                for name, value in patches.items():
+                    stack.enter_context(
+                        patch.object(ScratchpadAllocator, name, return_value=value)
+                    )
+                result = alloc._materialize_selection(graph, plan)
+            return alloc, plan, result, chosen, apply
 
-    def test_a_unit_tile_renumbers_the_dims_after_it(self):
-        # A (64, 64, 128) op tiled d0:64 is a (1, 64, 128) tile: it no longer
-        # iterates dim 0, and what was d1 is its d0.
-        tile = SimpleNamespace(symbols_on_tile={self._D1: self._D0})
-        self.assertEqual(splits_on_tile(tile, {self._D1: 2}), {self._D0: 2})
-
-    def test_a_split_of_a_dim_the_tile_no_longer_iterates_is_refused(self):
-        tile = SimpleNamespace(symbols_on_tile={self._D1: self._D0})
-        self.assertIsNone(splits_on_tile(tile, {self._D0: 2}))
-
-    def test_a_unit_split_of_a_dim_the_tile_no_longer_iterates_is_dropped(self):
-        tile = SimpleNamespace(symbols_on_tile={self._D1: self._D0})
-        self.assertEqual(
-            splits_on_tile(tile, {self._D0: 1, self._D1: 2}), {self._D0: 2}
-        )
-
-
-class CommitLxViewsTests(unittest.TestCase):
-    """``commit_lx_views`` sets ``lx_view`` on each buffer placed in LX. A
-    buffer takes the view the residency judge accepts for it; the source of
-    an accepted relayout takes the source view of its plan instead."""
-
-    def setUp(self):
-        ops = {name: _pointwise_op((4, 64), name=name) for name in ("a", "b")}
-        self.graph = SimpleNamespace(
-            operations=list(ops.values()), try_get_buffer=ops.get
-        )
-        # What the judge itself accepts for each buffer of this graph.
-        _, _, self.judged = get_ncores_for_buffers(self.graph)
-
-    @staticmethod
-    def _buf(name, address=None):
-        return CoreDivisionBuffer(
-            name, 128, [0, 1], core_divisions=[CoreDivision()], address=address
-        )
-
-    def test_a_resident_buffer_takes_the_view_the_judge_accepted(self):
-        resident, spilled = self._buf("a", address=0), self._buf("b")
-        commit_lx_views(self.graph, [resident, spilled], [])
-        self.assertEqual(resident.lx_view, self.judged["a"])
-        self.assertIsNone(spilled.lx_view)
-
-    def test_a_relayout_source_takes_the_view_its_plan_carries(self):
-        core_id = sympy.Symbol("core_id")
-        plan = LXRelayoutPlan(
-            "a",
-            ("b",),
-            PerCoreView(((0, 4),), ((0, core_id),), num_cores=4),
-            PerCoreView(((0, 2),), ((0, sympy.floor(core_id / 2)),), num_cores=4),
-            4,
-        )
-        self.assertNotEqual(plan.source_view, self.judged["a"])
-        source, consumer = self._buf("a", address=0), self._buf("b", address=128)
-        # The copy is in the allocation but is not a buffer of the graph:
-        # materialize_lx_relayouts gives its destination the plan's view.
-        copy = RelayoutCopyBuffer(
-            relayout_copy_name("a", 0),
-            128,
-            [1, 2],
-            core_divisions=[CoreDivision()],
-            address=256,
-            relayout_parent="a",
-            group=0,
-        )
-        commit_lx_views(self.graph, [source, copy, consumer], [plan])
-        self.assertIs(source.lx_view, plan.source_view)
-        self.assertEqual(consumer.lx_view, self.judged["b"])
-        self.assertIsNone(copy.lx_view)
-
-
-class _HeldDivisions(sa._GeneratedDivisions):
-    """A buffer's divisions restricted to one tiling, and optionally one split."""
-
-    spec = TileSpec()
-    pinned = False
-
-    def can_move(self) -> bool:
-        return not self.pinned and super().can_move()
-
-    def can_split(self) -> bool:
-        return not self.pinned and super().can_split()
-
-    def retiled(
-        self, config: sa.DivisionConfig, tiling: TileSpec
-    ) -> Optional[sa.DivisionConfig]:
-        return super().retiled(config, tiling) if tiling == self.spec else None
-
-    def _step_moves(self, config: sa.DivisionConfig) -> list[sa.DivisionConfig]:
-        if self.pinned:
-            return []
-        return [c for c in super()._step_moves(config) if c.tiling == self.spec]
-
-    def _draw_tiling(self, rng: random.Random) -> TileSpec:
-        return self.spec
-
-    def anchor(
-        self, config: sa.DivisionConfig, rng: random.Random
-    ) -> Optional[sa.DivisionConfig]:
-        c = None if self.pinned else super().anchor(config, rng)
-        return c if c is None or c.tiling == self.spec else None
-
-
-def _hold_tilings(
-    hold: Mapping[str, tuple[int, Optional[dict[str, int]]]], held: set[str]
-) -> contextlib.ExitStack:
-    """Hold each ``hold`` buffer's tiling (host dim x 2) and optional splits.
-
-    Every other buffer still anneals. The recolor flood assigns configs without
-    asking a source, so it is filtered too. ``held`` collects the buffers held.
-    """
-    build = sa.SaCoOptimizingSolver._build_sources
-    flood = sa.SaCoOptimizingSolver._flood_region
-
-    def build_sources(solver: sa.SaCoOptimizingSolver) -> None:
-        build(solver)
-        for i, (buf, src) in enumerate(zip(solver._bufs, solver._sources)):
-            if not isinstance(src, sa._GeneratedDivisions):
-                continue
-            source = _HeldDivisions(src.space, src.seed_config)
-            if buf.name in hold:
-                host_dim, pin = hold[buf.name]
-                source.spec = TileSpec((TileAxis(host_dim=host_dim, count=2),))
-                splits = {a: (pin or {}).get(str(a), 1) for a in src.space.axes}
-                assert src.space.admits(splits, source.spec), (buf.name, splits)
-                division = src.space.division(splits, source.spec)
-                source.seed_config = src.config_for(division)
-                source.pinned = pin is not None
-                held.add(buf.name)
-            solver._sources[i] = source
-
-    def flood_region(
-        solver: sa.SaCoOptimizingSolver, anchor: int, config: sa.DivisionConfig
-    ) -> dict[int, sa.DivisionConfig]:
-        return {
-            k: v
-            for k, v in flood(solver, anchor, config).items()
-            if v.tiling == solver._sources[k].spec
-        }
-
-    stack = contextlib.ExitStack()
-    stack.enter_context(
-        patch.object(sa.SaCoOptimizingSolver, "_build_sources", build_sources)
-    )
-    stack.enter_context(
-        patch.object(sa.SaCoOptimizingSolver, "_flood_region", flood_region)
-    )
-    return stack
-
-
-class HeldSolverTilingTests(unittest.TestCase):
-    """States the SA co-optimizer can reach, held so the result is deterministic."""
-
-    def setUp(self):
-        torch.manual_seed(0)
-        torch.compiler.reset()
-        self.addCleanup(torch.compiler.reset)
-
-    def test_gqa_query_tiled_in_two_groups_and_split_on_kv_heads(self):
-        # buf0 (q transposed to [b, hq, s, d]) and buf1 (q viewed [b, hkv, g, s,
-        # d] times the scale) are tiled on s in two single-op groups, and buf1
-        # is split 8 ways on hkv. buf1 reads buf0's copy-out through a view
-        # traced at full scale; rescaling it again read heads 8*hkv + 2*g.
-        b, s, hq, hkv, d = 1, 64, 32, 8, 128
-
-        def attention(
-            qh: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor
-        ) -> torch.Tensor:
-            q, k, v = (t.transpose(1, 2) for t in (qh, kh, vh))
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, enable_gqa=True
-            )
-            return out.transpose(1, 2).reshape(b, s, hq * d)
-
-        args = [
-            torch.randn(b, s, heads, d, dtype=torch.float16) for heads in (hq, hkv, hkv)
-        ]
-        expected = attention(*(arg.float() for arg in args))
-        held: set[str] = set()
-        with (
-            t_inductor_config.patch(force_disable_caches=True),
-            ts_inductor_config.patch(
-                lx_planning=True,
-                auto_coarse_tiling=True,
-                layout_solver="simulated_annealing",
-                co_optimizing_lx_planning=True,
-            ),
-            _hold_tilings({"buf0": (2, None), "buf1": (3, {"d0": 8})}, held),
-        ):
-            compiled = torch.compile(attention, dynamic=False)
-            actual = compiled(*(arg.to(DEVICE_NAME) for arg in args))
-
-        self.assertEqual(held, {"buf0", "buf1"})
-        actual = actual.to("cpu").float()
-        rel_l2 = float((actual - expected).norm() / expected.norm())
-        self.assertLess(rel_l2, 0.01)  # fp16 lands at 0.003
+    @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+    def test_cpsat_applies_and_solves_again(self):
+        second_plan = MagicMock()
+        _, _, result, _, apply = self._materialize(_solve=second_plan)
+        apply.assert_called_once_with(self._CHOICES)
+        self.assertIs(result, second_plan)

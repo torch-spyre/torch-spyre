@@ -28,7 +28,9 @@ from torch_spyre._inductor.cost_model import OpFeatures, relayout_ns
 from torch_spyre._inductor.dump_cost_model import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
-from torch_spyre._inductor.scratchpad.allocator import _intern_view_group
+from torch_spyre._inductor.scratchpad.division_menus import (
+    _intern_view_group,
+)
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     core_domain_rejection,

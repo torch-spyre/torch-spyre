@@ -98,20 +98,20 @@ from torch_spyre._inductor.wsr.tile_prediction import (
 )
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    CoarseTilingPass,
     _derive_group_idx_offset,
     _derive_hint_id_base,
-    apply_tilings,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
     TileAxis,
     TileSpec,
     ceil_div,
 )
+from buffer_spec import CoreDivisionBuffer, plan_of
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.scheduler import (
@@ -129,7 +129,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
+import torch_spyre._inductor.scratchpad.graph_builder as graph_builder_module
 from utils_inductor import ir_computed_buffer, ir_input_loader
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import residency_rules
+from torch_spyre._inductor.scratchpad import drain_plans, pricing
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -2652,9 +2656,8 @@ class TestCoarseTile(unittest.TestCase):
         """A value born before an automatically-tiled counted loop and read
         inside it must stay live through the loop (issue #4035).
 
-        Same clobber the ``persistent``/``later`` repro in
-        test_perm_layout_solver.py guards at the solver level, but here the
-        ``lifetime_end_override`` is *computed* by
+        The solver honours a hand-passed ``lifetime_end_override``; here the
+        override is *computed* by
         ``counted_loop_lifetime_end_overrides`` for a loop built by the
         automatic span-overflow entry point, ``coarse_tile_post_stickify``
         -- not hand-passed, and not hint-driven.  The liveness gap comes
@@ -2741,7 +2744,7 @@ class TestCoarseTile(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from buffer_spec import LifetimeBoundBuffer
         from torch_spyre._inductor.scratchpad.utils import (
             counted_loop_lifetime_overrides,
         )
@@ -7961,7 +7964,7 @@ class TestPredictFrameReduction(unittest.TestCase):
         ``reduction_ranges`` -- false as soon as a size-1 reduction dim is
         squeezed away, and the hint then names a symbol the op does not carry,
         so the applier silently tiles nothing. Going through the real lowering
-        is both faithful (it is what ``apply_tilings`` does) and immune to
+        is both faithful (it is what ``CoarseTilingPass`` does) and immune to
         that, and it mirrors ``TestPredictFrame._apply_and_compare``.
         """
         ranges_before = list(op.data.ranges)
@@ -9396,8 +9399,8 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
-class TestApplyTilingsEquivalence(unittest.TestCase):
-    """``apply_tilings`` reduces to the hint path.
+class TestCoarseTilingPassEquivalence(unittest.TestCase):
+    """CoarseTilingPass reduces to a direct coarse_tile_post_stickify call.
 
     Both paths call the same coarse_tile_post_stickify(); the pass just builds
     its (groups, group_idx_offset, dim_hints) inputs from a TileSpec instead of
@@ -9448,16 +9451,13 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         ref_fields = self._loop_fields(ref)
         ref_range = ref.data.ranges[0]
 
-        # apply_tilings: same tiling expressed as a TileSpec.
+        # CoarseTilingPass: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
+        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
         self.assertEqual(got.data.ranges[0], Integer(64))
-        # The tile still iterates dim 0, so its one symbol is the one it had.
-        c0 = sympy.Symbol("c0")
-        self.assertEqual(got.symbols_on_tile, {c0: c0})
 
     def test_nested_two_level_matches_direct_call(self):
         ref = _make_hinted_op(
@@ -9470,9 +9470,9 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         ref_ranges = list(ref.data.ranges)
 
         got = self._bare([256, 128], "op0")
-        apply_tilings(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
-        )
+        CoarseTilingPass(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
+        ).apply_pass(_graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
@@ -9481,7 +9481,7 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
         g = _graph(ops)
-        apply_tilings({"op0": spec, "op2": spec}, g)
+        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
         hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
         self.assertEqual(hint_ids, [[0], [1]])
         self.assertNotEqual(
@@ -9518,7 +9518,7 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        apply_tilings({}, g)
+        CoarseTilingPass({}).apply_pass(g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(
@@ -9526,8 +9526,8 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
             )
 
 
-class TestApplyTilingsRegionRefusal(unittest.TestCase):
-    """``apply_tilings`` refuses to tile an op inside a ``for_each_tile`` region.
+class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
+    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
 
     A region spans every op between the first and last op one outermost loop
     stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
@@ -9594,7 +9594,7 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
         ):
-            apply_tilings({"op0": self._SPEC}, _graph(ops))
+            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
@@ -9604,13 +9604,13 @@ class TestApplyTilingsRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
         ):
-            apply_tilings({"op1": self._SPEC}, _graph(ops))
+            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_tiles_op_after_the_loop(self):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
-        apply_tilings({"op1": self._SPEC}, _graph(ops))
+        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
         self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))
@@ -9631,6 +9631,21 @@ class _SentinelOp:
         return f"_SentinelOp({self.name!r})"
 
 
+def _solved_plan(*placements):
+    """A ``SolvedPlan`` of one-tick buffers given as ``(name, address,
+    lx_view)``; ``address=None`` leaves the buffer in HBM."""
+    from buffer_spec import LifetimeBoundBuffer
+
+    return plan_of(
+        [
+            LifetimeBoundBuffer(
+                name=name, size=128, uses=[0], address=address, lx_view=lx_view
+            )
+            for name, address, lx_view in placements
+        ]
+    )
+
+
 class TestDrainPlanPushAndLifetime(unittest.TestCase):
     """Post-loop drain plan: lifetime extension and the push branch.
 
@@ -9643,7 +9658,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
     """
 
     def test_drain_lifetime_extension_reaches_graph_exit(self):
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _drain_lifetime_end_overrides,
         )
 
@@ -9659,7 +9674,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         """The collective reads the storage after the drain, so the storage's
         own lifetime already covers the drain; extending it to the graph exit
         would hold every layer's carry in LX until the last layer."""
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _drain_lifetime_end_overrides,
         )
 
@@ -9672,13 +9687,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         """A post-loop reader cannot reuse a carry kept live for its drain."""
         from collections import namedtuple
 
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad import utils as utils_module
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-        from torch_spyre._inductor.scratchpad.plan_solver import (
-            CoreDivision,
-            _check_in_place_relationships,
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
         )
+        from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
         ops = [
             _LoopOp("carry"),
@@ -9710,23 +9723,27 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 writes={dep(op.name)},
             )
 
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
-
-        allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=4096)
-        allocator._validated_drain_plans = {
+        allocator = ScratchpadAllocator(size=4096, division_mode="open")
+        allocator.builder.drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
         divisions = {op.name: [CoreDivision(splits={})] for op in ops}
         with (
             patch.object(utils_module, "op_read_writes", side_effect=read_writes),
-            patch.object(allocator_module, "op_read_writes", side_effect=read_writes),
+            patch.object(residency_rules, "op_read_writes", side_effect=read_writes),
+            patch.object(drain_plans, "op_read_writes", side_effect=read_writes),
             patch.object(
-                allocator_module, "clone_at_graph_boundaries", return_value=False
+                graph_builder_module, "op_read_writes", side_effect=read_writes
             ),
             patch.object(
-                allocator_module,
+                residency_rules, "clone_at_graph_boundaries", return_value=False
+            ),
+            patch.object(drain_plans, "clone_at_graph_boundaries", return_value=False),
+            patch.object(
+                graph_builder_module, "clone_at_graph_boundaries", return_value=False
+            ),
+            patch.object(
+                pricing,
                 "mem_usage_by_buf",
                 return_value={
                     name: {"size": 128, "op_inputs": reads}
@@ -9734,35 +9751,55 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 },
             ),
             patch.object(
-                allocator,
+                graph_builder_module,
+                "mem_usage_by_buf",
+                return_value={
+                    name: {"size": 128, "op_inputs": reads}
+                    for name, reads in inputs.items()
+                },
+            ),
+            patch.object(
+                residency_rules,
                 "_op_inputs_good_for_lx_inplace",
                 side_effect=lambda op: inputs[op.name],
             ),
             patch.object(
-                allocator, "_residency_by_buf", return_value=dict.fromkeys(by_name)
+                allocator.builder,
+                "_residency_by_buf",
+                return_value=dict.fromkeys(by_name),
             ),
-            patch.object(allocator, "_parent_residency_edges", return_value={}),
-            patch.object(allocator, "_cd_parent_matches", return_value={}),
-            patch.object(allocator, "_cd_parent_relayouts", return_value={}),
+            patch.object(allocator.builder, "_parent_residency_edges", return_value={}),
+            patch.object(allocator.builder, "_cd_parent_matches", return_value={}),
+            patch.object(allocator.builder, "_relayout_edges", return_value={}),
         ):
-            in_place = allocator._determine_in_place_division_invariant(graph)
+            in_place = allocator.builder._determine_in_place_division_invariant(graph)
             self.assertEqual(in_place["reader"], ["carry"])
-            built = allocator._build_cd_bound_buffers(
-                graph, in_place, allocator_module._DivisionMap(divisions, set())
+            solve_graph = allocator.builder._build_graph(
+                graph, in_place, division_menus._DivisionMap(divisions, set())
             )
 
-        # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
-        _check_in_place_relationships(built)
-        buffers = {b.name: b for b in built}
-        self.assertEqual(buffers["carry"].end_time, len(ops))
-        self.assertEqual(buffers["reader"].in_place_parents, [])
-        self.assertEqual(buffers["tail"].in_place_parents, ["reader"])
+        nodes = solve_graph.nodes
+        # Before the fix an in-place pair broke abutment here:
+        # carry.end_time=4 != reader.start_time+1=3.
+        for node in nodes.values():
+            for e in node.inputs:
+                if e.in_place:
+                    self.assertEqual(e.src.end_time, node.start_time + 1, node.name)
+        self.assertEqual(nodes["carry"].end_time, len(ops))
+
+        def in_place_parents(name):
+            return [e.src.name for e in nodes[name].inputs if e.in_place]
+
+        self.assertEqual(in_place_parents("reader"), [])
+        self.assertEqual(in_place_parents("tail"), ["reader"])
 
     def test_missing_drain_anchor_raises_instead_of_falling_back(self):
         """After LX is committed there is no late decline."""
         from torch_spyre._inductor.scratchpad.allocator import (
-            DrainPlan,
             _assert_drain_plan_committed,
+        )
+        from torch_spyre._inductor.scratchpad.drain_plans import (
+            DrainPlan,
         )
 
         plan = DrainPlan(
@@ -9774,10 +9811,12 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         )
         graph = SimpleNamespace(operations=[], graph=object())
         with self.assertRaisesRegex(AssertionError, "no longer in graph.operations"):
-            _assert_drain_plan_committed(graph, None, {}, {}, plan)
+            _assert_drain_plan_committed(graph, None, None, {}, plan)
 
     def _isolation_plan(self):
-        from torch_spyre._inductor.scratchpad.allocator import DrainPlan
+        from torch_spyre._inductor.scratchpad.drain_plans import (
+            DrainPlan,
+        )
 
         return DrainPlan(
             storage_name="buf2",
@@ -9789,10 +9828,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
     def _run_push(self, *, with_plan, address=0x4000):
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(2**20)
         storage_op = _SentinelOp("buf2")
         update_op = _SentinelOp("buf2_update")
         plan = self._isolation_plan()
@@ -9801,7 +9841,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         graph.get_output_names.return_value = ["buf2"]
         graph.graph_input_names = []
         graph.get_buffer.return_value = storage_op
-        buffer = SimpleNamespace(name="buf2", address=address, lx_view=object())
+        buffer = ("buf2", address, object())
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -9821,7 +9861,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, [buffer], [])
+            allocator._push_allocation(graph, _solved_plan(buffer), [])
         return SimpleNamespace(
             editor=editor,
             clone=clone,
@@ -9885,11 +9925,8 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.greedy_solver import (
-            GreedyLayoutSolver,
-        )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(2**20)
         plan = self._isolation_plan()
         allocator._validated_drain_plans = {"buf2": plan}
         storage_op = _SentinelOp("buf2")
@@ -9904,13 +9941,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             "buf2": storage_op,
             "outA": other_op,
         }.get
-        buffer = SimpleNamespace(name="buf2", address=0x4000, lx_view=object())
         # Ordinary output clone first, then the drain: the drain's anchor is
         # the same object, whatever the ordinary push did to the list.
-        buffers = [
-            SimpleNamespace(name="outA", address=0x2000, lx_view=object()),
-            buffer,
-        ]
+        solved = _solved_plan(("outA", 0x2000, object()), ("buf2", 0x4000, object()))
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -9928,7 +9961,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, buffers, [])
+            allocator._push_allocation(graph, solved, [])
         calls = editor.push_allocation_with_clone.call_args_list
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].args, (other_op, [other_consumer]))
@@ -9975,7 +10008,7 @@ class TestDrainedCollective(unittest.TestCase):
         from torch._inductor.ir import ReinterpretView, StorageBox, TensorBox
 
         from torch_spyre._inductor.ir import AllGatherAsyncFallback
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _sole_post_loop_collective,
         )
 
@@ -10249,10 +10282,11 @@ class TestHoistedInputClone(unittest.TestCase):
 
     def _run_input_push(self, ops, users):
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(2**20)
         graph = MagicMock()
         graph.operations = list(ops)
         graph.get_output_names.return_value = []
@@ -10260,7 +10294,6 @@ class TestHoistedInputClone(unittest.TestCase):
         source = _SentinelOp("x")
         graph.get_buffer.return_value = source
         lx_view = object()
-        buffer = SimpleNamespace(name="x", address=0x4000, lx_view=lx_view)
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -10275,7 +10308,7 @@ class TestHoistedInputClone(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, [buffer], [])
+            allocator._push_allocation(graph, _solved_plan(("x", 0x4000, lx_view)), [])
         return SimpleNamespace(
             editor=editor,
             clone=clone,
@@ -10330,10 +10363,11 @@ class TestHoistedInputClone(unittest.TestCase):
 
         from torch_spyre._inductor.scratchpad import utils as utils_module
         from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
+            _hoisted_input_clone_entry,
+        )
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _handoff_child_start,
             _handoff_parent_end,
-            _hoisted_input_clone_entry,
         )
 
         dep = namedtuple("dep", ["name"])
@@ -10368,7 +10402,7 @@ class TestHoistedInputClone(unittest.TestCase):
                     lifetimes = utils_module.calculate_liveness(graph)
                     starts, ends = utils_module.counted_loop_lifetime_overrides(graph)
                 last_reader = ops[lifetimes["x"][-1]]
-                edge = ScratchpadAllocator._inplace_edge_ok(
+                edge = residency_rules._inplace_edge_ok(
                     child_pointwise_inputs=["x"],
                     parent_name="x",
                     child_device_layout=layout,

@@ -390,10 +390,10 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
     ops (no dtype change / no scalar-int constants) so the ONLY thing under test
     is "CPU pointwise ComputedBuffer in a Spyre graph".
 
-    Both scratchpad allocators are covered: the default greedy allocator (which
-    filters ops through `_op_output_good_for_lx_reuse` -> the gate fix) and the
-    co-optimizing allocator (`co_optimizing_lx_planning`), whose `_search`
-    footprint accounting reads `.device_layout` over every buffer -> the
+    Both division modes are covered: committed divisions (which filter ops
+    through `_op_output_good_for_lx_reuse` -> the gate fix) and the
+    co-optimizing mode (`co_optimizing_lx_planning`), whose footprint
+    accounting reads `.device_layout` over every buffer -> the
     `buf_total_bytes` guard.
     """
 
@@ -421,27 +421,16 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
             out.cpu(), ((x + 1.0) * (x - 1.0)) * 2.0, atol=0.05, rtol=0.05
         )
 
-    def test_cpu_pointwise_chain_compiles_greedy(self):
-        """Default greedy allocator: exercises the `_op_output_good_for_lx_reuse`
+    @config.patch({"co_optimizing_lx_planning": False})
+    def test_cpu_pointwise_chain_compiles_committed(self):
+        """Committed divisions: exercises the `_op_output_good_for_lx_reuse`
         gate (mem_usage_by_buf over the filtered graph_view)."""
         self._run_and_check(self)
 
-    # Pin greedy: this covers the co-opt allocator over the greedy inner solver
-    # (ExhaustiveSearchSolver-wrapped), the path this CPU-buffer guard was written
-    # for. The cpsat *joint* co-opt path does not yet apply the same guard;
-    # enabling cpsat co-opt is deferred to the co-opt follow-up. greedy has no
-    # core-division-capable solver, so this must opt into the
-    # ExhaustiveSearchSolver fallback via allow_exhaustive_search=True.
-    @config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "greedy",
-            "allow_exhaustive_search": True,
-        }
-    )
+    @config.patch({"co_optimizing_lx_planning": True})
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
-        `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
+        `GraphBuilder._build_graph` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
         self._run_and_check(self)
 

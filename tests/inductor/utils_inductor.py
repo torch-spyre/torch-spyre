@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 import copy
 import functools
@@ -28,11 +28,7 @@ from torch._inductor.utils import run_and_get_code
 
 import torch_spyre.execution.async_compile as async_compile_module
 import unittest
-from typing import Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.work_division import OpSplitSpace
-    from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
+from typing import Any
 
 DEVICE = torch.device("spyre")
 
@@ -1052,39 +1048,6 @@ def capture_backend_output_dirs():
 
     with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
         yield output_dirs
-
-
-def mock_op_split_space(
-    domains: dict,
-    output_axes: Iterable,
-    *,
-    op: Any = None,
-    legal: Callable[[dict], bool] | None = None,
-    tiling: "TilingSpace | None" = None,
-) -> "OpSplitSpace":
-    """An ``OpSplitSpace`` over stated domains, legal wherever ``legal`` says
-    (everywhere by default). The real legality rules are tested against the
-    enumeration in ``test_work_division.py``; a test of what *asks* a space
-    only needs some rule."""
-    from unittest.mock import MagicMock
-
-    from torch_spyre._inductor.work_division import OpSplitSpace
-
-    context = MagicMock()
-    context.axes = list(domains)
-    context.is_legal.side_effect = legal or (lambda splits: True)
-    context.factor_domain.side_effect = domains.__getitem__
-    space = OpSplitSpace(
-        op=MagicMock() if op is None else op,
-        context=context,
-        output_axes=frozenset(output_axes),
-        factor_domains=domains,
-        tiling=tiling,
-    )
-    # Every tiling is judged in this one context: how a per-tile frame narrows
-    # a domain is the real context's business.
-    space._context = lambda tiling: context  # type: ignore[method-assign]
-    return space
 
 
 def opspec_summaries(source: str) -> list[dict[str, Any]]:

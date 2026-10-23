@@ -58,6 +58,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     get_ncores_for_buffers,
     ops_in_offset_mutation_component,
 )
+from torch_spyre._inductor.scratchpad import residency_rules
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
 
@@ -75,8 +76,6 @@ _STICK_SIZE = 64
 
 class PointwiseInPlaceInputsTest(TestCase):
     def test_lowered_indices_determine_reuse(self):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
         def same(i, j):
             return 64 * i + j
 
@@ -92,7 +91,6 @@ class PointwiseInPlaceInputsTest(TestCase):
             ("mixed reads", [("a", same), ("a", transpose)], []),
             ("mixed reads reversed", [("a", transpose), ("a", same)], []),
         ]
-        allocator = object.__new__(ScratchpadAllocator)
         for label, reads, expected in cases:
             with self.subTest(label=label):
 
@@ -125,7 +123,8 @@ class PointwiseInPlaceInputsTest(TestCase):
                             SimpleNamespace(sizevars=SizeVarAllocator())
                         ):
                             self.assertEqual(
-                                allocator._op_inputs_good_for_lx_inplace(op), expected
+                                residency_rules._op_inputs_good_for_lx_inplace(op),
+                                expected,
                             )
 
 

@@ -4035,7 +4035,7 @@ def _per_core_view_on_buf(
     buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
     a producer's write-dep and a consumer's read-dep on the same buffer at the
     same index — and must NOT alias the same entry (both
-    ``ScratchpadAllocator._cd_parent_matches`` and ``get_ncores_for_buffers``
+    ``GraphBuilder._cd_parent_matches`` and ``get_ncores_for_buffers``
     share one cache across a producer and consumer of the same buffer).
     """
     ownership = ownership_override or getattr(op, "iteration_space_ownership", None)

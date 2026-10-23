@@ -73,6 +73,7 @@ from for_each_tile_fixtures import (
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
 )
+from torch_spyre._inductor.scratchpad import drain_plans
 
 
 class TestNestedForEachTileFixture(unittest.TestCase):
@@ -2303,15 +2304,11 @@ class TestDrainMaterialization(unittest.TestCase):
 
     @staticmethod
     def _validate(graph):
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
-
         # The validator reads op read/writes, which need an active graph
         # handler (op.get_read_writes -> V.graph.sizevars), exactly as in the
-        # production call site inside _prepare_buffers.
+        # production call site inside GraphBuilder.prepare_graph.
         with V.set_graph_handler(graph):
-            return allocator_module.validated_drain_plans(
-                graph, division_is_fixed=False
-            )
+            return drain_plans.validated_drain_plans(graph)
 
     @staticmethod
     def _carry_parts(graph):
@@ -2445,7 +2442,9 @@ class TestDrainMaterialization(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_plan_accepts_the_real_carry_graph(self):
-        from torch_spyre._inductor.scratchpad.allocator import DrainPlan
+        from torch_spyre._inductor.scratchpad.drain_plans import (
+            DrainPlan,
+        )
 
         graph = self._spliced_graph()
         storage, update, record = self._carry_parts(graph)
@@ -2474,8 +2473,6 @@ class TestDrainMaterialization(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep, ReadWrites
         from torch.utils._ordered_set import OrderedSet
-
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
 
         graph = self._spliced_graph()
         storage, update, record = self._carry_parts(graph)
@@ -2543,19 +2540,14 @@ class TestDrainMaterialization(unittest.TestCase):
                 graph.graph_outputs.pop()
         with self.subTest("reinterpret output entry"):
             with mock.patch.object(
-                allocator_module, "_is_reinterpret_output_entry", return_value=True
+                drain_plans, "_is_reinterpret_output_entry", return_value=True
             ):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("boundary cloning off"):
             with mock.patch.object(
-                allocator_module, "clone_at_graph_boundaries", return_value=False
+                drain_plans, "clone_at_graph_boundaries", return_value=False
             ):
                 self.assertEqual(self._validate(graph), {})
-        with self.subTest("fixed division"):
-            self.assertEqual(
-                allocator_module.validated_drain_plans(graph, division_is_fixed=True),
-                {},
-            )
         with self.subTest("extra in-loop reader of the storage"):
             victim = next(
                 op
@@ -2564,7 +2556,7 @@ class TestDrainMaterialization(unittest.TestCase):
                 and op is not update
                 and getattr(getattr(op, "loop_info", None), "loop_group_id", None)
             )
-            real_read_writes = allocator_module.op_read_writes
+            real_read_writes = drain_plans.op_read_writes
             injected = MemoryDep(storage.get_name(), sympy.Integer(0), (), ())
 
             def _forged(op):
@@ -2577,9 +2569,7 @@ class TestDrainMaterialization(unittest.TestCase):
                     )
                 return rw
 
-            with mock.patch.object(
-                allocator_module, "op_read_writes", side_effect=_forged
-            ):
+            with mock.patch.object(drain_plans, "op_read_writes", side_effect=_forged):
                 self.assertEqual(self._validate(graph), {})
         with self.subTest("storage has no FX origin in this graph"):
             with mock.patch.object(storage, "origins", OrderedSet()):

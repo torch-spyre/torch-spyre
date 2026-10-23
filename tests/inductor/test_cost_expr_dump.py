@@ -23,26 +23,14 @@ import sympy
 
 from torch_spyre._inductor.cost_model import CostParams
 from torch_spyre._inductor.dump_common import emit_json_line
-from torch_spyre._inductor.pass_utils import PerCoreView
-from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
-    RelayoutCharge,
     TileAxis,
     TileSpec,
-    cost_expr_record,
-    solved_bindings,
 )
-from torch_spyre._inductor.work_division import OpSplitSpace
-from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
+from torch_spyre._inductor.scratchpad.pricing import cost_expr_record, solved_bindings
 
-_CORE = sympy.Symbol("core_id")
-
-
-def _view(slot: int) -> PerCoreView:
-    return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), 4)
+from buffer_spec import CoreDivisionBuffer, plan_of
 
 
 def _buffers():
@@ -58,22 +46,6 @@ def _buffers():
         [1, 2],
         core_divisions=[CoreDivision(splits={1: 4})],
         parents=["P"],
-        cd_parent_relayouts={
-            "P": [
-                RelayoutCandidate(
-                    parent="P",
-                    consumer="C",
-                    source_division=1,
-                    consumer_division=0,
-                    group=0,
-                    source_view=_view(0),
-                    destination_view=_view(1),
-                    cost_ns=3000.0,
-                    source_footprint_bytes=16,
-                    destination_footprint_bytes=16,
-                )
-            ]
-        },
     )
     return p, c
 
@@ -82,7 +54,7 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
     p, c = _buffers()
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = None, 0
-    b = solved_bindings([p, c])
+    b = solved_bindings(plan_of([p, c]))
     assert b[p.sym_is_lx] == 1 and b[c.sym_is_lx] == 0
     assert b[p.sym_division] == 1 and b[c.sym_division] == 0
     # division 1 of P splits axis 0 four ways and leaves axis 1 whole.
@@ -91,74 +63,44 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
 
 
 def test_solved_bindings_bind_the_chosen_tiling_per_axis():
-    d0, d1 = sympy.symbols("d0 d1")
-    space = OpSplitSpace(
-        op=None,
-        context=None,
-        output_axes=frozenset({d0, d1}),
-        factor_domains={},
-        tiling=TilingSpace(max_dims=2, output_counts={0: [4], 1: [2]}),
-    )
-    tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+    d1 = sympy.Symbol("d1")
     t = CoreDivisionBuffer(
         "T",
         64,
         [0, 1],
-        core_divisions=[CoreDivision(splits={d1: 2}, tiling=tiling)],
-        division_space=space,
+        core_divisions=[
+            CoreDivision(
+                splits={d1: 2}, tiling=TileSpec((TileAxis(host_dim=0, count=4),))
+            ),
+            # The alternative tiles axis 1, so axis 1 has a symbol to bind.
+            CoreDivision(tiling=TileSpec((TileAxis(host_dim=1, count=2),))),
+        ],
     )
     t.address, t.chosen_division = 0, 0
     tiles = t.sym_tile_counts
-    b = solved_bindings([t])
+    b = solved_bindings(plan_of([t]))
     assert b[tiles[0, False]] == 4 and b[tiles[1, False]] == 1, "d1 is split, not tiled"
-    rec = cost_expr_record(10 * tiles[0, False] + tiles[1, False], [], [t])
+    rec = cost_expr_record(10 * tiles[0, False] + tiles[1, False], [], plan_of([t]))
     assert rec["objective_ns"] == 41.0
 
 
 def test_record_evaluates_every_term_under_the_solved_plan():
     p, c = _buffers()
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
     p.address, p.chosen_division = 0, 1
-    c.address, c.chosen_division = 16, 0
-    copy.address = 32
-    spill = 4000 * (1 - p.sym_is_lx) + 2000 * (1 - c.sym_is_lx)
+    c.address, c.chosen_division = None, 0
     bundle_terms = [
         (["P"], 4000 * (1 - p.sym_is_lx)),
         (["C"], 2000 * (1 - c.sym_is_lx)),
     ]
-    cost_expr = spill + copy.cost_term()
-    rec = cost_expr_record(cost_expr, bundle_terms, [p, c, copy], CostParams())
+    cost_expr = sum(term for _, term in bundle_terms)
+    rec = cost_expr_record(cost_expr, bundle_terms, plan_of([p, c]), CostParams())
     assert rec["buffers"] == ["P", "C"]
-    assert [b["value_ns"] for b in rec["bundles"]] == [0.0, 0.0]
-    (rt,) = rec["relayout_terms"]
-    assert rt["source"] == "P" and rt["resident"] is True
-    assert rt["value_ns"] == 3000.0, "P chose division 1, priced 3000 ns"
-    assert rec["objective_ns"] == 3000.0
+    assert [b["value_ns"] for b in rec["bundles"]] == [0.0, 2000.0]
+    assert rec["objective_ns"] == 2000.0, "only C spilled"
     assert rec["params"]["bw_peak_gbps"] == CostParams().bw_peak_gbps
-    # srepr round-trips, including the RelayoutCharge node.
-    back = sympy.parse_expr(rt["expr"], local_dict={"RelayoutCharge": RelayoutCharge})
-    assert back.free_symbols == {copy.sym_is_lx, p.sym_division}
-
-
-def test_relayout_charge_prints_only_the_priced_divisions():
-    """``str()`` keys each nonzero price by its division; ``srepr`` keeps the
-    full positional table, so the dump still round-trips."""
-    is_lx = sympy.Symbol("is_lx_copy", integer=True, nonnegative=True)
-    division = sympy.Symbol("division_P", integer=True, nonnegative=True)
-    charge = RelayoutCharge(is_lx, division, 0, 0, 65, 0, 147)
-    assert str(charge) == (
-        "RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147})"
-    )
-    assert str(2 * charge + 1) == (
-        "2*RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147}) + 1"
-    )
-    assert str(RelayoutCharge(is_lx, division, 0, 0)) == (
-        "RelayoutCharge(is_lx_copy, division_P, prices={})"
-    )
-    back = sympy.parse_expr(
-        sympy.srepr(charge), local_dict={"RelayoutCharge": RelayoutCharge}
-    )
-    assert back == charge
+    # srepr round-trips.
+    back = sympy.parse_expr(rec["bundles"][1]["expr"])
+    assert back.free_symbols == {c.sym_is_lx}
 
 
 def test_a_bundle_names_its_buffers_after_the_boundary_rewrite(monkeypatch):
@@ -218,16 +160,18 @@ def test_the_record_carries_the_context_the_buffers_cannot_show():
     context = {
         "op_names": {"C": "amax_1"},
         "op_ids": {"C": "op1"},
-        "env": {"sencores": 8, "lx_capacity": 1234, "solver": "CpSatLayoutSolver"},
+        "env": {"sencores": 8, "lx_capacity": 1234},
         "solve": {"status": "OPTIMAL", "solve_s": 0.4},
     }
-    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams(), context=context)
+    rec = cost_expr_record(
+        sympy.Integer(0), [], plan_of([p, c]), CostParams(), context=context
+    )
     assert rec["env"]["lx_capacity"] == 1234 and rec["env"]["sencores"] == 8
     assert rec["solve"]["status"] == "OPTIMAL"
     assert rec["op_names"]["C"] == "amax_1", "the readable name"
     assert rec["op_ids"]["C"] == "op1", "the key the numeric dump joins on"
     # And a record built without context is unchanged, so old readers still work.
-    plain = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
+    plain = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())
     assert "env" not in plain and "solve" not in plain
 
 
@@ -239,7 +183,11 @@ def test_context_may_not_redefine_the_record():
     c.address, c.chosen_division = 16, 0
     with pytest.raises(AssertionError, match="bundles"):
         cost_expr_record(
-            sympy.Integer(0), [], [p, c], CostParams(), context={"bundles": "oops"}
+            sympy.Integer(0),
+            [],
+            plan_of([p, c]),
+            CostParams(),
+            context={"bundles": "oops"},
         )
 
 
@@ -250,24 +198,11 @@ def test_a_buffer_carries_the_reason_it_never_reached_the_solver():
     p.residency_reason = "op not allowed"
     p.address, p.chosen_division = None, 1
     c.address, c.chosen_division = 16, 0
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())["divisions"]
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
+        "divisions"
+    ]
     assert divs["P"]["reason"] == "op not allowed"
     assert divs["C"]["reason"] is None, "C reached the solver; bindings say the rest"
-
-
-def test_priced_relayouts_record_the_copies_that_were_not_taken():
-    """``relayout_terms`` holds what fired. Without the priced candidates a
-    reader cannot tell "relayout was never on the table" from "it was available
-    and lost"."""
-    p, c = _buffers()
-    p.address, p.chosen_division = 0, 1
-    c.address, c.chosen_division = 16, 0
-    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
-    priced = rec["priced_relayouts"]
-    assert list(priced) == ["C"], "keyed by the consumer, as divisions are"
-    (cand,) = priced["C"]["P"]
-    assert cand["cost_ns"] == 3000.0
-    assert (cand["source_division"], cand["consumer_division"]) == (1, 0)
 
 
 def test_emit_json_line_appends_one_record_per_call(tmp_path):
@@ -282,13 +217,10 @@ def test_record_carries_the_divisions_the_choice_was_made_over():
     p, c = _buffers()
     # The gate admits only P's axis-1 split as a per-core match for C.
     c.cd_parent_matches = {"P": [(0, 0)]}
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
-    copy.address = 32
-    rec = cost_expr_record(sympy.Integer(0), [], [p, c, copy], CostParams())
+    rec = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())
     divs = rec["divisions"]
-    # Relayout copies carry a single division each and are left out.
     assert list(divs) == ["P", "C"]
     assert divs["P"]["cores"] == [4, 4] and divs["P"]["chosen"] == 1
     assert divs["P"]["labels"] == ["s1/4", "s0/4"]
@@ -313,18 +245,16 @@ def test_a_parent_the_gate_refused_outright_is_still_listed():
     """
     p, c = _buffers()
     c.cd_parent_matches = {}  # the gate built no edge for P at all
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
-    copy.address = 32
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c, copy], CostParams())[
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
         "divisions"
     ]
     assert divs["C"]["parents"] == ["P"], "the edge exists in the graph"
     assert "P" not in divs["C"]["matches"], "and the gate refused it outright"
     # The weighed-but-empty case is the other one, and must stay distinguishable.
     c.cd_parent_matches = {"P": []}
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c, copy], CostParams())[
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
         "divisions"
     ]
     assert divs["C"]["matches"] == {"P": []}

@@ -377,8 +377,13 @@ The full list of dynamic loggers in the codebase:
 | `"codegen.superdsc"` | `spyre.inductor.codegen.superdsc` | `_inductor/codegen/superdsc.py` |
 | `"kernel_runner"` | `spyre.inductor.kernel_runner` | `_inductor/execution/kernel_runner.py` |
 | `"scratchpad.allocator"` | `spyre.inductor.scratchpad.allocator` | `_inductor/scratchpad/allocator.py` |
+| `"scratchpad.coarse_tiling"` | `spyre.inductor.scratchpad.coarse_tiling` | `_inductor/scratchpad/coarse_tiling.py` |
+| `"scratchpad.division_menus"` | `spyre.inductor.scratchpad.division_menus` | `_inductor/scratchpad/division_menus.py` |
 | `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
-| `"scratchpad.greedy_solver"` | `spyre.inductor.scratchpad.greedy_solver` | `_inductor/scratchpad/greedy_solver.py` |
+| `"scratchpad.pricing"` | `spyre.inductor.scratchpad.pricing` | `_inductor/scratchpad/pricing.py` |
+| `"scratchpad.graph_builder"` | `spyre.inductor.scratchpad.graph_builder` | `_inductor/scratchpad/graph_builder.py` |
+| `"lx_context_switching"` | `spyre.inductor.lx_context_switching` | `_inductor/scratchpad/lx_context_switching.py` |
+| `"lx_relayout"` | `spyre.inductor.lx_relayout` | `_inductor/scratchpad/lx_relayout.py` |
 | `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/propagate_named_dims.py` |
 | `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile.py`, `_inductor/wsr/coarse_tile_span_overflow.py` |
 | `"wsr.propagate_named_dims"` | `spyre.inductor.wsr.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |

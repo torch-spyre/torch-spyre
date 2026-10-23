@@ -44,8 +44,9 @@ from torch_spyre._inductor.cost_model import (
     predict_by_bundle,
     predict_ops,
 )
+from torch_spyre._inductor.scratchpad import pricing
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
-from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+from torch_spyre._inductor.scratchpad.division_menus import _work_slices
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -64,20 +65,18 @@ def _entries():
 
 class CandidateDivisionTest(TestCase):
     def test_candidate_is_restored_as_complete_symbol_keyed_map(self):
-        """SA feature extraction neither encodes nor mutates Scheduler transport."""
+        """Feature extraction neither encodes nor mutates Scheduler transport."""
         m, n, kk = sympy.symbols("m n kk")
         op = object()
         division = CoreDivision(splits={m: 8, kk: 2}, reduction_syms=frozenset({kk}))
         expected = {m: 8, n: 1, kk: 2}
         with patch(
-            "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+            "torch_spyre._inductor.scratchpad.division_menus.iteration_space_from_op",
             return_value={m: 1024, n: 1024, kk: 2048},
         ):
             self.assertEqual(_work_slices(op, division), expected)
 
-    def test_symbolic_and_concrete_prices_receive_the_whole_legal_menu(self):
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-
+    def test_symbolic_price_receives_the_whole_legal_menu(self):
         m, n, k, split = sympy.symbols("m n k split", integer=True, positive=True)
         op = SimpleNamespace(get_name=lambda: "out")
         divisions = [CoreDivision(splits={m: 16}), CoreDivision(splits={m: 8, n: 2})]
@@ -87,37 +86,19 @@ class CandidateDivisionTest(TestCase):
         }
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+                "torch_spyre._inductor.scratchpad.division_menus.iteration_space_from_op",
                 return_value={m: 32, n: 128, k: 64},
             ),
             patch(
                 "torch_spyre._inductor.dump_cost_model.extract_op_features"
             ) as extract,
             patch("torch_spyre._inductor.cost_model.predict_ops", return_value=1.0),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
-                return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
-            ),
         ):
-            CoOptimizingAllocator._extract_op_features(
-                None, None, "out", buffers, {}, op=op
-            )
+            pricing.extract_op_features(None, "out", buffers, {}, op=op)
             self.assertEqual(
                 extract.call_args.kwargs["candidate_work_slices"], expected
             )
             self.assertEqual(extract.call_args.args[1], {m: split, n: 1, k: 1})
-            extract.reset_mock()
-
-            # Shortlisting prices only candidate 0, but applicability must still
-            # see candidate 1. Otherwise symbolic and concrete prices disagree.
-            CoOptimizingAllocator._relayout_consumer_costs(
-                op, divisions, "weight", [SimpleNamespace(consumer_division=0)]
-            )
-            extract.assert_called_once()
-            self.assertEqual(
-                extract.call_args.kwargs["candidate_work_slices"], expected
-            )
-            self.assertEqual(extract.call_args.args[1], expected[0])
 
 
 class FixturePresentTest(TestCase):
@@ -207,7 +188,7 @@ class DiscriminationTest(TestCase):
 class SymbolicTiledFeatureTest(TestCase):
     """Coarse-tiled features carrying the co-optimizer's UNDECIDED symbols.
 
-    ``CoOptimizingAllocator._extract_op_features`` keys ``is_lx`` and the core
+    ``pricing.extract_op_features`` keys ``is_lx`` and the core
     splits on the solver's own variables, so a coarse-tiled op reaches
     ``predict_ops`` with a symbolic per-core tile height. Every tiling surface
     keyed on it is a piecewise power law, and branching on a symbol raised
@@ -217,7 +198,7 @@ class SymbolicTiledFeatureTest(TestCase):
     ``explain()`` (the ``SPYRE_DUMP_COST`` report path) is deliberately NOT
     covered here: it is reached only from ``dump_cost_model``'s dump hook on the
     deterministic pre-scheduling extraction, never from
-    ``CoOptimizingAllocator``'s symbolic path -- so it never sees a symbolic
+    the joint ``ScratchpadAllocator``'s symbolic path -- so it never sees a symbolic
     feature and there is no regression surface to test.
     """
 
@@ -422,7 +403,7 @@ class SymbolicTiledFeatureTest(TestCase):
         )
 
     def test_predict_by_bundle_handles_a_mixed_symbolic_and_concrete_bundle(self):
-        """``predict_by_bundle`` -- what ``CoOptimizingAllocator._solve`` actually
+        """``predict_by_bundle`` -- what ``ScratchpadAllocator._solve`` actually
         calls (allocator.py:1845) -- groups ``operations`` via
         ``fusion.estimate_bundles`` before any op reaches ``predict_ops``. Real IR
         operations aren't available from this JSON fixture, so the grouping is
@@ -461,7 +442,7 @@ class SymbolicTiledFeatureTest(TestCase):
 class SymbolicMatmulSplitCostTest(TestCase):
     """A matmul whose CORE SPLITS -- not just ``is_lx`` -- are undecided symbols.
 
-    ``CoOptimizingAllocator._extract_op_features`` builds the work slices from
+    ``pricing.extract_op_features`` builds the work slices from
     ``plan_solver.sym_core_divs``, so ``dump_cost_model._matmul_features`` sees one
     ``sympy.Symbol`` per split and a matmul reaches ``predict_ops`` with symbolic
     ``m``/``n``/``k``, symbolic ``cores`` and a symbolic ``matmul_rows_per_core``.
@@ -493,7 +474,9 @@ class SymbolicMatmulSplitCostTest(TestCase):
     M, N, K, DTYPE_BYTES = 1024, 1024, 64, 2
 
     def _params(self):
-        from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+        from torch_spyre._inductor.scratchpad.pricing import (
+            _COST_PARAMS,
+        )
 
         return _COST_PARAMS
 
@@ -609,7 +592,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
     def test_the_symbolic_split_cost_expression_linearizes(self):
         """Run the REAL CP-SAT converter, not a structural proxy.
 
-        ``sym_map``/``buffer_map`` mirror ``CpSatLayoutSolver._minimize_cost_expr``:
+        ``sym_map``/``buffer_map`` mirror ``EnumeratedStrategy.cost_bindings``:
         the split variable in ``sym_map``, plus a ``buffer_map`` entry
         ``_print_Symbol`` needs to tabulate the ``log2_``/``inv_`` aux variables over
         the candidate divisions.

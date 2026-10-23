@@ -46,9 +46,9 @@ matmul_chain          4      1.50        135.50               52.50    270.50
 elementwise_chain    32      1.03        149.00               52.13    282.78
 =================  ====  ========  ============  ==================  ========
 
-Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
-and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
-not float on the shell's environment.
+Taken with ``sencores=32``, ``lx_planning=True`` and ``hbm_pool_planning=True``,
+which ``_counted_compile`` pins so the bounds do not float on the shell's
+environment.
 
 At the first calibration (main ``1a56c846``), the sweep's figures over 4,443
 operations counted at pre-scheduling-pipeline entry -- 1.32 misses, 90.7
@@ -153,13 +153,12 @@ def _counted_compile(fn, args) -> tuple[dict[str, int], int]:
         patch.object(passes, "CustomPreSchedulingPasses", _Capturing),
         torch._inductor.config.patch({"force_disable_caches": True}),
         # Which passes run, and how much each does, comes from the environment.
-        # A bound with 1.1-1.2x headroom cannot float on whatever SENCORES or
-        # LAYOUT_SOLVER the shell happens to export, so pin the four that matter
-        # to the values the calibration was taken at.
+        # A bound with 1.1-1.2x headroom cannot float on whatever SENCORES the
+        # shell happens to export, so pin the three that matter to the values
+        # the calibration was taken at.
         ts_inductor_config.patch("sencores", 32),
         ts_inductor_config.patch("lx_planning", True),
         ts_inductor_config.patch("hbm_pool_planning", True),
-        ts_inductor_config.patch("layout_solver", "cpsat"),
     ):
         # counted_region fills the dict on exit, so read it after the block.
         with pass_counters.counted_region() as counts:

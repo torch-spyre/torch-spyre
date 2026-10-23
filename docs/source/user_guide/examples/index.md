@@ -43,17 +43,6 @@ common Torch-Spyre use cases.
 | `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
 | `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
 
-## Scratchpad Planning Examples
-
-These scripts model the LX scratchpad layout solver in isolation and plot the
-resulting buffer layouts. They require `matplotlib` and `numpy`.
-
-| Script | Description |
-|--------|-------------|
-| `scratchpad/toy_layout.py` | Plot the layout for a fixed ordering of four buffers, with no annealing |
-| `scratchpad/random_buffers.py` | Compare first-fit against simulated-annealing quality on a set of random buffers |
-| `scratchpad/inplace_annealing.py` | Convergence study on an 18-buffer workload with in-place reuse |
-
 ## Provenance Audit
 
 The provenance audit traces which source-to-kernel provenance fields survive

@@ -65,7 +65,7 @@ from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import mock_backend_compiler, compare_with_cpu  # noqa: E402
+from utils_inductor import mock_backend_compiler, compare_with_cpu
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -83,7 +83,7 @@ from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     span_overflow_groups,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.scratchpad.allocator import (
+from torch_spyre._inductor.scratchpad.division_menus import (
     _drop_read_distance_violations,
     _op_read_span_is_evaluable,
     _spec_within_read_distance,

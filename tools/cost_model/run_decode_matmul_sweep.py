@@ -162,7 +162,6 @@ def measure(case, output):
             "dxp_lx_frac_avail": config.dxp_lx_frac_avail,
             "lx_planning": config.lx_planning,
             "co_optimizing_lx_planning": config.co_optimizing_lx_planning,
-            "layout_solver": config.layout_solver,
             "compile_threads": os.environ["TORCHINDUCTOR_COMPILE_THREADS"],
         },
     }

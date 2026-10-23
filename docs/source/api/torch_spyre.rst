@@ -734,6 +734,10 @@ Environment Variables
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
+   * - ``LX_DIVISION_STRATEGY``
+     - How the LX solve encodes work splits and edges: ``lazy``
+       (default), ``enumerated`` or ``table``. See
+       :doc:`/compiler/scratchpad_planning`
    * - ``FRONTEND_POOL_ALLOCATION``
      - Allocate each SDSC bundle's HBM pool as a front-end PyTorch tensor
        passed in as ``%pool_base_addr``, instead of the backend
@@ -753,18 +757,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver strategy: ``cpsat`` (default),
-       ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
-       See :doc:`/compiler/scratchpad_planning`
-   * - ``ALLOW_EXHAUSTIVE_SEARCH``
-     - Allow ``CO_OPTIMIZING_LX_PLANNING`` to fall back to
-       ``ExhaustiveSearchSolver`` (an expensive DFS over core-division
-       candidates) when ``LAYOUT_SOLVER`` names a solver that is not
-       natively core-division-capable -- ``greedy``, ``bestfit``,
-       ``firstfit``, or ``cpsat`` without ``ortools`` installed (default
-       ``0``; without this set, that combination raises ``ValueError``
-       instead). See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
        ``1``)
@@ -825,10 +817,6 @@ Environment Variables
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
-   * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
-     - Number of destination views the CP-SAT relayout enumeration keeps per
-       (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
-       every view)
    * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
      - For unpriced CP-SAT solves, skip presolve above this many relayout
        copies (default ``0``, which disables the threshold)

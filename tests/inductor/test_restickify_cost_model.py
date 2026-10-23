@@ -25,6 +25,8 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
 from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import pricing
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
@@ -561,8 +563,9 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
         commit_iteration_space_ownership,
         iteration_space_from_op,
     )
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+    from torch_spyre._inductor.scratchpad.allocator import (
+        ScratchpadAllocator,
+    )
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -570,19 +573,16 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     commit_iteration_space_ownership(consumer, committed)
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
-    allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    ordinary, _ = allocator._enumerate_core_divisions(consumer, config.sencores)
+    allocator = ScratchpadAllocator(size=2**20, division_mode="open")
+    ordinary, _ = allocator.builder._enumerate_core_divisions(consumer, config.sencores)
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == ordinary
-    solver = CpSatLayoutSolver(buffers, allocator.size)
-    result = allocator._solve(solver, graph)
-    selected = next(buf for buf in result if buf.name == consumer.name)
-    chosen = selected.core_divisions[selected.chosen_division]
-    direct = allocator._pricing_operations(graph, buffers)[0]
+    solve_graph = allocator._build_graph(graph)
+    assert list(solve_graph.nodes[consumer.name].menu) == ordinary
+    result = allocator._solve(graph)
+    chosen = result.division(result.by_name[consumer.name])
+    direct = allocator.builder._pricing_operations(graph, solve_graph)[0]
     costs = [
         cm._transport_dma_excess_ns(
             [dcm.extract_op_features(direct, splits)], cm.CostParams()
@@ -621,27 +621,29 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         iteration_space_from_op,
     )
     from torch_spyre._inductor.scratchpad import allocator as am
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+    from torch_spyre._inductor.scratchpad import graph_builder as tcm
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
     commit_iteration_space_ownership(consumer, {b: 8, x: 2, n: 1})
     if failure in ("disabled_pricing", "core_budget"):
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
-        )
+        for module in (pricing, tcm):
+            monkeypatch.setattr(
+                module,
+                "_COST_PARAMS",
+                replace(pricing._COST_PARAMS, transport_dma_ns_per_request={}),
+            )
         if failure == "core_budget":
             monkeypatch.setattr(config, "sencores", 8)
     elif failure == "unsupported_core_count":
-        rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
+        rates = dict(pricing._COST_PARAMS.transport_dma_ns_per_request)
         del rates[2]
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
-        )
+        for module in (pricing, tcm):
+            monkeypatch.setattr(
+                module,
+                "_COST_PARAMS",
+                replace(pricing._COST_PARAMS, transport_dma_ns_per_request=rates),
+            )
     elif failure == "unknown_geometry":
         monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *args: (None, None))
     elif failure == "one_candidate":
@@ -666,42 +668,48 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         monkeypatch.setattr(config, "read_copy_elision", False)
     elif failure == "hint":
         monkeypatch.setattr(config, "ignore_work_division_hints", False)
-        monkeypatch.setattr(am, "has_resolved_work_div_hint", lambda op: op is consumer)
-    allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
+        monkeypatch.setattr(
+            tcm, "has_resolved_work_div_hint", lambda op: op is consumer
+        )
+    allocator = am.ScratchpadAllocator(size=2**20, division_mode="open")
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
+            BufferType,
             CoreDivision,
-            CoreDivisionBuffer,
-            RelayoutCopyBuffer,
         )
 
-        build = allocator._build_cd_bound_buffers
+        build = allocator.builder._build_graph
 
         def with_allocation_choice(*args):
-            buffers = build(*args)
+            solve_graph = build(*args)
             # Inject only the allocation-dependent choice, not divisions or
             # the proof. Preparation must use the same context as pricing.
             if failure == "source_clone":
-                extra = CoreDivisionBuffer(
-                    "input", 128, [0, 1], core_divisions=[CoreDivision()]
+                assert "input" not in solve_graph.nodes
+                solve_graph.add_ir_node(
+                    "input",
+                    nbytes=128,
+                    uses=[0, 1],
+                    first_use_is_read=True,
+                    boundary=BufferType.Input,
+                    menu=(CoreDivision(),),
                 )
             else:
-                extra = RelayoutCopyBuffer(
-                    "shuffle",
-                    128,
-                    [0, 1],
-                    core_divisions=[CoreDivision()],
-                    relayout_parent=stage.name,
+                # The staging copy may be relaid out to its consumer.
+                edge = next(
+                    e
+                    for e in solve_graph.nodes[consumer.name].inputs
+                    if e.src.name == stage.name
                 )
-            return [*buffers, extra]
+                edge.relayout_edge = object()
+            return solve_graph
 
-        monkeypatch.setattr(
-            allocator, "_build_cd_bound_buffers", with_allocation_choice
-        )
+        monkeypatch.setattr(allocator.builder, "_build_graph", with_allocation_choice)
     if failure == "core_budget":
         with pytest.raises(AssertionError, match="fixed direct-read division over"):
-            allocator._prepare_buffers(graph)
+            allocator._build_graph(graph)
         return
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == [am._fixed_core_division(consumer)]
+    solve_graph = allocator._build_graph(graph)
+    assert list(solve_graph.nodes[consumer.name].menu) == [
+        division_menus._fixed_core_division(consumer)
+    ]

@@ -31,12 +31,10 @@ dependencies = [
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "psutil",
-    # CP-SAT LX layout solver. `layout_solver` defaults to "cpsat" (see config.py),
-    # so a base install needs ortools to actually get it -- without this, every
-    # default-config compile falls back to the greedy allocator with a warning.
-    # No PyPI wheel or sdist for s390x/ppc64le; those arches keep the documented
-    # greedy fallback (ppc64le gets a from-source build in spyre-frameworks
-    # instead, installed out-of-band -- see pipelines/components/ortools there).
+    # The LX layout solve runs on OR-Tools CP-SAT; without ortools nothing is
+    # placed in LX. No PyPI wheel or sdist for s390x/ppc64le (ppc64le gets a
+    # from-source build in spyre-frameworks instead, installed out-of-band -- see
+    # pipelines/components/ortools there).
     "ortools>=9.0; platform_machine != 's390x' and platform_machine != 'ppc64le'",
 ]
 requires-python = ">=3.11"
@@ -51,8 +49,8 @@ dynamic = ["version"]
 # against is `tools/ktir-mlir-frontend.pin`, which explains the rest.
 
 [project.optional-dependencies]
-# ortools is now a base dependency (on wheel-supported arches) since layout_solver
-# defaults to "cpsat" -- see `dependencies` above. This extra is kept as a no-op
+# ortools is a base dependency (on wheel-supported arches) -- see `dependencies`
+# above. This extra is kept as a no-op
 # alias so existing `--extra cpsat` / `.[cpsat]` call sites (e.g. spyre-frameworks'
 # Containerfile.dev) keep working unchanged.
 cpsat = [

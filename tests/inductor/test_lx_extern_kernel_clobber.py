@@ -51,7 +51,9 @@ import torch
 import torch_spyre  # noqa: F401
 from torch._inductor.ir import ExternKernel
 from torch_spyre._inductor.ir import SpyreEmptyFallback
-from torch_spyre._inductor.scratchpad.allocator import _extern_kernel_in_live_range
+from torch_spyre._inductor.scratchpad.residency_rules import (
+    _extern_kernel_in_live_range,
+)
 
 
 DEVICE = "spyre"

@@ -16,8 +16,8 @@
 
 Pointwise ops share their candidate divisions, so on an unconstrained graph a
 slicing MATCH is always available for free and the solver would rationally
-never shuffle. To exercise the decision deterministically, the match table is
-emptied on every edge (monkeypatch), making a relayout the only route to
+never shuffle. To exercise the decision deterministically, the edge relation
+is held false on every edge (monkeypatch), making a relayout the only route to
 residency; the real cost objective then chooses it, because the shuffle
 (~1-9 us depending on the chosen geometry) beats spilling the 2.10 MB
 intermediate through HBM.
@@ -37,14 +37,16 @@ import torch
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
-from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
 
 
-_COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+_COOPT = {"co_optimizing_lx_planning": True}
 
 
-def _no_matches(self, edges, *args, **kwargs):
-    return {parent: [] for parent in edges}
+def _no_relation(self, edge, lit, model):
+    """No division pair slices an edge's buffer alike: the derived relation's
+    form of an empty pair table."""
+    model.Add(lit == 0)
 
 
 class _Observed:
@@ -54,8 +56,9 @@ class _Observed:
     relayout (both args LX-resident with distinct work divisions) together
     with the LX addresses it emitted.
 
-    With ``force=True`` the match table is emptied on every edge, so a
-    relayout is the only route to residency (see the module docstring).
+    With ``force=True`` no division pair matches on any edge (the strategy's
+    relation is held false), so a relayout is the only route to residency (see
+    the module docstring).
     With ``force=False`` the graph is compiled as a user would see it and
     only read-only spies are installed.
     """
@@ -67,10 +70,6 @@ class _Observed:
         from torch_spyre._inductor import op_spec as opspec_mod
 
         self.plans: list = []
-        # The committed path's own plans for the SAME committed graph, taken at
-        # the moment the solver's plans are materialized (see
-        # assert_fired_edges_are_committed_eligible).
-        self.committed: list = []
         self.demotions: list = []
         self.emitted: set[tuple[int, int]] = set()  # (src, dst) LX addresses
         # One entry per emitted LX relayout op, recorded where spyre_kernel
@@ -88,14 +87,10 @@ class _Observed:
         def spy_materialize(graph, plans):
             from torch_spyre._inductor.pass_utils import op_read_writes
             from torch_spyre._inductor.scratchpad.lx_relayout import (
-                collect_lx_relayout_plans,
                 materialized_lx_relayouts,
             )
 
             self.plans.extend(plans)
-            # Divisions are committed by now and nothing is materialized yet:
-            # exactly the state the committed collector expects.
-            self.committed.extend(collect_lx_relayout_plans(graph))
             result = real_materialize(graph, plans)
             self.copies = {
                 edge: copy_name
@@ -142,9 +137,13 @@ class _Observed:
         monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity_codegen)
         monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
-            monkeypatch.setattr(
-                alloc_mod.CoOptimizingAllocator, "_cd_parent_matches", _no_matches
+            from torch_spyre._inductor.scratchpad.encoding_strategy import (
+                EnumeratedStrategy,
             )
+            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+            for strategy in (EnumeratedStrategy, LazyStrategy):
+                monkeypatch.setattr(strategy, "_relate", _no_relation)
         torch._inductor.codecache.FxGraphCache.clear()
         torch._dynamo.reset()
 
@@ -178,44 +177,6 @@ class _Observed:
                     f"{consumer} does not read the relayout copy {copy_name} "
                     f"(reads {sorted(self.consumer_reads[consumer])})"
                 )
-        self.assert_fired_edges_are_committed_eligible()
-
-    def assert_fired_edges_are_committed_eligible(self) -> None:
-        """Parity with the committed path.
-
-        The solver enumerates candidates before divisions exist, so it mirrors
-        the committed path's eligibility gates instead of calling them. Those
-        gates are being rewritten under it (#4284, #3440, #4153). This pins the
-        one direction that must always hold: every edge the solver fired is one
-        the committed collector, run on the same committed graph, also
-        certifies, with the same physical source and destination ownership,
-        core count and per-core LX spans (the sizes both allocators reserve for
-        the shuffle's endpoints, #3440). (The reverse need not hold: the solver may decline an
-        eligible edge on economics or capacity.) A solver segment's consumers
-        are a subset of the committed plan's, which groups every consumer of a
-        destination view together.
-        """
-        for plan in self.plans:
-            twins = [
-                c
-                for c in self.committed
-                if c.source_name == plan.source_name
-                and set(plan.consumer_names) <= set(c.consumer_names)
-                and c.num_cores == plan.num_cores
-                and c.source_view.same_partition(plan.source_view)
-                and c.destination_view.same_partition(plan.destination_view)
-                and c.source_footprint_bytes == plan.source_footprint_bytes
-                and c.destination_footprint_bytes == plan.destination_footprint_bytes
-            ]
-            assert twins, (
-                f"solver fired {plan.source_name} -> {plan.consumer_names} "
-                f"(src {dict(plan.source_view.work_slice_dims)}, dst "
-                f"{dict(plan.destination_view.work_slice_dims)}, {plan.num_cores} "
-                f"cores, spans {plan.source_footprint_bytes}/"
-                f"{plan.destination_footprint_bytes} B) but the committed collector "
-                "certifies no such edge on the committed graph; committed plans: "
-                f"{[(c.source_name, c.consumer_names, dict(c.source_view.work_slice_dims), dict(c.destination_view.work_slice_dims), c.source_footprint_bytes, c.destination_footprint_bytes) for c in self.committed]}"
-            )
 
     def assert_nothing_emitted(self) -> None:
         """No plan, no demotion, and no identity op codegen took for an LX
@@ -242,12 +203,7 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False)(x)
 
     # The solver fired the neg -> relu edge, the commit path handed
@@ -266,14 +222,10 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
-def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
-    """The solver's ``decides_lx_relayouts()`` says whether it decides
-    relayouts; when it does not, no candidate is enumerated and the
-    co-optimizing solve is exactly what it was before this feature."""
+def test_relayouts_off_materializes_nothing(monkeypatch):
+    """With ``lx_planner_relayout`` off no candidate is enumerated, and the
+    co-optimizing solve is exactly what it was before relayouts."""
     observed = _arm_forced(monkeypatch)
-    monkeypatch.setattr(
-        CpSatLayoutSolver, "decides_lx_relayouts", classmethod(lambda cls: False)
-    )
 
     def fn(t):
         return torch.relu(torch.neg(t)) + 1.0
@@ -281,7 +233,7 @@ def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(_COOPT):
+    with config.patch({**_COOPT, "lx_planner_relayout": False}):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_nothing_emitted()
@@ -318,12 +270,7 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     for name, size in (("B", 8), ("M", 256), ("K", 512)):
         _pnd.declare_tensor_dim(name, size)
     x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_emitted_in_lx(expected_plans=1)
@@ -389,7 +336,6 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
         observed.assert_emitted_in_lx(expected_plans=1)
     else:
         observed.assert_nothing_emitted()
-        assert observed.committed == []
     torch.testing.assert_close(out.cpu(), fn(hx, hw), rtol=2e-2, atol=2e-2)
 
 
@@ -408,9 +354,6 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     destination) LX address pair matches the pair emitted by codegen, exactly
     one shuffle op was recorded by spyre_kernel, and every plan consumer
     reads the materialized copy buffer.
-    - The parity sub-check runs the committed collector on the same committed
-    graph and verifies the same edge with matching core count, work-slice
-    partition, and per-endpoint LX footprint.
     - plan.num_cores and destination_view.num_cores match the fixture's
     source_cores / destination_cores expectations, verifying that the
     solver preserves the core counts from the grouped graph.
@@ -651,17 +594,15 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
-    orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+    orig_edges = GraphBuilder._relayout_edges
 
-    def spy_tables(self, *args, **kwargs):
-        out = orig_tables(self, *args, **kwargs)
+    def spy_edges(self, *args, **kwargs):
+        out = orig_edges(self, *args, **kwargs)
         if out:
             tables.append(out)
         return out
 
-    monkeypatch.setattr(
-        alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
-    )
+    monkeypatch.setattr(GraphBuilder, "_relayout_edges", spy_edges)
 
     recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
@@ -692,12 +633,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     hb = torch.randn(512, 256, dtype=torch.float16)
     a = ha.to("spyre")
     b = hb.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
     # Graph-global, same as the test this replaces: also covers each body's
@@ -715,22 +651,22 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
 
 def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch):
     """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
-    relayout candidate (the same-group exception in
-    ``solver_relayout_edge_context``, torch-spyre#5057), when
-    ``lx_same_tile_group_relayout`` is enabled (off by default as of #5632,
-    pending that PR's compile-time investigation), and that candidate's
-    cost must carry the loop's own trip-count multiplier
-    (``_coarse_tile_loop_trip_count``, see TestCoarseTileLoopTripCount in
-    test_scratchpad_solver.py) -- a relayout taken once but paid on every
-    tile iteration is not priced the same as one taken once, and the fitted
-    law has no loop_trip factor of its own to account for that.
+    relayout (the same-group exception in ``solver_relayout_edge_context``,
+    torch-spyre#5057) when ``lx_same_tile_group_relayout`` is enabled (off by
+    default as of #5632, pending that PR's compile-time investigation), and
+    the offered ``RelayoutEdge`` must price every pair at the loop's own
+    trip count (``_coarse_tile_loop_trip_count``, see
+    TestCoarseTileLoopTripCount in test_scratchpad_solver.py): a relayout
+    taken once but paid on every tile iteration is not priced the same as one
+    taken once, and the fitted law has no loop_trip factor of its own.
 
-    Before #5057, this exact graph was asserted to offer NO candidates
-    (test_coarse_tiled_edges_are_never_offered). #5367 unskipped that test on
-    main after confirming the #3810 crash it cited was gone, and the
-    invariant genuinely held on main as it stood then; #5057 is what
-    deliberately narrows it to the cross-group case covered by
-    test_cross_group_coarse_tiled_edges_are_never_offered above."""
+    The cross-group case is test_cross_group_coarse_tiled_edges_are_never_offered
+    above."""
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        solver_relayout_pair_cost,
+    )
+    from torch_spyre._inductor.scratchpad.graph_builder import RelayoutEdge
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tile_size = 128
@@ -749,124 +685,61 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     hb = torch.randn(512, 256, dtype=torch.float16)
     loop_trip_count = ha.shape[0] // tile_size
 
-    def run_and_collect_candidates():
-        tables = []
-        orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+    edges = []
+    orig_edges = GraphBuilder._relayout_edges
 
-        def spy_tables(self, *args, **kwargs):
-            out = orig_tables(self, *args, **kwargs)
-            if out:
-                tables.append(out)
-            return out
+    def spy_edges(self, *args, **kwargs):
+        out = orig_edges(self, *args, **kwargs)
+        edges.extend(out.values())
+        return out
 
-        with monkeypatch.context() as m:
-            m.setattr(
-                alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
-            )
-            torch._inductor.codecache.FxGraphCache.clear()
-            torch._dynamo.reset()
-            a = ha.to("spyre")
-            b = hb.to("spyre")
-            with config.patch(
-                {
-                    "co_optimizing_lx_planning": True,
-                    "layout_solver": "cpsat",
-                    "lx_same_tile_group_relayout": True,
-                }
-            ):
-                out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
-        candidates = [c for table in tables for cs in table.values() for c in cs]
-        return out, candidates
+    priced = []
+    orig_price = RelayoutEdge.price
 
-    def _key(c):
-        return (c.parent, c.consumer, c.source_division, c.consumer_division, c.group)
+    def spy_price(self, pv, cv, ncores, dst_cores):
+        out = orig_price(self, pv, cv, ncores, dst_cores)
+        if out is not None:
+            priced.append((self, (pv, cv, ncores, dst_cores), out[0]))
+        return out
 
-    out, scaled_candidates = run_and_collect_candidates()
-    assert scaled_candidates, "same-group coarse-tiled edge was not offered relayout"
-    scaled_by_key = {_key(c): c.cost_ns for c in scaled_candidates}
-    assert len(scaled_by_key) == len(scaled_candidates), (
-        "candidate key collided -- some candidates were dropped from the comparison"
-    )
-
-    with monkeypatch.context() as m:
-        m.setattr(alloc_mod, "_coarse_tile_loop_trip_count", lambda op: 1)
-        _, unscaled_candidates = run_and_collect_candidates()
-    assert unscaled_candidates, "forcing trip count to 1 should not remove candidates"
-    unscaled_by_key = {_key(c): c.cost_ns for c in unscaled_candidates}
-    assert len(unscaled_by_key) == len(unscaled_candidates), (
-        "candidate key collided -- some candidates were dropped from the comparison"
-    )
-
-    assert scaled_by_key.keys() == unscaled_by_key.keys()
-    for key, scaled_cost in scaled_by_key.items():
-        unscaled_cost = unscaled_by_key[key]
-        # pair_cost itself carries no trip-count factor (that is the whole point
-        # of multiplying it in locally), so both runs share the same
-        # deterministic base and the scaling must be exact, not approximate.
-        assert scaled_cost == unscaled_cost * loop_trip_count, (
-            f"candidate {key} cost {scaled_cost} is not the per-trip cost "
-            f"{unscaled_cost} scaled by the loop trip count ({loop_trip_count})"
-        )
-
-    ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
-    torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
-
-
-def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):
-    """The simulated-annealing engine does not decide relayouts yet, so the
-    allocator must hand it neither candidates nor copies, and its objective
-    must carry no relayout term: with one it cannot bind, the annealer would
-    silently drop the WHOLE cost objective and fall back to memory-only
-    scoring (the regression this guards). Same hinted graph as the natural
-    firing test above, under the annealer: it compiles, computes the right
-    numbers, fires nothing, and scores with the real cost expression."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-    from torch_spyre._inductor import spyre_hint
-    from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_mod
-
-    observed = _Observed(monkeypatch, force=False)
-    score_fns: list = []
-    real_build = sa_mod.SaCoOptimizingSolver._build_score_fn
-
-    def spy_build(self, cost_expr):
-        fn = real_build(self, cost_expr)
-        score_fns.append((cost_expr, fn))
-        return fn
-
-    monkeypatch.setattr(sa_mod.SaCoOptimizingSolver, "_build_score_fn", spy_build)
-
-    def fn(t):
-        with spyre_hint(work_div={"B": 4, "M": 2}):
-            hidden = torch.neg(t)
-        with spyre_hint(work_div={"B": 2, "M": 4}):
-            return torch.relu(hidden)
-
-    torch.manual_seed(0)
-    host = torch.randn(8, 256, 512, dtype=torch.float16)
-    for name, size in (("B", 8), ("M", 256), ("K", 512)):
-        _pnd.declare_tensor_dim(name, size)
-    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
+    monkeypatch.setattr(GraphBuilder, "_relayout_edges", spy_edges)
+    monkeypatch.setattr(RelayoutEdge, "price", spy_price)
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
     with config.patch(
         {
             "co_optimizing_lx_planning": True,
-            "layout_solver": "simulated_annealing",
+            "lx_same_tile_group_relayout": True,
         }
     ):
-        out = torch.compile(fn, dynamic=False)(x)
+        out = torch.compile(fn, dynamic=False, fullgraph=True)(
+            ha.to("spyre"), hb.to("spyre")
+        )
 
-    observed.assert_nothing_emitted()
-    assert score_fns, "the annealer never built a score function"
-    for cost_expr, score_fn in score_fns:
-        assert cost_expr is not None, "the allocator produced no cost expression"
-        assert not any(
-            str(sym).startswith(("is_lx___spyre_lx_relayout__", "relayout"))
-            for sym in cost_expr.free_symbols
-        ), (
-            f"relayout term handed to an engine that cannot decide relayouts: {cost_expr}"
+    tiled = [
+        e
+        for e in edges
+        if isinstance(getattr(e.parent_op, "loop_info", None), CoarseTileInfo)
+        and isinstance(getattr(e.consumer_op, "loop_info", None), CoarseTileInfo)
+    ]
+    assert tiled, f"same-group coarse-tiled edge was not offered relayout: {edges}"
+    assert all(e.loop_trip_count == loop_trip_count for e in tiled), [
+        (e.parent, e.loop_trip_count) for e in tiled
+    ]
+    tiled_priced = [p for p in priced if p[0] in tiled]
+    assert tiled_priced, "no pair of the same-group edge was priced"
+    for edge, (pv, cv, ncores, dst_cores), cost in tiled_priced:
+        # The fitted law prices one tile's shuffle; the edge pays it per trip.
+        # Same deterministic base, so the scaling is exact.
+        base = solver_relayout_pair_cost(
+            pv,
+            cv,
+            ncores,
+            edge.device_dims,
+            edge.out_elems,
+            edge.dtype_bytes,
+            destination_num_cores=dst_cores,
         )
-        assert score_fn is not None, (
-            "the annealer fell back to the memory-only objective: a symbol in the "
-            "cost expression could not be bound"
-        )
-    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
-    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+        assert cost == base * loop_trip_count, (edge.parent, cost, base)
+    ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)

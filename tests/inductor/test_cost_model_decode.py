@@ -51,6 +51,7 @@ from torch_spyre._inductor.dump_cost_model import (
     _stamped_advances,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.scratchpad import pricing
 
 
 class _FakeDep:
@@ -817,7 +818,9 @@ def test_a_mixed_nest_scales_only_the_level_that_re_writes(monkeypatch):
 
 def _allocator_compute_ns(feature):
     from torch_spyre._inductor import cost_model
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     assert _COST_PARAMS.use_bundled_cost_model is False
     return cost_model._matmul_ns_upstream([feature], _COST_PARAMS)
@@ -865,7 +868,9 @@ def _expert_matmuls(monkeypatch, trips):
 def test_loop_passes_do_not_multiply_the_batch_split_penalty_twice(monkeypatch):
     """The same physical BMM batch split costs once per invocation in either form."""
     from torch_spyre._inductor import cost_model as cm
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     E, B, M, N, K = 8, 2, 512, 128, 64
     b, m, n, r0 = sympy.symbols("b m n r0", integer=True)
@@ -1245,7 +1250,7 @@ def test_a_read_walked_only_by_the_levels_tiled_dim_is_a_coarse_loop_read(
 
 
 # Through the callers. The allocator builds its objective from
-# ``CoOptimizingAllocator._extract_op_features`` (the legal menu goes in) and prices
+# ``pricing.extract_op_features`` (the legal menu goes in) and prices
 # with its own ``_COST_PARAMS``; the report calls ``extract_op_features(op)`` with no
 # menu and the default params.
 
@@ -1286,11 +1291,10 @@ def _allocator_features(
 ):
     """The allocator's extraction with its legal ``menu``. ``chosen`` is a menu
     index, or a ``{dim: split symbol}`` map that keeps the splits symbolic."""
-    from torch_spyre._inductor.scratchpad import sa_cooptimizer
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad import division_menus
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
-    monkeypatch.setattr(sa_cooptimizer, "iteration_space_from_op", lambda _: it_space)
+    monkeypatch.setattr(division_menus, "iteration_space_from_op", lambda _: it_space)
     monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _: it_space)
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: None)
     buffers = {
@@ -1300,14 +1304,14 @@ def _allocator_features(
         )
     }
     with V.set_graph_handler(graph or _StubGraph()):
-        return CoOptimizingAllocator._extract_op_features(
-            None, None, "buf1", buffers, is_lx or {}, op=op
-        )
+        return pricing.extract_op_features(None, "buf1", buffers, is_lx or {}, op=op)
 
 
 def _delivery_ns(feature, params=None):
     from torch_spyre._inductor.cost_model import _partitioned_operand_read_excess
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     return _partitioned_operand_read_excess([feature], params or _COST_PARAMS)
 
@@ -1478,7 +1482,9 @@ def _moe_gate(hidden=_K, cols=_N, bank_dtype=DataFormats.SEN169_FP16):
 
 def _requests_ns(ops, params=None):
     from torch_spyre._inductor.cost_model import _loop_operand_request_excess
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     return _loop_operand_request_excess(ops, params or _COST_PARAMS)
 
@@ -1573,7 +1579,9 @@ def test_a_looped_operand_read_is_charged_the_slower_of_requests_and_delivery(
     delivery-bound read, keep the previous price. The report extracts without the
     legal menu, so it has no delivery estimate and charges the requests alone."""
     from torch_spyre._inductor.cost_model import CostParams, predict_ops
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     op, graph, space = _moe_gate(*shape)
     feature = _allocator_features(
@@ -1633,7 +1641,9 @@ def test_the_symbolic_operand_price_equals_the_concrete_price_at_every_candidate
     from test_cost_model_replication import _solve_pinned
 
     from torch_spyre._inductor.cost_model import predict_ops
-    from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+    from torch_spyre._inductor.scratchpad.pricing import (
+        _COST_PARAMS,
+    )
 
     op, graph, space = _moe_gate(bank_dtype=bank_dtype)
     names = {d1: "split_n", d2: "split_k", d0: "split_m"}  # _solve_pinned's order
