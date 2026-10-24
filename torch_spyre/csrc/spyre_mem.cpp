@@ -380,6 +380,106 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 }
 
 /*
+ * Generate the stride info for a QFP8WT (FP8 KERNEL weight) transfer.
+ *
+ * Each 128-byte stick of a QFP8WT tensor [L0, .., L(m-1), K, N] is a 2D
+ * [si=2, so=64] block: 2 consecutive K values (device stride 1) for each of
+ * 64 consecutive N values (device stride si). Outside the stick, the index
+ * space follows the SpyreTensorLayout's device_size order, with K counted in
+ * pairs and N in 64-wide blocks:
+ *   rank 2:   [N/so, K/si, stick]
+ *   rank >=3: [L1, .., L(m-1), K/si, N/so, L0, stick]   (N > eps)
+ *             [N/so, L1, .., L(m-1), K/si, L0, stick]   (N <= eps)
+ * because the identity-order generic stick layout has device_size
+ * [d1, .., d(r-2), ceil(N/eps), d0, eps], and when N fits in one tile its
+ * extent-1 tile axis is hoisted to the front by codegen. This is the order
+ * batchmatmulfp8 reads (checked against scaled_bmm on hardware).
+ *
+ * Host strides are row-major over `sizes`; the CPU tensor's actual strides
+ * are ignored. Callers (load_model_to_spyre) pass transposed views and rely
+ * on the CPU buffer being copied in its storage order.
+ *
+ * @param sizes: host sizes of the tensor
+ * @param cpu_offset: storage offset of the CPU tensor
+ * @param stl: device layout of the tensor
+ * @param host2device: direction of the transfer
+ * @return stride info covering every element of the tensor
+ */
+static DataConversionStrideInfo get_qfp8wt_stride_info(
+    c10::IntArrayRef sizes, int64_t cpu_offset, const SpyreTensorLayout& stl,
+    bool host2device) {
+  const int64_t rank = sizes.size();
+  TORCH_CHECK(rank >= 2, "QFP8WT requires a tensor of rank >= 2, got ", rank);
+  std::vector<int64_t> strides(rank);
+  int64_t host_elements = 1;
+  for (int64_t i = rank - 1; i >= 0; --i) {
+    strides[i] = host_elements;
+    host_elements *= sizes[i];
+  }
+  const int64_t eps = stl.elems_per_stick();
+  const int64_t si = 2;
+  const int64_t so = eps / si;
+  const int64_t K = sizes[rank - 2];
+  const int64_t N = sizes[rank - 1];
+  TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+  TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
+  const int64_t n_tiles = (N + eps - 1) / eps;
+
+  // The index space below assumes the identity-order generic stick layout.
+  std::vector<int64_t> expected_device_size(sizes.begin() + 1, sizes.end() - 1);
+  expected_device_size.insert(expected_device_size.end(),
+                              {n_tiles, sizes[0], eps});
+  TORCH_CHECK(stl.device_size == expected_device_size,
+              "QFP8WT expects device_size ", expected_device_size,
+              " (identity dim_order), got ", stl.device_size);
+
+  // Axes innermost first: {size, host stride, device extent}. The device
+  // extent of the N/so axis is padded to whole eps-wide tiles.
+  struct Axis {
+    int64_t size, host_stride, dev_extent;
+  };
+  const Axis k_lo{si, strides[rank - 2], si};
+  const Axis n_lo{so, strides[rank - 1], so};
+  const Axis k_hi{K / si, si * strides[rank - 2], K / si};
+  const Axis n_hi{N / so, so * strides[rank - 1], n_tiles * eps / so};
+  std::vector<Axis> axes = {k_lo, n_lo};
+  if (rank == 2) {
+    axes.insert(axes.end(), {k_hi, n_hi});
+  } else {
+    axes.push_back({sizes[0], strides[0], sizes[0]});
+    if (n_tiles > 1) axes.push_back(n_hi);
+    axes.push_back(k_hi);
+    for (int64_t i = rank - 3; i >= 1; --i) {
+      axes.push_back({sizes[i], strides[i], sizes[i]});
+    }
+    // A one-tile N axis has extent 1, and codegen hoists extent-1 dims to
+    // the front of the device order, so batchmatmulfp8 reads the N/so
+    // blocks outermost.
+    if (n_tiles == 1) axes.push_back(n_hi);
+  }
+
+  DataConversionStrideInfo dcsi;
+  std::vector<int64_t> host_strides, device_strides;
+  int64_t device_elements = 1;
+  for (const Axis& axis : axes) {
+    dcsi.size_.push_back(axis.size);
+    host_strides.push_back(axis.host_stride);
+    device_strides.push_back(device_elements);
+    device_elements *= axis.dev_extent;
+  }
+  TORCH_CHECK(device_elements == c10::multiply_integers(stl.device_size),
+              "QFP8WT index space covers ", device_elements,
+              " device elements, expected ",
+              c10::multiply_integers(stl.device_size));
+
+  dcsi.stride_src_ = host2device ? host_strides : device_strides;
+  dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+  dcsi.offset_src_ = host2device ? cpu_offset : 0;
+  dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
+  return dcsi;
+}
+
+/*
  * Generate description of data conversion for a tensor.
  *
  * @param cpu_tensor: CPU-side tensor (source for H2D, destination for D2H)
@@ -765,54 +865,18 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   }
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
-    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    // Sizes come from the CPU tensor itself: cpu_sizes above may have been
+    // rewritten for sliced device views.
+    const DataConversionStrideInfo dcsi = get_qfp8wt_stride_info(
+        cpu_tensor->sizes(), cpu_offset, stl, host2device);
+    dci.dcsi_ = {dcsi};
+
+    // Reverse PyTorch ordering
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
-
-    const int64_t eps = stl.elems_per_stick();
-    const int64_t si = 2;
-    const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
-    const int64_t N = cpu_sizes[0];
-    const int64_t K = cpu_sizes[1];
-
-    // Expanded device shape: [si, so, K/si, N/so]
-    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
-    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
-    const int64_t dim2 = K / si;
-    const int64_t dim3 = N / so;
-
-    // Host strides for the expanded layout
-    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
-    //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
-
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
-    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
-
-    DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = host2device ? host_strides : device_strides;
-    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-    dcsi.offset_src_ = host2device ? cpu_offset : 0;
-    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
-    dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
-    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
+    // For H2D, output (device) shape is the expanded index space.
+    // For D2H, output (host) shape is the original cpu_sizes.
+    dci.output_shape_ = host2device ? dcsi.size_ : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,

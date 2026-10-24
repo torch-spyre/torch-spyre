@@ -19,8 +19,8 @@ are loaded directly into QFP8WT KERNEL layout on Spyre — without lazy
 decompression or runtime qfp8wt quantization.
 
 Covers:
-  1. _dma_to_spyre_fp8_kernel: transfers a synthetic FP8 tensor to Spyre
-     with the correct dtype, shape, and device.
+  1. _dma_to_spyre_fp8_kernel: transfers a synthetic rank-2/3/4 FP8 tensor
+     to Spyre with the correct dtype, shape, device and layout, and back.
   2. load_fp8_model_to_spyre: loads FP8 Linear weights of an nn.Module
      into QFP8WT KERNEL layout; non-FP8 weights use the normal path.
   3. _scaled_mm with pre-quantized FP8 weight in KERNEL layout.
@@ -41,21 +41,77 @@ DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
 # ---------------------------------------------------------------------------
 
 
+# [..., K, N] shapes: rank 2, 3 and 4; N = 192 leaves a padded half tile.
+TRANSFER_SHAPES = [
+    (128, 256),
+    (2, 128, 128),
+    (2, 128, 256),
+    (3, 64, 128),
+    (1, 12, 128, 128),
+    (2, 12, 128, 128),
+    (2, 4, 64, 192),
+    # scaled_bmm weight shapes (N = 64 is a padded half tile, N = 384 three)
+    (4, 128, 64),
+    (1, 32, 128, 64),
+    (1, 12, 256, 384),
+]
+
+
+def _random_fp8(shape, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(shape, generator=g).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+
 class TestDmaToSpyreFp8Kernel:
     """Unit tests for _dma_to_spyre_fp8_kernel."""
 
-    def test_basic_transfer(self):
+    @pytest.mark.parametrize("shape", TRANSFER_SHAPES)
+    def test_basic_transfer(self, shape):
         """FP8 weight transfers to Spyre with correct dtype and shape."""
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
-        weight = torch.randn(128, 256, dtype=torch.float16).to(torch.float8_e4m3fn)
-        dev = _dma_to_spyre_fp8_kernel(weight)
+        dev = _dma_to_spyre_fp8_kernel(_random_fp8(shape))
 
         assert dev.device.type == DEVICE_TYPE, (
             f"Expected device {DEVICE}, got {dev.device}"
         )
         assert dev.dtype == torch.float8_e4m3fn, f"Expected fp8, got {dev.dtype}"
-        assert list(dev.shape) == [128, 256], f"Shape mismatch: {list(dev.shape)}"
+        assert list(dev.shape) == list(shape), f"Shape mismatch: {list(dev.shape)}"
+
+    @pytest.mark.parametrize("shape", TRANSFER_SHAPES)
+    def test_layout(self, shape):
+        """The device tensor carries the identity-order QFP8WT stick layout."""
+        from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        dev = _dma_to_spyre_fp8_kernel(_random_fp8(shape))
+        stl = get_spyre_tensor_layout(dev)
+
+        n_tiles = -(-shape[-1] // 128)
+        expected = [*shape[1:-1], n_tiles, shape[0], 128]
+        assert stl.element_arrangement == ElementArrangement.QFP8WT
+        assert list(stl.device_size) == expected, (
+            f"device_size {list(stl.device_size)} != {expected}"
+        )
+
+    @pytest.mark.parametrize("shape", TRANSFER_SHAPES)
+    def test_round_trip(self, shape):
+        """Host -> device -> host returns the weight bit for bit.
+
+        This proves the transfer covers every element exactly once and that
+        D2H inverts H2D. It does not prove the on-device arrangement matches
+        what a compiled consumer reads: the matmul tests below do that for
+        rank 2, and rank 3/4 waits for the 4-D bmm consumer.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        weight = _random_fp8(shape)
+        back = _dma_to_spyre_fp8_kernel(weight).cpu()
+
+        assert back.dtype == torch.float8_e4m3fn
+        assert torch.equal(back.view(torch.uint8), weight.view(torch.uint8)), (
+            f"round trip mismatch for shape {shape}"
+        )
 
     def test_non_contiguous_input(self):
         """Non-contiguous FP8 weight is transferred correctly without a CPU copy.
@@ -84,12 +140,12 @@ class TestDmaToSpyreFp8Kernel:
         with pytest.raises(AssertionError, match="float8_e4m3fn"):
             _dma_to_spyre_fp8_kernel(weight)
 
-    def test_rejects_non_2d(self):
-        """Raises AssertionError for non-2D tensor."""
+    def test_rejects_rank_1(self):
+        """Raises AssertionError for a tensor with no [K, N] stick pair."""
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
-        weight = torch.randn(4, 128, 128, dtype=torch.float16).to(torch.float8_e4m3fn)
-        with pytest.raises(AssertionError, match="2D"):
+        weight = torch.randn(128, dtype=torch.float16).to(torch.float8_e4m3fn)
+        with pytest.raises(AssertionError, match="rank >= 2"):
             _dma_to_spyre_fp8_kernel(weight)
 
     def test_production_shapes(self):

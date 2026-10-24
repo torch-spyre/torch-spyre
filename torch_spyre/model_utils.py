@@ -259,31 +259,37 @@ def _dma_to_spyre_fp8_kernel(
     the optimal device layout for FP8 matrix multiplication without requiring
     any runtime ``qfp8wt`` quantization overhead.
 
-    Caller must ensure ``weight.ndim == 2`` and
+    The weight is ``[..., K, N]``: the 2D stick pairs the last two dims, and
+    any leading (batch / head) dims are carried through.
+
+    Caller must ensure ``weight.ndim >= 2`` and
     ``weight.dtype == torch.float8_e4m3fn``.
     """
-    assert weight.ndim == 2, "FP8 KERNEL layout is for 2D weights only"
+    assert weight.ndim >= 2, (
+        f"FP8 KERNEL layout needs a weight of rank >= 2, got {weight.ndim}"
+    )
     assert weight.dtype == torch.float8_e4m3fn, (
         f"Weight must be torch.float8_e4m3fn, got {weight.dtype}"
     )
-    assert weight.shape[0] % 2 == 0, (
-        f"FP8 KERNEL K={weight.shape[0]} must be divisible by 2 (si=2)"
+    assert weight.shape[-2] % 2 == 0, (
+        f"FP8 KERNEL K={weight.shape[-2]} must be divisible by 2 (si=2)"
     )
-    assert weight.shape[1] % 64 == 0, (
-        f"FP8 KERNEL N={weight.shape[1]} must be divisible by 64 (so=64)"
+    assert weight.shape[-1] % 64 == 0, (
+        f"FP8 KERNEL N={weight.shape[-1]} must be divisible by 64 (so=64)"
     )
 
     _ensure_spyre_runtime()
 
     # Note: contiguity is NOT required here. The QFP8WT branch in generate_dci
-    # (spyre_mem.cpp) derives host strides analytically from K and N — it does
+    # (spyre_mem.cpp) derives row-major host strides from the shape — it does
     # not use the CPU tensor's actual strides. This means a non-contiguous view
     # (e.g. p.t()) is safe to pass directly, avoiding a CPU memcpy.
     layout = SpyreTensorLayout(
-        list(weight.shape),  # host_size: [K, N] = [in_features, out_features]
-        list(weight.stride()),  # host_strides: row-major [N, 1]
+        list(weight.shape),  # host_size: [..., K, N]
+        list(weight.stride()),
         torch.float8_e4m3fn,
-        [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
+        # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
+        list(range(weight.ndim)),
         ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
     )
     dst = spyre_empty_with_layout(
