@@ -4144,7 +4144,7 @@ def _insert_copy_op(
 class _NameSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) calls for names present in name_map.
 
-    See NameSwapHandler in insert_restickify.py — same pattern (AGENTS.md
+    See NameSwapHandler in pass_utils.py — same pattern (AGENTS.md
     "Compiler Pass Conventions": wrap inner_fn via a WrapperHandler, never
     reconstruct it from index expressions). Duplicated locally rather than
     imported to avoid a coarse_tile <-> insert_restickify import-order
