@@ -29,6 +29,31 @@ from torch._inductor.virtualized import V
 
 from . import pass_counters
 from .constants import DEVICE_NAME
+from .errors import Unsupported
+
+_DYNAMIC_TRUE_MESSAGE = (
+    "torch.compile(dynamic=True). To enable dynamism, declare the varying "
+    "dimension on the tensor and compile with the default dynamic=None:\n"
+    '    x = x.to("spyre", dynamic={0: dict(min=32, max=576, granularity=32)})\n'
+    "    compiled = torch.compile(model, dynamic=None)"
+)
+
+
+def _refuse_dynamic_true() -> None:
+    """Refuse a Spyre compile requested with ``torch.compile(dynamic=True)``.
+
+    ``dynamic=True`` makes every dimension of every input symbolic, with no
+    declared range. Spyre resolves such a symbol to the size of the call being
+    compiled, so the result is a fixed-size binary and a recompile for every new
+    shape: it never provides dynamism, only the appearance of it.
+
+    ``torch.compile(dynamic=True)`` is the only thing that clears
+    ``assume_static_by_default`` for the compile. The default ``dynamic=None``
+    keeps it set, and a dimension marked per tensor (``mark_dynamic``, or
+    ``.to("spyre", dynamic=...)``) never touches it, so neither is refused.
+    """
+    if not torch._dynamo.config.assume_static_by_default:
+        raise Unsupported(_DYNAMIC_TRUE_MESSAGE)
 
 
 @contextmanager
@@ -157,6 +182,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
             set real inputs in the virtualized context for shape inference and
             optimization decisions.
     """
+    _refuse_dynamic_true()
 
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
