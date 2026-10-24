@@ -175,7 +175,9 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **upgrade-pytorch-version** — PyTorch dependency upgrade workflow
 
 Subtree-specific skills live in `torch_spyre/_inductor/.claude/skills/`
-(`inductor-overview`, `logging`); load them when working under that path.
+(`inductor-overview`, `logging`) and `tests/op_coverage/.claude/skills/`
+(`model-op-coverage`: report which ops a model needs and how Spyre handles
+each); load them when working under that path.
 Claude Code discovers them automatically; other agents should follow the
 paths above explicitly.
 
