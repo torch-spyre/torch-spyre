@@ -24,7 +24,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
-from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor import cost_features as dcm
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
