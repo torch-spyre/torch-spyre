@@ -16,6 +16,8 @@ Applying them in filename order works from an empty database.
 | `26-dispatch-targets.sql` | `dispatch_targets` | — |
 | `30-benchmarks.sql` | `benchmarks`, `benchmark_runs` | — |
 | `40-jenkins-agents.sql` | `jenkins_agents` | — |
+| `41-credential-health.sql` | `credential_inventory`, `credential_probes`, `credential_owners` | — |
+| `42-incident-ledger.sql` | `incident_events`, `incident_log` | — |
 | `47-pipeline-runs.sql` | `pipeline_runs`, `pipeline_run_legs` | — |
 | `48-ci-run-timings.sql` | `ci_run_timings` | — |
 | `49-result-uploads.sql` | `result_uploads`, `v_result_uploads`, `v_artifact_results_published` | 20 |
@@ -25,6 +27,8 @@ Applying them in filename order works from an empty database.
 | `53-pipeline-views.sql` | `v_pipeline_runs`, `v_pipeline_run_outcomes`, `v_pipeline_gate_daily` | 47 |
 | `54-ci-run-timing-views.sql` | `v_ci_run_timings`, `v_ci_runs`, `v_ci_runs_spyre_test`, `v_ci_runs_merge_queue`, `v_ci_runs_main_push`, `v_ci_lane_daily` | 48 |
 | `55-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers`, `v_feed_events` (parameterized), `v_dispatch_targets` | 20, 25, 26, 49, 50 |
+| `56-credential-views.sql` | `v_credential_health` | 41 |
+| `57-incident-views.sql` | `v_incidents` | 42 |
 | `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
 | `62-benchmark-verdicts.sql` | `benchmark_metric_policy`, `v_benchmark_metric_verdicts`, `v_benchmark_gate`, `benchmark_metric_verdicts` + its refreshable MV | 60 |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |

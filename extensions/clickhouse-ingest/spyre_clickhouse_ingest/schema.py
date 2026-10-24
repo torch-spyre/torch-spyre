@@ -818,6 +818,165 @@ class DispatchTargets(Table):
     required = ("published_at",)
 
 
+CREDENTIAL_STATE_VALUES = frozenset({"bound", "unbound", "gone"})
+PROBE_STATUS_VALUES = frozenset({"ok", "failing", "unknown"})
+PROBE_SITE_VALUES = frozenset({"jenkins", "gha", "dashboard", "cluster"})
+
+
+class CredentialInventory(Table):
+    """What discovery found per credential; the latest observed_at wins."""
+
+    name = "credential_inventory"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "kind",
+        "description",
+        "consumers",
+        "state",
+        "source_created_at",
+        "source_updated_at",
+        "last_bound_at",
+        "observed_at",
+        "job_run",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "observed_at")
+    enums = (("state", CREDENTIAL_STATE_VALUES),)
+
+
+class CredentialProbes(Table):
+    """One probe of one credential, written by the site that holds the secret."""
+
+    name = "credential_probes"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "probe_site",
+        "probe",
+        "status",
+        "error_class",
+        "http_status",
+        "latency_ms",
+        "expires_at",
+        "fingerprint",
+        "detail",
+        "job_run",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "probe")
+    enums = (("status", PROBE_STATUS_VALUES), ("probe_site", PROBE_SITE_VALUES))
+
+
+class CredentialOwners(Table):
+    """What a person supplies about a credential; append-only, the newest row per credential wins."""
+
+    name = "credential_owners"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "owner",
+        "owner_email",
+        "backup_owner",
+        "linked_identity",
+        "linked_email",
+        "issuer",
+        "rotation_days",
+        "last_rotated_at",
+        "runbook_url",
+        "notes",
+        "updated_at",
+        "updated_by",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "updated_at", "updated_by")
+
+
+INCIDENT_SEVERITY_VALUES = frozenset({"info", "warning", "critical"})
+INCIDENT_STATE_VALUES = frozenset(
+    {"open", "acknowledged", "mitigated", "resolved", "dismissed"}
+)
+INCIDENT_ACTOR_VALUES = frozenset({"system", "agent", "ask_spyre", "human"})
+INCIDENT_CAUSE_VALUES = frozenset(
+    {
+        "credentials",
+        "resources",
+        "network",
+        "hardware",
+        "upstream",
+        "pipeline",
+        "data",
+        "unknown",
+    }
+)
+
+
+class IncidentEvents(Table):
+    """One normalized signal from any alert source; the router attaches it to an incident."""
+
+    name = "incident_events"
+    columns = (
+        "ts",
+        "source",
+        "subject",
+        "severity",
+        "signature",
+        "cause_class",
+        "summary",
+        "evidence_url",
+        "dedup_key",
+        "incident_id",
+        "job_run",
+        "props",
+    )
+    required = ("source", "subject", "severity")
+    enums = (
+        ("severity", INCIDENT_SEVERITY_VALUES),
+        ("cause_class", INCIDENT_CAUSE_VALUES),
+    )
+
+
+class IncidentLog(Table):
+    """Append-only incident timeline; the newest row per incident is its current state."""
+
+    name = "incident_log"
+    columns = (
+        "incident_id",
+        "updated_at",
+        "updated_by",
+        "actor_kind",
+        "state",
+        "severity",
+        "title",
+        "cause_class",
+        "signature",
+        "owner",
+        "owner_email",
+        "action",
+        "note",
+        "thread_url",
+        "evidence_url",
+        "props",
+    )
+    required = (
+        "incident_id",
+        "updated_at",
+        "updated_by",
+        "actor_kind",
+        "state",
+        "severity",
+    )
+    enums = (
+        ("actor_kind", INCIDENT_ACTOR_VALUES),
+        ("state", INCIDENT_STATE_VALUES),
+        ("severity", INCIDENT_SEVERITY_VALUES),
+        ("cause_class", INCIDENT_CAUSE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -836,6 +995,11 @@ ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
+CREDENTIAL_INVENTORY = CredentialInventory
+CREDENTIAL_PROBES = CredentialProbes
+CREDENTIAL_OWNERS = CredentialOwners
+INCIDENT_EVENTS = IncidentEvents
+INCIDENT_LOG = IncidentLog
 
 TABLES = {
     t.name: t
@@ -857,6 +1021,11 @@ TABLES = {
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,
+        CredentialInventory,
+        CredentialProbes,
+        CredentialOwners,
+        IncidentEvents,
+        IncidentLog,
     )
 }
 
