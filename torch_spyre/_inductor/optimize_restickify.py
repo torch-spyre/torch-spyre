@@ -154,7 +154,7 @@ class RestickNodeCost(abc.ABC):
 
     @abc.abstractmethod
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float: ...
 
     @abc.abstractmethod
@@ -250,21 +250,18 @@ class AllSameNode(RestickNodeCost):
         self._output_edge_costs = output_edge_costs or []
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         input_cost = sum(
-            ec.cost(lk, out_stl)
-            for ec, lk in zip(
-                self._input_edge_costs, in_layouts[: len(self._input_edge_costs)]
-            )
+            ec.cost(in_layouts[ec.dep.name], out_stl) for ec in self._input_edge_costs
         )
         if input_cost >= INF:
             return INF
         # Co-output edges: the shared buffer must have the exact same STL as this op's
         # output. Any mismatch means two mutation ops write the same buffer with different
         # layouts, which is always wrong — cost INF, not a restickify.
-        co_offset = len(self._input_edge_costs)
-        for ec, lk in zip(self._output_edge_costs, in_layouts[co_offset:]):
+        for ec in self._output_edge_costs:
+            lk = in_layouts.get(ec.dep.name)
             if lk is not None and lk != out_stl:
                 return INF
         return input_cost
@@ -334,13 +331,13 @@ class FixedInOutNode(RestickNodeCost):
         return not needed
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
-            ec.cost(lk, rk)
-            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_stls)
+            ec.cost(in_layouts[ec.dep.name], rk)
+            for ec, rk in zip(self.edge_costs, self.required_in_stls)
         )
 
     def required_input_stls(self, out_stl):
@@ -379,7 +376,7 @@ class AnyInNode(RestickNodeCost):
         return cls(edge_costs=[])
 
     def cost(
-        self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
+        self, in_layouts: "dict[str, SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
         return 0.0
 
@@ -698,8 +695,7 @@ def beam_global_min_cost(operations: list) -> None:
     # have zero cost when STLs match, and SpyreEmptyFallback has all valid STLs
     # as candidates, so the future-min-cost estimate is never pessimistic in a
     # way that causes incorrect pruning. Last-use liveness is also correct — the
-    # fallback should stay live until its last writer. A cleaner fix would
-    # exclude co-output deps from the base class edge_costs; cleanup is coming.
+    # fallback should stay live until its last writer.
     future_min_cost = compute_future_min_cost(operations)
 
     step_of: dict[str, int] = {}
@@ -761,7 +757,7 @@ def beam_global_min_cost(operations: list) -> None:
         op_future = future_min_cost.get(op.get_name(), {})
         next_states = []
         for state in frontier.states:
-            in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
+            in_layouts = {dep.name: frontier.input_stl(state, dep.name) for dep in deps}
 
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)
