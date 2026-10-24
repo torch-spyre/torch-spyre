@@ -1340,12 +1340,10 @@ def generate_sdsc(
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
         }
-        # dsOffset / allocateNode_ are part of the forward-conv (#3284) and
-        # general memOrg contract; depthwise conv (#3510) intentionally omits
-        # them. Restore them for every non-depthwise op so forward conv2d
-        # matches its golden SDSC.
+        # allocateNode_ is part of the forward-conv (#3284) and general memOrg
+        # contract; depthwise conv (#3510) intentionally omits it. Restore it
+        # for every non-depthwise op so forward conv2d matches its golden SDSC.
         if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP:
-            extra["dsOffset"] = 0
             extra["allocateNode_"] = alloc_node
         return extra
 
@@ -1363,16 +1361,10 @@ def generate_sdsc(
                     if sdsc_spec.debug_handle is not None
                     else None
                 ),
-                "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
-                "sdscFolds_": {
-                    "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
-                    "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
-                    "data_": {"[0]": "0"},
-                },
-                "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
-                "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
+                # The core, corelet and time folds and the core-to-DSC
+                # mapping and schedule are derived by the backend from
+                # coreIdsUsed_ below, so they are not emitted.
                 "numCoresUsed_": len(active_core_ids),
-                "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
                 # allocation coordinates below.
@@ -1381,9 +1373,6 @@ def generate_sdsc(
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
                 },
                 "coreIdToWkSlice_": core_id_to_wk_slice,
-                "coreIdToDscSchedule": {
-                    str(c): [[-1, 0, 0, 0]] for c in active_core_ids
-                },
                 "dscs_": [
                     {
                         sdsc_spec.opfunc: {
@@ -1440,9 +1429,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
@@ -1458,9 +1444,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
@@ -1499,11 +1482,6 @@ def generate_sdsc(
                                 # the future, key by (i, tensor.layout) instead.
                                 for i, tensor in enumerate(sdsc_spec.args)
                             },
-                            **(
-                                {"pdsRelation_": {"isPdsReuse": 1}}
-                                if sdsc_spec.pds_reuse
-                                else {}
-                            ),
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
@@ -1701,7 +1679,6 @@ def generate_sdsc(
                                         "dataFormat_": sdsc_spec.data_format.name,
                                         "fidelity_": "regular",
                                     },
-                                    "location": "Inner",
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
@@ -1725,21 +1702,6 @@ def generate_sdsc(
                         }
                     }
                 ],
-                # Emit top-level symbolic metadata only when symbolic dims are present.
-                # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
-                **(
-                    {
-                        "datadscs_": [],
-                        "dimToSymbolMappingOpcodeCorrection_": {},
-                        "inputSymbolsAndTags_": {
-                            str(sym_id): pytorch_sym
-                            for pytorch_sym, sym_id in dim_local_symbols.items()
-                        },
-                        "symbolDefinitions_": {},
-                    }
-                    if symbolic_dims
-                    else {}
-                ),
             }
         },
         # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols follow.

@@ -940,9 +940,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
 
     Fixture mirrors TestSdscJsonSymbolicDimSmoke but with work_slices that
     actually split the symbolic dim across 8 cores (s0 max=512, granularity=64).
-    This asserts on the SDSC JSON only. The real per-core arith formula and its
-    symbolDefinitions_ content are a separate later PR, so symbolDefinitions_
-    stays empty here.
+    This asserts on the SDSC JSON only.
     """
 
     _DEVICE_SIZE = [4, 512, 64]
@@ -1037,9 +1035,10 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         for sk in symbolic_kinds:
             self.assertEqual(sk.offset, 0)
 
-        # SDSC-only change: the real per-core arith formula is a later PR, so
-        # symbolDefinitions_ stays empty.
-        self.assertEqual(top["symbolDefinitions_"], {})
+        # The backend builds its own symbol definitions and input symbol list,
+        # from the bundle; the SDSC carries neither.
+        self.assertNotIn("symbolDefinitions_", top)
+        self.assertNotIn("inputSymbolsAndTags_", top)
 
     def test_dim_symbol_ids_lower_magnitude_than_address_ids(self):
         # Dim symbols must occupy the smallest-magnitude (closest to zero) ids
