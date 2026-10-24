@@ -2861,6 +2861,158 @@ def _eager_view_input_layout(
     )
 
 
+def _handle_multi_candidate_cooutput(
+    op: ComputedBuffer,
+    target_buf: ComputedBuffer,
+    target_buf_layouts: list[SpyreTensorLayout],
+    target_name: str,
+) -> None:
+    """Couple a mutation op to a multi-candidate target buffer via AllSameNode.
+
+    When a mutation op (e.g. copy_forced) and its target are co-outputs — both
+    writing the same buffer — they must commit to the same layout. AllSameNode
+    enforces this; restickify may only be inserted on real input edges, not on
+    the output buffer itself (issue #3845).
+    """
+    target_write_dep = _one_mem_dep(target_buf.get_read_writes().writes)
+    assert target_write_dep is not None, (
+        f"{op.get_name()}: mutation target {target_name!r} "
+        f"must have exactly one write MemoryDep to synthesize "
+        f"a coupling edge"
+    )
+    rw = op.get_read_writes()
+    output_dep = next(iter(rw.writes))
+    args = _get_prop_args(rw.reads)  # real inputs only (e.g. src)
+    op.layouts = list(target_buf_layouts)  # inherit target's candidates
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, op.layouts, [output_dep, target_write_dep], op
+    )
+
+
+def _handle_empty_fallback_mutation(
+    op: ComputedBuffer,
+    target_buf: SpyreEmptyFallback,
+    target_name: str,
+) -> None:
+    """Assign layouts for a mutation op whose target is a SpyreEmptyFallback.
+
+    SpyreEmptyFallback has no device layout until its mutation writers have run.
+    This function treats the mutation op like a normal compute op, deriving
+    candidate layouts from its real (non-target) inputs and propagating them
+    back onto the target buffer so later reads see the narrowed candidate set.
+    """
+    logger.debug(
+        "MutationLayoutSHOULDREMOVE target_stl=None: op=%s target_name=%r buf_type=%s",
+        op.get_operation_name(),
+        target_name,
+        type(target_buf).__name__,
+    )
+    rw = op.get_read_writes()
+    output_dep = next(iter(rw.writes))
+    all_args = _get_prop_args(rw.reads)
+    # Exclude the target read-back (dep.name == target_name) from
+    # layout candidate derivation: it IS the output buffer, not an
+    # independent input.
+    new_value_args = [a for a in all_args if a.dep.name != target_name]
+    # Build a dep for the SpyreEmptyFallback target so the beam
+    # search couples all mutation ops writing it via a co-output
+    # edge. We cannot find it in rw.reads — the mutation target is
+    # encoded in MutationLayoutSHOULDREMOVE, not in inner_fn, so
+    # it never appears in get_read_writes().reads. Construct a
+    # MemoryDep with target_name but same index shape as output_dep.
+    #
+    if not new_value_args:
+        # No real tensor inputs: this is a coarse-tile identity fill
+        # (e.g. coarse_tile_fill writing inf/0 into the accumulator).
+        # A scalar fill has no stick orientation preference, so use
+        # AnyInNode and let the real writers (combine, copy) determine
+        # the STL. Borrow target_buf.layouts so the beam has a non-empty
+        # candidate list; AnyInNode commits at zero cost regardless.
+        assert hasattr(target_buf, "layouts"), (
+            f"SpyreEmptyFallback {target_name!r} has no layouts — "
+            "expected SpyreEmptyFallback to have layouts set before any "
+            "mutation op writes it"
+        )
+        op.layouts = target_buf.layouts
+        op.restick_cost_fn = AnyInNode.from_args()
+        return
+    # Build a co-output dep for the mutation target so the beam
+    # couples all mutation ops (that have real inputs) writing it
+    # to the same STL. The target has all valid STLs as candidates
+    # so this dep adds no spurious constraint.
+    target_co_dep = MemoryDep(
+        name=target_name,
+        index=output_dep.index,
+        var_names=output_dep.var_names,
+        size=output_dep.size,
+    )
+    out_deps = [output_dep, target_co_dep]
+    if isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_OP:
+        # x and y are the two genuine matmul inputs (not the target
+        # read-back). _matmul_layouts derives a single out_stl
+        # deterministically from the target layout and installs its
+        # own FixedInOutNode, so no separate AllSameNode join is needed.
+        # target_co_dep is intentionally not threaded in: matmul has a
+        # fixed, deterministic output STL so two BATCH_MATMUL ops writing
+        # the same SpyreEmptyFallback will always agree.
+        assert len(new_value_args) == 2, (
+            "BATCH_MATMUL_OP mutation op should have exactly "
+            f"two non-target inputs, got {len(new_value_args)} "
+            f"for {op.get_name()}"
+        )
+        accum_layout = target_buf.get_layout()
+        candidates = _matmul_layouts(op, accum_layout, output_dep, new_value_args)
+        target_buf.layouts = candidates
+        op.layouts = candidates
+    elif isinstance(op.data, Reduction):
+        # The non-target input is the reduction's un-reduced,
+        # higher-rank input. Must use _single_arg_op_layout, not the
+        # broadcast-oriented pointwise join path.
+        assert len(new_value_args) == 1, (
+            "Reduction mutation op should have exactly one non-target "
+            f"input, got {len(new_value_args)} for {op.get_name()}"
+        )
+        accum_layout = target_buf.get_layout()
+        in_arg = new_value_args[0]
+        candidates = []
+        for stl in in_arg.layouts:
+            candidates.extend(
+                _single_arg_op_layout(
+                    op,
+                    accum_layout,
+                    output_dep,
+                    in_arg.dep,
+                    in_arg.layout,
+                    stl,
+                )
+            )
+        if not candidates:
+            raise Unsupported(
+                f"{op.get_name()}: no supported output layout "
+                f"found for any of {len(in_arg.layouts)} "
+                f"candidate input layouts; target size="
+                f"{accum_layout.size}"
+            )
+        op.restick_cost_fn = AllSameNode.from_args(all_args, candidates, out_deps, op)
+        target_buf.layouts = candidates
+        op.layouts = candidates
+    else:
+        target_layout = target_buf.get_layout()
+        candidates = _multi_arg_pointwise_layouts(
+            op, target_layout, output_dep, new_value_args
+        )
+        # Propagate candidates forward: the mutation target is
+        # write-only from this op's perspective (excluded from
+        # new_value_args), so no read edge carries the layout
+        # information forward naturally.  Overwrite target_buf.layouts
+        # so that ops later in topo order that READ the target see
+        # the narrowed candidate set from this write, not the initial
+        # wide set assigned at allocation time.
+        target_buf.layouts = candidates
+        op.restick_cost_fn = AllSameNode.from_args(all_args, candidates, out_deps, op)
+        op.layouts = candidates
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
@@ -3012,31 +3164,10 @@ def propagate_spyre_tensor_layouts(
                         target_buf_layouts and len(target_buf_layouts) > 1
                     ):
                         # target_buf is an ordinary multi-candidate ComputedBuffer
-                        # (issue #3845): this mutation op (e.g. copy_forced) and
-                        # target_buf are co-outputs — both write the same buffer, so
-                        # they must commit to the same layout. Pass target_buf as a
-                        # co-output to AllSameNode so the beam search enforces exact
-                        # layout equality. Restickify may only be inserted on real
-                        # input edges (e.g. the src tensor); the output buffer itself
-                        # cannot be restickified.
+                        # (issue #3845): couple this op to the target via AllSameNode.
                         assert target_buf is not None
-                        target_write_dep = _one_mem_dep(
-                            target_buf.get_read_writes().writes
-                        )
-                        assert target_write_dep is not None, (
-                            f"{op.get_name()}: mutation target {target_name!r} "
-                            f"must have exactly one write MemoryDep to synthesize "
-                            f"a coupling edge"
-                        )
-                        rw = op.get_read_writes()
-                        output_dep = next(iter(rw.writes))
-                        args = _get_prop_args(rw.reads)  # real inputs only (e.g. src)
-                        op.layouts = list(
-                            target_buf_layouts
-                        )  # inherit target's candidates
-                        # target_write_dep is the co-output: same buffer, must agree on layout
-                        op.restick_cost_fn = AllSameNode.from_args(
-                            args, op.layouts, [output_dep, target_write_dep], op
+                        _handle_multi_candidate_cooutput(
+                            op, target_buf, target_buf_layouts, target_name
                         )
                         continue
                     if not isinstance(target_buf, SpyreEmptyFallback):
@@ -3055,134 +3186,9 @@ def propagate_spyre_tensor_layouts(
                             type(target_buf).__name__,
                         )
                         continue
-                    # SpyreEmptyFallback mutation target has no device layout yet
-                    # -- expected, not exceptional; handled just below.
-                    logger.debug(
-                        "MutationLayoutSHOULDREMOVE target_stl=None: "
-                        "op=%s target_name=%r buf_type=%s",
-                        op.get_operation_name(),
-                        target_name,
-                        type(target_buf).__name__,
-                    )
-                    # SpyreEmptyFallback target has no device layout yet.
-                    # Treat the mutation op like a normal pointwise op: run
-                    # _multi_arg_pointwise_layouts with the non-target inputs.
-                    # This enforces input-compatibility and slice constraints,
-                    # so the backend slice check passes.
-                    rw = op.get_read_writes()
-                    output_dep = next(iter(rw.writes))
-                    all_args = _get_prop_args(rw.reads)
-                    # Exclude the target read-back (dep.name == target_name) from
-                    # layout candidate derivation: it IS the output buffer, not an
-                    # independent input.
-                    new_value_args = [a for a in all_args if a.dep.name != target_name]
-                    # Build a dep for the SpyreEmptyFallback target so the beam
-                    # search couples all mutation ops writing it via a co-output
-                    # edge. We cannot find it in rw.reads — the mutation target is
-                    # encoded in MutationLayoutSHOULDREMOVE, not in inner_fn, so
-                    # it never appears in get_read_writes().reads. Construct a
-                    # MemoryDep with target_name but same index shape as output_dep.
-                    #
-                    if not new_value_args:
-                        # No real tensor inputs: this is a coarse-tile identity fill
-                        # (e.g. coarse_tile_fill writing inf/0 into the accumulator).
-                        # A scalar fill has no stick orientation preference, so use
-                        # AnyInNode and let the real writers (combine, copy) determine
-                        # the STL. Borrow target_buf.layouts so the beam has a non-empty
-                        # candidate list; AnyInNode commits at zero cost regardless.
-                        assert hasattr(target_buf, "layouts"), (
-                            f"SpyreEmptyFallback {target_name!r} has no layouts — "
-                            "expected SpyreEmptyFallback to have layouts set before any "
-                            "mutation op writes it"
-                        )
-                        candidates = target_buf.layouts
-                        op.layouts = candidates
-                        op.restick_cost_fn = AnyInNode.from_args()
-                        continue
-                    # Build a co-output dep for the mutation target so the beam
-                    # couples all mutation ops (that have real inputs) writing it
-                    # to the same STL. The target has all valid STLs as candidates
-                    # so this dep adds no spurious constraint.
-                    target_co_dep = MemoryDep(
-                        name=target_name,
-                        index=output_dep.index,
-                        var_names=output_dep.var_names,
-                        size=output_dep.size,
-                    )
-                    out_deps = [output_dep, target_co_dep]
-                    if (
-                        isinstance(op.data, Reduction)
-                        and op.data.reduction_type == BATCH_MATMUL_OP
-                    ):
-                        # x and y are the two genuine matmul inputs (not the target
-                        # read-back). _matmul_layouts derives a single out_stl
-                        # deterministically from the target layout and installs its
-                        # own FixedInOutNode, so no separate AllSameNode join is needed.
-                        # target_co_dep is intentionally not threaded in: matmul has a
-                        # fixed, deterministic output STL so two BATCH_MATMUL ops writing
-                        # the same SpyreEmptyFallback will always agree.
-                        assert len(new_value_args) == 2, (
-                            "BATCH_MATMUL_OP mutation op should have exactly "
-                            f"two non-target inputs, got {len(new_value_args)} "
-                            f"for {op.get_name()}"
-                        )
-                        accum_layout = target_buf.get_layout()
-                        candidates = _matmul_layouts(
-                            op, accum_layout, output_dep, new_value_args
-                        )
-                        target_buf.layouts = candidates
-                        op.layouts = candidates
-                    elif isinstance(op.data, Reduction):
-                        # The non-target input is the reduction's un-reduced,
-                        # higher-rank input. Must use _single_arg_op_layout, not the
-                        # broadcast-oriented pointwise join path.
-                        assert len(new_value_args) == 1, (
-                            "Reduction mutation op should have exactly one non-target "
-                            f"input, got {len(new_value_args)} for {op.get_name()}"
-                        )
-                        accum_layout = target_buf.get_layout()
-                        in_arg = new_value_args[0]
-                        candidates = []
-                        for stl in in_arg.layouts:
-                            candidates.extend(
-                                _single_arg_op_layout(
-                                    op,
-                                    accum_layout,
-                                    output_dep,
-                                    in_arg.dep,
-                                    in_arg.layout,
-                                    stl,
-                                )
-                            )
-                        if not candidates:
-                            raise Unsupported(
-                                f"{op.get_name()}: no supported output layout "
-                                f"found for any of {len(in_arg.layouts)} "
-                                f"candidate input layouts; target size="
-                                f"{accum_layout.size}"
-                            )
-                        op.restick_cost_fn = AllSameNode.from_args(
-                            all_args, candidates, out_deps, op
-                        )
-                        target_buf.layouts = candidates
-                        op.layouts = candidates
-                    else:
-                        target_layout = target_buf.get_layout()
-                        candidates = _multi_arg_pointwise_layouts(
-                            op, target_layout, output_dep, new_value_args
-                        )
-                        # Propagate candidates forward: the mutation target is
-                        # write-only from this op's perspective (excluded from
-                        # new_value_args), so no read edge carries the layout
-                        # information forward naturally.  Overwrite target_buf.layouts
-                        # so that ops later in topo order that READ the target see
-                        # the narrowed candidate set from this write, not the initial
-                        # wide set assigned at allocation time.
-                        target_buf.layouts = candidates
-                        op.restick_cost_fn = AllSameNode.from_args(
-                            all_args, candidates, out_deps, op
-                        )
-                        op.layouts = candidates
+                    # SpyreEmptyFallback target has no device layout yet —
+                    # expected, not exceptional.
+                    _handle_empty_fallback_mutation(op, target_buf, target_name)
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
