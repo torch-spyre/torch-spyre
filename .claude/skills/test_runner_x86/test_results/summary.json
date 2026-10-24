@@ -1,0 +1,13 @@
+{
+  "total_tests": 9,
+  "passed": 9,
+  "failed": 0,
+  "xfailed": 0,
+  "skipped": 0,
+  "errors": 0,
+  "duration_seconds": 27.64863419532776,
+  "pod_name": "anjali-torch-spyre-jun01",
+  "namespace": "cicd-project",
+  "test_config": "/home/senuser/torch-spyre/tests/configs/upstream_tests_beta/test_unary_ufuncs.yaml",
+  "timestamp": "2026-06-01T06:21:52Z"
+}
