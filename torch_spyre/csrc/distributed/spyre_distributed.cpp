@@ -34,6 +34,8 @@
 #include "../spyre_allocator.h"
 #include "../spyre_composite_address.h"
 #include "../spyre_stream.h"
+#include "../spyre_tensor_impl.h"
+#include "spyre_collective_utils.h"
 
 namespace spyre {
 
@@ -106,8 +108,9 @@ struct CachedPlan {
 static std::vector<CachedPlan> wsi_cache_;
 static std::mutex wsi_cache_mutex_;
 
-// Helper to convert PyTorch ScalarType to spyre_comms TensorDataTypeEnum
-spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
+// Used only by the three device collective plan ops below, never host
+// transfers.
+static spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
     c10::ScalarType dtype) {
   switch (dtype) {
     case c10::ScalarType::Float:
@@ -117,7 +120,9 @@ spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
     case c10::ScalarType::Half:
       return spyre_comms::TensorDataTypeEnum::float16;
     case c10::ScalarType::BFloat16:
-      return spyre_comms::TensorDataTypeEnum::bfloat16;
+      // Ordinary BF16 Spyre tensors already contain DL16 device data. The
+      // collective borrows that storage; no host conversion is involved.
+      return spyre_comms::TensorDataTypeEnum::sen_fp16;
     case c10::ScalarType::Int:
       return spyre_comms::TensorDataTypeEnum::int32;
     case c10::ScalarType::Long:
@@ -330,6 +335,9 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
                         << ", src_rank=" << src_rank;
 
+  // Plans have only scalar metadata; validate actual storage at run time.
+  check_collective_storage(input);
+
   auto context = ensure_context();
 
   std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
@@ -389,6 +397,8 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
                                     int64_t plan_handle) {
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle;
 
+  check_collective_storage(input);
+
   auto context = ensure_context();
 
   std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
@@ -445,6 +455,8 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
                                     int64_t plan_handle, int64_t group_size) {
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
                         << ", group_size=" << group_size;
+
+  check_collective_storage(input);
 
   auto context = ensure_context();
 
