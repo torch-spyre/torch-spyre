@@ -221,6 +221,8 @@ FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
+# Largest k topkvalue/topkindex accept.
+TOPK_MAX_K = 128
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

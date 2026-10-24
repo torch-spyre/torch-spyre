@@ -763,6 +763,19 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
     )
 
 
+def legal_topk_k_splits(k: int) -> frozenset[int]:
+    """Core counts that split ``k`` topk results with at most four per core.
+
+    Shared by the topk and keep_by_index constraints and by ``spyre_sort``,
+    which pads an unsplittable sort dim up to a size this accepts.
+    """
+    return frozenset(
+        split
+        for split in divisors(k)
+        if split <= config.sencores and k // split <= TOPK_MAX_K_PER_CORE
+    )
+
+
 def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
     """Return TopK k var, absent from every input index expression."""
     input_vars = {
@@ -799,11 +812,7 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
         return ConstraintResult(allowed_splits=allowed_splits)
 
     k_size = concretize_expr(ctx.it_space[k_var])
-    legal_k_splits = frozenset(
-        split
-        for split in divisors(k_size)
-        if split <= config.sencores and k_size // split <= TOPK_MAX_K_PER_CORE
-    )
+    legal_k_splits = legal_topk_k_splits(k_size)
     if not legal_k_splits:
         raise Unsupported(
             f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
@@ -856,11 +865,7 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
     allowed_splits = {}
     for axis in axes:
         size = concretize_expr(ctx.it_space[axis])
-        legal = [
-            split
-            for split in divisors(size)
-            if split <= config.sencores and size // split <= _MAX_K_PER_CORE
-        ]
+        legal = legal_topk_k_splits(size)
         if not legal:
             raise Unsupported(
                 f"keep_by_index(k={size}): no divisor within {config.sencores} "
