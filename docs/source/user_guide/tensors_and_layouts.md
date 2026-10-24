@@ -191,9 +191,9 @@ the maximal number of element per stick for the tensor data type.
 The stride_map vector maps each device dimension to a host stride: the number
 of PyTorch elements to advance in host memory when stepping one position along
 that device dimension. The elements of this vector are integers where a value
-of `-1` indicates a synthetic or padded dimension with no corresponding host
-stride (e.g. the stick dimension when the tensor size is a multiple of the
-stick size, or a fully-padded expansion dimension).
+of `0` indicates a synthetic, padded, or broadcast dimension with no
+corresponding host stride (e.g. the stick dimension when the tensor size is
+a multiple of the stick size, or a broadcast/gap expansion dimension).
 
 For example, for a 3d PyTorch tensor of size `[128, 256, 512]` with
 stride `[131072, 512, 1]` and a device_size `[256, 8, 128, 64]`:
@@ -222,9 +222,9 @@ in device-coordinate order and still land on the right host element.
 
 ### Why the layout uses stride_map
 
-The layout records one host stride per device dimension, with `-1`
-reserved for synthetic or fully-padded dims that have no host
-counterpart. A stride is an integer count of how many host elements to
+The layout records one host stride per device dimension, with `0`
+reserved for synthetic, fully-padded, or broadcast dims that have no
+effective host counterpart. A stride is an integer count of how many host elements to
 step by, and that count stays meaningful through padding, split
 dimensions, fused dimensions, synthetic dims, and views. That is why
 the layout carries strides directly rather than a per-dimension index
@@ -243,7 +243,7 @@ work division, scratchpad planning, and codegen read it without special
 handling.
 
 Sparse Spyre layouts add a synthetic inner dimension that has no
-corresponding PyTorch dim; its stride is `-1`. Views without copies are
+corresponding PyTorch dim; its stride is `0`. Views without copies are
 handled the same way. When the compiler implements `transpose`,
 `flatten`, or `permute` as a different read pattern over the same
 storage, the device strides describe that read pattern directly, with
@@ -349,7 +349,7 @@ An instance of this class is embedded as a field in the `SpyreTensorImpl` class.
 It can be accessed in Python via an added Tensor method `device_tensor_layout()`.
 The key elements of metadata are:
 - `device_size`: analogous to PyTorch's `size` but with padded values and extra dimensions for tiling.
-- `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (-1 for synthetic or padded dimensions).
+- `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (0 for synthetic, padded, or broadcast dimensions).
 - `device_dtype`: the datatype of the Tensor.
 - `element_arrangement`: how elements are packed within a stick. Defaults to `STANDARD` and appears in the `repr` only when it is non-standard.
 

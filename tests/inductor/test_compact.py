@@ -21,7 +21,6 @@ import pytest
 import torch
 import torch._dynamo as dynamo
 
-
 # -------- Tests: ops in compacted tensors --------
 #
 # Tests that verify that operation on "compacted" tensors run

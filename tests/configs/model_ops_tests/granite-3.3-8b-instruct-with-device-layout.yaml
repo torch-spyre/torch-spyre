@@ -314,7 +314,7 @@ test_suite_config:
                             high: 2147483647
                           device_layout:
                             device_size: [2, 1, 32]
-                            stride_map: [32, -1, 1]
+                            stride_map: [32, 0, 1]
                             device_dtype: torch.int32
                   description: 'Operation: torch.Tensor.float, Node: position_ids_expanded'
                   tags:
