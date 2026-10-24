@@ -90,8 +90,9 @@ def _check_ktir_device_prerequisites() -> None:
 
 # One event name for every backend invocation, whichever emitter selected it, so
 # a frontend total stays a single subtraction as emitters come and go. The tool
-# is in the event's meta.
-_BACKEND_STAGE = "stage:SpyreAsyncCompile:backend_compile"
+# is in the event's meta. Defined in timing_recorder so a reader computing that
+# subtraction has one name to match rather than a copy of this string.
+_BACKEND_STAGE = timing_recorder.BACKEND_COMPILE_EVENT
 
 # The frontend-only warning is per process, not per kernel: a large model emits
 # hundreds of kernels and the record already names each skipped one.

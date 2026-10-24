@@ -98,7 +98,7 @@ The `stage:` regions are:
 
 | Name | Region |
 |---|---|
-| `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region nests inside it |
+| `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region in this table nests inside it |
 | `stage:CustomPreSchedulingPasses:pass_loop` | The pre-scheduling pass list |
 | `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
 | `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
@@ -106,7 +106,7 @@ The `stage:` regions are:
 | `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |
 | `stage:SpyreAsyncCompile:generate_bundle` / `:generate_ktir` | Backend-input generation, per kernel |
 | `stage:SpyreAsyncCompile:kernel_provenance` | Kernel provenance descriptor, per kernel |
-| `stage:SpyreAsyncCompile:backend_compile` | The backend compiler, per kernel (named in `meta.tool`) |
+| `stage:SpyreAsyncCompile:backend_compile` | The backend compiler, per kernel (named in `meta.tool`); distinct from [`stage:torch:backend_compile`](#upstream-pytorch-phases) |
 | `stage:SpyreAsyncCompile:prepare_kernel` | Loading the backend's output |
 | `stage:SpyreAsyncCompile:backend_skipped` | Marker where the backend was skipped; its duration is not a measurement |
 
@@ -125,6 +125,37 @@ compile, so group by it rather than summing the whole record.
 than one compile thread the work goes to a pool worker, which does not share this
 recorder, so no `backend_compile` event is emitted and the subtraction above
 would charge the backend to the frontend. Measure with a single compile thread.
+
+### Upstream PyTorch phases
+
+PyTorch's own compile phases are recorded as `stage:torch:<phase>`, under the
+names PyTorch times them with, so the full set depends on the PyTorch version.
+These four are checked by torch-spyre's tests:
+
+| Name | Region |
+|---|---|
+| `stage:torch:entire_frame_compile` | Dynamo, one whole frame |
+| `stage:torch:create_aot_dispatcher_function` | AOTAutograd |
+| `stage:torch:GraphLowering.run` | Lowering |
+| `stage:torch:GraphLowering.codegen` | Codegen |
+
+`stage:compile_fx:spyre_compile` runs inside Dynamo's
+`stage:torch:entire_frame_compile`, so it has a parent: find each compile by
+name, not by looking for root events. AOTAutograd, lowering and codegen run
+inside `spyre_compile` and count toward `pre_backend`. Dynamo's own tracing and
+guard building run outside it and do not.
+
+`stage:torch:backend_compile` is Dynamo's call into Inductor, which encloses the
+whole compile. It is not the Spyre backend, so match
+`stage:SpyreAsyncCompile:backend_compile` exactly rather than by its last
+segment.
+
+A phase can nest inside itself: `GraphLowering.run` recurses into while-loop
+bodies and subgraphs. Take the outermost one's `inclusive_ns` rather than
+summing them.
+
+Compiles that are not for Spyre are recorded too, as phase trees with no
+`spyre_compile` inside them.
 
 ### Skipping the backend
 
