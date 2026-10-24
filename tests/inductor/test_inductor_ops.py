@@ -3330,10 +3330,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # -----------------------------------------------------------------------
         # Regression: 0-dim integer compare inside a torch.cond branch.
         #
-        # eq/ne/le/gt/ge promote the integer operand through INT_TO_FLOAT before
-        # comparing, so they run on device.  lt is still expected to fail (#5551):
-        # the same promotion guard that protects while_loop trip counters (which
-        # must stay integer) also applies to lt inside torch.cond branches.
+        # Every compare promotes the integer operand through INT_TO_FLOAT before
+        # comparing, so all six run on device.
         # -----------------------------------------------------------------------
         ("test_cmp_cond_subgraph", "test_cmp_cond_subgraph_cpu"): {
             "ops_dict": {
@@ -3343,12 +3341,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "le": torch.le,
                 "gt": torch.gt,
                 "ge": torch.ge,
-            },
-            "expect_fail": {
-                "lt_int32_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int32_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int64_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int64_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
             },
             "param_sets": {
                 # int32 0-dim inside a torch.cond branch.
@@ -9313,10 +9305,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(op, x, y, run_eager=True)
 
     def test_cmp_cond_subgraph_cpu(self, op, n, x):
-        # Regression: 0-dim int compare (eq/ne/le/gt/ge) inside a torch.cond
-        # branch must not be erroneously skipped by the trip-counter carve-out.
-        # Before the fix, _lower_cmp_impl checked only "inside SubgraphLowering"
-        # and passed the raw integer IR to Spyre, which has no integer compare.
+        # A 0-dim integer compare inside a torch.cond branch runs on the device
+        # like a top-level one: it is promoted through INT_TO_FLOAT, since Spyre
+        # has no integer compare.
         def fn(n, x):
             return torch.cond(
                 x.sum() > 0,
