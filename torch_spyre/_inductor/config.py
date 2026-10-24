@@ -438,6 +438,11 @@ lx_same_tile_group_relayout: bool = (
     os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
 )
 
+# Layout optimizer to use for restickify placement.
+# "cpsat"  -- CP-SAT exact formulation (default)
+# "beam"   -- A*-beam search fallback
+restickify_optimizer: str = os.environ.get("SPYRE_RESTICKIFY_OPTIMIZER", "cpsat")
+
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every
 # other setting's value in the key. A setting belongs here when it describes the
