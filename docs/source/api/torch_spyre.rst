@@ -845,7 +845,7 @@ Environment Variables
        stderr (default empty)
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
-       invocations (default ``0``; set ``1`` to enable). When enabled,
+       invocations (default ``1``; set ``0`` to disable). When enabled,
        ``LIB_VERSION_FILE`` must point at the compiler version file, which
        supplies the compiler version for the cache key. If it is unset, the
        cache key cannot be computed: torch-spyre logs a warning and compiles
