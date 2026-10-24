@@ -26,6 +26,7 @@ from unittest.mock import patch
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
@@ -250,6 +251,43 @@ class TestItSpaceSplits(TestCase):
         self.assertEqual(len(logs.records), 1)
         self.assertIn("lossy work-division scheduler transport", logs.output[0])
         self.assertEqual(op.op_it_space_splits, ({8: 4}, {}))
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+
+    def test_scheduler_transport_carries_both_axes_without_collision(self):
+        """The non-lossy counterpart to the collision case above: distinct
+        write-index coefficients need no last-axis-wins fallback, so both
+        axes survive scheduler transport intact and no warning is logged."""
+
+        class Op:
+            def __init__(self):
+                self.op_it_space_splits = None
+                write = MemoryDep("out", 64 * i0 + 8 * i1, (i0, i1), (64, 8))
+                self.read_writes = type(
+                    "ReadWrites", (), {"writes": [write], "reads": []}
+                )()
+                self.iteration_space_ownership = TensorWorkDivision(
+                    {i0: 2, i1: 4}, {i0: sympy.Integer(0), i1: sympy.Integer(0)}
+                )
+
+            def get_name(self):
+                return "no_collision"
+
+            def get_read_writes(self):
+                return self.read_writes
+
+        op = Op()
+        graph = type("Graph", (), {"operations": [op]})()
+        with (
+            patch.object(pass_utils_module.logger, "warning") as warn,
+            patch(
+                "torch_spyre._inductor.pass_utils.iteration_space_from_op",
+                return_value={i0: 8, i1: 8},
+            ),
+        ):
+            finalize_work_division_for_scheduler(graph)
+
+        warn.assert_not_called()
+        self.assertEqual(op.op_it_space_splits, ({64: 2, 8: 4}, {}))
         self.assertFalse(hasattr(op, "iteration_space_ownership"))
 
 
