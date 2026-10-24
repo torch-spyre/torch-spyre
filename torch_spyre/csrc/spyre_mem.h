@@ -43,6 +43,22 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
  */
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value);
 
+/**
+ * Encode a CPU fp16 tensor (any strides) as SEN169_FP16 device bits, using
+ * the intra-op threads. SEN169_FP16 is DeepTools' DLF16 (1 sign, 6 exponent
+ * bits with bias 31, 9 mantissa bits); every element goes through a table
+ * built from DeepTools' converter deeptools::Ieeef16BinToFp16bin. Returns a
+ * contiguous CPU int16 tensor of the same shape.
+ */
+at::Tensor fp16_to_sen169_bits(const at::Tensor& src);
+
+/**
+ * Copy contiguous CPU tensor ``src`` as is into the whole device allocation
+ * of ``dst`` (no conversion, no re-layout). ``src`` must hold the
+ * allocation's bytes in device order. Synchronous.
+ */
+void spyre_copy_bytes_to_device(const at::Tensor& src, const at::Tensor& dst);
+
 class SpyreTensorLayout;
 at::Tensor spyre_empty_with_layout(
     c10::IntArrayRef size, c10::IntArrayRef stride, c10::ScalarType dtype,

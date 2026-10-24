@@ -474,6 +474,17 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  // Host-side fp16 -> SEN169_FP16 bit encoding (multi-threaded), used to
+  // upload fp16 weights without the runtime's per-element DMA conversion.
+  m.def("fp16_to_sen169_bits", &spyre::fp16_to_sen169_bits,
+        "Encode a CPU float16 tensor as SEN169_FP16 device bits (int16)",
+        py::arg("src"), py::call_guard<py::gil_scoped_release>());
+
+  m.def("copy_bytes_to_device", &spyre::spyre_copy_bytes_to_device,
+        "Copy a CPU buffer verbatim into a Spyre tensor's whole allocation",
+        py::arg("src"), py::arg("dst"),
+        py::call_guard<py::gil_scoped_release>());
+
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",

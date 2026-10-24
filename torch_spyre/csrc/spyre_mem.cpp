@@ -17,6 +17,7 @@
 #include "spyre_mem.h"
 
 #include <ATen/EmptyTensor.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/set_cpu_dispatch.h>
@@ -24,9 +25,11 @@
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
 #include <pybind11/pybind11.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -1243,6 +1246,79 @@ const at::Tensor& spyre_resize_(
   SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();
   return self;
+}
+
+// fp16 -> SEN169_FP16 (DeepTools' DLF16: 1 sign, 6 exponent bits with bias
+// 31, 9 mantissa bits). One entry per fp16 bit pattern, each made by DeepTools'
+// own converter, so the device format rules stay in DeepTools. Built on first
+// use (65536 calls, well under a millisecond).
+static const uint16_t* dlf16_from_fp16_table() {
+  static const std::vector<uint16_t> table = [] {
+    std::vector<uint16_t> t(1 << 16);
+    for (uint32_t h = 0; h < t.size(); ++h) {
+      t[h] = deeptools::Ieeef16BinToFp16bin(static_cast<uint16_t>(h));
+    }
+    return t;
+  }();
+  return table.data();
+}
+
+static void encode_sen169_contiguous(uint16_t* __restrict d,
+                                     const uint16_t* __restrict s, int64_t n,
+                                     const uint16_t* __restrict table) {
+  for (int64_t i = 0; i < n; ++i) d[i] = table[s[i]];
+}
+
+at::Tensor fp16_to_sen169_bits(const at::Tensor& src) {
+  TORCH_CHECK(src.device().is_cpu(),
+              "fp16_to_sen169_bits: expected a CPU tensor, got ", src.device());
+  TORCH_CHECK(src.scalar_type() == c10::ScalarType::Half,
+              "fp16_to_sen169_bits: expected float16, got ", src.scalar_type());
+  // Contiguous output in src's logical order; src may be any strided view
+  // (e.g. the host weight seen in device stick order), gathered on the fly.
+  at::Tensor out = at::empty(src.sizes(), src.options().dtype(at::kShort));
+  if (out.numel() == 0) return out;
+  auto iter = at::TensorIteratorConfig()
+                  .add_output(out)
+                  .add_const_input(src)
+                  .check_all_same_dtype(false)
+                  .build();
+  const uint16_t* table = dlf16_from_fp16_table();
+  // for_each parallelizes over the intra-op thread pool inside libtorch.
+  iter.for_each(
+      [table](char** data, const int64_t* strides, int64_t n) {
+        char* d = data[0];
+        const char* s = data[1];
+        if (strides[0] == 2 && strides[1] == 2) {
+          encode_sen169_contiguous(reinterpret_cast<uint16_t*>(d),
+                                   reinterpret_cast<const uint16_t*>(s), n,
+                                   table);
+        } else {
+          for (int64_t i = 0; i < n; ++i) {
+            uint16_t h;
+            std::memcpy(&h, s + i * strides[1], sizeof(h));
+            const uint16_t r = table[h];
+            std::memcpy(d + i * strides[0], &r, sizeof(r));
+          }
+        }
+      },
+      /*grain_size=*/1 << 16);
+  return out;
+}
+
+void spyre_copy_bytes_to_device(const at::Tensor& src, const at::Tensor& dst) {
+  TORCH_CHECK(src.device().is_cpu() && src.is_contiguous(),
+              "spyre_copy_bytes_to_device: src must be a contiguous CPU "
+              "tensor");
+  TORCH_CHECK(dst.is_privateuseone(),
+              "spyre_copy_bytes_to_device: dst must be a Spyre tensor");
+  flex::CompositeAddress* addr = get_composite_address(dst);
+  TORCH_CHECK(static_cast<size_t>(src.nbytes()) == addr->total_size(),
+              "spyre_copy_bytes_to_device: src has ", src.nbytes(),
+              " bytes, the device allocation has ", addr->total_size());
+  SpyreStream stream = getCurrentStream(dst.device());
+  stream.copyProgramAsync(const_cast<void*>(src.const_data_ptr()), addr);
+  stream.synchronize();
 }
 
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {

@@ -28,8 +28,13 @@ __all__: list[str] = [
     "synchronize",
     "as_strided_with_layout",
     "empty_with_layout",
+    "CompositeAddressHandle",
+    "copy_bytes_to_device",
     "copy_tensor",
     "fill_tensor",
+    "fp16_to_sen169_bits",
+    "get_composite_address",
+    "reinterpret_tensor_with_layout",
     "encode_constant",
     "extract_kernel_provenance_key",
     "free_runtime",
@@ -322,6 +327,40 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+def reinterpret_tensor_with_layout(
+    arg0: torch.Tensor,
+    arg1: collections.abc.Sequence[int],
+    arg2: collections.abc.Sequence[int],
+    arg3: typing.SupportsInt,
+    arg4: SpyreTensorLayout,
+) -> torch.Tensor: ...
+
+class CompositeAddressHandle:
+    """
+    Read-only handle over the device address backing a Spyre tensor's storage
+    """
+    @property
+    def total_size(self) -> int:
+        """
+        Total physical (padded/tiled) byte size of the allocation
+        """
+    @property
+    def num_chunks(self) -> int:
+        """
+        Number of device chunks the allocation spans
+        """
+    def chunks(self) -> list[typing.Any]:
+        """
+        Per-chunk geometry, in order
+        """
+
+def get_composite_address(tensor: torch.Tensor) -> CompositeAddressHandle:
+    """
+    Return a read-only handle over the device address backing a Spyre
+    tensor's storage; the handle keeps that allocation alive
+    """
+    ...
+
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
@@ -330,6 +369,25 @@ def copy_tensor(
 
     Args:
         self or dst: one of that must be on spyre device
+    """
+    ...
+
+def copy_bytes_to_device(src: torch.Tensor, dst: torch.Tensor) -> None:
+    """
+    Copy the bytes of a contiguous CPU tensor verbatim into the whole device
+    allocation of a Spyre tensor (no data conversion, no stick re-layout).
+
+    ``src.nbytes`` must equal the allocation's total size, and ``src`` must
+    hold the allocation's physical bytes in device order. Synchronous.
+    """
+    ...
+
+def fp16_to_sen169_bits(src: torch.Tensor) -> torch.Tensor:
+    """
+    Encode a CPU float16 tensor as SEN169_FP16 (DLF16) device bit patterns.
+
+    Each element goes through DeepTools' fp16 -> DLF16 converter. Returns a CPU
+    int16 tensor of the same shape.
     """
     ...
 

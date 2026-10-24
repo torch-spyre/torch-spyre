@@ -71,6 +71,7 @@ Usage::
     model.to("spyre")
 """
 
+import os
 import warnings
 
 import torch
@@ -80,8 +81,12 @@ from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
     SpyreTensorLayout,
+    copy_bytes_to_device,
     copy_tensor,
+    fp16_to_sen169_bits,
+    get_composite_address,
     get_device_dtype,
+    get_spyre_tensor_layout,
     spyre_empty_with_layout,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -126,6 +131,94 @@ def _normalize_spyre_device(
     return target
 
 
+# --- Pre-encoded fp16 upload (SPYRE_FAST_WEIGHT_DMA=1) ------------------
+#
+# An fp16 H2D copy makes the runtime convert every element to the device
+# 16-bit float (SEN169_FP16, DeepTools' DLF16) on the host, on one thread,
+# inside the copy call (~0.36 G elem/s). With SPYRE_FAST_WEIGHT_DMA=1 an
+# unpadded fp16 weight is encoded by ``_C.fp16_to_sen169_bits`` (many threads,
+# DeepTools' fp16 -> DLF16 converter) straight into its device image, which
+# ``_C.copy_bytes_to_device`` copies as is. Anything else (padding, other
+# layouts or dtypes) keeps the regular ``copy_tensor`` path.
+
+FAST_WEIGHT_DMA_ENV = "SPYRE_FAST_WEIGHT_DMA"
+
+
+def _fast_weight_dma_enabled() -> bool:
+    return os.environ.get(FAST_WEIGHT_DMA_ENV, "0") == "1"
+
+
+def _is_plain_fp16_stick_layout(stl: SpyreTensorLayout) -> bool:
+    """fp16 layout whose 64-element sticks run along the host-contiguous dim."""
+    return (
+        stl.device_dtype == DataFormats.SEN169_FP16
+        and stl.element_arrangement == ElementArrangement.STANDARD
+        and stl.elems_per_stick() == 64
+        and stl.device_size[-1] == 64
+        and stl.stride_map[-1] == 1
+        and all(s == -1 or s > 1 for s in stl.stride_map[:-1])
+    )
+
+
+def _device_image_strides(stl: SpyreTensorLayout, numel: int) -> list[int] | None:
+    """Host strides that enumerate the elements in device order, if unpadded.
+
+    Device coordinate ``k`` holds host element ``sum(k[i] * stride_map[i])``.
+    Returns those strides when the device dims tile the host tensor exactly
+    (no stick, dim or allocation padding), else None.
+    """
+    if not _is_plain_fp16_stick_layout(stl):
+        return None
+    sizes = list(stl.device_size)
+    strides = [0 if s == -1 else s for s in stl.stride_map]
+    # Bijective onto the host elements iff, ordered by stride, each non-unit
+    # dim's stride is the product of the sizes of the finer dims.
+    expected = 1
+    for s, d in sorted((s, d) for d, s in zip(sizes, strides) if d != 1):
+        if s != expected:
+            return None
+        expected *= d
+    return strides if expected == numel else None
+
+
+def _copy_fp16_preencoded(cpu_tensor: torch.Tensor, dst: torch.Tensor) -> bool:
+    """Upload fp16 ``cpu_tensor`` into fresh, unpadded ``dst`` as a device image.
+
+    Returns False (nothing copied) when the case is not covered.
+    """
+    if not (
+        cpu_tensor.dtype == torch.float16
+        and dst.dtype == torch.float16
+        and cpu_tensor.dim() >= 1
+        and cpu_tensor.numel() > 0
+        and cpu_tensor.shape[-1] >= 2
+        and cpu_tensor.is_contiguous()
+        and dst.shape == cpu_tensor.shape
+        and dst.is_contiguous()
+        and dst.storage_offset() == 0
+    ):
+        return False
+    stl = get_spyre_tensor_layout(dst)
+    numel = cpu_tensor.numel()
+    strides = _device_image_strides(stl, numel)
+    if (
+        strides is None
+        or get_composite_address(dst).total_size != numel * cpu_tensor.element_size()
+    ):
+        return False
+    # encode while gathering the host elements in device order
+    in_device_order = cpu_tensor.view(-1).as_strided(list(stl.device_size), strides)
+    copy_bytes_to_device(fp16_to_sen169_bits(in_device_order), dst)
+    return True
+
+
+def _copy_to_spyre(cpu_tensor: torch.Tensor, dst: torch.Tensor) -> None:
+    """``copy_tensor(cpu_tensor, dst)``, pre-encoded when enabled and covered."""
+    if _fast_weight_dma_enabled() and _copy_fp16_preencoded(cpu_tensor, dst):
+        return
+    copy_tensor(cpu_tensor, dst, non_blocking=False)
+
+
 # --- DMA helpers -----------------------------------------------------
 
 
@@ -148,7 +241,7 @@ def _dma_to_spyre_default(
     dst = spyre_empty_with_layout(
         cpu_tensor.size(), cpu_tensor.stride(), dev_dtype, layout, device=device
     )
-    copy_tensor(cpu_tensor, dst, non_blocking=False)
+    _copy_to_spyre(cpu_tensor, dst)
     return dst
 
 
@@ -183,7 +276,7 @@ def _dma_to_spyre_dim_order_swapped(
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
     )
-    copy_tensor(weight, dst, non_blocking=False)
+    _copy_to_spyre(weight, dst)
     return dst
 
 
@@ -242,7 +335,7 @@ def _dma_to_spyre_indirect_access(
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
     )
-    copy_tensor(weight, dst, non_blocking=False)
+    _copy_to_spyre(weight, dst)
     return dst
 
 
@@ -331,7 +424,7 @@ def dma_moe_expert_weight_to_spyre(
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
     )
-    copy_tensor(weight, dst, non_blocking=False)
+    _copy_to_spyre(weight, dst)
     return dst
 
 
@@ -367,7 +460,7 @@ def dma_moe_per_expert_scale_to_spyre(
     dst = spyre_empty_with_layout(
         widened.size(), widened.stride(), dev_dtype, layout, device=device
     )
-    copy_tensor(widened, dst, non_blocking=False)
+    _copy_to_spyre(widened, dst)
     return dst
 
 
