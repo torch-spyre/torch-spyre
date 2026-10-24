@@ -532,7 +532,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
   kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
@@ -666,6 +666,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
   // AIUpti_ActivityMemcpy does not say whether the record came from a
   // command buffer (real counters) or a standalone flex MEMCPY (always 0;
   // today flex reports every DMA this way), so omit the key when all slots
@@ -745,6 +746,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    mem_activity->addMetadata("stream", activity->stream_id);
 
     if (mem_activity->resource == getBaseResourceId(activity)) {
       recordMemoryStream(mem_activity->device, mem_activity->resource,
@@ -826,6 +828,7 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memset_activity->addMetadata("stream", activity->stream_id);
 
   if (memset_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memset_activity->device, memset_activity->resource,
