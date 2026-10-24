@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from collections import namedtuple
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from torch._dynamo.guards import GuardBuilder
@@ -32,6 +33,193 @@ if TYPE_CHECKING:
 # file's lazy-import convention (torch is only guaranteed importable once
 # this module's patch functions actually run).
 _UNSET = object()
+
+# Floor on a dynamic= reservation's `min`. The serving plugin's linear
+# wrapper branches on a row count below this, which would become a branch
+# on a symbol once that dim is dynamic. Real minima are far above it
+# today, so this holds by luck rather than by construction -- enforcing it
+# here means a future caller can't quietly drop below it.
+_MIN_RESERVED_DIM_SIZE = 8
+
+_DynamicSpec = namedtuple("_DynamicSpec", "dim min max granularity")
+
+_DYNAMIC_SPEC_KEYS = frozenset({"min", "max", "granularity"})
+
+_DYNAMIC_USAGE_HINT = (
+    'x.to("spyre", dynamic={0: {"min": 32, "max": 576, "granularity": 16}})'
+)
+
+
+def _parse_dynamic_spec(dynamic, size) -> _DynamicSpec:
+    """Validate a dynamic= declaration against a tensor's shape.
+
+    tensor.to("spyre", dynamic={0: {"min": 32, "max": 576, "granularity":
+    16}}): reserve the destination buffer at `max` along `dim` instead of
+    the current (warmup) shape, so a later in-place resize up to `max`
+    (done by the compiled graph via aten::resize_ / spyre_resize_) never
+    reallocates and never changes the SpyreTensorLayout the recompile
+    guard compares against. Scope for now: exactly one dim (dim 0 comes
+    first) -- multi-dim reservation is a later layer. `granularity` is
+    optional; omitting it means "no step restriction" (equivalent to
+    granularity=1).
+
+    A pure function of its arguments -- no device, no real tensor beyond
+    its size -- so it can be unit-tested without hardware.
+    """
+    if not isinstance(dynamic, dict) or len(dynamic) != 1:
+        raise ValueError(
+            f"dynamic= currently supports exactly one dim, e.g. {_DYNAMIC_USAGE_HINT}"
+        )
+
+    ((dim, spec),) = dynamic.items()
+    original_dim = dim  # for messages: report what the caller wrote, not
+    # the canonicalized index, if canonicalizing still leaves it invalid.
+
+    if not isinstance(dim, int):
+        raise ValueError(f"dynamic={{...}}: dim={dim!r} must be an int")
+
+    unknown = set(spec) - _DYNAMIC_SPEC_KEYS
+    if unknown:
+        raise ValueError(
+            f"dynamic={{{original_dim}: ...}}: unknown key(s) {sorted(unknown)}; "
+            "expected min, max and optionally granularity"
+        )
+    if "max" not in spec:
+        raise ValueError(f"dynamic={{{original_dim}: ...}} requires a 'max' entry")
+    if "min" not in spec:
+        raise ValueError(f"dynamic={{{original_dim}: ...}} requires a 'min' entry")
+
+    if dim < 0:
+        dim += len(size)
+
+    dim_max = spec["max"]
+    dim_min = spec["min"]
+    granularity = spec.get("granularity", 1)
+    if granularity is None:
+        granularity = 1
+
+    # Rules on the declaration itself: these must hold regardless of this
+    # call's concrete size, because the declaration is a contract the
+    # compiler and every later call will rely on, not just a fact about
+    # today's tensor.
+    for name, value in (
+        ("min", dim_min),
+        ("max", dim_max),
+        ("granularity", granularity),
+    ):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"dynamic={{{dim}: ...}}: {name}={value!r} must be a positive int"
+            )
+    if dim_min > dim_max:
+        raise ValueError(f"dynamic={{{dim}: ...}}: min={dim_min} exceeds max={dim_max}")
+    if dim_max % granularity != 0:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple of "
+            f"granularity={granularity}"
+        )
+    if dim_min < _MIN_RESERVED_DIM_SIZE:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: min={dim_min} is below the minimum "
+            f"supported reservation floor ({_MIN_RESERVED_DIM_SIZE})"
+        )
+
+    # Local import: this file must stay importable before torch_spyre's
+    # own submodules are guaranteed ready (see _UNSET above), and reading
+    # the Inductor layer's config from the eager transfer path is itself
+    # a deliberate dependency edge -- a single source of truth for
+    # max_buckets beats a duplicated constant that can drift from it.
+    from torch_spyre._inductor import config as inductor_config
+
+    num_buckets = dim_max // granularity
+    if num_buckets > inductor_config.max_buckets:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: max={dim_max} / granularity={granularity} = "
+            f"{num_buckets} buckets, exceeding the cap of "
+            f"{inductor_config.max_buckets} (each bucket costs roughly 5us of "
+            "host correction on every dispatch)"
+        )
+
+    if not (0 <= dim < len(size)):
+        raise ValueError(
+            f"dynamic dim {original_dim} is out of range for tensor of shape "
+            f"{tuple(size)}"
+        )
+    if not (dim_min <= size[dim] <= dim_max):
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: current size {size[dim]} at dim {dim} "
+            f"is not within [min={dim_min}, max={dim_max}]"
+        )
+    if size[dim] % granularity != 0:
+        raise ValueError(
+            f"dynamic={{{dim}: ...}}: current size {size[dim]} at dim {dim} "
+            f"is not a multiple of granularity={granularity}"
+        )
+
+    return _DynamicSpec(dim=dim, min=dim_min, max=dim_max, granularity=granularity)
+
+
+def _require_cpu_to_spyre(self, args, kwargs) -> None:
+    """Raise unless this call is an eager CPU -> "spyre" transfer.
+
+    dynamic= only makes sense for the initial host-to-device copy.
+    """
+    import torch
+
+    device = kwargs.get("device", None)
+    if device is None and len(args) > 0 and isinstance(args[0], (str, torch.device)):
+        device = args[0]
+    message = (
+        'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
+        f"{_DYNAMIC_USAGE_HINT}"
+    )
+    if device is None or torch.device(device).type != DEVICE_NAME:
+        raise ValueError(message)
+    if self.device.type != "cpu":
+        raise ValueError(message)
+
+
+def _transfer_reserved(src, spec: _DynamicSpec) -> "torch.Tensor":
+    """Allocate at the ceiling, copy the real data in, mark the dim dynamic."""
+    import torch
+
+    # This path calls spyre_empty_reserved directly via pybind11, bypassing
+    # the ATen dispatcher path that ordinarily self-inits the runtime (via
+    # the H2D stream pool inside spyre_copy_from -> getCurrentStream). On a
+    # fresh process this can be the very first device op, so the runtime
+    # must be brought up explicitly here first -- same idiom as
+    # manual_seed/CCL-backend/profiler init elsewhere in this package.
+    if not torch.spyre.is_initialized():
+        torch.spyre._impl._lazy_init()
+
+    # Local import, same lazy-import convention as the rest of this file
+    # (see _UNSET above): torch_spyre._C is a native extension module and
+    # this file must stay importable before it's guaranteed ready.
+    from torch_spyre._C import copy_tensor, spyre_empty_reserved
+
+    dst = spyre_empty_reserved(
+        src.size(),
+        src.stride(),
+        src.dtype,
+        spec.dim,
+        spec.min,
+        spec.max,
+        spec.granularity,
+    )
+    copy_tensor(src, dst, non_blocking=False)
+
+    # mark_dynamic must be called eager, pre-compile, so Dynamo treats
+    # `dim` as symbolic from the very first trace.
+    #
+    # Deliberately bare: no min=/max= here. Passing them installs a
+    # StrictMinMaxConstraint, which promises every value in that range is
+    # valid. The granularity check the compiler adds later (size %
+    # granularity == 0) then looks like it's violating that promise for a
+    # non-multiple size, raising ConstraintViolationError instead of a
+    # normal guard miss. The range is still declared -- just via
+    # torch._check inside the traced function, not here.
+    torch._dynamo.mark_dynamic(dst, spec.dim)
+    return dst
 
 
 def _add_ea(src_tensor, res_tensor) -> None:
@@ -137,7 +325,10 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
-    def spyre_to(self, *args, device_layout=None, **kwargs):
+    def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
+        if dynamic is not None:
+            _require_cpu_to_spyre(self, args, kwargs)
+            return _transfer_reserved(self, _parse_dynamic_spec(dynamic, self.size()))
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype
