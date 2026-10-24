@@ -406,6 +406,11 @@ provenance_capture_raw.json
 tools/cost_model/sweep_records.json
 tools/cost_model/sweep_records.json.part
 
+# Frontend timing records: measurements, and the default sweep destination. Records are
+# never replaced (the pid is in each filename), so a committed one would be summarized
+# together with the next sweep's.
+tools/frontend_timing/records/
+
 # OpSpec lab outputs
 captured/
 op_spec_out/
