@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from sympy import Expr, Integer, Symbol
+from sympy import Expr, Integer, Mod, Symbol
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -2519,10 +2519,25 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # Every non-unit dimension must already have a final assignment.
     mapping_dims = tuple(sdsc_iteration_space)
     if is_relayout:
+        operation_cores = num_cores
         num_cores = max(
             num_cores,
             *(arg.work_division.num_cores or 1 for arg in args if arg.work_division),
         )
+        if num_cores != operation_cores:
+            # A contraction must schedule every source core. Repeat the
+            # operation's destination frame within its original domain; the
+            # per-tensor maps below keep the exact source and destination
+            # domains. Example: with 16 output row slices, source core 16 must
+            # not become row 16.
+            # Explicit core domains:
+            # https://github.com/torch-spyre/torch-spyre/issues/5716
+            core_id_to_work_slice = {
+                dim: owner.xreplace(
+                    {Symbol("core_id"): Mod(Symbol("core_id"), operation_cores)}
+                )
+                for dim, owner in core_id_to_work_slice.items()
+            }
     for dim in mapping_dims:
         if dim not in core_id_to_work_slice:
             if int(dim_splits[dim]) != 1:
