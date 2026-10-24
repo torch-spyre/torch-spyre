@@ -37,7 +37,7 @@ from ..pass_utils import (
     device_coordinates,
     _fixed_read_layout,
     host_coordinates,
-    indirect_info_from_op,
+    indirect_load_subs_from_op,
     op_out_coords,
 )
 from ..work_division import MAX_SPAN_BYTES
@@ -2100,7 +2100,7 @@ def _has_indirect_reads(op: ComputedBuffer) -> bool:
     skipped here.
     """
     try:
-        _, _, indirect_sizes = indirect_info_from_op(op)
+        _, indirect_sizes = indirect_load_subs_from_op(op)
     except (AttributeError, RuntimeError, TypeError, Unsupported):
         return False
     return indirect_sizes is not None
