@@ -54,7 +54,7 @@ def test_ai_key_is_in_use_with_a_consumer():
 def test_unassigned_owner_stays_empty():
     _, own = reg.rows(NOW)
     by_id = {r["credential_id"]: r for r in own}
-    assert by_id["prometheus-alerts-reader-token"]["owner"] == ""
+    assert by_id["analyst-ask-spyre-mcp-token"]["owner"] == ""
     assert by_id["analyst-jenkins-read-token"]["owner_email"] == ""
 
 
@@ -106,3 +106,24 @@ def test_cli_writes_jsonl(tmp_path):
     assert reg.main(["--inventory-out", str(a), "--owners-out", str(b)]) == 0
     assert all(json.loads(x)["credential_id"] for x in a.read_text().splitlines())
     assert len(b.read_text().splitlines()) == len(reg.load())
+
+
+def test_analyst_credentials_are_owned_by_the_codeowners_and_planned_ones_marked():
+    by_id = {e["id"]: e for e in reg.load()}
+    for cid in (
+        "CURVEBENDER_SPYRE_CI_API_KEY",
+        "CURVEBENDER_SPYRE_CI_MANAGE_API_KEY",
+        "prometheus-alerts-reader-token",
+        "analyst-jenkins-read-token",
+        "analyst-github-app-installation-token",
+    ):
+        assert all(
+            n in by_id[cid]["owner"]
+            for n in ("ashokponkumar", "Anubhav-Jana97", "Harikrishnan-Balagopal")
+        )
+    assert by_id["analyst-github-app-installation-token"]["status"] == "planned"
+    assert by_id["CURVEBENDER_SPYRE_CI_MANAGE_API_KEY"]["status"] == "unused"
+    assert (
+        "litellm.cb.ete.res.ibm.com/v1/models"
+        in by_id["CURVEBENDER_SPYRE_CI_API_KEY"]["probe"]["call"]
+    )
