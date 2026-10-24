@@ -59,6 +59,20 @@ enable_lx_context_switching: bool = os.getenv(
     "yes",
 )
 
+# Move each collective's wait as late as its consumers allow, before
+# spyre_fuse_nodes bundles contiguous compute. Independent compute then sits
+# between the *_run call and wait_work in its own bundle, instead of being
+# fused with the code that reads the collective's result. Off by default:
+# collectives and compute share one in-order flex stream, so the hoisted
+# kernel still runs after the collective and the split only adds a kernel
+# launch. Set SPYRE_SINK_COLLECTIVE_WAITS=1 once collectives have their own
+# stream.
+sink_collective_waits: bool = os.getenv("SPYRE_SINK_COLLECTIVE_WAITS", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
