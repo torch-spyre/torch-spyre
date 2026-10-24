@@ -310,6 +310,20 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    `change_graph_output` to promote a producer to LX and clone the value
    back to a graph output.
 
+### Matmul output staging before a collective
+
+After the solver commits LX buffers and relayout copies, the co-optimizing
+allocator can stage a fresh matmul output in a gap that is free for the whole
+graph. Its sole reader must be a bare all-reduce. The allocator inserts an HBM
+clone after the matmul and makes the collective read and mutate that clone.
+This changes the matmul's output placement; it does not remove the HBM copy
+required by the collective.
+
+Staging uses only space left after other allocations. It cannot displace a
+chosen relayout copy. Enabling another relayout can remove a free gap and change
+which outputs are staged. This is a performance dependency, not a reason to
+relax either path's safety checks.
+
 ### Declarative exclusion
 
 Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
