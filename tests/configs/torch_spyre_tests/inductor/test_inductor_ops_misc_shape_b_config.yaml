@@ -39,6 +39,10 @@ test_suite_config:
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
             - TestOps::test_reduction_with_to_dtype.*
+            - TestOps::test_ea_reduction_dl16tofp32.*
+            - TestOps::test_ea_reduction_fp32todl16.*
+            - TestOps::test_ea_reduction_dl16tofp32_nonstick.*
+            - TestOps::test_ea_reduction_fp32todl16_nonstick.*
             - TestOps::test_float32_to_int_(truncates|saturates).*
             - TestOps::test_float16_to_int_.*
             - TestOps::test_int_to_(float16|bool)_.*
