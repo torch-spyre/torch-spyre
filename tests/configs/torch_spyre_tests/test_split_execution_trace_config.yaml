@@ -1,0 +1,11 @@
+test_suite_config:
+  # dispatch-only: trunk's "Test Spyre Profiler" job is currently failing and
+  # AIUPTI device events are not available in the standard CI image.
+  # A maintainer with Actions write access dispatches this manually after
+  # verifying the profiler job is green (see PR #4419 / issue #2889).
+  # Switch to [regression, integration, trunk] once trunk's profiler job is
+  # consistently passing (follow-up: fix "Test Spyre Profiler" trunk failure).
+  labels: [split_execution_trace]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_split_execution_trace.py
+      unlisted_test_mode: mandatory_success
