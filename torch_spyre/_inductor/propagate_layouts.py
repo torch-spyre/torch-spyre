@@ -14,7 +14,7 @@
 
 
 from collections import Counter
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 import logging
 import math
@@ -23,12 +23,16 @@ import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
+    Buffer,
     ComputedBuffer,
+    Conditional,
     DeviceCopy,
     ExternKernel,
     FallbackKernel,
     FixedLayout,
     InputBuffer,
+    InvokeSubgraph,
+    IRNode,
     Layout,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
@@ -39,6 +43,7 @@ from torch._inductor.ir import (
     Reduction,
     StorageBox,
     TensorBox,
+    WhileLoop,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -2861,6 +2866,83 @@ def _eager_view_input_layout(
     )
 
 
+def _hop_operands(graph: GraphLowering) -> Sequence[IRNode]:
+    """The parent HOP's operands that bind to `graph`'s inputs, in order."""
+    for op in graph.parent.operations:
+        if not isinstance(op, (Conditional, WhileLoop, InvokeSubgraph)):
+            continue
+        if not any(sg.graph is graph for sg in op.get_subgraphs()):
+            continue
+        if isinstance(op, WhileLoop):
+            return [*op.carried_inputs, *op.additional_inputs]
+        if isinstance(op, InvokeSubgraph):
+            # InvokeSubgraph passes its operands to ExternKernel as `inputs`
+            # and leaves its own `operands` attribute unset.
+            return op.inputs
+        return op.operands
+    raise Unsupported(
+        f"subgraph {graph.name}: no Conditional, WhileLoop or InvokeSubgraph "
+        "in the parent graph invokes it"
+    )
+
+
+def _unwrap_boxes(node: IRNode) -> IRNode:
+    while isinstance(node, (TensorBox, StorageBox)):
+        node = node.data
+    return node
+
+
+def _assign_subgraph_input_layouts(graph: GraphLowering) -> None:
+    """Give each device input of a subgraph its operand's final device layout.
+
+    The parent graph has finished layout propagation and finalize_layouts when a
+    subgraph's run starts, so each operand's layout is final. The HOP may hold a
+    buffer object a parent pass has since replaced, though, so the operand is
+    looked up by name in the parent rather than read from the HOP.
+
+    A view operand (a transpose or a slice) takes its base buffer's device
+    layout: a device layout describes the storage, and the subgraph input's host
+    layout carries the view's sizes, strides and offset into it, as a view graph
+    input does at the top level.
+    """
+    operands = _hop_operands(graph)
+    if len(operands) != len(graph.graph_input_names):
+        raise Unsupported(
+            f"subgraph {graph.name}: {len(graph.graph_input_names)} inputs but "
+            f"{len(operands)} operands"
+        )
+    for name, operand in zip(graph.graph_input_names, operands):
+        tb = graph.graph_inputs[name]
+        if not isinstance(tb, TensorBox):
+            continue
+        device = tb.get_device()
+        if device is None or device.type != DEVICE_NAME:
+            continue
+        operand = _unwrap_boxes(operand)
+        if isinstance(operand, ReinterpretView):
+            if tb.get_layout() != operand.layout:
+                raise Unsupported(
+                    f"subgraph {graph.name} input {name}: host layout "
+                    f"{tb.get_layout()} differs from the view operand's "
+                    f"{operand.layout}"
+                )
+            operand = _unwrap_boxes(operand.data)
+        if not isinstance(operand, Buffer):
+            raise Unsupported(
+                f"subgraph {graph.name} input {name}: operand "
+                f"{type(operand).__name__} is neither a buffer nor a view of one"
+            )
+        current = graph.parent.try_get_buffer(operand.get_name())
+        layout = current.get_layout() if current is not None else None
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(
+                f"subgraph {graph.name} input {name}: parent buffer "
+                f"{operand.get_name()} has no final device layout "
+                f"({type(layout).__name__})"
+            )
+        tb.layouts = [layout.device_layout]
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
@@ -2868,79 +2950,7 @@ def propagate_spyre_tensor_layouts(
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
     if len(graph.graph_input_names) > 0:
         if getattr(graph, "parent", None) is not None:
-            # SubgraphLowering: resolve input layouts from parent operands rather than V.get_real_inputs()
-            parent_operands = None
-            for op in graph.parent.operations:
-                if hasattr(op, "get_subgraphs"):
-                    subgraphs = op.get_subgraphs()
-                    if any(getattr(sg, "graph", None) is graph for sg in subgraphs):
-                        if getattr(op, "operands", None) is not None:
-                            parent_operands = op.operands
-                        elif hasattr(op, "inputs"):
-                            parent_operands = op.inputs
-                        elif hasattr(op, "carried_inputs") and hasattr(
-                            op, "additional_inputs"
-                        ):
-                            parent_operands = [
-                                *op.carried_inputs,
-                                *op.additional_inputs,
-                            ]
-                        break
-            if parent_operands is not None:
-                for name, operand in zip(graph.graph_input_names, parent_operands):
-                    tb = graph.graph_inputs[name]
-                    stl = None
-                    if hasattr(operand, "layouts") and operand.layouts:
-                        stl = operand.layouts[0]
-                    elif hasattr(operand, "get_layout"):
-                        lay = operand.get_layout()
-                        if hasattr(lay, "device_layout"):
-                            stl = lay.device_layout
-                    if (
-                        stl is None
-                        and hasattr(operand, "data")
-                        and hasattr(operand.data, "data")
-                    ):
-                        inner = operand.data.data
-                        if hasattr(inner, "layout") and hasattr(
-                            inner.layout, "device_layout"
-                        ):
-                            stl = inner.layout.device_layout
-                    if stl is None and hasattr(operand, "get_name"):
-                        # A parent pass may replace a buffer after the HOP
-                        # captured it; resolve by name to the current one.
-                        cur = next(
-                            (
-                                o
-                                for o in graph.parent.operations
-                                if o.get_name() == operand.get_name()
-                            ),
-                            None,
-                        )
-                        if cur is not None and hasattr(
-                            getattr(cur, "layout", None), "device_layout"
-                        ):
-                            stl = cur.layout.device_layout
-                    if stl is None:
-                        ptl = tb.data.data.layout
-                        stl = SpyreTensorLayout(
-                            [concretize_expr(s) for s in ptl.size],
-                            [concretize_expr(s) for s in ptl.stride],
-                            ptl.dtype,
-                            list(range(len(ptl.size))),
-                        )
-                    tb.layouts = [stl]
-            else:
-                for name in graph.graph_input_names:
-                    tb = graph.graph_inputs[name]
-                    ptl = tb.data.data.layout
-                    stl = SpyreTensorLayout(
-                        [concretize_expr(s) for s in ptl.size],
-                        [concretize_expr(s) for s in ptl.stride],
-                        ptl.dtype,
-                        list(range(len(ptl.size))),
-                    )
-                    tb.layouts = [stl]
+            _assign_subgraph_input_layouts(graph)
         else:
             for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
                 if isinstance(real_input, torch.Tensor):
