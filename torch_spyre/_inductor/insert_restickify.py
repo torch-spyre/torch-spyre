@@ -29,7 +29,12 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import (
+    finite_upper_or_none,
+    invalidate_op_read_writes,
+    patch_env,
+    undeclared_maximum_message,
+)
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -287,6 +292,109 @@ def _create_restickify_node(
     return arg_name, restick_buff
 
 
+def _pin_fixed_copy_extent_to_declared_max(restick_buff: ComputedBuffer) -> None:
+    """Size a loop-invariant whole-operand restickify at the declared maximum.
+
+    A restickify that makes a FIXED full copy inside a loop (its source is not a
+    tiled stage, so neither its read nor its write advances per trip) copies the
+    whole operand on every trip. When that operand has a symbolic extent, e.g. a
+    gathered page pool reserved with ``.to("spyre", dynamic=...)``, the copy
+    would carry the symbol into the loop body, where every extent must be
+    static: the body is one compiled tile, and the symbol may live only in a
+    loop trip count.
+
+    So the symbolic extent is replaced by its declared maximum. That is valid at
+    every runtime size because the source buffer is reserved at that maximum:
+    the copy reads rows past the logical extent, which exist in the reservation,
+    and its consumer (a gather) only ever indexes rows below the real size.
+
+    Mutated in place because ``restick_buff`` was created by this pass a moment
+    ago and nothing else holds a reference to it yet. Changing ``ranges``
+    changes the iteration space itself, so every cache derived from it is
+    dropped, and the list below is complete, not just sufficient. The derived
+    state lives in three places:
+
+    - the ``@cache_on_self`` methods of the two mutated objects. On the
+      ``Pointwise`` data those are ``get_free_symbol_uses``, ``inner_fn_str``
+      and ``inner_fn_opcount`` (all from ``Loops``); on the ``ComputedBuffer``
+      they are ``get_free_symbol_uses`` and ``get_default_sizes_body``. That is
+      every cached method either class has, all five are cleared, and
+      ``TestPinFixedCopyExtent.test_clears_every_cached_method`` in
+      ``tests/inductor/test_symbolic_gather.py`` derives the set from the IR
+      classes, so a cached method added upstream fails it instead of going
+      stale here;
+    - the memoized read/writes (``invalidate_op_read_writes``);
+    - the layout, which is rebuilt rather than mutated and so carries no cache.
+
+    This is the same list ``coarse_tile`` clears after its own ``ranges``
+    rewrite (``_divide_ranges``), the other place that rewrites a ``Loops``'
+    ranges in place. A stale entry would surface as a wrong extent in the
+    emitted copy rather than as an error.
+
+    Raises:
+        Unsupported: an extent is symbolic with no declared finite maximum.
+    """
+    # Deferred import: coarse_tile and this module avoid importing each other
+    # at load time (see coarse_tile._NameSwapHandler).
+    from .wsr.coarse_tile import (
+        _COMPUTED_BUF_FREE_SYMS_KEY,
+        _COMPUTED_BUF_SIZES_KEY,
+        _LOOPS_FREE_SYMS_KEY,
+        _LOOPS_INNER_FN_OPCOUNT_KEY,
+        _LOOPS_INNER_FN_STR_KEY,
+        _clear_cache,
+    )
+
+    ranges = list(restick_buff.data.ranges)
+    syms = set()
+    for r in ranges:
+        syms |= set(getattr(r, "free_symbols", ()) or ())
+    if not syms:
+        return
+    subs: dict = {}
+    for sym in syms:
+        upper = finite_upper_or_none(sym)
+        if upper is None:
+            raise Unsupported(
+                undeclared_maximum_message(
+                    f"restickify {restick_buff.get_name()}, a fixed copy inside a "
+                    f"loop with extent {ranges},",
+                    sym,
+                )
+            )
+        subs[sym] = sympy.Integer(upper)
+
+    def pinned(exprs):
+        return [sympy.sympify(e).xreplace(subs) for e in exprs]
+
+    object.__setattr__(restick_buff.data, "ranges", pinned(ranges))
+    _clear_cache(restick_buff.data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(restick_buff.data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(restick_buff, _COMPUTED_BUF_FREE_SYMS_KEY)
+    invalidate_op_read_writes(restick_buff)
+    layout = restick_buff.layout
+    if isinstance(layout, FixedTiledLayout):
+        pinned_layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            pinned(layout.size),
+            pinned(layout.stride),
+            layout.device_layout,
+            offset=layout.offset,
+        )
+        pinned_layout.allocation = layout.allocation
+        restick_buff.layout = pinned_layout
+    logger.info(
+        "[symbolic-gather] fixed in-loop copy %s sized at the declared maximum: "
+        "%s -> %s",
+        restick_buff.get_name(),
+        ranges,
+        list(restick_buff.data.ranges),
+    )
+
+
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
     resticks_needed: list[RestickifyArgInfo],
@@ -451,6 +559,10 @@ def insert_restickify_on_node_inputs(
             restick_li.squeezed_advance_per_read = []
             restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
             restick_buff.loop_info = restick_li
+            # Only this branch needs the pin: a tiled-stage copy above advances
+            # per trip and takes its extent from the tile, while this fixed copy
+            # takes the whole operand's, which may be symbolic (a reserved pool).
+            _pin_fixed_copy_extent_to_declared_max(restick_buff)
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify
