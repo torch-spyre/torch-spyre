@@ -15,6 +15,7 @@
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+import collections
 import json
 import logging
 import logging.handlers
@@ -71,6 +72,7 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     TensorArg,
     TensorWorkDivision,
+    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.pass_utils import PerCoreView
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
@@ -110,6 +112,83 @@ def _emitted_kernels():
 
 
 _capture_backend_output_dirs = capture_backend_output_dirs
+
+
+@contextmanager
+def _captured_completed_reduction_routes():
+    """Record every real call to derive_completed_reduction_routes
+    (lx_relayout.py), without changing its behavior.
+
+    Intercepts by rebinding the module-global name; lx_relayout.py's only
+    call site (derive_completed_reduction_routes, ~L1092) reaches this
+    through that same name. A caller that imports the function directly
+    would bypass the patch silently -- route_calls would stay empty and
+    _matching_completed_reduction_routes would raise, with no indication
+    of why."""
+
+    calls = []
+    real = lx_relayout_module.derive_completed_reduction_routes
+
+    def wrapped(source, destination, reduction_split):
+        result = real(source, destination, reduction_split)
+        calls.append((source, destination, reduction_split, result))
+        return result
+
+    with mock_patch.object(
+        lx_relayout_module, "derive_completed_reduction_routes", wrapped
+    ):
+        yield calls
+
+
+def _matching_completed_reduction_routes(route_calls, completed_producer_cores):
+    """Pick the captured call(s) whose producer-core set matches the
+    materialized plan, as a {producer_core: (reader_core, ...)} dict.
+
+    collect_lx_relayout_plans can reach derive_completed_reduction_routes
+    more than once per compile; if more than one captured call matches,
+    they must agree rather than silently picking the first."""
+
+    matches = [
+        dict(result)
+        for _, _, _, result in route_calls
+        if tuple(core for core, _readers in result) == completed_producer_cores
+    ]
+    if not matches:
+        raise AssertionError(
+            "no captured derive_completed_reduction_routes call's producer-core "
+            f"set matches {completed_producer_cores}"
+        )
+    assert all(match == matches[0] for match in matches[1:]), (
+        "captured derive_completed_reduction_routes calls disagree for "
+        f"producer-core set {completed_producer_cores}: {matches}"
+    )
+    return matches[0]
+
+
+def _all_op_specs(kernels):
+    """Every OpSpec across every captured kernel, flattened."""
+    return [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
+
+
+def _assert_lx_only_relayout_kernels(kernels):
+    """Exactly one LX-to-LX relayout copy was emitted -- read from the real
+    OpSpecs instead of the removed dxp_standalone debug JSON payload
+    (upstream #4984 / issue #4886).
+
+    Selects via is_lx_relayout_identity (op_spec.py), the same
+    planner-certified predicate superdsc uses to choose opfunc="shuffle".
+    A match already implies both args are LX-only (TensorArg.allocation's
+    hbm/lx/hbm_pool keys are mutually exclusive), so no separate "no HBM
+    key" check is needed."""
+
+    copies = [
+        spec
+        for spec in _all_op_specs(kernels)
+        if spec.op == IDENTITY_OP
+        and is_lx_relayout_identity(spec.op, spec.args, spec.op_info)
+    ]
+    assert len(copies) == 1, f"expected one LX relayout, found {len(copies)}"
+    return copies[0]
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):
@@ -1565,10 +1644,11 @@ def test_grouped_lx_relayout_device(broadcast):
         _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    actual, code = run_and_get_code(
-        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
-        *device_args,
-    )
+    with _emitted_kernels() as kernels:
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            *device_args,
+        )
     torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=2e-1)
     relayouts = [
         block
@@ -1580,6 +1660,9 @@ def test_grouped_lx_relayout_device(broadcast):
     assert len(relayouts) == 1
     domains = re.findall(r"num_cores=(\d+)", relayouts[0])
     assert domains == [str(source_cores), "32"]
+    # The text parse above checks the lowered shape; this independently
+    # verifies the real planner certification (is_lx_relayout_identity).
+    _assert_lx_only_relayout_kernels(kernels)
 
 
 @config.patch(
@@ -1628,6 +1711,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     torch._inductor.codecache.FxGraphCache.clear()
     with (
         config.patch(lx_planner_relayout=enabled),
+        _emitted_kernels() as kernels,
         _capture_backend_output_dirs() as directories,
     ):
         actual, code = run_and_get_code(
@@ -1647,6 +1731,9 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     assert len(copies) == int(enabled)
     if enabled:
         assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
+        # The text parse above checks the lowered shape; this independently
+        # verifies the real planner certification (is_lx_relayout_identity).
+        _assert_lx_only_relayout_kernels(kernels)
     if reader == "split_matmul":
         matmuls = [
             root
@@ -1717,6 +1804,7 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
+        _captured_completed_reduction_routes() as route_calls,
     ):
         actual, _ = run_and_get_code(
             torch.compile(
@@ -1747,6 +1835,18 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         assert copy.args[0].allocation == down_arg.allocation
         assert set(copy.args[-1].allocation) == {"lx"}
         assert copy.completed_producer_cores == tuple(range(1, 32, 2))
+        # native_routes is derive_completed_reduction_routes's own return
+        # value, computed before lowering; only its keys (producer cores)
+        # reach the OpSpec, not the reader lists. This checks the planner's
+        # output on this fixture, not an end-to-end routing check -- unlike
+        # the removed prodConsList, which DeepTools produced downstream
+        # from the emitted SDSC.
+        native_routes = _matching_completed_reduction_routes(
+            route_calls, copy.completed_producer_cores
+        )
+        assert collections.Counter(
+            core for readers in native_routes.values() for core in readers
+        ) == {core: 4 for core in range(32)}
         assert any(
             arg.is_input and arg.allocation == copy.args[-1].allocation
             for spec in specs
@@ -2128,7 +2228,9 @@ def test_completed_reduction_relayout_device(
     torch._inductor.codecache.FxGraphCache.clear()
     with (
         config.patch(lx_planner_relayout=enabled),
+        _emitted_kernels() as kernels,
         _capture_backend_output_dirs() as directories,
+        _captured_completed_reduction_routes() as route_calls,
     ):
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
@@ -2149,6 +2251,20 @@ def test_completed_reduction_relayout_device(
     ]
     assert len(copies) == int(enabled)
     if enabled:
+        # Restores the LX-only guarantee this test asserted before #4984,
+        # now via the real planner certification (is_lx_relayout_identity)
+        # rather than the removed debug JSON payload.
+        copy = _assert_lx_only_relayout_kernels(kernels)
+        routes = _matching_completed_reduction_routes(
+            route_calls, copy.completed_producer_cores
+        )
+        # copy.completed_producer_cores is the real emitted value, so this
+        # compares it against the formula instead of re-checking the match
+        # criterion that selected `routes` in the first place.
+        assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
+        assert collections.Counter(
+            c for readers in routes.values() for c in readers
+        ) == {core: out_split // consumer_out for core in range(32)}
         assert "completed_producer_cores=" in "\n".join(code)
 
 
