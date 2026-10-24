@@ -785,7 +785,13 @@ def _insert_mutation_relayout_copy(
     original_layout = mutation_op.layout
     assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
     slice_layout = original_layout.target.get_layout()
-    if isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0:
+    # buf_tmp carries the shape the write index uses, so retarget the mutation
+    # whenever the view's shape or offset differs from buf_tmp's.
+    slice_size = [concretize_expr(x) for x in slice_layout.size]
+    tmp_size = [concretize_expr(x) for x in buf_tmp.get_layout().size]
+    if (
+        isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0
+    ) or slice_size != tmp_size:
         mutation_op.layout = MutationLayoutSHOULDREMOVE(
             ReinterpretView(data=StorageBox(buf_tmp), layout=slice_layout)
         )
