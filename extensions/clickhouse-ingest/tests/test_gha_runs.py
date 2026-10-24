@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from spyre_clickhouse_ingest import gha_runs
+from spyre_clickhouse_ingest import gha_runs, paging
 from spyre_clickhouse_ingest.schema import PipelineRuns
 
 REPO = "torch-spyre/torch-spyre"
@@ -653,3 +653,139 @@ def test_a_poll_that_finishes_every_window_exits_0(clock, monkeypatch, capsys):
     runs = {repo: _recent(n, 1) for n, repo in enumerate(REPOS, 1)}
     assert _cli(monkeypatch, clock, runs, REPOS) == 0
     assert set(_attempts_by_repo(capsys.readouterr().out).values()) == {1}
+
+
+def _jobs_api(monkeypatch, fail_over, total=203):
+    """urlopen that answers 502 for a jobs page larger than fail_over, like GitHub for a many-job run."""
+    import io
+    import urllib.error
+
+    seen = []
+
+    class Resp(io.BytesIO):
+        headers: dict = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(req.full_url).query))
+        size, page = int(q["per_page"]), int(q["page"])
+        seen.append((size, page))
+        if size > fail_over:
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
+        lo = (page - 1) * size
+        jobs = [{"id": i} for i in range(lo, min(lo + size, total))]
+        return Resp(json.dumps({"total_count": total, "jobs": jobs}).encode())
+
+    monkeypatch.setattr(gha_runs.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gha_runs.time, "sleep", lambda s: None)
+    return seen
+
+
+def test_jobs_steps_the_page_size_down_when_github_answers_502(monkeypatch):
+    seen = _jobs_api(monkeypatch, fail_over=50)
+    jobs = gha_runs.GitHub("t").jobs("o/r", 1, 2)
+    assert [j["id"] for j in jobs] == list(range(203))
+    assert {s for s, _ in seen} == {100, 50}
+    # 100 is tried JOB_TRIES times, then 50 serves every page.
+    assert seen[: paging.STEP_ATTEMPTS] == [(100, 1)] * paging.STEP_ATTEMPTS
+    assert [p for s, p in seen if s == 50] == [1, 2, 3, 4, 5]
+
+
+def test_a_smaller_size_restarts_the_listing_from_page_one(monkeypatch):
+    # Pages from one size must not be stitched to pages of another: a job would repeat or go missing.
+    seen = _jobs_api(monkeypatch, fail_over=25)
+    jobs = gha_runs.GitHub("t").jobs("o/r", 1, 2)
+    assert len({j["id"] for j in jobs}) == len(jobs) == 203
+    first_25 = next(i for i, (s, _) in enumerate(seen) if s == 25)
+    assert seen[first_25] == (25, 1)
+
+
+def test_jobs_is_one_call_when_the_first_size_works(monkeypatch):
+    seen = _jobs_api(monkeypatch, fail_over=100, total=40)
+    assert len(gha_runs.GitHub("t").jobs("o/r", 1, 1)) == 40
+    assert seen == [(100, 1)]
+
+
+def test_the_last_size_gets_the_full_retries_then_the_run_is_unavailable(monkeypatch):
+    seen = _jobs_api(monkeypatch, fail_over=0)
+    with pytest.raises(gha_runs.Unavailable):
+        gha_runs.GitHub("t").jobs("o/r", 1, 2)
+    sizes = [s for s, _ in seen]
+    assert sizes.count(paging.JOB_PAGE_SIZES[-1]) == gha_runs.RETRIES
+    for size in paging.JOB_PAGE_SIZES[:-1]:
+        assert sizes.count(size) == paging.STEP_ATTEMPTS
+
+
+def test_a_client_error_is_not_retried_at_any_size(monkeypatch):
+    import urllib.error
+
+    calls = []
+
+    def urlopen(req, timeout):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(gha_runs.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gha_runs.time, "sleep", lambda s: None)
+    with pytest.raises(urllib.error.HTTPError):
+        gha_runs.GitHub("t").jobs("o/r", 1, 1)
+    assert len(calls) == 1
+
+
+def test_poll_skips_a_run_github_will_not_serve_and_stores_the_rest():
+    class Stuck(FakeGitHub):
+        skipped: list = []
+
+        def __init__(self, runs):
+            super().__init__(runs)
+            self.skipped = []
+
+        def jobs(self, repo, run_id, attempt):
+            if run_id == 2:
+                raise gha_runs.Unavailable("[error] GitHub API still failing")
+            return super().jobs(repo, run_id, attempt)
+
+    gh = Stuck(
+        [
+            _run(id=1, run_attempt=1),
+            _run(id=2, run_attempt=2),
+            _run(id=3, run_attempt=1),
+        ]
+    )
+    client = FakeClient()
+    start, end = _window()
+    attempts, rows, reason = gha_runs.poll(gh, client, "db", REPO, start, end)
+    stored_keys = {r["run_key"] for r in client.inserted}
+    assert reason == ""
+    assert any(k.endswith("/1#1") for k in stored_keys) and any(
+        k.endswith("/3#1") for k in stored_keys
+    )
+    assert not any("/2#" in k for k in stored_keys)
+    # Run 2 has two attempts; each is skipped on its own.
+    assert gh.skipped == [f"{REPO} run 2 attempt 1", f"{REPO} run 2 attempt 2"]
+
+
+def test_a_skipped_run_is_fetched_again_on_the_next_poll():
+    class Flaky(FakeGitHub):
+        def __init__(self, runs):
+            super().__init__(runs)
+            self.skipped, self.fail = [], True
+
+        def jobs(self, repo, run_id, attempt):
+            if self.fail:
+                raise gha_runs.Unavailable("x")
+            return super().jobs(repo, run_id, attempt)
+
+    gh = Flaky([_run(id=7, run_attempt=1)])
+    client = FakeClient()
+    start, end = _window()
+    gha_runs.poll(gh, client, "db", REPO, start, end)
+    assert client.inserted == []
+    gh.fail = False
+    gha_runs.poll(gh, client, "db", REPO, start, end)
+    assert any("/7#1" in r["run_key"] for r in client.inserted)
