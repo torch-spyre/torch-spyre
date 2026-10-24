@@ -818,6 +818,556 @@ class DispatchTargets(Table):
     required = ("published_at",)
 
 
+CREDENTIAL_STATE_VALUES = frozenset({"bound", "unbound", "gone"})
+PROBE_STATUS_VALUES = frozenset({"ok", "failing", "unknown"})
+PROBE_SITE_VALUES = frozenset({"jenkins", "gha", "dashboard", "cluster"})
+
+
+class CredentialInventory(Table):
+    """What discovery found per credential; the latest observed_at wins."""
+
+    name = "credential_inventory"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "kind",
+        "description",
+        "consumers",
+        "state",
+        "source_created_at",
+        "source_updated_at",
+        "last_bound_at",
+        "observed_at",
+        "job_run",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "observed_at")
+    enums = (("state", CREDENTIAL_STATE_VALUES),)
+
+
+class CredentialProbes(Table):
+    """One probe of one credential, written by the site that holds the secret."""
+
+    name = "credential_probes"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "probe_site",
+        "probe",
+        "status",
+        "error_class",
+        "http_status",
+        "latency_ms",
+        "expires_at",
+        "fingerprint",
+        "detail",
+        "job_run",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "probe")
+    enums = (("status", PROBE_STATUS_VALUES), ("probe_site", PROBE_SITE_VALUES))
+
+
+class CredentialOwners(Table):
+    """What a person supplies about a credential; append-only, the newest row per credential wins."""
+
+    name = "credential_owners"
+    columns = (
+        "system",
+        "scope",
+        "credential_id",
+        "owner",
+        "owner_email",
+        "backup_owner",
+        "linked_identity",
+        "linked_email",
+        "issuer",
+        "rotation_days",
+        "last_rotated_at",
+        "runbook_url",
+        "notes",
+        "updated_at",
+        "updated_by",
+        "props",
+    )
+    required = ("system", "scope", "credential_id", "updated_at", "updated_by")
+
+
+INCIDENT_SEVERITY_VALUES = frozenset({"info", "warning", "critical"})
+INCIDENT_STATE_VALUES = frozenset(
+    {"open", "acknowledged", "mitigated", "resolved", "dismissed"}
+)
+INCIDENT_ACTOR_VALUES = frozenset({"system", "agent", "ask_spyre", "human"})
+INCIDENT_CAUSE_VALUES = frozenset(
+    {
+        "credentials",
+        "resources",
+        "network",
+        "hardware",
+        "upstream",
+        "pipeline",
+        "data",
+        "unknown",
+    }
+)
+
+
+class IncidentEvents(Table):
+    """One normalized signal from any alert source; the router attaches it to an incident."""
+
+    name = "incident_events"
+    columns = (
+        "ts",
+        "source",
+        "subject",
+        "severity",
+        "signature",
+        "cause_class",
+        "summary",
+        "evidence_url",
+        "dedup_key",
+        "incident_id",
+        "job_run",
+        "props",
+    )
+    required = ("source", "subject", "severity")
+    enums = (
+        ("severity", INCIDENT_SEVERITY_VALUES),
+        ("cause_class", INCIDENT_CAUSE_VALUES),
+    )
+
+
+class IncidentLog(Table):
+    """Append-only incident timeline; the newest row per incident is its current state."""
+
+    name = "incident_log"
+    columns = (
+        "incident_id",
+        "updated_at",
+        "updated_by",
+        "actor_kind",
+        "state",
+        "severity",
+        "title",
+        "cause_class",
+        "signature",
+        "owner",
+        "owner_email",
+        "action",
+        "note",
+        "thread_url",
+        "evidence_url",
+        "props",
+    )
+    required = (
+        "incident_id",
+        "updated_at",
+        "updated_by",
+        "actor_kind",
+        "state",
+        "severity",
+    )
+    enums = (
+        ("actor_kind", INCIDENT_ACTOR_VALUES),
+        ("state", INCIDENT_STATE_VALUES),
+        ("severity", INCIDENT_SEVERITY_VALUES),
+        ("cause_class", INCIDENT_CAUSE_VALUES),
+    )
+
+
+ASSIGNMENT_MODE_VALUES = frozenset({"shadow", "propose", "live"})
+SESSION_STATE_VALUES = frozenset({"open", "closed", "abandoned"})
+TURN_OUTCOME_VALUES = frozenset({"ok", "rejected_schema", "error", "timeout", "budget"})
+MEMORY_KIND_VALUES = frozenset({"case_summary", "lesson", "signature_candidate"})
+MEMORY_STATUS_VALUES = frozenset({"proposed", "confirmed", "rejected", "expired"})
+
+
+class AnalystAssignments(Table):
+    """Which model alias plays a role for which incidents; the newest effective row wins."""
+
+    name = "analyst_assignments"
+    columns = (
+        "role",
+        "scope_cause_class",
+        "scope_severity",
+        "scope_source",
+        "scope_repo",
+        "model_alias",
+        "mode",
+        "weight",
+        "effective_from",
+        "set_by",
+        "second_approver",
+        "reason",
+        "props",
+    )
+    required = ("role", "model_alias", "mode", "effective_from", "set_by")
+    enums = (("mode", ASSIGNMENT_MODE_VALUES),)
+
+
+class AnalystSessions(Table):
+    """One investigation of one incident by one role; the newest row per session is its state."""
+
+    name = "analyst_sessions"
+    columns = (
+        "session_id",
+        "updated_at",
+        "incident_id",
+        "role",
+        "state",
+        "parent_session_id",
+        "props",
+    )
+    required = ("session_id", "updated_at", "incident_id", "role")
+    enums = (("state", SESSION_STATE_VALUES),)
+
+
+class AnalystTurns(Table):
+    """One model call within a session."""
+
+    name = "analyst_turns"
+    columns = (
+        "session_id",
+        "step",
+        "ts",
+        "role",
+        "model_alias",
+        "served_model",
+        "prompt_version",
+        "input_ref",
+        "output",
+        "verdict",
+        "confidence",
+        "tokens_in",
+        "tokens_out",
+        "cost_usd",
+        "outcome",
+        "props",
+    )
+    required = ("session_id", "step", "ts", "role", "model_alias")
+    enums = (("outcome", TURN_OUTCOME_VALUES),)
+
+
+class AnalystMemory(Table):
+    """What the analyst has learned; append-only versions, the newest row per memory_id wins."""
+
+    name = "analyst_memory"
+    columns = (
+        "memory_id",
+        "updated_at",
+        "kind",
+        "subject",
+        "body",
+        "evidence_ids",
+        "confidence",
+        "status",
+        "proposed_by",
+        "confirmed_by",
+        "expires_at",
+        "props",
+    )
+    required = ("memory_id", "updated_at", "subject", "proposed_by")
+    enums = (("kind", MEMORY_KIND_VALUES), ("status", MEMORY_STATUS_VALUES))
+
+
+GRANT_EVENT_VALUES = frozenset({"created", "used", "denied", "revoked", "expired"})
+GRANT_RESULT_VALUES = frozenset({"ok", "denied", "error"})
+
+
+class DelegationGrants(Table):
+    """One consented grant; written once, ended by an event or by expires_at, never updated."""
+
+    name = "delegation_grants"
+    columns = (
+        "grant_id",
+        "grantor",
+        "grantee",
+        "tools",
+        "scope_json",
+        "expires_at",
+        "max_uses",
+        "condition",
+        "created_at",
+        "created_by",
+        "consent_text_hash",
+        "props",
+    )
+    required = (
+        "grant_id",
+        "grantor",
+        "grantee",
+        "expires_at",
+        "created_at",
+        "created_by",
+        "consent_text_hash",
+    )
+
+    @classmethod
+    def row(cls, values):
+        out = super().row(values)
+        if values["grantor"] == values["grantee"]:
+            raise SchemaError(f"{cls.name}: a grant cannot be to its own grantor")
+        if len(str(values["consent_text_hash"])) != 64:
+            raise SchemaError(
+                f"{cls.name}: consent_text_hash must be a sha256 hex digest"
+            )
+        if not values["tools"]:
+            raise SchemaError(f"{cls.name}: a grant needs at least one tool")
+        return out
+
+
+class DelegationGrantEvents(Table):
+    """Everything done under a grant: creation, each use and refusal, revocation. The audit trail."""
+
+    name = "delegation_grant_events"
+    columns = (
+        "grant_id",
+        "ts",
+        "event",
+        "actor",
+        "tool",
+        "args_hash",
+        "result",
+        "on_behalf_of",
+        "props",
+    )
+    required = ("grant_id", "event", "actor", "result")
+    enums = (("event", GRANT_EVENT_VALUES), ("result", GRANT_RESULT_VALUES))
+
+
+STATUS_STATE_VALUES = frozenset({"ok", "degraded", "failing", "unknown"})
+STATUS_UPLOAD_PATH_VALUES = frozenset({"primary", "buffered"})
+ANNOTATION_KIND_VALUES = frozenset({"human", "agent", "system"})
+FETCH_OUTCOME_VALUES = frozenset(
+    {"ok", "unreachable", "http_error", "bad_shape", "not_modified"}
+)
+FETCH_INDICATOR_VALUES = frozenset(
+    {"", "none", "minor", "major", "critical", "maintenance", "unknown"}
+)
+EXTERNAL_KIND_VALUES = frozenset({"incident", "maintenance", "degradation", "notice"})
+EXTERNAL_IMPACT_VALUES = frozenset(
+    {"none", "minor", "major", "critical", "maintenance", "unknown"}
+)
+EXTERNAL_STATUS_VALUES = frozenset(
+    {
+        "scheduled",
+        "in_progress",
+        "investigating",
+        "identified",
+        "monitoring",
+        "resolved",
+        "completed",
+        "cancelled",
+    }
+)
+REMINDER_THRESHOLD_VALUES = frozenset({"7d", "1d", "1h", "cancelled"})
+FEEDBACK_TARGET_VALUES = frozenset(
+    {"signature_match", "incident", "status_post", "component", "answer", "failure"}
+)
+FEEDBACK_SIGNAL_VALUES = frozenset(
+    {"up", "down", "affected", "not_affected", "miss", "chip"}
+)
+FEEDBACK_SOURCE_VALUES = frozenset({"explicit", "implicit", "reaction"})
+MAX_STATUS_DETAIL = 500
+MAX_ANNOTATION_TEXT = 2000
+MAX_EXTERNAL_TITLE = 200
+MAX_FEEDBACK_DETAIL = 500
+BUCKET_SECONDS = 300
+
+
+def status_sample_id(vantage: str, component: str, probe: str, ts) -> str:
+    """The idempotency key of a probe: the same probe in the same 5-minute bucket repeats it."""
+    epoch = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts)
+    return f"{vantage}|{component}|{probe}|{epoch - epoch % BUCKET_SECONDS}"
+
+
+class StatusSamples(Table):
+    """One probe of one component from one vantage; a retry or a late upload repeats sample_id."""
+
+    name = "status_samples"
+    columns = (
+        "sample_id",
+        "ts",
+        "vantage",
+        "component",
+        "probe",
+        "state",
+        "http_status",
+        "latency_ms",
+        "error_class",
+        "detail",
+        "ingested_at",
+        "upload_path",
+        "props",
+    )
+    required = ("sample_id", "ts", "vantage", "component", "probe")
+    enums = (
+        ("state", STATUS_STATE_VALUES),
+        ("upload_path", STATUS_UPLOAD_PATH_VALUES),
+    )
+
+    @classmethod
+    def row(cls, values):
+        out = super().row(values)
+        if len(str(values["detail"])) > MAX_STATUS_DETAIL:
+            raise SchemaError(f"{cls.name}: detail is over {MAX_STATUS_DETAIL} chars")
+        return out
+
+
+class StatusAnnotations(Table):
+    """A note layered over the computed state; an edit supersedes, and never changes the state."""
+
+    name = "status_annotations"
+    columns = (
+        "annotation_id",
+        "ts",
+        "component",
+        "kind",
+        "author",
+        "text",
+        "expires_at",
+        "supersedes",
+        "props",
+    )
+    required = ("annotation_id", "ts", "author")
+    enums = (("kind", ANNOTATION_KIND_VALUES),)
+
+    @classmethod
+    def row(cls, values):
+        out = super().row(values)
+        if len(str(values["text"])) > MAX_ANNOTATION_TEXT:
+            raise SchemaError(f"{cls.name}: text is over {MAX_ANNOTATION_TEXT} chars")
+        if values["supersedes"] == values["annotation_id"]:
+            raise SchemaError(f"{cls.name}: a note cannot supersede itself")
+        return out
+
+
+class ExternalFeedFetches(Table):
+    """One fetch of one status feed from one vantage; a failed fetch is a row too."""
+
+    name = "external_feed_fetches"
+    columns = (
+        "fetched_at",
+        "vantage",
+        "source",
+        "feed_url",
+        "outcome",
+        "failed_phase",
+        "http_status",
+        "latency_ms",
+        "bytes",
+        "body_hash",
+        "page_indicator",
+        "job_run",
+        "props",
+    )
+    required = ("vantage", "source", "feed_url")
+    enums = (
+        ("outcome", FETCH_OUTCOME_VALUES),
+        ("page_indicator", FETCH_INDICATOR_VALUES),
+    )
+
+
+class ExternalEvents(Table):
+    """One observation of one external event by one vantage; event_id is stable across both."""
+
+    name = "external_events"
+    columns = (
+        "observed_at",
+        "event_id",
+        "vantage",
+        "source",
+        "component",
+        "upstream_component",
+        "kind",
+        "impact",
+        "status",
+        "starts_at",
+        "ends_at",
+        "title",
+        "url",
+        "content_hash",
+        "upstream_updated_at",
+        "props",
+    )
+    required = ("event_id", "vantage", "source", "title")
+    enums = (
+        ("kind", EXTERNAL_KIND_VALUES),
+        ("impact", EXTERNAL_IMPACT_VALUES),
+        ("status", EXTERNAL_STATUS_VALUES),
+    )
+
+    @classmethod
+    def row(cls, values):
+        out = super().row(values)
+        if len(str(values["title"])) > MAX_EXTERNAL_TITLE:
+            raise SchemaError(f"{cls.name}: title is over {MAX_EXTERNAL_TITLE} chars")
+        start, end = values["starts_at"], values["ends_at"]
+        if start is not None and end is not None and end < start:
+            raise SchemaError(f"{cls.name}: ends_at is before starts_at")
+        return out
+
+
+class ExternalReminders(Table):
+    """A maintenance reminder that went out; written after the send, keyed so it is sent once."""
+
+    name = "external_reminders"
+    columns = (
+        "sent_at",
+        "reminder_key",
+        "event_id",
+        "threshold",
+        "window_starts_at",
+        "recipients",
+        "channel",
+        "message_ref",
+        "sent_by_vantage",
+        "props",
+    )
+    required = ("reminder_key", "event_id", "window_starts_at")
+    enums = (("threshold", REMINDER_THRESHOLD_VALUES),)
+
+
+class FeedbackSignals(Table):
+    """One person's (or one behaviour's) signal on one target; evidence, never a label by itself."""
+
+    name = "feedback_signals"
+    columns = (
+        "created_at",
+        "target_type",
+        "target_id",
+        "signal",
+        "detail",
+        "source",
+        "actor",
+        "weight_hint",
+        "signature_id",
+        "signature_version",
+        "props",
+    )
+    required = ("target_id", "actor")
+    enums = (
+        ("target_type", FEEDBACK_TARGET_VALUES),
+        ("signal", FEEDBACK_SIGNAL_VALUES),
+        ("source", FEEDBACK_SOURCE_VALUES),
+    )
+
+    @classmethod
+    def row(cls, values):
+        out = super().row(values)
+        if len(str(values["detail"])) > MAX_FEEDBACK_DETAIL:
+            raise SchemaError(f"{cls.name}: detail is over {MAX_FEEDBACK_DETAIL} chars")
+        if float(values["weight_hint"]) < 0:
+            raise SchemaError(f"{cls.name}: weight_hint is negative")
+        if values["target_type"] == "signature_match" and not values["signature_id"]:
+            raise SchemaError(
+                f"{cls.name}: a signature_match signal names its signature"
+            )
+        return out
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -836,6 +1386,23 @@ ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
+CREDENTIAL_INVENTORY = CredentialInventory
+CREDENTIAL_PROBES = CredentialProbes
+CREDENTIAL_OWNERS = CredentialOwners
+INCIDENT_EVENTS = IncidentEvents
+INCIDENT_LOG = IncidentLog
+ANALYST_ASSIGNMENTS = AnalystAssignments
+ANALYST_SESSIONS = AnalystSessions
+ANALYST_TURNS = AnalystTurns
+ANALYST_MEMORY = AnalystMemory
+DELEGATION_GRANTS = DelegationGrants
+DELEGATION_GRANT_EVENTS = DelegationGrantEvents
+STATUS_SAMPLES = StatusSamples
+STATUS_ANNOTATIONS = StatusAnnotations
+EXTERNAL_FEED_FETCHES = ExternalFeedFetches
+EXTERNAL_EVENTS = ExternalEvents
+EXTERNAL_REMINDERS = ExternalReminders
+FEEDBACK_SIGNALS = FeedbackSignals
 
 TABLES = {
     t.name: t
@@ -857,6 +1424,23 @@ TABLES = {
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,
+        CredentialInventory,
+        CredentialProbes,
+        CredentialOwners,
+        IncidentEvents,
+        IncidentLog,
+        AnalystAssignments,
+        AnalystSessions,
+        AnalystTurns,
+        AnalystMemory,
+        DelegationGrants,
+        DelegationGrantEvents,
+        StatusSamples,
+        StatusAnnotations,
+        ExternalFeedFetches,
+        ExternalEvents,
+        ExternalReminders,
+        FeedbackSignals,
     )
 }
 

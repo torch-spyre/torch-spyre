@@ -131,6 +131,59 @@ class Sandbox:
             "published_at >= now() - INTERVAL {days} DAY",
             "(published_at, target_type, target_prefix)",
         ),
+        ("credential_inventory", "1", "(system, scope, credential_id)"),
+        (
+            "credential_probes",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(credential_id, ts)",
+        ),
+        (
+            "credential_owners",
+            "1",
+            "(system, scope, credential_id, updated_at)",
+        ),
+        (
+            "incident_events",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(source, subject, ts)",
+        ),
+        ("incident_log", "1", "(incident_id, updated_at)"),
+        (
+            "analyst_assignments",
+            "1",
+            "(role, scope_cause_class, scope_severity, scope_source, scope_repo, effective_from)",
+        ),
+        ("analyst_sessions", "1", "(session_id, updated_at)"),
+        (
+            "analyst_turns",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(session_id, step, ts)",
+        ),
+        ("analyst_memory", "1", "(memory_id, updated_at)"),
+        ("delegation_grants", "1", "(grant_id, created_at)"),
+        (
+            "delegation_grant_events",
+            "ts >= now() - INTERVAL {days} DAY",
+            "(grant_id, ts)",
+        ),
+        ("status_samples", "ts >= now() - INTERVAL {days} DAY", "sample_id"),
+        ("status_annotations", "1", "(annotation_id, ts)"),
+        (
+            "external_feed_fetches",
+            "fetched_at >= now() - INTERVAL {days} DAY",
+            "(source, vantage, fetched_at)",
+        ),
+        (
+            "external_events",
+            "observed_at >= now() - INTERVAL {days} DAY",
+            "(event_id, vantage, observed_at)",
+        ),
+        ("external_reminders", "1", "(reminder_key, sent_at)"),
+        (
+            "feedback_signals",
+            "1",
+            "(target_type, target_id, actor, created_at)",
+        ),
     )
 
     @classmethod
