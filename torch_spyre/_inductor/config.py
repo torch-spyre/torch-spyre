@@ -402,6 +402,25 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # is not yet a calibrated brake on the tiling axis.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
+# GraphLowering invariant validation after each compiler pass in
+# CustomPreSchedulingPasses. Catches consistency violations (stale
+# name_to_buffer entries, duplicate buffer names, reads from undefined
+# buffers, etc.) early. Set SPYRE_VALIDATE_GRAPH=0 to disable.
+validate_graph_invariants: bool = os.environ.get("SPYRE_VALIDATE_GRAPH", "1") == "1"
+
+# Use the C++ (native) permutation-layout packer accelerator, which both
+# simulated-annealing solvers drive (the layout-only one and the joint
+# co-optimizer). The native and Python packers are behaviourally identical
+# (verified bit-for-bit); the native one is faster. Set
+# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
+# to force the pure-Python packer. A missing native class is a stale or
+# incomplete build, not a supported mode, and raises rather than falling back.
+native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
 # Enable persistent on-disk caching of compiled Spyre kernels across
