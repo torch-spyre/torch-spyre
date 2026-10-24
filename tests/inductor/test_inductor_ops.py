@@ -12861,7 +12861,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         Root cause: three combined issues unblocked by this fix:
           1. pass_utils.py: compute_restickify_needed blocked SEN143_FP8 (#4238)
           2. spyre_kernel.py: RESTICKIFY_OP gate excluded SEN143_FP8
-          3. propagate_layouts.py: find_stick_compatible_input_layout returned
+          3. propagate_layouts.py: generate_stl_with_required_stick returned
              sparse QFP8CH without checking reduction_var was on the stick
         """
         FP8_MAX = 448.0

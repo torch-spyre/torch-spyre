@@ -38,6 +38,7 @@ from torch_spyre._inductor.wrapper import noop_simplify_loops_impl
 @pytest.mark.parametrize("folded_axis", ["new", "old", None])
 def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
     from torch_spyre._C import DataFormats, SpyreTensorLayout
+    from torch_spyre._inductor.propagate_layouts import PropArg
 
     page, token, head, feature = sympy.symbols(
         "page token head feature", integer=True, nonnegative=True
@@ -55,10 +56,22 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
             2 * page + sympy.floor(feature / 64),
             sympy.Mod(feature, 64),
         ]
+        dep = MemoryDep(
+            "x",
+            5120 * token + 2560 * head + 128 * page + feature,
+            (token, head, page, feature),
+            (64, 2, 20, 128),
+        )
     else:
         size = [20, 64, 2, 64]
         stride = [8192, 128, 64, 1]
         host_coords = [page, token, head, feature]
+        dep = MemoryDep(
+            "x",
+            8192 * page + 128 * token + 64 * head + feature,
+            (page, token, head, feature),
+            (20, 64, 2, 64),
+        )
         if folded_axis == "new":
             stl = SpyreTensorLayout(
                 [1280, 2, 1, 64], [128, 64, 64, 1], DataFormats.SEN169_FP16
@@ -71,12 +84,15 @@ def test_restickify_does_not_discard_folded_cache_pages(folded_axis):
                 DataFormats.SEN169_FP16,
             )
             device_coords = [page, token, head, sympy.S.Zero, feature]
+    host = FixedLayout(torch.device("cpu"), torch.float16, size, stride)
+    arg = PropArg(dep, host, [stl])
     target = pass_utils.compute_restickify_target_layout(
         stl,
-        FixedLayout(torch.device("cpu"), torch.float16, size, stride),
+        host,
         sympy.Mod(token, 64),
         host_coords,
         device_coords,
+        arg=arg,
     )
     if folded_axis is not None:
         assert target is None

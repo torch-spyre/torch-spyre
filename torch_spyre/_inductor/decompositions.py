@@ -3148,7 +3148,7 @@ def _is_direct_conv_supported(
     NCHW contract) and assumes the direct path will place C_in on the device
     stick. That stick placement is NOT decided here -- it is requested by the
     direct path and enforced downstream in propagate_layouts (_conv_layouts /
-    find_stick_compatible_input_layout), which restickify the activation onto
+    generate_stl_with_required_stick), which restickify the activation onto
     C_in or raise Unsupported if they cannot. So the ``C_in % stick == 0`` check
     below is a precondition of the channel-last layout the path *will request*,
     validated against the channel *count* (which no layout choice changes). The
