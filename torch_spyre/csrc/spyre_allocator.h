@@ -15,14 +15,19 @@
  */
 #pragma once
 
+#include <ATen/core/Tensor.h>
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace spyre {
 
@@ -91,6 +96,19 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   uint64_t compositeAddressToDeviceAddress(
       const flex::CompositeAddress& addr) const;
+
+  // Debug hooks for multi-domain (interleaved) placement tests.
+  //
+  // Flip the interleave gate at runtime; returns the previous value. Needed
+  // because only one process may hold the device, so an interleaved run and
+  // its Bind{0} baseline must both happen in this process.
+  static bool debugSetEmulateInterleave(bool enabled);
+  // Memory domains flex reports; 0 if the runtime is not started.
+  static size_t debugNumMemoryDomains();
+  // Hardware segment of each chunk of `tensor`'s allocation, in chunk order;
+  // std::nullopt where the chunk's region has no tensor segment.
+  static std::vector<std::optional<uint32_t>> debugChunkSegmentIds(
+      const at::Tensor& tensor);
 };
 
 }  // namespace spyre
