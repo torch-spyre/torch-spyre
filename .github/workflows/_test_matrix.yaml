@@ -1045,22 +1045,32 @@ jobs:
             config: granite-3.3-8b-instruct-fms.yaml
           - name: Granite 3.3 8B Instruct
             config: granite-3.3-8b-instruct.yaml
+          - name: Granite 3.3 8B Instruct Spyre Inference
+            config: granite-3.3-8b-instruct-spyre-inference.yaml
           - name: Granite 4.1 8B
             config: granite-4.1-8b.yaml
+          - name: Granite 4.1 8B Spyre Inference
+            config: granite-4.1-8b-spyre-inference.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Ministral 3 14B Instruct 2512
             config: Ministral-3-14B-Instruct-2512.yaml
           - name: Mistral Small 3.2 24B Instruct 2506
             config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506 Spyre Inference
+            config: Mistral-Small-3.2-24B-Instruct-2506-spyre-inference.yaml
           - name: Gemma 4 26B A4B IT
             config: gemma-4-26B-A4B-it.yaml
+          - name: Gemma 4 26B A4B IT Spyre Inference
+            config: gemma-4-26B-A4B-it-spyre-inference.yaml
           - name: Gemma 4 12B Instruct
             config: gemma-4-12B-it.yaml
           # "7B" kept: suite_name is derived from the job name, and prod's 3,096 rows for this
           # config are all under 'Qwen 2.5 7B Spyre'. Dropping it would fork the series.
           - name: Qwen 2.5 7B
             config: Qwen2.5-7B-Instruct.yaml
+          - name: Qwen 2.5 7B Spyre Inference
+            config: Qwen2.5-7B-Instruct-spyre-inference.yaml
     steps:
       # Same reasoning as the perf job: the action DEFINITIONS must be in the
       # workspace even in prebaked mode, so .github is always checked out fresh.
