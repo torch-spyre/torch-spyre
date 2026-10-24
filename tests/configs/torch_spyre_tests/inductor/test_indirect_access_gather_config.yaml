@@ -3,3 +3,23 @@ test_suite_config:
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_indirect_access_gather.py
       unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_attention.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_chained.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_compiler.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_downstream.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_dtypes.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_edge_cases.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_embedding.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_functional.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_inference_patterns.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/indirect_access/test_gather_stl.py
+      unlisted_test_mode: mandatory_success
