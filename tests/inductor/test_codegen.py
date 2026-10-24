@@ -1035,8 +1035,10 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         for sk in symbolic_kinds:
             self.assertEqual(sk.offset, 0)
 
-        # The backend builds its own symbol definitions; the SDSC carries none.
+        # The backend builds its own symbol definitions and input symbol list,
+        # from the bundle; the SDSC carries neither.
         self.assertNotIn("symbolDefinitions_", top)
+        self.assertNotIn("inputSymbolsAndTags_", top)
 
     def test_dim_symbol_ids_lower_magnitude_than_address_ids(self):
         # Dim symbols must occupy the smallest-magnitude (closest to zero) ids

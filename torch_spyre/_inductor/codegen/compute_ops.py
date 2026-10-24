@@ -1702,18 +1702,6 @@ def generate_sdsc(
                         }
                     }
                 ],
-                # Emit top-level symbolic metadata only when symbolic dims are present.
-                # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
-                **(
-                    {
-                        "inputSymbolsAndTags_": {
-                            str(sym_id): pytorch_sym
-                            for pytorch_sym, sym_id in dim_local_symbols.items()
-                        },
-                    }
-                    if symbolic_dims
-                    else {}
-                ),
             }
         },
         # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols follow.
