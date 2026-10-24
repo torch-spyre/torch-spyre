@@ -68,7 +68,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 5;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -286,6 +286,10 @@ PYBIND11_MODULE(_C, m) {
       .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
+  py::enum_<spyre::PADDING>(m, "PADDING")
+      .value("UNINITIALIZED", spyre::PADDING::UNINITIALIZED)
+      .value("CONSTANT", spyre::PADDING::CONSTANT);
+
   auto valid_elements_to_pydict =
       [](const std::map<std::vector<int64_t>, int64_t>& ve) {
         py::dict result;
@@ -306,6 +310,26 @@ PYBIND11_MODULE(_C, m) {
           "valid_elements",
           [valid_elements_to_pydict](const spyre::SpyreTensorLayout& stl) {
             return valid_elements_to_pydict(stl.valid_elements);
+          })
+      .def_readonly("padding", &spyre::SpyreTensorLayout::padding)
+      // Raw device-encoded bytes of one padding element, as read by the DMA.
+      .def_property_readonly("padding_bytes",
+                             [](const spyre::SpyreTensorLayout& stl) {
+                               return py::bytes(reinterpret_cast<const char*>(
+                                                    stl.padding_value.data()),
+                                                stl.padding_value.size());
+                             })
+      // The padding value as a Python float (rounded to device_dtype), or None
+      // when padding is not CONSTANT. Assigning a float sets CONSTANT padding;
+      // assigning None resets it to UNINITIALIZED.
+      .def_property(
+          "padding_value", &spyre::SpyreTensorLayout::constant_padding_value,
+          [](spyre::SpyreTensorLayout& stl, std::optional<double> value) {
+            if (value.has_value()) {
+              stl.set_constant_padding(*value);
+            } else {
+              stl.clear_padding();
+            }
           })
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
@@ -349,10 +373,12 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
-            return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
-                                  p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement,
-                                  valid_elements_to_pydict(p.valid_elements));
+            return py::make_tuple(
+                spyre::kSpyreTensorLayoutPickleVersion, p.device_size,
+                p.stride_map, p.device_dtype, p.element_arrangement,
+                valid_elements_to_pydict(p.valid_elements), p.padding,
+                py::bytes(reinterpret_cast<const char*>(p.padding_value.data()),
+                          p.padding_value.size()));
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -396,6 +422,21 @@ PYBIND11_MODULE(_C, m) {
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
                   t[4].cast<spyre::ElementArrangement>());
+            } else if (version == 5) {
+              // Version 5: v4 + (padding, padding_value bytes)
+              if (t.size() != 8) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v5: wrong tuple size");
+              }
+              auto stl = spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
+                  t[4].cast<spyre::ElementArrangement>());
+              stl.padding = t[6].cast<spyre::PADDING>();
+              std::string bytes = t[7].cast<std::string>();
+              stl.padding_value.assign(bytes.begin(), bytes.end());
+              return stl;
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +

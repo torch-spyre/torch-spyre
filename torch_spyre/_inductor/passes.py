@@ -39,7 +39,7 @@ from .logging_utils import get_inductor_logger
 from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding, insert_restickify_padding
+from .padding import insert_bmm_padding, insert_restickify_padding, track_padding_value
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -481,6 +481,7 @@ class CustomPreSchedulingPasses:
             # insert_restickify would have to pad a restickify output, whose
             # device layout and index expressions cannot be reconciled with a
             # grown host extent.
+            track_padding_value,
             insert_bmm_padding,
             #
             # Tensor Layout (Stickification)

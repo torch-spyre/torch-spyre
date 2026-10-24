@@ -449,4 +449,8 @@ _cache_config_ignore_prefix: list[str] = [
     "num_cpus",
 ]
 
+# Strict mode assumes that a block of uninitialized memory contains NaN
+# values, that will corrupt matmuls and potentially other operations
+padding_strict_mode: bool = os.environ.get("PADDING_STRICT_MODE", "0") == "1"
+
 install_config_module(sys.modules[__name__])

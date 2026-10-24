@@ -19,8 +19,10 @@
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
 #include <util/sendefs/dataType.h>
+#include <util/sendefs/numeric_convert.h>
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <string>
 #include <utility>
@@ -202,8 +204,68 @@ std::string SpyreTensorLayout::toString() const {
     ss << "): " << size;
   }
   ss << "}";
+  if (this->padding != PADDING::UNINITIALIZED) {
+    ss << ", padding=PADDING." << spyre::paddingToString(this->padding);
+    auto value = this->constant_padding_value();
+    if (value.has_value()) {
+      ss << "(" << *value << ")";
+    }
+  }
   ss << ")";
   return ss.str();
+}
+
+void SpyreTensorLayout::set_constant_padding(double value) {
+  TORCH_CHECK(this->element_arrangement == ElementArrangement::STANDARD,
+              "Constant padding requires ElementArrangement::STANDARD, got ",
+              spyre::elementArrangementToString(this->element_arrangement));
+  std::vector<uint8_t> bytes;
+  switch (this->device_dtype) {
+    case DataFormats::SEN169_FP16: {
+      uint16_t bits = deeptools::FloatToFp16Bin(static_cast<float>(value));
+      bytes.resize(sizeof(bits));
+      std::memcpy(bytes.data(), &bits, sizeof(bits));
+      break;
+    }
+    case DataFormats::IEEE_FP32: {
+      float f = static_cast<float>(value);
+      bytes.resize(sizeof(f));
+      std::memcpy(bytes.data(), &f, sizeof(f));
+      break;
+    }
+    default:
+      TORCH_CHECK(false, "Constant padding is not supported for DataFormats.",
+                  EnumsConversion::dataFormatsToString(this->device_dtype));
+  }
+  this->padding = PADDING::CONSTANT;
+  this->padding_value = std::move(bytes);
+}
+
+std::optional<double> SpyreTensorLayout::constant_padding_value() const {
+  if (this->padding != PADDING::CONSTANT) {
+    return std::nullopt;
+  }
+  switch (this->device_dtype) {
+    case DataFormats::SEN169_FP16: {
+      uint16_t bits;
+      TORCH_CHECK(this->padding_value.size() == sizeof(bits),
+                  "padding_value has ", this->padding_value.size(),
+                  " bytes; SEN169_FP16 needs ", sizeof(bits));
+      std::memcpy(&bits, this->padding_value.data(), sizeof(bits));
+      return deeptools::Fp16BinToFloat(bits);
+    }
+    case DataFormats::IEEE_FP32: {
+      float f;
+      TORCH_CHECK(this->padding_value.size() == sizeof(f), "padding_value has ",
+                  this->padding_value.size(), " bytes; IEEE_FP32 needs ",
+                  sizeof(f));
+      std::memcpy(&f, this->padding_value.data(), sizeof(f));
+      return f;
+    }
+    default:
+      TORCH_CHECK(false, "Constant padding is not supported for DataFormats.",
+                  EnumsConversion::dataFormatsToString(this->device_dtype));
+  }
 }
 
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
