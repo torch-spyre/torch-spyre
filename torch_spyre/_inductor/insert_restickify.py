@@ -55,6 +55,20 @@ from torch.utils._ordered_set import OrderedSet
 
 logger = get_inductor_logger("insert_restickify")
 
+# Cross-pass attribute protocol — dynamic attributes stamped on IR nodes by
+# various passes and consumed here (or set here and consumed downstream):
+#
+#   op.committed_stl          set by optimize_restickify; consumed+deleted by finalize_layouts
+#   op.layouts                set by propagate_layouts / stickify; consumed+deleted by finalize_layouts
+#   op.restick_cost_fn        set by propagate_layouts; consumed+deleted by finalize_layouts
+#   op.loop_info              set by coarse_tile; read (and cloned) by insert_restickify_on_node_inputs
+#   op._restickify_plan       set by propagate_layouts; consumed+deleted by insert_post_mutation_restickify
+#   op._tiled_reduction_accum_name  set by coarse_tile; read by finalize_layouts
+#   op._input_layout_overrides      set by insert_post_mutation_restickify; read by codegen
+#   op._emit_set_layout             set by insert_post_mutation_restickify; read by codegen
+#   op._read_copy_elision_record    set by propagate_layouts; moved/updated by insert_restickify_on_node_inputs
+#   tensor_box.layouts        set by stickify (graph inputs); consumed+deleted by finalize_layouts
+
 
 @dataclass
 class RestickifyArgInfo:
@@ -155,10 +169,11 @@ class InputEdgeSwapHandler(WrapperHandler):
             #    no restickify was deliberately skipped in the plan (its occurrence
             #    was advanced without recording an entry). This occurrence should
             #    stay on the original buffer.
-            min_planned = min(exp for exp, _ in matching)
-            if occurrence < min_planned:
-                # Gap: this occurrence precedes the first restickify — stay original.
+            first_planned_occurrence = min(exp for exp, _ in matching)
+            if occurrence < first_planned_occurrence:
+                # Gap: this occurrence precedes the first planned restickify — stay on the original buffer.
                 return super().load(self._name_map.get(name, name), index)
+            # All remaining occurrences share one target (multiple reads deduplicated to one dep.index).
             unique_targets = {new_name for _, new_name in matching}
             assert len(unique_targets) == 1, (
                 f"ambiguous fallback for load {name}[{index}] occurrence {occurrence}: "
@@ -287,6 +302,115 @@ def _create_restickify_node(
     return arg_name, restick_buff
 
 
+def _transfer_loop_info(
+    restick_buff: ComputedBuffer,
+    old_name_buf,
+    op: ComputedBuffer,
+    restick_arg_info: RestickifyArgInfo,
+    shared_loop_depth: int,
+) -> None:
+    """Assign loop_info to a newly-created restickify buffer.
+
+    When coarse-tiling has already annotated the consumer op with loop_info,
+    the restickify node must also carry loop_info to remain contiguous in
+    build_loop_scheduler_nodes. The assignment depends on whether old_name_buf
+    shares any loop-nest levels with op (has_shared_loop_scope):
+
+    Shared scope: restickify takes over the consumer's per-read advance for
+    shared levels; the consumer retains the advance for deeper levels. Sharing
+    one CoarseTileInfo object would apply the advance twice (issue #4008).
+
+    No shared scope (or old_name_buf has no loop_info): restickify gets a copy
+    of op's loop_info with all advances zeroed out; the consumer keeps its own.
+    """
+    source_li = getattr(old_name_buf, "loop_info", None)
+    consumer_li = getattr(op, "loop_info", None)
+    has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+
+    if consumer_li is not None and has_shared_loop_scope:
+        n_levels = len(getattr(consumer_li, "loop_count", []) or [])
+        reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
+        if n_levels and reads_per_dim is not None:
+            mem_deps = [
+                d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
+            if dep_idx is not None and dep_idx >= len(reads_per_dim):
+                raise AssertionError(
+                    f"restickify metadata index {dep_idx} is outside "
+                    f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
+                )
+            dep_advance = (
+                copy.deepcopy(reads_per_dim[dep_idx])
+                if dep_idx is not None
+                else [[] for _ in range(n_levels)]
+            )
+            transferred_advance = [
+                level if level_idx < shared_loop_depth else []
+                for level_idx, level in enumerate(dep_advance)
+            ]
+            retained_advance = [
+                [] if level_idx < shared_loop_depth else level
+                for level_idx, level in enumerate(dep_advance)
+            ]
+            # squeezed_advance_per_read is the second, independent channel
+            # for the same per-read advance (see CoarseTileInfo), also
+            # matched to reads positionally, so it must be handed over the
+            # same way. Left shared, the stage inherits the consumer's whole
+            # list and its single read picks up whatever advance sat at
+            # index 0 -- for an in-body page gather that is the block
+            # table's per-trip step, applied to the staged pages copy.
+            adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
+            dep_squeezed = (
+                copy.deepcopy(adv_per_read[dep_idx])
+                if dep_idx is not None and adv_per_read and dep_idx < len(adv_per_read)
+                else []
+            )
+            transferred_squeezed = [
+                level if level_idx < shared_loop_depth else []
+                for level_idx, level in enumerate(dep_squeezed)
+            ]
+            retained_squeezed = [
+                [] if level_idx < shared_loop_depth else level
+                for level_idx, level in enumerate(dep_squeezed)
+            ]
+            if restick_arg_info.occurrence != 0 and (
+                any(transferred_advance) or any(transferred_squeezed)
+            ):
+                raise Unsupported(
+                    f"restickify edge {restick_arg_info.arg_name}[{restick_arg_info.dep_index}] "
+                    f"occurrence {restick_arg_info.occurrence} cannot "
+                    "transfer advancing read metadata independently"
+                )
+            restick_li = copy.deepcopy(consumer_li)
+            restick_li.tiled_dims_per_read = [transferred_advance]
+            restick_li.squeezed_advance_per_read = (
+                [transferred_squeezed] if any(transferred_squeezed) else []
+            )
+            restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+            restick_buff.loop_info = restick_li
+            if dep_idx is not None:
+                consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
+                consumer_li.tiled_dims_per_read[dep_idx] = retained_advance
+                if adv_per_read:
+                    consumer_li.squeezed_advance_per_read = copy.deepcopy(adv_per_read)
+                    consumer_li.squeezed_advance_per_read[dep_idx] = retained_squeezed
+        else:
+            restick_buff.loop_info = consumer_li
+    elif hasattr(op, "loop_info"):
+        # old_name_buf is not itself a tiled stage: restickify still needs a
+        # copy of loop_info to stay contiguous in build_loop_scheduler_nodes,
+        # but neither its read (a fixed full copy of old_name_buf, made once)
+        # nor its output (consumed at a fixed address by every trip) advance —
+        # the consumer keeps whatever per-trip advance it already had.
+        restick_li = copy.deepcopy(op.loop_info)
+        n_levels = len(getattr(restick_li, "loop_count", []) or [])
+        restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
+        restick_li.squeezed_advance_per_read = []
+        restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+        restick_buff.loop_info = restick_li
+
+
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
     resticks_needed: list[RestickifyArgInfo],
@@ -329,31 +453,10 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
-        # When coarse-tiling runs pre-stickification, the consumer op already
-        # carries loop_info (loop_group_id + loop_count).  The restickify node
-        # is inserted inside the same loop group, so it must inherit loop_info
-        # to remain contiguous in build_loop_scheduler_nodes.
-        #
-        # It must inherit a COPY, not the consumer's own object. The transfer
-        # decision is per nesting level: old_name can be a tile-local stage in
-        # a prefix of the consumer's loop nest, yet a fixed full buffer for
-        # deeper levels. At shared levels the restickify takes over the
-        # consumer's per-read advance, its output is fixed scratch, and the
-        # consumer stops advancing. Sharing one CoarseTileInfo would apply the
-        # advance twice and can run off the restickified tile (issue #4008).
-        #
-        # At non-shared, deeper levels, restickify copies the source's full
-        # contents and the consumer must keep its advance to select a tile
-        # within that copy. Checking only whether old_name has loop_info loses
-        # this distinction. For example, nested SDPA first stages a full K
-        # buffer in the B/H prefix and later tiles it in the Lk loop. Moving
-        # the Lk advance to the full-K restickify pins the matmul itself to K
-        # tile zero. A graph input has no shared levels and follows this same
-        # fixed-full-buffer path at every level.
-        source_li = getattr(old_name_buf, "loop_info", None)
-        consumer_li = getattr(op, "loop_info", None)
-        source_group_id = getattr(source_li, "loop_group_id", ())
-        consumer_group_id = getattr(consumer_li, "loop_group_id", ())
+        source_group_id = getattr(
+            getattr(old_name_buf, "loop_info", None), "loop_group_id", ()
+        )
+        consumer_group_id = getattr(getattr(op, "loop_info", None), "loop_group_id", ())
         shared_loop_depth = 0
         for source_level, consumer_level in zip(
             source_group_id, consumer_group_id, strict=False
@@ -361,96 +464,9 @@ def insert_restickify_on_node_inputs(
             if source_level != consumer_level:
                 break
             shared_loop_depth += 1
-        has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
-        if consumer_li is not None and has_shared_loop_scope:
-            n_levels = len(getattr(consumer_li, "loop_count", []) or [])
-            reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
-            if n_levels and reads_per_dim is not None:
-                mem_deps = [
-                    d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-                ]
-                dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
-                if dep_idx is not None and dep_idx >= len(reads_per_dim):
-                    raise AssertionError(
-                        f"restickify metadata index {dep_idx} is outside "
-                        f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
-                    )
-                dep_advance = (
-                    copy.deepcopy(reads_per_dim[dep_idx])
-                    if dep_idx is not None
-                    else [[] for _ in range(n_levels)]
-                )
-                transferred_advance = [
-                    level if level_idx < shared_loop_depth else []
-                    for level_idx, level in enumerate(dep_advance)
-                ]
-                retained_advance = [
-                    [] if level_idx < shared_loop_depth else level
-                    for level_idx, level in enumerate(dep_advance)
-                ]
-                # squeezed_advance_per_read is the second, independent channel
-                # for the same per-read advance (see CoarseTileInfo), also
-                # matched to reads positionally, so it must be handed over the
-                # same way. Left shared, the stage inherits the consumer's whole
-                # list and its single read picks up whatever advance sat at
-                # index 0 -- for an in-body page gather that is the block
-                # table's per-trip step, applied to the staged pages copy.
-                adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
-                dep_squeezed = (
-                    copy.deepcopy(adv_per_read[dep_idx])
-                    if dep_idx is not None
-                    and adv_per_read
-                    and dep_idx < len(adv_per_read)
-                    else []
-                )
-                transferred_squeezed = [
-                    level if level_idx < shared_loop_depth else []
-                    for level_idx, level in enumerate(dep_squeezed)
-                ]
-                retained_squeezed = [
-                    [] if level_idx < shared_loop_depth else level
-                    for level_idx, level in enumerate(dep_squeezed)
-                ]
-                if restick_arg_info.occurrence != 0 and (
-                    any(transferred_advance) or any(transferred_squeezed)
-                ):
-                    raise Unsupported(
-                        f"restickify edge {old_name}[{restick_arg_info.dep_index}] "
-                        f"occurrence {restick_arg_info.occurrence} cannot "
-                        "transfer advancing read metadata independently"
-                    )
-                restick_li = copy.deepcopy(consumer_li)
-                restick_li.tiled_dims_per_read = [transferred_advance]
-                restick_li.squeezed_advance_per_read = (
-                    [transferred_squeezed] if any(transferred_squeezed) else []
-                )
-                restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-                restick_buff.loop_info = restick_li
-                if dep_idx is not None:
-                    consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
-                    consumer_li.tiled_dims_per_read[dep_idx] = retained_advance
-                    if adv_per_read:
-                        consumer_li.squeezed_advance_per_read = copy.deepcopy(
-                            adv_per_read
-                        )
-                        consumer_li.squeezed_advance_per_read[dep_idx] = (
-                            retained_squeezed
-                        )
-            else:
-                restick_buff.loop_info = consumer_li
-        elif hasattr(op, "loop_info"):
-            # old_name is not itself a tiled stage: restickify still needs a
-            # copy of loop_info to stay contiguous in
-            # build_loop_scheduler_nodes, but neither its read (a fixed full
-            # copy of old_name, made once) nor its output (consumed at a
-            # fixed address by every trip) advance -- the consumer keeps
-            # whatever per-trip advance it already had.
-            restick_li = copy.deepcopy(op.loop_info)
-            n_levels = len(getattr(restick_li, "loop_count", []) or [])
-            restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
-            restick_li.squeezed_advance_per_read = []
-            restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
-            restick_buff.loop_info = restick_li
+        _transfer_loop_info(
+            restick_buff, old_name_buf, op, restick_arg_info, shared_loop_depth
+        )
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify
@@ -479,11 +495,6 @@ def insert_restickify_on_node_inputs(
 
     # Wrap inner_fn with InputEdgeSwapHandler so each load is redirected to
     # the correct per-edge restickified buffer via index-matched routing.
-    # Then call redirect_computed_buffer_reads with an empty name_map solely for
-    # its ComputedBuffer reconstruction, cache invalidation, and mutation-target
-    # repointing side-effects. The empty map means the NameSwapHandler it installs
-    # is a no-op; it is intentionally kept rather than extracted to avoid
-    # duplicating that reconstruction logic here.
     orig_inner = op.data.inner_fn
 
     # Build canonical d* args using the same prefix/squeeze logic as extract_read_writes.
@@ -881,7 +892,8 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
       1. restickify op: arg0_1 (orig_stl) -> buf_tmp        (alt_stl)
       2. mutation op:   buf               -> buf_tmp[slice] (alt_stl)
       3. copy-back op:  buf_tmp (alt_stl) -> arg0_1         (alt_stl)
-      4. set_spyre_tensor_layout(arg0_1, alt_stl)
+      4. stamps mutation_op._emit_set_layout = (arg0_1, alt_stl) for codegen to emit
+         set_spyre_tensor_layout(arg0_1, alt_stl) after the copy-back write-back.
 
     Both (1) and (3) are inserted as restickify IR nodes via
     _create_restickify_node. In (3), the input and output STLs are both alt_stl,
