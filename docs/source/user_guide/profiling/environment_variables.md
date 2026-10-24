@@ -13,8 +13,6 @@ captured artifacts.
 
 | Variable | Effect |
 |---|---|
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated*. Use `TORCH_LOGS="torch_spyre.inductor"`. Enables Spyre-specific Inductor logging (INFO level) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated*. Use `TORCH_LOGS="+torch_spyre.inductor"`. Sets Spyre Inductor log verbosity to DEBUG |
 | `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated*. Mapped to the top-level `spyre` logger file handler. Redirects Spyre Inductor log output to a file |
 | `TORCH_LOGS="+torch_spyre.inductor"` | Preferred logging control (DEBUG level). Accepts `torch_spyre.*` namespaces |
 | `TORCH_LOGS="torch_spyre.inductor"` | Same as above but at INFO level (no `+` prefix) |
