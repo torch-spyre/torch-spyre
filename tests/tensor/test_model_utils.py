@@ -368,6 +368,57 @@ class TestLoadModelToSpyre(TestCase):
         load_model_to_spyre(model)
         self.assertEqual(model.weight.data_ptr(), ptr)
 
+    # ── upload from several threads ────────────────────────────────
+
+    def test_upload_threads_setting(self):
+        """TORCH_SPYRE_UPLOAD_THREADS sets the thread count; without it the
+        count is min(8, CPUs)."""
+        from torch_spyre.model_utils import _cpu_count, _upload_threads
+
+        with mock.patch.dict("os.environ", {"TORCH_SPYRE_UPLOAD_THREADS": "3"}):
+            self.assertEqual(_upload_threads(), 3)
+        with mock.patch.dict("os.environ", {"TORCH_SPYRE_UPLOAD_THREADS": "0"}):
+            self.assertEqual(_upload_threads(), 1)
+        with mock.patch.dict("os.environ", {"TORCH_SPYRE_UPLOAD_THREADS": ""}):
+            self.assertEqual(_upload_threads(), min(8, _cpu_count()))
+
+    @requires_spyre
+    def test_threaded_upload_matches_serial_upload(self):
+        """Uploading from 8 threads gives the same device layout and the same
+        bytes (copied back to the host) as uploading from 1 thread."""
+        import copy
+
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        layers = [nn.Linear(256, 128, dtype=torch.float16) for _ in range(6)]
+        model = nn.Sequential(
+            nn.Embedding(1000, 256, dtype=torch.float16),
+            *layers,
+            nn.LayerNorm(128, dtype=torch.float16),
+        )
+        model.register_buffer("scale", torch.randn(64, dtype=torch.float16))
+        serial = copy.deepcopy(model)
+        threaded = copy.deepcopy(model)
+
+        with mock.patch.dict("os.environ", {"TORCH_SPYRE_UPLOAD_THREADS": "1"}):
+            load_model_to_spyre(serial)
+        with mock.patch.dict("os.environ", {"TORCH_SPYRE_UPLOAD_THREADS": "8"}):
+            load_model_to_spyre(threaded)
+
+        a = dict(serial.state_dict())
+        b = dict(threaded.state_dict())
+        self.assertEqual(a.keys(), b.keys())
+        for name in a:
+            self.assertEqual(b[name].device.type, "spyre", name)
+            self.assertEqual(
+                get_spyre_tensor_layout(a[name]),
+                get_spyre_tensor_layout(b[name]),
+                name,
+            )
+            host_a = a[name].cpu().view(torch.int16)
+            host_b = b[name].cpu().view(torch.int16)
+            self.assertTrue(torch.equal(host_a, host_b), name)
+
     # ── nn.Module.to() patch ───────────────────────────────────────
 
     @requires_spyre
