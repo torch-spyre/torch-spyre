@@ -146,6 +146,26 @@ inline bool hasCyclesTs(const activity_type* activity) {
          activity->cycles_ts5 != 0;
 }
 
+// spyre-comms collective-invocation spans. Their AIUPTI correlation_id is the
+// collective ID from SpyreCommsContext::makeCollectiveId(), not a flex batch
+// ID; the two counters overlap numerically. The _SETUP spans carry no
+// collective ID and are deliberately not listed.
+inline bool isCollectiveSpanCbid(AIUpti_runtime_api_trace_cbid cbid) {
+  switch (cbid) {
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return true;
+    default:
+      return false;
+  }
+}
+
 inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
   switch (cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INVALID:
@@ -248,6 +268,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsCollBroadcast";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
       return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SCATTER:
+      return "aiuCommsCollReduceScatter";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
       return "aiuCommsWorkSchedStart";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
@@ -349,7 +371,11 @@ inline std::string fixedCharField(const char (&field)[N]) {
 // coll_algo only from a structured "[Coll,Algo,Bytes]" label, whose fields are
 // all required, so a non-empty coll_algo means coll_bytes was really parsed.
 // On collective records coll_bytes is therefore the number when known
-// (including a real 0) and "" when the label carried no size.
+// (including a real 0) and "" when the label carried no size. coll_id is the
+// spyre-comms collective ID from a "[Coll,Algo,Bytes,CollId]" label; 0 is a
+// valid ID, so has_coll_id says whether it was set. It is emitted under the
+// same "collective_id" key as the collective host spans, so device events can
+// be joined to the collective invocation that issued them.
 
 template <class T, class = void>
 struct HasCollFields : std::false_type {};
@@ -359,9 +385,23 @@ struct HasCollFields<T, std::void_t<decltype(std::declval<T&>().coll_group),
                                     decltype(std::declval<T&>().coll_bytes)>>
     : std::true_type {};
 
+// coll_id is newer than the other coll fields, so it is detected separately and
+// older libaiupti headers still get coll_group/coll_algo/coll_bytes.
+template <class T, class = void>
+struct HasCollIdFields : std::false_type {};
+template <class T>
+struct HasCollIdFields<T, std::void_t<decltype(std::declval<T&>().coll_id),
+                                      decltype(std::declval<T&>().has_coll_id)>>
+    : std::true_type {};
+
 template <class trace_activity_type, class aiupti_activity_type>
 inline void addCollMetadata(trace_activity_type& trace_activity,
                             const aiupti_activity_type* activity) {
+  if constexpr (HasCollIdFields<aiupti_activity_type>::value) {
+    if (activity->has_coll_id != 0) {
+      trace_activity->addMetadata("collective_id", activity->coll_id);
+    }
+  }
   if constexpr (HasCollFields<aiupti_activity_type>::value) {
     if (activity->coll_group[0] != '\0') {
       trace_activity->addMetadataQuoted("coll_group",
@@ -440,7 +480,14 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
-  runtime_activity->addMetadata("correlation", activity->correlation_id);
+  // Report a collective span's ID as "collective_id" only: emitting it as
+  // "correlation" too would make it look related to the kernel/memcpy events
+  // that happen to share that number.
+  if (isCollectiveSpanCbid((AIUpti_runtime_api_trace_cbid)activity->cbid)) {
+    runtime_activity->addMetadata("collective_id", activity->correlation_id);
+  } else {
+    runtime_activity->addMetadata("correlation", activity->correlation_id);
+  }
 
   if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
       !calibration && linked && linked->deviceId() == activity->process_id &&
@@ -586,6 +633,11 @@ inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
 
+inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpyPtoP* activity) {
+  // PTOP lands on 300, between DtoH and memory
+  return activity->copy_kind * 100;
+}
+
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemory* activity) {
   return 400;
 }
@@ -626,6 +678,8 @@ uint32_t AiuptiActivityProfilerSession::getResourceId(
 
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemcpy>(AIUpti_ActivityMemcpy* activity);
+template uint32_t AiuptiActivityProfilerSession::getResourceId<
+    AIUpti_ActivityMemcpyPtoP>(AIUpti_ActivityMemcpyPtoP* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
     AIUpti_ActivityMemory>(AIUpti_ActivityMemory* activity);
 template uint32_t AiuptiActivityProfilerSession::getResourceId<
@@ -692,6 +746,65 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   //   traceBuffer_.activities.pop_back();
   //   return;
   // }
+  memcpy_activity->log(*logger);
+}
+
+// flex reports src/dst of a P2P RDMA copy as ranks (BAT indices), and uses
+// UINT32_MAX as the destination of a multicast, whose peer set is not carried
+// on the data control block.
+inline std::string p2pRankName(uint32_t rank) {
+  return rank == UINT32_MAX ? "multicast" : std::to_string(rank);
+}
+
+void AiuptiActivityProfilerSession::handleMemcpyPtoPActivity(
+    const AIUpti_ActivityMemcpyPtoP* activity,
+    libkineto::ActivityLogger* logger) {
+  traceBuffer_.span.opCount += 1;
+  traceBuffer_.gpuOpCount += 1;
+  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
+  const libkineto::ITraceActivity* linked =
+      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+  traceBuffer_.emplace_activity(
+      traceBuffer_.span, libkineto::ActivityType::GPU_MEMCPY,
+      fmt::format("Memcpy ({})", memoryCopyOperationName(activity->copy_kind)));
+  auto& memcpy_activity = traceBuffer_.activities.back();
+  memcpy_activity->startTime = activity->start;
+  memcpy_activity->endTime = activity->end;
+  memcpy_activity->id = activity->correlation_id;
+  memcpy_activity->device = activity->device_id;
+  memcpy_activity->resource = getResourceId(activity);
+  memcpy_activity->threadId = activity->stream_id;
+  memcpy_activity->flow.id = 0;
+  memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
+  memcpy_activity->flow.start = 0;
+  memcpy_activity->linked = linked;
+  memcpy_activity->addMetadataQuoted(
+      "call", memoryCopyOperationName(activity->copy_kind));
+  memcpy_activity->addMetadata("device", memcpy_activity->deviceId());
+  memcpy_activity->addMetadataQuoted("context",
+                                     std::to_string(activity->context_id));
+  memcpy_activity->addMetadata("correlation", activity->correlation_id);
+  memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
+  memcpy_activity->addMetadataQuoted("src rank",
+                                     p2pRankName(activity->src_device_id));
+  memcpy_activity->addMetadataQuoted("dst rank",
+                                     p2pRankName(activity->dst_device_id));
+  memcpy_activity->addMetadata("bytes", activity->bytes);
+  memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  // flex fills these from the RDMA control block's response; omit the key when
+  // the device left every slot 0, as for the other Memcpy records.
+  if (hasCyclesTs(activity)) {
+    memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  }
+  addCollMetadata(memcpy_activity, activity);
+
+  if (memcpy_activity->resource == getBaseResourceId(activity)) {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
+                       fmt::format("Memcpy ({}):", memoryCopyOperationName(
+                                                       activity->copy_kind)));
+  } else {
+    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
+  }
   memcpy_activity->log(*logger);
 }
 
@@ -863,6 +976,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY:
       handleMemcpyActivity(
           reinterpret_cast<const AIUpti_ActivityMemcpy*>(record), logger);
+      break;
+    case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMCPY2:
+      handleMemcpyPtoPActivity(
+          reinterpret_cast<const AIUpti_ActivityMemcpyPtoP*>(record), logger);
       break;
     case (uint8_t)AIUPTI_ACTIVITY_KIND_MEMSET:
       handleMemsetActivity(
