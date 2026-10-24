@@ -85,6 +85,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "element_arrangement": "ElementArrangement",
     "work_division": "TensorWorkDivision | None",
     "kernel_local": "bool",
+    "qfp8wt_k_dim": "Symbol | None",
     "replicated_scalar": "bool",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
@@ -340,6 +341,12 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
     # emitter reads out of the buffer -- one lane or the whole stick.
     if arg.replicated_scalar:
         result["replicated_scalar"] = True
+    # Same rule again: only a QFP8WT tensor sets it, so every other identity is
+    # unchanged. It belongs in the identity because it names the K dim of the
+    # 2D stick, which decides the stickDimOrder_ the kernel is generated with.
+    if arg.qfp8wt_k_dim is not None:
+        result["qfp8wt_k_dim"] = _canonical_value(arg.qfp8wt_k_dim)
+
     return result
 
 
