@@ -868,8 +868,9 @@ def _(input: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
+@compile_once("spyre.quantscalepertokenfp8")
 def quantscalepertokenfp8(
-    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX
+    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX, compiled=None
 ) -> torch.Tensor:
     """
     Compute per-token quantization scale for FP8 conversion.
@@ -906,8 +907,11 @@ def quantscalepertokenfp8(
         >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
         >>> # scale.shape = [2, 4, 1]
         >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+    Note:
+        - Supports eager mode via compile_once decorator
     """
-    pass
+    return compiled(input, scale_ub)
 
 
 @quantscalepertokenfp8.register_fake
