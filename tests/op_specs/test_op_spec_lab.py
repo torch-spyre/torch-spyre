@@ -137,7 +137,7 @@ class _FakeRunner:
         self.launches.append(args)
 
 
-def _fake_sdsc(self, kernel_name, specs, pool_size=0):
+def _fake_sdsc(self, kernel_name, specs, pool_size=0, precomputed_key=None):
     """Stand in for sdsc() with its real signature, so the spy is called as it is."""
     return _FakeRunner()
 
@@ -157,7 +157,7 @@ class _FakeCompiler:
     def __init__(self):
         self.calls = []
 
-    def sdsc(self, name, specs, pool_size=0):
+    def sdsc(self, name, specs, pool_size=0, precomputed_key=None):
         self.calls.append("sdsc")
         return _FakeRunner()
 

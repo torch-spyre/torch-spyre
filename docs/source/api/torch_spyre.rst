@@ -856,6 +856,18 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_PRECOMPUTED_KERNEL_KEY``
+     - Reuse the kernel-cache key that codegen stored in the generated
+       wrapper, instead of building the SDSC JSON of every OpSpec again just
+       to compute the key when a cached wrapper is loaded (default ``0``; set
+       ``1``, ``true`` or ``yes`` to enable). Needs ``SPYRE_KERNEL_CACHE=1``.
+       The stored key is used only when its fingerprint (versions, config,
+       torch-spyre sources and ``_C`` file) matches the running process;
+       otherwise the key is computed as usual. ``verify`` computes both and
+       raises ``PrecomputedKernelKeyMismatch`` if they differ. Any other value
+       warns and leaves it off. Generated wrappers now pass a
+       ``precomputed_key`` keyword to ``async_compile.sdsc()``, so code that
+       replaces ``sdsc`` must accept it
    * - ``TORCH_SPYRE_CACHE_SCAN``
      - Let the FX graph and AOTAutograd caches keep graphs that use the
        ``scan`` op, such as attention built on ``for_each_tile`` (default

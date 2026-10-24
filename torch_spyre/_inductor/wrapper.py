@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import textwrap
 from typing import Optional
 
 import sympy
@@ -28,6 +29,26 @@ from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+
+# The wrapper header imports that the generated async_compile.sdsc(...) /
+# .ktir(...) kernel definitions evaluate their OpSpec source text against.
+SPYRE_WRAPPER_IMPORTS = """
+                from torch_spyre._inductor.op_spec import wrapper_sympify as sympify
+                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre.execution.async_compile import SpyreAsyncCompile
+                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
+                import subprocess
+                from torch_spyre.ops.eager import _run_compiled_fallback
+            """
+
+
+def spec_eval_namespace() -> dict:
+    """Return a namespace in which OpSpec source text emitted by
+    ``SpyreKernel.codegen_kernel`` evaluates to the same objects as in the
+    generated wrapper module (same names from SPYRE_WRAPPER_IMPORTS)."""
+    namespace: dict = {}
+    exec(textwrap.dedent(SPYRE_WRAPPER_IMPORTS), namespace)
+    return namespace
 
 
 class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
@@ -196,17 +217,7 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
 
     def write_header(self) -> None:
         super().write_header()
-        self.imports.splice(
-            """
-                from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
-                from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
-                import subprocess
-                from torch_spyre.ops.eager import _run_compiled_fallback
-            """,
-            strip=True,
-        )
+        self.imports.splice(SPYRE_WRAPPER_IMPORTS, strip=True)
         self.header.writeline(
             "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
         )
