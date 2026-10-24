@@ -20,7 +20,9 @@
 #include <c10/core/Stream.h>
 
 #include <cstdint>
+#include <flex/memory_interface/shared_host_pool.hpp>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "job_plan.h"
@@ -65,14 +67,15 @@ class SpyreStream {
   // flex::RuntimeStream::launchOperation(FillAsyncParams*) wrapper, which
   // performs the value->pattern conversion internally.
   void launchFillAsync(flex::FillAsyncParams* params) const;
+  void launchCopyRaw(flex::CopyRawParams* params) const;
   // Host-side compute for deeptools host compute calls.
   flex::HostComputeBuffer* launchHostCompute(flex::HostComputeParams*) const;
 
   // Conversions
   c10::Stream unwrap() const;
 
-  // Returns the error state of this stream without exposing the underlying
-  // flex::RuntimeStream handle to callers.
+  // Returns the error state of this stream without exposing the
+  // underlying flex::RuntimeStream handle to callers.
   SpyreStreamError getError() const;
 
  private:
