@@ -16,6 +16,11 @@ from .checks import (
     check_missing_labels,
 )
 from .discovery import find_test_files
+from .hw_classification import (
+    check_hw_classification,
+    load_class_entries,
+    read_hw_classifications,
+)
 from .display import bold, green, red, yellow, heuristic_base_names, warn
 from .loader import load_all_patterns, load_labels
 from .parser import parse_test_file
@@ -54,6 +59,7 @@ def run(
     total_hard_problems = check_missing_labels(load_labels(config_files))
 
     all_patterns = load_all_patterns(config_files)
+    class_entries = load_class_entries(config_files)
 
     if not any(all_patterns.values()):
         print("[WARN] No test patterns found in any config file.")
@@ -64,10 +70,11 @@ def run(
     # Build the reference map: basename → (collectable_names, helper_only)
     ref_collectable: dict[str, list[str]] = {}
     ref_helper_only: dict[str, set[str]] = {}
+    ref_paths: dict[str, Path] = {}
 
     if test_file:
         # Explicit file supplied -- use only that one
-        _load_reference(test_file, ref_collectable, ref_helper_only)
+        _load_reference(test_file, ref_collectable, ref_helper_only, ref_paths)
     else:
         # Auto-discover: search test_root for every basename the configs mention
         basenames = list(all_patterns.keys())
@@ -82,7 +89,7 @@ def run(
             )
         else:
             for basename, path in sorted(discovered.items()):
-                _load_reference(path, ref_collectable, ref_helper_only)
+                _load_reference(path, ref_collectable, ref_helper_only, ref_paths)
             # Report any basenames we could not find
             missing_files = set(basenames) - set(discovered)
             if missing_files:
@@ -142,6 +149,14 @@ def run(
             print(bold("  CHECK 3: Dead patterns (warnings only)"))
             total_warnings += check_dead_patterns(collectable, patterns, basename)
 
+            # CHECK 4 needs the class name and mode, which PatternEntry drops.
+            print(bold("  CHECK 4: hw_classification (warnings only)"))
+            total_warnings += check_hw_classification(
+                class_entries.get(basename, []),
+                read_hw_classifications(ref_paths[basename]),
+                basename,
+            )
+
     _print_summary(total_hard_problems, total_warnings)
 
     if fail_on_problems and total_hard_problems > 0:
@@ -158,6 +173,7 @@ def _load_reference(
     path: Path,
     ref_collectable: dict[str, list[str]],
     ref_helper_only: dict[str, set[str]],
+    ref_paths: dict[str, Path] | None = None,
 ) -> None:
     """Parse one test file and populate the reference dicts."""
     if not path.exists():
@@ -166,6 +182,8 @@ def _load_reference(
     collectable, helper_only = parse_test_file(path)
     ref_collectable[path.name] = collectable
     ref_helper_only[path.name] = helper_only
+    if ref_paths is not None:
+        ref_paths[path.name] = path
     print(f"Reference: {path}")
     print(f"  {len(collectable)} collectable name(s)  (PARAMS primaries + standalones)")
     print(f"  {len(helper_only)} helper-only method(s) (excluded from MISSING check)\n")
