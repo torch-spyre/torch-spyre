@@ -2329,6 +2329,48 @@ def _matmul_hbm_us(
     return bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
 
 
+def _pt_underfill_factor(m_tile):
+    """Split-ranking factor of ``_matmul_split_cost`` for a short per-core M tile.
+
+    The PT array streams M in passes of ``_PT_ROWS`` rows. Below
+    ``_TARGET_PT_PASSES`` passes the factor ranks a split as if its compute
+    slowed down by ``(_TARGET_PT_PASSES / passes) ** _PT_EFFICIENCY_EXPONENT``,
+    at most ``_TARGET_PT_PASSES ** _PT_EFFICIENCY_EXPONENT`` (1.50 at 8 rows).
+    It is a preference of the standalone chooser, not an operation latency:
+    measured matmuls with 8 to 40 rows per core and the input in LX ran no
+    slower than taller cuts of the same shape on the same cores
+    (tools/cost_model/matmul_short_tile_fit.py), so ``_matmul_execution_cost``,
+    the latency that the co-optimizing planner sums, does not carry it. With the
+    input in HBM a short tile can run slower; that is a cost of the HBM read,
+    not of the PT array.
+
+    For example, an 8x4x1 cut of ``[64, 4096] @ [4096, 4096]`` (8 rows per core)
+    ranks with factor 1.50 and a 4x8x1 cut (16 rows per core) with 1.26.
+    """
+    return piecewise(
+        (1, m_tile >= _PT_ROWS * _TARGET_PT_PASSES),
+        (_TARGET_PT_PASSES**_PT_EFFICIENCY_EXPONENT, m_tile <= _PT_ROWS),
+        (
+            ((_TARGET_PT_PASSES * _PT_ROWS) / m_tile) ** _PT_EFFICIENCY_EXPONENT,
+            True,
+        ),
+    )
+
+
+def _matmul_compute_us(b_axis, m_axis, n_axis, k_axis):
+    """Per-core MACs of ``[B,M,K]@[B,K,N]`` over the per-core peak, in microseconds.
+
+    The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
+    requiring cross-core reduction on one corelet, so a K-split has half that
+    compute throughput. This is separate from moving the partial sums. Keep the
+    existing unsplit estimate; small/unaligned output tiles may also prevent the
+    backend from using both corelets.
+    """
+    (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    compute_us = (B * M * N * K / (b * m * n * k)) / _PEAK_MACS_US_CORE
+    return piecewise((2 * compute_us, k > 1), (compute_us, True))
+
+
 def _matmul_execution_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
@@ -2350,41 +2392,28 @@ def _matmul_execution_cost(
     sharing penalty drops out of this function with that term. ``predict_ops``
     charges shared-input delivery separately, using each operand's consumers.
 
-    Array underfill remains an efficiency factor on computation. Standalone
-    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
+    The compute term is per-core MACs over peak, with no short-tile factor (see
+    ``_pt_underfill_factor``). Standalone split-ranking preferences belong to
+    ``_matmul_split_cost``, not this estimate.
 
     ``operand_bytes``/``output_bytes`` are bytes-per-element, derived by the
     caller from the real tensors' own ``elems_per_stick()``. Default to
     ``_DTYPE_BYTES`` (fp16) when unset (issue #4465).
     """
-    (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    (B, b), (M, m), (N, n), (_, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
     # Symbolic splits rely on the caller's enumerated candidate menu to enforce
     # the core budget; a symbolic expression cannot take this Python branch.
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
-    num_elems = B * M * N * K
-    # Compute: per-core MACs over peak, derated when the per-core M tile is too
-    # short to fill the PT pipeline. The PT array streams M in passes of
-    # _PT_ROWS; below _TARGET_PT_PASSES passes its startup/drain overhead is
-    # amortised over too little work, and that overhead grows sub-linearly.
-    m_t = M // m if m else 1
-    pt_eff_inv = piecewise(
-        (1, m_t >= _PT_ROWS * _TARGET_PT_PASSES),
-        (_TARGET_PT_PASSES**_PT_EFFICIENCY_EXPONENT, m_t <= _PT_ROWS),
-        (
-            ((_TARGET_PT_PASSES * _PT_ROWS) / m_t) ** _PT_EFFICIENCY_EXPONENT,
-            True,
-        ),
-    )
-    # The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
-    # requiring cross-core reduction on one corelet, so a K-split has half
-    # that compute throughput. This is separate from moving the partial sums.
-    # Keep the existing unsplit estimate; small/unaligned output tiles may
-    # also prevent the backend from using both corelets.
-    compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
-    compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
+    # Compute: per-core MACs over peak. A short per-core M tile carries no
+    # extra compute time here: on the card, matmuls with 8 to 40 rows per core
+    # and the input in LX ran no slower than taller cuts of the same shape on
+    # the same cores (fit and data: tools/cost_model/matmul_short_tile_fit.py).
+    # The PT short-tile factor stays a ranking preference of
+    # ``_matmul_split_cost``.
+    compute_us = _matmul_compute_us(b_axis, m_axis, n_axis, k_axis)
 
     hbm_us = (
         _matmul_hbm_us(
@@ -2436,13 +2465,43 @@ def _matmul_split_cost(
     )
     if isinf(execution_us):
         return execution_us
+    preferences = _matmul_split_preferences(
+        b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, operand_bytes
+    )
+    for preference in preferences.values():
+        execution_us += preference
+    return execution_us
+
+
+def _matmul_split_preferences(
+    b_axis,
+    m_axis,
+    n_axis,
+    k_axis,
+    max_cores,
+    shared_weight=False,
+    operand_bytes=_DTYPE_BYTES,
+):
+    """Standalone ranking preferences in us, without execution or HBM charges.
+
+    Keep the chooser's addition order. The three tile-shape amounts remain
+    grouped, so these seven entries contain all nine standalone preferences.
+    """
     (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
     m_t = M // m if m else 1
 
+    # The PT short-tile factor ranks a split whose per-core M tile is shorter
+    # than _TARGET_PT_PASSES passes as if its compute were slower. It is charged
+    # here, on the same per-core compute the execution estimate uses, so the
+    # chooser ranks exactly as when the estimate itself carried the factor.
+    pt_underfill_us = (_pt_underfill_factor(m_t) - 1) * _matmul_compute_us(
+        b_axis, m_axis, n_axis, k_axis
+    )
+
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
-    # to stream work over the stationary weight tile. The execution estimate handles
-    # the opposite case where an M split makes each per-core tile too short.
+    # to stream work over the stationary weight tile. The short-tile factor above
+    # handles the opposite case where an M split makes each per-core tile too short.
     target_m = max(
         _M_MIN,
         min(max_cores // 2, max(1, M // (_TARGET_M_TIE_PASSES * _PT_ROWS))),
@@ -2511,15 +2570,15 @@ def _matmul_split_cost(
     # small additive split overhead instead of multiplying the whole estimate.
     batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
-    return (
-        execution_us
-        + m_lane_underuse_us
-        + m_tile_underfill_us
-        + wide_n_us
-        + large_m_tile_shape_us
-        + core_underuse_us
-        + batch_split_us
-    )
+    return {
+        "pt_underfill": pt_underfill_us,
+        "m_lane_underuse": m_lane_underuse_us,
+        "m_tile_underfill": m_tile_underfill_us,
+        "wide_n": wide_n_us,
+        "large_m_tile_shape": large_m_tile_shape_us,
+        "core_underuse": core_underuse_us,
+        "batch_split": batch_split_us,
+    }
 
 
 def _single_input_row_dims(

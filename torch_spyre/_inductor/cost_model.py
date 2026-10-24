@@ -107,7 +107,11 @@ implementations, switched on ``CostParams.use_bundled_cost_model``:
 
 - UPSTREAM (``use_bundled_cost_model=False``): the computation and partial-sum part of
   ``work_division._matmul_execution_cost``, shared with the work-division planner.
-  Standalone split-ranking preferences are excluded: they are not operation times.
+  Standalone split-ranking preferences are excluded from time predictions. The
+  allocator enables ``restore_matmul_split_preferences`` after shortlisting to add
+  all nine preferences to its objective, replacing the separate graph batch charge.
+  These amounts rank shapes; they are not measured operation times. They remain on
+  the compute side of the existing compute/memory overlap.
   It is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
@@ -191,18 +195,19 @@ import regex
 import sympy
 from sympy.utilities.lambdify import implemented_function
 
+from . import config
 from .work_division import (
     _DECODE_MAX_ROWS,
     _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
+    _matmul_split_preferences,
     # These wrappers dispatch symbolic operands to SymPy.
-    min,
-    max,
-    log2,
     isinf,
+    log2,
+    max,
+    min,
 )
-from . import config
 
 
 @dataclasses.dataclass
@@ -671,6 +676,9 @@ class CostParams:
     # compute/HBM/spill/split-shape model below (``_matmul_ns_bundled``).
     # False -- delegates matmul entirely to ``work_division._matmul_execution_cost``.
     use_bundled_cost_model: bool = True
+    # Add standalone shape preferences to the graph objective, in place of its
+    # batch charge. Time prediction and candidate shortlisting keep this off.
+    restore_matmul_split_preferences: bool = False
     # MATMUL compute term. T_matmul = max(compute, HBM), where
     # compute = MACs/cores/(mac_peak*pt_eff). mac_peak=1140 (sustained) fit on the
     # compute-DOMINANT low-core runs (cores 4-8, compute 80-90% of the kernel; the old
@@ -2094,6 +2102,43 @@ def _matmul_passes(o, K):
     return o.matmul_macs / one_pass
 
 
+def _matmul_preference_price(axes, operand_bytes):
+    """Numeric standalone preferences, tabulated over existing legal divisions.
+
+    Reuse the implemented-function lowering used by decode delivery. Evaluating
+    the helper numerically preserves its floors, logs and fractional PT factor.
+    All nine standalone preferences are included. The caller disables the
+    separate graph batch-versus-M preference to charge it once.
+    """
+    b_axis, m_axis, n_axis, k_axis, shared_weight = axes
+    B, M, N, K = (int(axis[0]) for axis in axes[:4])
+    max_cores = config.sencores
+
+    def price(b, m, n, k):
+        terms = _matmul_split_preferences(
+            (B, int(b)),
+            (M, int(m)),
+            (N, int(n)),
+            (K, int(k)),
+            max_cores,
+            shared_weight,
+            operand_bytes,
+        )
+        return round(1000 * sum(terms.values()))
+
+    tag = regex.sub(
+        r"\W", "_", f"{B}_{M}_{N}_{K}_{max_cores}_{shared_weight}_{operand_bytes}"
+    )
+    fn = implemented_function(
+        sympy.Function(f"matmul_preferences_{tag}", integer=True, nonnegative=True),
+        price,
+    )
+    splits = (b_axis[1], m_axis[1], n_axis[1], k_axis[1])
+    if any(isinstance(s, sympy.Basic) and s.free_symbols for s in splits):
+        return fn(*splits)
+    return price(*splits)
+
+
 def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     """Compute-side (ns) of a bundle containing a matmul, using the UPSTREAM
     (``CostParams.use_bundled_cost_model=False``) matmul model.
@@ -2102,14 +2147,18 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     memory term, exactly as for ``_matmul_ns_bundled`` -- the two terms count the same
     operand/output bytes, so charging both double-counts memory (and the split-cost
     version is blind to LX residency, which is what the co-optimizing planner steers).
-    Standalone chooser preferences are also excluded: a preference for using more
-    cores must not become an additive latency on every matmul in the graph.
+    Standalone chooser preferences are excluded from time predictions. With
+    ``restore_matmul_split_preferences``, all nine enter this compute-side score,
+    before the existing overlap with memory. The standalone batch preference
+    replaces the separate graph batch charge. These preferences rank shapes;
+    they are not newly measured operation times.
 
     The estimate is for one pass over the output buffer and is charged once per
     pass of the loop (``_matmul_passes``), never multiplied by the trip count
     directly: a stacked output already spans the trips.
     """
     total_us = 0.0
+    preferences_ns = 0.0
     for o in ops:
         if not getattr(o, "is_matmul", False):
             continue
@@ -2138,7 +2187,14 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 f"k_axis={k_axis}, cores_used={cores_used})"
             )
         total_us += us * _matmul_passes(o, k_axis[0])
-    return total_us * 1000.0 + _matmul_batch_split_ns(ops, p)  # us -> ns
+        if p.restore_matmul_split_preferences:
+            preferences_ns += _matmul_preference_price(
+                axes, o.dtype_bytes
+            ) * _matmul_passes(o, k_axis[0])
+    batch_ns = (
+        0.0 if p.restore_matmul_split_preferences else _matmul_batch_split_ns(ops, p)
+    )
+    return total_us * 1000.0 + preferences_ns + batch_ns  # us -> ns
 
 
 def _matmul_batch_split_ns(ops: list, p: CostParams):
@@ -3200,7 +3256,9 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             "(shared-weight split rate, before compute overlap)"
         )
     batch_split_extra = (
-        0.0 if p.use_bundled_cost_model else _matmul_batch_split_ns(ops, p)
+        0.0
+        if p.use_bundled_cost_model or p.restore_matmul_split_preferences
+        else _matmul_batch_split_ns(ops, p)
     )
     if batch_split_extra:
         lines.append(
@@ -3238,7 +3296,9 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         # see the module docstring), and the bundle memory term supplies the traffic.
         # Report the reconstructed axes each matmul op was priced with, then R/W.
         lines.append(
-            "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
+            "  -- objective score (matmul, includes shape preferences) --"
+            if p.restore_matmul_split_preferences
+            else "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
         )
         compute_ns = batch_split_extra
         for o in ops:
@@ -3276,11 +3336,24 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 f"cores={cores_used} -> compute {us:.2f} us{per_pass}"
             )
             compute_ns += us * passes * 1000.0
+            if p.restore_matmul_split_preferences:
+                preference_ns = _matmul_preference_price(axes, o.dtype_bytes)
+                lines.append(
+                    f"       shape preferences: {preference_ns / 1000:.2f} us"
+                    f"{per_pass} (score only; before compute/memory overlap)"
+                )
+                compute_ns += preference_ns * passes
         R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
-        lines.append(
-            f"     compute = {compute_ns / 1000:.2f} us   R={R}B (read) W={W}B (write)"
+        compute_label = (
+            "compute + preferences" if p.restore_matmul_split_preferences else "compute"
         )
-        lines.append(f"     => T_model = {predict_ops(ops, p) / 1000:.2f} us")
+        lines.append(
+            f"     {compute_label} = {compute_ns / 1000:.2f} us   R={R}B (read) W={W}B (write)"
+        )
+        score_label = (
+            "objective_score" if p.restore_matmul_split_preferences else "T_model"
+        )
+        lines.append(f"     => {score_label} = {predict_ops(ops, p) / 1000:.2f} us")
         return "\n".join(lines)
     # Prediction with the rough calculation spelled out, so SPYRE_DUMP_COST shows the
     # same step-by-step breakdown (base + turnaround, then the underfill derate for
