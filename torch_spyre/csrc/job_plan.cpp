@@ -16,9 +16,14 @@
 
 #include "job_plan.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,6 +32,71 @@
 #include "spyre_stream.h"
 
 namespace spyre {
+
+namespace {
+
+std::atomic<uint64_t> g_cache_hits{0};
+std::atomic<uint64_t> g_cache_misses{0};
+std::atomic<uint64_t> g_cache_evictions{0};
+std::atomic<uint64_t> g_cache_entries{0};
+std::atomic<uint64_t> g_cache_bytes{0};
+
+bool envEnabled(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && std::string_view(v) == "1";
+}
+
+uint64_t envUint(const char* name, uint64_t fallback) {
+  const char* v = std::getenv(name);
+  return v != nullptr ? std::strtoull(v, nullptr, 10) : fallback;
+}
+
+std::string correctionKey(const std::vector<at::Tensor>& tensors) {
+  std::ostringstream key;
+  for (const auto& t : tensors) {
+    key << *get_composite_address(t) << '/' << t.sizes() << t.strides() << '+'
+        << t.storage_offset() << ':' << static_cast<int>(t.scalar_type())
+        << ';';
+  }
+  return key.str();
+}
+
+}  // namespace
+
+CorrectionCache::Blob CorrectionCache::find(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = index_.find(key);
+  if (it == index_.end()) return nullptr;
+  lru_.splice(lru_.begin(), lru_, it->second);
+  return it->second->second;
+}
+
+void CorrectionCache::insert(const std::string& key, Blob blob) {
+  const uint64_t max_entries =
+      envUint("TORCH_SPYRE_CORRECTION_CACHE_ENTRIES", 8192);
+  const uint64_t max_bytes =
+      envUint("TORCH_SPYRE_CORRECTION_CACHE_BYTES", uint64_t{4} << 30);
+  std::lock_guard<std::mutex> lock(mu_);
+  if (index_.count(key) != 0) return;
+  while (!lru_.empty() && (lru_.size() >= max_entries ||
+                           g_cache_bytes + blob->size() > max_bytes)) {
+    g_cache_bytes -= lru_.back().second->size();
+    --g_cache_entries;
+    ++g_cache_evictions;
+    index_.erase(lru_.back().first);
+    lru_.pop_back();
+  }
+  if (max_entries == 0 || g_cache_bytes + blob->size() > max_bytes) return;
+  g_cache_bytes += blob->size();
+  ++g_cache_entries;
+  lru_.emplace_front(key, std::move(blob));
+  index_[key] = lru_.begin();
+}
+
+CorrectionCacheStats getCorrectionCacheStats() {
+  return {g_cache_hits, g_cache_misses, g_cache_evictions, g_cache_entries,
+          g_cache_bytes};
+}
 
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
@@ -161,6 +231,24 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
+  // Without a host input buffer the correction depends only on the addresses,
+  // shapes and strides of the tensors, which repeat once the allocator settles.
+  const bool cacheable =
+      input_buffer_ == nullptr && envEnabled("TORCH_SPYRE_CORRECTION_CACHE");
+  const bool verify =
+      cacheable && envEnabled("TORCH_SPYRE_CORRECTION_CACHE_VERIFY");
+  std::string key;
+  CorrectionCache::Blob cached;
+  if (cacheable) {
+    key = correctionKey(ctx.inputs_outputs);
+    cached = correction_cache_.find(key);
+    if (cached && !verify) {
+      ++g_cache_hits;
+      launchCorrection(ctx, std::move(cached), stream);
+      return;
+    }
+  }
+
   std::vector<flex::HostComputeArg> args;
 
   // Cases 1 and 2 need no address args, input_buffer_ and ishape_ carry
@@ -201,21 +289,41 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // allocation size.
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
 
+  if (cached) {
+    ++g_cache_hits;
+    TORCH_CHECK(cached->size() == host_buffer->size() &&
+                    std::memcmp(cached->data(), host_buffer->data(),
+                                host_buffer->size()) == 0,
+                "Correction cache returned a stale correction of ",
+                host_buffer->size(), " bytes");
+  } else if (cacheable) {
+    ++g_cache_misses;
+    // The buffer is not written after launchHostCompute returns, so later
+    // launches can share it.
+    correction_cache_.insert(key, host_buffer);
+  }
+
+  launchCorrection(ctx, std::move(host_buffer), stream);
+}
+
+void JobPlanStepHostCompute::launchCorrection(
+    LaunchContext& ctx, std::shared_ptr<flex::HostComputeBuffer> correction,
+    const SpyreStream& stream) const {
   if (ctx.batch_program_corrections) {
     ctx.program_corrections.push_back(
-        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
-                                     device_address_.clone_non_owning())});
+        {std::move(correction), std::make_shared<flex::CompositeAddress>(
+                                    device_address_.clone_non_owning())});
     return;
   }
 
   // Create DmaParams to transfer the host buffer.
   auto* dma_params =
-      flex::createDmaParams(host_buffer->data(), host_buffer->size(),
+      flex::createDmaParams(correction->data(), correction->size(),
                             /*to_device=*/true, &device_address_);
   dma_params->pipeline_barrier = pipeline_barrier_;
   // The managed buffer is freed when the callback is destroyed, which happens
   // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*) {};
+  dma_params->callback = [correction](void*) {};
 
   try {
     stream.launchH2D(dma_params);
