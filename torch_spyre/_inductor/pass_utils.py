@@ -67,9 +67,9 @@ from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
 from .core_mapping import (
+    PerCoreView as PerCoreView,
     core_to_slice_mapping,
     decompose_fused_split_view,
-    same_owner_maps,
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
@@ -3277,62 +3277,6 @@ def lower_pad_sequence(
     return padded_buf, list(new_ops)
 
 
-@dataclass(frozen=True)
-class PerCoreView:
-    """Geometric description of a buffer's per-core slicing.
-
-    - work_slice_dims: (device-dim index, split factor) pairs, one per
-      split dim.
-    - core_to_slot: (device-dim index, slice-index expression in core_id)
-      pairs giving each core's position along that split dim.
-    - num_cores: physical cores over which ``core_to_slot`` is defined. This
-      can exceed the number of logical slices when data is replicated.
-      If omitted, the split product is used. Views that omit a reduction axis
-      or describe broadcast copies must retain the explicit physical count.
-
-    The first two fields are keyed by the buffer's device-dim index — not by
-    op-local iter symbols — so the value depends only on the buffer's physical
-    slicing.
-
-    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
-        work_slice_dims = ((0, 4),)
-        core_to_slot    = ((0, Mod(core_id, 4)),)
-    so core_id=2 owns slot 2 along dim 0.
-    """
-
-    work_slice_dims: tuple[tuple[int, int], ...]
-    core_to_slot: tuple[tuple[int, Expr], ...]
-    split_product: int
-    num_cores: int | None = None
-
-    def __init__(
-        self,
-        work_slice_dims: tuple[tuple[int, int], ...],
-        core_to_slot: tuple[tuple[int, Expr], ...],
-        num_cores: int | None = None,
-        *,
-        split_product: int = 0,  # dummy arg to absorb automatically copied args
-    ):
-        object.__setattr__(self, "work_slice_dims", work_slice_dims)
-        object.__setattr__(self, "core_to_slot", core_to_slot)
-        object.__setattr__(
-            self, "split_product", math.prod(split for _, split in work_slice_dims)
-        )
-        object.__setattr__(self, "num_cores", num_cores)
-
-    def same_partition(self, other: "PerCoreView") -> bool:
-        """Whether both views assign every physical core the same buffer slice."""
-
-        return same_owner_maps(
-            dict(self.work_slice_dims),
-            dict(self.core_to_slot),
-            self.num_cores if self.num_cores is not None else self.split_product,
-            dict(other.work_slice_dims),
-            dict(other.core_to_slot),
-            other.num_cores if other.num_cores is not None else other.split_product,
-        )
-
-
 def per_core_views_equal(left: PerCoreView | None, right: PerCoreView | None) -> bool:
     """None-aware physical-partition comparison."""
 
@@ -3636,6 +3580,41 @@ def _per_core_view_from_prep(
                     f"returning empty_view"
                 )
                 return unrepresentable
+
+        # Repack can put an outer loop inside one physical stick-count axis:
+        # 2*head + floor(width/64). Head's host stride128 has no direct match
+        # in [64, 1024, 1], yet head4 owns four contiguous stick groups. The
+        # multi-axis decomposition below cannot infer a single driven axis.
+        # Reuse the relayout projector's whole-rectangle containment proof;
+        # do not infer ownership just from a divisible host stride.
+        if (
+            dev_dim is None
+            and config.lx_planner_relayout
+            and config.lx_extended_ownership
+        ):
+            from .slice_ownership import project_slice_axis
+
+            driven = [
+                axis
+                for axis, coord in enumerate(prep.dep_device_coordinates)
+                if sym in coord.free_symbols
+            ]
+            if len(driven) == 1 and driven[0] != len(device_size) - 1:
+                axis = driven[0]
+                coordinate = prep.dep_device_coordinates[axis]
+                if device_size[axis] % split == 0 and all(
+                    per_sym.get(other, 1) == 1
+                    for other in coordinate.free_symbols - {sym}
+                ):
+                    projected = project_slice_axis(
+                        coordinate,
+                        int(device_size[axis]),
+                        split,
+                        iter_space,
+                        floor_only=True,
+                    )
+                    if projected is not None and projected[0] == sym:
+                        dev_dim = axis
 
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when
