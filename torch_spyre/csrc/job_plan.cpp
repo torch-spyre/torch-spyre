@@ -133,7 +133,6 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
-// NOTE: kDimension is not yet implemented; only kAddress is supported.
 std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
     const std::vector<at::Tensor>& tensors,
     const std::vector<SymbolicArg>& symbolic_args) {
@@ -147,10 +146,27 @@ std::vector<flex::HostComputeArg> JobPlanStepHostCompute::resolveSymbolicArgs(
       case SymbolicArgKind::kAddress:
         resolved[i] = get_composite_address(tensors[arg.tensor_id]);
         break;
-      case SymbolicArgKind::kDimension:
-        TORCH_CHECK(false,
-                    "SymbolicArgKind::kDimension is not yet implemented");
+      case SymbolicArgKind::kDimension: {
+        // A varying dimension behind a symbolic loop bound. The bundle
+        // declares it as
+        //   !sdscbundle.input_arg<index, granularity=G, max_value=M>
+        // and the device derives the trip count from it as (ub - lb) / step,
+        // so the value bound here is the ONLY place the runtime size enters
+        // the program. Nothing in the program body is rewritten for it, which
+        // is the whole point: an address or stride derived from this size
+        // would instead have to be recomputed on every dispatch.
+        //
+        // size(), i.e. the LOGICAL size. Under a max-strided reservation the
+        // allocation is deliberately larger, and it is the logical size that
+        // varies per call and that the trip count must track.
+        const at::Tensor& tensor = tensors[arg.tensor_id];
+        TORCH_CHECK(arg.dim_index >= 0 && arg.dim_index < tensor.dim(),
+                    "symbolic_args[", i, "] dim_index ", arg.dim_index,
+                    " is out of range for the rank-", tensor.dim(),
+                    " tensor at tensor_id ", arg.tensor_id);
+        resolved[i] = static_cast<int64_t>(tensor.size(arg.dim_index));
         break;
+      }
       default:
         TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
                     static_cast<int32_t>(arg.kind));
