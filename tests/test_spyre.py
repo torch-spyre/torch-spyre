@@ -55,14 +55,6 @@ _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
 )
 
 
-# A float16-format bool's float32 or integer result is staggered on device.
-_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="a staggered result is read back without restoring its order (#4393)",
-)
-
-
 def _expect_raise(match):
     """Decorator: the test passes only if it raises with a message matching ``match``."""
 
@@ -415,7 +407,6 @@ class TestSpyre(TestCase):
             subtest(
                 dtype,
                 name=str(dtype).removeprefix("torch."),
-                decorators=[_EAGER_BOOL_READBACK_XFAIL],
             )
             for dtype in (torch.float32, torch.int32, torch.int64)
         ],

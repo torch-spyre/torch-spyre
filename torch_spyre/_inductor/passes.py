@@ -98,7 +98,7 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
-from .split_multi_ops import split_multi_ops, validate_ops
+from .split_multi_ops import split_multi_ops, validate_ops, optimize_shuffling
 
 
 logger = get_inductor_logger("passes")
@@ -487,6 +487,7 @@ class CustomPreSchedulingPasses:
             split_multi_ops,
             propagate_spyre_tensor_layouts,
             validate_ops,
+            optimize_shuffling,
             optimize_restickify_locations,
             reorder_nonstick_dims,
             finalize_layouts,

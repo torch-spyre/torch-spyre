@@ -18,12 +18,13 @@ from typing import Any
 
 from sympy import Symbol
 
-from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._C import DataFormats, ElementArrangement, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
     DLFLOAT16_MAX,
     FP8_2D_STICK_OPS,
+    STAGGERED_EAS,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
@@ -329,6 +330,87 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return layout_info
 
 
+def _shuffle_stick_levels(
+    size: int, elems_per_stick: int, ea: ElementArrangement
+) -> list[tuple[int, int]]:
+    """Element-arrangement levels (cardinality, alpha) of a `shuffle` stick dim.
+
+    Levels are listed innermost first (``elem_arr_0`` first); alpha is how far
+    the coordinate advances per step of that level. Levels of cardinality 1
+    carry no arrangement and are dropped (the innermost level is always kept),
+    so a single-stick STANDARD dim is just ``[(elems_per_stick, 1)]``.
+
+    The staggered patterns are the ones deeptools exercises in
+    ``dxp/test/elem_arrangement``:
+
+    * 16-bit tensor (64 elements per stick), staggered inside the stick:
+      ``[4/a1, 2/a32, 8/a4]`` then one level of ``a64`` per stick.
+    * FP32 tensor (32 elements per stick), staggered over a stick pair that
+      holds 64 columns: ``[4/a1, 8/a8 // 2/a4]`` then one level of ``a64`` per
+      pair.
+    """
+    if ea not in STAGGERED_EAS:
+        levels = [(elems_per_stick, 1), (-(-size // elems_per_stick), elems_per_stick)]
+    elif elems_per_stick == 64:
+        if size % 64:
+            raise Unsupported(
+                f"shuffle to/from {ea.name} needs the stick dim ({size} per core) "
+                f"to be a multiple of 64 for 16-bit data"
+            )
+        levels = [(4, 1), (2, 32), (8, 4), (size // 64, 64)]
+    elif elems_per_stick == 32:
+        if size % 64:
+            raise Unsupported(
+                f"shuffle to/from {ea.name} needs the stick dim ({size} per core) "
+                f"to be a multiple of 64 for FP32 data (a stick pair)"
+            )
+        levels = [(4, 1), (8, 8), (2, 4), (size // 64, 64)]
+    else:
+        raise Unsupported(
+            f"shuffle to/from {ea.name} is not defined for {elems_per_stick} "
+            f"elements per stick"
+        )
+    return [lvl for i, lvl in enumerate(levels) if i == 0 or lvl[0] != 1]
+
+
+def _gen_shuffle_stick_coord_info(
+    size: int,
+    nsplits: int,
+    elems_per_stick: int,
+    padding: str,
+    ea: ElementArrangement,
+) -> dict:
+    """Coordinate info of the stick dim of a `shuffle` tensor, in arrangement `ea`."""
+    levels = _shuffle_stick_levels(size, elems_per_stick, ea)
+    zero = {"Affine": {"alpha_": 0, "beta_": 0}}
+    return {
+        "spatial": 3,
+        "temporal": 0,
+        "elemArr": len(levels),
+        "padding": padding,
+        "folds": {
+            "dim_prop_func": [
+                {"Affine": {"alpha_": size, "beta_": 0}},
+                zero,
+                zero,
+                *(
+                    {"Affine": {"alpha_": alpha, "beta_": 0}}
+                    for _, alpha in reversed(levels)
+                ),
+            ],
+            "dim_prop_attr": [
+                {"factor_": nsplits, "label_": "core_fold"},
+                {"factor_": 1, "label_": "corelet_fold"},
+                {"factor_": 1, "label_": "row_fold"},
+                *(
+                    {"factor_": card, "label_": f"elem_arr_{i}"}
+                    for i, (card, _) in reversed(list(enumerate(levels)))
+                ),
+            ],
+        },
+    }
+
+
 def gen_coord_info_value(
     size: int,
     nsplits: int,
@@ -340,9 +422,13 @@ def gen_coord_info_value(
     tensor_idx: int = -1,
     opfunc: str = "",
     core_stride: int | None = None,
+    element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
+    is_ea_shuffle: bool = False,
 ):
     """
     Args:
+        is_ea_shuffle: True for a `shuffle` that changes the element arrangement
+        (a tensor is staggered); `element_arrangement` then shapes the stick dim.
         conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
         If conv_params is not specified, pad type should default to "nopad" and total_size to size.
     """
@@ -403,6 +489,10 @@ def gen_coord_info_value(
                 ],
             },
         }
+    elif is_stick_dim and is_ea_shuffle:
+        return _gen_shuffle_stick_coord_info(
+            size, nsplits, elems_per_stick, padding, element_arrangement
+        )
     elif is_stick_dim and tensor_idx == 0 and opfunc == "batchmatmulfp8":
         return {
             "spatial": 3,
@@ -1169,6 +1259,12 @@ def generate_sdsc(
             result[f"[{c}, 0, 0]"] = str(local_symbols[key])
         return result
 
+    # `shuffle` is also the opfunc of restickify; only a shuffle with a staggered
+    # side re-arranges the elements of a stick.
+    is_ea_shuffle = sdsc_spec.opfunc == "shuffle" and any(
+        a.element_arrangement in STAGGERED_EAS for a in sdsc_spec.args
+    )
+
     def _build_coord_info(op, tensor, tensor_idx: int) -> dict:
         """Builds the coordinate information for all dimensions of a tensor.
 
@@ -1233,6 +1329,8 @@ def generate_sdsc(
                 core_stride=(
                     _coord_core_stride(dim, is_input, nsplits) if is_tiled else None
                 ),
+                element_arrangement=tensor.element_arrangement,
+                is_ea_shuffle=is_ea_shuffle,
             )
         return result
 
@@ -1611,6 +1709,7 @@ def generate_sdsc(
                                                 or int(core) in active_core_ids
                                             }
                                             if sdsc_spec.opfunc == "shuffle"
+                                            and not is_ea_shuffle
                                             and tensor.work_division is not None
                                             else {}
                                         ),
