@@ -2132,6 +2132,24 @@ def lower_where(condition, self, other):
     )
 
     converted_condition = condition if skip_cast else to_dtype(condition, val_dtype)
+    if (
+        not skip_cast
+        and condition.get_dtype() != val_dtype
+        and result_dtype != torch.bool
+    ):
+        # The cast is realized under this where, so its only origin is
+        # aten.where.self. Layout propagation finds a dtype conversion, and the
+        # element arrangement it creates (e.g. dl16tofp32 -> DL16_TO_FP32), by the
+        # convert_element_type origin; without one the cast is recorded as
+        # STANDARD and a staggered mask is read as standard by where3.
+        origin = (
+            condition.get_origin_node() if isinstance(condition, ir.IRNode) else None
+        )
+        _ensure_synthetic_origin(
+            converted_condition,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
     if not skip_cast:
         # Spliced loop bodies no longer have FX bindings for splitting this cast.
         converted_condition.realize()

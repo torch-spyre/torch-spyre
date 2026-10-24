@@ -14,6 +14,13 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
       unlisted_test_mode: skip
       tests:
+        # Known LX-planning failures -- run and expected to fail. The masked_fill
+        # -inf result is exact; the LX wrappers then compute (y + y) / 2 or
+        # sum(y, dim=0) on it, and that arithmetic gives NaN on device even
+        # without LX planning (#5190). Covers masked_fill and masked_fill_.
+        - names:
+            - LxPlanning.*::test_masked_fill_scalar.*fp16_2d_neginf_lx_planning_(pointwise|reduction)
+          mode: xfail
         - names:
             - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_rmsnorm.*_lx_planning_(pointwise|reduction)
@@ -44,6 +51,7 @@ test_suite_config:
             - LxPlanning.*::test_uniform_custom_range_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_masked_fill_scalar.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success

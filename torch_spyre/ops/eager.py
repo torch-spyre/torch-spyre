@@ -496,6 +496,7 @@ COMPILED_OPS = [
     aten.linalg_vector_norm,
     aten.where.self,
     aten.where.self_out,
+    aten.masked_fill,
     aten.clamp,
     aten.constant_pad_nd,
     aten._scaled_mm,
