@@ -38,6 +38,9 @@ Event names have three shapes, so a reader can group without a lookup table:
 ``pipeline:<PipelineClass>``, ``pass:<PipelineClass>:<pass_name>``, and
 ``stage:<Owner>:<what>`` for a region that is not a pass -- work a pipeline does
 around its pass list, or a stage of the compile outside the pipelines entirely.
+Owner ``torch`` means an upstream ``dynamo_timed`` phase mirrored into the record
+by torch_phases.py, which is how lowering, codegen and tracing are accounted for;
+read its module docstring before relying on one of those names.
 
 Frontend time for one compile is a subtraction, not a span, because the backend
 runs per kernel from inside codegen::
@@ -52,6 +55,9 @@ when an emitter is added.
 
 A process compiling several graphs has one such event per compile, so group by
 the enclosing ``stage:compile_fx:spyre_compile`` rather than summing the record.
+That region is the compile, not the root: it runs inside the mirrored
+``stage:torch:entire_frame_compile``, so a reader must find it by name rather
+than by having no parent.
 
 Events nest, so ``inclusive_ns`` double-counts across levels and ``self_ns``
 does not. Ordinals are assignment-ordered, which reproduces the wall-clock
@@ -262,10 +268,10 @@ class TimingRecorder:
         # then record parent_ordinal None and no longer nest under the compile that
         # produced them. Identity, not equality: _Event is a dataclass, so == would
         # match a different event whose fields happen to agree.
-        if any(open_event is event for open_event in stack):
-            while stack:
-                if stack.pop() is event:
-                    break
+        for index in reversed(range(len(stack))):
+            if stack[index] is event:
+                del stack[index:]
+                break
 
     def _stack(self) -> list[_Event]:
         stack = getattr(self._stack_local, "stack", None)
@@ -374,6 +380,7 @@ def _run_metadata() -> dict[str, Any]:
         # stage:compile_fx:spyre_compile event's meta, not here.
         "frontend_only": config.frontend_only,
         "torch_version": torch.__version__,
+        "torch_git_version": torch.version.git_version,
         "python_version": sys.version.split()[0],
     }
 
@@ -382,6 +389,14 @@ def record_path(path: str, pid: Optional[int] = None) -> str:
     """Per-process destination derived from ``path``: ``x.json`` -> ``x.<pid>.json``."""
     stem, suffix = os.path.splitext(path)
     return f"{stem}.{pid if pid is not None else os.getpid()}{suffix}"
+
+
+#: The single event name every Spyre backend invocation is recorded under, for a
+#: reader computing a frontend total. Match it exactly, not by trailing segment:
+#: upstream has a ``backend_compile`` phase of its own -- the call into Inductor,
+#: recorded as ``stage:torch:backend_compile`` -- and a suffix match would count
+#: the entire Inductor compile as backend time and report no frontend at all.
+BACKEND_COMPILE_EVENT = "stage:SpyreAsyncCompile:backend_compile"
 
 
 def is_enabled() -> bool:
@@ -435,6 +450,7 @@ def _dump_at_exit() -> None:
 
 
 __all__ = [
+    "BACKEND_COMPILE_EVENT",
     "RECORDER",
     "RECORDER_VERSION",
     "TimingRecorder",
