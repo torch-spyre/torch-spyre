@@ -39,10 +39,12 @@ Pass 1 — ``reorder_nonstick_dims``
       A fused SDPA output may retain a higher-rank host view (e.g. [B, L, H, D])
       even though the downstream projection matmul reads it as a flat 2-D matrix
       [B*L, H*D]. Retaining those outer axes causes the backend to treat the op
-      as a BMM rather than the cheaper flat MM. This transform collapses
-      committed_stl to the canonical flat-M shape [M, K] when the access is
-      provably a single dense row-major 2-D matrix with a rank-2 weight. If it
-      fires, dim reorder is skipped for that buffer.
+      as a BMM rather than the cheaper flat MM, or, for a batch-1 [1, L, N]
+      output, to read the input through a rows-outermost restickify. This
+      transform collapses committed_stl to the canonical flat-M shape [M, K]
+      when the access is provably a single dense row-major 2-D matrix with a
+      rank-2 weight and the output is a logical matrix. If it fires, dim
+      reorder is skipped for that buffer.
     matmul perf reorder (tried if flat-M did not fire)
       For factorised-stick layouts, swaps the largest non-pinned nonstick dim
       into the slot between the two stick dims (outer_stick+1) so the widest
@@ -151,19 +153,25 @@ def _flat_dense_projection_x_layout(
     m_size: int,
     n_size: int,
 ) -> SpyreTensorLayout | None:
-    """Return a canonical flat-M STL for a logically 2-D dense projection, or None.
+    """Return a flat-M STL for a dense projection input, or None.
 
-    A fused attention producer can retain a higher-rank contiguous host view
-    such as [B, L, H, D] even though the downstream projection reads it as the
-    logical matrix [B*L, H*D]. Preserving those outer axes causes the backend
-    to encode the op as a BMM rather than a flat MM. Collapse only when the
-    access is provably one dense row-major 2-D matrix and the weight is rank-2.
+    The matmul reads the input as [M, K], uses a 2-D weight [N, K], and writes
+    [M, N]. M is the number of rows, K is the number of input features, and N
+    is the number of output features. An input [B, L, H, D] (batch size B,
+    sequence length L, H heads of size D) gives M = B*L and K = H*D. With the
+    flat layout, the matmul reads the input without a restickify copy.
+
+    All output dims before the last two must be 1. An [M, N] output is
+    accepted. A [1, L, N] output is also accepted: it has one batch, so it
+    holds the same data as [L, N]. The input must have more dims than the
+    output, the weight must be 2-D, and the dense-access checks below must pass.
     """
     if (
         m_size <= 1
         or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
+        or len(output.size) < 2
+        or any(size != 1 for size in output.size[:-2])
+        or len(x.layout.size) <= len(output.size)
         or len(y.layout.size) != 2
         or not x.layouts
         or x.layouts[0].element_arrangement != ElementArrangement.STANDARD

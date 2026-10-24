@@ -2871,3 +2871,84 @@ def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
         compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
         is None
     )
+
+
+def _record_flat_m_projections():
+    """Patch NDO's flat-M rule to record the buffers it rewrites."""
+    import torch_spyre._inductor.nonstick_dim_order as _ndo
+
+    fired = []
+    try_flat_m_projection = _ndo._try_flat_m_projection
+
+    def recording(buf, x_dep, op):
+        result = try_flat_m_projection(buf, x_dep, op)
+        if result is not None:
+            fired.append(buf.get_name())
+        return result
+
+    return patch.object(_ndo, "_try_flat_m_projection", recording), fired
+
+
+@pytest.mark.parametrize("form", ["linear"])
+@pytest.mark.parametrize("rows", [512])
+def test_nonstick_flat_dense_projection_unit_batch_output(rows, form):
+    """NDO collapses a batch-1 SDPA output to flat [L, K] for a [1, L, N] o_proj.
+
+    A batch-1 model keeps the projection output's unit batch dim, so the output
+    is [1, L, N] rather than the [M, N] of
+    test_nonstick_flat_dense_projection_collapses_outer_dims. The SDPA output
+    [1, L, H, D] is then still a higher-rank view of the matrix [L, H*D] the
+    projection reads. NDO must give it the canonical flat-M layout (K-sticks
+    outer, rows contiguous), so the projection reads it in place instead of
+    through a restickify to a rows-outermost layout.
+    """
+    import torch.nn.functional as F
+
+    H, D, N = 2, 128, 128
+    K = H * D
+    q, k, v = [torch.randn(1, H, rows, D, dtype=torch.float16) for _ in range(3)]
+    weight = torch.randn((N, K) if form == "linear" else (K, N), dtype=torch.float16)
+    weight = weight * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        unit_batch = attention.transpose(1, 2).reshape(1, rows, K)
+        if form == "linear":
+            return F.linear(unit_batch, weight)
+        return unit_batch @ weight
+
+    recorder, fired = _record_flat_m_projections()
+    with recorder:
+        spyre_result, plan, nonstick_log = _compile_and_run_nonstick_capture(
+            fn,
+            q.to(DEVICE),
+            k.to(DEVICE),
+            v.to(DEVICE),
+            weight.to(DEVICE),
+        )
+
+    assert fired, (
+        "expected the flat-M projection to fire for the o_proj input, nonstick_log "
+        f"{[(name, list(stl.device_size)) for name, stl in nonstick_log.items()]}"
+    )
+    for name in fired:
+        stl = nonstick_log[name]
+        assert list(stl.device_size) == [K // 64, rows, 64], (name, stl.device_size)
+        # Strides, not only sizes, name the slots: K-sticks outer, rows next.
+        assert list(stl.stride_map) == [64, K, 1], (name, stl.stride_map)
+    restickified = {r.arg_name for resticks in plan.values() for r in resticks}
+    assert not restickified & set(fired), (
+        f"the projection should read {fired} in place, but the restickify plan "
+        f"reads {sorted(restickified & set(fired))}"
+    )
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.02,
+        rtol=0.05,
+    )
