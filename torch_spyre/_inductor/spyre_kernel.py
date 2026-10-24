@@ -975,7 +975,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             # Check if operation supports the argument's dtype
             if not (
-                op == IDENTITY_OP
+                op in (IDENTITY_OP, RESTICKIFY_OP)
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (

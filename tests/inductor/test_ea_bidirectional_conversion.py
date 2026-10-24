@@ -756,4 +756,118 @@ def test_pad_of_staggered_inside_stick_pair_raises():
         torch.compile(fn)(a.to(DEVICE_NAME))
 
 
+def _rotate_half(x, half):
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+
+_STAGGERED_VIEW_PROGRAMS = {
+    # (input shape, program on the converted tensor)
+    "neg_of_stick_slice": ((4, 128), lambda x: -x[:, 64:]),
+    "neg_of_row_slice": ((4, 128), lambda x: -x[1:3]),
+    "cat_of_one_tensor": ((4, 64), lambda x: torch.cat([x, x])),
+    "stack_of_one_tensor": ((4, 64), lambda x: torch.stack([x, x])),
+    "rotate_half_head_128": ((4, 128), lambda x: _rotate_half(x, 64)),
+    # 64 rows let the conversion offer layouts with the stick on rows as well.
+    "neg_of_stick_slice_64_rows": ((64, 128), lambda x: -x[:, 64:]),
+}
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+@pytest.mark.parametrize("program", list(_STAGGERED_VIEW_PROGRAMS))
+def test_staggered_view_keeps_arrangement(program, conversion):
+    """An op that reads whole stagger units through a view keeps the arrangement."""
+    shape, view_fn = _STAGGERED_VIEW_PROGRAMS[program]
+    dtype, convert, expected_ea, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16(shape, 7, base=1).to(dtype)
+
+    def fn(a):
+        return view_fn(convert(a))
+
+    torch._dynamo.reset()
+    out = torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME))
+    assert_ea(out, expected_ea)
+
+    def round_trip(a):
+        return restore(fn(a))
+
+    restored = torch.compile(round_trip, dynamic=False)(a.to(DEVICE_NAME))
+    assert_ea(restored, ElementArrangement.STANDARD)
+    assert torch.equal(restored.cpu(), round_trip(a))
+
+
+@pytest.mark.parametrize("conversion", list(_STAGGERING_CONVERSIONS))
+def test_first_element_of_each_staggered_stick(conversion):
+    """Reading the first element of each stick is unaffected by the stagger."""
+    dtype, convert, _, restore = _STAGGERING_CONVERSIONS[conversion]
+    a = _small_int_fp16((4, 128), 7, base=1).to(dtype)
+
+    def fn(a):
+        return -convert(a)[:, :1]
+
+    torch._dynamo.reset()
+    out = torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME))
+    assert_ea(out, ElementArrangement.STANDARD)
+    assert torch.equal(out.cpu(), fn(a))
+
+
+@expects_raise
+@pytest.mark.parametrize("rows", [4, 64])
+def test_staggered_view_splitting_a_unit_raises(rows):
+    """A read that starts inside a DL16_TO_FP32 stick pair cannot keep the stagger."""
+    a = _small_int_fp16((rows, 64), 7, base=1)
+
+    def fn(a):
+        # rotate_half at head dim 64 splits each stick pair at 32.
+        return _rotate_half(a.float(), 32)
+
+    torch._dynamo.reset()
+    with pytest.raises(InductorError, match="not whole units"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME))
+
+
+@expects_raise
+def test_staggered_transpose_contiguous_raises():
+    """Moving the stick of a staggered tensor needs a restickify, which drops it."""
+    a = _small_int_fp16((64, 64), 7, base=1)
+
+    def fn(a):
+        return a.float().t().contiguous()
+
+    torch._dynamo.reset()
+    with pytest.raises(InductorError, match="restickifying a staggered tensor"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME))
+
+
+def _offset_write(y, z):
+    y[:, 16:48] = z
+    return y
+
+
+@expects_raise
+def test_offset_write_into_staggered_graph_input_raises():
+    """An offset write into a staggered input would relocate it with a restickify."""
+    torch._dynamo.reset()
+    to_fp32 = torch.compile(lambda t: t.float(), dynamic=False)
+    y = to_fp32(_small_int_fp16((4, 128), 7).to(DEVICE_NAME))
+    assert_ea(y, ElementArrangement.DL16_TO_FP32)
+    z = _small_int_fp16((4, 32), 5, base=20).float().to(DEVICE_NAME)
+
+    with pytest.raises(InductorError, match="restickifying a staggered tensor"):
+        torch.compile(_offset_write, dynamic=False)(y, z)
+
+
+@expects_raise
+def test_offset_write_into_staggered_buffer_raises():
+    """The same for a staggered buffer computed inside the compiled program."""
+    a = _small_int_fp16((64, 128), 7)
+    b = _small_int_fp16((64, 32), 5, base=20)
+
+    def fn(a, b):
+        return _offset_write(a.float(), b.float())
+
+    torch._dynamo.reset()
+    with pytest.raises(InductorError, match="restickifying a staggered tensor"):
+        torch.compile(fn, dynamic=False)(a.to(DEVICE_NAME), b.to(DEVICE_NAME))
+
+
 # Made with Bob
