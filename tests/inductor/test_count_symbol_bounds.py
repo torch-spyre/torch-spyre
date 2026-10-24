@@ -38,6 +38,7 @@ occasions, so there is a test here for each.
 No device. The ShapeEnv is stubbed the way test_codegen.py stubs it.
 """
 
+import math
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -67,6 +68,7 @@ from torch_spyre._inductor.spyre_kernel import (
     _sympy_literal,
 )
 from torch_spyre._inductor.op_spec import walk_loop_specs
+from torch_spyre._inductor.views import _concretize_for_cmp
 
 SYM = "s0"
 TILE = 64
@@ -178,6 +180,47 @@ class TestConcretizeExprPrefersTheDeclaredMax(unittest.TestCase):
         expression in one returns before the ShapeEnv is consulted at all."""
         self.assertEqual(concretize_expr(64), 64)
         self.assertEqual(concretize_expr(sympy.Integer(64)), 64)
+
+
+class TestTheTwoConcretizersAgree(unittest.TestCase):
+    """``views._concretize_for_cmp`` is a second copy of ``concretize_expr``.
+
+    The copy exists only because a module-level import would cycle. When the two
+    disagree about a symbol, a comparison inside ``compute_coordinates`` or
+    tensor alignment picks its branch at one size while the geometry built around
+    it uses another. These arms make a future divergence fail here instead of
+    sitting in a comment.
+    """
+
+    def test_both_resolve_a_declared_symbol_to_its_ceiling(self):
+        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)}, hint=320)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(_concretize_for_cmp(_sym()), MAX)
+            self.assertEqual(concretize_expr(_sym()), MAX)
+
+    def test_both_still_take_the_hint_without_a_ceiling(self):
+        """The control. A dim that went dynamic by accident has no ceiling, so
+        nothing better than the hint exists and neither copy changes."""
+        graph = _graph_with_bounds({}, hint=320)
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(_concretize_for_cmp(_sym()), 320)
+            self.assertEqual(concretize_expr(_sym()), 320)
+
+    def test_the_copy_keeps_its_infinity_sentinels(self):
+        """Why the copy cannot become a thin forwarder. ``add_term`` is handed
+        ``limit=sympy.oo`` for an index with a non-zero storage offset, and
+        ``int(sympy.oo)`` raises."""
+        self.assertEqual(_concretize_for_cmp(sympy.oo), math.inf)
+        self.assertEqual(_concretize_for_cmp(-sympy.oo), -math.inf)
+        self.assertEqual(_concretize_for_cmp(math.inf), math.inf)
+
+    def test_concrete_values_reach_neither_path(self):
+        """Which is why this cannot touch a static kernel: every expression in
+        one returns before the ShapeEnv is consulted at all."""
+        self.assertEqual(_concretize_for_cmp(64), 64)
+        self.assertEqual(_concretize_for_cmp(sympy.Integer(64)), 64)
 
 
 class TestTheProducer(unittest.TestCase):
