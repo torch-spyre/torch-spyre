@@ -457,8 +457,8 @@ _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_reduce_copy_",)
 # the user ``work_div`` hint exemption there. Keyed on the op rather than a
 # config flag: the greedy passes run on the same graph and stay pinned, and an
 # op the hint pass tiled carries ``loop_info`` before the menu is enumerated, so
-# its candidates respect the pin. Written by whoever applies such a solve
-# (``CoOptimizingAllocator._apply_chosen_tilings``) and never cleared: nothing
+# its candidates respect the pin. Written by ``coarse_tiling.apply_tilings`` on
+# each op it tiles or adds to a nest, and never cleared: nothing
 # after scratchpad planning re-derives a work division, so its lifetime is the
 # rest of the compile.
 JOINT_TILING_AND_DIVISION_ATTR = "_work_division_chosen_with_tiling"

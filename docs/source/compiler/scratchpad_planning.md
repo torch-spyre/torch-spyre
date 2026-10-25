@@ -345,15 +345,22 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `read by restickify (local-read proof failed)` | Relayout is enabled, but exact physical ownership could not prove that every restickify read stays on the same core |
 | `extern kernel user` | extern ops read from HBM |
 | `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
-| `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
+| `graph input (no clone)` | without boundary cloning there is nothing to redirect |
 | `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
 | `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
 | `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only**: the joint solver *chooses* the division, so its slicing gate decides instead) |
+| `graph output (no clone)` | without boundary cloning there is nothing to redirect |
 | `no consumer reads it from LX` | residency would save nothing |
 | `lx back gap` | `backGap` is supported for HBM but not LX |
 
 That last distinction is the only difference between the two allocators,
 and it is a parameter (`division_is_fixed`) rather than a second predicate.
+
+With `auto_coarse_tiling` on, the joint path does not bar an op whose menu
+offers a tiling for `graph output (no clone)` or `no consumer reads it from
+LX`: both hold only while the op is untiled. The buffer carries the reason as
+`untiled_bar` instead, and the CP-SAT solve keeps it out of LX unless it tiles
+the op.
 
 ### Per-core size and core-division mismatch
 
