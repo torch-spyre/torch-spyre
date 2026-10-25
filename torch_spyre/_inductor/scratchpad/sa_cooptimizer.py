@@ -729,10 +729,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return False
 
     @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return False
-
-    @classmethod
     def linear_cost_only(cls) -> bool:
         return False
 
@@ -1159,7 +1155,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         term, and be paid for afterwards in the traffic residency frees.
 
         Only the per-tile scratch is sized: an escaping op's companion never
-        enters LX (``CoOptimizingAllocator._apply_chosen_tilings``).
+        enters LX (``coarse_tiling.apply_chosen_tilings``).
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
@@ -1323,7 +1319,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         A tiling shrinks what the buffer holds at once; it does not shrink what
         the buffer moves. For an op whose output escapes its tiling group,
-        ``CoarseTilingPass`` allocates a full-extent ``full_buf``, inserts a copy
+        ``apply_tilings`` allocates a full-extent ``full_buf``, inserts a copy
         op that drains one tile into it per iteration, and repoints every outside
         consumer and any graph output at it (``wsr/coarse_tile.py``). None of
         that is in the features: they were extracted from the untiled graph,
