@@ -82,6 +82,7 @@ class _Observed:
         # plan edge -> materialized copy buffer name, and each consumer's read
         # names right after materialization (V.graph is live inside the pass).
         self.copies: dict = {}
+        self.source_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
         real_materialize = alloc_mod.materialize_lx_relayouts
 
@@ -102,6 +103,12 @@ class _Observed:
                 for edge, (copy_name, _plan) in materialized_lx_relayouts(graph).items()
             }
             for plan in plans:
+                layout = graph.get_buffer(plan.source_name).get_layout()
+                self.source_layouts[plan.edge] = (
+                    list(layout.device_layout.device_size),
+                    list(layout.device_layout.stride_map),
+                    list(layout.stride),
+                )
                 for name in plan.consumer_names:
                     op = graph.get_buffer(name)
                     self.consumer_reads[name] = {
@@ -627,47 +634,77 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
 
 
 def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
-    """A coarse-tiled edge that crosses for_each_tile scopes must enumerate NO
-    relayout candidates, even though a same-group coarse-tiled edge now can
-    (see test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip
-    below, torch-spyre#5057).
+    """Relayouts must stay within one coarse-tile scope.
 
-    The producer sits in one for_each_tile body and the consumer in a
-    separate, sibling body with its own loop_group_id, so this is a true
-    cross-group edge, not merely two ops that happen to both be tiled. A
-    relayout taken at that seam would still be stale on the next outer
-    iteration the same way an in-loop one would be; the solver path must
-    decline at enumeration (loop_info gate), not merely decline to fire.
-
-    The two for_each_tile calls tile different axes of the intermediate (dim
-    0 then dim 1) specifically to force two genuinely distinct loop scopes.
-    Verified empirically, not just by inspection: equal tile_size/dims
-    siblings over the same shape fuse into one shared while_loop body (both
-    intermediates named ``while_loop_body_graph_0_0_*``); giving the second
-    call a different tile_size ALONE (same dim) still fuses the same way,
-    byte-identical candidate list. Only a different tiled axis keeps the
-    splicer from inlining the producer directly into the consumer's body --
-    which is not the cross-group case this test means to cover."""
+    The two for_each_tile bodies tile different axes to retain distinct
+    scopes. Check every offered and materialized edge by its endpoint
+    metadata; valid edges inside either body may still offer relayouts.
+    The candidate unit test also probes real sibling and nested group IDs
+    to prove that the scope gate rejects them before layout inspection.
+    """
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    tables = []
+    groups_seen = set()
+
+    def assert_same_scope(producer, consumer):
+        prod_info = getattr(producer, "loop_info", None)
+        cons_info = getattr(consumer, "loop_info", None)
+        if prod_info is None and cons_info is None:
+            return
+        assert isinstance(prod_info, CoarseTileInfo)
+        assert isinstance(cons_info, CoarseTileInfo)
+        assert prod_info.loop_group_id == cons_info.loop_group_id, (
+            f"cross-group relayout: {producer.get_name()} "
+            f"{prod_info.loop_group_id} -> {consumer.get_name()} "
+            f"{cons_info.loop_group_id}"
+        )
+
     orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
 
-    def spy_tables(self, *args, **kwargs):
-        out = orig_tables(self, *args, **kwargs)
-        if out:
-            tables.append(out)
+    def spy_tables(
+        self,
+        graph,
+        consumer_op,
+        consumer_divs,
+        parent_names,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        out = orig_tables(
+            self,
+            graph,
+            consumer_op,
+            consumer_divs,
+            parent_names,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for op in [consumer_op, *(op_by_name.get(name) for name in parent_names)]:
+            info = getattr(op, "loop_info", None)
+            if isinstance(info, CoarseTileInfo):
+                groups_seen.add(info.loop_group_id)
+        for parent, candidates in out.items():
+            if candidates:
+                assert_same_scope(op_by_name[parent], consumer_op)
         return out
 
     monkeypatch.setattr(
         alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
     )
 
-    recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
 
     def spy_mat(graph, plans):
-        recorded.extend(plans)
+        for plan in plans:
+            for name in plan.consumer_names:
+                assert_same_scope(
+                    graph.get_buffer(plan.source_name), graph.get_buffer(name)
+                )
         return real_materialize(graph, plans)
 
     monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy_mat)
@@ -700,15 +737,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     ):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
-    # Graph-global, same as the test this replaces: also covers each body's
-    # own within-scope edges, which happen to offer nothing for this graph's
-    # shapes. A future same-group change that makes one of those offer could
-    # fail this assert looking like a cross-group regression when it isn't;
-    # the printed table disambiguates by parent/consumer name.
-    assert tables == [], (
-        f"cross-group coarse-tiled edges were offered relayout: {tables}"
-    )
-    assert recorded == []
+    assert len(groups_seen) >= 2, "fixture did not retain distinct coarse-tile scopes"
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
@@ -717,8 +746,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
     relayout candidate (the same-group exception in
     ``solver_relayout_edge_context``, torch-spyre#5057), when
-    ``lx_same_tile_group_relayout`` is enabled (off by default as of #5632,
-    pending that PR's compile-time investigation), and that candidate's
+    ``lx_same_tile_group_relayout`` is enabled, and that candidate's
     cost must carry the loop's own trip-count multiplier
     (``_coarse_tile_loop_trip_count``, see TestCoarseTileLoopTripCount in
     test_scratchpad_solver.py) -- a relayout taken once but paid on every
@@ -870,3 +898,86 @@ def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch)
         )
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,width,dtype,batched,strided",
+    [
+        (512, 4096, torch.float16, False, False),
+        (64, 512, torch.float16, False, False),
+        (128, 1024, torch.float16, False, False),
+        (512, 4096, torch.float16, True, False),
+        (64, 512, torch.float32, False, True),
+    ],
+)
+def test_complete_partition_expansion_fires_and_preserves_values(
+    monkeypatch, rows, width, dtype, batched, strided
+):
+    """A real 16-to-32-core transfer with four-source destination gathers."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 16}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    # Give all 128 source/feature fragments distinct value ranges.
+    # Keep inputs negative so relu(-t) observes every destination.
+    storage_width = width * (2 if strided else 1)
+    row_ids = torch.arange(rows).reshape(-1, 1)
+    column_ids = torch.arange(storage_width).reshape(1, -1) // (2 if strided else 1)
+    fragment = (row_ids // (rows // 16)) * 8 + column_ids // (width // 8)
+    offset = (row_ids * 37 + column_ids * 17) % 8
+    host = -(fragment * 8 + offset + 1).to(dtype)
+    if strided:
+        host = host[:, ::2]
+        assert not host.is_contiguous()
+    names = ["R", "H"]
+    if batched:
+        host = host.unsqueeze(0)
+        names = ["B", *names]
+        _pnd.declare_tensor_dim("B", 1)
+    for name, size in (("R", rows), ("H", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), names)
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == 16 and plan.destination_view.num_cores == 32
+    # Physical dimension order may change when a singleton batch is present.
+    # Locate row and outer-stick axes from the committed tensor's strides,
+    # independently of the per-core views being checked.
+    dims, strides, logical_strides = observed.source_layouts[plan.edge]
+    row_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims, strides))
+        if size == rows and stride == logical_strides[-2]
+    ]
+    column_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims[:-1], strides[:-1]))
+        if size == width // dims[-1] and stride == logical_strides[-1] * dims[-1]
+    ]
+    assert len(row_axes) == len(column_axes) == 1
+    row_axis, column_axis = row_axes[0], column_axes[0]
+    assert row_axis != column_axis
+    assert _core_slices(plan.source_view, 16) == {c: {row_axis: c} for c in range(16)}
+    assert _core_slices(plan.destination_view, 32) == {
+        c: {column_axis: c // 4, row_axis: c % 4} for c in range(32)
+    }
+    # Striding doubles host backing storage, not this logical device tensor's LX span.
+    assert plan.source_footprint_bytes == rows * width * host.element_size() // 16
+    assert plan.destination_footprint_bytes == rows * width * host.element_size() // 32
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "live source and destination LX spans overlap"
+    assert torch.equal(out.cpu(), torch.relu(-host))

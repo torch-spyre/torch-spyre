@@ -21,6 +21,8 @@ path is pinned to, so the enumeration path and the reporting path cannot
 drift apart.
 """
 
+from collections import Counter
+
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
@@ -206,26 +208,29 @@ def test_split_product_must_equal_core_count():
     )
 
 
+@config.patch({"lx_same_tile_group_relayout": True})
 def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
-    """An endpoint carrying loop_info can never host a relayout: the fitted
-    law has no loop_trip factor, a tiled producer's buffer is per-tile
-    scratch, and a tiled consumer reads through a per-iteration staging op.
+    """Cross-group endpoints must stop before any layout inspection.
 
-    Probes are real-enough ComputedBuffers (created via __new__ to pass the
-    isinstance check) whose ``layout`` is a recording property: the gate is
-    the first check, so a tiled endpoint must be rejected WITHOUT the layout
-    ever being touched - distinguishing gate-rejection from the downstream
-    rejections that any fake would also hit. (The full compile-path variant
-    lives in test_solver_relayout_e2e.py, skipped until the co-opt substrate
-    survives coarse-tiled graphs at all; its non-vacuity was verified by
-    running it with the gate reverted.)"""
+    Real sibling and nested group IDs pin exact scope equality. Recording
+    layout properties distinguish this gate from later layout rejection;
+    untiled and equal-group controls must reach that later check.
+    """
     from torch._inductor.ir import ComputedBuffer
 
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         solver_relayout_edge_context,
     )
 
-    def probe(tiled):
+    def tiled(group):
+        return CoarseTileInfo(
+            loop_group_id=group,
+            loop_count=[4] * len(group),
+            loop_tiled_dims=[[0]] * len(group),
+        )
+
+    def probe(loop_info):
         class _Probe(ComputedBuffer):
             layout_accessed = False
 
@@ -234,23 +239,38 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
                 type(self).layout_accessed = True
 
         obj = _Probe.__new__(_Probe)
-        obj.loop_info = object() if tiled else None
+        obj.loop_info = loop_info
         return obj
 
-    # No graph: both gates under test sit before the first use of it.
-    graph = None
-    for prod_tiled, cons_tiled in ((True, False), (False, True), (True, True)):
-        prod, cons = probe(prod_tiled), probe(cons_tiled)
-        assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
+    unknown = object()
+    rejected = [
+        (unknown, None),
+        (None, unknown),
+        (unknown, unknown),
+        (tiled((0,)), None),
+        (None, tiled((0,))),
+        (tiled((0,)), tiled((1,))),
+        (tiled((0,)), tiled((0, 1))),
+        (tiled((0, 1)), tiled((0,))),
+        (tiled((0, 1)), tiled((0, 2))),
+    ]
+    # No graph: the loop-info and layout checks precede its first use.
+    for prod_info, cons_info in rejected:
+        prod, cons = probe(prod_info), probe(cons_info)
+        assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
         assert not type(prod).layout_accessed and not type(cons).layout_accessed, (
-            "a coarse-tiled endpoint reached checks past the loop_info gate"
+            "a cross-group endpoint reached checks past the loop_info gate"
         )
 
-    # Control: an untiled pair proceeds past the gate into the layout check,
-    # proving the probes are capable of registering deeper progression.
-    prod, cons = probe(False), probe(False)
-    assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
-    assert type(prod).layout_accessed
+    # Distinct metadata objects with equal IDs must also pass the scope gate.
+    for prod_info, cons_info in [
+        (None, None),
+        (tiled((0,)), tiled((0,))),
+        (tiled((0, 1)), tiled((0, 1))),
+    ]:
+        prod, cons = probe(prod_info), probe(cons_info)
+        assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
+        assert type(prod).layout_accessed
 
 
 # --- Solver gate vs committed gate ------------------------------------------
@@ -366,6 +386,87 @@ def test_broadcast_to_a_larger_core_domain_is_admitted_and_priced():
         )
         is None
     )
+
+
+@pytest.mark.parametrize("fragments", [4, 8, 16])
+def test_complete_partition_expansion_respects_fanin(fragments):
+    """Complete 16-to-32 repartitions reach the fan-in guard, including eight."""
+    source = PerCoreView(((0, 16),), ((0, _CORE_ID),), num_cores=16)
+    rows = 16 // fragments
+    destination = PerCoreView(
+        ((0, rows), (1, 2 * fragments)),
+        ((0, Mod(_CORE_ID, rows)), (1, floor(_CORE_ID / rows))),
+        num_cores=32,
+    )
+    edges = lx_relayout.transfer_edges(
+        dict(source.work_slice_dims),
+        dict(destination.work_slice_dims),
+        lx_relayout._core_slices(source, 16),
+        lx_relayout._core_slices(destination, 32),
+    )
+    assert destination.split_product == 32
+    assert set(Counter(src for src, _ in edges).values()) == {2 * fragments}
+    assert set(Counter(dst for _, dst in edges).values()) == {fragments}
+    assert lx_relayout.movement_supported(source, destination, 16, 32) == (
+        fragments <= 8
+    )
+
+
+@pytest.mark.parametrize("columns,supported", [(8, True), (4, False)])
+def test_expansion_rejects_replicated_multisource_destination(columns, supported):
+    """Replication cannot use the complete-destination gather exception."""
+    source = PerCoreView(((0, 16),), ((0, _CORE_ID),), num_cores=16)
+    destination = PerCoreView(
+        ((0, 4), (1, columns)),
+        ((0, Mod(_CORE_ID, 4)), (1, Mod(floor(_CORE_ID / 4), columns))),
+        num_cores=32,
+    )
+    edges = lx_relayout.transfer_edges(
+        dict(source.work_slice_dims),
+        dict(destination.work_slice_dims),
+        lx_relayout._core_slices(source, 16),
+        lx_relayout._core_slices(destination, 32),
+    )
+    # Both geometries pass uniformity and the register budget; only the
+    # rejected arm has replicated destination slices (16 slices on 32 cores).
+    assert set(Counter(src for src, _ in edges).values()) == {8}
+    assert set(Counter(dst for _, dst in edges).values()) == {4}
+    assert destination.split_product == 4 * columns
+    assert lx_relayout.movement_supported(source, destination, 16, 32) == supported
+
+
+@pytest.mark.parametrize("balanced", [True, False])
+def test_expansion_rejects_nonuniform_fanout(balanced):
+    """Keep coverage and fan-in valid while changing only source fan-out."""
+    destination = PerCoreView(
+        ((0, 4),),
+        (
+            (
+                0,
+                Piecewise(
+                    (0, Eq(_CORE_ID, 0)),
+                    (1, _CORE_ID < (4 if balanced else 3)),
+                    (2, Eq(_CORE_ID, 4 if balanced else 3)),
+                    (3, True),
+                ),
+            ),
+        ),
+        num_cores=8,
+    )
+    source_map = lx_relayout._core_slices(_TWO_ON_2, 2)
+    destination_map = lx_relayout._core_slices(destination, 8)
+    assert {row[0] for row in destination_map.values()} == {0, 1, 2, 3}
+    edges = lx_relayout.transfer_edges(
+        dict(_TWO_ON_2.work_slice_dims),
+        dict(destination.work_slice_dims),
+        source_map,
+        destination_map,
+    )
+    assert set(Counter(dst for _, dst in edges).values()) == {1}
+    assert Counter(src for src, _ in edges) == (
+        {0: 4, 1: 4} if balanced else {0: 3, 1: 5}
+    )
+    assert lx_relayout.movement_supported(_TWO_ON_2, destination, 2, 8) == balanced
 
 
 def test_destination_views_are_interned_by_ownership():

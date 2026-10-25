@@ -408,7 +408,7 @@ def canonical_tiling(spec: TileSpec) -> TileSpec:
 
 def _tileable(op: object) -> bool:
     """Whether ``op`` may be offered a coarse tiling at all. Not in a loop
-    group already, which ``CoarseTilingPass`` would clobber by stamping
+    group already, which ``apply_tilings`` would clobber by stamping
     ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint and
     span-overflow passes tiled, ``loop_info`` the members ``coarse_tile`` adds
     around them (a copy-out, a restickify of a tiled read)."""

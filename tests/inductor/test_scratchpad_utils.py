@@ -47,6 +47,8 @@ from torch._inductor.ir import (
     FallbackKernel,
     FixedLayout,
     MutationLayoutSHOULDREMOVE,
+    NonOwningLayout,
+    OperationBuffer,
     Pointwise,
 )
 from torch._inductor.sizevars import SizeVarAllocator
@@ -57,6 +59,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     get_ncores_for_buffers,
     ops_in_offset_mutation_component,
+    storage_has_single_writer,
 )
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
@@ -71,6 +74,76 @@ d0, d1, d2, d3 = sympy.symbols("d0 d1 d2 d3", integer=True, nonnegative=True)
 # one non-stick device dim, so ``device_size[0]`` is the dim under test.
 _STICK_COORD = sympy.Mod(d0, 64)
 _STICK_SIZE = 64
+
+
+class SingleWriterTest(TestCase):
+    """Exercise the shared proof with real IR and dependency extraction."""
+
+    @staticmethod
+    def _producer(name=_BUF, layout=None, input_name="input"):
+        return ComputedBuffer(
+            name=name,
+            layout=layout
+            if layout is not None
+            else FixedLayout(torch.device("cpu"), torch.float16, [4, 64], [64, 1]),
+            data=Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(input_name, 64 * index[0] + index[1]),
+                ranges=[4, 64],
+            ),
+        )
+
+    def setUp(self):
+        self.graph = SimpleNamespace(
+            operations=[],
+            sizevars=SizeVarAllocator(),
+            mark_buffer_mutated=lambda name: None,
+        )
+
+    def test_fresh_storage_and_read_only_consumer(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            reader = self._producer("reader", input_name=_BUF)
+            self.graph.operations = [producer, reader]
+            self.assertTrue(storage_has_single_writer(self.graph, producer))
+
+    def test_second_writer_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer, second_writer = self._producer(), self._producer()
+            self.assertIsNot(producer, second_writer)
+            self.assertEqual(
+                {dep.name for dep in second_writer.get_read_writes().writes}, {_BUF}
+            )
+            self.graph.operations = [producer, second_writer]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_mutation_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            mutation = self._producer("mutation", MutationLayoutSHOULDREMOVE(producer))
+            self.assertIn(_BUF, mutation.get_mutation_names())
+            self.graph.operations = [producer, mutation]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_output_alias_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            alias = OperationBuffer(name="alias", layout=NonOwningLayout(producer))
+            self.assertIn(_BUF, alias.get_inputs_that_alias_output())
+            self.graph.operations = [producer, alias]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_unimplemented_dependency_proof_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            # OperationBuffer cannot describe its writes. Unknown operations must
+            # fail closed rather than be treated as read-only.
+            unknown = OperationBuffer(name="unknown", layout=producer.get_layout())
+            with self.assertRaises(NotImplementedError):
+                unknown.get_read_writes()
+            self.graph.operations = [producer, unknown]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
 
 
 class PointwiseInPlaceInputsTest(TestCase):
