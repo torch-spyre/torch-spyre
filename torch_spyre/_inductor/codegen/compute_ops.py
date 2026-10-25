@@ -1396,20 +1396,14 @@ def generate_sdsc(
             return sdsc_spec.input_coord_padding.get(str(dim), "nopad")
         return "nopad"
 
-    def _memorg_extra(is_input: bool, alloc_node: str) -> dict:
+    def _memorg_extra(is_input: bool) -> dict:
         """Extra memOrg_ padding fields, emitted only when the op needs them."""
         if not sdsc_spec.emit_memorg_padding:
             return {}
-        extra: dict = {
+        return {
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
         }
-        # allocateNode_ is part of the forward-conv (#3284) and general memOrg
-        # contract; depthwise conv (#3510) intentionally omits it. Restore it
-        # for every non-depthwise op so forward conv2d matches its golden SDSC.
-        if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP:
-            extra["allocateNode_"] = alloc_node
-        return extra
 
     active_core_ids = sdsc_spec.completed_producer_cores or tuple(
         range(sdsc_spec.num_cores)
@@ -1694,10 +1688,7 @@ def generate_sdsc(
                                         "hbm": {
                                             "isPresent": 1,
                                             **(
-                                                _memorg_extra(
-                                                    i < sdsc_spec.num_inputs,
-                                                    f"allocate-Tensor{i}_hbm",
-                                                )
+                                                _memorg_extra(i < sdsc_spec.num_inputs)
                                                 if sdsc_spec.opfunc
                                                 != DEPTHWISE_CONV2D_OP
                                                 or i == 0
@@ -1707,10 +1698,7 @@ def generate_sdsc(
                                         "lx": {
                                             "isPresent": 1,
                                             **(
-                                                _memorg_extra(
-                                                    i < sdsc_spec.num_inputs,
-                                                    "",
-                                                )
+                                                _memorg_extra(i < sdsc_spec.num_inputs)
                                                 if sdsc_spec.opfunc
                                                 != DEPTHWISE_CONV2D_OP
                                                 or i == 0
