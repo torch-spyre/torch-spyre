@@ -14,6 +14,7 @@
 
 
 import abc
+import itertools
 import logging
 import math
 from collections import defaultdict
@@ -33,6 +34,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
+from . import config
 from .pass_utils import (
     compute_restickify_needed,
     device_coordinates,
@@ -42,6 +44,11 @@ from .pass_utils import (
 INF = math.inf
 
 logger = get_inductor_logger("optimize_restickify")
+
+try:
+    from ortools.sat.python import cp_model as _cp_model
+except ImportError:  # pragma: no cover
+    _cp_model = None  # type: ignore[assignment]
 
 
 class EdgeCostMap:
@@ -840,8 +847,352 @@ def beam_global_min_cost(operations: list) -> None:
         op.committed_stl = stl
 
 
+def _cur_layouts(ec: "EdgeCostMap") -> list:
+    """Return the dep buffer's current .layouts list, falling back to the snapshot."""
+    dep_buf = V.graph.get_buffer(ec.dep.name)
+    cur = getattr(dep_buf, "layouts", None)
+    return list(cur) if cur else list(ec._in_layouts)
+
+
+def _build_node_tables(operations: list) -> list:
+    """Build feasible-assignment tables for CP-SAT model construction.
+
+    Returns node_tables: list of (op, table) pairs for each op (with layouts
+    and a non-AnyInNode cost_fn), where table is a list of tuples
+    (i1, i2, ..., j, cost):
+      - i1..iN are indices into each input buffer's CURRENT .layouts list
+      - j is an index into the op's own .layouts list (output candidate index)
+      - cost is the total restickify cost the op pays for this combination
+      - INF combinations are excluded
+
+    Uses the dep buffer's *current* .layouts (not ec._in_layouts snapshot) so
+    that layouts added by later propagation passes are included.  This prevents
+    CP-SAT from seeing a stale, under-constrained table that is missing valid
+    low-cost assignments discovered after snapshot time.
+
+    A list is used instead of a dict because ComputedBuffer is not hashable.
+
+    Raises NotImplementedError (via _no_feasible_layout_error) if any op has an
+    empty table -- the graph is infeasible before the solver even runs.
+    """
+    node_tables: list = []
+
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        cost_fn = op.restick_cost_fn
+        if isinstance(cost_fn, AnyInNode):
+            continue  # zero cost, no constraint
+        if isinstance(cost_fn, FixedInOutNode):
+            input_stl_lists = [_cur_layouts(ec) for ec in cost_fn.edge_costs]
+            table = []
+            for in_indices in itertools.product(
+                *[range(len(stls)) for stls in input_stl_lists]
+            ):
+                in_stls = [
+                    input_stl_lists[k][in_indices[k]] for k in range(len(in_indices))
+                ]
+                cost = cost_fn.cost(in_stls, cost_fn.required_out_stl)
+                if cost < INF:
+                    table.append(in_indices + (0, cost))
+            if not table:
+                raise _no_feasible_layout_error(op)
+            node_tables.append((op, table))
+            continue
+
+        # AllSameNode: enumerate all (in_combo, out_candidate) pairs.
+        # Use only the real input edges (_input_edge_costs), not co-output edges.
+        # Co-output equality is enforced via separate constraints in the CP-SAT model
+        # (add_allowed_assignments on the co-output var and op output var pairs), so
+        # indices here must correspond to each dep's current .layouts list, not the
+        # snapshot, to stay consistent with the CP-SAT layout variables.
+        if isinstance(cost_fn, AllSameNode) and cost_fn._output_edge_costs:
+            input_stl_lists = [_cur_layouts(ec) for ec in cost_fn._input_edge_costs]
+            table = []
+            for in_indices in itertools.product(
+                *[range(len(stls)) for stls in input_stl_lists]
+            ):
+                in_stls = [
+                    input_stl_lists[k][in_indices[k]] for k in range(len(in_indices))
+                ]
+                # Pass empty co-output in_layouts so cost() skips co-output checks.
+                all_in_stls = in_stls + [None] * len(cost_fn._output_edge_costs)
+                for j, out_stl in enumerate(op.layouts):
+                    cost = cost_fn.cost(all_in_stls, out_stl)
+                    if cost < INF:
+                        table.append(in_indices + (j, cost))
+        else:
+            input_stl_lists = [_cur_layouts(ec) for ec in cost_fn.edge_costs]
+            table = []
+            for in_indices in itertools.product(
+                *[range(len(stls)) for stls in input_stl_lists]
+            ):
+                in_stls = [
+                    input_stl_lists[k][in_indices[k]] for k in range(len(in_indices))
+                ]
+                for j, out_stl in enumerate(op.layouts):
+                    cost = cost_fn.cost(in_stls, out_stl)
+                    if cost < INF:
+                        table.append(in_indices + (j, cost))
+
+        if not table:
+            raise _no_feasible_layout_error(op)
+        node_tables.append((op, table))
+
+    return node_tables
+
+
+def cp_sat_stick_optimizer(operations: list) -> None:
+    """CP-SAT layout optimizer — exact global minimum within a time limit.
+
+    Builds a CP-SAT model over all buffers with layout choices, then solves for
+    the globally optimal STL assignment that minimizes total restickify cost.
+
+    Variables: one integer variable per buffer indexed into buf.layouts.
+    Constraints: add_allowed_assignments per op (feasibility table).
+    Objective: sum of per-op cost vars, each tied via add_element to the
+               flattened input/output index combination.
+    """
+    if _cp_model is None:
+        raise ImportError(
+            "OR-Tools is required for cp_sat_stick_optimizer. "
+            "Install with: pip install ortools"
+        )
+
+    operations = _reorder_any_in_nodes(operations)
+
+    # Step 1: Build node tables (feasible assignment tuples per op).
+    node_tables = _build_node_tables(operations)
+
+    # Step 2: Build CP-SAT model.
+    model = _cp_model.CpModel()
+
+    # layout_var[buf_name] = IntVar with domain [0, len(buf.layouts)-1]
+    # All consumers of the same buffer share this variable — multi-consumer invariant.
+    layout_var: dict = {}
+
+    # Commit graph inputs first (single candidate each).
+    # Also set committed_stl on the TensorBox itself so downstream passes that call
+    # V.graph.get_buffer(name) (which returns TensorBox, not InputBuffer) can find it.
+    # Beam does this via its generic "op.committed_stl = stl" loop; CP-SAT must be
+    # explicit here because graph inputs are not in the operations list.
+    for name in V.graph.graph_input_names:
+        tb = V.graph.graph_inputs[name]
+        if (
+            isinstance(tb, TensorBox)
+            and isinstance(tb.data, StorageBox)
+            and isinstance(tb.data.data, InputBuffer)
+            and hasattr(tb, "layouts")
+        ):
+            stl = next(iter(tb.layouts))
+            tb.data.data.committed_stl = stl
+            tb.committed_stl = (
+                stl  # mirrors beam's V.graph.get_buffer(name).committed_stl = stl
+            )
+            layout_var[name] = model.new_constant(0)
+
+    # Create one variable per op output buffer.
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        name = op.get_name()
+        cost_fn = op.restick_cost_fn
+        n = len(op.layouts)
+        assert n > 0, (
+            f"{name}: op.layouts is empty — propagate_layouts did not set candidates"
+        )
+        if isinstance(cost_fn, FixedInOutNode):
+            # FixedInOutNode always has exactly one output layout (required_out_stl).
+            layout_var[name] = model.new_constant(0)
+        elif isinstance(cost_fn, AnyInNode):
+            # AnyInNode ops accept any layout at zero cost — no constraints are
+            # added for them (they are skipped in _build_node_tables), so the solver
+            # chooses freely.  Use a free integer variable so the domain matches
+            # ec._in_layouts when this buffer appears as a dep of a downstream op.
+            layout_var[name] = model.new_int_var(0, n - 1, f"layout_{name}")
+        else:
+            layout_var[name] = model.new_int_var(0, n - 1, f"layout_{name}")
+
+    # Guard: every dep buffer referenced by any op's edge_costs must be in layout_var.
+    # Buffers without layouts (constants, scalars) are not optimized and should not
+    # appear as deps of ops that have layouts. Assert rather than silently skip.
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        for ec in op.restick_cost_fn.edge_costs:
+            assert ec.dep.name in layout_var, (
+                f"{op.get_name()}: dep '{ec.dep.name}' not in layout_var — "
+                f"it has no layouts and was not registered as a graph input with layouts"
+            )
+
+    # Step 3: Add feasibility constraints and build objective cost vars.
+    cost_vars = []
+
+    for op, table in node_tables:
+        cost_fn = op.restick_cost_fn
+        op_name = op.get_name()
+
+        if isinstance(cost_fn, FixedInOutNode):
+            # Input layout vars + constant output var.
+            dep_vars = [layout_var[ec.dep.name] for ec in cost_fn.edge_costs]
+            out_var = layout_var[op_name]
+            all_vars = dep_vars + [out_var]
+            tuples_no_cost = [t[:-1] for t in table]
+            costs_list = [int(t[-1]) for t in table]
+        elif isinstance(cost_fn, AllSameNode) and cost_fn._output_edge_costs:
+            # AllSameNode with co-output deps: use only real input edge_costs in the
+            # table constraint.  Co-output equality is handled via a separate
+            # add_allowed_assignments below so that index mismatches between
+            # ec._in_layouts (captured at propagation time) and the dep buffer's
+            # current .layouts list (used to size layout_var) don't corrupt the table.
+            dep_vars = [layout_var[ec.dep.name] for ec in cost_fn._input_edge_costs]
+            out_var = layout_var[op_name]
+            all_vars = dep_vars + [out_var]
+            tuples_no_cost = [t[:-1] for t in table]
+            costs_list = [int(t[-1]) for t in table]
+        else:
+            # AllSameNode without co-output deps: input layout vars + output layout var.
+            dep_vars = [layout_var[ec.dep.name] for ec in cost_fn.edge_costs]
+            out_var = layout_var[op_name]
+            all_vars = dep_vars + [out_var]
+            tuples_no_cost = [t[:-1] for t in table]
+            costs_list = [int(t[-1]) for t in table]
+
+        if not all_vars:
+            continue
+
+        # Feasibility constraint: only allow combinations in the table.
+        model.add_allowed_assignments(all_vars, tuples_no_cost)
+
+        # Co-output equality constraints: for each co-output dep, the dep's layout
+        # and this op's output must be the same STL (from their respective .layouts
+        # lists, which may be ordered differently).  Use pairwise allowed_assignments
+        # to enforce this without assuming index alignment.
+        if isinstance(cost_fn, AllSameNode) and cost_fn._output_edge_costs:
+            for co_ec in cost_fn._output_edge_costs:
+                co_dep_name = co_ec.dep.name
+                if co_dep_name not in layout_var:
+                    continue
+                co_var = layout_var[co_dep_name]
+                co_dep_buf = V.graph.get_buffer(co_dep_name)
+                co_dep_layouts = getattr(co_dep_buf, "layouts", [])
+                if not co_dep_layouts:
+                    continue
+                op_layouts = op.layouts
+                # Build pairs (j_co, j_op) where co_dep_layouts[j_co] == op_layouts[j_op].
+                stl_to_co_idx = {stl: j for j, stl in enumerate(co_dep_layouts)}
+                valid_pairs = [
+                    (stl_to_co_idx[stl], j_op)
+                    for j_op, stl in enumerate(op_layouts)
+                    if stl in stl_to_co_idx
+                ]
+                if valid_pairs:
+                    model.add_allowed_assignments([co_var, out_var], valid_pairs)
+
+        # Cost objective via flattened index + add_element.
+        # flat_idx = i1*stride1 + i2*stride2 + ... + j  (row-major)
+        if not costs_list:
+            continue
+
+        # Compute strides for the flattened index.
+        # Use v.domain.max() to get the upper bound — Proto().domain[-1] is
+        # not a valid API in the installed OR-Tools version and will crash.
+        dims = []
+        for v in dep_vars:
+            dims.append(v.domain.max() + 1)
+        dims.append(out_var.domain.max() + 1)
+
+        strides: list[int] = []
+        stride = 1
+        for d in reversed(dims):
+            strides.insert(0, stride)
+            stride *= d
+
+        flat_idx_var = model.new_int_var(0, stride - 1, f"flat_{op_name}")
+        flat_expr = sum(v * s for v, s in zip(all_vars, strides))
+        model.add(flat_idx_var == flat_expr)
+
+        max_cost = max(costs_list)
+        cost_var = model.new_int_var(0, max_cost, f"cost_{op_name}")
+        # Build a cost lookup table indexed by flat_idx.
+        # The table only covers feasible entries (tuples_no_cost is the allowed set),
+        # so we need a lookup array of size = product(dims) with 0 for infeasible.
+        lookup = [0] * stride
+        for t, c in zip(tuples_no_cost, costs_list):
+            flat = sum(t[k] * strides[k] for k in range(len(t)))
+            lookup[flat] = c
+        model.add_element(flat_idx_var, lookup, cost_var)
+        cost_vars.append(cost_var)
+
+    # Step 4: Set objective.
+    if cost_vars:
+        model.minimize(sum(cost_vars))
+
+    # Step 5: Solve.
+    solver = _cp_model.CpSolver()
+    status = solver.Solve(model)
+
+    if status == _cp_model.MODEL_INVALID:
+        raise NotImplementedError(
+            f"cp_sat_stick_optimizer: CP-SAT model is invalid — likely an empty "
+            f"layouts list on some op (new_int_var(0, -1) is illegal). "
+            f"Validation: {solver.SolveLog()}"
+        )
+    if status == _cp_model.INFEASIBLE:
+        raise NotImplementedError(
+            f"cp_sat_stick_optimizer: CP-SAT returned INFEASIBLE "
+            f"(wall time {solver.WallTime():.3f}s)"
+        )
+    if status == _cp_model.UNKNOWN:
+        # Raise for now so failures surface clearly during testing.
+        # TODO: fall back to beam_global_min_cost once UNKNOWN is understood.
+        raise NotImplementedError(
+            f"cp_sat_stick_optimizer: CP-SAT returned UNKNOWN "
+            f"(search exhausted without proof; wall time {solver.WallTime():.3f}s)"
+        )
+
+    total_cost = solver.ObjectiveValue() if cost_vars else 0.0
+    status_name = "OPTIMAL" if status == _cp_model.OPTIMAL else "FEASIBLE"
+    logger.info(
+        "cp_sat_stick_optimizer done: status=%s, cost=%.0f, wall_time=%.3fs",
+        status_name,
+        total_cost,
+        solver.WallTime(),
+    )
+
+    # Step 6: Commit STLs.
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+        name = op.get_name()
+        if name not in layout_var:
+            continue
+        cost_fn = op.restick_cost_fn
+
+        if isinstance(cost_fn, FixedInOutNode):
+            stl = cost_fn.required_out_stl
+        else:
+            idx = solver.Value(layout_var[name])
+            assert 0 <= idx < len(op.layouts), (
+                f"{name}: layout index {idx} out of range [0, {len(op.layouts)})"
+            )
+            stl = op.layouts[idx]
+
+        buf = V.graph.get_buffer(name)
+        buf.committed_stl = stl
+
+
 def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
     operations = graph.operations
-    logger.info("optimizer: beam (global)")
-    beam_global_min_cost(operations)
+    optimizer = config.restickify_optimizer
+    if optimizer == "cpsat":
+        logger.info("optimizer: cp_sat_stick_optimizer")
+        cp_sat_stick_optimizer(operations)
+    else:
+        if optimizer != "beam":
+            logger.warning(
+                "Unknown SPYRE_RESTICKIFY_OPTIMIZER=%r, falling back to beam", optimizer
+            )
+        logger.info("optimizer: beam (global)")
+        beam_global_min_cost(operations)
