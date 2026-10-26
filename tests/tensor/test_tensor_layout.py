@@ -604,7 +604,10 @@ class TestSpyreTensorLayout(TestCase):
         ],
     )
     @parametrize("start,stop", [(5, 31), (64, 128), (5, 67), (65, 130)])
-    def test_d2h_partial_stick_view_transfer(self, dtype, device_format, start, stop):
+    @parametrize("row", [0, 3, 7])
+    def test_d2h_partial_stick_view_transfer(
+        self, dtype, device_format, start, stop, row
+    ):
         rows, width = 8, 130
         host = ((torch.arange(rows * width) % 251) - 125).to(dtype).reshape(rows, width)
         eps = device_format.elems_per_stick()
@@ -615,6 +618,8 @@ class TestSpyreTensorLayout(TestCase):
         # Offsets within one stick and aligned multi-stick slices can use DCI
         # directly. Crossing a tile from an unaligned start uses the existing
         # full-allocation CPU staging fallback in spyre_copy_from.
+        # Flex preserves the original DCI for unaligned DMA ranges; narrowing
+        # its allocation descriptor must still limit that fallback to one stick.
         torch.spyre.synchronize()
         with torch.profiler.profile(
             activities=[
@@ -622,8 +627,8 @@ class TestSpyreTensorLayout(TestCase):
                 torch.profiler.ProfilerActivity.PrivateUse1,
             ]
         ) as prof:
-            actual = device[3, start:stop].cpu()
-        torch.testing.assert_close(actual, host[3, start:stop], rtol=0, atol=0)
+            actual = device[row, start:stop].cpu()
+        torch.testing.assert_close(actual, host[row, start:stop], rtol=0, atol=0)
         if start % eps and start % eps + stop - start > eps:
             expected_bytes = rows * ((width + eps - 1) // eps) * 128
         else:
@@ -640,8 +645,9 @@ class TestSpyreTensorLayout(TestCase):
             [2, 8, 2, 1, 64], [1024, 128, 64, -1, 1], DataFormats.SEN169_FP16
         )
         device = host.to("spyre", device_layout=layout)
-        # There is a gap between the selected rows. The bounded DMA must preserve
-        # the original source strides when rebasing, and use the device item size.
+        # The bounded descriptor must preserve source strides when rebasing.
+        # Flex then compacts the two selected rows, omitting the gap and using
+        # the device item size even though the CPU destination is float32.
         torch.spyre.synchronize()
         with torch.profiler.profile(
             activities=[
@@ -651,7 +657,7 @@ class TestSpyreTensorLayout(TestCase):
         ) as prof:
             actual = device[:, 3, :].to(device="cpu", dtype=torch.float32)
         torch.testing.assert_close(actual, host[:, 3, :].float(), rtol=0, atol=0)
-        self._assert_d2h_bytes(prof, 9 * 128 * 2)
+        self._assert_d2h_bytes(prof, 2 * 128 * 2)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_d2h_slice_to_larger_host_dtype(self, dtype):
@@ -675,7 +681,9 @@ class TestSpyreTensorLayout(TestCase):
         "dtype,device_format",
         [(torch.float32, DataFormats.BFLOAT16), (torch.int32, DataFormats.IEEE_INT64)],
     )
-    def test_d2h_other_storage_formats_keep_full_transfer(self, dtype, device_format):
+    def test_d2h_other_storage_formats_use_flex_slice_transfer(
+        self, dtype, device_format
+    ):
         host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
         eps = device_format.elems_per_stick()
         layout = SpyreTensorLayout([8, 128 // eps, eps], [128, eps, 1], device_format)
@@ -689,9 +697,9 @@ class TestSpyreTensorLayout(TestCase):
         ) as prof:
             actual = device[3].cpu()
         torch.testing.assert_close(actual, host[3], rtol=0, atol=0)
-        # Spyre storage reserves at least the logical CPU byte size, even when
-        # the explicitly requested device encoding uses fewer bytes per element.
-        self._assert_d2h_bytes(prof, max(host.nbytes, 8 * (128 // eps) * 128))
+        # torch-spyre leaves these allocation descriptors unchanged. Flex still
+        # transfers just the selected row, using its explicit device encoding.
+        self._assert_d2h_bytes(prof, (128 // eps) * 128)
 
     def test_to_layout_patched(self):
         x = torch.rand([512, 256], dtype=torch.float16)

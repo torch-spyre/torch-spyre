@@ -50,6 +50,10 @@ namespace {
 // D2H to the whole sticks covering those reads, then rebase the DCI onto that
 // staging buffer. In particular, a final-token logits view needs one row,
 // even when its storage contains a complete prefill chunk.
+// Flex can further compact aligned ranges, but its unaligned-range fallback
+// keeps the original DCI and copies the full descriptor supplied here. Bounding
+// that descriptor still limits partial-stick D2H transfers to the covered
+// sticks.
 std::optional<flex::CompositeAddress> narrowD2HRange(
     DataConversionInfo& dci, const SpyreTensorLayout& layout,
     const flex::CompositeAddress& allocation) {
