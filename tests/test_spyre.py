@@ -193,6 +193,47 @@ class TestSpyre(TestCase):
         self.assertFalse(destination.is_pinned())
         torch.testing.assert_close(destination, expected, rtol=0, atol=0)
 
+    # The DCI-skip optimization must reject anything that is not a dense
+    # same-format copy: for each layout below, dci_is_identity_copy has to
+    # keep the conversion descriptor, and a round trip through the device
+    # must reproduce the view's values exactly. (If the predicate wrongly
+    # accepted the layout, the raw DMA would move storage bytes a plain
+    # memcpy would — including bytes before a storage offset or stride
+    # gaps — and the comparison would fail.)
+
+    def test_pinned_h2d_storage_offset_view_keeps_conversion(self):
+        base = (torch.arange(8192, dtype=torch.int64) % 31).to(torch.float16)
+        pinned = base.pin_memory()
+        view = pinned[37:8101]  # non-zero storage offset + partial slice
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    def test_pinned_h2d_strided_view_keeps_conversion(self):
+        base = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        pinned = base.pin_memory()
+        view = pinned.view(64, 64)[:, ::2]  # stride gaps between rows
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    def test_pinned_h2d_broadcast_strides_keeps_conversion(self):
+        row = (torch.arange(64, dtype=torch.int64) % 31).to(torch.float16)
+        pinned = row.pin_memory()
+        view = pinned.unsqueeze(0).expand(32, 64)  # broadcast (zero) stride
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
+        # 64x32 int8 maps to a partial-stick device layout: the DCI carries
+        # real stickification and must survive the identity-copy skip.
+        expected = (torch.arange(64 * 32, dtype=torch.int64) % 31).to(torch.int8)
+        pinned = expected.reshape(64, 32).pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), pinned, rtol=0, atol=0)
+
     def test_zero_size_pinned_allocation(self):
         cpu = torch.empty(0, dtype=torch.float16, pin_memory=True)
         self.assertEqual(cpu.numel(), 0)

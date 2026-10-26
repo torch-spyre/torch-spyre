@@ -404,6 +404,9 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
     // handleDmaDataConversionD2H reads host_capacity_bytes (falling back to
     // the device-format dma_size, which under-reports the host buffer for
     // dtype-upscaling conversions like bf16 -> fp32).
+    // TODO(#2149-flex): writing a public DmaParams field after the factory is
+    // fragile — flex should take the D2H out-capacity as a factory argument.
+    // Tracked in a flex issue; remove this write once the factory is extended.
     params->host_capacity_bytes = host_capacity;
     try {
       launchD2H(params);

@@ -42,7 +42,12 @@ struct PinnedAllocationState {
     catch (...) {
       // A deleter cannot report an exception. If cache return fails,
       // destruction of the remaining buffer ownership still unmaps and frees
-      // the allocation.
+      // the allocation. That is correct but a pure performance loss — the
+      // next same-size allocation pays a fresh map — so make it visible once
+      // instead of silently degrading.
+      TORCH_WARN_ONCE(
+          "SpyrePinnedAllocator: returning a buffer to the pinned staging "
+          "cache failed; the buffer was freed instead of retained");
     }
   }
 
@@ -91,7 +96,8 @@ c10::DataPtr SpyrePinnedAllocator::allocate(size_t size) {
       std::make_shared<PinnedAllocationState>(buffer, std::move(cache));
   {
     const std::lock_guard<std::mutex> lock(mutex_);
-    const auto [unused, inserted] = allocations_.emplace(ptr, state);
+    const auto [unused, inserted] =
+        allocations_.emplace(static_cast<const void*>(ptr), state);
     if (!inserted) {
       throw std::runtime_error(
           "SpyrePinnedAllocator: cache returned an active allocation");
@@ -112,9 +118,9 @@ void SpyrePinnedAllocator::copy_data(void* dest, const void* src,
 }
 
 bool SpyrePinnedAllocator::record_event(void*, void*, c10::Stream) {
-  // D2H retains PinnedAllocationState through Flex's host_lifetime token; H2D
-  // converts into a Flex-owned staging buffer before asynchronous submission.
-  // This allocator has no event queue, so it must not claim to record an event.
+  // Both directions retain PinnedAllocationState through Flex's host_lifetime
+  // token, so in-flight DMAs keep their pinned buffers alive without an event
+  // queue here. This allocator must not claim to record an event.
   return false;
 }
 
@@ -137,6 +143,9 @@ void SpyrePinnedAllocator::empty_cache() {
 }
 
 at::HostStats SpyrePinnedAllocator::get_stats() {
+  // TODO(#5753): populate from the flex staging cache (allocated/active/peak
+  // bytes and segment counts) so torch.accelerator.host_memory_stats() reports
+  // the pinned pool instead of zeros. Tracked in a follow-up issue.
   return {};
 }
 
@@ -163,34 +172,40 @@ void SpyrePinnedAllocator::deallocate(void* context) {
   }
 }
 
+SpyrePinnedAllocator::AllocationMap::const_iterator
+SpyrePinnedAllocator::findContaining(uintptr_t address) const {
+  auto it = allocations_.upper_bound(reinterpret_cast<const void*>(address));
+  if (it == allocations_.begin()) {
+    return allocations_.end();
+  }
+  --it;
+  const auto base = reinterpret_cast<uintptr_t>(it->first);
+  if (address - base >= it->second->buffer->capacity()) {
+    return allocations_.end();
+  }
+  return it;
+}
+
 bool SpyrePinnedAllocator::isPinnedPtr(const void* ptr) const {
   const auto address = reinterpret_cast<uintptr_t>(ptr);
   const std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& [base_ptr, state] : allocations_) {
-    const auto base = reinterpret_cast<uintptr_t>(base_ptr);
-    if (address >= base && address - base < state->buffer->capacity()) {
-      return true;
-    }
-  }
-  return false;
+  return findContaining(address) != allocations_.end();
 }
 
 PinnedAllocation SpyrePinnedAllocator::retain(const void* ptr) const {
   const auto address = reinterpret_cast<uintptr_t>(ptr);
   const std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& [base_ptr, state] : allocations_) {
-    const auto base = reinterpret_cast<uintptr_t>(base_ptr);
-    if (address >= base && address - base < state->buffer->capacity()) {
-      const auto offset = address - base;
-      return {
-          state->buffer,
-          offset,
-          state->buffer->capacity() - offset,
-          state,
-      };
-    }
+  const auto it = findContaining(address);
+  if (it == allocations_.end()) {
+    return {};
   }
-  return {};
+  const auto offset = address - reinterpret_cast<uintptr_t>(it->first);
+  return {
+      it->second->buffer,
+      offset,
+      it->second->buffer->capacity() - offset,
+      it->second,
+  };
 }
 
 at::HostAllocator* GetSpyrePinnedAllocator() {

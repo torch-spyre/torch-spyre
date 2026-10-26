@@ -20,10 +20,10 @@
 
 #include <cstddef>
 #include <flex/memory_interface/pinned_staging_cache.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
-#include <unordered_map>
 
 namespace spyre {
 
@@ -32,6 +32,11 @@ struct PinnedAllocationState;
 struct PinnedAllocation {
   std::shared_ptr<flex::PinnedBuffer> buffer;
   size_t offset = 0;
+  // Whole-buffer capacity from the requested address to the end of the
+  // backing buffer, NOT the caller's logical allocation size: the staging
+  // cache may hand out a buffer up to 2x the requested size. Memory-safe
+  // (the allocation owns the whole buffer), but consumers must not treat
+  // this as the size the caller asked allocate() for.
   size_t capacity = 0;
   std::shared_ptr<PinnedAllocationState> owner;
 
@@ -58,8 +63,17 @@ class SpyrePinnedAllocator : public at::HostAllocator {
  private:
   static void deallocate(void* context);
 
-  std::unordered_map<void*, std::shared_ptr<PinnedAllocationState>>
-      allocations_;
+  using AllocationMap =
+      std::map<const void*, std::shared_ptr<PinnedAllocationState>>;
+
+  // O(log n) containment lookup for a possibly-interior pointer. Allocations
+  // are disjoint ranges keyed by base address, so the only candidate is the
+  // greatest base <= address; an earlier base's range ends before the next
+  // base starts. Returns end() when no live allocation contains the address.
+  AllocationMap::const_iterator findContaining(uintptr_t address) const;
+
+  // Base-address-ordered so findContaining can upper_bound + step back.
+  AllocationMap allocations_;
   std::set<std::weak_ptr<flex::PinnedStagingCache>,
            std::owner_less<std::weak_ptr<flex::PinnedStagingCache>>>
       caches_;
