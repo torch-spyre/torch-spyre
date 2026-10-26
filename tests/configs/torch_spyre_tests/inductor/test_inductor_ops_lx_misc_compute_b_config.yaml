@@ -25,6 +25,7 @@ test_suite_config:
             - LxPlanning.*::test_inplace_op.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_bitwise_and.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_bitwise_not.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_logical_int_mask.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_dropout_functional.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_fallback.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_fill_scalar.*_lx_planning_(pointwise|reduction)
