@@ -45,8 +45,8 @@ from ..core_mapping import (
     select_unique_partition_division,
     transfer_edges,
 )
-from ..cost_model import CostParams, OpFeatures, relayout_ns
-from ..dump_cost_model import governing_run_split
+from ..cost_model import CostParams, relayout_ns
+from ..dump_cost_model import relayout_cost_features
 from ..ir import FixedTiledLayout
 from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
@@ -62,7 +62,7 @@ from ..pass_utils import (
     op_read_writes,
     try_device_coordinates,
 )
-from .utils import _op_num_cores
+from .utils import _op_num_cores, storage_has_single_writer
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -152,10 +152,11 @@ class RelayoutCandidate:
 
     @property
     def destination_num_cores(self) -> int:
-        """The consumer's core count, carried by the destination view: equal to
-        ``num_cores`` for permutations and gathers, a multiple of it for a
-        broadcast (#3440), where the copy lives on the destination's cores while
-        the plan's ``num_cores`` stays the source's."""
+        """The destination view's physical core count.
+
+        The copy lives on these cores. The plan's ``num_cores`` remains the
+        source count, including when the two domains differ.
+        """
         return cast(int, self.destination_view.num_cores)
 
     def __post_init__(self) -> None:
@@ -541,12 +542,14 @@ def movement_supported(
     source_num_cores: int,
     destination_num_cores: int,
 ) -> bool:
-    """Extend the original full-partition check to gathers and broadcasts.
+    """Certify uniform partition transfers, gathers and broadcasts.
 
     Edges are ownership intersections, never a separate geometry calculation.
     A complete source may feed uniformly repeated destination slices. Across
-    unequal core counts, only even broadcasts (one source per destination) are
-    supported. Equal destination slices have identical sources by construction.
+    unequal core counts, a larger complete destination partition may gather
+    several disjoint source fragments. Replicated destinations retain the
+    one-source broadcast rule. Equal destination slices have identical sources
+    by construction.
     Incoming fragments must also fit the current shuffle lowering's address
     register budget; broadcast fan-out does not consume this budget.
     """
@@ -615,9 +618,16 @@ def movement_supported(
         return False
     if max(fanin) > _MAX_SHUFFLE_FANIN:
         return False
-    # A larger domain only broadcasts: one source per destination.
-    return source_num_cores == destination_num_cores or (
-        fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1
+    # A complete destination is an exact repartition, including an expansion
+    # onto more cores. The shuffle's per-tensor maps describe the two domains;
+    # STCDP intersects their pieces rather than assuming one source per reader.
+    # Keep the narrower existing rule for replicated larger destinations.
+    # The guards above require every destination slice to be present. With
+    # as many distinct slices as cores, each core therefore owns one slice.
+    return (
+        source_num_cores == destination_num_cores
+        or destination_slices == destination_num_cores
+        or (fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1)
     )
 
 
@@ -625,28 +635,31 @@ def core_domain_rejection(source_num_cores: int, consumer_num_cores: int) -> str
     """Why a producer on ``source_num_cores`` may not feed a consumer on
     ``consumer_num_cores`` through a relayout, from the core counts alone, or
     ``None`` when they are compatible. Equal counts are always fine
-    (permutations and gathers). A larger consumer domain is a grouped broadcast
-    (#3440), which the emitter supports only onto every compute core; the
-    geometric half of that rule (an even multiple, one source per destination
-    core) is :func:`movement_supported`'s. Shared by the committed collector and
-    the solver's enumeration so the two paths cannot drift."""
+    (permutations and gathers). A larger consumer domain is either a complete
+    repartition or a grouped broadcast, supported only onto every compute core.
+    The geometric half of that rule is :func:`movement_supported`'s.
+    Shared by the committed collector and the solver's enumeration so the two
+    paths cannot drift."""
     if consumer_num_cores < source_num_cores:
         return "cannot emit: consumer uses fewer physical cores than producer"
     if consumer_num_cores > source_num_cores and consumer_num_cores != config.sencores:
-        return "cannot emit: grouped broadcast must target all compute cores"
+        return "cannot emit: larger relayout domain must target all compute cores"
     return None
 
 
 def grouped_gather_rejection(
     consumer: Operation, source_num_cores: int, destination_view: PerCoreView
 ) -> str | None:
-    """Why ``consumer``'s ``destination_view`` may not be a grouped gather of a
-    producer on ``source_num_cores``, or ``None``. A destination with fewer
-    owners than the source has cores assembles each slice from several source
-    slices (#3440), which the emitter supports for a matmul consumer only; a
-    complete partition (a permutation) or a broadcast is not a gather and passes.
-    The consumer half of the rule; the geometry is :func:`movement_supported`'s.
-    Shared by the committed collector and the solver's enumeration."""
+    """Reject a replicated grouped gather without a matmul consumer.
+
+    A #3440 grouped gather repeats assembled destination slices across cores.
+    This replicated layout supports matmul consumers only.
+    A complete destination partition has no replicas. Shuffle lowering can
+    assemble its disjoint source pieces for a pointwise consumer too, including
+    expansion onto more cores. ``movement_supported`` checks its uniform
+    routes and fan-in bound. Both candidate pricing and committed copies use
+    this consumer rule.
+    """
     owners = math.prod(dict(destination_view.work_slice_dims).values())
     if owners < source_num_cores and not _is_matmul_op(consumer):
         return "cannot emit: grouped gather requires a matmul consumer"
@@ -853,6 +866,127 @@ def solver_relayout_edge_context(
     )
 
 
+def prefix_lx_contraction_axis(producer: Operation, consumer: Operation) -> int | None:
+    """Prove a zero-offset dense prefix read after a full-buffer LX gather.
+
+    Ordinary IR shapes describe the producer's full width and the consumer's
+    shorter K. Only the outermost stick axis may have a tail. The read index
+    must retain the producer row stride exactly; arbitrary strided slices,
+    offsets, broadcast/batched reads and counted loops are not admitted.
+    The division-dependent gates separately require unsplit K and a disjoint
+    copy of the complete producer domain. No width metadata or loop rewrite
+    is involved.
+    """
+    if not isinstance(producer, ComputedBuffer) or not _is_matmul_op(consumer):
+        return None
+    layout = producer.layout
+    if (
+        not isinstance(layout, FixedTiledLayout)
+        or layout.offset != 0
+        or len(layout.size) < 2
+        or any(not sympy.sympify(x).is_Integer for x in layout.size)
+        or any(x != 1 for x in layout.size[:-2])
+        or getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+        or getattr(producer, "_input_layout_overrides", None)
+        or getattr(consumer, "_input_layout_overrides", None)
+    ):
+        return None
+    m, physical = map(int, layout.size[-2:])
+    ranges = consumer.data.ranges
+    reduction = consumer.data.reduction_ranges
+    if (
+        m <= 1
+        or list(layout.stride[-2:]) != [physical, 1]
+        or len(ranges) < 2
+        or any(x != 1 for x in ranges[:-2])
+        or ranges[-2] != m
+        or len(reduction) != 1
+        or not sympy.sympify(reduction[0]).is_Integer
+        or not sympy.sympify(ranges[-1]).is_Integer
+    ):
+        return None
+    logical, n = int(reduction[0]), int(ranges[-1])
+    rw = op_read_writes(consumer)
+    reads = list(rw.reads)
+    writes = list(rw.writes)
+    if (
+        not 0 < logical < physical
+        or n <= 1
+        or len(reads) != 2
+        or len(writes) != 1
+        or not all(isinstance(d, MemoryDep) for d in [*reads, *writes])
+    ):
+        return None
+    out = writes[0]
+    ms = [
+        v for v, extent in out.ranges.items() if extent == m and out.index.coeff(v) == n
+    ]
+    ns = [
+        v for v, extent in out.ranges.items() if extent == n and out.index.coeff(v) == 1
+    ]
+    if len(ms) != 1 or len(ns) != 1:
+        return None
+    ms, ns = ms[0], ns[0]
+    ks = (reads[0].index.free_symbols | reads[1].index.free_symbols) - {ms, ns}
+    if len(ks) != 1:
+        return None
+    (ks,) = ks
+    source_reads = [d for d in reads if d.name == producer.get_name()]
+    if len(source_reads) != 1:
+        return None
+    src = source_reads[0]
+    weight = next(d for d in reads if d is not src)
+    if (
+        out.index != n * ms + ns
+        or src.index != physical * ms + ks
+        or src.ranges.get(ms) != m
+        or src.ranges.get(ks) != logical
+        or weight.index != logical * ns + ks
+        or weight.ranges.get(ns) != n
+        or weight.ranges.get(ks) != logical
+    ):
+        return None
+    stl = layout.device_layout
+    eps = stl.elems_per_stick()
+    dims = list(stl.device_size)
+    axes = [
+        axis
+        for axis in range(len(dims) - 1)
+        if dims[axis] * eps == physical and stl.stride_map[axis] == eps
+    ]
+    if (
+        stl.element_arrangement != ElementArrangement.STANDARD
+        or logical % eps
+        or physical % eps
+        or stl.stride_map[-1] != 1
+        or dims[-1] != eps
+        or len(axes) != 1
+        or any(size != 1 for size in dims[: axes[0]])
+        or math.prod(dims) != m * physical
+    ):
+        return None
+    return axes[0]
+
+
+def prefix_lx_gather_source(graph: GraphLowering, name: str, uses: list[int]) -> bool:
+    """One full-width producer and one zero-offset prefix matmul reader.
+
+    Division-dependent proof remains in the relayout pair gate: the reader
+    must own the whole padded feature axis, and a real copy must be allocated.
+    Other users are deliberately refused, including external/collective users.
+    """
+    if name in graph.get_output_names():
+        return False
+    producer = graph.get_buffer(name)
+    readers = [graph.operations[i] for i in uses if graph.operations[i] is not producer]
+    return (
+        len(readers) == 1
+        and prefix_lx_contraction_axis(producer, readers[0]) is not None
+        and storage_has_single_writer(graph, producer)
+    )
+
+
 def solver_relayout_pair_cost(
     source_view: PerCoreView,
     destination_view: PerCoreView,
@@ -871,35 +1005,42 @@ def solver_relayout_pair_cost(
     grouped movements use [``relayout_split_min``, ``_GROUPED_SPLIT_MAX``].
     The caller also applies the consumer's core-domain and gather rules.
 
-    Use the reporting path's ``relayout_ns`` with the source's core count and
-    the finer view's geometry. Build each view for its own core count:
-    ``num_cores`` for the source and ``destination_num_cores`` for the destination
-    (defaults to the source's count).
+    Unequal complete partitions use the same estimate on the smaller domain;
+    this is not a separately fitted law.
+    It charges more than the larger-domain formula, not a proven upper bound
+    on hardware time.
+
+    Use the reporting path's feature vector and ``relayout_ns`` with the finer
+    view's geometry. Build each view for its own core
+    count: ``num_cores`` for the source and ``destination_num_cores`` for the
+    destination (defaults to the source's count).
     """
-    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
-    p = params or CostParams()
-    permutation = (
-        destination_view.split_product == num_cores
-        and (destination_num_cores or num_cores) == num_cores
+    features = relayout_cost_features(
+        source_view,
+        destination_view,
+        num_cores,
+        device_dims,
+        out_elems,
+        dtype_bytes,
+        destination_num_cores=destination_num_cores,
     )
-    top = p.relayout_split_max if permutation else _GROUPED_SPLIT_MAX
+    run_elems, split = features.relayout_run_elems, features.relayout_split
+    p = params or CostParams()
+    complete_partition = (
+        source_view.split_product == num_cores
+        and destination_view.split_product == (destination_num_cores or num_cores)
+    )
+    # A complete repartition moves each element once, with no destination
+    # replicas. Use the partition law's range and retain the
+    # smaller core count below: the larger slice governs send or receive work.
+    # This is an estimate for unequal domains, not a new measured cost law.
+    top = p.relayout_split_max if complete_partition else _GROUPED_SPLIT_MAX
     if run_elems <= 0 or not p.relayout_split_min <= split <= top:
         return None
     if not movement_supported(
         source_view, destination_view, num_cores, destination_num_cores or num_cores
     ):
         return None
-    features = OpFeatures(
-        name="lx_relayout",
-        is_reduction=False,
-        out_elems=out_elems,
-        cores=num_cores,
-        dtype_bytes=dtype_bytes,
-        args=[],
-        is_lx_relayout=True,
-        relayout_run_elems=run_elems,
-        relayout_split=split,
-    )
     return relayout_ns(features, p)
 
 
@@ -1100,6 +1241,16 @@ def collect_lx_relayout_plans(
                 rejection_reason = failure
                 break
             consumer_space = iteration_space_from_op(consumer)
+            padded_axis = prefix_lx_contraction_axis(producer, consumer)
+            if padded_axis is not None:
+                if dict(view.work_slice_dims).get(padded_axis, 1) != 1:
+                    rejection_reason = "cannot emit: padded LX contraction splits K"
+                    break
+                # Copy the full physical domain before the logical-K read.
+                # Projecting 832-wide owners onto 800-wide logical quarters
+                # would invent different ownership; the reader owns all K.
+                consumer_coordinates = producer_coordinates
+                consumer_space = iteration_space_from_op(producer)
             transfers.append(
                 (consumer_name, consumer_coordinates, consumer_space, view, routes)
             )
@@ -1373,6 +1524,21 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
         consumers = [
             cast(ComputedBuffer, graph.get_buffer(name)) for name in plan.consumer_names
         ]
+        if any(prefix_lx_contraction_axis(source, c) is not None for c in consumers):
+            for consumer in consumers:
+                axis = prefix_lx_contraction_axis(source, consumer)
+                if (
+                    axis is None
+                    or dict(plan.destination_view.work_slice_dims).get(axis, 1) != 1
+                ):
+                    raise RuntimeError("padded LX gather lost its full-K read contract")
+            if not (
+                plan.source_address + plan.source_footprint_bytes
+                <= plan.destination_address
+                or plan.destination_address + plan.destination_footprint_bytes
+                <= plan.source_address
+            ):
+                raise RuntimeError("padded LX gather source and destination overlap")
         copy = editor.insert_clone_before_consumers(
             source,
             consumers,

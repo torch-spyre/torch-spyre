@@ -21,6 +21,9 @@ path is pinned to, so the enumeration path and the reporting path cannot
 drift apart.
 """
 
+from types import SimpleNamespace
+from collections import Counter
+
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
@@ -109,6 +112,38 @@ def test_grouped_gather_is_priced_like_a_permutation_of_the_same_tensor():
     assert cost == solver_relayout_pair_cost(
         _SRC, _DST, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
     ), "same tensor, same cores, same governing geometry: same price"
+
+
+@pytest.mark.parametrize("source_cores", [2, 8])
+def test_broadcast_report_uses_the_solver_price_domain(source_cores):
+    from dataclasses import replace
+
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._inductor import dump_cost_model as dcm
+
+    source = PerCoreView(((0, source_cores),), ((0, _CORE_ID),), num_cores=source_cores)
+    destination = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=8)
+    # Each of the two destination pieces is held by four cores.
+    plan = lx_relayout.LXRelayoutPlan(
+        "source", ("consumer",), source, destination, source_cores
+    )
+    graph = SimpleNamespace(_spyre_lx_relayout_copies={plan.edge: ("copy", plan)})
+    with V.set_graph_handler(graph):
+        reported = dcm._relayout_features(
+            SimpleNamespace(get_name=lambda: "copy"), [64], 2
+        )
+
+    assert reported is not None
+    assert reported.relayout_cores == source_cores
+    price = relayout_ns(reported)
+    old_execution_domain = relayout_ns(replace(reported, cores=8, relayout_cores=0))
+    assert price > 0
+    assert price == pytest.approx(old_execution_domain * 8 / source_cores)
+    solver_price = solver_relayout_pair_cost(
+        source, destination, source_cores, [64], 64, 2, destination_num_cores=8
+    )
+    assert solver_price == pytest.approx(price)
 
 
 @pytest.mark.parametrize("fragments", [8, 10, 11, 16])
@@ -206,26 +241,29 @@ def test_split_product_must_equal_core_count():
     )
 
 
+@config.patch({"lx_same_tile_group_relayout": True})
 def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
-    """An endpoint carrying loop_info can never host a relayout: the fitted
-    law has no loop_trip factor, a tiled producer's buffer is per-tile
-    scratch, and a tiled consumer reads through a per-iteration staging op.
+    """Cross-group endpoints must stop before any layout inspection.
 
-    Probes are real-enough ComputedBuffers (created via __new__ to pass the
-    isinstance check) whose ``layout`` is a recording property: the gate is
-    the first check, so a tiled endpoint must be rejected WITHOUT the layout
-    ever being touched - distinguishing gate-rejection from the downstream
-    rejections that any fake would also hit. (The full compile-path variant
-    lives in test_solver_relayout_e2e.py, skipped until the co-opt substrate
-    survives coarse-tiled graphs at all; its non-vacuity was verified by
-    running it with the gate reverted.)"""
+    Real sibling and nested group IDs pin exact scope equality. Recording
+    layout properties distinguish this gate from later layout rejection;
+    untiled and equal-group controls must reach that later check.
+    """
     from torch._inductor.ir import ComputedBuffer
 
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         solver_relayout_edge_context,
     )
 
-    def probe(tiled):
+    def tiled(group):
+        return CoarseTileInfo(
+            loop_group_id=group,
+            loop_count=[4] * len(group),
+            loop_tiled_dims=[[0]] * len(group),
+        )
+
+    def probe(loop_info):
         class _Probe(ComputedBuffer):
             layout_accessed = False
 
@@ -234,23 +272,38 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
                 type(self).layout_accessed = True
 
         obj = _Probe.__new__(_Probe)
-        obj.loop_info = object() if tiled else None
+        obj.loop_info = loop_info
         return obj
 
-    # No graph: both gates under test sit before the first use of it.
-    graph = None
-    for prod_tiled, cons_tiled in ((True, False), (False, True), (True, True)):
-        prod, cons = probe(prod_tiled), probe(cons_tiled)
-        assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
+    unknown = object()
+    rejected = [
+        (unknown, None),
+        (None, unknown),
+        (unknown, unknown),
+        (tiled((0,)), None),
+        (None, tiled((0,))),
+        (tiled((0,)), tiled((1,))),
+        (tiled((0,)), tiled((0, 1))),
+        (tiled((0, 1)), tiled((0,))),
+        (tiled((0, 1)), tiled((0, 2))),
+    ]
+    # No graph: the loop-info and layout checks precede its first use.
+    for prod_info, cons_info in rejected:
+        prod, cons = probe(prod_info), probe(cons_info)
+        assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
         assert not type(prod).layout_accessed and not type(cons).layout_accessed, (
-            "a coarse-tiled endpoint reached checks past the loop_info gate"
+            "a cross-group endpoint reached checks past the loop_info gate"
         )
 
-    # Control: an untiled pair proceeds past the gate into the layout check,
-    # proving the probes are capable of registering deeper progression.
-    prod, cons = probe(False), probe(False)
-    assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
-    assert type(prod).layout_accessed
+    # Distinct metadata objects with equal IDs must also pass the scope gate.
+    for prod_info, cons_info in [
+        (None, None),
+        (tiled((0,)), tiled((0,))),
+        (tiled((0, 1)), tiled((0, 1))),
+    ]:
+        prod, cons = probe(prod_info), probe(cons_info)
+        assert solver_relayout_edge_context(None, prod, cons, "buf0", {}) is None
+        assert type(prod).layout_accessed
 
 
 # --- Solver gate vs committed gate ------------------------------------------
@@ -368,6 +421,121 @@ def test_broadcast_to_a_larger_core_domain_is_admitted_and_priced():
     )
 
 
+@pytest.mark.parametrize("fragments", [4, 8, 16])
+def test_complete_partition_expansion_respects_fanin(fragments):
+    """Complete 16-to-32 repartitions reach the fan-in guard, including eight."""
+    source = PerCoreView(((0, 16),), ((0, _CORE_ID),), num_cores=16)
+    rows = 16 // fragments
+    destination = PerCoreView(
+        ((0, rows), (1, 2 * fragments)),
+        ((0, Mod(_CORE_ID, rows)), (1, floor(_CORE_ID / rows))),
+        num_cores=32,
+    )
+    edges = lx_relayout.transfer_edges(
+        dict(source.work_slice_dims),
+        dict(destination.work_slice_dims),
+        lx_relayout._core_slices(source, 16),
+        lx_relayout._core_slices(destination, 32),
+    )
+    assert destination.split_product == 32
+    assert set(Counter(src for src, _ in edges).values()) == {2 * fragments}
+    assert set(Counter(dst for _, dst in edges).values()) == {fragments}
+    assert lx_relayout.movement_supported(source, destination, 16, 32) == (
+        fragments <= 8
+    )
+
+
+@pytest.mark.parametrize("columns,supported", [(8, True), (4, False)])
+def test_expansion_rejects_replicated_multisource_destination(columns, supported):
+    """Replication cannot use the complete-destination gather exception."""
+    source = PerCoreView(((0, 16),), ((0, _CORE_ID),), num_cores=16)
+    destination = PerCoreView(
+        ((0, 4), (1, columns)),
+        ((0, Mod(_CORE_ID, 4)), (1, Mod(floor(_CORE_ID / 4), columns))),
+        num_cores=32,
+    )
+    edges = lx_relayout.transfer_edges(
+        dict(source.work_slice_dims),
+        dict(destination.work_slice_dims),
+        lx_relayout._core_slices(source, 16),
+        lx_relayout._core_slices(destination, 32),
+    )
+    # Both geometries pass uniformity and the register budget; only the
+    # rejected arm has replicated destination slices (16 slices on 32 cores).
+    assert set(Counter(src for src, _ in edges).values()) == {8}
+    assert set(Counter(dst for _, dst in edges).values()) == {4}
+    assert destination.split_product == 4 * columns
+    assert lx_relayout.movement_supported(source, destination, 16, 32) == supported
+
+
+@pytest.mark.parametrize("balanced", [True, False])
+def test_expansion_rejects_nonuniform_fanout(balanced):
+    """Keep coverage and fan-in valid while changing only source fan-out."""
+    # Four slices on eight cores use the existing replicated-broadcast path.
+    # This checks its shared fan-out guard, not the complete-destination arm.
+    destination = PerCoreView(
+        ((0, 4),),
+        (
+            (
+                0,
+                Piecewise(
+                    (0, Eq(_CORE_ID, 0)),
+                    (1, _CORE_ID < (4 if balanced else 3)),
+                    (2, Eq(_CORE_ID, 4 if balanced else 3)),
+                    (3, True),
+                ),
+            ),
+        ),
+        num_cores=8,
+    )
+    source_map = lx_relayout._core_slices(_TWO_ON_2, 2)
+    destination_map = lx_relayout._core_slices(destination, 8)
+    assert {row[0] for row in destination_map.values()} == {0, 1, 2, 3}
+    edges = lx_relayout.transfer_edges(
+        dict(_TWO_ON_2.work_slice_dims),
+        dict(destination.work_slice_dims),
+        source_map,
+        destination_map,
+    )
+    assert set(Counter(dst for _, dst in edges).values()) == {1}
+    assert Counter(src for src, _ in edges) == (
+        {0: 4, 1: 4} if balanced else {0: 3, 1: 5}
+    )
+    assert lx_relayout.movement_supported(_TWO_ON_2, destination, 2, 8) == balanced
+
+
+@pytest.mark.parametrize("balanced", [True, False])
+def test_complete_destination_rejects_nonuniform_fanout(balanced):
+    source = PerCoreView(((0, 4),), ((0, _CORE_ID),), num_cores=4)
+    rows, columns = (4, 3) if balanced else (3, 4)
+    destination = PerCoreView(
+        ((0, rows), (1, columns)),
+        ((0, floor(_CORE_ID / columns)), (1, Mod(_CORE_ID, columns))),
+        num_cores=12,
+    )
+    edges = lx_relayout.transfer_edges(
+        dict(source.work_slice_dims),
+        dict(destination.work_slice_dims),
+        lx_relayout._core_slices(source, 4),
+        lx_relayout._core_slices(destination, 12),
+    )
+    assert destination.split_product == destination.num_cores == 12
+    assert (
+        len(
+            {
+                tuple(row.items())
+                for row in lx_relayout._core_slices(destination, 12).values()
+            }
+        )
+        == 12
+    )
+    assert set(Counter(dst for _, dst in edges).values()) == ({1} if balanced else {2})
+    assert Counter(src for src, _ in edges) == (
+        {0: 3, 1: 3, 2: 3, 3: 3} if balanced else {0: 4, 1: 8, 2: 8, 3: 4}
+    )
+    assert lx_relayout.movement_supported(source, destination, 4, 12) == balanced
+
+
 def test_destination_views_are_interned_by_ownership():
     """Two consumers whose candidates land on the same physical view of one
     parent must share ONE group (one shuffle serves both), even when the two
@@ -400,3 +568,83 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
     )
     assert grouped_gather_rejection(pointwise, 8, _DST) is None  # a permutation
     assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "offset", "compact_stride", "inner_tail", "second_reader"]
+)
+def test_prefix_lx_contraction_requires_exact_backing_stride(invalid):
+    from dataclasses import replace
+    import torch
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+    from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+    from torch._inductor.runtime.hints import ReductionHint
+    from torch.utils._ordered_set import OrderedSet
+    from torch_spyre._C import ElementArrangement
+    from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    m, physical, logical, n = 512, 3328, 3200, 4096
+    a, b, k = [Symbol(name, integer=True, nonnegative=True) for name in ("a", "b", "k")]
+    stl = SimpleNamespace(
+        device_size=[52, m, 64],
+        stride_map=[64, physical, 1],
+        elems_per_stick=lambda: 64,
+        element_arrangement=ElementArrangement.STANDARD,
+    )
+    if invalid == "inner_tail":
+        stl.device_size, stl.stride_map = [m, 52, 64], [physical, 64, 1]
+    layout = FixedTiledLayout(
+        torch.device("cpu"), torch.float16, [m, physical], [physical, 1], stl
+    )
+    source = ComputedBuffer(
+        name="source",
+        layout=layout,
+        data=Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx: 0,
+            ranges=[m, physical],
+        ),
+    )
+    consumer = ComputedBuffer(
+        name="down",
+        layout=layout.unallocated_copy(),
+        data=Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            src_dtype=torch.float16,
+            inner_fn=lambda idx, red: (0, 0),
+            ranges=[m, n],
+            reduction_ranges=[logical],
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_hint=ReductionHint.DEFAULT,
+        ),
+    )
+    stride = logical if invalid == "compact_stride" else physical
+    offset = 64 if invalid == "offset" else 0
+    read = MemoryDep("source", stride * a + k + offset, (a, b, k), (m, n, logical))
+    weight = MemoryDep("weight", logical * b + k, (a, b, k), (m, n, logical))
+    write = MemoryDep("down", n * a + b, (a, b), (m, n))
+    consumer.get_read_writes = lambda: ReadWrites(
+        OrderedSet([read, weight]), OrderedSet([write]), OrderedSet()
+    )
+    axis = lx_relayout.prefix_lx_contraction_axis(source, consumer)
+    assert axis == (0 if invalid in (None, "second_reader") else None)
+    if invalid == "second_reader":
+        other = replace(consumer, name="other", layout=layout.unallocated_copy())
+        other.get_read_writes = lambda: ReadWrites(
+            OrderedSet([read, weight]),
+            OrderedSet([MemoryDep("other", n * a + b, (a, b), (m, n))]),
+            OrderedSet(),
+        )
+        graph = SimpleNamespace(
+            operations=[source, consumer],
+            get_buffer=lambda name: source,
+            get_output_names=lambda: [],
+        )
+        assert lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1])
+        graph.operations = [source, other]
+        assert lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1])
+        graph.operations = [source, consumer, other]
+        assert not lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1, 2])
