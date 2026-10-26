@@ -1075,6 +1075,59 @@ class TestComputeValidElements(TestCase):
         )
         self.assertEqual(stl.valid_elements, expected)
 
+    @parametrize(
+        "device_size, valid_elements",
+        [
+            ([4, 512, 64], {}),
+            ([4, 512, 64], {(0, 2): 256, (1,): 512}),
+            ([4, 512, 64], {(0, 2): 200, (1,): 7}),
+            ([4, 512, 64], {(0, 2): 0, (1,): 0}),
+            ([4, 0, 64], {(0, 2): 256, (1,): 0}),
+            ([2**62, 4, 64], {(0, 1): 1}),
+        ],
+    )
+    def test_valid_elements_accepted(self, device_size, valid_elements):
+        stl = SpyreTensorLayout(
+            device_size,
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            valid_elements,
+        )
+        self.assertEqual(stl.valid_elements, valid_elements)
+
+    @parametrize(
+        "device_size, valid_elements, message",
+        [
+            ([4, 512, 64], {(): 0}, "empty device dimension tuple"),
+            ([4, 512, 64], {(2, 0): 256, (1,): 512}, "not strictly increasing"),
+            ([4, 512, 64], {(0, 0, 2): 256, (1,): 512}, "not strictly increasing"),
+            ([4, 512, 64], {(-1,): 1}, "nonnegative integers, but encountered -1"),
+            ([4, 512, 64], {(3,): 1}, r"less than len\(device_size\)"),
+            ([4, 512, 64], {(0, 2): 256, (0, 1): 4}, "multiple keys"),
+            ([4, 512, 64], {(0, 2): 256, (1,): -1}, "values must be nonnegative"),
+            ([4, 512, 64], {(0, 2): 257, (1,): 512}, "exceeds the 256 positions"),
+            ([4, 0, 64], {(1,): 1}, "exceeds the 0 positions"),
+            ([2**62, 4, 0], {(0, 1, 2): 1}, "exceeds the 0 positions"),
+        ],
+    )
+    def test_valid_elements_rejected(self, device_size, valid_elements, message):
+        with self.assertRaisesRegex(RuntimeError, message):
+            SpyreTensorLayout(
+                device_size,
+                [64, 256, 1],
+                get_device_dtype(torch.float16),
+                valid_elements,
+            )
+
+    def test_valid_elements_after_element_arrangement(self):
+        # The deprecated overload takes element_arrangement before valid_elements.
+        args = ([4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16))
+        valid_elements = {(0, 2): 256, (1,): 512}
+        stl = SpyreTensorLayout(*args, ElementArrangement.STANDARD, valid_elements)
+        self.assertEqual(stl.valid_elements, valid_elements)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 256 positions"):
+            SpyreTensorLayout(*args, ElementArrangement.STANDARD, {(0, 2): 257})
+
 
 if __name__ == "__main__":
     run_tests()
