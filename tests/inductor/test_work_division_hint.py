@@ -1215,13 +1215,22 @@ def test_lx_relayout_planner_uses_projected_read_ownership(reader):
 
     source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
     producer = SimpleNamespace(
-        layout=SimpleNamespace(device_layout=SimpleNamespace(device_size=[32, 32])),
+        layout=SimpleNamespace(
+            offset=0,
+            size=[32, 32],
+            stride=[32, 1],
+            device_layout=SimpleNamespace(device_size=[32, 32]),
+        ),
         data=SimpleNamespace(),
         get_name=lambda: "source",
     )
     consumer = SimpleNamespace(
         layout=SimpleNamespace(),
-        data=object() if reader == "reduction" else SimpleNamespace(),
+        data=(
+            object()
+            if reader == "reduction"
+            else SimpleNamespace(ranges=[32, 32], reduction_ranges=[32])
+        ),
         get_name=lambda: "consumer",
     )
     graph = SimpleNamespace(operations=[producer, consumer])

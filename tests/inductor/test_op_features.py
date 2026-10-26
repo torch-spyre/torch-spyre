@@ -620,7 +620,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
             from ortools.sat.python import cp_model
         except ImportError:
             self.skipTest("the cpsat converter needs ortools")
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
             _SympyExprToCpSat,
         )
 

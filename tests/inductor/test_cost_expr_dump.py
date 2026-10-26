@@ -30,9 +30,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     RelayoutCharge,
+    TileAxis,
+    TileSpec,
     cost_expr_record,
     solved_bindings,
 )
+from torch_spyre._inductor.work_division import OpSplitSpace
+from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
 _CORE = sympy.Symbol("core_id")
 
@@ -86,6 +90,31 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
     assert set(splits.values()) == {4, 1}
 
 
+def test_solved_bindings_bind_the_chosen_tiling_per_axis():
+    d0, d1 = sympy.symbols("d0 d1")
+    space = OpSplitSpace(
+        op=None,
+        context=None,
+        output_axes=frozenset({d0, d1}),
+        factor_domains={},
+        tiling=TilingSpace(max_dims=2, output_counts={0: [4], 1: [2]}),
+    )
+    tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+    t = CoreDivisionBuffer(
+        "T",
+        64,
+        [0, 1],
+        core_divisions=[CoreDivision(splits={d1: 2}, tiling=tiling)],
+        division_space=space,
+    )
+    t.address, t.chosen_division = 0, 0
+    tiles = t.sym_tile_counts
+    b = solved_bindings([t])
+    assert b[tiles[0, False]] == 4 and b[tiles[1, False]] == 1, "d1 is split, not tiled"
+    rec = cost_expr_record(10 * tiles[0, False] + tiles[1, False], [], [t])
+    assert rec["objective_ns"] == 41.0
+
+
 def test_record_evaluates_every_term_under_the_solved_plan():
     p, c = _buffers()
     (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
@@ -109,6 +138,27 @@ def test_record_evaluates_every_term_under_the_solved_plan():
     # srepr round-trips, including the RelayoutCharge node.
     back = sympy.parse_expr(rt["expr"], local_dict={"RelayoutCharge": RelayoutCharge})
     assert back.free_symbols == {copy.sym_is_lx, p.sym_division}
+
+
+def test_relayout_charge_prints_only_the_priced_divisions():
+    """``str()`` keys each nonzero price by its division; ``srepr`` keeps the
+    full positional table, so the dump still round-trips."""
+    is_lx = sympy.Symbol("is_lx_copy", integer=True, nonnegative=True)
+    division = sympy.Symbol("division_P", integer=True, nonnegative=True)
+    charge = RelayoutCharge(is_lx, division, 0, 0, 65, 0, 147)
+    assert str(charge) == (
+        "RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147})"
+    )
+    assert str(2 * charge + 1) == (
+        "2*RelayoutCharge(is_lx_copy, division_P, prices={2: 65, 4: 147}) + 1"
+    )
+    assert str(RelayoutCharge(is_lx, division, 0, 0)) == (
+        "RelayoutCharge(is_lx_copy, division_P, prices={})"
+    )
+    back = sympy.parse_expr(
+        sympy.srepr(charge), local_dict={"RelayoutCharge": RelayoutCharge}
+    )
+    assert back == charge
 
 
 def test_a_bundle_names_its_buffers_after_the_boundary_rewrite(monkeypatch):

@@ -98,7 +98,11 @@ def _pointwise_ops() -> frozenset[str]:
 # them so this file cannot silently drift out of sync as ops are added.
 MATMUL_OPS = constants.MATMUL_REDUCTION_OPS
 
-REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS | {constants.KEEP_BY_INDEX_OP}
+REDUCTION_OPS = (
+    constants.SINGLE_INPUT_REDUCTION_OPS
+    | constants.TWO_INPUT_REDUCTION_OPS
+    | constants.DEPTHWISE_CONV_REDUCTION_OPS
+)
 
 DTYPE_OPS = DtypeOpTable.op_names()
 
@@ -359,12 +363,18 @@ def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
 
 
 def _check_op_name(op_spec: OpSpec, stage: str) -> None:
-    """OS-2: Op name should be a known operation."""
+    """OS-2: Op name must be a known operation.
+
+    A new op must be registered in one of the sets behind _all_known_ops()
+    (see constants.py) so that it also gets the per-op checks below.
+    """
     if op_spec.op not in _all_known_ops():
-        logger.warning(
-            "Unknown op name %r in OpSpec at stage %s. "
-            "This may be valid for new ops not yet registered.",
-            op_spec.op,
+        raise OpSpecValidationError(
+            op_spec,
+            "unknown op name",
+            f"Got op={op_spec.op!r}. Register new ops in the op sets in "
+            "constants.py (or SpyreOpFuncs for pointwise ops) so they are "
+            "known to op_spec_validation.",
             stage,
         )
 
@@ -470,7 +480,7 @@ def _check_args(op_spec: OpSpec, stage: str) -> None:
 
         _check_allocation(op_spec, arg, i, stage)
 
-    if not has_output and op_spec.op in _all_known_ops():
+    if not has_output:
         raise OpSpecValidationError(
             op_spec,
             "OpSpec must have at least one output TensorArg (is_input=False)",
@@ -649,6 +659,12 @@ def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
         _check_stick_topk(op_spec, stage)
     elif op == constants.RESTICKIFY_OP:
         _check_stick_restickify(op_spec, stage)
+    elif op in constants.CONV_OPS:
+        # Convolution args stick on different dims by design (input on
+        # in-channel, weight on its own dim, output on out-channel), so the
+        # all-same rule below does not apply.
+        # TODO: add a conv-specific stick check.
+        return
     elif op in _pointwise_ops() | DTYPE_OPS | REDUCTION_OPS:
         # avgpoolfwd is in REDUCTION_OPS but its full constraint (window dims
         # must not appear in the stick) is deferred — _check_stick_all_same

@@ -272,6 +272,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
+| `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
@@ -344,15 +345,61 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `read by restickify (local-read proof failed)` | Relayout is enabled, but exact physical ownership could not prove that every restickify read stays on the same core |
 | `extern kernel user` | extern ops read from HBM |
 | `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
-| `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
+| `graph input (no clone)` | without boundary cloning there is nothing to redirect |
 | `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
-| `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
+| `partial/offset read` | sliced or multi-offset reads are rejected, except the certified zero-offset prefix below |
 | `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only**: the joint solver *chooses* the division, so its slicing gate decides instead) |
+| `graph output (no clone)` | without boundary cloning there is nothing to redirect |
 | `no consumer reads it from LX` | residency would save nothing |
-| `lx back gap` | `backGap` is supported for HBM but not LX |
+| `lx back gap` | generic LX gaps are rejected; the certified prefix below permits a uniform per-core gap |
+
+A narrow exception permits an untiled matmul to read a zero-offset prefix made
+of complete storage sticks. It requires one private, full-width producer and a
+separate gather of its **complete backing buffer**, with the original physical
+row stride preserved. The reader must not split K. Source and copy spans must
+be disjoint, and both must fit in frontend LX. Only the outermost stick axis
+may have an unused tail. Other offset, strided, partial, aliased or multi-reader
+cases remain excluded. The fixed placement path must already have a copy plan;
+the joint solver must guarantee the copy through its relayout decision.
+
+This untiled exception does not require same-tile-group relayout search.
 
 That last distinction is the only difference between the two allocators,
 and it is a parameter (`division_is_fixed`) rather than a second predicate.
+
+With `auto_coarse_tiling` on, the joint path does not bar an op whose menu
+offers a tiling for `graph output (no clone)` or `no consumer reads it from
+LX`: both hold only while the op is untiled. The buffer carries the reason as
+`untiled_bar` instead, and the CP-SAT solve keeps it out of LX unless it tiles
+the op.
+
+### Prefix demotion contract
+
+If preparation rejects a prefix gather, scheduling retries after clearing the
+source and copy LX allocations, their physical LX views and their relayout
+registry entry. The ordinary HBM clone remains. It has one writer and keeps the
+full physical extent and stride. Its consumers keep valid reads from that clone.
+Preparation discards the rejected kernels and builds kernels for the HBM path.
+Unrelated LX allocations stay unchanged.
+
+This is an amendment to D6-2 in the merge plan. It does not remove the clone or
+restore the original graph topology. It is not plan-exact rollback. The focused
+test checks finite and NaN unused tails against the existing exact reference.
+A bitwise HBM-placement comparison requires a matched same-division control;
+this test does not force an allocator result to create one.
+
+### Certified exception contracts
+
+An ownership proof does not replace storage, lifetime or capacity checks.
+Each exception must name its proof and tests. The checks still run in their
+existing order; this table does not add a separate rule engine.
+
+| Admission check | Permitted case | Required proof and storage conditions | Covering tests |
+|---|---|---|---|
+| `partial/offset read`, `lx back gap` | Zero-offset linear prefix | `prefix_lx_contraction_axis` proves the physical stride and complete-stick prefix. `prefix_lx_gather_source` requires one reader and a single writer. Residency requires a served full-backing copy with unsplit K and disjoint LX spans. | `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone` |
+
+The untiled prefix case does not depend on same-tile-group search. Later
+ownership exceptions must retain this contract and add their own rows.
 
 ### Per-core size and core-division mismatch
 
@@ -591,8 +638,8 @@ utilization). Remaining gaps:
 - **No performance model.** The "honor compute-bound ops, search the
   rest" rule is still a heuristic; the trade between compute throughput
   and memory traffic is not scored.
-- **Coarse-tiling integration**: landed for CP-SAT (`#4768`), partially landed for simulated
-  annealing — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
+- **Coarse-tiling integration**: landed for CP-SAT (`#4768`) and simulated annealing
+  (`#4456`-`#4894`) — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
   for current status.
 
 The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
@@ -655,8 +702,8 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`), partially
-  landed for simulated annealing — see
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`) and simulated
+  annealing (`#4456`-`#4894`) — see
   [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
   current status.
 

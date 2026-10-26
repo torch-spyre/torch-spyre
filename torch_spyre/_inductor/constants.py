@@ -14,11 +14,24 @@
 
 import torch
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+
+# Relative restickify cost per device byte, by device dtype. The restickify cost
+# is (device size in bytes) x this weight. 32-bit formats take 2 passes per stick,
+# so they are 2x slower than fp16 for the same number of bytes (and therefore 4x
+# per element, since they also have 2x the bytes). Single source of truth for the
+# supported dtypes below.
+RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT = {
+    DataFormats.SEN169_FP16: 1,
+    DataFormats.IEEE_FP32: 2,
+    DataFormats.IEEE_INT32: 2,
+    DataFormats.SENUINT32: 2,
+}
+RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT)
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
@@ -170,6 +183,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "log",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when
@@ -226,6 +240,8 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
+# max(|x|) reduction; torch.any/all lower to it (see lowering.lower_any_*).
+ABSMAX_OP = "absmax"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
 POOL_OPS = {AVGPOOL2D_OP}
@@ -254,11 +270,22 @@ DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
 # Single-input reductions: everything store_reduction dispatches to its
 # fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
 # reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
-# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
-# of supported reduction_type strings to derive this from, so it is written
-# down here explicitly.
+# ops (exx2, topkvalue/topkindex, avgpoolfwd, absmax, quantscalepertokenfp8) --
+# there is no upstream registry of supported reduction_type strings to derive
+# this from, so it is written down here explicitly.
 SINGLE_INPUT_REDUCTION_OPS = frozenset(
-    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+    {
+        "sum",
+        "mean",
+        "max",
+        "min",
+        "prod",
+        "exx2",
+        *TOPK_OPS,
+        AVGPOOL2D_OP,
+        ABSMAX_OP,
+        QUANTSCALEPERTOKENFP8_OP,
+    }
 )
 
 # Populate more valid labels from deeptools here if needed

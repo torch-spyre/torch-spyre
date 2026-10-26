@@ -4933,29 +4933,13 @@ def _patch_consumers(
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
-        # _retile_load_index's squeezed-dim term injection (see
-        # _squeezed_retile_dims) is only meaningful for a consumer with no
-        # loop_info of its own -- an "outside" consumer whose incoming index
-        # was traced against old_name's tile-local (squeezed) layout with no
-        # enclosing coarse-tile loop nest to supply a term for a dim that
-        # layout squeezed away. An "inside" consumer (has loop_info) already
-        # derives its index from a real, enclosing loop nest that supplies a
-        # correct term for every one of *its own* real dimensions; passing
-        # it here anyway injects a bogus extra term for any dim this
-        # consumer tiles as an output dim but that new_name's layout does
-        # not vary over (e.g. a fully-reduced dim in an accum_full buffer),
-        # double-counting/corrupting the address. See
-        # test_copy_accum_with_reduction_512x256_A4_B4, where this caused a
-        # spurious B-tile-index term in a redirected read of an
-        # already-fully-B-reduced accum_full buffer.
-        _index_consumer = consumer if not hasattr(consumer, "loop_info") else None
 
         def new_inner_fn(
             *args,
             _map=name_map,
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
-            _consumer=_index_consumer,
+            _consumer=consumer,
         ):
             if _info is not None:
                 handler = _NameAndIndexSwapHandler(
@@ -5125,6 +5109,11 @@ def _is_dense_full_buffer_view(
     case without view metadata when both layouts are dense and the affine
     index is a complete, bijective permutation/reshape of the new buffer.
 
+    A consumer tiled in a loop group of its own iterates only a tile of its
+    ranges, yet a view with its own layout (a ``ReinterpretView``) keeps
+    tracing its read at full scale; its index is matched against the ranges
+    before division too.
+
     A missed recognition is safe but conservative: ``False`` keeps the
     caller on the general retile/``Unsupported`` path rather than accepting
     an unproven full-buffer mapping.
@@ -5148,9 +5137,6 @@ def _is_dense_full_buffer_view(
         running *= size
     target_numel = running
 
-    consumer_ranges = tuple(consumer.data.ranges)
-    reduction_ranges = tuple(getattr(consumer.data, "reduction_ranges", None) or ())
-
     try:
         atoms, offset = decompose_index_for_tiling(
             index, dict.fromkeys(index.free_symbols, 1)
@@ -5170,76 +5156,78 @@ def _is_dense_full_buffer_view(
             return False
         symbol_numbers[symbol] = int(name[split:])
 
-    nonunit_ranges = [size for size in consumer_ranges if size != 1]
-    all_ranges = [*consumer_ranges, *reduction_ranges]
-    nonunit_all_ranges = [size for size in all_ranges if size != 1]
-    nonunit_reduction_ranges = [size for size in reduction_ranges if size != 1]
-    extent_maps: list[dict[sympy.Symbol, Expr]] = []
-    # Some retraces preserve raw dimension numbers (_i1/_i2/_i3 when raw dim
-    # 0 is unit), while extract_read_writes renumbers them densely (d0/d1/d2).
-    if all(number < len(consumer_ranges) for number in symbol_numbers.values()):
-        extent_maps.append(
-            {
-                symbol: consumer_ranges[number]
-                for symbol, number in symbol_numbers.items()
-            }
-        )
-    if all(number < len(nonunit_ranges) for number in symbol_numbers.values()):
-        extent_maps.append(
-            {
-                symbol: nonunit_ranges[number]
-                for symbol, number in symbol_numbers.items()
-            }
-        )
-    if all(number < len(all_ranges) for number in symbol_numbers.values()):
-        extent_maps.append(
-            {symbol: all_ranges[number] for symbol, number in symbol_numbers.items()}
-        )
-    if all(number < len(nonunit_all_ranges) for number in symbol_numbers.values()):
-        extent_maps.append(
-            {
-                symbol: nonunit_all_ranges[number]
-                for symbol, number in symbol_numbers.items()
-            }
-        )
-    # Some inner_fn traces use an independent r0/r1/... namespace for
-    # reduction indices rather than continuing the d-numbering after outputs.
-    if all(
-        symbol.name.lstrip("_").startswith("r") and number < len(reduction_ranges)
-        for symbol, number in symbol_numbers.items()
-    ):
-        extent_maps.append(
-            {
-                symbol: reduction_ranges[number]
-                for symbol, number in symbol_numbers.items()
-            }
-        )
-    if all(
-        symbol.name.lstrip("_").startswith("r")
-        and number < len(nonunit_reduction_ranges)
-        for symbol, number in symbol_numbers.items()
-    ):
-        extent_maps.append(
-            {
-                symbol: nonunit_reduction_ranges[number]
-                for symbol, number in symbol_numbers.items()
-            }
-        )
+    ranges = tuple(consumer.data.ranges)
+    reduction_ranges = tuple(getattr(consumer.data, "reduction_ranges", None) or ())
+    extent_sets = [(ranges, reduction_ranges)]
+    if getattr(consumer, "loop_info", None) is not None:
+        extent_sets.append(_undivided_ranges(consumer))
 
-    for extent_map in extent_maps:
-        indexed_dims = sorted(
-            ((coefficient, extent_map[symbol]) for coefficient, symbol in atoms),
-            key=lambda pair: pair[0],
-        )
-        running = sympy.Integer(1)
-        for coefficient, extent in indexed_dims:
-            if not _equal(coefficient, running):
-                break
-            running *= extent
-        else:
-            if _equal(running, target_numel):
-                return True
+    # Symbols number the live (possibly divided) ranges; extents come from
+    # either set.  Some retraces preserve raw dimension numbers (_i1/_i2/_i3
+    # when raw dim 0 is unit), while extract_read_writes renumbers them
+    # densely (d0/d1/d2).  Some use an independent r0/r1/... namespace for
+    # reduction indices rather than continuing the d-numbering after outputs.
+    n_out = len(ranges)
+    all_ranges = [*ranges, *reduction_ranges]
+    positions = [
+        list(range(n_out)),
+        [i for i, size in enumerate(ranges) if size != 1],
+        list(range(len(all_ranges))),
+        [i for i, size in enumerate(all_ranges) if size != 1],
+    ]
+    reduction_positions = [
+        [n_out + i for i in range(len(reduction_ranges))],
+        [n_out + i for i, size in enumerate(reduction_ranges) if size != 1],
+    ]
+    if all(symbol.name.lstrip("_").startswith("r") for symbol in symbol_numbers):
+        positions += reduction_positions
+
+    for extent_ranges, extent_reduction_ranges in extent_sets:
+        extents = [*extent_ranges, *extent_reduction_ranges]
+        for pos in positions:
+            if any(number >= len(pos) for number in symbol_numbers.values()):
+                continue
+            indexed_dims = sorted(
+                (
+                    (coefficient, extents[pos[symbol_numbers[symbol]]])
+                    for coefficient, symbol in atoms
+                ),
+                key=lambda pair: pair[0],
+            )
+            running = sympy.Integer(1)
+            for coefficient, extent in indexed_dims:
+                if not _equal(coefficient, running):
+                    break
+                running *= extent
+            else:
+                if _equal(running, target_numel):
+                    return True
     return False
+
+
+def _undivided_ranges(
+    consumer: ComputedBuffer,
+) -> tuple[tuple[Expr, ...], tuple[Expr, ...]]:
+    """``consumer``'s ranges and reduction ranges before ``_divide_ranges``.
+
+    Exact because ``_divide_ranges`` refuses a trip count that does not divide
+    its range; a non-exact tiling would have to record the original extent.
+    """
+    info = consumer.loop_info  # type: ignore[attr-defined]
+    ranges = list(consumer.data.ranges)
+    reduction_ranges = list(getattr(consumer.data, "reduction_ranges", None) or ())
+    hinted = _loop_var_hinted_ranges(consumer)
+    hinted_reduction = _loop_var_hinted_reduction_ranges(consumer)
+    for count, dims, reduction_dims in zip(
+        info.loop_count, info.loop_tiled_dims, info.loop_tiled_reduction_dims
+    ):
+        for d in dims:
+            if d not in hinted:
+                ranges[d] = ranges[d] * count
+        for d in reduction_dims:
+            if d not in hinted_reduction:
+                reduction_ranges[d] = reduction_ranges[d] * count
+    return tuple(ranges), tuple(reduction_ranges)
 
 
 def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
@@ -5475,7 +5463,24 @@ def _retile_load_index(
         )
         new_index += preserved_index
 
-    if consumer is not None and not dense_full_view:
+    # The squeezed-dim term injection is only meaningful for a consumer with
+    # no loop_info of its own -- an "outside" consumer whose incoming index
+    # was traced against buf_name's tile-local (squeezed) layout with no
+    # enclosing coarse-tile loop nest to supply a term for a dim that layout
+    # squeezed away. An "inside" consumer (has loop_info) already derives its
+    # index from a real, enclosing loop nest that supplies a correct term for
+    # every one of *its own* real dimensions; injecting anyway adds a bogus
+    # term for any dim this consumer tiles as an output dim but that the new
+    # layout does not vary over (e.g. a fully-reduced dim in an accum_full
+    # buffer) -- see test_copy_accum_with_reduction_512x256_A4_B4. Such a
+    # consumer still reaches the dense-full-view check above: one in another
+    # loop group can read the whole buffer every iteration, its index traced
+    # at full scale.
+    if (
+        consumer is not None
+        and not hasattr(consumer, "loop_info")
+        and not dense_full_view
+    ):
         for d in _squeezed_retile_dims(info, consumer):
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a

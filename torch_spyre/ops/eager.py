@@ -465,6 +465,7 @@ COMPILED_OPS = [
     aten.exp,
     aten.floor,
     aten.index_select,
+    aten.index_copy.out,
     aten.log,
     aten.mean,
     aten.mul,

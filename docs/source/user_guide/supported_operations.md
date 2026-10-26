@@ -6,6 +6,13 @@ This page lists the PyTorch operations that Torch-Spyre supports via
 For details on how operations are implemented and how to add new ones,
 see [Adding Operations](../compiler/adding_operations.md).
 
+Runnable scripts for several of these operations are in the examples
+directory. See the [attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/attention.py) and the
+[flash attention example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/flash_attention.py) for scaled
+dot-product attention, the [RMS norm example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/rms_norm.py), the
+[embedding example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/embedding.py), and the
+[FP8 quantization example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/fp8.py).
+
 ## Operations Table
 
 | Operation | Eager | Compiled | Execution | Notes |
@@ -48,6 +55,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.floor` | Y | Y | Spyre | |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
+| `torch.trunc` | | Y | Spyre | Compiled only; custom lowering `floor(abs(x)) * clip(x, -1, 1)`, since the device has no native trunc op |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
@@ -57,9 +65,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
-| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter |
+| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32 runs natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
-| `torch.mul` | Y | Y | Spyre | |
+| `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
@@ -103,6 +111,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
+| `torch.index_copy` | Y | Y | Spyre | `index_copy.out` is registered on the compiled path (`ops/eager.py` `COMPILED_OPS`), which also serves `index_copy` and `index_copy_`. Scattering along the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
 | `torch.slice_scatter` | | Y | Spyre | Compiled only (`lower_slice_scatter`); unit-step slices only, strided writes raise `Unsupported` |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
@@ -127,7 +136,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
-| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
+| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported. Converts fp16, bf16, int32, int64, and bool on device; int32 and int64 share one storage layout, so a cast between them is an identity |
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
@@ -137,7 +146,6 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.index_copy` | Y | | CPU fallback | Eager only; runs on CPU |
 
 > **Column key:**
 >

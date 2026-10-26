@@ -897,20 +897,74 @@ class TestFactorizedMatmulCandidates(TestCase):
             )
 
     def test_rejects_noncontiguous_or_partial_factorized_chain(self):
-        """Only a full, gap-free mixed-radix view is safe to collapse."""
+        """Only a gap-free mixed-radix view, windowed on whole inner dims, collapses."""
         scenarios = (
+            # Heads stride 256 over a 128-wide D leaves a gap between heads.
             self._same_graph_attention_scenario(host_stride=(262144, 4096, 256, 1)),
-            self._same_graph_attention_scenario(contraction_range=2048),
+            # 2000 elements end in the middle of a head (not a multiple of D).
+            self._same_graph_attention_scenario(contraction_range=2000),
         )
         for arg, contraction, source in scenarios:
             with self.subTest(
                 stride=arg.layout.stride,
                 contraction_range=arg.dep.ranges[contraction],
             ):
-                with self.assertRaisesRegex(Unsupported, "full-range contiguous"):
+                with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
                     find_stick_compatible_input_layout(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
+
+    def test_windowed_factorized_chain_collapses_to_the_full_chain(self):
+        """A contraction var covering whole heads of a gap-free view collapses.
+
+        A ``for_each_tile`` over head groups reads one window of the chain
+        (here 16 of 32 heads, 2048 of 4096 elements); the window's position
+        enters through the loop index, not the host coordinates.  The canonical
+        layout must span the whole chain, not just the window.
+        """
+        arg, contraction, _ = self._same_graph_attention_scenario(
+            contraction_range=2048
+        )
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [64, 64, 1, 64])
+        self.assertEqual(list(result.stride_map), [4096, 64, -1, 1])
+
+    def test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain(self):
+        """An outer variable added to the head coordinate does not block collapse.
+
+        The dep index ``4096*outer + contraction`` makes the head coordinate
+        ``32*outer + floor(contraction/128)``: a loop variable selects a group of
+        32 heads and the contraction variable walks one group.  Only the part of
+        a host coordinate that varies with the contraction variable must depend
+        on it alone, so the outer term is allowed (issue #5441).  The canonical
+        layout spans the whole 64-head chain.
+        """
+        outer, contraction = sympy.symbols(
+            "outer contraction", integer=True, nonnegative=True
+        )
+        heads = 64
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, heads, 1, 128],
+            [heads * 128, 128, 128, 1],
+        )
+        source = SpyreTensorLayout(
+            [heads, 1, 2, 1, 64],
+            [128, -1, 64, -1, 1],
+            get_device_dtype(torch.float16),
+            {(0,): heads, (1,): 1, (2, 4): 128, (3,): 1},
+        )
+        dep = MemoryDep(
+            "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
+        )
+        result = find_stick_compatible_input_layout(
+            PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [1, 128, 1, 64])
+        self.assertEqual(list(result.stride_map), [-1, 64, -1, 1])
 
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""

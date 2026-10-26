@@ -1632,6 +1632,39 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         self.assertEqual(int(weight_step.group(1)) * 64, hidden * ffn)
         self.assertNotIn("read_copy", src)
 
+    def test_split_k_over_head_groups(self):
+        """Split the o_proj contraction over groups of heads.
+
+        ``x`` is the decode attention output ``[B, H, 1, D]``; each trip reads
+        ``Ht`` heads, so the contraction variable covers one tile (``Ht * D`` of
+        ``H * D``) of a head dim that is factorized on the host
+        (``[0, floor(d1/D), 0, Mod(d1, D)]``).  The tile position enters through
+        the loop index, not the host coordinates.  The weight tile is likewise a
+        ``[N, Ht, D]`` view reshaped to ``[N, Ht * D]``.
+        """
+        import torch.nn.functional as F
+
+        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+        B, H, D, Ht = 1, 32, 128, 8
+        hidden = H * D
+        a = shaped_randn(B, H, 1, D)
+        w = shaped_randn(hidden, hidden, seed=1) * 0.05
+
+        def fn(a, w):
+            w3 = w.view(hidden, H, D)
+
+            def body(acc, ops):
+                a_t, w_t = ops
+                x = a_t.transpose(1, 2).reshape(B, 1, Ht * D)
+                return acc + F.linear(x, w_t.reshape(hidden, Ht * D)), None
+
+            init = torch.zeros(B, 1, hidden, dtype=a.dtype, device=a.device)
+            return for_each_tile(body, (a, w3), dims=(1, 1), tile_size=Ht, init=init)[0]
+
+        ref = F.linear(a.transpose(1, 2).reshape(B, 1, hidden).float(), w.float())
+        self._check(fn, (a, w), ref, trips=H // Ht)
+
     def test_carried_sum_over_tiled_dim(self):
         v = shaped_randn(4, 64, 64)
         fn = lambda v: carried_reduction_fn(v, lambda acc, s: acc + s.sum(0), 0.0)  # noqa: E731
@@ -1776,6 +1809,26 @@ class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.float(), values.float().sum(0) + 1, atol=0.05, rtol=0.05
         )
+
+    @expects_raise
+    def test_carried_sum_rejects_a_split_that_does_not_divide_the_rows(self):
+        """A ``work_div`` that does not divide the output rows is an error.
+
+        The hint-driven carried reduction raised here; the ``for_each_tile``
+        carry must not quietly pick another split, which would leave the
+        accumulator's init and update on different row splits.
+        """
+        from torch._inductor.exc import InductorError
+
+        values = self._linspace_values(2)
+        for split in (3, 7):
+            with self.subTest(work_div=split):
+                with self.assertRaisesRegex(
+                    InductorError, "work_division_hint:.*dim d0 size=64"
+                ):
+                    self._compile(
+                        lambda v: carried_expert_sum_fn(v, split), self._named(values)
+                    )
 
 
 if __name__ == "__main__":

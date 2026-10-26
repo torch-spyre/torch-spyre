@@ -103,6 +103,74 @@ def test_change_graph_output_skips_unrelated_view_and_preserves_matching_view():
     assert view.data.data is new
 
 
+def test_output_clone_precedes_consumers_in_lowered_order():
+    """Name-sorted users must not place a drain after an earlier reader."""
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+    from torch_spyre._inductor.scratchpad import graph_editor as ge
+
+    fx_graph = torch.fx.Graph()
+    source_fx = fx_graph.placeholder("source")
+    early_fx = fx_graph.call_function(torch.neg, (source_fx,))
+    late_fx = fx_graph.call_function(torch.relu, (source_fx,))
+    fx_graph.output((early_fx, late_fx))
+    gm = torch.fx.GraphModule(torch.nn.Module(), fx_graph)
+
+    def buffer(name, origin):
+        result = _graph_editor_test_buffer(name)
+        result.origins.add(origin)
+        result.origin_node = origin
+        return result
+
+    source = buffer("source", source_fx)
+    source.layout = FixedTiledLayout(
+        torch.device("spyre"),
+        torch.float16,
+        [2, 3],
+        [3, 1],
+        SpyreTensorLayout([2, 3], [3, 1], torch.float16, [0, 1]),
+    )
+    source.layout.allocation["lx"] = 128
+    early = buffer("buf59", early_fx)
+    late = buffer("buf121", late_fx)
+    operations = [source, early, late]
+    lowering = SimpleNamespace(
+        operations=operations,
+        orig_gm=gm,
+        register_buffer=lambda _buf: "drain",
+    )
+    editor = object.__new__(GraphEditor)
+    editor.lowering = lowering
+    editor.fx_graph = fx_graph
+    editor.clone_aten_op = torch.clone
+    clone_data = _graph_editor_test_buffer("clone_data").data
+
+    with (
+        patch.object(
+            ge,
+            "clone_lowering",
+            return_value=TensorBox(StorageBox(clone_data)),
+        ),
+        patch.object(
+            ge,
+            "register_operation_after_graph_edit",
+            side_effect=lambda graph, op: graph.operations.append(op),
+        ),
+        patch.object(ge, "copy_op_metadata"),
+        patch.object(ge, "iteration_space_from_op", return_value={}),
+        patch.object(ge, "commit_iteration_space_ownership"),
+    ):
+        drain = editor.push_allocation_with_clone(
+            source, [late, early], input=False, private=True
+        )
+
+    assert operations == [source, drain, early, late]
+    assert early_fx.args == late_fx.args == (drain.origin_node,)
+    assert drain.layout.allocation == {}
+    assert source.layout.allocation == {"lx": 128}
+    fx_graph.lint()
+
+
 def test_nested_spyre_context_runs_pre_scheduling_once():
     calls = []
 
@@ -1786,7 +1854,6 @@ class TestSolverCapabilities(unittest.TestCase):
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "replans_after_tiling",
         "linear_cost_only",
     )
 
@@ -1829,7 +1896,6 @@ class TestSolverCapabilities(unittest.TestCase):
                 "decides_lx_relayouts": True,
                 "chooses_tilings": True,
                 "tilings_from_menu": True,
-                "replans_after_tiling": True,
                 "linear_cost_only": True,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
@@ -1897,18 +1963,14 @@ class TestSolverCapabilities(unittest.TestCase):
 
         joint = placement(**all_false)
         joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
-        for implied in ("tilings_from_menu", "replans_after_tiling"):
-            with (
-                self.subTest(implied=implied),
-                self.assertRaisesRegex(
-                    TypeError, f"{implied}\\(\\) requires chooses_tilings"
-                ),
-            ):
-                type(
-                    "WithoutTilings",
-                    (CoreDivisionLayoutSolver,),
-                    {**joint, implied: classmethod(lambda cls: True)},
-                )
+        with self.assertRaisesRegex(
+            TypeError, "tilings_from_menu\\(\\) requires chooses_tilings"
+        ):
+            type(
+                "WithoutTilings",
+                (CoreDivisionLayoutSolver,),
+                {**joint, "tilings_from_menu": classmethod(lambda cls: True)},
+            )
         with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
             type(
                 "JointThatDenies",
@@ -2391,6 +2453,82 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
             "co-opt input clone in-place reuse changed the numerical result",
+        )
+
+    def test_input_clone_matches_visible_to_relayout_candidate_capping(self):
+        """Clone-supplied free divisions are merged into cd_parent_matches
+        BEFORE _cd_parent_relayouts runs, so its cap-and-rank sibling pinning
+        can preserve the candidate group that would let a parent join a
+        division an input clone already occupies for free (#3212's reverse
+        parent).
+
+        Merged only after the call, a positive
+        lx_solver_relayout_groups_per_edge cap could prune exactly that group
+        and silently drop a residency option (cyang49's PR #5057 review).
+        Pins the ordering -- what the pinning sees at call time -- not the
+        solver's eventual choice."""
+        import inspect
+
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            return x * 2.0 + x * 3.0
+
+        captured: list[set] = []
+        orig = CoOptimizingAllocator._cd_parent_relayouts
+
+        def spy(self, *a, **k):
+            bound = inspect.signature(orig).bind(self, *a, **k)
+            matches = bound.arguments.get("cd_parent_matches") or {}
+            captured.append(set(matches))
+            return orig(self, *a, **k)
+
+        # True input-clone names: the inputs that actually produced clone
+        # divisions are exactly the keys input_clone_matches ends up with.
+        # NOT every BufferType.Input buffer -- an ordinary (uncloned) graph
+        # input could appear in cd_parent_matches as a plain relayout
+        # parent and satisfy the ordering assertion without any clone being
+        # visible.
+        clone_names: set[str] = set()
+        orig_cdm = CoOptimizingAllocator._clone_divisions_and_matches
+
+        def spy_cdm(self, input_name, *a, **k):
+            divs, matches = orig_cdm(self, input_name, *a, **k)
+            if divs:
+                clone_names.add(input_name)
+            return divs, matches
+
+        with (
+            patch.object(CoOptimizingAllocator, "_cd_parent_relayouts", spy),
+            patch.object(
+                CoOptimizingAllocator, "_clone_divisions_and_matches", spy_cdm
+            ),
+        ):
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="cpsat",
+                co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+
+        self.assertTrue(captured, "_cd_parent_relayouts was not called")
+        self.assertTrue(
+            clone_names,
+            "expected at least one input clone with a valid core division",
+        )
+        self.assertTrue(
+            any(clone_names & seen for seen in captured),
+            "input-clone matches were not visible in cd_parent_matches at "
+            "_cd_parent_relayouts call time (merged only after the call, so "
+            "the cap-and-rank sibling pinning cannot preserve the group "
+            "matching the clone's free division)",
+        )
+        self.assertTrue(
+            torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
+            "clone-match ordering change altered the numerical result",
         )
 
     def test_output_feeding_buffer_reused_in_place(self):

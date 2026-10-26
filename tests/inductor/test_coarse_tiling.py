@@ -82,6 +82,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _divide_ranges,
     _index_var_prefix,
     _loop_var_to_reduction_ranges_pos,
+    _patch_consumers,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
@@ -97,9 +98,9 @@ from torch_spyre._inductor.wsr.tile_prediction import (
 )
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    CoarseTilingPass,
     _derive_group_idx_offset,
     _derive_hint_id_base,
+    apply_tilings,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
@@ -128,6 +129,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
+from utils_inductor import ir_computed_buffer, ir_input_loader
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -1330,6 +1332,23 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
 
         self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
 
+    def test_squeezed_dim_not_added_for_a_consumer_with_loop_info(self):
+        # The squeeze shape of the test above, but the consumer sits in a loop
+        # nest of its own, which already supplies a term for every real dim.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+            new_size=(Integer(4), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _make_consumer_with_ranges([4, 256])
+        consumer.loop_info = object()
+
+        result = _retile_load_index("buf", q1, info, consumer)
+
+        self.assertEqual(result, q1)
+
     def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
         # Same squeeze shape as above, but the consumer's own dim 0 is ALSO
         # unit-size (e.g. B=1 when only H is tiled) -- no real loop variable
@@ -1472,6 +1491,92 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
 
         self.assertEqual(result, contraction)
+
+    def test_regrouped_full_scale_view_from_a_consumer_tiled_elsewhere(self):
+        # q [1, 32, 64, 128], tiled on seq by 2, read as [1, 8, 4, s, 128] by
+        # a consumer tiled on s in a loop group of its own. A full-scale
+        # trace (32768 per kv head) is kept; a tile-scale one is rescaled.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(4096), Integer(128), Integer(1)),
+            new_stride=(Integer(262144), Integer(8192), Integer(128), Integer(1)),
+            old_size=(Integer(1), Integer(32), Integer(32), Integer(128)),
+            new_size=(Integer(1), Integer(32), Integer(64), Integer(128)),
+        )
+        consumer = _make_consumer_with_ranges([1, 8, 4, 32, 128])
+        consumer.loop_info = SimpleNamespace(
+            loop_count=[2], loop_tiled_dims=[[3]], loop_tiled_reduction_dims=[[]]
+        )
+        kv, group, seq, column = map(sympy_index_symbol, ("d0", "d1", "d2", "d3"))
+        full_scale = 32768 * kv + 8192 * group + 128 * seq + column
+
+        for index in (full_scale, 16384 * kv + 4096 * group + 128 * seq + column):
+            result = _retile_load_index(
+                "q", index, info, consumer, preserve_target_stride_atoms=True
+            )
+            self.assertEqual(simplify(result - full_scale), 0)
+
+
+class TestPatchConsumersLoopInfo(unittest.TestCase):
+    """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
+
+    The tile [1024, 128] (stride [128, 1]) of a [1024, 256] buffer (stride
+    [256, 1]) is redirected to the full buffer.
+    """
+
+    _INFO = _RetiledBufferInfo(
+        old_stride=(Integer(128), Integer(1)),
+        new_stride=(Integer(256), Integer(1)),
+        old_size=(Integer(1024), Integer(128)),
+        new_size=(Integer(1024), Integer(256)),
+    )
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _redirected_index(self, consumer, old_name: str) -> sympy.Expr:
+        consumer.loop_info = SimpleNamespace(
+            tiled_dims_per_read=[],
+            loop_count=[],
+            loop_tiled_dims=[],
+            loop_tiled_reduction_dims=[],
+        )
+        operations = [consumer]
+        _patch_consumers([consumer], old_name, "full", operations, self._INFO)
+        (read,) = [r for r in operations[0].get_read_writes().reads if r.name == "full"]
+        return read.index
+
+    def test_full_scale_read_from_another_loop_group_is_preserved(self):
+        # A matmul in a loop group of its own reads the whole weight every
+        # iteration, so its index is traced at the full buffer's scale;
+        # decomposing 256 against the tile's row stride of 128 would turn it
+        # into 512.
+        loader = ir_input_loader("weight", [1024, 256])
+        _, mm = ir_computed_buffer(
+            "mm",
+            [1024, 1024],
+            lambda i, r: loader([i[1], r[0]]),
+            reduction_ranges=[256],
+        )
+        d1, d2 = sympy_index_symbol("d1"), sympy_index_symbol("d2")
+
+        self.assertEqual(self._redirected_index(mm, "weight"), 256 * d1 + d2)
+
+    def test_tile_local_read_in_the_same_loop_group_is_rescaled(self):
+        # A same-group reader iterates the tile, so its index is tile-local.
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(128)],
+            input_shapes_strides=[([1024, 128], [128, 1])],
+            name="pw",
+            hints=(),
+        )
+        d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
+
+        self.assertEqual(self._redirected_index(op, "in0_pw"), 256 * d0 + d1)
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
@@ -6464,6 +6569,12 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # These tests check MLIR symbol/argument plumbing with synthetic
+        # one-tensor specs and made-up op names, which are not valid specs
+        # for any real op, so skip OpSpec validation.
+        patcher = config.patch({"validate_op_specs": False})
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
 
     def tearDown(self):
         import shutil
@@ -6582,6 +6693,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
         self.assertNotIn("sdsc_execute (%sym_1)", mlir)
 
+    @config.patch({"frontend_pool_allocation": False})
     def test_non_tensor_arg_symbols_remain_as_constants(self):
         c0 = Symbol("c0")
         op_a = self._make_op_spec_with_hbm_args("a", [0])
@@ -7850,7 +7962,7 @@ class TestPredictFrameReduction(unittest.TestCase):
         ``reduction_ranges`` -- false as soon as a size-1 reduction dim is
         squeezed away, and the hint then names a symbol the op does not carry,
         so the applier silently tiles nothing. Going through the real lowering
-        is both faithful (it is what ``CoarseTilingPass`` does) and immune to
+        is both faithful (it is what ``apply_tilings`` does) and immune to
         that, and it mirrors ``TestPredictFrame._apply_and_compare``.
         """
         ranges_before = list(op.data.ranges)
@@ -9285,8 +9397,8 @@ class TestDerivedBases(unittest.TestCase):
         self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
 
 
-class TestCoarseTilingPassEquivalence(unittest.TestCase):
-    """CoarseTilingPass reduces to a direct coarse_tile_post_stickify call.
+class TestApplyTilingsEquivalence(unittest.TestCase):
+    """``apply_tilings`` reduces to the hint path.
 
     Both paths call the same coarse_tile_post_stickify(); the pass just builds
     its (groups, group_idx_offset, dim_hints) inputs from a TileSpec instead of
@@ -9337,13 +9449,16 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_fields = self._loop_fields(ref)
         ref_range = ref.data.ranges[0]
 
-        # CoarseTilingPass: same tiling expressed as a TileSpec.
+        # apply_tilings: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
         self.assertEqual(got.data.ranges[0], Integer(64))
+        # The tile still iterates dim 0, so its one symbol is the one it had.
+        c0 = sympy.Symbol("c0")
+        self.assertEqual(got.symbols_on_tile, {c0: c0})
 
     def test_nested_two_level_matches_direct_call(self):
         ref = _make_hinted_op(
@@ -9356,9 +9471,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_ranges = list(ref.data.ranges)
 
         got = self._bare([256, 128], "op0")
-        CoarseTilingPass(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
-        ).apply_pass(_graph([got]))
+        apply_tilings(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+        )
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
@@ -9367,7 +9482,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4),))
         ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
         g = _graph(ops)
-        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        apply_tilings({"op0": spec, "op2": spec}, g)
         hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
         self.assertEqual(hint_ids, [[0], [1]])
         self.assertNotEqual(
@@ -9404,7 +9519,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        CoarseTilingPass({}).apply_pass(g)
+        apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(
@@ -9412,8 +9527,8 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             )
 
 
-class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
-    """CoarseTilingPass refuses to tile an op inside a ``for_each_tile`` region.
+class TestApplyTilingsRegionRefusal(unittest.TestCase):
+    """``apply_tilings`` refuses to tile an op inside a ``for_each_tile`` region.
 
     A region spans every op between the first and last op one outermost loop
     stamped (see ``prescribed_regions``), so the refusal covers the ops the loop
@@ -9480,7 +9595,7 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op0": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
@@ -9490,13 +9605,13 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+            apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_tiles_op_after_the_loop(self):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
-        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        apply_tilings({"op1": self._SPEC}, _graph(ops))
         self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))

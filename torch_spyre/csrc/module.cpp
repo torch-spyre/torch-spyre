@@ -693,6 +693,38 @@ PYBIND11_MODULE(_C, m) {
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
 
+  // Test-only seam: runs a single HostCompute on the current stream and returns
+  // the produced correction bytes. A HostCompute-only plan cannot go through
+  // prepare_kernel (the validator requires a following Compute, and executing
+  // a Compute from a mock SpyreCode faults the device), so this drives the
+  // same flex path JobPlanStepHostCompute::construct uses (Case 2: no input
+  // buffer, no address args) directly. The "_" prefix signals this is not part
+  // of the stable public API.
+  m.def(
+      "_host_compute_bytes",
+      [](const std::string& hcm_json, size_t correction_size) {
+        auto hcm = std::make_unique<Hcm>();
+        TORCH_CHECK(hcm->importJsonStr(hcm_json), "Failed to import Hcm");
+        auto handle = flex::createHostComputeHandle(std::move(hcm));
+        auto* params = flex::createHostComputeParams(
+            handle.get(), correction_size, /*input_buffer=*/nullptr, {});
+        struct Guard {
+          flex::HostComputeParams* p;
+          ~Guard() {
+            flex::destroyHostComputeParams(p);
+          }
+        } guard{params};
+        std::unique_ptr<flex::HostComputeBuffer,
+                        decltype(&flex::destroyHostComputeBuffer)>
+            buffer(spyre::getCurrentStream().launchHostCompute(params),
+                   flex::destroyHostComputeBuffer);
+        return py::bytes(static_cast<const char*>(buffer->data()),
+                         buffer->size());
+      },
+      py::arg("hcm_json"), py::arg("correction_size"),
+      "Test-only: run one HostCompute (no args) and return the produced "
+      "bytes.");
+
   // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
   // that Python tests can verify the HostComputeArg ordering without needing
   // a live HCM or device execution. Returns one integer (CompositeAddress*

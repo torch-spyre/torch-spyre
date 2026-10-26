@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 250" font-family="'Source Sans 3', Calibri, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <pattern id="stick-cells" width="12" height="50" patternUnits="userSpaceOnUse">
+      <rect width="12" height="50" fill="none" stroke="#cfcfcf" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <text x="20" y="28" font-size="20" font-weight="600" fill="#1a1a1a">float16 tensor of 65 elements, laid out as two device sticks</text>
+  <text x="20" y="52" font-size="15" fill="#666666">64 elements per stick, 128 bytes</text>
+
+  <!-- storage index ticks above stick 0 -->
+  <text x="100" y="76" font-size="13" fill="#777777" text-anchor="middle">0</text>
+  <text x="868" y="76" font-size="13" fill="#777777" text-anchor="end">63</text>
+
+  <!-- stick 0: all data -->
+  <text x="20" y="116" font-size="16" fill="#555555">stick 0</text>
+  <rect x="100" y="84" width="768" height="50" fill="#ffffff" stroke="#333333" stroke-width="1.5"/>
+  <rect x="100" y="84" width="768" height="50" fill="url(#stick-cells)"/>
+  <text x="484" y="115" font-size="16" fill="#1a1a1a" text-anchor="middle">elements 0 to 63 (full)</text>
+
+  <!-- stick 1: one element then padding -->
+  <text x="20" y="192" font-size="16" fill="#555555">stick 1</text>
+  <rect x="112" y="160" width="756" height="50" fill="#e2e2e2" stroke="#333333" stroke-width="1.5"/>
+  <rect x="112" y="160" width="756" height="50" fill="url(#stick-cells)"/>
+  <rect x="100" y="160" width="12" height="50" fill="#ffffff" stroke="#333333" stroke-width="1.5"/>
+  <text x="490" y="191" font-size="16" fill="#1a1a1a" text-anchor="middle">63 padding lanes</text>
+
+  <!-- element 64 marker -->
+  <text x="106" y="234" font-size="13" fill="#777777" text-anchor="middle">64</text>
+  <text x="128" y="234" font-size="13" fill="#666666">element 64, the only real value in stick 1</text>
+</svg>
