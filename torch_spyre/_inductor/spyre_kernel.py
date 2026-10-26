@@ -1050,9 +1050,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (
                     op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
                 )
-                or (
-                    op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16
-                )
+                or (op in SPYRE_INT16_OPS and arg.device_dtype == DataFormats.SENINT16)
                 or (
                     op
                     in (

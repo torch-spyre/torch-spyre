@@ -2491,6 +2491,7 @@ def lower_qfp8ch(x):
     pw.realize()
     return pw
 
+
 @register_spyre_lowering(torch.ops.spyre.i16tofp32)
 def lower_i16tofp32(x):
     """

@@ -3048,8 +3048,6 @@ def bitwise_not(input: torch.Tensor) -> torch.Tensor:
         return torch.ops.aten.bitwise_xor(input, neg_one)
 
 
-
-
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,

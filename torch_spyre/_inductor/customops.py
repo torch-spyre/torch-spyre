@@ -850,6 +850,7 @@ def _(input: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
+
 @torch.library.custom_op("spyre::i16tofp32", mutates_args=(), device_types="spyre")
 def i16tofp32(input: torch.Tensor) -> torch.Tensor:
     """
@@ -1004,9 +1005,7 @@ def _(input: torch.Tensor) -> torch.Tensor:
 
 
 @torch.library.custom_op("spyre::i16_top3_to_fp32", mutates_args=())
-def i16_top3_to_fp32(
-    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
-) -> torch.Tensor:
+def i16_top3_to_fp32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     """
     Builds the 24-bit value s = top8(a) * 2^16 + top8(b) * 2^8 + top8(c) from the top byte
     of every 32-bit lane (the high byte of the odd int16 element) of three tensors, and
