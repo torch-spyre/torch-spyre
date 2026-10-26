@@ -22,8 +22,6 @@ import textwrap
 
 LOGGING_ENV_VARS = [
     "TORCH_SPYRE_DEBUG",
-    "SPYRE_INDUCTOR_LOG",
-    "SPYRE_INDUCTOR_LOG_LEVEL",
     "SPYRE_LOG_FILE",
     "TORCH_LOGS",
 ]

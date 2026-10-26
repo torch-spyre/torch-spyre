@@ -44,6 +44,7 @@ from torch_spyre._inductor.op_spec_validation import (
     _is_unimplemented_op,
     validate_op_specs,
 )
+from torch_spyre._inductor import constants
 from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 
 # ---------------------------------------------------------------------------
@@ -163,6 +164,66 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
 
     def test_keep_by_index_is_known(self):
         self.assertIn(KEEP_BY_INDEX_OP, _all_known_ops())
+
+    def test_unknown_op_name_raises(self):
+        op = _make_valid_op_spec("not_a_registered_op")
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage="test")
+        self.assertIn("unknown op name", str(ctx.exception))
+
+    def test_conv_and_quant_reduction_ops_are_known(self):
+        known = _all_known_ops()
+        for op in (
+            *constants.CONV_OPS,
+            *constants.TWO_INPUT_REDUCTION_OPS,
+            *constants.SINGLE_INPUT_REDUCTION_OPS,
+            constants.QUANTSCALEPERTOKENFP8_OP,
+        ):
+            self.assertIn(op, known)
+
+    def test_emitted_reduction_op_names_are_known(self):
+        """Every ReductionOp literal in SpyreOpFuncs must be a known op."""
+        import ast
+        import inspect
+        import textwrap
+
+        from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(SpyreOpFuncs)))
+        names = {
+            n.args[0].value
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "ReductionOp"
+            and n.args
+            and isinstance(n.args[0], ast.Constant)
+        }
+        self.assertTrue(names)
+        self.assertLessEqual(names, _all_known_ops())
+
+    def test_lowered_reduction_types_are_known(self):
+        """Every reduction_type lowering.py creates must be a known op.
+
+        These reach the validator as OpSpec ops without going through a
+        ``ReductionOp`` literal in SpyreOpFuncs (e.g. ``absmax``).
+        """
+        import ast
+        import inspect
+
+        from torch_spyre._inductor import lowering
+
+        tree = ast.parse(inspect.getsource(lowering))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.keyword) or node.arg != "reduction_type":
+                continue
+            if isinstance(node.value, ast.Constant):
+                names.add(node.value.value)
+            elif isinstance(node.value, ast.Name) and hasattr(constants, node.value.id):
+                names.add(getattr(constants, node.value.id))
+        self.assertIn(constants.ABSMAX_OP, names)
+        self.assertLessEqual(names, _all_known_ops())
 
     def test_tiled_symbols_valid(self):
         op = _make_valid_op_spec()
@@ -397,21 +458,6 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
         )
         validate_op_specs([op], stage="before_bundle_generation")
 
-    def test_unknown_op_no_output_passes(self):
-        """Unknown/synthetic ops without output args are valid."""
-        op = OpSpec(
-            op="synthetic_test_op",
-            is_reduction=False,
-            iteration_space={
-                _C_ROW: (Integer(128), 1),
-                _C_COL: (Integer(256), 1),
-            },
-            args=[_make_tensor_arg(is_input=True, arg_index=0)],
-            op_info={},
-            tiled_symbols=[],
-        )
-        validate_op_specs([op], stage="test")
-
     def test_allocation_invalid_keys(self):
         """allocation must contain exactly one of hbm/lx/hbm_pool."""
         op = _make_valid_op_spec()
@@ -560,6 +606,19 @@ class TestStickConstraints(unittest.TestCase):
         with self.assertRaises(OpSpecValidationError) as ctx:
             validate_op_specs([op], stage=STICK_STAGE)
         self.assertIn("different stick loop variables", str(ctx.exception))
+
+    def test_conv_different_sticks_passes(self):
+        """Conv args stick on different dims by design; not an all-same op."""
+        for conv_op in sorted(constants.CONV_OPS):
+            c_other = Symbol("c_other")
+            op = _make_valid_op_spec(conv_op, is_reduction=True)
+            op.iteration_space[c_other] = (Integer(64), 1)
+            op.args[1] = dataclasses.replace(
+                op.args[1],
+                device_coordinates=[_C_COL // 64, _C_ROW, sympy.Mod(c_other, 64)],
+            )
+            with self.subTest(op=conv_op):
+                validate_op_specs([op], stage=STICK_STAGE)
 
     def test_restickify_different_sticks_passes(self):
         c_other = Symbol("c_other")

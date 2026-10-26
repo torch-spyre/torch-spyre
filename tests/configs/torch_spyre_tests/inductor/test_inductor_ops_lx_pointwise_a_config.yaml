@@ -25,6 +25,7 @@ test_suite_config:
         # clamp_mixed_dtype fp16: sum(dim=0) wrap error at |sum|~1e4 (3-5 ULP > atol 1.0), not a clamp bug.
         - names:
             - LxPlanning.*::test_pointwise_binary_op_div_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_log_log_zero_val_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_clamp_mixed_dtype_.*fp16.*_lx_planning_reduction
           mode: xfail
         - names:

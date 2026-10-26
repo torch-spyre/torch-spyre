@@ -293,6 +293,25 @@ def is_empty_tiled_layout(layout: object) -> bool:
     )
 
 
+def storage_has_single_writer(graph: GraphLowering, producer: Operation) -> bool:
+    """Prove fresh storage has no aliases or writers beyond its producer."""
+    name = producer.get_name()
+    for op in graph.operations:
+        try:
+            if (
+                name in op.get_mutation_names()
+                or name in op.get_inputs_that_alias_output()
+                or (
+                    op is not producer
+                    and any(dep.name == name for dep in op_read_writes(op).writes)
+                )
+            ):
+                return False
+        except NotImplementedError:
+            return False
+    return True
+
+
 def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
@@ -728,7 +747,9 @@ def _would_produce_lx_back_gap(
 
     A backGap fires when the in-core iteration and physical device extents
     differ, including the negative gap used for overlapping unfold reads.
-    The backend supports backGap for HBM but not for LX.
+    Generic LX gaps remain unsupported. The allocator may admit only a
+    certified prefix-slice gather whose unsplit-K consumer uses a uniform
+    outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout

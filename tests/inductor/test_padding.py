@@ -22,7 +22,6 @@ import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
-import pytest
 import sympy
 import torch
 import torch.fx as fx
@@ -840,23 +839,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "for_each_tile gives a silently wrong result (~64% of elements) for "
-            "a matmul with unaligned K=67 and a loop-invariant weight (#5440)"
-        ),
-    )
     def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
         """A loop-invariant weight with unaligned K inside a for_each_tile body.
 
         x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
-        compiled result is ~64% wrong (max abs error ~2.7e4) although the same
-        graph with K=64 or without the loop is correct.  Compiling does not
-        fail, so this is a silent wrong answer in the for_each_tile path
-        (#5440).  insert_bmm_padding must also pad the read-copy buffer for w,
-        which has no FX node of its own.
+        padding ops for w join the loop group, but must not inherit the
+        matmul's per-trip read advance: that record is positional in the
+        matmul's reads (the tiled x), so on the pad ops it advanced the read of
+        the invariant w and corrupted the padded copy on every trip after the
+        first, leaving ~64% of the result wrong (#5440).
         """
         dtype = torch.float16
         E, M, K, N = 3, 64, 67, 128
@@ -878,6 +869,150 @@ class TestInsertPaddingIR(unittest.TestCase):
         torch.testing.assert_close(
             torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
         )
+
+    def test_linear_invariant_weight_unaligned_k_pads_for_each_tile(self) -> None:
+        """An ``nn.Linear`` weight ``[N, K]`` with unaligned K, loop-invariant.
+
+        The same padding-op bug as the ``x @ w`` case above, on the most common
+        weight pattern: the weight is stored ``[N, K]``, padded, and restickified
+        for the matmul, all inside the loop group.  Over 70% of the result was
+        wrong before the padding ops stopped inheriting the matmul's read advance
+        (#5440).
+        """
+        import torch.nn.functional as F
+
+        dtype = torch.float16
+        E, M, K, N = 3, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(N, K, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, F.linear(x_tile, w_whole)
+
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            F.linear(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_tiled_expert_weight_unaligned_k_pads_for_each_tile(self) -> None:
+        """A per-expert weight ``[E, K, N]`` tiled with x, with unaligned K.
+
+        Padding K to the stick boundary grows the per-expert stride of the weight
+        (67 * 128 to 128 * 128).  The per-trip step ``splice_while_loops`` stamped
+        before padding still held the unpadded stride, so every trip after the
+        first read the wrong place and the device faulted (#5573).  At K=64 there
+        is no padding and it was always correct.
+        """
+        dtype = torch.float16
+        E, M, K, N = 4, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(E, K, N, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                return None, torch.matmul(ops[0], ops[1])
+
+            return for_each_tile(body, (x, w), dims=(0, 0), tile_size=1, out_dim=0)[1]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_tiled_transposed_expert_weight_unaligned_k_pads_for_each_tile(
+        self,
+    ) -> None:
+        """A per-expert weight stored ``[E, N, K]`` and used transposed, K unaligned.
+
+        The same stale per-trip step as the ``[E, K, N]`` case, on a weight whose K
+        is its innermost dim, so the padded buffer's per-expert stride and the
+        within-expert strides all differ from the unpadded ones.  It returned NaN
+        for about 70% of the result before the step was re-strided (#5573).
+        """
+        dtype = torch.float16
+        E, M, K, N = 4, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(E, N, K, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                return None, torch.matmul(ops[0], ops[1].transpose(-1, -2))
+
+            return for_each_tile(body, (x, w), dims=(0, 0), tile_size=1, out_dim=0)[1]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        expected = torch.einsum("emk,enk->emn", x_cpu.float(), w_cpu.float())
+        torch.testing.assert_close(expected, result.cpu().float(), atol=0.1, rtol=0.1)
+
+    def test_padded_read_step_shared_by_two_dims_is_rejected(self) -> None:
+        """A per-trip step that two non-trivial dims of y could own is an error.
+
+        The stamped step is a stride of y's layout; when two dims of size above one
+        share it, there is no telling which one the loop walks, and re-striding the
+        wrong one would read the wrong place after the first trip.  It must raise
+        rather than leave the unpadded step in place (#5573).
+        """
+        from torch._inductor.ir import FixedLayout
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.padding import (
+            _refresh_loop_advance_for_padded_read,
+        )
+
+        class _Buf:
+            def __init__(self, name, size, stride):
+                self._name = name
+                self._layout = FixedLayout(
+                    torch.device("cpu"), torch.float16, size, stride
+                )
+
+            def get_name(self):
+                return self._name
+
+            def get_layout(self):
+                return self._layout
+
+        # Two dims of size 2 and 3 share stride 4 (an overlapping view).
+        y = _Buf("y", [2, 3, 5], [4, 4, 1])
+        padded = _Buf("y_padded", [2, 3, 8], [24, 8, 1])
+
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[[]],
+            squeezed_advance_per_read=[[[(4, 1)]]],
+        )
+
+        class _Op:
+            loop_info = info
+
+            def get_read_writes(self):
+                from torch._inductor.dependencies import MemoryDep
+                import sympy
+
+                x = sympy.Symbol("d0")
+                dep = MemoryDep("y_padded", x, (x,), (6,))
+                return type("RW", (), {"reads": [dep]})()
+
+        with self.assertRaisesRegex(Unsupported, "cannot tell which dim"):
+            _refresh_loop_advance_for_padded_read(_Op(), y, padded)
 
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
