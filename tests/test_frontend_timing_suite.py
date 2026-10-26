@@ -47,6 +47,7 @@ def _load(name, filename):
 
 run_sweep = _load("fts_run_sweep", "run_sweep.py")
 scaling = _load("fts_scaling", "scaling.py")
+summarize_mod = _load("fts_summarize", "summarize.py")
 
 
 def _write_plan(tmp_path, points):
@@ -210,7 +211,11 @@ class TestShippedPlan:
         assert len(seqs) >= scaling.MIN_POINTS, sorted(seqs)
 
 
-def _rows(tmp_path, points, schema="frontend-timing-rows/1"):
+def _rows(tmp_path, points, schema=None):
+    # Defaults to whatever the summarizer writes today. Pinning it to a literal
+    # is why the /2 bump went unnoticed: every test built rows the writer no
+    # longer produces, and scaling.py refused the real ones.
+    schema = schema or summarize_mod.ROWS_SCHEMA
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "rows.json"
     path.write_text(json.dumps({"schema": schema, "meta": {}, "points": points}))
@@ -265,6 +270,27 @@ class TestFits:
 
     def test_too_little_data_has_no_fit(self):
         assert scaling.loglog_fit([(4, 1.0)]) is None
+
+
+class TestSummarizerAndFitterAgree:
+    def test_the_fitter_reads_the_schema_the_summarizer_writes(self, tmp_path):
+        # The end-to-end seam. Each file knew its own schema name and they drifted:
+        # the summarizer moved to /2, scaling.py still demanded /1, and every real
+        # rows file was refused while every test passed.
+        path = _rows(tmp_path / "current", [], schema=summarize_mod.ROWS_SCHEMA)
+        assert scaling.load_points([path]) == []
+
+    def test_the_previous_schema_is_still_read(self, tmp_path):
+        # The committed baselines were written as /1, and /2 only moved a clock
+        # between metric prefixes -- the shape of a point is unchanged.
+        path = _rows(tmp_path / "old", [], schema="frontend-timing-rows/1")
+        assert scaling.load_points([path]) == []
+
+    def test_an_unknown_schema_is_refused_by_name(self, tmp_path):
+        path = _rows(tmp_path / "future", [], schema="frontend-timing-rows/99")
+        with pytest.raises(SystemExit) as caught:
+            scaling.load_points([path])
+        assert "frontend-timing-rows/99" in str(caught.value)
 
 
 class TestSeriesDiscovery:

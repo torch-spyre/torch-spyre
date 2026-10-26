@@ -30,10 +30,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
 from dataclasses import dataclass
 from typing import Any
+
+# The writer owns the schema name. Hardcoding it here let the two drift: the
+# summarizer moved to /2 when clocks were split out of counter.*, and this file
+# then refused every rows file it wrote.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from summarize import ROWS_SCHEMA  # noqa: E402
 
 #: Fewer points than this and a fit is arithmetic rather than evidence. Four is the
 #: smallest series that can disagree with a straight line and show it.
@@ -101,6 +109,13 @@ def loglog_fit(pairs: list[tuple[float, float]]) -> Fit | None:
     )
 
 
+#: Rows files this version reads. /1 is still accepted because the only thing /2
+#: changed is that a clock moved from counter.* to duration.*, which adds and
+#: removes metric keys without changing the shape of a point -- and the committed
+#: baselines were written as /1.
+_KNOWN_SCHEMAS = frozenset({ROWS_SCHEMA, "frontend-timing-rows/1"})
+
+
 def load_points(paths: list[str]) -> list[dict[str, Any]]:
     """Read every rows file, refusing a schema this version does not know."""
     points: list[dict[str, Any]] = []
@@ -108,8 +123,11 @@ def load_points(paths: list[str]) -> list[dict[str, Any]]:
         with open(path) as handle:
             payload = json.load(handle)
         schema = payload.get("schema")
-        if schema != "frontend-timing-rows/1":
-            raise SystemExit(f"{path}: unknown rows schema {schema!r}")
+        if schema not in _KNOWN_SCHEMAS:
+            raise SystemExit(
+                f"{path}: unknown rows schema {schema!r}; this version reads "
+                + ", ".join(sorted(_KNOWN_SCHEMAS))
+            )
         points += payload.get("points", [])
     return points
 

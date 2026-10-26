@@ -187,7 +187,7 @@ a counter, with no change needed here.
 (`Map(LowCardinality(String), Array(Float64))`), so variance stays recomputable
 downstream. A metric only some samples carry gets a shorter array, never a padded zero.
 
-`schema` is versioned (`frontend-timing-rows/1`). A consumer that does not recognise it
+`schema` is versioned (`frontend-timing-rows/2`). A consumer that does not recognise it
 should refuse the file, as `scaling.py` does.
 
 ## Scaling
