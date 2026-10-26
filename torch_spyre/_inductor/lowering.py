@@ -24,6 +24,7 @@ import sympy
 import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
+from torch._inductor.graph import SubgraphLowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -610,9 +611,49 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
     x_loader = x.make_loader()
     w_loader = w.make_loader()
 
-    # Input / weight shapes
-    N, C_in, H_in, W_in = x.get_size()
-    C_out, G, K_h, K_w = w.get_size()
+    # Input / weight shapes. A depthwise conv1d arrives here at rank 3
+    # ((N, C, L) activation, (C_out, G, K) weight) and is handled natively
+    # rather than being reshaped to rank 4 by the decomposition.
+    # Reshape doesn't work as V.graph.get_buffer resolves to the underlying
+    # buffer with get_size() returning 3 entries only.
+    #
+    # Keeping the op at rank 3 enables using the input tensor's activation
+    # and stick dim as pinned.
+    #
+    x_size = x.get_size()
+    w_size = w.get_size()
+    is_conv1d = len(x_size) == 3
+
+    if is_conv1d:
+        if len(w_size) != 3:
+            raise Unsupported(
+                f"depthwise conv1d: expected a 3D weight for a 3D activation, "
+                f"got activation {list(x_size)} and weight {list(w_size)}"
+            )
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            raise Unsupported(
+                f"depthwise conv1d: expected 1-element stride/padding/dilation, "
+                f"got stride={stride}, padding={padding}, dilation={dilation}"
+            )
+        N, C_in, W_in = x_size
+        C_out, G, K_w = w_size
+        # Degenerate height: a single row, a single tap, no padding, unit stride.
+        H_in, K_h = 1, 1
+        stride = [1, stride[0]]
+        padding = [0, padding[0]]
+        dilation = [1, dilation[0]]
+    elif len(x_size) == 4:
+        if len(w_size) != 4:
+            raise Unsupported(
+                f"depthwise conv2d: expected a 4D weight for a 4D activation, "
+                f"got activation {list(x_size)} and weight {list(w_size)}"
+            )
+        N, C_in, H_in, W_in = x_size
+        C_out, G, K_h, K_w = w_size
+    else:
+        raise Unsupported(
+            f"depthwise conv: expected a 3D or 4D activation, got {list(x_size)}"
+        )
 
     H_in_padded = H_in + 2 * padding[0]
     W_in_padded = W_in + 2 * padding[1]
@@ -640,6 +681,16 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
     W_out = (W_in + 2 * padding[1] - K_w) // stride[1] + 1
 
     def inner_fn(index, reduction_index):
+        # At rank 3 there is no height axis to index, and the reduction carries
+        # only the kernel width.
+        if is_conv1d:
+            n, c, wo = index
+            kw = reduction_index[0]
+            g = reduction_index[1] if len(reduction_index) > 1 else 0
+            x_val = x_loader([n, c, wo])
+            w_val = w_loader([c, g, kw])
+            return (x_val, w_val)
+
         # Output indices
         n, c, ho, wo = index
         # Reduction indices: may be [kh, kw] or [kh, kw, g] depending on whether G is 1
@@ -671,10 +722,13 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
             else "padded_nozeropad",
         }
     }
-    # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway)
-    red_ranges = [K_h, K_w]
+    # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway).
+    # A conv1d's height is likewise always 1, so it is left out for the same reason.
+    red_ranges = [K_w] if is_conv1d else [K_h, K_w]
     if G != 1:
         red_ranges.append(G)
+
+    ranges = [N, C_out, W_out] if is_conv1d else [N, C_out, H_out, W_out]
 
     result = SpyreReduction.create(
         reduction_type=DEPTHWISE_CONV2D_OP,
@@ -683,7 +737,7 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=[N, C_out, H_out, W_out],
+        ranges=ranges,
         reduction_ranges=red_ranges,
         op_info=op_info,
     )
@@ -927,8 +981,13 @@ def lower_convolution(
     avgpool (lower_avg_pool2d) patterns. Selected via config.conv2d_direct_lowering;
     when off, aten.convolution decomposes to im2col+matmul (conv2d_via_bmm_decomp).
 
-    v1 scope: fp16, groups==1, non-transposed, 4D input. Bias (if present) is a
-    separate pointwise add, not a fused biasadd computeOp (follow-up).
+    v1 scope: fp16, groups==1, non-transposed, 3D or 4D input. Bias (if present)
+    is a separate pointwise add, not a fused biasadd computeOp (follow-up).
+
+    A 3D input is a conv1d and is lowered natively at rank 3 (no reshape to rank
+    4): the degenerate height collapses the ``ki`` tap, which needs no special
+    handling because this path's dim roles are recovered structurally from the
+    args' access expressions rather than from sizes or positions.
     """
     # Lock-step invariant with the decomposition: conv2d_via_bmm_decomp only
     # declines (returns NotImplemented, letting aten.convolution survive to this
@@ -954,13 +1013,24 @@ def lower_convolution(
         raise Unsupported(f"conv2d direct lowering: padding={padding} (only 0)")
     if any(d != 1 for d in dilation):
         raise Unsupported(f"conv2d direct lowering: dilation={dilation} (only 1)")
-    if len(x.get_size()) != 4:
+    is_conv1d = len(x.get_size()) == 3
+    if not is_conv1d and len(x.get_size()) != 4:
         raise Unsupported(
-            f"conv2d direct lowering: expected 4D input, got {len(x.get_size())}D"
+            f"conv2d direct lowering: expected 3D or 4D input, got {len(x.get_size())}D"
+        )
+    if is_conv1d and len(weight.get_size()) != 3:
+        raise Unsupported(
+            f"conv2d direct lowering: expected a 3D weight for a 3D input, got "
+            f"{len(weight.get_size())}D"
         )
     if x.get_dtype() != torch.float16:
         raise Unsupported(f"conv2d direct lowering: dtype {x.get_dtype()} (fp16 only)")
-    if weight.get_size()[-2] == 1 and weight.get_size()[-1] == 1:
+    # A conv1d's height tap is degenerate (kh_w == 1), so a K_w == 1 rank-3
+    # weight collapses *both* taps -- exactly the condition the 1x1 guard below
+    # exists to reject.
+    kh_w = 1 if is_conv1d else int(weight.get_size()[-2])
+    kw_w = int(weight.get_size()[-1])
+    if kh_w == 1 and kw_w == 1:
         # Only a 1x1 kernel squeezes *both* ki and kj to size-1, leaving the
         # conv SDSC with no window dims -- which the backend's conv path rejects in
         # dimension-mapping. A 1x1 conv is a channel matmul; it stays on the
@@ -968,7 +1038,6 @@ def lower_convolution(
         # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
         # verified by the test_conv2d_direct k1x3 / k3x1 cases).
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
-    kh_w, kw_w = int(weight.get_size()[-2]), int(weight.get_size()[-1])
     if kh_w > 3 or kw_w > 3:
         # k>3 overflows the dense C_in*kH*kW contraction's LX budget in the backend;
         # mirrors the _CONV_MAX_KERNEL exclusion in _is_direct_conv_supported.
@@ -993,12 +1062,20 @@ def lower_convolution(
     x_loader = x.make_loader()
     weight_loader = weight.make_loader()
 
-    N, C_in, H_in, W_in = x.get_size()
-    C_out, C_in_per_group, kH, kW = weight.get_size()
+    if is_conv1d:
+        # Rank-3 conv1d: no host height axis.
+        N, C_in, W_in = x.get_size()
+        C_out, C_in_per_group, kW = weight.get_size()
+        H_in, kH = 1, 1
+        sH, pH, dilH = 1, 0, 1
+        sW, pW, dilW = stride[0], padding[0], dilation[0]
+    else:
+        N, C_in, H_in, W_in = x.get_size()
+        C_out, C_in_per_group, kH, kW = weight.get_size()
 
-    sH, sW = stride[0], stride[1]
-    pH, pW = padding[0], padding[1]
-    dilH, dilW = dilation[0], dilation[1]
+        sH, sW = stride[0], stride[1]
+        pH, pW = padding[0], padding[1]
+        dilH, dilW = dilation[0], dilation[1]
 
     H_out = (H_in + 2 * pH - dilH * (kH - 1) - 1) // sH + 1
     W_out = (W_in + 2 * pW - dilW * (kW - 1) - 1) // sW + 1
@@ -1036,11 +1113,23 @@ def lower_convolution(
     }
 
     def inner_fn(index, reduction_index):
-        n, co, ho, wo = index
-        r_in, r_ki, r_kj = reduction_index
         # Unclamped windowed input coordinates; zero-padding is expressed at the
         # SDSC level via padFront_/padBack_ in padding_sizes (see superdsc
         # _conv_sdsc_fields), mirroring the avgpool window mechanism.
+        if is_conv1d:
+            # kH == 1 is excluded from reduction_ranges below
+            # hence no r_ki here and no height coordinate to index.
+            n, co, wo = index
+            r_in, r_kj = reduction_index
+            wi = wo * sW - pW + r_kj * dilW
+            act = x_loader([n, r_in, wi])
+            # weight is [C_out, C_in_per_group, kW]; groups==1 so
+            # C_in_per_group == C_in.
+            ker = weight_loader([co, r_in, r_kj])
+            return (act, ker)
+
+        n, co, ho, wo = index
+        r_in, r_ki, r_kj = reduction_index
         hi = ho * sH - pH + r_ki * dilH
         wi = wo * sW - pW + r_kj * dilW
         act = x_loader([n, r_in, hi, wi])
@@ -1055,17 +1144,19 @@ def lower_convolution(
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=[N, C_out, H_out, W_out],
-        reduction_ranges=[C_in, kH, kW],
+        ranges=[N, C_out, W_out] if is_conv1d else [N, C_out, H_out, W_out],
+        reduction_ranges=[C_in, kW] if is_conv1d else [C_in, kH, kW],
         op_info=op_info,
     )
     result.realize()
 
     if bias is not None:
         # v1: separate pointwise add (broadcast bias [C_out] over NCHW) rather
-        # than a fused biasadd computeOp. Reshape to (1, C_out, 1, 1) for the
-        # channel-wise broadcast.
-        bias_reshaped = lowering.view(bias, [1, C_out, 1, 1])
+        # than a fused biasadd computeOp. Reshape to a channel vector with unit
+        # spatial dims for the channel-wise broadcast -- one spatial dim at rank 3
+        # (conv1d), two at rank 4.
+        bias_shape = [1, C_out, 1] if is_conv1d else [1, C_out, 1, 1]
+        bias_reshaped = lowering.view(bias, bias_shape)
         result = lowering.add(result, bias_reshaped)
 
     return result
@@ -1879,11 +1970,26 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # No bool format has an op to an integer, but float32 has one, and a bool's
-    # 0/1 values convert exactly through it.
-    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+    integer = (torch.int32, torch.int64)
+    float16_format = (torch.float16, torch.bfloat16)
+
+    # Only float32 has an op to an integer, so a float16-format source (float16,
+    # bfloat16, or a bool stored as either) converts through it. A bool's 0/1
+    # values need no trunc.
+    if src_dtype in (torch.bool, *float16_format) and dst_dtype in integer:
+        skip_trunc = skip_trunc or src_dtype == torch.bool
         as_float = to_dtype(x, torch.float32, use_compute_types)
-        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=skip_trunc)
+
+    # Likewise an integer has an op only to float32, which then converts to the
+    # float16 format.
+    if src_dtype in integer and dst_dtype in float16_format:
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types)
+
+    # A cast to bool tests against zero rather than converting a value.
+    if src_dtype in integer and dst_dtype == torch.bool:
+        return lower_ne_scalar(x, 0)
 
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
@@ -2215,10 +2321,9 @@ def _cmp_operand_dtype(tensors):
       Both branches are expect_fail in the tests.
     * int32 -> fp32 (int32tofp32) keeps the element byte size, so the EA is
       unchanged and the comparison runs entirely on device.
-    * int32/int64 -> fp16 is not in DtypeOpTable at all, so ``to_dtype`` falls
-      back to a host cast. Those pairs produce the right answer and raise no EA
-      question -- no stick reordering is emitted -- but at the cost of a D2H/H2D
-      round-trip, and the fallback is only visible as a FallbackWarning.
+    * int32/int64 -> fp16 converts through fp32, and its fp32todl16 step makes
+      the operand staggered, so it meets the STANDARD fp16 operand exactly as in
+      the fp16 <-> fp32 case above.
 
     All-``torch.bool`` operands are returned unchanged, deliberately diverging
     from torch (which would promote them to fp32). A device bool is already stored
@@ -2236,7 +2341,7 @@ def _cmp_operand_dtype(tensors):
     return operand_dtype
 
 
-def _lower_cmp_impl(x, y, pointwise_fn):
+def _lower_cmp_impl(x, y, pointwise_fn, op_name: str):
     """Convert both operands to a common float dtype, then apply pointwise_fn.
 
     The operand dtype is computed from the TENSOR operands only, and a Python
@@ -2256,16 +2361,26 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
 
-    # A 0-dim integer predicate compared against a Python int (e.g. a
-    # while_loop / for_each_tile cond ``iter < N``) keeps Inductor's stock
-    # form unchanged.  Such a predicate is pattern-matched by the WhileLoop
-    # lowering (_extract_trip_count in wsr/for_each_tile_lowering.py), which
-    # expects exactly one ``load(iter) < constant(int N)`` op in the cond
-    # graph.  The int -> float cast below would insert a second op and coerce
-    # N to float, breaking both checks and causing silently wrong loop counts.
+    # A 0-dim integer predicate of the form ``iter < N`` (while_loop /
+    # for_each_tile trip counter) must keep Inductor's stock integer form
+    # unchanged.  _extract_trip_count (wsr/for_each_tile_lowering.py) matches
+    # exactly one ``load(iter) < constant(int N)`` op in the cond graph; the
+    # int -> float cast below would insert a second op and coerce N to float,
+    # breaking both the single-op check and the loop count.
+    #
+    # The guard is narrowed to two conditions that are jointly precise:
+    #   1. op_name == "lt" -- _extract_trip_count only accepts lt; every other
+    #      0-dim integer compare (eq/ne/le/gt/ge) in a torch.cond branch or
+    #      while_loop body must still fall through to INT_TO_FLOAT promotion.
+    #   2. isinstance(V.graph, SubgraphLowering) -- the cond graph is always
+    #      compiled inside a SubgraphLowering.  Top-level 0-dim integer compares
+    #      (e.g. model-level torch.eq(i64[], N)) are compiled in a plain
+    #      GraphLowering and must not be skipped.
     dtypes = {t.get_dtype() for t in tensors}
     if (
-        len(dtypes) == 1
+        op_name == "lt"
+        and isinstance(V.graph, SubgraphLowering)
+        and len(dtypes) == 1
         and not next(iter(dtypes)).is_floating_point
         and all(len(t.get_size()) == 0 for t in tensors)
         and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
@@ -2327,7 +2442,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
-        return _lower_cmp_impl(x, y, pw)
+        return _lower_cmp_impl(x, y, pw, op_name=op_name)
 
     @register_spyre_lowering(
         aten_packet.Scalar,
@@ -2338,7 +2453,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _scalar(x, y):
         if _is_host_cmp(x, y):
             return stock_scalar(x, y)
-        return _lower_cmp_impl(x, y, pw)
+        return _lower_cmp_impl(x, y, pw, op_name=op_name)
 
     return _tensor, _scalar
 

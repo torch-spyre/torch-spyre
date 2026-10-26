@@ -964,12 +964,13 @@ class TestSpyre(TestCase):
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
         from torch_spyre.ops.fallbacks import FallbackWarning
 
-        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        # int8 has a device format but no conversion op.
+        source_cpu = (torch.arange(128) % 100).to(torch.int8).reshape(2, 64)
         source = source_cpu.to("spyre")
 
         with self.assertWarnsRegex(
             FallbackWarning,
-            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+            r"conversion from torch\.int8 to torch\.float16 is falling back to cpu",
         ):
             actual = source.to(torch.float16)
 
@@ -1077,6 +1078,27 @@ class TestSpyre(TestCase):
         )
         x[3, 3, 3] = y
         self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    @pytest.mark.xfail(
+        strict=False,  # Allows XPASS for now, will be changed to True to enforce later
+        raises=AssertionError,
+        reason="Sub-stick slices are not yet supported for DMA",
+    )
+    def test_h2d_copy_to_substick_sliced_destination(self, sizes):
+        """H2D sub-stick tensor slice"""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
 
         slice_sizes = [2]
         y = torch.rand(

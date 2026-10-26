@@ -1068,17 +1068,53 @@ def governing_run_split(source_view, destination_view, device_dims) -> tuple:
     return min(src, dst, key=lambda t: (t[0], -t[1]))
 
 
-def _relayout_features(op, out_dims):
-    """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
+def relayout_cost_features(
+    source_view,
+    destination_view,
+    num_cores,
+    device_dims,
+    out_elems,
+    dtype_bytes,
+    *,
+    destination_num_cores=None,
+) -> OpFeatures:
+    """One feature vector for candidate pricing and committed-copy reporting.
+
+    Core counts describe the physical transfer domains, not the copy's loop
+    split product: a full replica has an unsplit loop on many physical cores.
+    ``out_elems`` counts the unique physical tensor, including padding, once.
+    Preserve the existing estimate on the smaller physical domain. Replicated
+    destinations do not multiply that tensor size; this remains a permutation-
+    based estimate, not a calibrated model of replicated receive traffic.
+    At fixed run and split, the smaller count charges more than the larger
+    count. This does not establish an upper bound on measured transfer time.
+    """
+    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
+    return OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=out_elems,
+        cores=num_cores,
+        dtype_bytes=dtype_bytes,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=min(num_cores, destination_num_cores or num_cores),
+        relayout_run_elems=run_elems,
+        relayout_split=split,
+    )
+
+
+def _relayout_features(op, out_dims, dtype_bytes):
+    """The certified relayout's shared price features, or None for another op.
 
     The materialization registry is the authority: an op is a relayout copy iff the
     scratchpad planner registered it (``graph._spyre_lx_relayout_copies``), so a plan
     the allocator or scheduler later demoted never reaches here as a relayout. The
     governing geometry is the FINER of the plan's two views (smaller per-core run);
     the term's law is direction-symmetric (measured: 8.721 vs 8.701 us reversed), so
-    which side is source does not matter. All-zeros for every other op.
+    which side is source does not matter. Both physical core domains come from
+    the same plan that supplied the solver's candidate price.
     """
-    zeros = (False, 0, 0)
     try:
         from torch._inductor.virtualized import V
 
@@ -1086,7 +1122,7 @@ def _relayout_features(op, out_dims):
 
         registry = materialized_lx_relayouts(V.graph)
         if not registry:
-            return zeros
+            return None
         # The registry records the COPY BUFFER's name (materialize_lx_relayouts
         # stores ``copy.get_name()``, e.g. "buf2"); ``get_operation_name()`` is the
         # op name ("op2"), so match on the buffer name.
@@ -1095,13 +1131,19 @@ def _relayout_features(op, out_dims):
             (p for copy_name, p in registry.values() if copy_name == name), None
         )
         if plan is None:
-            return zeros
-        run_elems, split = governing_run_split(
-            plan.source_view, plan.destination_view, out_dims
+            return None
+        features = relayout_cost_features(
+            plan.source_view,
+            plan.destination_view,
+            plan.num_cores,
+            out_dims,
+            _prod_ints(out_dims),
+            dtype_bytes,
+            destination_num_cores=plan.destination_view.num_cores,
         )
-        if run_elems <= 0 or split <= 0:
-            return zeros
-        return True, run_elems, split
+        if features.relayout_run_elems <= 0 or features.relayout_split <= 0:
+            return None
+        return features
     except Exception as exc:  # noqa: BLE001 - a diagnostic feature must not sink a compile
         # Deliberately broad, but never silent: a regression in the registry
         # lookup (say an AttributeError from a PerCoreView refactor) must not
@@ -1109,7 +1151,7 @@ def _relayout_features(op, out_dims):
         _relayout_logger().debug(
             "relayout feature extraction failed for %s: %r", op.get_name(), exc
         )
-        return zeros
+        return None
 
 
 def _graph_boundary_names() -> tuple[set, set] | None:
@@ -1369,6 +1411,7 @@ def extract_op_features(
     # set above, from the committed loop_info or the candidate tiling.
     _loop_vars = _level_loop_vars(op, _levels) if _levels else []
     _li = getattr(op, "loop_info", None)
+    _rw = None
     try:
         _rw = op.get_read_writes()
         _write_index = next(iter(_rw.writes)).index
@@ -1518,8 +1561,10 @@ def extract_op_features(
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
     # layout -- so a reduction's reduced input is naturally full-sized (no separate
     # reduction scaling), and a broadcast operand carries its real (one-row) size.
+    # No dependencies change during feature extraction. Reuse the output snapshot,
+    # retrying only if that extraction failed; keep it local to this invocation.
     try:
-        reads = op.get_read_writes().reads
+        reads = (_rw if _rw is not None else op.get_read_writes()).reads
     except Exception:  # noqa: BLE001
         reads = []
     n_out_vars = len(out_size)
@@ -1648,7 +1693,7 @@ def extract_op_features(
             )
         )
 
-    _rl = _relayout_features(op, out_dims)
+    _rl = _relayout_features(op, out_dims, dtype_bytes)
 
     hbm_pattern = "" if is_matmul else _hbm_pattern(op, is_reduction, out_dims)
     # A staging copy still issues the source DMA even if it is later elided into
@@ -1694,9 +1739,10 @@ def extract_op_features(
         transport_read_run_bytes=transport_read_run_bytes,
         transport_tile_elems=transport_tile_elems,
         transport_compute_read=bool(compute_read and transport_tile_elems),
-        is_lx_relayout=_rl[0],
-        relayout_run_elems=_rl[1],
-        relayout_split=_rl[2],
+        is_lx_relayout=_rl is not None,
+        relayout_cores=_rl.relayout_cores if _rl is not None else 0,
+        relayout_run_elems=_rl.relayout_run_elems if _rl is not None else 0,
+        relayout_split=_rl.relayout_split if _rl is not None else 0,
         # The byte-count check defines which store geometry gets the rate estimate.
         is_indirect_store=out_write_elems is not None,
     )
