@@ -211,6 +211,17 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     return device_dtype
 
 
+def arg_dtype_for_layout(arg: PropArg) -> torch.dtype:
+    """Logical dtype whose stick size matches ``arg``'s physical format.
+
+    A torch.bool operand takes it from its producer's format (fp32-backed bools
+    hold 32 elements per stick, not the 64 that ``torch.bool`` implies).
+    """
+    if arg.layout.dtype != torch.bool or not arg.layouts:
+        return arg.layout.dtype
+    return bool_layout_dtype(arg.layouts[0].device_dtype, "operand")
+
+
 def _compute_dim_order(stick_dim, size, coords):
     """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
@@ -1747,7 +1758,7 @@ def _multi_arg_pointwise_layouts(
                 arg_coors != out_coords
                 or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
-                or not same_device_size(arg.layout.dtype, out_dtype_for_layout)
+                or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
             ):
                 can_use_same_layout = False
                 break
@@ -1866,14 +1877,14 @@ def _multi_arg_pointwise_layouts(
             # whose index is exactly the same expression as the output's qualify
             # as same-frame candidates for in-place layout reuse.
             or arg.dep.index != output_dep.index
-            or not same_device_size(arg.layout.dtype, output.dtype)
+            or not same_device_size(arg_dtype_for_layout(arg), out_dtype_for_layout)
         ):
             continue
         src_stl = next(iter(arg.layouts))
         candidate = SpyreTensorLayout(
             src_stl.device_size,
             src_stl.stride_map,
-            get_device_dtype(output.dtype),
+            out_device_dtype,
         )
         if (
             math.prod([s for s in candidate.device_size if s > 0])

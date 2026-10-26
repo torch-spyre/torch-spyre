@@ -459,6 +459,8 @@ COMPILED_OPS = [
     aten.add,
     aten.bitwise_not,
     aten.logical_not,
+    aten.logical_and,
+    aten.logical_or,
     aten.bmm,
     aten.cat,
     aten.div,
