@@ -4469,7 +4469,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # Integer comparisons give fp32-backed bools (32 elems/stick); combining
             # two of them must not assume the 64-elem stick of an fp16 bool.
             "test_logical_int_mask",
-            "test_binary_op",
+            "test_logical_int_mask_compiled",
         ): {
             "ops_dict": {
                 "and": lambda a, b: torch.logical_and(a >= 0, a < b),
@@ -8969,6 +8969,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    def test_logical_int_mask_compiled(self, op, a, b):
+        # Exercise compiled layouts without requiring eager logical kernels.
+        # LX wrappers leave bool/int outputs unchanged, but the reduction wrapper
+        # relaxes atol. Bypass them to keep these checks exact under LX too.
+        utils_inductor.compare_with_cpu(op, a, b, atol=0, rtol=0, run_eager=False)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
