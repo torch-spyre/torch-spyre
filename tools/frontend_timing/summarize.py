@@ -190,6 +190,38 @@ class Record:
                 totals[full] = totals.get(full, 0) + value
         return totals
 
+    def per_region(self) -> dict[str, float]:
+        """Every pass's and stage's own counters and graph sizes, keyed by region.
+
+        ``counters`` sums a pass's counts into a compile total, which is what a
+        dashboard wants and what the complexity audit cannot use: a claim about
+        one pass is in that pass's own variables, against the operation count at
+        *its* entry rather than at pipeline entry. Both are emitted -- the summed
+        keys are unchanged, these are additional.
+
+        Keys are dotted (``pass.Pipeline.name.counter.read_writes.misses``), which
+        is also what keeps them out of the secret scanner's way: the colon form of
+        a pass event name reads as a password assignment and blocks a push.
+
+        A reentrant region's values are summed, which is right for a count and for
+        an entry size both: two entries of one pass are two lots of work.
+        """
+        out: dict[str, float] = {}
+        for event in self.events:
+            name = event["name"]
+            if not name.startswith(("pass:", "stage:")):
+                continue
+            base = metric_key(name)[: -len("_ms")]
+            for key, value in (event.get("meta") or {}).items():
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                if key in _GRAPH_META_KEYS:
+                    full = f"{base}.{key}"
+                else:
+                    full = f"{base}.{counter_metric_key(key)}"
+                out[full] = out.get(full, 0.0) + float(value)
+        return out
+
     def run_metrics(self) -> dict[str, float]:
         """Run-level numbers the child recorded alongside the events."""
         out: dict[str, float] = {}
@@ -449,6 +481,8 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
             add(metric_key(name), ns / 1e6)
         for name, count in record.counters().items():
             add(counter_metric_key(name), count)
+        for name, value in record.per_region().items():
+            add(name, value)
         for name, value in record.run_metrics().items():
             add(name, value)
     return series

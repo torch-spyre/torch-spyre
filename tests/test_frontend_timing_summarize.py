@@ -607,6 +607,59 @@ class TestStageCounters:
         assert summary.measurements["counter.read_writes.misses"] == [10.0]
 
 
+class TestPerPassColumns:
+    @staticmethod
+    def _pass(name, ordinal, **meta):
+        return {
+            "name": summarize_mod.GRAPH_PASS_PREFIX + name,
+            "ordinal": ordinal,
+            "parent_ordinal": 1,
+            "inclusive_ns": 1_000_000,
+            "self_ns": 1_000_000,
+            "meta": meta,
+        }
+
+    def test_each_pass_reports_its_own_counters_and_entry_size(self, tmp_path):
+        # A complexity claim is about one pass's own variables against the
+        # operation count at *its* entry, which the summed totals cannot give.
+        first = self._pass("a", 40, input_operations=100, **{"read_writes.misses": 5})
+        second = self._pass("b", 41, input_operations=80, **{"read_writes.misses": 7})
+        _record(tmp_path, "a.json", extra_events=[first, second])
+        m = _summary(tmp_path).measurements
+        base = "pass.CustomPreSchedulingPasses"
+        assert m[f"{base}.a.input_operations"] == [100.0]
+        assert m[f"{base}.b.input_operations"] == [80.0]
+        assert m[f"{base}.a.counter.read_writes.misses"] == [5.0]
+        assert m[f"{base}.b.counter.read_writes.misses"] == [7.0]
+
+    def test_the_summed_totals_are_unchanged(self, tmp_path):
+        # The dashboard reads these, so the per-pass keys are additive only.
+        first = self._pass("a", 40, **{"read_writes.misses": 5})
+        second = self._pass("b", 41, **{"read_writes.misses": 7})
+        _record(tmp_path, "a.json", extra_events=[first, second])
+        m = _summary(tmp_path).measurements
+        assert m["counter.read_writes.misses"] == [12.0]
+
+    def test_a_pass_clock_is_a_duration_here_too(self, tmp_path):
+        event = self._pass("a", 40, **{"read_writes.extract_ns": 900_000})
+        _record(tmp_path, "a.json", extra_events=[event])
+        m = _summary(tmp_path).measurements
+        base = "pass.CustomPreSchedulingPasses.a"
+        assert m[f"{base}.duration.read_writes.extract_ns"] == [900_000.0]
+        assert f"{base}.counter.read_writes.extract_ns" not in m
+
+    def test_a_reentrant_pass_sums_its_entries(self, tmp_path):
+        # Two entries of one pass are two lots of work, for a count and for an
+        # entry size alike.
+        first = self._pass("a", 40, input_operations=10, **{"read_writes.misses": 3})
+        second = self._pass("a", 41, input_operations=10, **{"read_writes.misses": 4})
+        _record(tmp_path, "a.json", extra_events=[first, second])
+        m = _summary(tmp_path).measurements
+        base = "pass.CustomPreSchedulingPasses.a"
+        assert m[f"{base}.counter.read_writes.misses"] == [7.0]
+        assert m[f"{base}.input_operations"] == [20.0]
+
+
 class TestDurationsAreNotCounters:
     def test_a_clock_named_counter_goes_under_duration(self, tmp_path):
         # read_writes.extract_ns and cpsat_solve.solver_wall_s are clocks a pass
