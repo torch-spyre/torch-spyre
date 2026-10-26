@@ -12116,7 +12116,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
             dlfloat16_reference=ref,
         )
-        
+
     # The im2col+matmul decomposition runs on the device; any CPU fallback is a
     # regression (#3053, #5134).
     @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
