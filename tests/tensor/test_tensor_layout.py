@@ -618,8 +618,8 @@ class TestSpyreTensorLayout(TestCase):
         # Offsets within one stick and aligned multi-stick slices can use DCI
         # directly. Crossing a tile from an unaligned start uses the existing
         # full-allocation CPU staging fallback in spyre_copy_from.
-        # Flex preserves the original DCI for unaligned DMA ranges; narrowing
-        # its allocation descriptor must still limit that fallback to one stick.
+        # A slice within one stick must transfer just that stick and preserve
+        # the source displacement within it during data conversion.
         torch.spyre.synchronize()
         with torch.profiler.profile(
             activities=[

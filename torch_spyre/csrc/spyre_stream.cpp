@@ -45,15 +45,12 @@
 namespace spyre {
 namespace {
 
-// DCI describes the elements read by unpacking a view, but the allocation
-// descriptor otherwise makes DMA fetch its entire backing storage. Restrict
-// D2H to the whole sticks covering those reads, then rebase the DCI onto that
-// staging buffer. In particular, a final-token logits view needs one row,
-// even when its storage contains a complete prefill chunk.
-// Flex can further compact aligned ranges, but its unaligned-range fallback
-// keeps the original DCI and copies the full descriptor supplied here. Bounding
-// that descriptor still limits partial-stick D2H transfers to the covered
-// sticks.
+// Bound the device descriptor to the whole sticks covering the view, then
+// rebase DCI onto that staging buffer. When Flex's transfer spans this range
+// from offset zero, it can reuse the DCI instead of constructing another
+// compact conversion. Flex can still compact strided selections within the
+// bounded descriptor. For a final-token logits view, the range is one row
+// even when the tensor owns a complete prefill allocation.
 std::optional<flex::CompositeAddress> narrowD2HRange(
     DataConversionInfo& dci, const SpyreTensorLayout& layout,
     const flex::CompositeAddress& allocation) {
