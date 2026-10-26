@@ -929,6 +929,70 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    # (query heads, kv heads, head tiles): the geometries on which hint-driven q_h
+    # tiling over fused SDPA silently returned wrong values (errors up to NaN) or
+    # failed to compile, while the for_each_tile decomposition was correct (#5441).
+    GQA_HEAD_TILED = (
+        (12, 12, 3),
+        (12, 2, 2),
+        (8, 2, 2),
+        (16, 4, 2),
+        (16, 4, 4),
+        (2, 2, 2),
+        (4, 2, 2),
+        (6, 3, 3),
+    )
+
+    def test_gqa_head_tiled_numerics_across_group_sizes(self):
+        """Head-tiled fused GQA attention is right for every group size.
+
+        Lq=Lk=64, D=128 at fp16 against an fp32 reference.  The group size runs
+        from 1 to 6 and the head counts include ones that are not powers of two.
+        The default strategy does not tile these shapes, so the head tiling is
+        forced, and each case asserts a loop really formed.
+        """
+        B, LQ, LK, D = 1, 64, 64, 128
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q, k, v, scale=D**-0.5, enable_gqa=True
+            )
+
+        for hq, hkv, tiles in self.GQA_HEAD_TILED:
+            with self.subTest(query_heads=hq, kv_heads=hkv, head_tiles=tiles):
+                generator = torch.Generator().manual_seed(0)
+                q = torch.randn(B, hq, LQ, D, dtype=torch.float16, generator=generator)
+                k = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                v = torch.randn(B, hkv, LK, D, dtype=torch.float16, generator=generator)
+                expected = sdpa(q.float(), k.float(), v.float())
+
+                def force_head_tiles(tiles=tiles, **kwargs):
+                    return dataclasses.replace(
+                        _select_sdpa_tiling(**kwargs), num_head_tiles=tiles
+                    )
+
+                # A fresh cache: the patched selector is not part of the compile
+                # cache key, so a cached compile of the same graph would be reused.
+                with (
+                    fresh_cache(),
+                    mock.patch.object(
+                        _decompositions,
+                        "_select_sdpa_tiling",
+                        side_effect=force_head_tiles,
+                    ),
+                ):
+                    torch._dynamo.reset()
+                    actual, sources = run_and_get_code(
+                        torch.compile(sdpa, fullgraph=True, dynamic=False),
+                        q.to("spyre"),
+                        k.to("spyre"),
+                        v.to("spyre"),
+                    )
+                self.assertIn("LoopSpec(", "\n".join(sources))
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected, atol=0.05, rtol=0.05
+                )
+
     def test_mapped_single_block_gqa_with_broadcast_mask(self):
         """Outer maps must preserve stable SDPA across query and head tiles."""
 
@@ -1202,10 +1266,13 @@ class TestSDPAForEachTileIntegration(unittest.TestCase):
         This test does NOT guard the case it was first written for, where an
         outer tile variable appears alongside the contraction variable
         (``[0, 32*d0 + floor(d1/D), 0, Mod(d1, D)]``, which needed o_proj to
-        sit inside SDPA's loop).  SDPA no longer places o_proj there, and
+        sit inside SDPA's loop).  SDPA no longer places o_proj there, so
         restoring the strict pre-fix check in ``propagate_layouts`` does not
-        fail this test.  A split-K-over-heads ``for_each_tile`` reaches the same
-        "cannot canonicalize factorized x_var" rejection today.
+        fail this test.  That relaxation is guarded at the layout level by
+        ``test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain``
+        in ``tests/tensor/test_coordinates.py``, and a split-K-over-heads
+        ``for_each_tile`` is covered by ``test_split_k_over_head_groups`` in
+        ``test_for_each_tile_e2e.py``.
         """
         B, H, Lq, Lk, D = 1, 32, 1, 2048, 128
         hidden = H * D

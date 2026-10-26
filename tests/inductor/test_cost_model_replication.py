@@ -35,16 +35,19 @@ import torch
 import torch_spyre  # noqa: F401
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import config, cost_model, spyre_hint
+from torch_spyre._inductor import work_division as wd
 from torch_spyre._inductor import cost_model_pass as cmp
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     CostParams,
     OpFeatures,
+    _decode_weight_delivery_excess,
     _fused_hbm_bytes,
     _loop_operand_request_excess,
     _partitioned_operand_read_excess,
     _read_burst_excess_ns,
     _replicated_operand_reads,
+    _shared_operand_read_excess,
     explain,
     predict_ops,
 )
@@ -632,7 +635,7 @@ def _solve_pinned(expr, menu, candidate, residency=None):
     buffer's candidate divisions, residency a solver variable -- and solve it
     with the division (and residency) pinned. Returns the objective value."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     model = cp_model.CpModel()
     division = model.new_int_var(0, len(menu) - 1, "div")
@@ -888,11 +891,272 @@ def test_extractor_stamps_the_matmul_operand_the_core_split_replicates(monkeypat
             assert all(a.replication == 1 for a in f.args), f.name
 
 
+# ------------------------------------------------ small-M decode weight delivery
+#
+# The co-optimizer's price for a small-M decode projection's shared weight must
+# follow ``work_division._decode_weight_delivery_us`` at every candidate, concretely
+# and as lowered to CP-SAT, so the joint solver ranks gate_up M4 x N8 ahead of
+# M8 x N4 (1357 vs 1626 us measured) instead of pricing them alike.
+
+GU_K, GU_N = 4096, 25600  # gate_up
+GU_W_ELEMS = GU_K * GU_N
+GU_W_BYTES = 2 * GU_W_ELEMS
+
+
+def _gate_up(M, m, n, k, *, weight_lx=False):
+    cores = m * n * k
+    return OpFeatures(
+        name="mm",
+        is_reduction=True,
+        out_elems=M * GU_N,
+        cores=cores,
+        dtype_bytes=2,
+        reduction_cores=k,
+        args=[
+            ArgTraffic("buf0", "input", False, M * GU_K, replication=n),
+            ArgTraffic(
+                "arg1_1", "input", weight_lx, GU_W_ELEMS, broadcast=m > 1,
+                is_boundary=True, replication=m,
+            ),
+            ArgTraffic("buf1", "output", False, M * GU_N),
+        ],
+        is_matmul=True,
+        matmul_macs=M * GU_K * GU_N,
+        matmul_a_bytes=2 * M * GU_K,
+        matmul_b_bytes=GU_W_BYTES,
+        matmul_rows_per_core=M / m,
+        matmul_cols_per_core=GU_N / n,
+        matmul_m_split=m,
+        matmul_n_split=n,
+    )  # fmt: skip
+
+
+def _decode_expected(m, k, cores, p=_COST_PARAMS):
+    bw = wd._decode_weight_delivery_gbps(cores, m, k)
+    return max(0.0, GU_W_BYTES / bw - GU_W_BYTES / p.bw_peak_gbps)
+
+
+@pytest.mark.parametrize("m, n, k", [(4, 8, 1), (8, 4, 1), (1, 16, 1), (8, 2, 2)])
+def test_the_excess_is_the_measured_delivery_over_the_peak(m, n, k):
+    got = _decode_weight_delivery_excess([_gate_up(8, m, n, k)], _COST_PARAMS)
+    assert got == pytest.approx(_decode_expected(m, k, m * n * k))
+
+
+def test_the_joint_price_ranks_sharing_by_four_ahead_of_eight():
+    p = _COST_PARAMS
+    by_4 = predict_ops([_gate_up(8, 4, 8, 1)], p)
+    by_8 = predict_ops([_gate_up(8, 8, 4, 1)], p)
+    unshared_16 = predict_ops([_gate_up(8, 1, 16, 1)], p)
+    assert by_4 < by_8 < unshared_16
+    assert by_8 - by_4 > 100_000  # ~270 us measured
+
+
+def test_a_resident_weight_pays_no_delivery():
+    assert _decode_weight_delivery_excess([_gate_up(8, 8, 4, 1, weight_lx=True)], _COST_PARAMS) == 0  # fmt: skip
+
+
+@pytest.mark.parametrize("M", [1, 64])
+def test_outside_the_measured_rows_the_cohort_excess_still_prices(M):
+    op = _gate_up(M, 16, 2, 1)  # shared by 16: past the cohort limit
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    expected = (
+        GU_W_BYTES * (wd._matmul_multicast_penalty(16) - 1) / _COST_PARAMS.bw_peak_gbps
+    )
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == pytest.approx(expected)
+
+
+def test_in_scope_the_cohort_excess_steps_aside():
+    op = _gate_up(8, 16, 2, 1)  # replication 16: the old cohort penalty would fire
+    assert _shared_operand_read_excess([op], _COST_PARAMS) == 0
+
+
+DECODE_MENU = [
+    (4, 8, 1),
+    (8, 4, 1),
+    (2, 16, 1),
+    (1, 16, 1),
+    (8, 2, 2),
+    (2, 4, 4),
+    (1, 8, 4),
+]
+SPLIT_M, SPLIT_N, SPLIT_K = sympy.symbols(
+    "split_m split_n split_k", integer=True, positive=True
+)
+
+
+def _decode_symbolic(M, *, weight_lx=False):
+    """The op as the co-optimizer extracts it: symbolic M, N and K splits."""
+    m, n, k = SPLIT_M, SPLIT_N, SPLIT_K
+    op = _gate_up(M, 1, 1, 1, weight_lx=weight_lx)
+    return dataclasses.replace(
+        op,
+        cores=m * n * k,
+        reduction_cores=k,
+        matmul_m_split=m,
+        matmul_n_split=n,
+        args=[
+            dataclasses.replace(op.args[0], replication=n),
+            dataclasses.replace(op.args[1], broadcast=True, replication=m),
+            op.args[2],
+        ],
+    )
+
+
+def _at(m, n, k):
+    return {SPLIT_M: m, SPLIT_N: n, SPLIT_K: k}
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_batched_matmuls_keep_cohort_pricing(batch, shared_weight, symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 16, 2, 1)
+    activation, weight, output = op.args
+    weight = dataclasses.replace(
+        weight, elems=weight.elems * (1 if shared_weight else batch)
+    )
+    # The extractor's A/B byte counts exclude batch; MACs, output elements,
+    # and per-batch argument footprints include it.
+    op = dataclasses.replace(
+        op,
+        matmul_macs=op.matmul_macs * batch,
+        out_elems=op.out_elems * batch,
+        args=[
+            dataclasses.replace(activation, elems=activation.elems * batch),
+            weight,
+            dataclasses.replace(output, elems=output.elems * batch),
+        ],
+    )
+    assert _decode_weight_delivery_excess([op], _COST_PARAMS) == 0
+    cohort = _shared_operand_read_excess([op], _COST_PARAMS)
+    actual = float(sympy.sympify(cohort).xreplace(_at(16, 2, 1)))
+    expected = (
+        weight.elems
+        * op.dtype_bytes
+        * (wd._matmul_multicast_penalty(16) - 1)
+        / _COST_PARAMS.bw_peak_gbps
+    )
+    assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("symbolic", [False, True])
+def test_decode_delivery_charges_a_shared_boundary_weight_once(symbolic):
+    op = _decode_symbolic(8) if symbolic else _gate_up(8, 4, 8, 1)
+    other = _gate_up(8, 8, 4, 1)
+    expr = _decode_weight_delivery_excess([op, other], _COST_PARAMS)
+    for m, n, k in DECODE_MENU if symbolic else [(4, 8, 1)]:
+        actual = float(sympy.sympify(expr).xreplace(_at(m, n, k)))
+        expected = max(_decode_expected(m, k, m * n * k), _decode_expected(8, 1, 32))
+        assert actual == pytest.approx(expected, abs=1.0)
+
+
+def test_the_symbolic_price_equals_the_concrete_price_at_every_candidate():
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K], expr, modules="math")
+    for m, n, k in DECODE_MENU:
+        expected = _decode_expected(m, k, m * n * k)
+        assert at(m, n, k) == pytest.approx(expected, abs=1.0), (m, n, k)
+        # The substituted node folds, and evalf (plan_solver's reading) agrees.
+        assert float(expr.xreplace(_at(m, n, k))) == pytest.approx(expected, abs=1.0)
+
+
+def test_a_resident_symbolic_weight_pays_nothing():
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    at = sympy.lambdify([SPLIT_M, SPLIT_N, SPLIT_K, is_lx], expr, modules="math")
+    assert at(8, 4, 1, 1) == 0
+    assert at(8, 4, 1, 0) == pytest.approx(_decode_expected(8, 1, 32), abs=1.0)
+    assert expr.xreplace({is_lx: 1}) == 0
+
+
+def _decode_buffer():
+    """A co-optimizer buffer whose candidates are ``DECODE_MENU``; a candidate
+    that does not split an axis reads 1 for it."""
+    keys = {"d0": SPLIT_M, "d1": SPLIT_N, "d2": SPLIT_K}
+    return types.SimpleNamespace(
+        sym_division=sympy.Symbol("division_buf1", integer=True, nonnegative=True),
+        sym_core_divs=keys,
+        core_divisions=[
+            types.SimpleNamespace(splits={d: v for d, v in zip(keys, mnk) if v != 1})
+            for mnk in DECODE_MENU
+        ],
+    )
+
+
+@pytest.mark.parametrize("weight_lx", [False, True])
+def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    buffer = _decode_buffer()
+    for i, (m, n, k) in enumerate(DECODE_MENU):
+        model = cp_model.CpModel()
+        division = model.new_int_var(0, len(DECODE_MENU) - 1, "div")
+        model.add(division == i)
+        resident = model.new_bool_var("resident")
+        model.add(resident == int(weight_lx))
+        wrapper = types.SimpleNamespace(division=division, buffer=buffer)
+        sym_map = {is_lx.name: resident}
+        buffer_map = {
+            sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+            for key, sym in buffer.sym_core_divs.items()
+        }
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        solver = cp_model.CpSolver()
+        assert solver.Solve(model) == cp_model.OPTIMAL
+        expected = 0 if weight_lx else _decode_expected(m, k, m * n * k)
+        assert solver.ObjectiveValue() == pytest.approx(expected, rel=2e-3, abs=2.0), (
+            m,
+            n,
+            k,
+        )
+
+
+def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
+    assert _SympyExprToCpSat(cp_model.CpModel(), {}, {}).convert(expr) == 0
+
+
+def test_cp_sat_gates_the_price_on_residency_without_a_product():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+
+    is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
+    expr = _decode_weight_delivery_excess(
+        [_decode_symbolic(8, weight_lx=is_lx)], _COST_PARAMS
+    )
+    buffer = _decode_buffer()
+    model = cp_model.CpModel()
+    wrapper = types.SimpleNamespace(
+        division=model.new_int_var(0, len(DECODE_MENU) - 1, "div"), buffer=buffer
+    )
+    sym_map = {is_lx.name: model.new_bool_var("resident")}
+    buffer_map = {
+        sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
+        for key, sym in buffer.sym_core_divs.items()
+    }
+    _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+    constraints = model.proto.constraints
+    # One lookup for the price, though ``expand`` repeats it under the gate,
+    # and the gate as enforced linear constraints rather than a product.
+    assert sum(c.has_element() for c in constraints) == 1
+    assert not any(c.has_int_prod() for c in constraints)
+
+
 @pytest.mark.parametrize("resident", [0, 1])
 @pytest.mark.parametrize("value", [-3, 0, 5])
 def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     b, x = sympy.symbols("b x", integer=True)
     model = cp_model.CpModel()
@@ -911,7 +1175,7 @@ def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
 @pytest.mark.parametrize("value", [None, -3, 5])
 def test_cp_sat_bools_times_int_is_the_int_while_every_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     b1, b2, x = sympy.symbols("b1 b2 x", integer=True)
     model = cp_model.CpModel()

@@ -170,6 +170,57 @@ class TestCoordinates(TestCase):
         # offset 1855 = 3*600 + 1*30 + 25*1
         self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
 
+    def test_stepped_nonstick_coordinate_bounds(self):
+        # A valid ::step slice reaches at most rows - 1, including when
+        # rows is not divisible by step. Test both common stick widths.
+        for width in (32, 64):
+            for rows, step in ((97, 3), (96, 3), (98, 5), (99, 3)):
+                with self.subTest(width=width, rows=rows, step=step):
+                    count = (rows + step - 1) // step
+                    coords = compute_coordinates(
+                        [rows, 256 // width, 2, width],
+                        [256, width, rows * 256, 1],
+                        {p0: 2, p1: count, p2: 256},
+                        rows * 256 * p0 + step * 256 * p1 + p2,
+                    )
+                    self.assertEqual(coords, [step * p1, p2 // width, p0, p2 % width])
+
+    def test_stepped_nonstick_coordinate_preserves_wrap(self):
+        # A flattened batch/row axis genuinely crosses the original row
+        # boundary. rows=99 exercises landing exactly on the boundary.
+        for rows in (97, 99):
+            with self.subTest(rows=rows):
+                count = (2 * rows + 2) // 3
+                coords = compute_coordinates(
+                    [rows, 4, 2, 64],
+                    [256, 64, rows * 256, 1],
+                    {p0: count, p1: 256},
+                    3 * 256 * p0 + p1,
+                )
+                self.assertEqual(
+                    coords,
+                    [(3 * p0) % rows, p1 // 64, (3 * p0) // rows, p1 % 64],
+                )
+                # Compare physical addresses at every selected row against
+                # the original batch/row coordinates, including the wrap.
+                for t in range(count):
+                    for c in (0, 63, 64, 255):
+                        actual = sum(
+                            coord.subs({p0: t, p1: c}) * stride
+                            for coord, stride in zip(coords, (512, 128, 64, 1))
+                        )
+                        batch, row = divmod(3 * t, rows)
+                        expected = row * 512 + (c // 64) * 128 + batch * 64 + c % 64
+                        self.assertEqual(actual, expected)
+
+    def test_stepped_coordinate_last_value_at_boundary(self):
+        # max == boundary must retain both the carry and modulo; max ==
+        # boundary - 1 may drop them. This catches a strict-comparison error.
+        for count in (2, 3):
+            coords = compute_coordinates([2, 6], [6, 1], {p0: count}, 3 * p0)
+            expected = [0, 3 * p0] if count == 2 else [(3 * p0) // 6, (3 * p0) % 6]
+            self.assertEqual(coords, expected)
+
     def test_compute_coordinates_mixed_radix_flattened_dim(self):
         """A flattened H*D loop maps back to separate H and D coordinates."""
         lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
@@ -573,6 +624,70 @@ class TestAlignTensorsStridedTerm(TestCase):
         # The other tensor gains a size-1 dim for the synthetic variable.
         self.assertIn(z, {s for c in tensors[1]["coordinates"] for s in c.free_symbols})
 
+    def test_outer_stride_partial_group_preserves_addresses(self):
+        # The final group need not be physically padded: only the selected
+        # coordinates are accessed. Compare the complete address expressions,
+        # including offsets, after alignment introduces its synthetic gap.
+        r, c = sympy.symbols("r c", integer=True, nonnegative=True)
+        for rows, step, start in [(97, 3, 0), (98, 5, 0), (97, 3, 1), (7, 3, 3)]:
+            for width in (32, 64):
+                for leading_unit in (False, True):
+                    with self.subTest(
+                        rows=rows,
+                        step=step,
+                        start=start,
+                        width=width,
+                        leading_unit=leading_unit,
+                    ):
+                        count = len(range(start, rows, step))
+                        inp = {
+                            "size": [rows, width],
+                            "coordinates": [step * r + start, c],
+                        }
+                        out = {"size": [count, width], "coordinates": [r, c]}
+                        if leading_unit:
+                            inp["size"].insert(0, 1)
+                            inp["coordinates"].insert(0, sympy.S.Zero)
+                        space, tensors, _ = align_tensors(
+                            {r: (count, 1), c: (width, 1)}, [inp, out]
+                        )
+                        synthetic = {v: 0 for v in space if v not in (r, c)}
+                        for v in synthetic:
+                            self.assertEqual(space[v][0], 1)
+                        for tensor, expected in zip(
+                            tensors, [(step * r + start) * width + c, r * width + c]
+                        ):
+                            address = sympy.S.Zero
+                            for extent, coord in zip(
+                                tensor["size"], tensor["coordinates"]
+                            ):
+                                address = address * extent + coord
+                            # Alignment may retain floor(c / width); it is
+                            # zero throughout the column iteration range.
+                            for column in range(width):
+                                substitutions = {**synthetic, c: column}
+                                self.assertEqual(
+                                    sympy.expand(address.subs(substitutions)),
+                                    sympy.expand(expected.subs(substitutions)),
+                                )
+                        self.assertLess(
+                            (start + step * (count - 1)) * width + width - 1,
+                            rows * width,
+                        )
+
+    def test_outer_stride_partial_group_rejects_out_of_bounds(self):
+        r, c = sympy.symbols("r c", integer=True, nonnegative=True)
+        for count, start in [(34, 0), (33, 1), (33, -1)]:
+            with self.subTest(count=count, start=start):
+                with self.assertRaisesRegex(Unsupported, "does not divide"):
+                    align_tensors(
+                        {r: (count, 1), c: (64, 1)},
+                        [
+                            {"size": [97, 64], "coordinates": [3 * r + start, c]},
+                            {"size": [count, 64], "coordinates": [r, c]},
+                        ],
+                    )
+
     def test_stride_not_dividing_dim_is_rejected(self):
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         it_space = {d0: (8, 1), d1: (3, 1), d2: (64, 1)}
@@ -782,20 +897,74 @@ class TestFactorizedMatmulCandidates(TestCase):
             )
 
     def test_rejects_noncontiguous_or_partial_factorized_chain(self):
-        """Only a full, gap-free mixed-radix view is safe to collapse."""
+        """Only a gap-free mixed-radix view, windowed on whole inner dims, collapses."""
         scenarios = (
+            # Heads stride 256 over a 128-wide D leaves a gap between heads.
             self._same_graph_attention_scenario(host_stride=(262144, 4096, 256, 1)),
-            self._same_graph_attention_scenario(contraction_range=2048),
+            # 2000 elements end in the middle of a head (not a multiple of D).
+            self._same_graph_attention_scenario(contraction_range=2000),
         )
         for arg, contraction, source in scenarios:
             with self.subTest(
                 stride=arg.layout.stride,
                 contraction_range=arg.dep.ranges[contraction],
             ):
-                with self.assertRaisesRegex(Unsupported, "full-range contiguous"):
+                with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
                     find_stick_compatible_input_layout(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
+
+    def test_windowed_factorized_chain_collapses_to_the_full_chain(self):
+        """A contraction var covering whole heads of a gap-free view collapses.
+
+        A ``for_each_tile`` over head groups reads one window of the chain
+        (here 16 of 32 heads, 2048 of 4096 elements); the window's position
+        enters through the loop index, not the host coordinates.  The canonical
+        layout must span the whole chain, not just the window.
+        """
+        arg, contraction, _ = self._same_graph_attention_scenario(
+            contraction_range=2048
+        )
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [64, 64, 1, 64])
+        self.assertEqual(list(result.stride_map), [4096, 64, -1, 1])
+
+    def test_outer_loop_var_in_the_head_coordinate_collapses_the_whole_chain(self):
+        """An outer variable added to the head coordinate does not block collapse.
+
+        The dep index ``4096*outer + contraction`` makes the head coordinate
+        ``32*outer + floor(contraction/128)``: a loop variable selects a group of
+        32 heads and the contraction variable walks one group.  Only the part of
+        a host coordinate that varies with the contraction variable must depend
+        on it alone, so the outer term is allowed (issue #5441).  The canonical
+        layout spans the whole 64-head chain.
+        """
+        outer, contraction = sympy.symbols(
+            "outer contraction", integer=True, nonnegative=True
+        )
+        heads = 64
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, heads, 1, 128],
+            [heads * 128, 128, 128, 1],
+        )
+        source = SpyreTensorLayout(
+            [heads, 1, 2, 1, 64],
+            [128, -1, 64, -1, 1],
+            get_device_dtype(torch.float16),
+            {(0,): heads, (1,): 1, (2, 4): 128, (3,): 1},
+        )
+        dep = MemoryDep(
+            "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
+        )
+        result = find_stick_compatible_input_layout(
+            PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [1, 128, 1, 64])
+        self.assertEqual(list(result.stride_map), [-1, 64, -1, 1])
 
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""

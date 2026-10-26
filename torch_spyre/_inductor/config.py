@@ -246,7 +246,9 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # Append one JSON record per co-optimized graph to this file: the symbolic cost
 # objective the solver minimized (per-bundle terms and relayout charges as sympy
 # ``srepr`` strings), the symbol values the solve chose, and each term evaluated
-# under them. Read by the summarize-sdsc skill. Empty = off.
+# under them, plus any terms the engine adds outside the expression and the
+# total it minimized (see ``cost_expr_record``). Read by the summarize-sdsc
+# skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.
@@ -395,9 +397,9 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 #
 # Under the SA co-optimizer, anything the apply refuses raises rather than
 # falling back, so any gap between what the search believes it may tile and
-# what ``coarse_tile`` accepts is a compile failure. And nothing yet prices the
-# loop cost above the split cap, so the search has no downward pressure on the
-# tiling axis and takes as much of it as the divisor lattice offers.
+# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
+# search sees is only part of what ``predict_ops`` charges a real tiling, so it
+# is not yet a calibrated brake on the tiling axis.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
@@ -409,6 +411,32 @@ _cpsat_warn_on_cost_expr: bool = True
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+
+# Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
+# if an optimal solution is fully priced. The check is a second solve with no
+# time limit, so it can run well past ``cpsat_time_limit_seconds`` on a hard model;
+# not for production compiles.
+enable_uniqueness_check: bool = (
+    os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
+)
+
+# solver_relayout_edge_context's same-tile-group exception (#5057): without it,
+# a coarse-tiled producer or consumer can never host a relayout candidate at
+# all, even when the pair shares one loop_group_id (same iteration, same tile,
+# direct read, no staging op between them). With it, every such edge is priced,
+# which can enumerate and cost a large number of candidate divisions on a graph
+# with many eligible same-group edges -- see #5609's compile-time report.
+# This is not for_each_tile-specific: loop_group_id/CoarseTileInfo is stamped
+# by for_each_tile_lowering.py AND by the separate declarative coarse-tiling
+# path (scratchpad/coarse_tiling.py, wsr/coarse_tile.py), so the flag affects
+# any graph with coarse-tiled ops sharing a loop_group_id with their consumer,
+# through either mechanism.
+# This trades a device-runtime boost for a compile-time slow-down. While
+# investigating ways to speed up the compile side (#5609), we leave it off by
+# default for now. Set SPYRE_LX_SAME_TILE_GROUP_RELAYOUT=1 to opt in.
+lx_same_tile_group_relayout: bool = (
+    os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
+)
 
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every

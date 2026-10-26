@@ -69,6 +69,7 @@ test_suite_config:
             - TestOps::test_single_dim_reduction_invalid_dims_spyre.*
             # restickify add on padded dim tests
             - TestOps::test_restickify_add_transpose.*
+            - TestOps::test_restickify_clone.*
             - TestOps::test_prod.*
             # DtypeOpTable unit tests — pure Python, no hardware needed
             - TestOps::test_dtype_op_table_keys_are_torch_dtypes

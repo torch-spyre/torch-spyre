@@ -4,6 +4,8 @@
 :hidden:
 :maxdepth: 2
 
+differential_testing
+failure_classes
 inductor_artifacts
 unified_logging_framework
 op_spec_lab
@@ -34,9 +36,38 @@ from the outside in:
    standalone script and run just the back-end half of the compile
    ([The OpSpec Lab](op_spec_lab.md))
 
+Two companion pages support this workflow. [Differential Testing Against
+CPU](differential_testing.md) is the comparison method the steps above rely
+on, and [Common Failure Classes](failure_classes.md) maps a divergence to its
+cause once you have one.
+
+The method in one view:
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart TD
+    A[wrong result] --> B["reduce to one operation<br/>(minimal reproducer)"]
+    B --> C["differential test<br/>same inputs, same seed, three runs"]
+    C --> D{first run to diverge}
+    D -->|Spyre eager| E[one operation is wrong]
+    D -->|only Spyre compiled| F[lowering, fusion, or layout]
+    E --> G{classify by the symptom}
+    F --> G
+    G -->|zeros past the first stick| H[layout and stick alignment]
+    G -->|NaN where CPU is finite| I["special values (inf and NaN)"]
+    G -->|warning and wrong dtype| J[silent CPU fallback]
+    G -->|wrong only with planning on| K[scratchpad residency]
+    G -->|changes between runs| L[nondeterminism]
+```
+
 ---
 
-## Step 1 — Create a Minimal Reproducer
+## The debugging workflow
+
+These steps work from the outside in. Run them in order; most bugs are
+localized before you reach the last one.
+
+### Step 1 — Create a Minimal Reproducer
 
 Before investigating, reduce the failing model or script to the smallest
 possible program that still shows the wrong behaviour. This makes the
@@ -53,7 +84,7 @@ print(result)
 
 ---
 
-## Step 2 — Enable Debug Environment Variables
+### Step 2 — Enable Debug Environment Variables
 
 The following environment variables control the level of diagnostic output:
 
@@ -70,7 +101,17 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
-### Programmatic Logging Control
+To find an operation that silently ran on the host, promote its warning to an
+error so the run stops at the exact call:
+
+```bash
+python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" my_reproducer.py
+```
+
+See [Silent CPU fallback](failure_classes.md#silent-cpu-fallback) for why this
+matters.
+
+#### Programmatic Logging Control
 
 For log levels not supported by `TORCH_LOGS` (WARNING, CRITICAL, DISABLED) or
 for runtime control, use the programmatic API:
@@ -106,7 +147,7 @@ directory, depending on your PyTorch version).
 
 ---
 
-## Step 3 — Capture FFDC Report
+### Step 3 — Capture FFDC Report
 
 If the failure is a compile error, runtime launch error, or
 unimplemented operation, FFDC can preserve the exception context and
@@ -137,7 +178,7 @@ artifact interpretation, and pod/CI workflow.
 
 ---
 
-## Step 4 — Examine Compiler Artifacts
+### Step 4 — Examine Compiler Artifacts
 
 `TORCH_COMPILE_DEBUG` preserves one subdirectory per compiled function.
 Inside you will find the intermediate representation at each stage of
@@ -160,7 +201,7 @@ torch_compile_debug/
             └── output_code.py                                    ← generated host code
 ```
 
-### What to look for at each layer
+#### What to look for at each layer
 
 **FX Graph** (`fx_graph_readable.py`)
 Verify the traced operation matches what you expect. Check that the
@@ -180,7 +221,7 @@ layouts (`device_size`, `stride_map`, `device_dtype`), work division,
 and scratchpad allocations. Bugs that appear only in the final output
 often trace back to one of these files.
 
-### Example: debugging an incorrect `clone` result
+#### Example: debugging an incorrect `clone` result
 
 Consider a `float16` tensor of size `[65]`. The default Spyre layout
 pads the stick dimension to 128 bytes (64 elements per stick), so the
@@ -215,7 +256,7 @@ for the full investigation.)*
 
 ---
 
-## Checklist for Filing a Bug Report
+### Checklist for Filing a Bug Report
 
 When opening an issue, include:
 
@@ -230,7 +271,7 @@ When opening an issue, include:
 
 ---
 
-## Quick Reference
+### Quick Reference
 
 ```bash
 # Full debug run
@@ -243,4 +284,20 @@ python my_reproducer.py
 # Find the generated artifacts
 find . -name "sdsc_*.json" 2>/dev/null
 find /tmp -name "fx_graph_readable.py" 2>/dev/null
+```
+
+---
+
+## Provenance audit
+
+A multi-stage audit that traces a model through the compilation pipeline and
+records, at each stage, which source-to-kernel provenance fields are carried
+or dropped. The README explains how to run the audit, and the example is one
+generated artifact from auditing `SimpleMLP`.
+
+```{toctree}
+:maxdepth: 1
+
+provenance/README
+provenance/provenance_audit
 ```

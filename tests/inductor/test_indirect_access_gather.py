@@ -1008,13 +1008,6 @@ class _GatherScenarios:
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
 
-    @pytest.mark.skip(
-        reason=(
-            "backend compiler crash: std::out_of_range (map::at) — "
-            "multiple gathers sharing the same index tensor in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_multiple_indices_same_kernel(self):
         """Test x[i] + y[i] - multiple gathers with same index in one kernel.
 
@@ -1031,13 +1024,6 @@ class _GatherScenarios:
 
         self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "RuntimeError: StreamInErrorState — cannot launch D2H; "
-            "multiple gathers with different index tensors in one kernel "
-            "are not yet supported"
-        )
-    )
     def test_gather_different_indices_same_kernel(self):
         """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
 
@@ -1345,6 +1331,20 @@ register_multicore_variants(
     globals(),
     counts=(32,),
 )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.int32, torch.int64], ids=lambda d: str(d)[6:]
+)
+def test_gather_stick_indexed_32bit_rejected(dtype):
+    """A 1-D 32-bit gather indexes along the stick dim and is refused at compile
+    time (#4360) rather than faulting the device or returning wrong values."""
+    torch._dynamo.reset()
+    x = torch.arange(64).to(dtype).to("spyre")
+    idx = torch.tensor([3, 17, 40, 5], dtype=torch.int32).to("spyre")
+    with pytest.raises(Exception, match=r"indexed along its stick dimension \(#4360\)"):
+        torch.compile(lambda x, i: x[i])(x, idx)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests

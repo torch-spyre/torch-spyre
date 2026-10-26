@@ -101,6 +101,10 @@ one loop level per call (see [Composing and nesting](working_set_reduction.md#co
 in `working_set_reduction.md` for how a second, nested level is built by
 calling `for_each_tile` again inside `body`).
 
+See the [for_each_tile example](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/user_guide/examples/for_each_tile.py) for
+a runnable script that tiles a computation with `for_each_tile`, using a map
+over one dimension and a split-K carry over another.
+
 This example is exactly what `docs/tools/capture_for_each_tile_ir.py`
 compiles. Every IR/OpSpec/`bundle.mlir` snippet below is real, captured
 output, not hand-derived. When compiler internals drift and these snippets

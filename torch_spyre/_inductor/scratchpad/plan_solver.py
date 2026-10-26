@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
@@ -93,6 +93,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Why the buffer cannot reside while its op is untiled, set instead of
+    # ``residency_reason`` when the solve may tile the op: the solver keeps the
+    # buffer out of LX unless it chooses a tiling for it.
+    untiled_bar: Optional[str] = None
     # Optional lifetime bounds for storage reused by a counted loop. Keep these
     # separate from ``uses``: they change address overlap, but must not
     # manufacture reads or inflate residency/spill benefit.
@@ -388,24 +392,22 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
+    def per_core_size(self, division: int) -> int:
+        """Bytes per core after output partitioning and output tiling.
+
+        Reduction splits retain a full output part.
+        """
+        cd = self.core_divisions[division]
+        return ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+
     @property
     def min_footprint(self) -> int:
-        """Smallest per-core footprint any candidate division allows. With no
+        """Smallest :meth:`per_core_size` any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on).
-
-        A tiled candidate's own buffer is per-tile scratch, so its footprint
-        shrinks by the output tile count as well as the core count -- this is
-        the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); where no
-        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
-        ``ceil_div(size, output_partition)`` exactly."""
+        (the placement-only case ``_wrap`` also dispatches on)."""
         if not self.core_divisions:
             return self.size
-        return min(
-            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
-            for cd in self.core_divisions
-        )
+        return min(self.per_core_size(i) for i in range(len(self.core_divisions)))
 
     @property
     def sym_cores(self) -> sympy.Symbol:
@@ -451,12 +453,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         leaves the axis untiled. Keyed on the axis rather than the nesting level, so the
         symbols do not depend on how a candidate orders its levels -- the cost
         of a nest (a product of per-level trip counts) does not either. Empty
-        while no candidate is tiled."""
+        while no candidate is tiled.
+
+        The SA co-optimizer generates its tilings from :attr:`division_space`
+        instead of listing them as candidates, so every output dim that space
+        may tile is declared too."""
         keys = dict.fromkeys(
             (axis.host_dim, axis.is_reduction)
             for cd in self.core_divisions
             for axis in cd.tiling.axes
         )
+        space = self.division_space
+        if space is not None and space.tiling is not None:
+            keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
         return {
             (dim, is_red): sympy.Symbol(
                 f"tile_{self.name}_{'r' if is_red else 'o'}{dim}",
@@ -514,6 +523,21 @@ class RelayoutCharge(sympy.Function):
         i = int(round(division))
         return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
 
+    def _sympystr(self, printer):
+        """``str()`` names the priced divisions only, ``prices={4: 65, 12: 147}``:
+        the table is mostly zeros (a copy is priced on few of its source's
+        divisions), and positional prices make the reader count to find which
+        division a price belongs to. ``srepr`` is untouched, so the dump stays
+        lossless."""
+        is_lx, division, *prices = self.args
+        priced = ", ".join(
+            f"{i}: {printer._print(p)}" for i, p in enumerate(prices) if p != 0
+        )
+        return (
+            f"{self.func.__name__}({printer._print(is_lx)}, "
+            f"{printer._print(division)}, prices={{{priced}}})"
+        )
+
 
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
@@ -552,6 +576,8 @@ def cost_expr_record(
     bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
     buffers: Sequence["LifetimeBoundBuffer"],
     params: object = None,
+    off_expression_ns: Mapping[str, float] | None = None,
+    score_ns: float | None = None,
     *,
     context: dict | None = None,
 ) -> dict:
@@ -560,6 +586,12 @@ def cost_expr_record(
     ``parse_expr`` restores them), the solved symbol bindings, and every term
     evaluated under them. ``buffers`` are the solver's returned buffers;
     ``buffers`` names (the graph's stores) are what a reader joins on.
+
+    ``objective_ns`` is ``cost_expr`` alone. ``off_expression_ns`` is what the
+    engine adds outside it for this plan
+    (:meth:`CoreDivisionLayoutSolver.off_expression_ns`), and ``score_ns`` the
+    total the engine minimized (:meth:`CoreDivisionLayoutSolver.score_ns`),
+    ``objective_ns`` for an engine that minimizes ``cost_expr`` itself.
 
     ``divisions`` carries each buffer's candidate core counts, the one chosen,
     its producers, its residency ``reason`` when one kept it out of LX, and the
@@ -675,6 +707,8 @@ def cost_expr_record(
         },
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,
+        "off_expression_ns": dict(off_expression_ns or {}),
+        "score_ns": objective_ns if score_ns is None else score_ns,
     }
     # Additive only: context describes the record, it does not get to redefine
     # it. Without this a caller key named `bundles` would replace the terms.
@@ -770,7 +804,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     def per_core_footprint(self) -> int:
         """The destination span: what one core must hold for the copy to be
         resident (``size`` is that span times the destination core count)."""
-        return ceil_div(self.size, self.num_cores)
+        return self.per_core_size(0)
 
     @property
     def consumers(self) -> tuple[str, ...]:
@@ -993,13 +1027,6 @@ class MemoryPlanSolver(ABC):
 
     @classmethod
     @abstractmethod
-    def replans_after_tiling(cls) -> bool:
-        """Needs a second, placement-only solve over the graph once the tilings
-        it chose are applied, rather than its own placement standing
-        (``CoOptimizingAllocator._materialize_selection``)."""
-
-    @classmethod
-    @abstractmethod
     def linear_cost_only(cls) -> bool:
         """Can only minimize a cost expression that lowers to linear terms, so
         the objective must avoid the cost model's fractional powers."""
@@ -1010,7 +1037,6 @@ class MemoryPlanSolver(ABC):
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "replans_after_tiling",
         "linear_cost_only",
     )
 
@@ -1038,7 +1064,6 @@ class MemoryPlanSolver(ABC):
             ("chooses_tilings", "chooses_core_divisions"),
             ("linear_cost_only", "chooses_core_divisions"),
             ("tilings_from_menu", "chooses_tilings"),
-            ("replans_after_tiling", "chooses_tilings"),
         ):
             if getattr(cls, implied)() and not getattr(cls, prerequisite)():
                 raise TypeError(f"{cls.__name__}.{implied}() requires {prerequisite}()")
@@ -1076,6 +1101,9 @@ class MemoryPlanSolver(ABC):
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
             return buffer.residency_reason
+        if buffer.untiled_bar is not None and not self.tilings_from_menu():
+            # Only a solver choosing among the menu's tilings can lift it.
+            return buffer.untiled_bar
         if buffer.min_footprint > self.limit:
             return (
                 f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
@@ -1140,6 +1168,16 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     @classmethod
     def chooses_core_divisions(cls) -> bool:
         return True
+
+    def off_expression_ns(self) -> dict[str, float]:
+        """The terms this engine's objective adds outside ``cost_expr`` for the
+        solved plan, by name, in ns as added; the cost dump reports them."""
+        return {}
+
+    def score_ns(self) -> Optional[float]:
+        """The total this engine minimized for the solved plan, in ns, where
+        that is not ``cost_expr`` alone; the cost dump reports it."""
+        return None
 
     @abstractmethod
     def plan_layout_and_core_divisions(
