@@ -15,6 +15,7 @@
  */
 #include "spyre_ccl.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <string>
@@ -34,6 +35,34 @@
 #include "types_mapping.h"
 
 namespace c10d {
+
+namespace {
+
+// Prove that physical element i has host storage offset i. Singleton device
+// dimensions do not affect the address, but every other dimension must have
+// the corresponding contiguous stride. This excludes tiled multi-row layouts
+// such as device_size=[2, 8, 64], stride_map=[64, 96, 1].
+bool can_borrow_linear_dl16_storage(const at::Tensor& tensor) {
+  if (tensor.is_neg() || tensor.is_conj()) {
+    return false;
+  }
+  const auto layout = spyre::get_spyre_tensor_layout(tensor);
+  if (layout.device_dtype != DataFormats::SEN169_FP16 ||
+      layout.element_arrangement != spyre::ElementArrangement::STANDARD) {
+    return false;
+  }
+  int64_t stride = 1;
+  for (int i = static_cast<int>(layout.device_size.size()) - 1; i >= 0; --i) {
+    const auto size = layout.device_size[i];
+    if (size <= 0 || (size > 1 && layout.stride_map[i] != stride)) {
+      return false;
+    }
+    stride *= size;
+  }
+  return true;
+}
+
+}  // namespace
 
 /***********************************************
  * Wrapper Backend for the Sypre Collective Library
@@ -450,22 +479,56 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
 
   auto input = inputTensors[0];
   spyre::check_collective_device(input);
-  if (input.storage_offset() == 0 &&
-      c10::multiply_integers(spyre::get_spyre_tensor_sizes(input)) !=
-          input.numel()) {
-    // Eager LM-head unpadding can return a contiguous prefix with its base
-    // allocation's descriptor. Copy the view before borrowing its device
-    // address; communicating the base would include unrelated elements.
-    input = input.clone(at::MemoryFormat::Contiguous);
-  }
-  spyre_comms::Tensor input_tensor;
-  prepare_tensor(input, &input_tensor);
+  const auto descriptor_numel =
+      c10::multiply_integers(spyre::get_spyre_tensor_sizes(input));
+  TORCH_INTERNAL_ASSERT(
+      descriptor_numel >= input.numel(),
+      "Collective input exceeds its device descriptor extent");
 
   std::vector<spyre_comms::Tensor> output_tensors;
   for (auto& outputTensor : outputTensors[0]) {
     spyre_comms::Tensor output_tensor;
     prepare_tensor(outputTensor, &output_tensor);
     output_tensors.push_back(output_tensor);
+  }
+
+  bool borrow_prefix = false;
+  if (input.storage_offset() == 0 && descriptor_numel > input.numel()) {
+    const auto input_bytes =
+        spyre::get_device_size_in_bytes(spyre::get_spyre_tensor_layout(input));
+    const auto output_bytes = spyre::get_device_size_in_bytes(
+        spyre::get_spyre_tensor_layout(outputTensors[0][0]));
+    borrow_prefix =
+        (input.scalar_type() == c10::ScalarType::Half ||
+         input.scalar_type() == c10::ScalarType::BFloat16) &&
+        can_borrow_linear_dl16_storage(input) && output_bytes <= input_bytes &&
+        std::all_of(outputTensors[0].begin(), outputTensors[0].end(),
+                    [&](const at::Tensor& output) {
+                      return output.sizes() == input.sizes() &&
+                             output.scalar_type() == input.scalar_type() &&
+                             can_borrow_linear_dl16_storage(output) &&
+                             spyre::get_device_size_in_bytes(
+                                 spyre::get_spyre_tensor_layout(output)) ==
+                                 output_bytes;
+                    });
+    if (!borrow_prefix) {
+      // Tiled prefixes need materialization. This handles the logits
+      // allgather caller; mutating collectives would also need copy-back.
+      input = input.clone(at::MemoryFormat::Contiguous);
+    }
+  }
+  spyre_comms::Tensor input_tensor;
+  if (borrow_prefix) {
+    // Single-row logits are a linear device prefix. Limit the transfer to the
+    // output allocation, including its last stick's padding, without changing
+    // the input's descriptor or copying its data. Keep the original alive.
+    input_tensor =
+        spyre_comms::Tensor(spyre_comms::TensorInfo(output_tensors[0]),
+                            input.storage().data_ptr().get());
+    input_tensor.SetSpyreDeviceAddressBorrowed(
+        spyre::get_composite_address(input));
+  } else {
+    prepare_tensor(input, &input_tensor);
   }
 
   c10::intrusive_ptr<SpyreCCLWork> work =

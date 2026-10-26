@@ -44,7 +44,11 @@ inline void check_collective_storage(const at::Tensor& tensor) {
   // Borrowed composite addresses cover that descriptor, not just the view.
   TORCH_CHECK(
       c10::multiply_integers(get_spyre_tensor_sizes(tensor)) == tensor.numel(),
-      "Collective input view requires matching device storage extent");
+      "Collective tensor requires matching device storage extent: logical "
+      "elements=",
+      tensor.numel(), ", descriptor elements=",
+      c10::multiply_integers(get_spyre_tensor_sizes(tensor)),
+      "; a view or allocation descriptor may cover a different logical shape");
 }
 
 }  // namespace spyre

@@ -33,6 +33,7 @@
 #include "../logging.h"
 #include "../spyre_allocator.h"
 #include "../spyre_composite_address.h"
+#include "../spyre_mem.h"
 #include "../spyre_stream.h"
 #include "../spyre_tensor_impl.h"
 #include "spyre_collective_utils.h"
@@ -347,7 +348,11 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
   auto& plan = wsi_cache_[static_cast<size_t>(plan_handle)];
 
   // Create output tensor
-  at::Tensor output = at::empty_like(input);
+  // A compiled producer can pad beyond the default stick layout. The plan
+  // covers that entire device allocation, so preserve it in the receive buffer.
+  at::Tensor output = spyre_empty_with_layout(
+      input.sizes(), input.strides(), input.scalar_type(),
+      get_spyre_tensor_layout(input), input.device());
   TORCH_CHECK(output.nbytes() > 0,
               "Tensor must have non-zero size for broadcast");
 
@@ -480,7 +485,9 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   std::vector<at::Tensor> rank_outputs;
   rank_outputs.reserve(group_size);
   for (int64_t i = 0; i < group_size; i++) {
-    rank_outputs.push_back(at::empty_like(input));
+    rank_outputs.push_back(spyre_empty_with_layout(
+        input.sizes(), input.strides(), input.scalar_type(),
+        get_spyre_tensor_layout(input), input.device()));
   }
 
   // Build spyre_comms::Tensor vector for per-rank outputs
@@ -511,9 +518,11 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   TORCH_CHECK(output_ctx != nullptr,
               "SharedOwnerCtx is null for output tensor");
 
-  // Build keep_alive from rank_outputs before moving them into PendingWork.
-  // allgather borrows the buffer addresses of every per-rank output tensor.
-  auto ka = make_tensor_keep_alive(rank_outputs);
+  // allgather borrows both the input and the per-rank outputs. Generated code
+  // may release its input immediately after allgather_run, before wait_work.
+  auto borrowed_tensors = rank_outputs;
+  borrowed_tensors.push_back(input);
+  auto ka = make_tensor_keep_alive(std::move(borrowed_tensors));
 
   // Store pending work with rank_outputs for assembly in wait_work
   {

@@ -348,16 +348,23 @@ compiled collective. The storage-extent guard compares `numel()` with
 when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
-storage descriptor covering the input's own elements. Eager allgather materializes
-contiguous zero-offset input views with larger base descriptors into their own
-allocation, including prefix slices from a padded logits projection. Its work
-handle retains that allocation through asynchronous completion. Other eager
-collectives and allgather outputs reject these views. A compiled collective buffer
+storage descriptor covering the input's own elements. Eager allgather also accepts
+contiguous zero-offset input prefixes with larger base descriptors. When the input
+and outputs have linear DL16 storage without lazy value transforms, it borrows
+the input and limits the transfer to the output allocation, including the final
+stick's padding. Single-row logits prefixes take this path with no extra tensor
+allocation or device copy on repeated calls. Tiled prefixes are materialized
+into their own allocation. The work handle
+retains the borrowed or materialized input through asynchronous completion.
+Other eager collectives and allgather outputs reject these views. A compiled collective buffer
 must have a finalized device layout describing its own size, stride, offset,
 and dtype; missing or incompatible metadata is rejected instead
 of planning from an unpadded logical element count. Compiled broadcast,
 allgather, and allreduce materialize view inputs into their own allocation
-before planning. In-place compiled allreduce copies the full completed result
+before planning. Compiled broadcast and allgather preserve that finalized layout
+in their receive buffers, including padding beyond the default stick layout.
+Compiled allgather retains both its input and receive buffers until communication
+completes. In-place compiled allreduce copies the full completed result
 back to the original view even when waiting on a slice or reshape of the
 collective result. Reshapes or other stride-changing views before a wait require
 the original target to cover its full allocation; a stride-changing wait on a
@@ -369,7 +376,8 @@ Eager callers must materialize other unsupported views explicitly before submiss
 
 **Compatibility note:** eager collectives now diagnose nonzero storage offsets
 and descriptors that still cover a larger base allocation. Contiguity was
-already required. Eager allgather materializes zero-offset input views, and
+already required. Eager allgather borrows compatible linear zero-offset prefixes
+and materializes other zero-offset input views, while
 compiled broadcast, allgather, and allreduce materialize view inputs automatically.
 Materialize other unsupported views before submission.
 

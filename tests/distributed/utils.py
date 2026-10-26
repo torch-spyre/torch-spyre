@@ -107,3 +107,17 @@ def _native_bfloat16_tensor(device):
     # Explicit native BF16 storage must not be reinterpreted as DL16.
     layout = SpyreTensorLayout([2, 64], [64, 1], DataFormats.BFLOAT16, {(0, 1): 128})
     return spyre_empty_with_layout([128], [1], torch.bfloat16, layout, device=device)
+
+
+def _overpadded_collective_tensor(values, padded_width, device):
+    from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+
+    # Match a compiled producer that retains padding beyond the default layout.
+    layout = SpyreTensorLayout(
+        [padded_width // 64, 1, 64], [64, -1, 1], DataFormats.SEN169_FP16, {}
+    )
+    tensor = spyre_empty_with_layout(
+        values.shape, values.stride(), values.dtype, layout, device=device
+    )
+    tensor.copy_(values)
+    return tensor

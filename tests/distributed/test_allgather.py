@@ -17,6 +17,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity, profile
 from torch.testing._internal.common_utils import (
     TestCase,
     instantiate_parametrized_tests,
@@ -245,11 +246,17 @@ class TestAllGather(TestCase):
             * (1 + torch.arange(width) // 64).to(dtype)
             for rank in range(self.comm_size)
         ]
+        if input_kind == "vocab_prefix":
+            # Borrowing a partial stick carries these discarded values into
+            # output padding. A downstream reduction must still mask them.
+            for rank, weight in enumerate(weights):
+                weight[:, vocab_size:] = 32 * (rank + 1)
         base = hidden.to(DEVICE) @ weights[self.comm_rank].to(DEVICE)
         logits = base[:rows, :vocab_size]
         self.assertTrue(logits.is_contiguous())
         outputs = [torch.empty_like(logits) for _ in range(self.comm_size)]
-        work = dist.all_gather(outputs, logits, async_op=async_op)
+        with profile(activities=[ProfilerActivity.CPU]) as prof:
+            work = dist.all_gather(outputs, logits, async_op=async_op)
         # In async mode the work must own any materialized input until done.
         del logits, base
         if async_op:
@@ -258,12 +265,62 @@ class TestAllGather(TestCase):
             self.assertTrue(work.is_completed())
         else:
             self.assertIsNone(work)
+        clones = sum(e.count for e in prof.key_averages() if e.key == "aten::clone")
+        copies = sum(
+            e.count for e in prof.key_averages() if e.key == "spyre::copy_from_d2d"
+        )
+        # A multi-row prefix spans separated physical tiles and needs packing.
+        # The single-row vocabulary prefix is already linear on the device.
+        if input_kind == "row_prefix":
+            # The first invocation can also profile FakeTensor operations
+            # while compiling the packing kernel.
+            self.assertGreaterEqual(clones, 1)
+            self.assertGreaterEqual(copies, 1)
+        else:
+            self.assertEqual(clones, 0)
+            self.assertEqual(copies, 0)
         for rank, output in enumerate(outputs):
             expected = (hidden.float() @ weights[rank].float())[:rows, :vocab_size].to(
                 dtype
             )
             self.assertEqual(output.dtype, dtype)
             self.assertEqual(output.cpu(), expected, rtol=0, atol=0)
+            if input_kind == "vocab_prefix" and vocab_size == 96:
+                self.assertEqual(output.sum().cpu(), expected.sum(), rtol=0, atol=0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    def test_allgather_logits_prefix_repeated(self, dtype, async_op):
+        # Granite's actual TP2 vocabulary shard and padded projection width.
+        width, vocab = 26624, 24640
+        base = torch.empty((1, width), dtype=dtype, device=DEVICE)
+        outputs = [
+            torch.empty((1, vocab), dtype=dtype, device=DEVICE)
+            for _ in range(self.comm_size)
+        ]
+        for step in range(3):
+            if step == 2:
+                # Repeated invocations must also accept a new source allocation.
+                base = torch.empty_like(base)
+            values = _collective_rank_input(self.comm_rank, (1, width), dtype)
+            base.copy_(values * (step + 1))
+            logits = base[:, :vocab]
+            with profile(activities=[ProfilerActivity.CPU]) as prof:
+                work = dist.all_gather(outputs, logits, async_op=async_op)
+                if async_op:
+                    work.wait()
+            self.assertFalse(
+                any(
+                    e.key in ("aten::clone", "spyre::copy_from_d2d")
+                    for e in prof.key_averages()
+                )
+            )
+            for rank, output in enumerate(outputs):
+                expected = _collective_rank_input(rank, (1, width), dtype)
+                expected = (expected * (step + 1))[:, :vocab]
+                self.assertEqual(output.cpu(), expected, rtol=0, atol=0)
+            # The view's original allocation metadata must remain usable.
+            self.assertEqual(base.cpu(), values * (step + 1), rtol=0, atol=0)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     @expects_raise

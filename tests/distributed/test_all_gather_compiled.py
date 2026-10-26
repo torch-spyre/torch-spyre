@@ -31,6 +31,7 @@ from utils import (
     _collective_expected,
     _collective_rank_input,
     _native_bfloat16_tensor,
+    _overpadded_collective_tensor,
 )
 
 import torch_spyre  # noqa: F401
@@ -113,6 +114,34 @@ class TestAllGatherCompiled(TestCase):
         """Reset compiler caches before each test."""
         super().setUp()
         torch.compiler.reset()
+
+    @parametrize("dtype,dtype_code", [(torch.float16, 5), (torch.bfloat16, 15)])
+    @parametrize("width,padded_width", [(128, 256), (24640, 26624)])
+    def test_all_gather_runtime_overpadded_storage(
+        self, dtype, dtype_code, width, padded_width
+    ):
+        # Exercise the compiled runtime directly with a finalized producer layout.
+        # empty_like would allocate fewer bytes than this plan transfers.
+        plan = torch.ops.spyre.allgather_plan(
+            padded_width, dtype_code, self.comm_size, _GROUP_NAME
+        )
+        for step in range(3):
+            values = _collective_rank_input(self.comm_rank, (1, width), dtype)
+            source = _overpadded_collective_tensor(
+                values * (step + 1), padded_width, DEVICE
+            )
+            result = torch.ops.spyre.allgather_run(source, plan, self.comm_size)
+            # Generated code releases its temporary before the wait as well.
+            del source
+            result = torch.ops.spyre.wait_work(result)
+            expected = torch.cat(
+                [
+                    _collective_rank_input(rank, (1, width), dtype) * (step + 1)
+                    for rank in range(self.comm_size)
+                ]
+            )
+            self.assertEqual(result.dtype, dtype)
+            self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
 
     def test_all_gather_compiled_fp32(self):
         """Verify compiled all_gather works with fp32."""

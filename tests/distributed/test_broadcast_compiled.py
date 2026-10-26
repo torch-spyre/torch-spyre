@@ -31,6 +31,7 @@ from utils import (
     _collective_expected,
     _collective_rank_input,
     _native_bfloat16_tensor,
+    _overpadded_collective_tensor,
 )
 
 import torch_spyre  # noqa: F401
@@ -111,6 +112,34 @@ class TestBroadcastCompiled(TestCase):
         """Reset compiler caches before each test."""
         super().setUp()
         torch.compiler.reset()
+
+    @parametrize("dtype,dtype_code", [(torch.float16, 5), (torch.bfloat16, 15)])
+    @parametrize("width,padded_width", [(128, 256), (24640, 26624)])
+    def test_broadcast_runtime_overpadded_storage(
+        self, dtype, dtype_code, width, padded_width
+    ):
+        from torch_spyre._C import get_device_size_in_bytes, get_spyre_tensor_layout
+
+        src_rank = self.comm_size - 1
+        plan = torch.ops.spyre.broadcast_plan(
+            padded_width, dtype_code, src_rank, _GROUP_NAME
+        )
+        for step in range(3):
+            values = _collective_rank_input(self.comm_rank, (1, width), dtype)
+            source = _overpadded_collective_tensor(
+                values * (step + 1), padded_width, DEVICE
+            )
+            result = torch.ops.spyre.broadcast_run(source, plan, src_rank)
+            del source
+            # Every rank needs room for the full transfer, including padding.
+            self.assertEqual(
+                get_device_size_in_bytes(get_spyre_tensor_layout(result)),
+                padded_width * 2,
+            )
+            result = torch.ops.spyre.wait_work(result)
+            expected = _collective_rank_input(src_rank, (1, width), dtype) * (step + 1)
+            self.assertEqual(result.dtype, dtype)
+            self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
 
     def test_broadcast_compiled_fp32(self):
         """Verify compiled broadcast works with fp32."""
