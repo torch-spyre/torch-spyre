@@ -153,6 +153,8 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     RelayoutCandidate,
     solver_relayout_edge_context,
     solver_relayout_pair_cost,
+    prefix_lx_contraction_axis,
+    prefix_lx_gather_source,
     work_division_from_view,
 )
 from torch_spyre._inductor.cost_model import CostParams
@@ -1153,7 +1155,24 @@ class ScratchpadAllocator:
                 # re-anchors that clone after the whole counted loop instead, so
                 # only the plan clears this refusal.
                 return "graph output mutated after production"
-        if buffer_not_read_in_full(graph, name):
+        # A prefix read is legal only through the same guaranteed full-buffer
+        # gather used for a back gap. Keep every other partial read in HBM.
+        prefix_gather = (
+            config.lx_planner_relayout
+            and not config.ktir_emitter
+            and prefix_lx_gather_source(graph, name, uses)
+            and (
+                (
+                    not division_is_fixed
+                    and getattr(self, "_decides_lx_relayouts", False)
+                )
+                or (
+                    division_is_fixed
+                    and any(plan.source_name == name for plan in lx_relayout_plans)
+                )
+            )
+        )
+        if buffer_not_read_in_full(graph, name) and not prefix_gather:
             return "partial/offset read"
         if division_is_fixed and ncores.get(name, -1) < 0:
             reason = ncores_reasons.get(name, "core div mismatch")
@@ -1163,9 +1182,14 @@ class ScratchpadAllocator:
             if untiled_bar is not None:
                 return untiled_bar
         if _would_produce_lx_back_gap(graph, name, uses):
-            # backGap fires when device_size[d] > it_dim_size; the backend
-            # supports it for HBM but not for LX.
-            return "lx back gap"
+            # Only a certified full-physical gather may cross this boundary.
+            # Its copy keeps the padded span and the unsplit-K reader emits
+            # the backend's uniform per-core LX back gap. Generic gaps remain
+            # barred. The fixed path must already have an allocated-copy plan;
+            # the joint engine must guarantee a served copy through its own
+            # relayout decision. An engine without that capability must decline.
+            if not prefix_gather:
+                return "lx back gap"
         return None
 
     def _untiled_residency_bar(
@@ -4460,6 +4484,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
+            # A padded contraction is legal only through the separately
+            # certified physical-width copy, never a direct slicing match.
+            if prefix_lx_contraction_axis(op_by_name[parent], consumer_op) is not None:
+                continue
             edge = build_residency_edge(
                 parent,
                 op_by_name[parent],
@@ -4645,6 +4673,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if residency_by_buf.get(parent, "not in graph") is not None:
                 continue
             parent_op = op_by_name[parent]
+            padded_axis = prefix_lx_contraction_axis(parent_op, consumer_op)
             context = solver_relayout_edge_context(
                 graph, parent_op, consumer_op, parent, op_by_name
             )
@@ -4750,6 +4779,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     # spellings of one partition are a match, never a shuffle.
                     if cv is None or pv.same_partition(cv):
                         continue
+                    if (
+                        padded_axis is not None
+                        and dict(cv.work_slice_dims).get(padded_axis, 1) != 1
+                    ):
+                        # Uniform tail gaps apply only to a full K row. A K
+                        # split would require ragged ownership/offset support.
+                        continue
                     if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
@@ -4768,8 +4804,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     # (materialize_lx_relayouts commits it there and raises).
                     if _projected(cv, prod_coords, prod_space, "prod") is None:
                         continue
-                    src_division = _projected(pv, cons_coords, cons_space, "cons")
-                    dst_division = _projected(cv, cons_coords, cons_space, "cons")
+                    # The shuffle iterates the physical producer domain. Its
+                    # source 832-column partitions cannot project into the
+                    # later logical-K=3200 frame (800 columns per quarter).
+                    # Certify both copy operands on the domain they execute;
+                    # the unsplit-K reader's view was checked independently.
+                    copy_coords, copy_space, copy_frame = (
+                        (prod_coords, prod_space, "prod")
+                        if padded_axis is not None
+                        else (cons_coords, cons_space, "cons")
+                    )
+                    src_division = _projected(pv, copy_coords, copy_space, copy_frame)
+                    dst_division = _projected(cv, copy_coords, copy_space, copy_frame)
                     if src_division is None or dst_division is None:
                         continue
                     # Distinct per-core views that collapse to one logical work
