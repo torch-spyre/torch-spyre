@@ -58,6 +58,7 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
+    TOPK_OPS,
 )
 from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
@@ -554,6 +555,13 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
             overlapping_coordinate_extents(2 * w + k, {w: 7, k: 4}), {k: (2, w)}
         )
 
+    def test_slice_offset_does_not_hide_overlap(self):
+        w, k = _isym("w"), _isym("k")
+        self.assertEqual(
+            overlapping_coordinate_extents(1 + 2 * w + k, {w: 7, k: 4}),
+            {k: (2, w)},
+        )
+
     def test_equal_steps_cap_the_shorter_window_axis(self):
         # x.unfold(0, 3, 1): row w + k; normalize_coordinates orders k (range 3)
         # inside w (range 8) and gives it a size-1 device dim.
@@ -612,6 +620,40 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
         self.assertEqual(result.allowed_splits, {k: frozenset({2, 4})})
         self.assertFalse(result.blocked)
 
+    def test_sliced_unfold_read_domains(self):
+        ctx, k = self._unfold_sum_context()
+        ctx.input_tds[0].device_coords = [
+            coord + 1 if k in coord.free_symbols else coord
+            for coord in ctx.input_tds[0].device_coords
+        ]
+        self.assertEqual(
+            overlapping_window_split_domains(ctx).allowed_splits[k],
+            frozenset({2, 4}),
+        )
+
+    def test_structured_reduction_still_constrains_ordinary_coordinates(self):
+        ctx, k = self._unfold_sum_context()
+        ctx.op.data.reduction_type = next(iter(TOPK_OPS))
+        self.assertEqual(
+            overlapping_window_split_domains(ctx).allowed_splits[k],
+            frozenset({2, 4}),
+        )
+
+    def test_symbolic_inner_window_is_rejected(self):
+        ctx, k = self._unfold_sum_context()
+        ctx.it_space[k] = sympy.Symbol("window_size", integer=True, positive=True)
+        with self.assertRaisesRegex(Unsupported, "symbolic overlapping read"):
+            overlapping_window_split_domains(ctx)
+
+    def test_symbolic_outer_window_keeps_concrete_inner_constraint(self):
+        ctx, k = self._unfold_sum_context()
+        w = next(v for v in ctx.it_space if str(v) == "w")
+        ctx.it_space[w] = sympy.Symbol("num_windows", integer=True, positive=True)
+        self.assertEqual(
+            overlapping_window_split_domains(ctx).allowed_splits[k],
+            frozenset({2, 4}),
+        )
+
     def test_collected_with_the_other_constraints(self):
         ctx, k = self._unfold_sum_context()
         result = collect_work_division_constraints(ctx)
@@ -637,7 +679,15 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
         domains = overlapping_window_split_domains(ctx).allowed_splits
         self.assertEqual(domains[k], frozenset({1, 2, 4}))
         self.assertEqual(domains[w], frozenset({7}))
+        # The physical layout places b after the row axis in device_coords,
+        # but its stride is larger (96 versus 6), so it must be pinned.
+        self.assertEqual(domains[b], frozenset({8}))
         self.assertNotIn(j, domains)
+
+        # The same larger-stride role may be folded into the row coordinate.
+        source.device_coords = [16 * b + 2 * w + k, sympy.S.Zero, sympy.S.Zero, j]
+        folded_domains = overlapping_window_split_domains(ctx).allowed_splits
+        self.assertEqual(folded_domains[b], frozenset({8}))
 
     def test_contiguous_read_is_unconstrained(self):
         rows, cols = _isym("d0"), _isym("d1")

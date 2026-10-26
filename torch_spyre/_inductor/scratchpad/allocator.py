@@ -1150,8 +1150,7 @@ class ScratchpadAllocator:
             # Only the producer's write touches it, so residency saves nothing.
             return "no consumer reads it from LX"
         if _would_produce_lx_back_gap(graph, name, uses):
-            # backGap fires when device_size[d] > it_dim_size; the backend
-            # supports it for HBM but not for LX.
+            # Both positive and negative backGaps require HBM.
             return "lx back gap"
         return None
 

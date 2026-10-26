@@ -1521,6 +1521,7 @@ def _create_sdsc_tensors(
                 and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
+                coord_without_offset = dim_coord.as_coeff_Add()[1]
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
                 # through the window/padding machinery in _conv2d_sdsc_fields, which already
@@ -1534,9 +1535,12 @@ def _create_sdsc_tensors(
                     dim is not stick_dim
                     and dim not in reduced_dims
                     and not (_is_conv(op_spec.op) or _is_pool(op_spec.op))
-                    and dim_coord.subs(symbol_mapping) == dim
-                    and dim_coord in op_spec.iteration_space
-                    and -(-it_dim_size // int(op_spec.iteration_space[dim_coord][1]))
+                    and coord_without_offset.subs(symbol_mapping) == dim
+                    and coord_without_offset in op_spec.iteration_space
+                    and -(
+                        -it_dim_size
+                        // int(op_spec.iteration_space[coord_without_offset][1])
+                    )
                     <= dev_dim_size
                 ):
                     # Keep the per-core extent guard above in sync with
@@ -2388,7 +2392,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     continue
                 padded_it_size = sdsc_iteration_space[dim_sym]
                 dev_dim_size = op_spec_arg.device_size[coord_idx]
-                if dev_dim_size < padded_it_size:
+                # The earlier negative gap describes an overlapping read, not
+                # restickify padding. Preserve it when the padded space is
+                # revisited here, or outer strides become inflated again.
+                if (
+                    dev_dim_size < padded_it_size
+                    and sdsc_arg.backGap.get(dim_sym, 0) >= 0
+                ):
                     sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
         for dim in padding:
             if dim_splits[dim] != 1:

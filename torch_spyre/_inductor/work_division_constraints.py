@@ -1046,8 +1046,11 @@ def overlapping_coordinate_extents(
     Coordinates with a non-linear term (``floor``, ``Mod``), or whose strides
     do not nest, are not analysed.
     """
+    # A slice before unfold adds a constant base offset. It changes where the
+    # read starts, but not the stride ratio or the overlap between loop vars.
+    _, variable_part = coordinate.as_coeff_Add()
     terms = []
-    for term, coeff in coordinate.as_coefficients_dict().items():
+    for term, coeff in variable_part.as_coefficients_dict().items():
         if not isinstance(term, Symbol) or term not in ranges or coeff <= 0:
             return {}
         if ranges[term] > 1:
@@ -1093,29 +1096,85 @@ def overlapping_window_split_domains(
     convolution reads realize their windows through dedicated SDSC fields and
     are left alone.
     """
-    if (
-        isinstance(ctx.op.data, Reduction)
-        and ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES
-    ):
+    # Convolution and pooling use dedicated window fields in SuperDSC. Other
+    # structured reductions still use ordinary coordinates for their inputs.
+    if isinstance(ctx.op.data, Reduction) and ctx.op.data.reduction_type in {
+        CONV2D_FWD_OP,
+        DEPTHWISE_CONV2D_OP,
+        *POOL_OPS,
+    }:
         return ConstraintResult()
     ranges = {
-        v: int(size)
-        for v, size in ((v, concretize_expr(e)) for v, e in ctx.it_space.items())
-        if not getattr(size, "free_symbols", None)
+        v: int(concretize_expr(e))
+        for v, e in ctx.it_space.items()
+        if not getattr(e, "free_symbols", None)
     }
+    symbolic_vars = ctx.it_space.keys() - ranges.keys()
     caps: dict[Symbol, int] = {}
     pinned: set[Symbol] = set()
     for td in ctx.input_tds:
         coords = td.device_coords
         for axis, coordinate in enumerate(coords[:-1]):
-            overlaps = overlapping_coordinate_extents(coordinate, ranges)
+            coord_terms = coordinate.as_coeff_Add()[1].as_coefficients_dict()
+            coord_ranges = ranges
+            if symbolic_vars & coordinate.free_symbols:
+                # An inner symbolic extent can grow past its stride-ratio box
+                # at runtime. A symbolic outer extent does not affect that
+                # ratio, provided it is unambiguously the outermost term.
+                terms = [
+                    (int(coeff), term)
+                    for term, coeff in coord_terms.items()
+                    if isinstance(term, Symbol)
+                    and term in ctx.it_space
+                    and coeff.is_Integer
+                    and coeff > 0
+                ]
+                terms.sort(key=lambda term: term[0])
+                loop_vars = coordinate.free_symbols & ctx.it_space.keys()
+                if len(loop_vars) > 1 and {var for _, var in terms} != loop_vars:
+                    raise Unsupported(
+                        f"{ctx.op.get_name()}: symbolic read coordinate "
+                        f"{coordinate} cannot be divided safely"
+                    )
+                if len(terms) > 1:
+                    outer_step, outer_var = terms[-1]
+                    if any(var in symbolic_vars for _, var in terms[:-1]) or (
+                        outer_var in symbolic_vars and terms[-2][0] == outer_step
+                    ):
+                        raise Unsupported(
+                            f"{ctx.op.get_name()}: symbolic overlapping read "
+                            f"coordinate {coordinate} cannot be divided safely"
+                        )
+                    if outer_var in symbolic_vars:
+                        coord_ranges = {**ranges, outer_var: 2}
+            overlaps = overlapping_coordinate_extents(coordinate, coord_ranges)
             for var, (size, outer) in overlaps.items():
+                if var in ctx.reduction_vars and outer in symbolic_vars:
+                    raise Unsupported(
+                        f"{ctx.op.get_name()}: reduced overlapping read "
+                        f"requires a concrete outer extent for {outer}"
+                    )
                 caps[var] = min(size, caps.get(var, size))
                 if var in ctx.reduction_vars:
                     pinned.add(outer)
+                    # All larger-stride terms of the same coordinate are
+                    # outside the overlapped window after normalization.
+                    outer_coeff = coordinate.coeff(outer)
+                    pinned.update(
+                        term
+                        for term, coeff in coord_terms.items()
+                        if isinstance(term, Symbol)
+                        and term in ranges
+                        and coeff >= outer_coeff
+                    )
+                    # Device axes need not be listed in physical stride order:
+                    # a permuted layout can place a higher-stride batch axis
+                    # after the overlapping row axis. Compare stride_map.
+                    strides = td.layout.device_layout.stride_map
                     pinned.update(
                         v
-                        for c in coords[:axis]
+                        for other_axis, c in enumerate(coords[:-1])
+                        if other_axis != axis and strides[other_axis] > strides[axis]
                         for v in c.free_symbols
                         if v in ranges and _moves_coordinate(c, v, ranges[v])
                     )
