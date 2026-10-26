@@ -62,7 +62,7 @@ from ..pass_utils import (
     op_read_writes,
     try_device_coordinates,
 )
-from .utils import _op_num_cores
+from .utils import _op_num_cores, storage_has_single_writer
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -866,6 +866,127 @@ def solver_relayout_edge_context(
     )
 
 
+def prefix_lx_contraction_axis(producer: Operation, consumer: Operation) -> int | None:
+    """Prove a zero-offset dense prefix read after a full-buffer LX gather.
+
+    Ordinary IR shapes describe the producer's full width and the consumer's
+    shorter K. Only the outermost stick axis may have a tail. The read index
+    must retain the producer row stride exactly; arbitrary strided slices,
+    offsets, broadcast/batched reads and counted loops are not admitted.
+    The division-dependent gates separately require unsplit K and a disjoint
+    copy of the complete producer domain. No width metadata or loop rewrite
+    is involved.
+    """
+    if not isinstance(producer, ComputedBuffer) or not _is_matmul_op(consumer):
+        return None
+    layout = producer.layout
+    if (
+        not isinstance(layout, FixedTiledLayout)
+        or layout.offset != 0
+        or len(layout.size) < 2
+        or any(not sympy.sympify(x).is_Integer for x in layout.size)
+        or any(x != 1 for x in layout.size[:-2])
+        or getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+        or getattr(producer, "_input_layout_overrides", None)
+        or getattr(consumer, "_input_layout_overrides", None)
+    ):
+        return None
+    m, physical = map(int, layout.size[-2:])
+    ranges = consumer.data.ranges
+    reduction = consumer.data.reduction_ranges
+    if (
+        m <= 1
+        or list(layout.stride[-2:]) != [physical, 1]
+        or len(ranges) < 2
+        or any(x != 1 for x in ranges[:-2])
+        or ranges[-2] != m
+        or len(reduction) != 1
+        or not sympy.sympify(reduction[0]).is_Integer
+        or not sympy.sympify(ranges[-1]).is_Integer
+    ):
+        return None
+    logical, n = int(reduction[0]), int(ranges[-1])
+    rw = op_read_writes(consumer)
+    reads = list(rw.reads)
+    writes = list(rw.writes)
+    if (
+        not 0 < logical < physical
+        or n <= 1
+        or len(reads) != 2
+        or len(writes) != 1
+        or not all(isinstance(d, MemoryDep) for d in [*reads, *writes])
+    ):
+        return None
+    out = writes[0]
+    ms = [
+        v for v, extent in out.ranges.items() if extent == m and out.index.coeff(v) == n
+    ]
+    ns = [
+        v for v, extent in out.ranges.items() if extent == n and out.index.coeff(v) == 1
+    ]
+    if len(ms) != 1 or len(ns) != 1:
+        return None
+    ms, ns = ms[0], ns[0]
+    ks = (reads[0].index.free_symbols | reads[1].index.free_symbols) - {ms, ns}
+    if len(ks) != 1:
+        return None
+    (ks,) = ks
+    source_reads = [d for d in reads if d.name == producer.get_name()]
+    if len(source_reads) != 1:
+        return None
+    src = source_reads[0]
+    weight = next(d for d in reads if d is not src)
+    if (
+        out.index != n * ms + ns
+        or src.index != physical * ms + ks
+        or src.ranges.get(ms) != m
+        or src.ranges.get(ks) != logical
+        or weight.index != logical * ns + ks
+        or weight.ranges.get(ns) != n
+        or weight.ranges.get(ks) != logical
+    ):
+        return None
+    stl = layout.device_layout
+    eps = stl.elems_per_stick()
+    dims = list(stl.device_size)
+    axes = [
+        axis
+        for axis in range(len(dims) - 1)
+        if dims[axis] * eps == physical and stl.stride_map[axis] == eps
+    ]
+    if (
+        stl.element_arrangement != ElementArrangement.STANDARD
+        or logical % eps
+        or physical % eps
+        or stl.stride_map[-1] != 1
+        or dims[-1] != eps
+        or len(axes) != 1
+        or any(size != 1 for size in dims[: axes[0]])
+        or math.prod(dims) != m * physical
+    ):
+        return None
+    return axes[0]
+
+
+def prefix_lx_gather_source(graph: GraphLowering, name: str, uses: list[int]) -> bool:
+    """One full-width producer and one zero-offset prefix matmul reader.
+
+    Division-dependent proof remains in the relayout pair gate: the reader
+    must own the whole padded feature axis, and a real copy must be allocated.
+    Other users are deliberately refused, including external/collective users.
+    """
+    if name in graph.get_output_names():
+        return False
+    producer = graph.get_buffer(name)
+    readers = [graph.operations[i] for i in uses if graph.operations[i] is not producer]
+    return (
+        len(readers) == 1
+        and prefix_lx_contraction_axis(producer, readers[0]) is not None
+        and storage_has_single_writer(graph, producer)
+    )
+
+
 def solver_relayout_pair_cost(
     source_view: PerCoreView,
     destination_view: PerCoreView,
@@ -1120,6 +1241,16 @@ def collect_lx_relayout_plans(
                 rejection_reason = failure
                 break
             consumer_space = iteration_space_from_op(consumer)
+            padded_axis = prefix_lx_contraction_axis(producer, consumer)
+            if padded_axis is not None:
+                if dict(view.work_slice_dims).get(padded_axis, 1) != 1:
+                    rejection_reason = "cannot emit: padded LX contraction splits K"
+                    break
+                # Copy the full physical domain before the logical-K read.
+                # Projecting 832-wide owners onto 800-wide logical quarters
+                # would invent different ownership; the reader owns all K.
+                consumer_coordinates = producer_coordinates
+                consumer_space = iteration_space_from_op(producer)
             transfers.append(
                 (consumer_name, consumer_coordinates, consumer_space, view, routes)
             )
@@ -1393,6 +1524,21 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
         consumers = [
             cast(ComputedBuffer, graph.get_buffer(name)) for name in plan.consumer_names
         ]
+        if any(prefix_lx_contraction_axis(source, c) is not None for c in consumers):
+            for consumer in consumers:
+                axis = prefix_lx_contraction_axis(source, consumer)
+                if (
+                    axis is None
+                    or dict(plan.destination_view.work_slice_dims).get(axis, 1) != 1
+                ):
+                    raise RuntimeError("padded LX gather lost its full-K read contract")
+            if not (
+                plan.source_address + plan.source_footprint_bytes
+                <= plan.destination_address
+                or plan.destination_address + plan.destination_footprint_bytes
+                <= plan.source_address
+            ):
+                raise RuntimeError("padded LX gather source and destination overlap")
         copy = editor.insert_clone_before_consumers(
             source,
             consumers,

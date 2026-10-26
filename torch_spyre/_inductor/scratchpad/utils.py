@@ -746,8 +746,9 @@ def _would_produce_lx_back_gap(
     """Check if pinning a buffer to LX would produce a backGapCore_.
 
     A backGap fires when device_size[d] > it_dim_size for any device dimension d.
-    The backend supports backGap for HBM but not for LX, so buffers triggering
-    this condition must stay in HBM.
+    Generic LX gaps remain unsupported. The allocator may admit only a
+    certified prefix-slice gather whose unsplit-K consumer uses a uniform
+    outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout

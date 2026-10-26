@@ -83,6 +83,7 @@ class _Observed:
         # names right after materialization (V.graph is live inside the pass).
         self.copies: dict = {}
         self.source_layouts: dict = {}
+        self.copy_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
         real_materialize = alloc_mod.materialize_lx_relayouts
 
@@ -108,6 +109,13 @@ class _Observed:
                     list(layout.device_layout.device_size),
                     list(layout.device_layout.stride_map),
                     list(layout.stride),
+                )
+                copy_layout = graph.get_buffer(self.copies[plan.edge]).get_layout()
+                self.copy_layouts[plan.edge] = (
+                    list(copy_layout.size),
+                    list(copy_layout.stride),
+                    list(copy_layout.device_layout.device_size),
+                    list(copy_layout.device_layout.stride_map),
                 )
                 for name in plan.consumer_names:
                     op = graph.get_buffer(name)
@@ -981,3 +989,271 @@ def test_complete_partition_expansion_fires_and_preserves_values(
         <= plan.source_address
     ), "live source and destination LX spans overlap"
     assert torch.equal(out.cpu(), torch.relu(-host))
+
+
+def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
+    """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
+    _run_prefix_linear_case(monkeypatch, mode="served")
+
+
+def test_prefix_linear_without_served_copy_spills_the_source(monkeypatch):
+    """Removing this edge's candidates must remove its route to LX residency."""
+    _run_prefix_linear_case(monkeypatch, mode="no_copy")
+
+
+def test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone(monkeypatch):
+    """Amended D6-2: retry through the ordinary HBM clone, not topology rollback."""
+    _run_prefix_linear_case(monkeypatch, mode="demoted")
+
+
+def _run_prefix_linear_case(monkeypatch, *, mode):
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    import torch_spyre._inductor.scheduler as sched_mod
+    import torch_spyre._inductor.passes as passes_mod
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.pass_utils import op_read_writes
+    from torch_spyre._inductor.scratchpad.utils import storage_has_single_writer
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        prefix_lx_contraction_axis,
+        materialized_lx_relayouts,
+    )
+
+    observed = _Observed(monkeypatch, force=False)
+    prefix_sources, removed_candidates, source_residency = set(), [], []
+    real_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+
+    def tables(
+        allocator,
+        graph,
+        consumer,
+        consumer_divs,
+        parents,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        result = real_tables(
+            allocator,
+            graph,
+            consumer,
+            consumer_divs,
+            parents,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for parent in parents:
+            if parent not in op_by_name or consumer is None:
+                continue
+            if prefix_lx_contraction_axis(op_by_name[parent], consumer) is None:
+                continue
+            prefix_sources.add(parent)
+            if mode == "no_copy":
+                # cap=0 means unlimited. Remove only the actual prefix edge's
+                # candidates, leaving all unrelated allocator choices intact.
+                removed_candidates.extend(result.pop(parent, []))
+        return result
+
+    real_post_solve = alloc_mod.CoOptimizingAllocator._post_solve
+
+    def post_solve(allocator, graph, allocation, plans):
+        source_residency.extend(
+            (buffer.name, buffer.address)
+            for buffer in allocation
+            if buffer.name in prefix_sources
+        )
+        return real_post_solve(allocator, graph, allocation, plans)
+
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", tables)
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_post_solve", post_solve)
+
+    rejected, restored, final_kernels = [], [], []
+    if mode == "demoted":
+        real_prepare = sched_mod.SuperDSCScheduling.prepare_kernel
+        real_prepare_all = sched_mod.prepare_spyre_kernels
+
+        def layout_facts(layout):
+            return (
+                tuple(layout.size),
+                tuple(layout.stride),
+                tuple(layout.device_layout.device_size),
+                tuple(layout.device_layout.stride_map),
+            )
+
+        def prepare(backend, bundle, kernel):
+            graph = V.graph
+            if rejected:
+                plan, copy_name, copy_buffer, original_facts, unrelated, _ = rejected[0]
+                assert all(
+                    edge[0] != plan.source_name
+                    for edge in materialized_lx_relayouts(graph)
+                )
+                source_layout = graph.get_buffer(plan.source_name).get_layout()
+                copy_layout = copy_buffer.get_layout()
+                for layout in (source_layout, copy_layout):
+                    assert "lx" not in layout.allocation
+                    assert layout.lx_view is None
+                assert graph.get_buffer(copy_name) is copy_buffer
+                assert copy_buffer in graph.operations
+                assert layout_facts(copy_layout) == original_facts
+                assert storage_has_single_writer(graph, copy_buffer)
+                for name in plan.consumer_names:
+                    reads = {
+                        dep.name for dep in op_read_writes(graph.get_buffer(name)).reads
+                    }
+                    assert copy_name in reads and plan.source_name not in reads
+                assert plan.source_name in {
+                    dep.name for dep in op_read_writes(copy_buffer).reads
+                }
+                for name, allocation, view in unrelated:
+                    layout = graph.get_buffer(name).get_layout()
+                    assert layout.allocation == allocation and layout.lx_view == view
+                restored.append(copy_name)
+            else:
+                for copy_name, plan in materialized_lx_relayouts(graph).values():
+                    if plan.source_name not in prefix_sources:
+                        continue
+                    for node in sched_mod._all_scheduler_nodes([bundle]):
+                        if not any(
+                            dep.name == copy_name for dep in node.read_writes.writes
+                        ):
+                            continue
+                        copy_buffer = graph.get_buffer(copy_name)
+                        assert storage_has_single_writer(graph, copy_buffer)
+                        unrelated = []
+                        for op in graph.operations:
+                            name = op.get_name()
+                            layout = op.get_layout()
+                            if (
+                                name not in (plan.source_name, copy_name)
+                                and hasattr(layout, "allocation")
+                                and "lx" in layout.allocation
+                            ):
+                                unrelated.append(
+                                    (name, dict(layout.allocation), layout.lx_view)
+                                )
+                        rejected.append(
+                            (
+                                plan,
+                                copy_name,
+                                copy_buffer,
+                                layout_facts(copy_buffer.get_layout()),
+                                unrelated,
+                                kernel,
+                            )
+                        )
+                        kernel.failed_node = node
+                        raise ValueError("prefix gather test: reject LX finalization")
+            result = real_prepare(backend, bundle, kernel)
+            if rejected:
+                plan, copy_name, _, _, _, _ = rejected[0]
+                for name, arg in kernel.spyre_kernel_args:
+                    if name in (plan.source_name, copy_name):
+                        assert "lx" not in arg.allocation
+                        assert arg.work_division is None
+            return result
+
+        def prepare_all(nodes):
+            result = real_prepare_all(nodes)
+            if rejected:
+                failed_kernel = rejected[0][-1]
+                for node in result:
+                    prepared = getattr(node, "prepared_kernel", None)
+                    if prepared is not None:
+                        assert prepared is not failed_kernel
+                        final_kernels.append(prepared)
+            return result
+
+        monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
+        monkeypatch.setattr(sched_mod, "prepare_spyre_kernels", prepare_all)
+        monkeypatch.setattr(passes_mod, "prepare_spyre_kernels", prepare_all)
+
+    rows, physical, logical, outputs = 512, 3328, 3200, 512
+
+    def fn(value, weight):
+        with spyre_hint(work_div={"M": 8, "P": 4}):
+            backing = torch.neg(value)
+        with spyre_hint(work_div={"M": 4, "N": 8}):
+            return torch.nn.functional.linear(backing[:, :logical], weight)
+
+    for name, size in (("M", rows), ("P", physical), ("K", logical), ("N", outputs)):
+        _pnd.declare_tensor_dim(name, size)
+    selected = (torch.arange(outputs) * 37) % logical
+    selected[-1] = logical - 1
+    weight = torch.zeros(outputs, logical, dtype=torch.float16)
+    weight[torch.arange(outputs), selected] = 1
+    device_weight = _pnd.name_tensor_dims(weight.to("spyre"), ["N", "K"])
+    eps = get_elem_in_stick(torch.float16)
+    assert eps == 64
+    layout = SpyreTensorLayout(
+        device_size=[physical // eps, rows, eps],
+        stride_map=[eps, physical, 1],
+        device_dtype=get_device_dtype(torch.float16),
+    )
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+    options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}
+    if mode == "no_copy":
+        options["lx_solver_relayout_groups_per_edge"] = 0
+    with config.patch(options):
+        for tail in (512.0, float("nan")):
+            # One selected element per output makes the reduction exact. Every
+            # row differs; a compacted stride or a read into the tail is visible.
+            host = (
+                (torch.arange(rows * physical).reshape(rows, physical) * 17) % 251 - 125
+            ).to(torch.float16)
+            host[:, logical:] = tail
+            value = _pnd.name_tensor_dims(
+                host.to("spyre", device_layout=layout), ["M", "P"]
+            )
+            out = compiled(value, device_weight).cpu()
+            expected = -host[:, selected]
+            control = torch.nn.functional.linear(
+                -host[:, :logical].float(), weight.float()
+            )
+            assert torch.equal(control, expected.float())
+            assert torch.isfinite(out).all()
+            assert torch.equal(out, expected)
+
+    assert prefix_sources and source_residency, (
+        "the fixture did not reach the prefix edge"
+    )
+    if mode == "no_copy":
+        assert removed_candidates, "the negative arm removed no prefix candidates"
+        assert all(address is None for _, address in source_residency), (
+            f"a prefix producer resided without a served gather: {source_residency}"
+        )
+        observed.assert_nothing_emitted()
+        return
+    if mode == "demoted":
+        assert rejected and restored and final_kernels
+        assert observed.demotions and not observed.emitted and not observed.emitted_ops
+    else:
+        observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == plan.destination_view.num_cores == 32
+    assert observed.source_layouts[plan.edge] == (
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+        [physical, 1],
+    )
+    assert observed.copy_layouts[plan.edge] == (
+        [rows, physical],
+        [physical, 1],
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+    )
+    assert dict(plan.source_view.work_slice_dims) == {0: 4, 1: 8}
+    destination = dict(plan.destination_view.work_slice_dims)
+    assert destination.get(0, 1) == 1, "the linear reader must not split K"
+    assert destination.get(1, 1) == 4
+    assert plan.source_footprint_bytes == rows * physical * 2 // 32
+    assert plan.destination_footprint_bytes == rows * physical * 2 // 4
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "the full-backing gather must have separate LX storage"
