@@ -225,14 +225,7 @@ class GraphEditor:
 
         layout = buffer.layout
         assert isinstance(layout, FixedTiledLayout)
-        clone_layout = FixedTiledLayout(
-            layout.device,
-            layout.dtype,
-            list(layout.size),
-            list(layout.stride),
-            layout.device_layout,
-            offset=layout.offset,
-        )
+        clone_layout = layout.unallocated_copy()
         # "First consumer" means first in the lowered order, not first in
         # ``buffer_users``: callers may pass consumers in any order (relayout
         # groups are name-sorted, so buf121 precedes buf59). A clone placed after

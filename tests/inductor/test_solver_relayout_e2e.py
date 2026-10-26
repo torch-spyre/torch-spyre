@@ -82,6 +82,8 @@ class _Observed:
         # plan edge -> materialized copy buffer name, and each consumer's read
         # names right after materialization (V.graph is live inside the pass).
         self.copies: dict = {}
+        self.source_layouts: dict = {}
+        self.copy_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
         real_materialize = alloc_mod.materialize_lx_relayouts
 
@@ -102,6 +104,19 @@ class _Observed:
                 for edge, (copy_name, _plan) in materialized_lx_relayouts(graph).items()
             }
             for plan in plans:
+                layout = graph.get_buffer(plan.source_name).get_layout()
+                self.source_layouts[plan.edge] = (
+                    list(layout.device_layout.device_size),
+                    list(layout.device_layout.stride_map),
+                    list(layout.stride),
+                )
+                copy_layout = graph.get_buffer(self.copies[plan.edge]).get_layout()
+                self.copy_layouts[plan.edge] = (
+                    list(copy_layout.size),
+                    list(copy_layout.stride),
+                    list(copy_layout.device_layout.device_size),
+                    list(copy_layout.device_layout.stride_map),
+                )
                 for name in plan.consumer_names:
                     op = graph.get_buffer(name)
                     self.consumer_reads[name] = {
@@ -470,6 +485,48 @@ def test_relayout_into_a_matmul_x_operand(monkeypatch):
     torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
+def test_permutation_past_split_8_fires(monkeypatch):
+    """The row-split normalization geometry on a hinted pointwise pair: neg
+    hinted {R: 32} (16 whole rows per core, as a row reduction needs) feeds
+    relu hinted {R: 4, H: 8}. Logical [512, 4096] fp16 lays out as
+    [64 sticks, 512 rows, 64], so the pair's governing split is 32 (a run of
+    16 * 64 elements); both views are complete partitions of the 32 cores, so
+    the move is a permutation, and each destination gathers its 128 rows from
+    8 sources, inside the shuffle budget. The relayout law is measured for
+    permutations up to split 32, so the solver is offered the pair at the law's
+    price and fires it on economics alone (a shuffle of a few microseconds
+    against a 4 MB HBM write and re-read). Read-only spies."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.dump_cost_model import governing_run_split
+
+    observed = _Observed(monkeypatch, force=False)
+    recorded = observed.plans
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 32}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(512, 4096, dtype=torch.float16)
+    for name, size in (("R", 512), ("H", 4096)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "H"])
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = recorded
+    assert plan.num_cores == 32
+    assert governing_run_split(
+        plan.source_view, plan.destination_view, [64, 512, 64]
+    ) == (1024, 32)
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
 def test_two_relayout_edges_into_one_consumer(monkeypatch):
     """add(neg(a), abs(b)) with both edges forced: two destination rectangles
     at the consumer's tick, and two clones inserted before one consumer."""
@@ -585,47 +642,77 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
 
 
 def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
-    """A coarse-tiled edge that crosses for_each_tile scopes must enumerate NO
-    relayout candidates, even though a same-group coarse-tiled edge now can
-    (see test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip
-    below, torch-spyre#5057).
+    """Relayouts must stay within one coarse-tile scope.
 
-    The producer sits in one for_each_tile body and the consumer in a
-    separate, sibling body with its own loop_group_id, so this is a true
-    cross-group edge, not merely two ops that happen to both be tiled. A
-    relayout taken at that seam would still be stale on the next outer
-    iteration the same way an in-loop one would be; the solver path must
-    decline at enumeration (loop_info gate), not merely decline to fire.
-
-    The two for_each_tile calls tile different axes of the intermediate (dim
-    0 then dim 1) specifically to force two genuinely distinct loop scopes.
-    Verified empirically, not just by inspection: equal tile_size/dims
-    siblings over the same shape fuse into one shared while_loop body (both
-    intermediates named ``while_loop_body_graph_0_0_*``); giving the second
-    call a different tile_size ALONE (same dim) still fuses the same way,
-    byte-identical candidate list. Only a different tiled axis keeps the
-    splicer from inlining the producer directly into the consumer's body --
-    which is not the cross-group case this test means to cover."""
+    The two for_each_tile bodies tile different axes to retain distinct
+    scopes. Check every offered and materialized edge by its endpoint
+    metadata; valid edges inside either body may still offer relayouts.
+    The candidate unit test also probes real sibling and nested group IDs
+    to prove that the scope gate rejects them before layout inspection.
+    """
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    tables = []
+    groups_seen = set()
+
+    def assert_same_scope(producer, consumer):
+        prod_info = getattr(producer, "loop_info", None)
+        cons_info = getattr(consumer, "loop_info", None)
+        if prod_info is None and cons_info is None:
+            return
+        assert isinstance(prod_info, CoarseTileInfo)
+        assert isinstance(cons_info, CoarseTileInfo)
+        assert prod_info.loop_group_id == cons_info.loop_group_id, (
+            f"cross-group relayout: {producer.get_name()} "
+            f"{prod_info.loop_group_id} -> {consumer.get_name()} "
+            f"{cons_info.loop_group_id}"
+        )
+
     orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
 
-    def spy_tables(self, *args, **kwargs):
-        out = orig_tables(self, *args, **kwargs)
-        if out:
-            tables.append(out)
+    def spy_tables(
+        self,
+        graph,
+        consumer_op,
+        consumer_divs,
+        parent_names,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        out = orig_tables(
+            self,
+            graph,
+            consumer_op,
+            consumer_divs,
+            parent_names,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for op in [consumer_op, *(op_by_name.get(name) for name in parent_names)]:
+            info = getattr(op, "loop_info", None)
+            if isinstance(info, CoarseTileInfo):
+                groups_seen.add(info.loop_group_id)
+        for parent, candidates in out.items():
+            if candidates:
+                assert_same_scope(op_by_name[parent], consumer_op)
         return out
 
     monkeypatch.setattr(
         alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
     )
 
-    recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
 
     def spy_mat(graph, plans):
-        recorded.extend(plans)
+        for plan in plans:
+            for name in plan.consumer_names:
+                assert_same_scope(
+                    graph.get_buffer(plan.source_name), graph.get_buffer(name)
+                )
         return real_materialize(graph, plans)
 
     monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy_mat)
@@ -658,15 +745,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     ):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
-    # Graph-global, same as the test this replaces: also covers each body's
-    # own within-scope edges, which happen to offer nothing for this graph's
-    # shapes. A future same-group change that makes one of those offer could
-    # fail this assert looking like a cross-group regression when it isn't;
-    # the printed table disambiguates by parent/consumer name.
-    assert tables == [], (
-        f"cross-group coarse-tiled edges were offered relayout: {tables}"
-    )
-    assert recorded == []
+    assert len(groups_seen) >= 2, "fixture did not retain distinct coarse-tile scopes"
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
@@ -674,7 +753,8 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
 def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch):
     """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
     relayout candidate (the same-group exception in
-    ``solver_relayout_edge_context``, torch-spyre#5057), and that candidate's
+    ``solver_relayout_edge_context``, torch-spyre#5057), when
+    ``lx_same_tile_group_relayout`` is enabled, and that candidate's
     cost must carry the loop's own trip-count multiplier
     (``_coarse_tile_loop_trip_count``, see TestCoarseTileLoopTripCount in
     test_scratchpad_solver.py) -- a relayout taken once but paid on every
@@ -724,7 +804,11 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             a = ha.to("spyre")
             b = hb.to("spyre")
             with config.patch(
-                {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+                {
+                    "co_optimizing_lx_planning": True,
+                    "layout_solver": "cpsat",
+                    "lx_same_tile_group_relayout": True,
+                }
             ):
                 out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
         candidates = [c for table in tables for cs in table.values() for c in cs]
@@ -822,3 +906,354 @@ def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch)
         )
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,width,dtype,batched,strided",
+    [
+        (512, 4096, torch.float16, False, False),
+        (64, 512, torch.float16, False, False),
+        (128, 1024, torch.float16, False, False),
+        (512, 4096, torch.float16, True, False),
+        (64, 512, torch.float32, False, True),
+    ],
+)
+def test_complete_partition_expansion_fires_and_preserves_values(
+    monkeypatch, rows, width, dtype, batched, strided
+):
+    """A real 16-to-32-core transfer with four-source destination gathers."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 16}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    # Give all 128 source/feature fragments distinct value ranges.
+    # Keep inputs negative so relu(-t) observes every destination.
+    storage_width = width * (2 if strided else 1)
+    row_ids = torch.arange(rows).reshape(-1, 1)
+    column_ids = torch.arange(storage_width).reshape(1, -1) // (2 if strided else 1)
+    fragment = (row_ids // (rows // 16)) * 8 + column_ids // (width // 8)
+    offset = (row_ids * 37 + column_ids * 17) % 8
+    host = -(fragment * 8 + offset + 1).to(dtype)
+    if strided:
+        host = host[:, ::2]
+        assert not host.is_contiguous()
+    names = ["R", "H"]
+    if batched:
+        host = host.unsqueeze(0)
+        names = ["B", *names]
+        _pnd.declare_tensor_dim("B", 1)
+    for name, size in (("R", rows), ("H", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), names)
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == 16 and plan.destination_view.num_cores == 32
+    # Physical dimension order may change when a singleton batch is present.
+    # Locate row and outer-stick axes from the committed tensor's strides,
+    # independently of the per-core views being checked.
+    dims, strides, logical_strides = observed.source_layouts[plan.edge]
+    row_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims, strides))
+        if size == rows and stride == logical_strides[-2]
+    ]
+    column_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims[:-1], strides[:-1]))
+        if size == width // dims[-1] and stride == logical_strides[-1] * dims[-1]
+    ]
+    assert len(row_axes) == len(column_axes) == 1
+    row_axis, column_axis = row_axes[0], column_axes[0]
+    assert row_axis != column_axis
+    assert _core_slices(plan.source_view, 16) == {c: {row_axis: c} for c in range(16)}
+    assert _core_slices(plan.destination_view, 32) == {
+        c: {column_axis: c // 4, row_axis: c % 4} for c in range(32)
+    }
+    # Striding doubles host backing storage, not this logical device tensor's LX span.
+    assert plan.source_footprint_bytes == rows * width * host.element_size() // 16
+    assert plan.destination_footprint_bytes == rows * width * host.element_size() // 32
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "live source and destination LX spans overlap"
+    assert torch.equal(out.cpu(), torch.relu(-host))
+
+
+def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
+    """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
+    _run_prefix_linear_case(monkeypatch, mode="served")
+
+
+def test_prefix_linear_without_served_copy_spills_the_source(monkeypatch):
+    """Removing this edge's candidates must remove its route to LX residency."""
+    _run_prefix_linear_case(monkeypatch, mode="no_copy")
+
+
+def test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone(monkeypatch):
+    """Amended D6-2: retry through the ordinary HBM clone, not topology rollback."""
+    _run_prefix_linear_case(monkeypatch, mode="demoted")
+
+
+def _run_prefix_linear_case(monkeypatch, *, mode):
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    import torch_spyre._inductor.scheduler as sched_mod
+    import torch_spyre._inductor.passes as passes_mod
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.pass_utils import op_read_writes
+    from torch_spyre._inductor.scratchpad.utils import storage_has_single_writer
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        prefix_lx_contraction_axis,
+        materialized_lx_relayouts,
+    )
+
+    observed = _Observed(monkeypatch, force=False)
+    prefix_sources, removed_candidates, source_residency = set(), [], []
+    real_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+
+    def tables(
+        allocator,
+        graph,
+        consumer,
+        consumer_divs,
+        parents,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        result = real_tables(
+            allocator,
+            graph,
+            consumer,
+            consumer_divs,
+            parents,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for parent in parents:
+            if parent not in op_by_name or consumer is None:
+                continue
+            if prefix_lx_contraction_axis(op_by_name[parent], consumer) is None:
+                continue
+            prefix_sources.add(parent)
+            if mode == "no_copy":
+                # cap=0 means unlimited. Remove only the actual prefix edge's
+                # candidates, leaving all unrelated allocator choices intact.
+                removed_candidates.extend(result.pop(parent, []))
+        return result
+
+    real_post_solve = alloc_mod.CoOptimizingAllocator._post_solve
+
+    def post_solve(allocator, graph, allocation, plans):
+        source_residency.extend(
+            (buffer.name, buffer.address)
+            for buffer in allocation
+            if buffer.name in prefix_sources
+        )
+        return real_post_solve(allocator, graph, allocation, plans)
+
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", tables)
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_post_solve", post_solve)
+
+    rejected, restored, final_kernels = [], [], []
+    if mode == "demoted":
+        real_prepare = sched_mod.SuperDSCScheduling.prepare_kernel
+        real_prepare_all = sched_mod.prepare_spyre_kernels
+
+        def layout_facts(layout):
+            return (
+                tuple(layout.size),
+                tuple(layout.stride),
+                tuple(layout.device_layout.device_size),
+                tuple(layout.device_layout.stride_map),
+            )
+
+        def prepare(backend, bundle, kernel):
+            graph = V.graph
+            if rejected:
+                plan, copy_name, copy_buffer, original_facts, unrelated, _ = rejected[0]
+                assert all(
+                    edge[0] != plan.source_name
+                    for edge in materialized_lx_relayouts(graph)
+                )
+                source_layout = graph.get_buffer(plan.source_name).get_layout()
+                copy_layout = copy_buffer.get_layout()
+                for layout in (source_layout, copy_layout):
+                    assert "lx" not in layout.allocation
+                    assert layout.lx_view is None
+                assert graph.get_buffer(copy_name) is copy_buffer
+                assert copy_buffer in graph.operations
+                assert layout_facts(copy_layout) == original_facts
+                assert storage_has_single_writer(graph, copy_buffer)
+                for name in plan.consumer_names:
+                    reads = {
+                        dep.name for dep in op_read_writes(graph.get_buffer(name)).reads
+                    }
+                    assert copy_name in reads and plan.source_name not in reads
+                assert plan.source_name in {
+                    dep.name for dep in op_read_writes(copy_buffer).reads
+                }
+                for name, allocation, view in unrelated:
+                    layout = graph.get_buffer(name).get_layout()
+                    assert layout.allocation == allocation and layout.lx_view == view
+                restored.append(copy_name)
+            else:
+                for copy_name, plan in materialized_lx_relayouts(graph).values():
+                    if plan.source_name not in prefix_sources:
+                        continue
+                    for node in sched_mod._all_scheduler_nodes([bundle]):
+                        if not any(
+                            dep.name == copy_name for dep in node.read_writes.writes
+                        ):
+                            continue
+                        copy_buffer = graph.get_buffer(copy_name)
+                        assert storage_has_single_writer(graph, copy_buffer)
+                        unrelated = []
+                        for op in graph.operations:
+                            name = op.get_name()
+                            layout = op.get_layout()
+                            if (
+                                name not in (plan.source_name, copy_name)
+                                and hasattr(layout, "allocation")
+                                and "lx" in layout.allocation
+                            ):
+                                unrelated.append(
+                                    (name, dict(layout.allocation), layout.lx_view)
+                                )
+                        rejected.append(
+                            (
+                                plan,
+                                copy_name,
+                                copy_buffer,
+                                layout_facts(copy_buffer.get_layout()),
+                                unrelated,
+                                kernel,
+                            )
+                        )
+                        kernel.failed_node = node
+                        raise ValueError("prefix gather test: reject LX finalization")
+            result = real_prepare(backend, bundle, kernel)
+            if rejected:
+                plan, copy_name, _, _, _, _ = rejected[0]
+                for name, arg in kernel.spyre_kernel_args:
+                    if name in (plan.source_name, copy_name):
+                        assert "lx" not in arg.allocation
+                        assert arg.work_division is None
+            return result
+
+        def prepare_all(nodes):
+            result = real_prepare_all(nodes)
+            if rejected:
+                failed_kernel = rejected[0][-1]
+                for node in result:
+                    prepared = getattr(node, "prepared_kernel", None)
+                    if prepared is not None:
+                        assert prepared is not failed_kernel
+                        final_kernels.append(prepared)
+            return result
+
+        monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
+        monkeypatch.setattr(sched_mod, "prepare_spyre_kernels", prepare_all)
+        monkeypatch.setattr(passes_mod, "prepare_spyre_kernels", prepare_all)
+
+    rows, physical, logical, outputs = 512, 3328, 3200, 512
+
+    def fn(value, weight):
+        with spyre_hint(work_div={"M": 8, "P": 4}):
+            backing = torch.neg(value)
+        with spyre_hint(work_div={"M": 4, "N": 8}):
+            return torch.nn.functional.linear(backing[:, :logical], weight)
+
+    for name, size in (("M", rows), ("P", physical), ("K", logical), ("N", outputs)):
+        _pnd.declare_tensor_dim(name, size)
+    selected = (torch.arange(outputs) * 37) % logical
+    selected[-1] = logical - 1
+    weight = torch.zeros(outputs, logical, dtype=torch.float16)
+    weight[torch.arange(outputs), selected] = 1
+    device_weight = _pnd.name_tensor_dims(weight.to("spyre"), ["N", "K"])
+    eps = get_elem_in_stick(torch.float16)
+    assert eps == 64
+    layout = SpyreTensorLayout(
+        device_size=[physical // eps, rows, eps],
+        stride_map=[eps, physical, 1],
+        device_dtype=get_device_dtype(torch.float16),
+    )
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+    options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}
+    if mode == "no_copy":
+        options["lx_solver_relayout_groups_per_edge"] = 0
+    with config.patch(options):
+        for tail in (512.0, float("nan")):
+            # One selected element per output makes the reduction exact. Every
+            # row differs; a compacted stride or a read into the tail is visible.
+            host = (
+                (torch.arange(rows * physical).reshape(rows, physical) * 17) % 251 - 125
+            ).to(torch.float16)
+            host[:, logical:] = tail
+            value = _pnd.name_tensor_dims(
+                host.to("spyre", device_layout=layout), ["M", "P"]
+            )
+            out = compiled(value, device_weight).cpu()
+            expected = -host[:, selected]
+            control = torch.nn.functional.linear(
+                -host[:, :logical].float(), weight.float()
+            )
+            assert torch.equal(control, expected.float())
+            assert torch.isfinite(out).all()
+            assert torch.equal(out, expected)
+
+    assert prefix_sources and source_residency, (
+        "the fixture did not reach the prefix edge"
+    )
+    if mode == "no_copy":
+        assert removed_candidates, "the negative arm removed no prefix candidates"
+        assert all(address is None for _, address in source_residency), (
+            f"a prefix producer resided without a served gather: {source_residency}"
+        )
+        observed.assert_nothing_emitted()
+        return
+    if mode == "demoted":
+        assert rejected and restored and final_kernels
+        assert observed.demotions and not observed.emitted and not observed.emitted_ops
+    else:
+        observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == plan.destination_view.num_cores == 32
+    assert observed.source_layouts[plan.edge] == (
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+        [physical, 1],
+    )
+    assert observed.copy_layouts[plan.edge] == (
+        [rows, physical],
+        [physical, 1],
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+    )
+    assert dict(plan.source_view.work_slice_dims) == {0: 4, 1: 8}
+    destination = dict(plan.destination_view.work_slice_dims)
+    assert destination.get(0, 1) == 1, "the linear reader must not split K"
+    assert destination.get(1, 1) == 4
+    assert plan.source_footprint_bytes == rows * physical * 2 // 32
+    assert plan.destination_footprint_bytes == rows * physical * 2 // 4
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "the full-backing gather must have separate LX storage"

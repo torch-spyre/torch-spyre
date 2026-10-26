@@ -170,6 +170,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "log",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when

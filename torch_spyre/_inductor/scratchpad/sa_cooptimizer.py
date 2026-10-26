@@ -729,10 +729,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return False
 
     @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return False
-
-    @classmethod
     def linear_cost_only(cls) -> bool:
         return False
 
@@ -1145,10 +1141,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _per_core_size(self, idx: int, config: DivisionConfig) -> int:
         """Per-core footprint of buffer ``idx`` under ``config``:
-        ``ceil_div(total_size, output_partition * output_tile_count)``, using
-        the substrate's integer helper so this rounds identically to every
-        other footprint-division site -- ``CoreDivisionBuffer.min_footprint``
-        divides by the same product.
+        ``ceil_div(total_size, output_partition * output_tile_count)``, as
+        :meth:`CoreDivisionBuffer.per_core_size` computes for a menu position.
+        It is computed from ``config`` because a generated config has no
+        position (``menu_index`` is ``None``).
 
         The tile count is the whole payoff channel for tiling. Every
         tiling-sensitive term in the cost model is a derate bounded by 1.0, and
@@ -1159,7 +1155,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         term, and be paid for afterwards in the traffic residency frees.
 
         Only the per-tile scratch is sized: an escaping op's companion never
-        enters LX (``CoOptimizingAllocator._apply_chosen_tilings``).
+        enters LX (``coarse_tiling.apply_chosen_tilings``).
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
@@ -1323,7 +1319,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         A tiling shrinks what the buffer holds at once; it does not shrink what
         the buffer moves. For an op whose output escapes its tiling group,
-        ``CoarseTilingPass`` allocates a full-extent ``full_buf``, inserts a copy
+        ``apply_tilings`` allocates a full-extent ``full_buf``, inserts a copy
         op that drains one tile into it per iteration, and repoints every outside
         consumer and any graph output at it (``wsr/coarse_tile.py``). None of
         that is in the features: they were extracted from the untiled graph,
