@@ -187,6 +187,18 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     return op
 
 
+def _residency_graph(producer, output_names=()):
+    """A producer and a full-width pointwise reader for residency gate tests."""
+    reader = _computed_buffer(producer.layout.size, name="reader")
+    operations = [producer, reader]
+    buffers = {op.get_name(): op for op in operations}
+    return SimpleNamespace(
+        operations=operations,
+        get_buffer=buffers.__getitem__,
+        get_output_names=lambda: list(output_names),
+    )
+
+
 class TestLoopCarryLxEligibility(unittest.TestCase):
     def setUp(self):
         self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
@@ -212,7 +224,8 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             self.assertFalse(self.allocator._op_output_good_for_lx_reuse(op))
 
     def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
-        graph = SimpleNamespace(operations=[])
+        ordinary = _computed_buffer((64, 64), name="carry")
+        graph = _residency_graph(ordinary)
         common = dict(
             graph=graph,
             name="carry",
@@ -225,13 +238,13 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             division_is_fixed=False,
             buf_user_deps={},
         )
-        ordinary = _computed_buffer((64, 64), name="carry")
         self.assertEqual(
             self.allocator._buffer_residency_reason(op=ordinary, **common),
             "mutation target",
         )
 
         carry = self._tagged_carry()
+        common["graph"] = _residency_graph(carry)
         with (
             patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
             patch.object(
@@ -271,7 +284,8 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
         never produced on the fixed-division (placement) path, and the
         pre-existing mutation-target refusal above it is untouched.
         """
-        graph = SimpleNamespace(operations=[])
+        carry = self._tagged_carry()
+        graph = _residency_graph(carry, output_names=("carry",))
         common = dict(
             graph=graph,
             name="carry",
@@ -284,7 +298,6 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             division_is_fixed=False,
             buf_user_deps={},
         )
-        carry = self._tagged_carry()
         with (
             patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
             patch.object(
@@ -345,7 +358,7 @@ class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
         self.allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, 2**20)
         self.op = _computed_buffer((64, 64), name="buf")
         self.common = dict(
-            graph=SimpleNamespace(operations=[]),
+            graph=_residency_graph(self.op),
             name="buf",
             uses=[0, 1],
             op=self.op,
@@ -2352,6 +2365,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
     @staticmethod
     def _op(name):
         op = MagicMock(spec=ComputedBuffer)
+        op.data = MagicMock(spec=Reduction if name == "matmul" else Pointwise)
+        if name == "matmul":
+            op.data.reduction_type = BATCH_MATMUL_OP
         op.get_name.return_value = name
         return op
 
