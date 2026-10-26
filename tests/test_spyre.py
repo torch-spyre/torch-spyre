@@ -88,7 +88,7 @@ _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
 
 # TODO:ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
 _SCALAR_ADD_SKIP_UINT8 = pytest.mark.skip(
-    reason="Spyre hardware requires 128-byte aligned buffers - small uint8 tensors cause alignment violations"
+    reason="uint8 host transfers unsupported: host format SENUINT32 is 4 bytes, PyTorch stores 1 (#1588)"
 )
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
@@ -784,6 +784,50 @@ class TestSpyre(TestCase):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
+
+    def test_uint8_transfer_rejected_not_card_fault(self):
+        """uint8 host transfers raise a clean error in both directions."""
+        # D2H: the direction that faulted on an unfixed build.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.empty(272, dtype=torch.uint8, device="spyre").cpu()
+        # H2D: refused by this gate too, so a wrong host format cannot reach
+        # the card in either direction.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.ones(272, dtype=torch.uint8).to("spyre")
+
+    def test_uint8_allocation_still_allowed(self):
+        """Allocating a uint8 tensor on device must keep working.
+
+        Only the host transfer is refused.  torch.distributed allocates uint8
+        tensors internally (distributed_c10d.py, used by barrier() and the
+        object collectives), so gating is_supported_dtype() on this would
+        break the multi-Spyre barrier tests.
+        """
+        t = torch.empty(272, dtype=torch.uint8, device="spyre")
+        self.assertEqual(t.device.type, "spyre")
+        self.assertEqual(t.dtype, torch.uint8)
+
+    def test_supported_dtypes_still_transferable(self):
+        """The width gate must not reject dtypes whose host width matches.
+
+        int16 is excluded because isDCIConversionSupported has no
+        {SENINT16, SENINT16} pair, so its H2D fails on the conversion check
+        rather than on this gate.
+        """
+        for dtype in (
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        ):
+            with self.subTest(dtype=dtype):
+                cpu = torch.ones(128, dtype=dtype)
+                dev = cpu.to("spyre")
+                self.assertEqual(dev.device.type, "spyre")
+                self.assertEqual(dev.cpu().dtype, dtype)
 
     def test_d2h_h2d_dtype_conversion(self):
         """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.

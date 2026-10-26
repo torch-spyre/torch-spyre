@@ -1339,23 +1339,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
-def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    pass
-
-
-@prod_dim_int.register_fake
-def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    if keepdim:
-        out_shape[dim] = 1
-    else:
-        out_shape = out_shape[:dim] + out_shape[dim + 1 :]
-    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
-
-
 @torch.library.custom_op(
     "spyre::compute_grouped_mm_routing_tables",
     mutates_args=(),
