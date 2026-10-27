@@ -3265,6 +3265,165 @@ def _will_lower_conv2d_direct(
     )
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def conv_transpose2d_via_matmul_col2im(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    output_padding: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """Transposed 2D convolution as one matmul plus an on-device col2im.
+
+    Every input pixel (i, j) scatters weight tap (a, b) to output pixel
+    (s*i + d*a - p, s*j + d*b - p). So:
+
+      1. cols = x @ W: a channel-last (N, H, W, C_in) x (C_in, kH*kW*C_out)
+         matmul gives (N, H, W, kH, kW, C_out) with no wasted MACs (unlike
+         zero-inserting the input and running a stride-1 conv).
+      2. col2im without a scatter-add (Spyre has none, and slice_scatter with
+         step > 1 is rejected): write tap a = q*s + r. Taps with the same q
+         form one slab whose r index is the output phase, so the slab permuted
+         to (N, H, s, W, s, C) and shifted by q rows is already in the
+         interleaved output's coordinates. Merging (H, s) -> H*s and
+         (W, s) -> W*s is a view; each merged slab is cropped by the padding
+         and output_padding, and the col2im is the sum of the ceil(k/s)^2
+         cropped slabs. When k == s there is one slab and no add.
+
+    Everything stays channel-last with C_out on the stick: the matmul's own
+    output layout. Slicing, padding and merging only touch non-stick dims,
+    which keeps every stick expression a bare variable. The NCHW form of the
+    same col2im (H*W on the stick) needs `Mod(w, s)` stick indices, which the
+    backend cannot map. C_in and C_out are zero-padded to a whole stick, since
+    splitting kH*kW*C_out with a partial-stick C_out also gives an unmappable
+    stick expression.
+
+    A dilated kernel is expanded to a dense one with zero taps, so it costs
+    d times the MACs per axis but needs no other handling.
+    """
+    if groups != 1:
+        raise Unsupported(
+            f"conv_transpose2d: groups != 1 is not supported (got groups={groups})"
+        )
+    N, C_in, H, W = input.shape
+    _, C_out, K_h, K_w = weight.shape
+    s_h, s_w = stride
+    p_h, p_w = padding
+    d_h, d_w = dilation
+    op_h, op_w = output_padding
+    H_out = (H - 1) * s_h - 2 * p_h + d_h * (K_h - 1) + op_h + 1
+    W_out = (W - 1) * s_w - 2 * p_w + d_w * (K_w - 1) + op_w + 1
+
+    eps = get_elem_in_stick(input.dtype)
+    C_in_p, C_out_p = _round_up(C_in, eps), _round_up(C_out, eps)
+    if W == 1:
+        # A unit W puts the input's default stick on a size-1 dim (a sparse
+        # layout), and the sparse-to-dense restickify then puts H, not C_in, on
+        # the stick, which breaks the matmul's reduction stick. Pad W (with
+        # C_in, in the same pad) and slice it back so the matmul reads a fresh
+        # dense buffer instead. Pad W by 2: a one-column pad has the constant
+        # stick expression 1, which the backend rejects.
+        # TODO: drop this once compute_restickify_needed's is_sparse_stl
+        # branch honours the requested stick.
+        input = torch.constant_pad_nd(input, [0, 2, 0, 0, 0, C_in_p - C_in])
+        input = input[..., :1]
+    elif C_in_p != C_in:
+        input = torch.constant_pad_nd(input, [0, 0, 0, 0, 0, C_in_p - C_in])
+    # (C_in, C_out, kH, kW) -> (C_in_p, kH, kW, C_out_p), C_out on the stick.
+    # Pad before the permute: there the channel dims are not the stick, while
+    # padding a partial-stick C_out on the stick breaks the matmul's weight
+    # stick (batchmatmul's "Input2 stick must contain" check).
+    if (C_in_p, C_out_p) != (C_in, C_out):
+        weight = torch.constant_pad_nd(
+            weight, [0, 0, 0, 0, 0, C_out_p - C_out, 0, C_in_p - C_in]
+        )
+    w_cl = torch.permute(weight, (0, 2, 3, 1))
+    if d_h != 1 or d_w != 1:
+        # Expand a dilated kernel to dense taps (tap a lands at offset d*a):
+        # give each tap d - 1 trailing zero taps, merge, drop the last ones. A
+        # step-d slice_scatter would be simpler but is rejected on Spyre.
+        w_cl = w_cl.reshape(C_in_p, K_h, 1, K_w, 1, C_out_p)
+        w_cl = torch.constant_pad_nd(w_cl, [0, 0, 0, d_w - 1, 0, 0, 0, d_h - 1])
+        w_cl = w_cl.reshape(C_in_p, K_h * d_h, K_w * d_w, C_out_p)
+        K_h, K_w = d_h * (K_h - 1) + 1, d_w * (K_w - 1) + 1
+        w_cl = w_cl[:, :K_h, :K_w, :]
+    w_2d = w_cl.reshape(C_in_p, K_h * K_w * C_out_p)
+
+    # Shift slabs per axis, and the phase-image extent: tall enough for the
+    # last slab and for the cropped output window [p, p + out).
+    Q_h, Q_w = -(-K_h // s_h), -(-K_w // s_w)
+    H_q = max(H + Q_h - 1, -(-(p_h + H_out) // s_h))
+    W_q = max(W + Q_w - 1, -(-(p_w + W_out) // s_w))
+
+    x_cl = torch.permute(input, (0, 2, 3, 1))
+    cols = torch.matmul(x_cl, w_2d).view(N, H, W, K_h, K_w, C_out_p)
+
+    # Each slab is merged and cropped before the sum, so the sum writes a fresh
+    # buffer of exactly the output size. A crop left as the result would be a
+    # view whose merged rows span two dims of the 6D slab buffer, and reading
+    # such a view back to the host is wrong for an even crop start.
+    out: Optional[torch.Tensor] = None
+    for q_h in range(Q_h):
+        taps_h = min(s_h, K_h - q_h * s_h)
+        for q_w in range(Q_w):
+            taps_w = min(s_w, K_w - q_w * s_w)
+            slab = cols[
+                :,
+                :,
+                :,
+                q_h * s_h : q_h * s_h + taps_h,
+                q_w * s_w : q_w * s_w + taps_w,
+                :,
+            ]
+            # (N, H, W, r_h, r_w, C) -> (N, H, r_h, W, r_w, C)
+            slab = torch.permute(slab, (0, 1, 3, 2, 4, 5))
+            # Missing phases (taps < s) are zero; shift by (q_h, q_w) slabs.
+            pad = [
+                0,
+                0,
+                0,
+                s_w - taps_w,
+                q_w,
+                W_q - W - q_w,
+                0,
+                s_h - taps_h,
+                q_h,
+                H_q - H - q_h,
+            ]
+            if any(pad):
+                slab = torch.constant_pad_nd(slab, pad)
+            slab = slab.reshape(N, H_q * s_h, W_q * s_w, C_out_p)
+            if Q_h * Q_w == 1:
+                # A lone slab has no sum to materialize the crop. A negative
+                # constant_pad_nd crops into a fresh buffer instead (the Spyre
+                # lowering clones the slice); a trailing clone() or a zero
+                # bias add would be removed as a no-op before lowering.
+                crop = [
+                    0,
+                    C_out - C_out_p,
+                    -p_w,
+                    p_w + W_out - W_q * s_w,
+                    -p_h,
+                    p_h + H_out - H_q * s_h,
+                ]
+                if any(crop):
+                    slab = torch.constant_pad_nd(slab, crop)
+            else:
+                slab = slab[:, p_h : p_h + H_out, p_w : p_w + W_out, :C_out]
+            out = slab if out is None else out + slab
+    assert out is not None
+
+    if bias is not None:
+        out = out + bias
+    return torch.permute(out, (0, 3, 1, 2))
+
+
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
 def conv2d_via_bmm_decomp(
     input: torch.Tensor,
@@ -3310,7 +3469,25 @@ def conv2d_via_bmm_decomp(
         return NotImplemented
 
     if transposed:
-        raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
+        if input.dim() == 3:
+            # conv_transpose1d: a unit-height conv_transpose2d.
+            return conv_transpose2d_via_matmul_col2im(
+                input.unsqueeze(2),
+                weight.unsqueeze(2),
+                bias,
+                [1, stride[0]],
+                [0, padding[0]],
+                [1, dilation[0]],
+                [0, output_padding[0]],
+                groups,
+            ).squeeze(2)
+        if input.dim() != 4:
+            raise Unsupported(
+                f"conv_transpose: expected 3D or 4D input, got {input.dim()}D"
+            )
+        return conv_transpose2d_via_matmul_col2im(
+            input, weight, bias, stride, padding, dilation, output_padding, groups
+        )
 
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")

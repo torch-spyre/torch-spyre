@@ -7564,6 +7564,201 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # conv_transpose1d/2d via conv_transpose2d_via_matmul_col2im: one
+        # channel-last matmul plus an on-device col2im (shifted, summed slabs).
+        # Params: (x, weight[C_in, C_out, kH, kW], bias, stride, padding,
+        # output_padding, dilation, groups). Weights are scaled by 0.1 so the
+        # output stays O(1) at a C_in*taps contraction of up to 64*9.
+        ("test_conv_transpose", "test_conv_transpose_base"): {
+            "param_sets": {
+                # k == s: one slab, the col2im is a pure depth-to-space (UNet).
+                "k2s2": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 2, 2), scale=0.1),
+                    None,
+                    (2, 2),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "k2s2_n2_bias": (
+                    cached_randn((2, 128, 8, 8)),
+                    cached_randn((128, 64, 2, 2), scale=0.1),
+                    cached_randn((64,)),
+                    (2, 2),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # Partial-stick C_in and C_out are zero-padded to a stick.
+                "k2s2_cin48_cout32": (
+                    cached_randn((1, 48, 16, 16)),
+                    cached_randn((48, 32, 2, 2), scale=0.1),
+                    None,
+                    (2, 2),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # A lone slab with a crop (padding == s).
+                "k2s2_pad2": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 2, 2), scale=0.1),
+                    None,
+                    (2, 2),
+                    (2, 2),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # k < s: missing phases are zero.
+                "k1s2_outpad1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 1, 1), scale=0.1),
+                    None,
+                    (2, 2),
+                    (0, 0),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                # k > s: overlapping taps, summed shifted slabs.
+                "k3s2_pad1_outpad1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 3, 3), scale=0.1),
+                    None,
+                    (2, 2),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "k3s2_cout32_bias": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 32, 3, 3), scale=0.1),
+                    cached_randn((32,)),
+                    (2, 2),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                # DCGAN / VAE-decoder upsampling block.
+                "k4s2_pad1_n2_bias": (
+                    cached_randn((2, 64, 8, 12)),
+                    cached_randn((64, 128, 4, 4), scale=0.1),
+                    cached_randn((128,)),
+                    (2, 2),
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # Even crop start (pad 2): regression for the fused-dim offset
+                # in normalize_coordinates.
+                "k5s2_pad2_outpad1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 5, 5), scale=0.1),
+                    None,
+                    (2, 2),
+                    (2, 2),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "k3s1_pad1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 3, 3), scale=0.1),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "k3s2_dil2": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 3, 3), scale=0.1),
+                    None,
+                    (2, 2),
+                    (2, 2),
+                    (1, 1),
+                    (2, 2),
+                    1,
+                ),
+                "k2x3_s2x1_pad0x1": (
+                    cached_randn((1, 64, 16, 16)),
+                    cached_randn((64, 64, 2, 3), scale=0.1),
+                    None,
+                    (2, 1),
+                    (0, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # Unit W: the input's default stick is on the size-1 W dim (a
+                # sparse layout), which the decomposition pads away.
+                "w1_k2x1": (
+                    cached_randn((1, 64, 8, 1)),
+                    cached_randn((64, 64, 2, 1), scale=0.1),
+                    None,
+                    (1, 1),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                # Unit H with an odd crop: H_out == s, so the crop is a slice
+                # of length s at an odd start on a merged (H, s) dim, which
+                # compute_coordinates used to place on the inner dim alone.
+                "h1_k3s2_pad1_outpad1": (
+                    cached_randn((1, 64, 1, 8)),
+                    cached_randn((64, 64, 3, 3), scale=0.1),
+                    None,
+                    (2, 2),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "w1_k2s2_cin32": (
+                    cached_randn((1, 32, 8, 1)),
+                    cached_randn((32, 48, 2, 2), scale=0.1),
+                    None,
+                    (2, 2),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "1d_k4s2_pad1_bias": (
+                    cached_randn((2, 64, 32)),
+                    cached_randn((64, 64, 4), scale=0.1),
+                    cached_randn((64,)),
+                    (2,),
+                    (1,),
+                    (0,),
+                    (1,),
+                    1,
+                ),
+                "k2s2_groups2": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 32, 2, 2), scale=0.1),
+                    None,
+                    (2, 2),
+                    (0, 0),
+                    (0, 0),
+                    (1, 1),
+                    2,
+                ),
+            },
+            # TODO: grouped conv_transpose is a missing feature (a batched
+            # matmul over the groups); when it lands this becomes a positive case.
+            "expect_raise": {"k2s2_groups2": "groups != 1 is not supported"},
+        },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
             # Non-zero padding is an intentional capability gap on the direct
             # depthwise path, not a bug: lower_convolution raises Unsupported
@@ -12255,6 +12450,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
             dlfloat16_reference=ref,
         )
+
+    def test_conv_transpose_base(
+        self, x, weight, bias, stride, padding, output_padding, dilation, groups
+    ):
+        conv = F.conv_transpose1d if x.dim() == 3 else F.conv_transpose2d
+
+        def fn(x, weight, bias):
+            return conv(
+                x,
+                weight,
+                bias,
+                stride=stride,
+                padding=padding,
+                output_padding=output_padding,
+                groups=groups,
+                dilation=dilation,
+            )
+
+        # Reference accumulated in fp32, as in test_conv2d_cpu: an overlapping
+        # tap sums up to C_in * ceil(k/s)^2 products, which CPU fp16 rounds
+        # more coarsely than the device.
+        ref = fn(x.float(), weight.float(), bias.float() if bias is not None else None)
+        self.compare_with_cpu(fn, x, weight, bias, dlfloat16_reference=ref)
 
     def test_conv2d_direct_base(self, x, weight, bias, stride):
         # Exercises the native conv2d SDSC (lower_convolution), not the
