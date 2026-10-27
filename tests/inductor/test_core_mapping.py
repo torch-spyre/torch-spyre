@@ -1408,3 +1408,78 @@ def test_the_probe_bound_covers_the_callers_filter_too():
     assert unbounded > 1, "this target has to offer more than one candidate"
     assert probes(unbounded - 1) == unbounded - 1
     assert probes(1) == 1
+
+
+@pytest.mark.parametrize("kind", ["direct", "affine"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enabled):
+    """Compare both production callers without widening the recovery policy."""
+    from torch_spyre._inductor.scratchpad.lx_relayout import work_division_from_view
+
+    row, head, pair, lane = sympy.symbols(
+        "row head pair lane", integer=True, nonnegative=True
+    )
+    affine = kind == "affine"
+    iteration = {row: 512, head: 8, **({pair: 2} if affine else {}), lane: 64}
+    coordinate = 2 * head + pair if affine else head
+    width = 1024 if affine else 512
+    index = width * row + (128 if affine else 64) * head + lane
+    if affine:
+        index += 64 * pair
+    coefficients = {symbol: index.coeff(symbol) for symbol in iteration}
+    prep = _view_prep(
+        iter_space=iteration,
+        write_index=index,
+        dep_coeff=coefficients,
+        dep_device_coordinates=(coordinate, row, lane),
+        device_size=[16 if affine else 8, 512, 64],
+        stride_map=[64, width, 1],
+        device_stride_to_dim={64: 0, width: 1, 1: 2},
+        stick_host_stride=1,
+        num_stick_dim=0,
+        num_stick=16 if affine else 8,
+        num_stick_stride=64,
+    )
+    physical = PerCoreView(
+        ((0, 4), (1, 8)),
+        ((0, sympy.floor(_CORE_ID / 8)), (1, sympy.Mod(_CORE_ID, 8))),
+        num_cores=32,
+    )
+    splits = {
+        symbol: 8 if symbol == row else 4 if symbol == head else 1
+        for symbol in iteration
+    }
+    coordinates = prep.dep_device_coordinates
+    with pass_utils_module.config.patch(
+        lx_extended_ownership=enabled, lx_planner_relayout=True
+    ):
+        recovered, partial, represented = pass_utils_module._per_core_view_from_prep(
+            prep, splits
+        )
+        assert not partial
+        # The affine emitter may accept while recovery declines: recovery is
+        # floor-only, not a second route around the affine admission policy.
+        assert represented is (not affine)
+        if represented:
+            assert recovered.same_partition(physical)
+        if affine and not enabled:
+            with pytest.raises(ValueError, match="cannot map device dimension"):
+                work_division_from_view(
+                    physical, prep.device_size, coordinates, iteration
+                )
+        else:
+            division = work_division_from_view(
+                physical, prep.device_size, coordinates, iteration
+            )
+            assert division.work_slices == {head: 4, row: 8}
+            assert division.physical_core_count == 32
+            for core in range(32):
+                assert (
+                    int(division.core_id_to_work_slice[head].subs(_CORE_ID, core))
+                    == core // 8
+                )
+                assert (
+                    int(division.core_id_to_work_slice[row].subs(_CORE_ID, core))
+                    == core % 8
+                )
+    assert prep.dep_device_coordinates == coordinates

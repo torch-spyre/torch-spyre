@@ -4840,6 +4840,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
                     50.0,
                 ),
+                # Below about -4 the runtime primitive drifts and from -7 returns
+                # 0, while softplus(x) ~= e^x is still a normal fp16 value. Mamba's
+                # dt = softplus(dt + dt_bias) sits in [-12, -4]. The clamp keeps
+                # the result above the fp16 normal minimum (e^-9.7).
+                "2d_negative": (
+                    (
+                        cached_randn((256, 128), dtype=torch.float16, scale=2.0) - 6.0
+                    ).clamp(-9.5, -2.0),
+                    1.0,
+                ),
+                # The clamp applies before the scaling, so beta * x stays in
+                # [-9.5, -2] and the result above the fp16 normal minimum. Widened
+                # further, the expected values underflow and all zeros would pass.
+                "2d_negative_beta_0p5": (
+                    (
+                        cached_randn((256, 128), dtype=torch.float16, scale=4.0) - 12.0
+                    ).clamp(-19.0, -4.0),
+                    0.5,
+                ),
             },
         },
         # --- Migrated from test_ops.py ---
@@ -10666,6 +10685,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 dtype=torch.float64,
             )
             self.compare_with_cpu(fn, x, dlfloat16_reference=ref)
+        elif beta * x.max() <= -2.0:
+            # Every output here is below 0.13, under the default atol of 0.1, so an
+            # all-zero result would pass. Bound the error relative to the value
+            # instead: 2% covers fp16 rounding of e^x and the series.
+            self.compare_with_cpu(fn, x, atol=1e-7, rtol=2e-2)
         else:
             self.compare_with_cpu(fn, x)
 
