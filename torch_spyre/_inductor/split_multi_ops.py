@@ -39,7 +39,9 @@ from .pass_utils import (
     patch_env,
     find_fx_node,
 )
-from .constants import is_ea_compatible
+from .constants import is_ea_compatible, SUPPORTED_EAS
+from .optimize_restickify import AllSameNode, AnyInNode
+from .propagate_layouts import _get_prop_args
 from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
@@ -731,13 +733,128 @@ def _get_op_name(op) -> str:
     return str(target) if target else str(origin_node)
 
 
+def _insert_shuffle_op(
+    graph: GraphLowering, op, stg_name: str, stg_buf, target_ea: ElementArrangement
+) -> bool:
+    """Create and insert a torch.ops.spyre.shuffle op."""
+
+    # Find the origin FX node from the operation
+    orig_node = origin_in_graph(op.data.origins, graph.graph)
+    if orig_node is None:
+        logger.warning(f"Cannot find origin node for op {op.get_name()}")
+        return False
+
+    try:
+        insert_idx = graph.operations.index(op)
+    except ValueError:
+        insert_idx = 0
+
+    # Find the FX node that produces the staggered buffer
+    stg_fx_node = None
+    if hasattr(stg_buf, "origins"):
+        for origin in stg_buf.origins:
+            # Try to find the FX node by name matching
+            for node in graph.graph.nodes:
+                if node.name == origin.name:
+                    stg_fx_node = node
+                    break
+            if stg_fx_node:
+                break
+
+    if stg_fx_node is None:
+        logger.warning(
+            f"Cannot find FX node for buffer {stg_name} among origins {[o.name for o in stg_buf.origins]}"
+        )
+        return False
+
+    shuffle_op = torch.ops.spyre.shuffle.default
+    with graph.graph.inserting_before(orig_node):
+        shuffle_node = graph.graph.create_node(
+            "call_function",
+            shuffle_op,
+            (stg_fx_node, target_ea.value),
+            {},
+        )
+
+    # Copy metadata
+    if "val" in stg_fx_node.meta:
+        shuffle_node.meta["val"] = stg_fx_node.meta["val"]
+    if "tensor_meta" in stg_fx_node.meta:
+        shuffle_node.meta["tensor_meta"] = stg_fx_node.meta["tensor_meta"]
+
+    # Set provenance
+    _set_split_child_provenance(orig_node, shuffle_node, shuffle_op)
+
+    # Lower the shuffle FX node into a buffer
+    new_buf = _lower_fx_node(shuffle_node, graph, graph.operations, insert_idx)
+
+    if new_buf is None:
+        logger.warning(f"Failed to lower shuffle node for {stg_name}")
+        return False
+
+    object.__setattr__(new_buf, "origins", OrderedSet([shuffle_node]))
+
+    # Set layouts on new_buf
+    stg_stl = next(iter(stg_buf.layouts))
+    out_stl = SpyreTensorLayout(
+        stg_stl.device_size,
+        stg_stl.stride_map,
+        stg_stl.device_dtype,
+        target_ea,
+    )
+    new_buf.layouts = [out_stl]
+    new_buf.restick_cost_fn = AnyInNode.from_args()
+
+    # Update provenance
+    decompose_provenance(
+        stg_buf,
+        (new_buf,),
+        pass_name="split_multi_ops",
+        reason="insert EA shuffle",
+        inherit_origins=False,
+    )
+
+    # Redirect the staggered buffer load to the new shuffled buffer
+    name_map = {stg_name: new_buf.get_name()}
+    orig_inner = op.data.inner_fn
+
+    def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
+        inner = _SplitOpsHandler(V.ops, _nm)
+        with V.set_ops_handler(inner):
+            return _orig(*args)
+
+    new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
+    object.__setattr__(new_data, "origins", op.data.origins)
+
+    new_op = replace_computed_buffer_body(
+        op,
+        new_data,
+        graph.operations,
+        pass_name="split_multi_ops",
+        reason="insert EA shuffle redirect",
+    )
+    graph.name_to_buffer[new_op.get_name()] = new_op
+
+    if hasattr(op, "layouts"):
+        new_op.layouts = list(op.layouts)
+        rw = new_op.get_read_writes()
+        output_dep = next(iter(rw.writes))
+        args = _get_prop_args(rw.reads)
+        new_op.restick_cost_fn = AllSameNode.from_args(
+            args, new_op.layouts, output_dep, new_op
+        )
+
+    logger.info(f"Successfully inserted shuffle: {stg_name} -> {new_buf.get_name()}")
+    return True
+
+
 def validate_ops(graph: GraphLowering) -> None:
     """Validate inputs to ops have same ElementArrangement.
 
-    This pass need to be run after propagate_spyre_tensor_layouts so that it
+    This pass needs to be run after propagate_spyre_tensor_layouts so that it
     has all the required SpyreTensorLayouts.
     """
-    for op in graph.operations:
+    for op in list(graph.operations):
         if not hasattr(op, "data"):
             continue
         if not isinstance(op.data, Pointwise):
@@ -750,46 +867,69 @@ def validate_ops(graph: GraphLowering) -> None:
         if len(inputs) <= 1:
             continue
 
-        layouts = []
-        input_names = []
+        # Collect ONE EA per unique input buffer
+        buf_eas = {}  # buffer_name -> EA
         for inp in inputs:
             buf = V.graph.get_buffer(inp.name)
-            # Skip buffers without layouts
             if not hasattr(buf, "layouts"):
                 continue
+
+            # Get the first SpyreTensorLayout for this buffer
             for layout in buf.layouts:
                 if isinstance(layout, SpyreTensorLayout):
-                    layouts.append(layout)
-                    input_names.append(inp.name)
+                    if inp.name not in buf_eas:
+                        buf_eas[inp.name] = layout.element_arrangement
+                    break
 
-        if len(layouts) <= 1:
+        if len(buf_eas) <= 1:
             continue
+
+        input_names = list(buf_eas.keys())
+        stl_eas = list(buf_eas.values())
 
         op_name = _get_op_name(op)
 
         # Check ElementArrangement compatibility
-        stl_eas = [layout.element_arrangement for layout in layouts]
+        if is_ea_compatible(stl_eas):
+            logger.debug(
+                f"EA incompatible detected for op {op_name}: {list(zip(input_names, stl_eas))}"
+            )
 
-        # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
-        skip_ops = {"layernormnorm", "layernormscale"}
-        skip_eas = {ElementArrangement.EXX2}
-        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
-            continue
+            # Check for the mixed STANDARD + supported staggered pattern
+            if len(stl_eas) == 2 and ElementArrangement.STANDARD in stl_eas:
+                std_idx = stl_eas.index(ElementArrangement.STANDARD)
+                stg_idx = 1 - std_idx
+                stg_ea = stl_eas[stg_idx]
 
-        # Valid EA patterns (see is_ea_compatible):
-        # 1. All operands share one EA.
-        # 2. Exactly one distinct non-STANDARD EA (not EXX2) mixed with STANDARD
-        #    operands (the broadcast pattern).
-        if not is_ea_compatible(stl_eas):
+                if stg_ea in SUPPORTED_EAS:
+                    stg_name = input_names[stg_idx]
+                    stg_buf = V.graph.get_buffer(stg_name)
+
+                    # We want to shuffle the staggered operand to STANDARD
+                    # so it matches the other operand.
+                    target_ea = ElementArrangement.STANDARD
+
+                    logger.debug(
+                        f"Attempting to insert shuffle for buffer {stg_name} (EA={stg_ea} -> {target_ea})"
+                    )
+                    if _insert_shuffle_op(graph, op, stg_name, stg_buf, target_ea):
+                        logger.debug(f"Successfully inserted shuffle for {stg_name}")
+                        continue
+
+            # If we couldn't fix it, raise error
             args_str = ", ".join(
                 f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
             )
             raise Unsupported(
-                f"Incompatible ElementArrangement in multi-arg op. "
-                f"Valid patterns: all inputs share one EA, or one non-STANDARD EA "
-                f"broadcast against STANDARD inputs. "
-                f"op: {op_name}, args: {args_str}"
+                f"Spyre backend does not support: Incompatible ElementArrangement in multi-arg op. "
+                f"Valid patterns: all inputs share one EA, or one non-STANDARD EA broadcast against "
+                f"STANDARD inputs. op: {op_name}, args: {args_str}"
             )
+
+
+def optimize_shuffling(graph: GraphLowering) -> None:
+    """TODO implement global analysis of shuffle to optimze."""
+    pass
 
 
 def _validate_split_supported(op, trace, intermediate_ops) -> None:

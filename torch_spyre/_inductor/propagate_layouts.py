@@ -71,6 +71,7 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
+    SUPPORTED_EAS,
 )
 from .ir import (
     AllGatherAsyncFallback,
@@ -846,6 +847,35 @@ def _single_arg_op_layout(
             return _convert_layout(
                 stl, dep, in_layout, output, output_dep, fmt, input_ea
             )
+
+        case spyreop.shuffle.default:
+            # Read dst_ea from the stashed attribute on the buffer data
+            # (set by lower_spyre_shuffle).
+            dst_ea_int = getattr(op.data, "ea_shuffle_dst_ea", None)
+
+            if dst_ea_int is None:
+                raise Unsupported("shuffle: missing ea_shuffle_dst_ea on buffer")
+
+            # Convert int back to ElementArrangement enum
+            try:
+                dst_ea = next(
+                    member
+                    for member in ElementArrangement.__members__.values()
+                    if member.value == dst_ea_int
+                )
+            except ValueError:
+                raise Unsupported(f"shuffle: invalid ea value {dst_ea_int}")
+
+            # Preserve the full device geometry (device_size, stride_map) and
+            # only change the element_arrangement tag.
+            out_stl = SpyreTensorLayout(
+                stl.device_size,
+                stl.stride_map,
+                stl.device_dtype,
+                dst_ea,
+            )
+            op.restick_cost_fn = AnyInNode.from_args()
+            return [out_stl]
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
@@ -2355,6 +2385,18 @@ def compute_layouts(
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.shuffle.default or any(
+        origin.target == spyreop.shuffle.default for origin in data.origins
+    ):
+        layouts = []
+        for stl in args[0].layouts:
+            result = _single_arg_op_layout(
+                op, output, output_dep, args[0].dep, args[0].layout, stl
+            )
+            layouts.extend(result)
+        op.restick_cost_fn = AnyInNode.from_args()
+        return layouts
 
     # All other single arg ops
     layouts = []
