@@ -12811,6 +12811,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
 
+    def test_unfold_step_one_window_reduction(self):
+        """A step-one unfold reduces each complete window on one core."""
+        rows = torch.arange(10, dtype=torch.float16).view(10, 1)
+        cols = torch.arange(6, dtype=torch.float16).view(1, 6)
+        x = rows * 8 + cols
+
+        def fn(t):
+            return t.unfold(0, 3, 1).sum(dim=-1)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0, run_eager=False)
+
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 

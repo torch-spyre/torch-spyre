@@ -1026,6 +1026,28 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
     )
 
 
+def _ordered_affine_coordinate_terms(
+    coordinate: Expr, ranges: dict[Symbol, int]
+) -> list[tuple[int, int, Symbol]] | None:
+    """Affine terms in the inner-to-outer order used by normalize_coordinates.
+
+    For an affine term, normalize_coordinates sorts by its step (``num``),
+    then its iteration range (``mod``). Return None when that ordering cannot
+    be determined for the whole coordinate.
+    """
+    # A slice before unfold adds a constant base offset. It changes where the
+    # read starts, but not the stride ratio or the overlap between loop vars.
+    _, variable_part = coordinate.as_coeff_Add()
+    terms = []
+    for term, coeff in variable_part.as_coefficients_dict().items():
+        if not isinstance(term, Symbol) or term not in ranges or coeff <= 0:
+            return None
+        if ranges[term] > 1:
+            terms.append((int(coeff), ranges[term], term))
+    terms.sort(key=lambda t: (t[0], t[1], str(t[2])))
+    return terms
+
+
 def overlapping_coordinate_extents(
     coordinate: Expr, ranges: dict[Symbol, int]
 ) -> dict[Symbol, tuple[int, Symbol]]:
@@ -1046,16 +1068,9 @@ def overlapping_coordinate_extents(
     Coordinates with a non-linear term (``floor``, ``Mod``), or whose strides
     do not nest, are not analysed.
     """
-    # A slice before unfold adds a constant base offset. It changes where the
-    # read starts, but not the stride ratio or the overlap between loop vars.
-    _, variable_part = coordinate.as_coeff_Add()
-    terms = []
-    for term, coeff in variable_part.as_coefficients_dict().items():
-        if not isinstance(term, Symbol) or term not in ranges or coeff <= 0:
-            return {}
-        if ranges[term] > 1:
-            terms.append((int(coeff), ranges[term], term))
-    terms.sort(key=lambda t: (t[0], t[1], str(t[2])))
+    terms = _ordered_affine_coordinate_terms(coordinate, ranges)
+    if terms is None:
+        return {}
     overlaps: dict[Symbol, tuple[int, Symbol]] = {}
     for (step, extent, var), (next_step, _, outer) in zip(terms, terms[1:]):
         if next_step % step:
@@ -1147,6 +1162,7 @@ def overlapping_window_split_domains(
                         )
                     if outer_var in symbolic_vars:
                         coord_ranges = {**ranges, outer_var: 2}
+            ordered_terms = _ordered_affine_coordinate_terms(coordinate, coord_ranges)
             overlaps = overlapping_coordinate_extents(coordinate, coord_ranges)
             for var, (size, outer) in overlaps.items():
                 if var in ctx.reduction_vars and outer in symbolic_vars:
@@ -1157,15 +1173,16 @@ def overlapping_window_split_domains(
                 caps[var] = min(size, caps.get(var, size))
                 if var in ctx.reduction_vars:
                     pinned.add(outer)
-                    # All larger-stride terms of the same coordinate are
-                    # outside the overlapped window after normalization.
-                    outer_coeff = coordinate.coeff(outer)
+                    # Pin only terms after this window in the same ordered
+                    # coordinate. Equal coefficients can describe different
+                    # nesting levels: for w + k, k's shorter range puts it
+                    # inside w, so pinning by coefficient would also pin k.
+                    assert ordered_terms is not None
+                    ordered_vars = [term for _, _, term in ordered_terms]
                     pinned.update(
                         term
-                        for term, coeff in coord_terms.items()
-                        if isinstance(term, Symbol)
-                        and term in ranges
-                        and coeff >= outer_coeff
+                        for term in ordered_vars[ordered_vars.index(var) + 1 :]
+                        if term in ranges
                     )
                     # Device axes need not be listed in physical stride order:
                     # a permuted layout can place a higher-stride batch axis

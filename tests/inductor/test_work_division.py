@@ -716,6 +716,31 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
         folded_domains = overlapping_window_split_domains(ctx).allowed_splits
         self.assertEqual(folded_domains[b], frozenset({8}))
 
+    def test_reduced_equal_stride_window_keeps_reduction_whole(self):
+        # x.unfold(0, 3, 1): w + k has equal coefficients, but k's shorter
+        # range puts it inside w. The complete k reduction stays on one core.
+        w, j, k = (_isym(n) for n in ("w", "j", "k"))
+        op = _computed_buffer((8, 6), name="buf0", reduction_type="sum")
+        output_td = _tensor_dep("buf0", (8, 6), (w, j))
+        source = TensorDep(
+            dep=MemoryDep("x", 6 * (w + k) + j, (w, j, k), (8, 6, 3)),
+            layout=_fixed_tiled_layout((10, 6)),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            [source],
+            it_space={w: 8, j: 6, k: 3},
+            reduction_vars=[k],
+        )
+        domains = overlapping_window_split_domains(ctx).allowed_splits
+        self.assertEqual(domains[k], frozenset({1, 3}))
+        self.assertEqual(domains[w], frozenset({8}))
+        self.assertEqual(
+            collect_work_division_constraints(ctx).allowed_splits[k],
+            frozenset({1}),
+        )
+
     def test_contiguous_read_is_unconstrained(self):
         rows, cols = _isym("d0"), _isym("d1")
         op = _computed_buffer((6, 128))
