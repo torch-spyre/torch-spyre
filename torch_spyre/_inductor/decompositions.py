@@ -2834,6 +2834,16 @@ def spyre_linear_attention(
             f"linear_attention: Causal linear attention requires seqlen_q == seqlen_kv, "
             f"got seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}"
         )
+    if head_dim_k % STICK != 0 or head_dim_v % STICK != 0:
+        raise Unsupported(
+            f"linear_attention: head_dim (query={head_dim_k}, value={head_dim_v}) "
+            f"must be a multiple of Spyre hardware stick size ({STICK}). "
+            f"Ensure head_dim is at least {STICK} (e.g. 64, 128, 256)."
+        )
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
 
     gqa_group_size = num_heads // num_kvheads
     if gqa_group_size > 1:
@@ -2858,38 +2868,52 @@ def spyre_linear_attention(
     q_feat = _apply_feature_map(q_scaled, feature_map)
     k_feat = _apply_feature_map(key, feature_map)
 
+    # Flatten batch and head dimensions to rank-3: [BH, L, D]
+    # This ensures intermediate outer-products stay strictly within rank 4 (supported by hardware)
+    bh = batch_size * num_heads
+    q_3d = q_feat.view(bh, seqlen_q, head_dim_k)
+    k_3d = k_feat.view(bh, seqlen_kv, head_dim_k)
+    v_3d = value.view(bh, seqlen_kv, head_dim_v)
+
     if is_causal:
-        # Causal linear attention: cumulative sum / prefix scan over sequence dimension
-        delta_s = k_feat.unsqueeze(-1) * value.unsqueeze(-2)  # [B, H, L, Dk, Dv]
-        causal_state = torch.cumsum(delta_s, dim=2)          # [B, H, L, Dk, Dv]
+        # Causal linear attention: cumulative outer-product scan over time
+        # k_3d.unsqueeze(-1): [BH, L, Dk, 1], v_3d.unsqueeze(-2): [BH, L, 1, Dv] -> [BH, L, Dk, Dv] (rank 4)
+        delta_s = k_3d.unsqueeze(-1) * v_3d.unsqueeze(-2)
+        causal_state = torch.cumsum(delta_s, dim=1)  # [BH, L, Dk, Dv]
 
         if initial_state is not None:
-            causal_state = causal_state + initial_state.unsqueeze(2)
+            init_state_3d = initial_state.view(bh, head_dim_k, head_dim_v).unsqueeze(1)
+            causal_state = causal_state + init_state_3d
 
-        final_state = causal_state[:, :, -1, :, :]  # [B, H, Dk, Dv]
+        final_state = causal_state[:, -1, :, :].view(batch_size, num_heads, head_dim_k, head_dim_v)
 
-        q_expanded = q_feat.unsqueeze(-2)  # [B, H, L, 1, Dk]
-        out = torch.matmul(q_expanded, causal_state).squeeze(-2)  # [B, H, L, Dv]
+        q_expanded = q_3d.unsqueeze(-2)  # [BH, L, 1, Dk]
+        out_3d = torch.matmul(q_expanded, causal_state).squeeze(-2)  # [BH, L, Dv]
 
-        k_cumsum = torch.cumsum(k_feat, dim=2)  # [B, H, L, Dk]
-        z = torch.sum(q_feat * k_cumsum, dim=-1, keepdim=True)  # [B, H, L, 1]
-        out = out / (z + eps)
+        k_cumsum = torch.cumsum(k_3d, dim=1)  # [BH, L, Dk]
+        z_3d = torch.sum(q_3d * k_cumsum, dim=-1, keepdim=True)  # [BH, L, 1]
+        out_3d = out_3d / (z_3d + eps)
 
+        out = out_3d.view(batch_size, num_heads, seqlen_q, head_dim_v)
         return out.to(query.dtype), final_state.to(query.dtype)
     else:
-        # Non-causal linear attention: O(N) matrix associativity
-        # k_feat.transpose(-2, -1): [B, H, Dk, Lkv], value: [B, H, Lkv, Dv] -> [B, H, Dk, Dv]
-        kv_state = torch.matmul(k_feat.transpose(-2, -1), value)
+        # Non-causal linear attention: O(N) batched matrix associativity
+        # k_3d.transpose(-2, -1): [BH, Dk, Lkv], v_3d: [BH, Lkv, Dv] -> [BH, Dk, Dv]
+        kv_state_3d = torch.bmm(k_3d.transpose(-2, -1), v_3d)
         if initial_state is not None:
-            kv_state = kv_state + initial_state
+            kv_state_3d = kv_state_3d + initial_state.view(bh, head_dim_k, head_dim_v)
 
-        out = torch.matmul(q_feat, kv_state)  # [B, H, Lq, Dv]
+        final_state = kv_state_3d.view(batch_size, num_heads, head_dim_k, head_dim_v)
 
-        k_sum = torch.sum(k_feat, dim=-2, keepdim=True)  # [B, H, 1, Dk]
-        z = torch.matmul(q_feat, k_sum.transpose(-2, -1))  # [B, H, Lq, 1]
-        out = out / (z + eps)
+        # q_3d: [BH, Lq, Dk], kv_state_3d: [BH, Dk, Dv] -> [BH, Lq, Dv]
+        out_3d = torch.bmm(q_3d, kv_state_3d)
 
-        return out.to(query.dtype), kv_state.to(query.dtype)
+        k_sum_3d = torch.sum(k_3d, dim=1, keepdim=True)  # [BH, 1, Dk]
+        z_3d = torch.bmm(q_3d, k_sum_3d.transpose(-2, -1))  # [BH, Lq, 1]
+        out_3d = out_3d / (z_3d + eps)
+
+        out = out_3d.view(batch_size, num_heads, seqlen_q, head_dim_v)
+        return out.to(query.dtype), final_state.to(query.dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.max.default])

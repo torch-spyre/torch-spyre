@@ -41,7 +41,6 @@ def _reference_linear_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(Dk)
 
-    # Feature maps
     def phi(x):
         if feature_map == "elu":
             return F.elu(x) + 1.0
@@ -53,7 +52,6 @@ def _reference_linear_attention(
             return x
         raise ValueError(f"Unknown feature map {feature_map}")
 
-    # GQA broadcast if needed
     if Hq > Hkv:
         group_size = Hq // Hkv
         key = torch.repeat_interleave(key, group_size, dim=1)
@@ -66,7 +64,6 @@ def _reference_linear_attention(
     V = value
 
     if is_causal:
-        # Autoregressive cumulative sum
         delta_s = K.unsqueeze(-1) * V.unsqueeze(-2)  # [B, H, L, Dk, Dv]
         causal_s = torch.cumsum(delta_s, dim=2)
         if initial_state is not None:
@@ -79,7 +76,6 @@ def _reference_linear_attention(
         out = out / (z + eps)
         return out, final_state
     else:
-        # Global associative product
         kv_state = torch.matmul(K.transpose(-2, -1), V)  # [B, H, Dk, Dv]
         if initial_state is not None:
             kv_state = kv_state + initial_state
@@ -117,7 +113,7 @@ class TestLinearAttention(unittest.TestCase):
         torch.testing.assert_close(act_state, ref_state, atol=1e-5, rtol=1e-5)
 
     def test_feature_maps(self):
-        batch, heads, seqlen, dim = 1, 2, 16, 32
+        batch, heads, seqlen, dim = 1, 2, 16, 64
         q = torch.randn(batch, heads, seqlen, dim)
         k = torch.randn(batch, heads, seqlen, dim)
         v = torch.randn(batch, heads, seqlen, dim)
@@ -141,7 +137,7 @@ class TestLinearAttention(unittest.TestCase):
         torch.testing.assert_close(act_state, ref_state, atol=1e-5, rtol=1e-5)
 
     def test_initial_state_carry(self):
-        batch, heads, seqlen, dim = 1, 2, 16, 32
+        batch, heads, seqlen, dim = 1, 2, 16, 64
         init_state = torch.randn(batch, heads, dim, dim)
         q = torch.randn(batch, heads, seqlen, dim)
         k = torch.randn(batch, heads, seqlen, dim)
@@ -158,7 +154,7 @@ class TestLinearAttention(unittest.TestCase):
         torch.testing.assert_close(act_state, ref_state, atol=1e-5, rtol=1e-5)
 
     def test_cross_attention_non_causal(self):
-        batch, heads, q_len, kv_len, dim = 2, 4, 16, 64, 32
+        batch, heads, q_len, kv_len, dim = 2, 4, 16, 64, 64
         q = torch.randn(batch, heads, q_len, dim)
         k = torch.randn(batch, heads, kv_len, dim)
         v = torch.randn(batch, heads, kv_len, dim)
@@ -170,7 +166,7 @@ class TestLinearAttention(unittest.TestCase):
         torch.testing.assert_close(act_state, ref_state, atol=1e-5, rtol=1e-5)
 
     def test_custom_op_and_wrapper(self):
-        batch, heads, seqlen, dim = 1, 2, 8, 16
+        batch, heads, seqlen, dim = 1, 2, 8, 64
         q = torch.randn(batch, heads, seqlen, dim)
         k = torch.randn(batch, heads, seqlen, dim)
         v = torch.randn(batch, heads, seqlen, dim)
@@ -180,15 +176,13 @@ class TestLinearAttention(unittest.TestCase):
         self.assertEqual(state.shape, (batch, heads, dim, dim))
 
     def test_validation_errors(self):
-        q = torch.randn(1, 4, 16, 32)
-        k = torch.randn(1, 4, 32, 32)
-        v = torch.randn(1, 4, 32, 32)
+        q = torch.randn(1, 4, 16, 64)
+        k = torch.randn(1, 4, 32, 64)
+        v = torch.randn(1, 4, 32, 64)
 
-        # Causal with mismatched query/key sequence lengths
         with self.assertRaises(Unsupported):
             spyre_linear_attention(q, k, v, is_causal=True)
 
-        # Invalid feature map
         with self.assertRaises(Unsupported):
             spyre_linear_attention(q, k, v, is_causal=False, feature_map="invalid_map")
 
