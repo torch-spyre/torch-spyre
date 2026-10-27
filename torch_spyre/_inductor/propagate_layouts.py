@@ -851,7 +851,7 @@ def _single_arg_op_layout(
         case spyreop.shuffle.default:
             # Read dst_ea from the stashed attribute on the buffer data
             # (set by lower_spyre_shuffle).
-            dst_ea_int = getattr(op.data, "ea_shuffle_dst_ea", None)
+            dst_ea_int = getattr(op, "shuffle_ea", None)
 
             if dst_ea_int is None:
                 raise Unsupported("shuffle: missing ea_shuffle_dst_ea on buffer")

@@ -1610,7 +1610,7 @@ def lower_spyre_shuffle(src, ea):
     # Stash ea on the realized buffer so propagate_layouts can
     # read it back without having to search the FX node args at that stage.
     pw.realize()
-    pw.data.data.ea_shuffle_dst_ea = ea
+    pw.data.data.shuffle_ea = ea
     return pw
 
 

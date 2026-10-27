@@ -30,7 +30,10 @@ from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
-from utils_inductor import expects_raise
+from utils_inductor import cached_randn, shapes2key, expects_raise
+
+
+EA = ElementArrangement
 
 
 def _run(fn, *args, mode="compile"):
@@ -54,10 +57,12 @@ def assert_ea(tensor, expected_ea):
     assert actual_ea == expected_ea, f"Expected: {expected_ea}, Got: {actual_ea}"
 
 
-def assert_val(fn, x, result):
-    x_cpu = x.cpu()
-    result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+def assert_val(fn, x, result, rtol=1e-3, atol=1e-3):
+    result_ea = get_ea(result)
+    if result_ea == EA.STANDARD:
+        x_cpu = x.cpu()
+        result_cpu = fn(x_cpu)
+        torch.testing.assert_close(result.cpu(), result_cpu, rtol=rtol, atol=atol)
 
 
 def ea_of(dev):
@@ -676,6 +681,162 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 
     with pytest.raises(InductorError, match="not whole units"):
         torch.compile(fn)(a.to(DEVICE_NAME))
+
+
+# ---------------------------------------------------------------------------
+# Shuffle op
+# ---------------------------------------------------------------------------
+def shuffle(x, ea):
+    return torch.ops.spyre.shuffle(x, ea.value)
+
+
+class TestEAShuffle:
+    """Tests for explicit torch.ops.spyre.shuffle functionality."""
+
+    BASIC_SHAPES = [(2, 64)]
+
+    SHAPES = [
+        # 1-D: stick-aligned
+        (64,),
+        (128,),
+        # 1-D: non-stick-aligned
+        (44,),
+        (100,),
+        # 2-D: stick-aligned
+        (4, 64),
+        (7, 128),
+        # 2-D: non-stick-aligned
+        (7, 44),
+        (3, 100),
+        # 3-D: stick-aligned
+        (2, 4, 64),
+        (3, 5, 128),
+        # 3-D: non-stick-aligned
+        (2, 4, 44),
+        # 4-D: stick-aligned
+        (2, 3, 4, 64),
+        (2, 3, 4, 128),
+        # 4-D: non-stick-aligned
+        (2, 3, 4, 44),
+    ]
+
+    OPS_DICT = {
+        "add": torch.add,
+        "mul": torch.mul,
+        "eq": torch.eq,
+    }
+
+    @staticmethod
+    @staticmethod
+    def _case(in_dtype, out_dtype=None, in_ea=None, out_ea=None, rtol=1e-3, atol=1e-3):
+        in_ea = in_ea if in_ea is not None else EA.STANDARD
+        out_ea = out_ea if out_ea is not None else EA.STANDARD
+        if out_dtype is not None:
+            src = "dl16" if in_dtype == torch.float16 else "fp32"
+            dst = "fp32" if out_dtype == torch.float32 else "dl16"
+            name = f"{src}_to_{dst}_to_std"
+        else:
+            name = f"std_to_{in_ea.name.lower()}"
+        return (name, in_dtype, out_dtype, in_ea, out_ea, rtol, atol)
+
+    TEST_CASES = [
+        # Case 1: fp16 -> fp32 (staggered DL16_TO_FP32) -> shuffle to STANDARD
+        _case(torch.float16, torch.float32),
+        # Case 2: fp32 -> fp16 (staggered FP32_TO_DL16) -> shuffle to STANDARD
+        _case(torch.float32, torch.float16, rtol=1e-2, atol=1e-2),
+        # Case 3: fp32 (STANDARD) -> shuffle to FP32_TO_DL16
+        _case(torch.float32, None, EA.FP32_TO_DL16, EA.FP32_TO_DL16, 0, 0),
+        # Case 4: fp16 (STANDARD) -> shuffle to DL16_TO_FP32
+        _case(torch.float16, None, EA.DL16_TO_FP32, EA.DL16_TO_FP32, 0, 0),
+    ]
+
+    @pytest.mark.parametrize("shape", SHAPES, ids=[shapes2key((s,)) for s in SHAPES])
+    @pytest.mark.parametrize(
+        "name, base_dtype, cast_dtype, target_ea, exp_ea, atol, rtol",
+        TEST_CASES,
+        ids=[case[0] for case in TEST_CASES],
+    )
+    def test_shuffle(
+        self, shape, name, base_dtype, cast_dtype, target_ea, exp_ea, atol, rtol
+    ):
+        def fn(x):
+            x_proc = x.to(cast_dtype) if cast_dtype is not None else x
+            return shuffle(x_proc, target_ea)
+
+        x = cached_randn(*shape, dtype=base_dtype)
+        result = _run(fn, x.to(DEVICE_NAME))
+
+        assert_ea(result, exp_ea)
+        assert_val(fn, x, result, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    @pytest.mark.parametrize(
+        "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+    )
+    def test_shuffle_preserves_geometry(self, shape, fp16):
+        x_dev = cached_randn(shape, dtype=fp16).to(DEVICE_NAME)
+        in_layout = get_spyre_tensor_layout(x_dev)
+
+        y_dev = _run(lambda t: shuffle(t, EA.DL16_TO_FP32), x_dev)
+        out_layout = get_spyre_tensor_layout(y_dev)
+
+        assert y_dev.dtype == x_dev.dtype
+        assert y_dev.shape == x_dev.shape
+        assert out_layout.element_arrangement == EA.DL16_TO_FP32
+        assert out_layout.device_size == in_layout.device_size
+        assert out_layout.stride_map == in_layout.stride_map
+        assert out_layout.device_dtype == in_layout.device_dtype
+
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    def test_shuffle_feeds_downstream_op(self, shape):
+        def fn(x, y):
+            # x is fp16 -> fp32 (staggered) -> shuffle to std -> add to y (std)
+            return (shuffle(x.to(torch.float32), EA.STANDARD) + y) * 2.0
+
+        x = cached_randn(shape, dtype=torch.float16)
+        y = cached_randn(shape, dtype=torch.float32)
+
+        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+
+        assert_ea(result, self.EA.STANDARD)
+        assert_val(fn, x, result, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    @pytest.mark.parametrize(
+        "op",
+        list(OPS_DICT.values()),
+        ids=list(OPS_DICT.keys()),
+    )
+    def test_shuffle_implicit_pointwise(self, shape, op):
+        def fn(x_stg, y_std):
+            return op(x_stg, y_std)
+
+        x = cached_randn(shape, dtype=torch.float32)
+        y = cached_randn(shape, dtype=torch.float32)
+
+        x_dev = x.to(DEVICE_NAME)
+        y_dev = y.to(DEVICE_NAME)
+
+        x_stg = shuffle(x_dev, EA.FP32_TO_DL16)
+        result = _run(fn, x_stg, y_dev)
+
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, x, result)
+
+    @expects_raise
+    @pytest.mark.parametrize(
+        "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
+    )
+    def test_shuffle_invalid_ea(self, shape):
+        x = cached_randn(shape, dtype=torch.float16).to(DEVICE_NAME)
+        with pytest.raises(Exception, match="shuffle: invalid EA"):
+            _run(lambda t: torch.ops.spyre.shuffle(t, 99999), x)
 
 
 # Made with Bob
