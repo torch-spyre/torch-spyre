@@ -15,7 +15,9 @@
 import io
 import itertools
 import math
+import threading
 import warnings
+import weakref
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -83,6 +85,7 @@ from .loop_info import copy_op_metadata
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
+    DEVICE_COORDINATES_REQUESTS,
     HOST_COORDINATES,
     READ_WRITES_MISSES,
     READ_WRITES_REQUESTS,
@@ -1484,6 +1487,52 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
         )
 
 
+class _CoordCache(threading.local):
+    """``device_coordinates`` results for the current graph.
+
+    The result depends on the arguments and on the graph's size hints, which
+    concretization reads from ``V.graph.sizevars``. The arguments compare by
+    value: SpyreTensorLayout's equality covers every field the computation reads,
+    and MemoryDep is frozen. So entries are tied to the current graph and to the
+    shape state they were computed under, and are dropped when either changes or
+    the graph is freed. Thread-local, like ``V.graph``.
+    """
+
+    def __init__(self) -> None:
+        self._graph: "weakref.ref[Any] | None" = None
+        self._state: "tuple[int, int] | None" = None
+        self._entries: dict = {}
+
+    def entries(self) -> "dict | None":
+        """The current graph's entries, or None if there is no graph to key them on."""
+        graph = V.graph
+        sizevars = getattr(graph, "sizevars", None)
+        shape_env = getattr(sizevars, "shape_env", None)
+        version = getattr(shape_env, "_version_counter", None)
+        if sizevars is None or version is None:
+            return None
+        # ShapeEnv bumps _version_counter when its replacements, divisibility
+        # facts or deferred runtime asserts change. Precomputed replacements live
+        # on the SizeVarAllocator.
+        state = (version, len(sizevars.precomputed_replacements))
+        if self._graph is None or self._graph() is not graph or self._state != state:
+            entries: dict = {}
+            try:
+                # Free the entries with the graph rather than at the next compile.
+                self._graph = weakref.ref(graph, lambda _: entries.clear())
+            except TypeError:
+                # A stand-in graph (a test's SimpleNamespace) cannot be weakly
+                # referenced, and without one an entry could outlive it.
+                self._graph = None
+                return None
+            self._state = state
+            self._entries = entries
+        return self._entries
+
+
+_COORD_CACHE = _CoordCache()
+
+
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
@@ -1491,9 +1540,11 @@ def device_coordinates(
     *,
     check_stick_expr: bool = True,
     op: "Operation | None" = None,
-    cache: "dict | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
+
+    Results are memoized per graph (see ``_CoordCache``); ``config.coord_cache``
+    turns that off and ``config.coord_cache_verify`` checks every hit.
 
     Args:
         stl: Device layout (SpyreTensorLayout) of the tensor being accessed.
@@ -1503,46 +1554,49 @@ def device_coordinates(
             matching) where indirect coordinates are irrelevant.
         op: when given, splice trip counters in the dep index are pinned to trip
             zero (``per_trip_index``), matching codegen's base coordinates.
-        cache: optional memo for a caller that asks the same question
-            repeatedly. Keyed on every input: SpyreTensorLayout compares and
-            hashes over all four of its fields, MemoryDep is frozen, and ``op``
-            enters through the pinned index rather than by identity, so ops that
-            pin nothing share entries. The result is NOT a pure function of
-            them, though -- concretization consults ``V.graph.sizevars``
-            optimization hints, whose precomputed-replacement state grows as
-            compilation proceeds -- so a cache must not outlive the graph it was
-            populated for. A fresh list is returned each time, so no caller can
-            mutate another's result through it.
 
     Returns:
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
     if COUNTERS.enabled:
-        # Defined as constructions, not asks: a reader treats the count as the
-        # work because nothing memoizes this today. #4245 adds a shared memo, and
-        # whichever of the two lands second must bump this only on the miss path
-        # and count asks under a separate ``device_coordinates.requests`` -- a
-        # single counter spanning both stops measuring either.
-        COUNTERS.bump(DEVICE_COORDINATES)
+        COUNTERS.bump(DEVICE_COORDINATES_REQUESTS)
     index = per_trip_index(op, dep.index) if op is not None else dep.index
-    key = None
-    if cache is not None:
-        sizes_key = (
-            None if indirect_sizes is None else frozenset(indirect_sizes.items())
-        )
-        key = (stl, dep, index, sizes_key, check_stick_expr)
-        hit = cache.get(key)
-        if hit is not None:
-            return list(hit)
+    entries = _COORD_CACHE.entries() if config.coord_cache else None
+    if entries is None:
+        return _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+    # op enters through the pinned index, so ops that pin nothing share entries.
+    sizes = None if indirect_sizes is None else frozenset(indirect_sizes.items())
+    key = (stl, dep, index, sizes, check_stick_expr)
+    hit = entries.get(key)
+    if hit is None:
+        # Unsupported stick expressions raise before the store, so the raising
+        # path is the same with or without the cache.
+        hit = _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+        entries[key] = hit
+    elif config.coord_cache_verify:
+        fresh = _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+        if fresh != hit:
+            raise AssertionError(
+                f"device_coordinates cache returned {hit} for {dep} under {stl}, "
+                f"but recomputing gives {fresh}"
+            )
+    # A fresh list, so no caller can mutate another's result through the cache.
+    return list(hit)
+
+
+def _device_coordinates(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    index: sympy.Expr,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+    check_stick_expr: bool,
+) -> list[sympy.Expr]:
+    if COUNTERS.enabled:
+        COUNTERS.bump(DEVICE_COORDINATES)
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
-    # Unsupported stick expressions raise here, so they are never cached and
-    # the raising path stays identical whether or not a cache is supplied.
     if check_stick_expr:
         _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
-    if cache is not None:
-        cache[key] = coords
-        return list(coords)
     return coords
 
 
@@ -1638,7 +1692,6 @@ def try_device_coordinates(
     indirect_sizes: "dict[sympy.Symbol, int] | None",
     *,
     op: "Operation | None" = None,
-    cache: "dict | None" = None,
 ) -> list[sympy.Expr] | None:
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
@@ -1653,7 +1706,7 @@ def try_device_coordinates(
     returns ``None``.
     """
     try:
-        return device_coordinates(stl, dep, indirect_sizes, op=op, cache=cache)
+        return device_coordinates(stl, dep, indirect_sizes, op=op)
     except Unsupported:
         return None
 
@@ -2499,70 +2552,6 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
-def _indirect_info_memo(
-    op: "ComputedBuffer | None", cache: "dict | None"
-) -> "tuple[set[str], dict[sympy.Symbol, int] | None]":
-    """``indirect_info_from_op`` memoized per op for the lifetime of ``cache``.
-
-    A function of ``op`` alone, yet recomputed on every candidate pair by
-    :func:`compute_restickify_needed` -- and not cheap: it calls
-    ``ComputedBuffer.get_read_writes``, which carries no ``cache_on_self`` and so
-    re-extracts every dep and index expression, then re-runs ``inner_fn`` for ops
-    with indirect reads.
-
-    Computed on first use during layout selection rather than snapshotted when
-    the edge maps are built. ``get_read_writes`` reaches input buffer layouts
-    through ``make_indexer``, and ``propagate_spyre_tensor_layouts`` rebinds
-    buffer layouts while it constructs those maps, so a construction-time value
-    could predate a rebinding. Copies are handed out so no caller can mutate
-    another's.
-    """
-    if cache is None:
-        names, _, sizes = indirect_info_from_op(op)
-        return names, sizes
-    key = ("indirect_info", op.get_name() if op is not None else None)
-    hit = cache.get(key)
-    if hit is None:
-        hit = indirect_info_from_op(op)
-        cache[key] = hit
-    names, _, sizes = hit
-    return set(names), None if sizes is None else dict(sizes)
-
-
-def _host_coords_memo(
-    in_host: FixedLayout,
-    in_dep: MemoryDep,
-    ind_sizes: "dict[sympy.Symbol, int] | None",
-    op: "ComputedBuffer | None",
-    cache: "dict | None",
-) -> "list[sympy.Expr]":
-    """``host_coordinates`` memoized per edge for the lifetime of ``cache``.
-
-    ``in_host``, ``in_dep`` and ``op`` are an edge's construction-time
-    snapshots, so the result varies only with ``ind_sizes`` for a given edge.
-    Keyed on ``(in_dep, sizes, op)`` even though the owning EdgeCostMap makes
-    the dep and op redundant: this parameter sits beside ``coord_cache`` with
-    the same type but the opposite sharing contract, and a self-keyed entry
-    means a dict passed for both cannot silently serve another edge's
-    coordinates. ``in_host`` stays out of the key because it is fixed for a dep
-    name across the search, the invariant ``_dep_layout`` already leans on.
-
-    Filled on first use, so an edge whose candidate pairs all take the
-    stick-compatible early-out never pays for it. Like the coordinate memo this
-    is graph-bounded rather than pass-bounded, which holds because the owning
-    edge map is itself per-graph.
-    """
-    if cache is None:
-        return host_coordinates(in_host, in_dep, ind_sizes, op=op)
-    sizes_key = None if ind_sizes is None else frozenset(ind_sizes.items())
-    key = (in_dep, sizes_key, op.get_name() if op is not None else None)
-    hit = cache.get(key)
-    if hit is None:
-        hit = host_coordinates(in_host, in_dep, ind_sizes, op=op)
-        cache[key] = hit
-    return list(hit)
-
-
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -2570,8 +2559,6 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
-    coord_cache: "dict | None" = None,
-    host_coords: "dict | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2586,17 +2573,11 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
 
-    coord_cache: optional memo forwarded to try_device_coordinates and used for
-    the per-op indirect-access info, shared by a caller that evaluates many
-    layout pairs over the same accesses.
-
-    host_coords: optional per-edge memo for the host-side coordinates, whose
-    inputs are fixed for one edge.
     """
-    ind_names, ind_sizes = _indirect_info_memo(op, coord_cache)
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
-    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op, cache=coord_cache)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
     if idc is None:
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
@@ -2608,9 +2589,7 @@ def compute_restickify_needed(
         # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
         # preferable to aborting the whole pass when another candidate is valid.
         return True, None
-    out_idc = try_device_coordinates(
-        out_stl, out_dep, ind_sizes, op=op, cache=coord_cache
-    )
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
     if idc is None or out_idc is None:
         # Same as above
         return True, None
@@ -2668,7 +2647,7 @@ def compute_restickify_needed(
         # always passes [req_stl] as the target list, so the beam search only
         # queries this function with that canonical result.
         return True, out_stl
-    ic = _host_coords_memo(in_host, in_dep, ind_sizes, op, host_coords)
+    ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):

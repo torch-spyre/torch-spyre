@@ -396,6 +396,15 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
+# Memoize device_coordinates within one graph (pass_utils._CoordCache). Set
+# SPYRE_COORD_CACHE=0 to recompute every query, to check whether the cache
+# changes a result.
+coord_cache: bool = os.environ.get("SPYRE_COORD_CACHE", "1") == "1"
+
+# Recompute every coord_cache hit and raise if it differs from the cached value.
+# Costs the cache's whole saving; for debugging and tests.
+coord_cache_verify: bool = os.environ.get("SPYRE_COORD_CACHE_VERIFY", "0") == "1"
+
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
 # selects. Off by default, and inert unless a joint co-opt path is active
@@ -455,6 +464,8 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # coord_cache and coord_cache_verify: both leave the compiled graph unchanged.
+    "coord_cache",
 ]
 
 install_config_module(sys.modules[__name__])
