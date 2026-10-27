@@ -3369,11 +3369,6 @@ def _conv2d_im2col_matmul(
         C1 = K_w * C_p
         tv = t.view(N, Hq, stride_h, W_out, C1)
         w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, C1, C_out_p)
-        # The view merges (K_w, C_p) into K, which stays two device dims, and
-        # batchmatmul rejects a K that spans two dims once C_out is more than
-        # one stick (out_reuse_dim.size() == 1). A clone of a contiguous view
-        # is dropped, so pad and slice to write w_cl through a real kernel.
-        w_cl = torch.constant_pad_nd(w_cl, (0, 0, 0, stick))[:, :C1]
     else:
         C1 = _round_up(K_w * C, stick)
         # The W taps read through the input's own H stick, whose device size is
@@ -3399,7 +3394,16 @@ def _conv2d_im2col_matmul(
         w_cl = torch.constant_pad_nd(w_cl, (0, 0, 0, C1 - K_w * C))
 
     K = K_h * C1
-    weight_2d = torch.cat([w_cl[a] for a in range(K_h)], dim=0) if K_h > 1 else w_cl[0]
+    if K_h > 1:
+        weight_2d = torch.cat([w_cl[a] for a in range(K_h)], dim=0)
+    else:
+        # w_cl[0] can still be a view that merges (K_w, C) into K, leaving K two
+        # device dims: always when H == 1, and when H > 1 if K_w * C is whole
+        # sticks so the pad above is dropped. batchmatmul rejects such a K once
+        # C_out is more than one stick (out_reuse_dim.size() == 1). A clone of a
+        # contiguous view is dropped too, so pad and slice to write it through
+        # a real kernel.
+        weight_2d = torch.constant_pad_nd(w_cl[0], (0, 0, 0, stick))[:C1]
 
     band_bytes = N * W_out * max(K, C_out_p) * input.element_size()
     rows_per_band = max(1, min(H_out, _CONV_IM2COL_BAND_BYTES // band_bytes))

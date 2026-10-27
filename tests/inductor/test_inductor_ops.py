@@ -7601,6 +7601,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
+                # The same with H > 1: K_w * C = 128 is whole sticks, so the K
+                # pad is dropped and, with kH == 1, the weight is still a view.
+                "1x64x4x64_ksize1x2_cout128": (
+                    cached_randn((1, 64, 4, 64)),
+                    cached_randn((128, 64, 1, 2)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
             },
         },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
