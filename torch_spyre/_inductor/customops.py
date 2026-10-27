@@ -1165,6 +1165,28 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op(
+    "spyre::linear_causal_mask", mutates_args=(), device_types="spyre"
+)
+def linear_causal_mask(
+    seqlen_q: int,
+    seqlen_kv: int,
+    template: torch.Tensor,
+) -> torch.Tensor:
+    """Build a lower-triangular causal 0/1 mask matching template dtype and device."""
+    mask_cpu = torch.tril(torch.ones(seqlen_q, seqlen_kv, dtype=template.dtype, device="cpu"))
+    return mask_cpu.unsqueeze(0).to(device=template.device)
+
+
+@linear_causal_mask.register_fake
+def _(
+    seqlen_q: int,
+    seqlen_kv: int,
+    template: torch.Tensor,
+) -> torch.Tensor:
+    return template.new_empty((1, seqlen_q, seqlen_kv))
+
+
 @torch.library.custom_op("spyre::triu_cpu", mutates_args=())
 def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
     """
@@ -1587,6 +1609,7 @@ def linear_attention_cpu(
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.linear_causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
