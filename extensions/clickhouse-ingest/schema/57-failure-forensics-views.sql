@@ -106,8 +106,8 @@ INNER JOIN test_cases AS c ON c.test_case_id = cr.test_case_id AND c.component =
 LEFT JOIN v_result_run_context AS x ON x.run_id = cr.run_id;
 
 -- Per case and failure signature: how often, where and when it failed. passes_between counts
--- passes inside [first_failed, last_failed]; > 0 means the failure comes and goes. failing_runners
--- runners are those of every failed job in the failing runs (the failing job is not recorded per
+-- passes inside [first_failed, last_failed]; > 0 means the failure comes and goes.
+-- failing_runner_* are the runners of every failed job in the failing runs (the failing job is not recorded per
 -- case, so a run with several failed jobs over-attributes); empty until the GHA poller has the run.
 -- ALWAYS filter by name.
 CREATE VIEW IF NOT EXISTS v_failure_recurrence AS
