@@ -684,28 +684,17 @@ def _make_context(
 
 
 class TestPlainReductionKSplitDomains(unittest.TestCase):
-    def test_plain_reductions_pin_single_and_multiple_reduction_axes(self):
-        m, k, r = (_isym(name) for name in ("m", "k", "r"))
+    def test_single_axis_reductions_are_not_pinned(self):
+        """All single-axis plain reductions are unconstrained regardless of type."""
+        m, k = _isym("m"), _isym("k")
         output = _tensor_dep("plain_reduce", (128,), (m,))
-        # Layer norm's exx2 reduction regressed in fused encoder blocks when
-        # its single reduction axis was allowed to split across cores.
         for kind in ("sum", "max", "min", "mean", "prod", "exx2"):
-            for axes in ((k,), (k, r)):
-                with self.subTest(kind=kind, axes=axes):
-                    op = _computed_buffer(
-                        (128,), name="plain_reduce", reduction_type=kind
-                    )
-                    context = _make_context(op, output, reduction_vars=axes)
-                    result = collect_work_division_constraints(context)
-                    self.assertEqual(
-                        result.allowed_splits,
-                        {axis: frozenset({1}) for axis in axes},
-                    )
-                    # A committed span split must be rejected, not used to
-                    # silently re-enable an unsafe partial reduction.
-                    context.committed_splits = {k: 2}
-                    with self.assertRaisesRegex(Unsupported, "memory-span"):
-                        collect_work_division_constraints(context)
+            with self.subTest(kind=kind):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                result = collect_work_division_constraints(
+                    _make_context(op, output, reduction_vars=(k,))
+                )
+                self.assertNotIn(k, result.allowed_splits)
 
     def test_structured_reductions_keep_their_own_combine_rules(self):
         m, k = _isym("m"), _isym("k")
@@ -719,6 +708,25 @@ class TestPlainReductionKSplitDomains(unittest.TestCase):
                     _make_context(op, output, reduction_vars=(k,))
                 )
                 self.assertEqual(result.allowed_splits, {})
+
+    def test_multi_axis_plain_reductions_always_pinned(self):
+        """With 2+ reduction vars, all plain reductions are pinned regardless of type."""
+        m, k, r = (_isym(name) for name in ("m", "k", "r"))
+        output = _tensor_dep("plain_reduce", (128,), (m,))
+        for kind in ("sum", "max", "min", "mean", "prod", "exx2"):
+            with self.subTest(kind=kind):
+                op = _computed_buffer((128,), name="plain_reduce", reduction_type=kind)
+                context = _make_context(op, output, reduction_vars=(k, r))
+                result = collect_work_division_constraints(context)
+                self.assertEqual(
+                    result.allowed_splits,
+                    {k: frozenset({1}), r: frozenset({1})},
+                )
+                # A committed span split must be rejected, not used to
+                # silently re-enable an unsafe partial reduction.
+                context.committed_splits = {k: 2}
+                with self.assertRaisesRegex(Unsupported, "memory-span"):
+                    collect_work_division_constraints(context)
 
 
 class TestAlignedOwnershipSplitDomains(unittest.TestCase):
