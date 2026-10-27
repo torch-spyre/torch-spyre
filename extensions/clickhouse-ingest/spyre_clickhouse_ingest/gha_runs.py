@@ -45,7 +45,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -547,6 +549,23 @@ def attempt_rows(
     ]
 
 
+def _in_order(fn: Callable, items: Iterable, workers: int) -> Iterator:
+    """fn over items, results in item order; up to workers calls run at once, a few ahead."""
+    if workers <= 1:
+        yield from map(fn, items)
+        return
+    pool, pending, work = ThreadPoolExecutor(workers), deque(), iter(items)
+    try:
+        while True:
+            while len(pending) < 2 * workers and (item := next(work, None)):
+                pending.append(pool.submit(fn, item))
+            if not pending:
+                return
+            yield pending.popleft().result()
+    finally:
+        pool.shutdown(cancel_futures=True)
+
+
 def poll(
     gh: GitHub,
     client,
@@ -555,11 +574,13 @@ def poll(
     start: datetime,
     end: datetime,
     dry_run: bool = False,
+    workers: int = 1,
 ) -> tuple[int, int, str]:
     """Write every new or changed run attempt created in the window, oldest first.
 
     Returns (attempts, rows, stop reason or ''). A stop keeps every attempt completed so far,
-    so what is stored stays a prefix of the window.
+    so what is stored stays a prefix of the window; with workers > 1 attempts are fetched
+    concurrently but consumed in order.
     """
     known = (
         {}
@@ -569,13 +590,18 @@ def poll(
     attempts = rows = 0
     reason = ""
     batch: list[dict[str, Any]] = []
+    todo = (
+        (latest, a)
+        for latest in gh.runs(repo, start, end)
+        for a in range(1, int(latest.get("run_attempt") or 1) + 1)
+    )
     try:
-        for latest in gh.runs(repo, start, end):
-            for a in range(1, int(latest.get("run_attempt") or 1) + 1):
-                got = attempt_rows(gh, repo, latest, a, known)
-                if got:
-                    batch += got
-                    attempts += 1
+        for got in _in_order(
+            lambda item: attempt_rows(gh, repo, *item, known), todo, workers
+        ):
+            if got:
+                batch += got
+                attempts += 1
             if len(batch) >= 500:
                 rows += _flush(client, db, batch, dry_run)
     except Stop as stop:
@@ -628,6 +654,12 @@ def main(argv=None) -> None:
         help="re-read this much before the watermark (runs that started late)",
     )
     p.add_argument("--max-catchup-days", type=float, default=90.0)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="attempts fetched concurrently; 1 = sequential",
+    )
     p.add_argument(
         "--reserve",
         type=float,
@@ -692,23 +724,39 @@ def main(argv=None) -> None:
         wait_for_reset=args.wait_for_reset,
     )
     end_all, stopped = gh.deadline, False
-    for i, repo in enumerate(args.repo):
+    marks = {
+        repo: watermark(client, db or "", repo) if client is not None else None
+        for repo in args.repo
+    }
+    # Freshest first: a laggard polls last and inherits the time the others leave unused.
+    repos = sorted(
+        args.repo,
+        key=lambda r: marks[r] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    for i, repo in enumerate(repos):
         # An even share of the time left; what a repo leaves unused passes on.
         if end_all is not None:
-            gh.deadline = time.time() + (end_all - time.time()) / (len(args.repo) - i)
+            gh.deadline = time.time() + (end_all - time.time()) / (len(repos) - i)
         start, resumed = window_start(
             now,
             base,
-            watermark(client, db or "", repo) if client is not None else None,
+            marks[repo],
             timedelta(hours=args.overlap_hours),
             timedelta(days=args.max_catchup_days),
         )
         print(
             f"[info] {repo}: from {start:%Y-%m-%dT%H:%MZ}"
-            + (" (watermark - overlap)" if resumed else ""),
+            + (
+                f" (watermark - overlap, lag {(now - marks[repo]).total_seconds() / 3600:.1f} h)"
+                if resumed
+                else ""
+            ),
             file=sys.stderr,
         )
-        attempts, rows, reason = poll(gh, client, db, repo, start, now, args.dry_run)
+        attempts, rows, reason = poll(
+            gh, client, db, repo, start, now, args.dry_run, args.workers
+        )
         print(
             f"[info] {repo}: {attempts} run attempt(s), {rows} row(s)", file=sys.stderr
         )
