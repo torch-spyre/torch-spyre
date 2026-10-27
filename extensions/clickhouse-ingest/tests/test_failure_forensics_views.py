@@ -14,7 +14,9 @@
 
 """Static checks on schema/57; the views' behaviour is proven on a sandbox (verify_schema)."""
 
+import json
 import re
+from pathlib import Path
 
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
@@ -56,3 +58,53 @@ def test_event_record_tables_are_create_if_missing():
     stmts = SchemaApplier.statements(text)
     names = {re.search(r"TABLE IF NOT EXISTS (\w+)", s).group(1) for s in stmts}
     assert names == {"poller_decisions", "ci_write_failures", "merge_queue_events"}
+
+
+CASES = json.loads(
+    (Path(__file__).parent / "data" / "failure_fingerprint_cases.json").read_text()
+)["cases"]
+
+
+def by(name):
+    return next(c for c in CASES if c["case"] == name)
+
+
+def test_fixture_shape():
+    keys = {
+        "case",
+        "test",
+        "status",
+        "message",
+        "exception_class",
+        "fp_coarse",
+        "fp_fine",
+        "fp_text",
+    }
+    assert all(set(c) == keys for c in CASES)
+    assert len({c["case"] for c in CASES}) == len(CASES)
+    assert all(c["fp_coarse"].isdigit() and c["fp_fine"].isdigit() for c in CASES)
+
+
+def test_fixture_wrapper_cause_beats_wrapper_line():
+    for name in ("wrapper_indented_error", "wrapper_mlir_error"):
+        assert "SubprocException" not in by(name)["fp_text"]
+    assert by("truncated_no_cause")["exception_class"] == ""
+
+
+def test_fixture_numbers_paths_collapse_but_tests_and_causes_stay_apart():
+    a, b, o = by("numbers_a"), by("numbers_b"), by("same_cause_other_test")
+    assert a["fp_coarse"] == b["fp_coarse"] == o["fp_coarse"]
+    assert len({a["fp_fine"], b["fp_fine"], o["fp_fine"]}) == 3
+    assert by("tensor_likes_a")["fp_coarse"] == by("tensor_likes_b")["fp_coarse"]
+    coarse = [
+        by(n)["fp_coarse"]
+        for n in (
+            "wrapper_indented_error",
+            "wrapper_mlir_error",
+            "numbers_a",
+            "tensor_likes_a",
+            "unrelated_a",
+            "unrelated_b",
+        )
+    ]
+    assert len(set(coarse)) == len(coarse)
