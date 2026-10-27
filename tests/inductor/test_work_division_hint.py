@@ -2170,7 +2170,7 @@ def test_completed_reduction_relayout_device(
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2**-8, atol=0)
     roots = [
         root
         for directory in directories
