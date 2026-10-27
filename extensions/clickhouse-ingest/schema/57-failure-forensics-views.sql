@@ -1,5 +1,5 @@
 -- Failure forensics: join a test case's result to the CI run, PR, commits and runner behind it.
--- Views only; every fact comes from rows already written. Apply after 10-, 20-, 47- and 53-.
+-- Views only; every fact comes from rows already written. Apply after 10-, 20-, 45-, 47- and 53-.
 
 -- One row per artifact_results run_id: the CI run it came from and that run's context. run_key is
 -- the Jenkins run when artifact_results names one (props['orch_run_key']), else the GHA attempt
@@ -7,7 +7,8 @@
 -- with no pipeline_runs row yet (the GHA poller lags) keeps its keys and has NULL context.
 -- failed_job_agents / failed_job_images are the runners and `image_id_*` labels of the attempt's
 -- failed jobs: the best available answer to "where did this fail", as the failing job is not
--- recorded per case. base_sha is the PR base the run was started against, when the poller saw it.
+-- recorded per case. runner_nodes are the nodes hw_failure_diagnostics recorded for the run_id
+-- (empty when no hardware-diagnostic job ran). base_sha is the PR base the run was started against, when the poller saw it.
 CREATE VIEW IF NOT EXISTS v_result_run_context AS
 WITH runs AS
 (
@@ -43,6 +44,13 @@ jobs AS
     FROM v_pipeline_runs
     WHERE pipeline_type = 'gha-job' AND parent_run_key IN (SELECT gha_run_key FROM keyed WHERE gha_run_key != '')
     GROUP BY parent_run_key
+),
+nodes AS
+(
+    SELECT run_id, groupUniqArrayIf(node_name, node_name != '') AS runner_nodes
+    FROM hw_failure_diagnostics
+    WHERE run_id IN (SELECT run_id FROM keyed)
+    GROUP BY run_id
 )
 SELECT
     k.run_id AS run_id,
@@ -67,6 +75,7 @@ SELECT
     j.failed_job_agents AS failed_job_agents,
     j.failed_job_images AS failed_job_images,
     j.max_job_queue_ms AS max_job_queue_ms,
+    n.runner_nodes AS runner_nodes,
     (p.run_key != '' OR g.run_key != '') AS has_run_row
 FROM keyed AS k
 LEFT JOIN (SELECT * FROM v_pipeline_runs WHERE pipeline_type IN ('orchestrator', 'component-build', 'product-test', 'gha-workflow')
@@ -75,10 +84,66 @@ LEFT JOIN (SELECT * FROM v_pipeline_runs WHERE pipeline_type IN ('orchestrator',
 LEFT JOIN (SELECT * FROM v_pipeline_runs WHERE pipeline_type = 'gha-workflow'
            AND run_key IN (SELECT gha_run_key FROM keyed WHERE gha_run_key != '')) AS g
        ON g.run_key = k.gha_run_key AND k.gha_run_key != ''
-LEFT JOIN jobs AS j ON j.parent_run_key = k.gha_run_key AND k.gha_run_key != '';
+LEFT JOIN jobs AS j ON j.parent_run_key = k.gha_run_key AND k.gha_run_key != ''
+LEFT JOIN nodes AS n ON n.run_id = k.run_id;
 
--- Each case result with its run context and a normalised failure signature (numbers and addresses
--- masked, first line only), so the same assertion with different values groups together.
+-- Every case result with a failure fingerprint (fp_* are empty/0 for non-failures). The cause line is the deepest
+-- recognised one, not the last: an indented `Error:` line, else a `.mlir:L:C: error:` line, else the first
+-- non-wrapper exception line, else line 1 (the stored text is head-truncated, so a cause past the cap is lost).
+-- fp_coarse keys the exception class and the cause with paths and numbers masked; fp_fine adds the test and keeps
+-- the numbers; fp_text is the masked cause for display. Rules change by recreating the view, not the data.
+-- ALWAYS filter by name or ts: unfiltered it reads every case result.
+CREATE VIEW IF NOT EXISTS v_failure_fingerprint AS
+SELECT
+    ts, run_id, test_case_id, component, status, retried,
+    exception_class,
+    if(is_failure, cityHash64(exception_class, '|', coarse_text), 0) AS fp_coarse,
+    if(is_failure, cityHash64(exception_class, '|', fine_text, '|', toString(test_case_id)), 0) AS fp_fine,
+    if(is_failure, substring(coarse_text, 1, 160), '') AS fp_text
+FROM
+(
+    SELECT
+        ts, run_id, test_case_id, component, status, retried, is_failure,
+        if(extract(cause, '([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Fault))') != '',
+           extract(cause, '([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Fault))'),
+           extract(ls[1], '([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Fault))')) AS exception_class,
+        replaceRegexpAll(replaceRegexpAll(fine_base, '0x[0-9a-fA-F]+', '#'), '[0-9]+', '#') AS coarse_text,
+        fine_base AS fine_text
+    FROM
+    (
+        SELECT
+            ts, run_id, test_case_id, component, status, retried, is_failure, ls, cause,
+            replaceRegexpAll(cause, '(/[A-Za-z0-9_.+~-]+){2,}/?', '<path>') AS fine_base
+        FROM
+        (
+            SELECT
+                ts, run_id, test_case_id, component, status, retried, is_failure, ls,
+                trimBoth(replaceRegexpOne(multiIf(
+                    notEmpty(arrayFirst(x -> match(x, '^\\s+Error:'), ls)),
+                        arrayFirst(x -> match(x, '^\\s+Error:'), ls),
+                    notEmpty(arrayFirst(x -> match(x, '\\.mlir:[0-9]+:[0-9]+: error:'), ls)),
+                        replaceRegexpOne(arrayFirst(x -> match(x, '\\.mlir:[0-9]+:[0-9]+: error:'), ls),
+                                         '^.*\\.mlir:[0-9]+:[0-9]+: error:', ''),
+                    notEmpty(arrayFirst(x -> match(x, '^(E\\s+)?[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Fault)\\b')
+                                             AND NOT match(x, 'SubprocException|BackendCompilerFailed|CalledProcessError'), ls)),
+                        arrayFirst(x -> match(x, '^(E\\s+)?[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Fault)\\b')
+                                        AND NOT match(x, 'SubprocException|BackendCompilerFailed|CalledProcessError'), ls),
+                    ls[1]), '"$', '')) AS cause
+            FROM
+            (
+                SELECT
+                    ts, run_id, test_case_id, component, status,
+                    props['result.retried'] AS retried,
+                    status IN ('failed', 'error') AS is_failure,
+                    splitByChar('\n', replaceRegexpOne(fail_message, '^failed on (setup|teardown) with "', '')) AS ls
+                FROM test_case_runs
+            )
+        )
+    )
+);
+
+-- Each case result with its run context and failure fingerprint (see v_failure_fingerprint): `signature` is
+-- fp_text, so the same failure with different paths or values groups together.
 -- ALWAYS filter by name (and ts): unfiltered it reads every case result.
 CREATE VIEW IF NOT EXISTS v_case_run_history AS
 SELECT
@@ -88,8 +153,10 @@ SELECT
     c.classname AS classname,
     c.name AS name,
     cr.status AS status,
-    cr.props['result.retried'] AS retried,
-    lower(substring(replaceRegexpAll(splitByChar('\n', cr.fail_message)[1], '0x[0-9a-fA-F]+|[0-9]+(\\.[0-9]+)?', '#'), 1, 160)) AS signature,
+    cr.retried AS retried,
+    cr.fp_text AS signature,
+    cr.fp_coarse AS fp_coarse,
+    cr.fp_fine AS fp_fine,
     x.run_key AS run_key,
     x.gha_run_key AS gha_run_key,
     x.run_attempt AS run_attempt,
@@ -100,8 +167,9 @@ SELECT
     x.artifact_id AS artifact_id,
     x.failed_job_agents AS failed_job_agents,
     x.failed_job_images AS failed_job_images,
+    x.runner_nodes AS runner_nodes,
     x.has_run_row AS has_run_row
-FROM test_case_runs AS cr
+FROM v_failure_fingerprint AS cr
 INNER JOIN test_cases AS c ON c.test_case_id = cr.test_case_id AND c.component = cr.component
 LEFT JOIN v_result_run_context AS x ON x.run_id = cr.run_id;
 
@@ -195,3 +263,26 @@ LEFT JOIN (SELECT artifact_id, any(arrayMap(t -> concat(t.repo, '@', t.git_sha),
            FROM artifacts GROUP BY artifact_id) AS fa ON fa.artifact_id = w.first_fail_artifact
 LEFT JOIN (SELECT artifact_id, any(arrayMap(t -> concat(t.repo, '@', t.git_sha), sources)) AS srcs
            FROM artifacts GROUP BY artifact_id) AS pa ON pa.artifact_id = w.last_pass_artifact;
+
+-- Per day and coarse failure fingerprint: how widely it fails. failing_prs counts distinct PRs and
+-- failing_artifacts distinct artifact input versions, so a cause on one PR reads differently from one on many.
+-- ALWAYS filter by day (or ts range).
+CREATE VIEW IF NOT EXISTS v_failure_groups AS
+SELECT
+    toDate(f.ts) AS day,
+    f.fp_coarse AS fp_coarse,
+    any(f.exception_class) AS exception_class,
+    any(f.fp_text) AS fp_text,
+    count() AS failing_results,
+    uniqExact(f.run_id) AS failing_runs,
+    uniqExactIf(x.pr_number, x.pr_number != 0) AS failing_prs,
+    uniqExactIf(x.artifact_id, x.artifact_id != toUUID('00000000-0000-0000-0000-000000000000')) AS failing_artifacts,
+    uniqExact(f.test_case_id) AS failing_tests,
+    uniqExact(f.fp_fine) AS fine_keys,
+    min(f.ts) AS first_seen,
+    max(f.ts) AS last_seen,
+    groupUniqArray(3)(f.test_case_id) AS sample_test_case_ids
+FROM v_failure_fingerprint AS f
+LEFT JOIN v_result_run_context AS x ON x.run_id = f.run_id
+WHERE f.status IN ('failed', 'error')
+GROUP BY day, fp_coarse;

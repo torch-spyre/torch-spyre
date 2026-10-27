@@ -21,9 +21,11 @@ from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 FILE = SCHEMA_DIR / "57-failure-forensics-views.sql"
 VIEWS = {
     "v_result_run_context",
+    "v_failure_fingerprint",
     "v_case_run_history",
     "v_failure_recurrence",
     "v_failure_first_seen",
+    "v_failure_groups",
 }
 
 
@@ -40,3 +42,17 @@ def test_readme_lists_the_file_and_every_view():
         if "57-failure-forensics-views.sql" in ln
     )
     assert all(v in row for v in VIEWS)
+
+
+def test_fingerprint_columns_are_exposed_to_consumers():
+    text = FILE.read_text()
+    assert all(
+        f"AS {c}" in text for c in ("fp_coarse", "fp_fine", "fp_text", "runner_nodes")
+    )
+
+
+def test_event_record_tables_are_create_if_missing():
+    text = (SCHEMA_DIR / "58-ci-event-records.sql").read_text()
+    stmts = SchemaApplier.statements(text)
+    names = {re.search(r"TABLE IF NOT EXISTS (\w+)", s).group(1) for s in stmts}
+    assert names == {"poller_decisions", "ci_write_failures", "merge_queue_events"}
