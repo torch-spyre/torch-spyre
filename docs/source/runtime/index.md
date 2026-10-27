@@ -353,7 +353,10 @@ contiguous zero-offset input prefixes with larger base descriptors. When the inp
 and outputs have linear DL16 storage without lazy value transforms, it borrows
 the input and limits the transfer to the output allocation, including the final
 stick's padding. Single-row logits prefixes take this path with no extra tensor
-allocation or device copy on repeated calls. Tiled prefixes are materialized
+allocation or device copy on repeated calls. This contract applies to every
+eligible FP16/BF16 prefix: output padding may contain values from the source
+beyond the logical prefix, and downstream operations must ignore that padding.
+Logical tensor elements remain unchanged. Tiled prefixes are materialized
 into their own allocation. The work handle
 retains the borrowed or materialized input through asynchronous completion.
 Other eager collectives and allgather outputs reject these views. A compiled collective buffer

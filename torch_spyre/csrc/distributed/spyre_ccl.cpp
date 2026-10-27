@@ -475,6 +475,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
         " Actual: " + std::to_string(outputTensors.size());
     TORCH_CHECK(false, _err_msg);
   }
+  // check_single_tensor enforces logical contiguity here, before either the
+  // borrow or clone path. A linear base layout alone cannot validate a view's
+  // logical order (for example, a zero-offset slice with step 2).
   check_vector_tensor(inputTensors, 1, 1);
 
   auto input = inputTensors[0];

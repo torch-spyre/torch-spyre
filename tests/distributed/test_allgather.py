@@ -323,6 +323,24 @@ class TestAllGather(TestCase):
             self.assertEqual(base.cpu(), values * (step + 1), rtol=0, atol=0)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    @expects_raise
+    def test_allgather_rejects_stepped_linear_base(self, dtype, async_op):
+        # The allocation is linear and the view starts at zero, but its logical
+        # elements are not a contiguous prefix of that allocation.
+        base = torch.empty((1, 256), dtype=dtype, device=DEVICE)
+        stepped = base[:, ::2]
+        self.assertEqual(stepped.storage_offset(), 0)
+        self.assertEqual(stepped.stride(), (256, 2))
+        self.assertFalse(stepped.is_contiguous())
+        outputs = [
+            torch.empty((1, 128), dtype=dtype, device=DEVICE)
+            for _ in range(self.comm_size)
+        ]
+        with self.assertRaisesRegex(RuntimeError, "The tensor has to be contiguous"):
+            dist.all_gather(outputs, stepped, async_op=async_op)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
     @expects_raise
     def test_allgather_rejects_nonzero_storage_offset(self, dtype):
         x = torch.ones((5, 96), dtype=dtype, device=DEVICE)[1:]
