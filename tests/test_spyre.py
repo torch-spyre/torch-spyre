@@ -315,6 +315,101 @@ class TestSpyre(TestCase):
                 y[4096:], torch.full((4096,), -1, dtype=dtype), rtol=0, atol=0
             )
 
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_round_trip_same_format(self, dtype):
+        # The flagship fast-path combination: a same-format pinned tensor is
+        # submitted as a raw pinned DMA (DCI stripped) in both directions.
+        # fp16 keeps the conversion path and never exercises this.
+        x = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        pinned = x.pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), x, rtol=0, atol=0)
+
+        y = torch.empty(8192, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(y, x, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_d2h_dense_leading_slice(self, dtype):
+        # d[:4096].cpu() is dense with offset 0 but covers only part of the
+        # device allocation: the identity-copy skip must not fire, or the raw
+        # DMA (sized from the whole allocation) would overrun the 4096-element
+        # host buffer returned by .cpu().
+        src = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        dev = src.to("spyre")
+
+        out = dev[:4096].cpu()
+        torch.testing.assert_close(out, src[:4096], rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pageable_h2d_source_freed(self, dtype):
+        # With the DCI stripped there is no caller-thread staging copy, so
+        # flex reads the pageable source pages from the scheduler thread
+        # after the copy call returns. Dropping the only reference right
+        # after a non-blocking copy must not free those pages under the
+        # in-flight DMA.
+        n = 8192
+        dev = torch.empty(n, dtype=dtype, device="spyre")
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        expected = src.clone()
+
+        dev.copy_(src, non_blocking=True)
+        del src
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pinned_d2h_freed_and_reused(self, dtype):
+        # A pinned destination freed to the staging cache right after a
+        # non-blocking D2H must not be handed back out while the DMA is
+        # still writing it (the in-flight buffer is retained by the DMA's
+        # completion callback). Whether the next allocation recycles the
+        # freed buffer is timing-dependent, so this checks the observable
+        # contract: the copy completes without error and later pinned
+        # traffic through the cache is intact.
+        n = 8192
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        y = torch.empty(n, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        del y
+
+        z = torch.empty(n, dtype=dtype, pin_memory=True)
+        z.fill_(-1)
+        torch.accelerator.synchronize()
+
+        expected = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        torch.testing.assert_close(
+            z.copy_(dev, non_blocking=False), expected, rtol=0, atol=0
+        )
+
     def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
         # 64x32 int8 maps to a partial-stick device layout: the DCI carries
         # real stickification and must survive the identity-copy skip.

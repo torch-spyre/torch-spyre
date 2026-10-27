@@ -308,13 +308,24 @@ void SpyreStream::copyAsync(const at::Tensor& src,
         // Flex clones the descriptor when enqueuing; the tensor continues to
         // own the underlying allocation, just as in the full-storage path.
         copyAsyncImpl(cpu_ptr, host_capacity, &*range, &dci, host2device,
-                      std::make_shared<at::Tensor>(*cpu_tensor));
+                      std::make_shared<c10::Storage>(cpu_tensor->storage()));
         return;
       }
     }
+
+    // Hold the host storage alive across the DMA when flex will touch the
+    // user pages after launchOperation returns: that is every D2H (the raw
+    // DMA or the conversion's write-back runs on the scheduler thread) and
+    // any DCI-less H2D (with the DCI stripped there is no caller-thread
+    // staging copy, so the scheduler thread reads the source pages
+    // directly). Hold c10::Storage rather than at::Tensor: a tensor copy
+    // shares the TensorImpl, which resize_/set_ mutate in place by swapping
+    // in a new storage -- the old pages would be freed under the in-flight
+    // DMA. The pinned branches in copyAsyncImpl replace this token with the
+    // pinned-buffer owner.
     std::shared_ptr<void> host_lifetime;
-    if (device2host) {
-      host_lifetime = std::make_shared<at::Tensor>(*cpu_tensor);
+    if (device2host || dci_arg == nullptr) {
+      host_lifetime = std::make_shared<c10::Storage>(cpu_tensor->storage());
     }
     copyAsyncImpl(cpu_ptr, host_capacity, allocation, dci_arg, host2device,
                   std::move(host_lifetime));
