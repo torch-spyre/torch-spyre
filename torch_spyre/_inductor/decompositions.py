@@ -3369,6 +3369,11 @@ def _conv2d_im2col_matmul(
         C1 = K_w * C_p
         tv = t.view(N, Hq, stride_h, W_out, C1)
         w_cl = weight.permute(2, 3, 1, 0).contiguous().view(K_h, C1, C_out_p)
+        # The view merges (K_w, C_p) into K, which stays two device dims, and
+        # batchmatmul rejects a K that spans two dims once C_out is more than
+        # one stick (out_reuse_dim.size() == 1). A clone of a contiguous view
+        # is dropped, so pad and slice to write w_cl through a real kernel.
+        w_cl = torch.constant_pad_nd(w_cl, (0, 0, 0, stick))[:, :C1]
     else:
         C1 = _round_up(K_w * C, stick)
         # The W taps read through the input's own H stick, whose device size is

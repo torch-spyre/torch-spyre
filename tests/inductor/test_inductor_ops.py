@@ -7591,6 +7591,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
+                # H == 1 with K (2 taps x 64 channels) and C_out both more than
+                # one stick: the matmul weight must be one K dim, not (K_w, C).
+                "1x3x1x64_ksize1x2_cout128": (
+                    cached_randn((1, 3, 1, 64)),
+                    cached_randn((128, 3, 1, 2)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
             },
         },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
