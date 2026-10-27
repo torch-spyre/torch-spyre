@@ -21,8 +21,8 @@ path is pinned to, so the enumeration path and the reporting path cannot
 drift apart.
 """
 
-from types import SimpleNamespace
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
@@ -203,7 +203,7 @@ def _law(run_elems, split, out_elems=_NORM_ELEMS, cores=32):
     )
 
 
-@pytest.mark.parametrize("groups", [8])
+@pytest.mark.parametrize("groups", [4, 8])
 def test_split_past_fitted_range_is_declined_not_clamped(groups):
     # A GROUPED movement keeps the old range [2, 8]: the law is fitted on
     # permutations, and a gather into a matmul's replicated operand measured
