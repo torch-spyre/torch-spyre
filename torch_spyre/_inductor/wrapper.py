@@ -34,8 +34,8 @@ from .ir import FixedTiledLayout
 def _sanitize_fallback_arg(arg: str) -> str:
     # PyTorch's repr(device) formats as device(type='spyre', index=0), which is invalid Python syntax.
     # Convert device(type='x', index=y) -> torch.device('x', y) and device(type='x') -> torch.device('x')
-    arg = re.sub(r"device\(type='([^']+)',\s*index=(\d+)\)", r"torch.device('\1', \2)", arg)
-    arg = re.sub(r"device\(type='([^']+)'\)", r"torch.device('\1')", arg)
+    arg = re.sub(r"\bdevice\(type=['\"]?([^'\",)]+)['\"]?,\s*index=([^)]+)\)", r"torch.device('\1', \2)", arg)
+    arg = re.sub(r"\bdevice\(type=['\"]?([^'\")]+)['\"]?\)", r"torch.device('\1')", arg)
     return arg
 
 
