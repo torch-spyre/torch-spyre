@@ -200,30 +200,92 @@ class TestSpyre(TestCase):
     # accepted the layout, the raw DMA would move storage bytes a plain
     # memcpy would — including bytes before a storage offset or stride
     # gaps — and the comparison would fail.)
+    #
+    # These run in same-format dtypes (int8, fp32): fp16/bf16 host and
+    # device formats differ, so their DCIs are rejected at the dataformat
+    # check before the offset/stride/broadcast logic is ever reached and
+    # would not exercise the layout rejection at all.
 
-    def test_pinned_h2d_storage_offset_view_keeps_conversion(self):
-        base = (torch.arange(8192, dtype=torch.int64) % 31).to(torch.float16)
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_storage_offset_view_keeps_conversion(self, dtype):
+        base = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
         pinned = base.pin_memory()
         view = pinned[37:8101]  # non-zero storage offset + partial slice
 
         dev = view.to("spyre")
         torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
 
-    def test_pinned_h2d_strided_view_keeps_conversion(self):
-        base = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_strided_view_keeps_conversion(self, dtype):
+        base = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype)
         pinned = base.pin_memory()
         view = pinned.view(64, 64)[:, ::2]  # stride gaps between rows
 
         dev = view.to("spyre")
         torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
 
-    def test_pinned_h2d_broadcast_strides_keeps_conversion(self):
-        row = (torch.arange(64, dtype=torch.int64) % 31).to(torch.float16)
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_broadcast_strides_keeps_conversion(self, dtype):
+        row = (torch.arange(64, dtype=torch.int64) % 31).to(dtype)
         pinned = row.pin_memory()
         view = pinned.unsqueeze(0).expand(32, 64)  # broadcast (zero) stride
 
         dev = view.to("spyre")
         torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_into_device_slice_keeps_conversion(self, dtype):
+        # The device side is the strided side here: a copy into d[64:] must
+        # keep its DCI, since a raw DMA would write storage-base-relative
+        # bytes instead of the slice's.
+        pinned = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype).pin_memory()
+        dev = torch.zeros(8192, dtype=dtype, device="spyre")
+
+        dev[64:4160].copy_(pinned)
+        torch.testing.assert_close(dev[64:4160].cpu(), pinned, rtol=0, atol=0)
+        torch.testing.assert_close(
+            dev[:64].cpu(), torch.zeros(64, dtype=dtype), rtol=0, atol=0
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_d2h_from_device_slice_keeps_conversion(self, dtype):
+        # Mirror of the above: reading d[64:] out into a pinned host tensor
+        # must also keep the conversion for the device-side offset.
+        dev = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype).to("spyre")
+        y = torch.empty(4096, dtype=dtype, pin_memory=True)
+
+        y.copy_(dev[64:4160])
+        torch.testing.assert_close(y, dev[64:4160].cpu(), rtol=0, atol=0)
 
     def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
         # 64x32 int8 maps to a partial-stick device layout: the DCI carries
