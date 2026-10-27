@@ -377,19 +377,17 @@ def _shuffle_stick_levels(
     if ea not in STAGGERED_EAS:
         levels = [(elems_per_stick, 1), (-(-size // elems_per_stick), elems_per_stick)]
     elif elems_per_stick == 64:
-        if size % 64:
-            raise Unsupported(
-                f"shuffle to/from {ea.name} needs the stick dim ({size} per core) "
-                f"to be a multiple of 64 for 16-bit data"
-            )
-        levels = [(4, 1), (2, 32), (8, 4), (size // 64, 64)]
+        # A partial last stick is padded to a whole one.
+        levels = [(4, 1), (2, 32), (8, 4), (-(-size // 64), 64)]
     elif elems_per_stick == 32:
-        if size % 64:
+        # The stagger unit is a pair of sticks; a padded last stick still counts.
+        sticks = -(-size // 32)
+        if sticks % 2:
             raise Unsupported(
-                f"shuffle to/from {ea.name} needs the stick dim ({size} per core) "
-                f"to be a multiple of 64 for FP32 data (a stick pair)"
+                f"shuffle to/from {ea.name} needs whole FP32 stick pairs, got "
+                f"{sticks} stick(s) for a stick dim of {size} per core"
             )
-        levels = [(4, 1), (8, 8), (2, 4), (size // 64, 64)]
+        levels = [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]
     else:
         raise Unsupported(
             f"shuffle to/from {ea.name} is not defined for {elems_per_stick} "

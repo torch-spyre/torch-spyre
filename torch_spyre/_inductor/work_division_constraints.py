@@ -140,6 +140,7 @@ def collect_work_division_constraints(
         direct_read_source_stick_split_domains,
         aligned_ownership_split_domains,
         restickify_padding_blocked_vars,
+        ea_shuffle_stick_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
@@ -678,6 +679,30 @@ def restickify_padding_blocked_vars(
         if concretize_expr(ctx.it_space[dim]) % stick_size
     }
     return ConstraintResult(blocked=padded)
+
+
+def ea_shuffle_stick_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Keep the stick dimension of a ``spyre.shuffle`` op on one core.
+
+    A staggered element arrangement interleaves the columns of a whole stagger
+    unit (one 64-element stick, or an fp32 stick pair of 64 columns). Splitting
+    the stick dimension across cores would hand a core part of a unit, which the
+    shuffle's per-core elem_arr encoding cannot express. Only the explicit
+    shuffle (lowered with ``shuffle_ea``) is restricted: dtype conversions that
+    produce a staggered EA keep their own work division.
+    """
+    if (
+        getattr(ctx.op, "shuffle_ea", None) is None
+        or not isinstance(ctx.op.data, Pointwise)
+        or len(ctx.input_tds) != 1
+    ):
+        return ConstraintResult()
+
+    in_ea = getattr(ctx.input_tds[0].layout.device_layout, "element_arrangement", None)
+    out_ea = getattr(ctx.output_td.layout.device_layout, "element_arrangement", None)
+    if in_ea == out_ea or not {in_ea, out_ea} & STAGGERED_EAS:
+        return ConstraintResult()
+    return ConstraintResult(blocked=set(ctx.stick_vars))
 
 
 def _has_ea_tensor(

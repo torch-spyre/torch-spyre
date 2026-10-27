@@ -387,8 +387,16 @@ def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
 #
 # ``ea`` is the integer value of the target ElementArrangement.
 @torch.library.custom_op("spyre::shuffle", mutates_args=(), device_types="spyre")
-def shuffle(src: torch.Tensor, ea: int) -> torch.Tensor:
-    pass
+@compile_once("spyre.shuffle", dynamic=False)
+def shuffle(src: torch.Tensor, ea: int, compiled) -> torch.Tensor:
+    """Run an eager shuffle as a compiled Spyre op.
+
+    specialize_int=True bakes ``ea`` into the trace: the lowering stashes it as a
+    constant, so a symbolic ``ea`` reused for another value would shuffle to the
+    wrong arrangement.
+    """
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, ea)
 
 
 @shuffle.register_fake

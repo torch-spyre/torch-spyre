@@ -867,8 +867,8 @@ def validate_ops(graph: GraphLowering) -> None:
         if len(inputs) <= 1:
             continue
 
-        # Collect ONE EA per unique input buffer
-        buf_eas = {}  # buffer_name -> EA
+        # Collect ONE (layout) per unique input buffer
+        buf_stls = {}  # buffer_name -> SpyreTensorLayout
         for inp in inputs:
             buf = V.graph.get_buffer(inp.name)
             if not hasattr(buf, "layouts"):
@@ -877,46 +877,29 @@ def validate_ops(graph: GraphLowering) -> None:
             # Get the first SpyreTensorLayout for this buffer
             for layout in buf.layouts:
                 if isinstance(layout, SpyreTensorLayout):
-                    if inp.name not in buf_eas:
-                        buf_eas[inp.name] = layout.element_arrangement
+                    if inp.name not in buf_stls:
+                        buf_stls[inp.name] = layout
                     break
 
-        if len(buf_eas) <= 1:
+        if len(buf_stls) <= 1:
             continue
 
-        input_names = list(buf_eas.keys())
-        stl_eas = list(buf_eas.values())
+        input_names = list(buf_stls.keys())
+        stl_eas = [stl.element_arrangement for stl in buf_stls.values()]
 
         op_name = _get_op_name(op)
 
-        # Check ElementArrangement compatibility
-        if is_ea_compatible(stl_eas):
-            logger.debug(
-                f"EA incompatible detected for op {op_name}: {list(zip(input_names, stl_eas))}"
-            )
+        # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
+        skip_ops = {"layernormnorm", "layernormscale"}
+        skip_eas = {ElementArrangement.EXX2}
+        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
+            continue
 
-            # Check for the mixed STANDARD + supported staggered pattern
-            if len(stl_eas) == 2 and ElementArrangement.STANDARD in stl_eas:
-                std_idx = stl_eas.index(ElementArrangement.STANDARD)
-                stg_idx = 1 - std_idx
-                stg_ea = stl_eas[stg_idx]
-
-                if stg_ea in SUPPORTED_EAS:
-                    stg_name = input_names[stg_idx]
-                    stg_buf = V.graph.get_buffer(stg_name)
-
-                    # We want to shuffle the staggered operand to STANDARD
-                    # so it matches the other operand.
-                    target_ea = ElementArrangement.STANDARD
-
-                    logger.debug(
-                        f"Attempting to insert shuffle for buffer {stg_name} (EA={stg_ea} -> {target_ea})"
-                    )
-                    if _insert_shuffle_op(graph, op, stg_name, stg_buf, target_ea):
-                        logger.debug(f"Successfully inserted shuffle for {stg_name}")
-                        continue
-
-            # If we couldn't fix it, raise error
+        # Valid EA patterns (see is_ea_compatible):
+        # 1. All operands share one EA.
+        # 2. Exactly one distinct non-STANDARD EA (not EXX2) mixed with STANDARD
+        #    operands (the broadcast pattern).
+        if not is_ea_compatible(stl_eas):
             args_str = ", ".join(
                 f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
             )
@@ -925,6 +908,34 @@ def validate_ops(graph: GraphLowering) -> None:
                 f"Valid patterns: all inputs share one EA, or one non-STANDARD EA broadcast against "
                 f"STANDARD inputs. op: {op_name}, args: {args_str}"
             )
+
+        # Mixed STANDARD + supported staggered EA where neither side is a
+        # stick broadcast (case 3.3 in _multi_arg_pointwise_layouts): shuffle
+        # the staggered operand to STANDARD so the op sees one arrangement.
+        # When either side broadcasts at the stick dim the stagger is
+        # unobservable and no shuffle is needed.
+        if len(stl_eas) == 2 and ElementArrangement.STANDARD in stl_eas:
+            stg_idx = 1 - stl_eas.index(ElementArrangement.STANDARD)
+            stg_name = input_names[stg_idx]
+            stg_stl = buf_stls[stg_name]
+            std_stl = buf_stls[input_names[1 - stg_idx]]
+            if (
+                stl_eas[stg_idx] in SUPPORTED_EAS
+                and stg_stl.stride_map[-1] != -1
+                and std_stl.stride_map[-1] != -1
+            ):
+                target_ea = ElementArrangement.STANDARD
+                logger.debug(
+                    f"Inserting shuffle for buffer {stg_name} "
+                    f"(EA={stl_eas[stg_idx]} -> {target_ea})"
+                )
+                if not _insert_shuffle_op(
+                    graph, op, stg_name, V.graph.get_buffer(stg_name), target_ea
+                ):
+                    raise Unsupported(
+                        f"Failed to insert EA shuffle for buffer {stg_name} "
+                        f"in op {op_name}"
+                    )
 
 
 def optimize_shuffling(graph: GraphLowering) -> None:

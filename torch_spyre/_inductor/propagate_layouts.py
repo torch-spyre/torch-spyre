@@ -854,17 +854,21 @@ def _single_arg_op_layout(
             dst_ea_int = getattr(op, "shuffle_ea", None)
 
             if dst_ea_int is None:
-                raise Unsupported("shuffle: missing ea_shuffle_dst_ea on buffer")
+                raise Unsupported("shuffle: missing shuffle_ea on buffer")
 
-            # Convert int back to ElementArrangement enum
+            # Convert int back to ElementArrangement enum. The pybind enum has no
+            # int constructor (mypy: call-arg), so look the member up by value.
+            ea_by_value = {
+                int(member.value): member
+                for member in ElementArrangement.__members__.values()
+            }
             try:
-                dst_ea = next(
-                    member
-                    for member in ElementArrangement.__members__.values()
-                    if member.value == dst_ea_int
+                dst_ea = ea_by_value[int(dst_ea_int)]
+            except (KeyError, TypeError, ValueError):
+                raise Unsupported(
+                    f"shuffle: invalid EA value {dst_ea_int!r} "
+                    f"({type(dst_ea_int).__name__})"
                 )
-            except ValueError:
-                raise Unsupported(f"shuffle: invalid ea value {dst_ea_int}")
 
             # Preserve the full device geometry (device_size, stride_map) and
             # only change the element_arrangement tag.

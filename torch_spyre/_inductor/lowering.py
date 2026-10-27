@@ -1598,6 +1598,9 @@ def lower_spyre_shuffle(src, ea):
     # as a distinct ComputedBuffer. The origin_node keeps the FX-level
     # spyre.shuffle node alive in data.origins so propagate_layouts can
     # identify it and read ea from the node's args.
+    # Dynamo can hand a int read off an object attribute (e.g. ``ea.value``) over
+    # as a symbolic int; the target EA must be a concrete value here.
+    ea = V.graph.sizevars.guard_int(ea)
     src.realize()
     loader = src.make_loader()
     pw = Pointwise.create(

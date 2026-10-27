@@ -39,7 +39,10 @@ EA = ElementArrangement
 def _run(fn, *args, mode="compile"):
     if mode == "compile":
         fn = torch.compile(fn)
-    return fn(*args)
+    # specialize_int: ``shuffle`` reads ``ea.value`` inside the traced function,
+    # and the target EA must stay a constant rather than become a symbolic int.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return fn(*args)
 
 
 def get_ea(tensor):
@@ -58,10 +61,11 @@ def assert_ea(tensor, expected_ea):
 
 
 def assert_val(fn, x, result, rtol=1e-3, atol=1e-3):
+    """Compare ``result`` to ``fn`` on CPU; ``x`` is a tensor or a tuple of them."""
     result_ea = get_ea(result)
     if result_ea == EA.STANDARD:
-        x_cpu = x.cpu()
-        result_cpu = fn(x_cpu)
+        xs = x if isinstance(x, tuple) else (x,)
+        result_cpu = fn(*(t.cpu() for t in xs))
         torch.testing.assert_close(result.cpu(), result_cpu, rtol=rtol, atol=atol)
 
 
@@ -107,17 +111,19 @@ def test_fp16_to_fp32_standard_input(device, mode, fp16):
 
 @pytest.mark.parametrize("device", ["spyre"])
 @pytest.mark.parametrize("mode", ["compile", "eager"])
-def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device, mode):
-    """A bf16/fp32 add must raise on EA mismatch instead of silently executing (#2843)."""
+def test_mixed_bf16_fp32_add_shuffles_ea_mismatch(device, mode):
+    """A bf16/fp32 add mixes EAs; a shuffle makes them match (#2843)."""
 
     def fn(x, y):
         return torch.add(x, y)
 
-    x_fp32 = torch.randn(5120, dtype=torch.float32, device=device)
-    y_bf16 = torch.randn(5120, dtype=torch.bfloat16, device=device)
+    x_fp32 = torch.randn(5120, dtype=torch.float32)
+    y_bf16 = torch.randn(5120, dtype=torch.bfloat16)
 
-    with pytest.raises(Exception, match="element arrangement|EA"):
-        _run(fn, x_fp32, y_bf16)
+    result = _run(fn, x_fp32.to(device), y_bf16.to(device), mode=mode)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    assert_val(fn, (x_fp32, y_bf16), result, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -306,36 +312,22 @@ def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
 
 # An op consuming an upcast FP32 value before the downcast back, on stick lengths
 # that end inside a stick. The upcast value is staggered: each FP16 stick spans a
-# pair of FP32 sticks. Padding the conversions is enough while work division
-# leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
-# is a whole number of pairs; (68,) is the unsplit case.
-_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
-# Here work division splits the stick dim and the round-up ends in the middle of
-# a pair, so the pair's second stick is left to no core.
-# TODO: make work division handle staggered FP32, splitting the stick dim by
-# whole stick pairs.
-_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
+# pair of FP32 sticks, and the last pair's second stick must still be processed
+# when work division splits the stick dim.
+_PARTIAL_STICK_UPCAST_SHAPES = [
+    (68,),
+    (196,),
+    (232,),
+    (1000,),
+    (4100,),
+    (4, 68),
+    (4, 100),
+    (4, 104),
+    (4, 196),
+]
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        *_PARTIAL_STICK_UPCAST_PASS,
-        *[
-            pytest.param(
-                shape,
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=AssertionError,
-                    reason="TODO: size work division for an upcast value by whole "
-                    "stick pairs, so the last pair's second stick is processed",
-                ),
-            )
-            for shape in _PARTIAL_STICK_UPCAST_NEEDS_PAIRS
-        ],
-    ],
-    ids=str,
-)
+@pytest.mark.parametrize("shape", _PARTIAL_STICK_UPCAST_SHAPES, ids=str)
 def test_upcast_consumed_on_partial_stick(shape):
     """An op between an FP16 -> FP32 -> FP16 round trip keeps every element.
 
@@ -727,7 +719,6 @@ class TestEAShuffle:
     }
 
     @staticmethod
-    @staticmethod
     def _case(in_dtype, out_dtype=None, in_ea=None, out_ea=None, rtol=1e-3, atol=1e-3):
         in_ea = in_ea if in_ea is not None else EA.STANDARD
         out_ea = out_ea if out_ea is not None else EA.STANDARD
@@ -752,18 +743,18 @@ class TestEAShuffle:
 
     @pytest.mark.parametrize("shape", SHAPES, ids=[shapes2key((s,)) for s in SHAPES])
     @pytest.mark.parametrize(
-        "name, base_dtype, cast_dtype, target_ea, exp_ea, atol, rtol",
+        "name, base_dtype, cast_dtype, target_ea, exp_ea, rtol, atol",
         TEST_CASES,
         ids=[case[0] for case in TEST_CASES],
     )
     def test_shuffle(
-        self, shape, name, base_dtype, cast_dtype, target_ea, exp_ea, atol, rtol
+        self, shape, name, base_dtype, cast_dtype, target_ea, exp_ea, rtol, atol
     ):
         def fn(x):
             x_proc = x.to(cast_dtype) if cast_dtype is not None else x
             return shuffle(x_proc, target_ea)
 
-        x = cached_randn(*shape, dtype=base_dtype)
+        x = cached_randn(shape, dtype=base_dtype)
         result = _run(fn, x.to(DEVICE_NAME))
 
         assert_ea(result, exp_ea)
@@ -802,8 +793,8 @@ class TestEAShuffle:
 
         result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
 
-        assert_ea(result, self.EA.STANDARD)
-        assert_val(fn, x, result, rtol=1e-2, atol=1e-2)
+        assert_ea(result, EA.STANDARD)
+        assert_val(fn, (x, y), result, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize(
         "shape", BASIC_SHAPES, ids=[shapes2key((s,)) for s in BASIC_SHAPES]
@@ -827,7 +818,7 @@ class TestEAShuffle:
         result = _run(fn, x_stg, y_dev)
 
         assert_ea(result, EA.STANDARD)
-        assert_val(fn, x, result)
+        assert_val(fn, (x, y), result)
 
     @expects_raise
     @pytest.mark.parametrize(
