@@ -499,6 +499,15 @@ def test_the_watermark_extends_the_window_after_an_outage():
     )
 
 
+def test_the_default_overlap_keeps_a_catch_up_chunk_from_relisting_hours():
+    mark = NOW - timedelta(days=1)
+    overlap = timedelta(hours=gha_runs.OVERLAP_HOURS)
+    start, resumed = gha_runs.window_start(
+        NOW, timedelta(hours=8), mark, overlap, timedelta(days=90)
+    )
+    assert resumed and mark - start <= timedelta(hours=1)
+
+
 def test_catch_up_is_capped_but_an_explicit_backfill_is_not():
     day = timedelta(days=1)
     args = (timedelta(hours=6), timedelta(days=90))

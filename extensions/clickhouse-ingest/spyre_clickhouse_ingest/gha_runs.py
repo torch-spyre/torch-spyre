@@ -56,6 +56,8 @@ API = "https://api.github.com"
 LIST_CAP = 1000
 PAGE = 100
 RETRIES = 6
+# Re-read this long before the watermark; each chunk of a catch-up lists the whole overlap again.
+OVERLAP_HOURS = 1.0
 # Exit status of a poll that stopped early with more to do: at its deadline or an expired token
 # (a caller may continue at once), or at the rate reserve (wait for a later run). 0 = done.
 EXIT_MORE = 3
@@ -567,7 +569,7 @@ def main(argv=None) -> None:
     p.add_argument(
         "--overlap-hours",
         type=float,
-        default=6.0,
+        default=OVERLAP_HOURS,
         help="re-read this much before the watermark (runs that started late)",
     )
     p.add_argument("--max-catchup-days", type=float, default=90.0)
