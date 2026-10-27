@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast, NamedTuple, Optional
 
 import sympy
@@ -84,6 +85,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     relayout_copy_name,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.residency_rules import buffer_residency_reason
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
@@ -153,6 +155,8 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     RelayoutCandidate,
     solver_relayout_edge_context,
     solver_relayout_pair_cost,
+    prefix_lx_contraction_axis,
+    prefix_lx_gather_source,
     work_division_from_view,
 )
 from torch_spyre._inductor.cost_model import CostParams
@@ -758,10 +762,168 @@ class ScratchpadOptimizationPass(ABC):
         pass
 
 
+@dataclass
+class _BufferResidencyChecks:
+    """Facts for one synchronous residency check, before any graph edit.
+
+    Cached facts belong to this call only. Later solver passes create a new
+    adapter; they must not reuse it after changing graph or layout metadata.
+    """
+
+    allocator: "ScratchpadAllocator"
+    graph: GraphLowering
+    name: str
+    uses: list[int]
+    op: Optional[Operation]
+    mutated_buffers: set[str]
+    graph_output_names: set[str]
+    reinterpret_output_names: set[str]
+    ncores: dict[str, int]
+    ncores_reasons: dict[str, str]
+    division_is_fixed: bool
+    buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]]
+    planned_lx_buffers: frozenset[str]
+    lx_relayout_plans: Sequence[LXRelayoutPlan]
+    drain_plans: Collection[str]
+    tileable: bool
+    _loop_carry: bool = False
+
+    def op_allowed(self) -> Optional[str]:
+        if self.op is None or not self.allocator._op_output_good_for_lx_reuse(
+            self.op, self.planned_lx_buffers
+        ):
+            return "op not allowed"
+        return None
+
+    def sized(self) -> Optional[str]:
+        if not hasattr(getattr(self.op, "layout", None), "device_layout"):
+            return "unsized (no device layout)"
+        return None
+
+    def empty(self) -> Optional[str]:
+        if is_empty_tiled_layout(cast(ComputedBuffer, self.op).layout):
+            return "empty tensor"
+        return None
+
+    def mutation(self) -> Optional[str]:
+        self._loop_carry = not self.division_is_fixed and _is_loop_carry_storage(
+            self.op
+        )
+        return "mutation target" if self.name in self.mutated_buffers else None
+
+    def loop_carry(self) -> bool:
+        return self._loop_carry
+
+    def advancing(self) -> Optional[str]:
+        if _is_tiled_advancing(self.op) or _is_read_advancing_anywhere(
+            self.name, self.buf_user_deps
+        ):
+            return "tiled (advancing)"
+        return None
+
+    def restickify(self) -> Optional[str]:
+        if self.division_is_fixed:
+            return self.allocator._restickify_barrier(
+                self.graph,
+                self.name,
+                self.uses,
+                lx_relayout_plans=self.lx_relayout_plans,
+            )
+        return None
+
+    def extern(self) -> Optional[str]:
+        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
+            self.graph, self.uses
+        ):
+            return "extern kernel user or live across extern kernel"
+        return None
+
+    def multi_output_extern(self) -> Optional[str]:
+        if (
+            config.enable_lx_context_switching
+            and _multi_output_extern_kernel_in_live_range(self.graph, self.uses)
+        ):
+            return "live across multi-output extern kernel"
+        return None
+
+    def indirect(self) -> Optional[str]:
+        if self.allocator._is_index_or_indirectly_accessed(
+            self.graph, self.name, self.uses, self.op
+        ):
+            return "index tensor or indirectly accessed"
+        return None
+
+    @cached_property
+    def _cloned_output(self) -> bool:
+        return self.name in self.graph_output_names and clone_at_graph_boundaries()
+
+    def reinterpret_output(self) -> Optional[str]:
+        if self._cloned_output and self.name in self.reinterpret_output_names:
+            return "graph output is a ReinterpretView"
+        return None
+
+    def mutated_output(self) -> Optional[str]:
+        if self._cloned_output and self.name in self.mutated_buffers:
+            return "graph output mutated after production"
+        return None
+
+    def drain(self) -> bool:
+        return self.name in self.drain_plans
+
+    @cached_property
+    def _prefix_gather(self) -> bool:
+        return (
+            config.lx_planner_relayout
+            and not config.ktir_emitter
+            and prefix_lx_gather_source(self.graph, self.name, self.uses)
+            and (
+                (not self.division_is_fixed and self.allocator._decides_lx_relayouts)
+                or (
+                    self.division_is_fixed
+                    and any(
+                        plan.source_name == self.name for plan in self.lx_relayout_plans
+                    )
+                )
+            )
+        )
+
+    def partial_read(self) -> Optional[str]:
+        # Keep the original evaluation point, even when the read is complete.
+        _ = self._prefix_gather
+        return (
+            "partial/offset read"
+            if buffer_not_read_in_full(self.graph, self.name)
+            else None
+        )
+
+    def prefix_gather(self) -> bool:
+        return self._prefix_gather
+
+    def core_division(self) -> Optional[str]:
+        if self.division_is_fixed and self.ncores.get(self.name, -1) < 0:
+            reason = self.ncores_reasons.get(self.name, "core div mismatch")
+            return f"core div mismatch: {reason}"
+        return None
+
+    def untiled(self) -> Optional[str]:
+        if not self.tileable:
+            return self.allocator._untiled_residency_bar(
+                self.name, self.uses, self.graph_output_names
+            )
+        return None
+
+    def back_gap(self) -> Optional[str]:
+        if _would_produce_lx_back_gap(self.graph, self.name, self.uses):
+            return "lx back gap"
+        return None
+
+
 class ScratchpadAllocator:
     """
     Class for allocating on scratchpad
     """
+
+    _decides_lx_relayouts: bool = False
 
     def __init__(
         self,
@@ -1071,102 +1233,26 @@ class ScratchpadAllocator:
             tileable: the solve may tile ``name``'s op, which skips the
                 :meth:`_untiled_residency_bar` checks; the solver applies them.
         """
-        if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
-            return "op not allowed"
-        if not hasattr(getattr(op, "layout", None), "device_layout"):
-            # No device layout => no computable footprint (e.g. a
-            # MultiOutputLayout tuple op). There is nothing to place, and the
-            # checks below would raise.
-            return "unsized (no device layout)"
-        if is_empty_tiled_layout(op.layout):
-            # The joint solver does not consult the fixed-division judge until
-            # after placement, so it must share this pre-allocation exclusion.
-            return "empty tensor"
-        # A counted-loop carry may stay resident only when the joint solver can
-        # also choose the update's division.  Fixed-division placement cannot
-        # repair a mismatched update and therefore keeps the mutation target in
-        # HBM, like every other mutation.
-        loop_carry_is_safe = not division_is_fixed and _is_loop_carry_storage(op)
-        if name in mutated_buffers and not loop_carry_is_safe:
-            return "mutation target"
-        if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
-            # LX addresses cannot be expressed as affine.apply symbols today (see
-            # compute_ops.py's generate_sdsc, which raises NotImplementedError via
-            # _tensor_tiled_by_symbol for exactly this case), so a buffer whose
-            # address advances per coarse-tile iteration must stay in HBM, where that is
-            # supported -- whether the advance is on this buffer's own write
-            # (_is_tiled_advancing) or on some other op's read of it
-            # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
-            # copied into a nested tile every outer iteration).
-            return "tiled (advancing)"
-        if division_is_fixed:
-            # On the joint path this same geometric check runs again per
-            # candidate division pair, as part of the solver's own residency
-            # gate (``_cd_parent_matches`` / ``constrain_residency``): a
-            # restickify reader is an ordinary consumer edge there, and an
-            # edge with no compatible pair already forces ``in_buffer`` false
-            # (see ``constrain_residency``'s docstring). Applying the barrier
-            # here too would instead test the read against whatever division
-            # the op happens to carry on ``iteration_space_ownership`` before
-            # the solver has chosen anything -- stale, provisional, and
-            # unrelated to any candidate the solver could actually pick -- and
-            # can reject a buffer the solver would otherwise place correctly
-            # (issue #4655).
-            restickify = self._restickify_barrier(
-                graph, name, uses, lx_relayout_plans=lx_relayout_plans
+        return buffer_residency_reason(
+            _BufferResidencyChecks(
+                self,
+                graph,
+                name,
+                uses,
+                op,
+                mutated_buffers,
+                graph_output_names,
+                reinterpret_output_names,
+                ncores,
+                ncores_reasons,
+                division_is_fixed,
+                buf_user_deps,
+                planned_lx_buffers,
+                lx_relayout_plans,
+                drain_plans,
+                tileable,
             )
-            if restickify is not None:
-                return restickify
-        # PR3683's guard: reject residency outright rather than let LX context
-        # switching (dump/restore around the risky call) handle it. Kept behind
-        # the flag, not deleted, so the old (conservative) and new (context
-        # switching) behaviors can still be compared -- see
-        # LxContextSwitchingPass in lx_context_switching.py, which is the intended
-        # long-term replacement for this check.
-        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
-            graph, uses
-        ):
-            return "extern kernel user or live across extern kernel"
-        # Unconditional, regardless of the flag above: LxContextSwitchingPass does
-        # not bracket multi-output FallbackKernels (see
-        # _multi_output_extern_kernel_in_live_range's docstring), so a buffer live
-        # across one gets no protection from either mechanism unless residency is
-        # refused here.
-        if config.enable_lx_context_switching and (
-            _multi_output_extern_kernel_in_live_range(graph, uses)
-        ):
-            return "live across multi-output extern kernel"
-        if self._is_index_or_indirectly_accessed(graph, name, uses, op):
-            # Index tensors and the value tensors they index into are read via
-            # data-dependent (indirect) addressing, must stay in hbm.
-            return "index tensor or indirectly accessed"
-        if name in graph_output_names and clone_at_graph_boundaries():
-            # With boundary cloning on a graph output is pinned via an output
-            # clone that still writes HBM once; that unavoidable write cancels
-            # from the CP-SAT differential spill cost, so allow residency then.
-            if name in reinterpret_output_names:
-                return "graph output is a ReinterpretView"
-            if name in mutated_buffers and name not in drain_plans:
-                # The output clone is inserted after the producer, so it would
-                # copy the value from before a later in-place update (e.g. a
-                # loop carry returned from the graph).  A validated drain plan
-                # re-anchors that clone after the whole counted loop instead, so
-                # only the plan clears this refusal.
-                return "graph output mutated after production"
-        if buffer_not_read_in_full(graph, name):
-            return "partial/offset read"
-        if division_is_fixed and ncores.get(name, -1) < 0:
-            reason = ncores_reasons.get(name, "core div mismatch")
-            return f"core div mismatch: {reason}"
-        if not tileable:
-            untiled_bar = self._untiled_residency_bar(name, uses, graph_output_names)
-            if untiled_bar is not None:
-                return untiled_bar
-        if _would_produce_lx_back_gap(graph, name, uses):
-            # backGap fires when device_size[d] > it_dim_size; the backend
-            # supports it for HBM but not for LX.
-            return "lx back gap"
-        return None
+        )
 
     def _untiled_residency_bar(
         self, name: str, uses: list[int], graph_output_names: set[str]
@@ -4460,6 +4546,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
+            # A padded contraction is legal only through the separately
+            # certified physical-width copy, never a direct slicing match.
+            if prefix_lx_contraction_axis(op_by_name[parent], consumer_op) is not None:
+                continue
             edge = build_residency_edge(
                 parent,
                 op_by_name[parent],
@@ -4645,6 +4735,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if residency_by_buf.get(parent, "not in graph") is not None:
                 continue
             parent_op = op_by_name[parent]
+            padded_axis = prefix_lx_contraction_axis(parent_op, consumer_op)
             context = solver_relayout_edge_context(
                 graph, parent_op, consumer_op, parent, op_by_name
             )
@@ -4750,6 +4841,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     # spellings of one partition are a match, never a shuffle.
                     if cv is None or pv.same_partition(cv):
                         continue
+                    if (
+                        padded_axis is not None
+                        and dict(cv.work_slice_dims).get(padded_axis, 1) != 1
+                    ):
+                        # Uniform tail gaps apply only to a full K row. A K
+                        # split would require ragged ownership/offset support.
+                        continue
                     if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
@@ -4768,8 +4866,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     # (materialize_lx_relayouts commits it there and raises).
                     if _projected(cv, prod_coords, prod_space, "prod") is None:
                         continue
-                    src_division = _projected(pv, cons_coords, cons_space, "cons")
-                    dst_division = _projected(cv, cons_coords, cons_space, "cons")
+                    # The shuffle iterates the physical producer domain. Its
+                    # source 832-column partitions cannot project into the
+                    # later logical-K=3200 frame (800 columns per quarter).
+                    # Certify both copy operands on the domain they execute;
+                    # the unsplit-K reader's view was checked independently.
+                    copy_coords, copy_space, copy_frame = (
+                        (prod_coords, prod_space, "prod")
+                        if padded_axis is not None
+                        else (cons_coords, cons_space, "cons")
+                    )
+                    src_division = _projected(pv, copy_coords, copy_space, copy_frame)
+                    dst_division = _projected(cv, copy_coords, copy_space, copy_frame)
                     if src_division is None or dst_division is None:
                         continue
                     # Distinct per-core views that collapse to one logical work
