@@ -2881,8 +2881,7 @@ def spyre_linear_attention(
         scores = torch.bmm(q_3d, k_3d.transpose(-2, -1))
 
         # Causal mask: 1.0 where j <= i, 0.0 where j > i
-        triu_m = torch.ops.spyre.triu_mask(seqlen_q, seqlen_kv, 1, query.dtype, query.device)
-        causal_mask = (1.0 - triu_m).unsqueeze(0)  # [1, Lq, Lkv]
+        causal_mask = torch.ops.spyre.linear_causal_mask(seqlen_q, seqlen_kv, query)  # [1, Lq, Lkv]
 
         scores_causal = scores * causal_mask  # [BH, Lq, Lkv]
 
