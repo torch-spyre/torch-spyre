@@ -1165,34 +1165,19 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
-@torch.library.custom_op("spyre::linear_causal_mask", mutates_args=())
-def linear_causal_mask(
+@torch.library.register_kernel("spyre::causal_mask", ["cpu"])
+def causal_mask_cpu(
     seqlen_q: int,
     seqlen_kv: int,
-    template: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> torch.Tensor:
-    """Build a lower-triangular causal 0/1 mask matching template dtype and device."""
-    mask = torch.tril(torch.ones(seqlen_q, seqlen_kv, dtype=template.dtype, device=template.device))
-    return mask.unsqueeze(0)
-
-
-@linear_causal_mask.register_fake
-def _(
-    seqlen_q: int,
-    seqlen_kv: int,
-    template: torch.Tensor,
-) -> torch.Tensor:
-    return template.new_empty((1, seqlen_q, seqlen_kv))
-
-
-@torch.library.register_kernel("spyre::linear_causal_mask", ["cpu"])
-def linear_causal_mask_cpu(
-    seqlen_q: int,
-    seqlen_kv: int,
-    template: torch.Tensor,
-) -> torch.Tensor:
-    mask = torch.tril(torch.ones(seqlen_q, seqlen_kv, dtype=template.dtype, device=template.device))
-    return mask.unsqueeze(0)
+    causal_cpu = torch.tril(
+        torch.ones(seqlen_q, seqlen_kv, dtype=torch.bool, device="cpu")
+    )
+    mask_cpu = torch.zeros(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~causal_cpu, float("-inf"))
+    return mask_cpu.to(device=device)
 
 
 @torch.library.custom_op("spyre::triu_cpu", mutates_args=())
@@ -1617,7 +1602,6 @@ def linear_attention_cpu(
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
-mark_lx_safe(torch.ops.spyre.linear_causal_mask.default)
 mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are

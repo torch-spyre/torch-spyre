@@ -2876,8 +2876,10 @@ def spyre_linear_attention(
         # scores: [BH, Lq, Lkv]
         scores = torch.bmm(q_3d, k_3d.transpose(-2, -1))
 
-        # Causal mask: 1.0 where j <= i, 0.0 where j > i
-        causal_mask = torch.ops.spyre.linear_causal_mask(seqlen_q, seqlen_kv, query)  # [1, Lq, Lkv]
+        # Causal additive mask from spyre::causal_mask: 0.0 for keep, -inf for masked
+        additive_mask = torch.ops.spyre.causal_mask(seqlen_q, seqlen_kv, query.dtype, query.device)
+        # Convert additive mask to 0/1 multiplier: clamp(additive_mask + 1.0, min=0.0) -> [1, Lq, Lkv]
+        causal_mask = torch.clamp(additive_mask.squeeze(1) + 1.0, min=0.0)
 
         scores_causal = scores * causal_mask  # [BH, Lq, Lkv]
 
