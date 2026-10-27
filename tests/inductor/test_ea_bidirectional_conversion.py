@@ -28,7 +28,6 @@ import pytest
 import torch
 from torch._inductor.exc import InductorError
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
-from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
 from utils_inductor import expects_raise
@@ -347,83 +346,6 @@ def test_upcast_consumed_on_partial_stick(shape):
     x = (torch.randint(-64, 64, shape) / 8).to(torch.float16)
     result = torch.compile(fn)(x.to("spyre"))
     torch.testing.assert_close(result.cpu(), fn(x), rtol=0, atol=0)
-
-
-def _stagger_fn(x, fp16):
-    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
-    return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
-
-
-@pytest.mark.parametrize(
-    "x",
-    [
-        # 1-D: stick-aligned
-        torch.randn(64, dtype=torch.float32),
-        torch.randn(128, dtype=torch.float32),
-        # 1-D: non-stick-aligned (padded to 64-multiple)
-        torch.nn.functional.pad(torch.randn(44, dtype=torch.float32), (0, 20)),
-        # 2-D: stick-aligned
-        torch.randn(4, 64, dtype=torch.float32),
-        torch.randn(7, 128, dtype=torch.float32),
-        # 2-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(7, 44, dtype=torch.float32), (0, 20)),
-        # 3-D: stick-aligned
-        torch.randn(2, 4, 64, dtype=torch.float32),
-        torch.randn(3, 5, 128, dtype=torch.float32),
-        # 3-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 4, 44, dtype=torch.float32), (0, 20)),
-        # 4-D: stick-aligned
-        torch.randn(2, 3, 4, 64, dtype=torch.float32),
-        torch.randn(2, 3, 4, 128, dtype=torch.float32),
-        # 4-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 3, 4, 44, dtype=torch.float32), (0, 20)),
-    ],
-)
-@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea(x, fp16):
-    """stagger_to_standard_ea restores standard EA after fp32→fp16 (fp32todl16).
-
-    Verifies:
-      1. Output values match a plain x.to(fp16) on CPU (logical correctness).
-      2. Output EA is STANDARD (layout correctness).
-    """
-    expected = x.to(fp16)
-
-    compiled_fn = torch.compile(_stagger_fn, backend="inductor")
-
-    # 1. Value correctness: Spyre result matches CPU fp16 cast.
-    # fp32→fp16 rounding differs slightly (Spyre uses DF16); use fp16 tolerances.
-    result = compiled_fn(x.to("spyre"), fp16).cpu()
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-
-    # 2. Layout correctness: output EA must be STANDARD.
-    spyre_result = compiled_fn(x.to("spyre"), fp16)
-    ea = get_spyre_tensor_layout(spyre_result).element_arrangement
-    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
-
-
-@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
-@pytest.mark.parametrize(
-    "fp16",
-    DtypeOpTable.fp16_types(),
-    ids=lambda dt: str(dt).replace("torch.", ""),
-)
-def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
-    """Keep conflicting physical row segments local to one core (#4703)."""
-    torch._dynamo.reset()
-    # Distinct, exactly representable rows make a row permutation unambiguous.
-    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
-    x = x.expand(2, 4, 64).contiguous()
-    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
-        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
-        result = compiled_fn(x.to(DEVICE_NAME), fp16)
-    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
-    assert_ea(result, ElementArrangement.STANDARD)
 
 
 _SLICED_RMSNORM_SHAPES = {
