@@ -40,6 +40,7 @@ import http.client
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -288,11 +289,15 @@ class GitHub:
         reserve: float = 0.5,
         deadline: float | None = None,
         wait_for_reset: bool = False,
+        min_interval: float = 0.0,
     ):
         self.token = token
         self.reserve = reserve
         self.deadline = deadline
         self.wait_for_reset = wait_for_reset
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._next_slot = self._pause_until = 0.0
         self.limit = self.remaining = self.reset = None
         self.requests, self.first = 0, ""
         self.authed = self.expired = False
@@ -310,7 +315,9 @@ class GitHub:
         )
         for attempt in range(tries):
             self._guard()
-            self.requests += 1
+            self._pace()
+            with self._lock:
+                self.requests += 1
             try:
                 body, headers = self._fetch(req)
                 self._note(headers)
@@ -326,6 +333,8 @@ class GitHub:
                 wait = self._backoff(err, attempt)
                 if wait is None:
                     raise
+                with self._lock:
+                    self._pause_until = max(self._pause_until, time.time() + wait)
             # A truncated body or dropped connection is transient, like a 5xx.
             except (
                 urllib.error.URLError,
@@ -348,10 +357,11 @@ class GitHub:
         """Track the rate limit from a response's headers."""
         if headers is None or headers.get("X-RateLimit-Limit") is None:
             return
-        self.limit = int(headers["X-RateLimit-Limit"])
-        self.remaining = int(headers.get("X-RateLimit-Remaining", self.limit))
-        self.reset = float(headers.get("X-RateLimit-Reset", 0))
-        self.first = self.first or self.rate()
+        with self._lock:
+            self.limit = int(headers["X-RateLimit-Limit"])
+            self.remaining = int(headers.get("X-RateLimit-Remaining", self.limit))
+            self.reset = float(headers.get("X-RateLimit-Reset", 0))
+            self.first = self.first or self.rate()
 
     def rate(self) -> str:
         """remaining/limit as the last response reported it; GET /rate_limit lags behind."""
@@ -365,12 +375,24 @@ class GitHub:
         """Stop, or wait for the reset, before a request that would dip into the reserve."""
         if self.deadline is not None and time.time() >= self.deadline:
             raise Stop("deadline reached")
+        if (hold := self._pause_until - time.time()) > 0:
+            self._sleep(hold)
         if not self.exhausted():
             return
         if not self.wait_for_reset:
             raise Stop(f"budget reached at {self.remaining} remaining")
         self._sleep(max(1.0, (self.reset or 0) - time.time() + 1))
         self.remaining = self.limit
+
+    def _pace(self) -> None:
+        """Start requests at least min_interval apart, across threads."""
+        if not self.min_interval:
+            return
+        with self._lock:
+            slot = max(time.time(), self._next_slot)
+            self._next_slot = slot + self.min_interval
+        if slot > time.time():
+            self._sleep(slot - time.time())
 
     def _sleep(self, seconds: float) -> None:
         if self.deadline is not None and time.time() + seconds > self.deadline:
@@ -386,6 +408,9 @@ class GitHub:
             )
         if err.code == 429 or err.code >= 500:
             return float(err.headers.get("Retry-After") or 2**attempt)
+        # A secondary limit is a 403 that names Retry-After and leaves the quota unspent.
+        if err.code == 403 and err.headers.get("Retry-After"):
+            return float(err.headers["Retry-After"])
         return None
 
     def runs(
@@ -439,14 +464,16 @@ class GitHub:
 
 
 def stored(
-    client, db: str, repo: str, since: datetime
+    client, db: str, repo: str, since: datetime, until: datetime | None = None
 ) -> dict[str, tuple[datetime, str]]:
     """run_key -> (updated_at, state) of the gha-workflow rows already written for repo."""
     res = client.query(
         f"SELECT run_key, updated_at, state FROM {db}.pipeline_runs FINAL "
         "WHERE source = 'gha' AND pipeline_type = 'gha-workflow' "
-        "AND repo = {repo:String} AND started_at >= {since:DateTime64(3)}",
-        parameters={"repo": repo.split("/")[-1], "since": since},
+        "AND repo = {repo:String} AND started_at >= {since:DateTime64(3)}"
+        + (" AND started_at < {until:DateTime64(3)}" if until else ""),
+        parameters={"repo": repo.split("/")[-1], "since": since}
+        | ({"until": until} if until else {}),
     )
     return {
         k: (u.replace(tzinfo=timezone.utc) if u.tzinfo is None else u, s)
@@ -490,6 +517,36 @@ def window_start(
     return (resume, True) if resume < start else (start, False)
 
 
+def attempt_rows(
+    gh: GitHub,
+    repo: str,
+    latest: Mapping[str, Any],
+    a: int,
+    known: Mapping[str, tuple[datetime, str]],
+) -> list[dict[str, Any]] | None:
+    """Rows of attempt a of a listed run: [] when already stored current, None when skipped."""
+    n = int(latest.get("run_attempt") or 1)
+    have = known.get(run_key(repo, latest["id"], a))
+    if (
+        have
+        and have[1] == "finished"
+        and (a < n or have[0] == _ts(latest.get("updated_at")))
+    ):
+        return []
+    try:
+        run = latest if a == n else gh.attempt(repo, latest["id"], a)
+        jobs = gh.jobs(repo, latest["id"], a)
+    except Unavailable as err:
+        # Not stored, so any later poll whose window still holds the run retries it.
+        gh.skipped.append(f"{repo} run {latest['id']} attempt {a}")
+        print(f"[warn] skipped {gh.skipped[-1]}: {err}", file=sys.stderr)
+        return None
+    return [
+        workflow_row(repo, run, jobs),
+        *(r for r in (job_row(repo, run, j) for j in jobs) if r),
+    ]
+
+
 def poll(
     gh: GitHub,
     client,
@@ -514,28 +571,11 @@ def poll(
     batch: list[dict[str, Any]] = []
     try:
         for latest in gh.runs(repo, start, end):
-            n = int(latest.get("run_attempt") or 1)
-            for a in range(1, n + 1):
-                key = run_key(repo, latest["id"], a)
-                have = known.get(key)
-                run = latest if a == n else None
-                if (
-                    have
-                    and have[1] == "finished"
-                    and (a < n or have[0] == _ts(latest.get("updated_at")))
-                ):
-                    continue
-                try:
-                    run = run or gh.attempt(repo, latest["id"], a)
-                    jobs = gh.jobs(repo, latest["id"], a)
-                except Unavailable as err:
-                    # Not stored, so any later poll whose window still holds the run retries it.
-                    gh.skipped.append(f"{repo} run {latest['id']} attempt {a}")
-                    print(f"[warn] skipped {gh.skipped[-1]}: {err}", file=sys.stderr)
-                    continue
-                batch.append(workflow_row(repo, run, jobs))
-                batch += [r for r in (job_row(repo, run, j) for j in jobs) if r]
-                attempts += 1
+            for a in range(1, int(latest.get("run_attempt") or 1) + 1):
+                got = attempt_rows(gh, repo, latest, a, known)
+                if got:
+                    batch += got
+                    attempts += 1
             if len(batch) >= 500:
                 rows += _flush(client, db, batch, dry_run)
     except Stop as stop:
@@ -553,6 +593,21 @@ def _flush(client, db: str | None, batch: list[dict[str, Any]], dry_run: bool) -
             print(json.dumps(r, default=str))
     batch.clear()
     return n
+
+
+def connect(database: str = ""):
+    """(client, database name) for the v2 database: the argument, else $CLICKHOUSE_DB_V2."""
+    from .client import ClickHouse, ClickHouseEnv
+
+    db = database or ClickHouseEnv.target_database()
+    if not db:
+        sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
+    return ClickHouse.connect(database=db), db
+
+
+def _iso(value: str) -> datetime:
+    when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def main(argv=None) -> None:
@@ -590,7 +645,36 @@ def main(argv=None) -> None:
     p.add_argument(
         "--dry-run", action="store_true", help="print rows instead of writing"
     )
+    b = sub.add_parser(
+        "backfill",
+        help="fill past slices of one repo newest first; the poll's watermark is untouched",
+    )
+    b.add_argument("--repo", required=True, help="owner/name")
+    b.add_argument(
+        "--from", dest="top", type=_iso, help="newest edge, exclusive; default now"
+    )
+    b.add_argument(
+        "--to", type=_iso, help="oldest edge, default now - max-catchup-days"
+    )
+    b.add_argument("--max-catchup-days", type=float, default=90.0)
+    b.add_argument("--slice-hours", type=float, default=1.0)
+    b.add_argument("--workers", type=int, default=4, help="slices in flight")
+    b.add_argument(
+        "--max-rps", type=float, default=8.0, help="request starts per second, 0 = off"
+    )
+    b.add_argument("--reserve", type=float, default=0.5)
+    b.add_argument("--deadline-minutes", type=float, default=12.0)
+    b.add_argument("--wait-for-reset", action="store_true")
+    b.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="read GitHub, write nothing (stored counts need no database: all slices missing)",
+    )
     args = parser.parse_args(argv)
+    if args.cmd == "backfill":
+        from .gha_backfill import run
+
+        return run(args)
 
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
@@ -598,14 +682,7 @@ def main(argv=None) -> None:
     now = datetime.now(timezone.utc)
     base = timedelta(days=args.days) if args.days else timedelta(hours=args.hours)
 
-    client, db = None, None
-    if not args.dry_run:
-        from .client import ClickHouse, ClickHouseEnv
-
-        db = args.database or ClickHouseEnv.target_database()
-        if not db:
-            sys.exit("[error] no database: pass --database or set CLICKHOUSE_DB_V2")
-        client = ClickHouse.connect(database=db)
+    client, db = (None, None) if args.dry_run else connect(args.database)
     gh = GitHub(
         token,
         reserve=args.reserve,
