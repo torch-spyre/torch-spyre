@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""run_links' vocabularies and column order are the DDL's, not their own."""
+"""pipeline_run_links' vocabularies and column order are the DDL's, not their own."""
 
 import regex as re
 from spyre_clickhouse_ingest import schema
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR
 
-SQL = (SCHEMA_DIR / "56-run-lineage.sql").read_text()
+SQL = (SCHEMA_DIR / "56-pipeline-run-lineage.sql").read_text()
 
 
 def _check(name: str) -> set:
@@ -34,7 +34,9 @@ def test_vocabularies_match_the_ddl_checks():
 
 
 def test_columns_follow_the_ddl_order():
-    body = SQL.split("CREATE TABLE IF NOT EXISTS run_links", 1)[1].split("ENGINE", 1)[0]
+    body = SQL.split("CREATE TABLE IF NOT EXISTS pipeline_run_links", 1)[1].split(
+        "ENGINE", 1
+    )[0]
     ddl = re.findall(r"^    (\w+)\s+[A-Z]", body, flags=re.M)
     ddl = [c for c in ddl if c not in ("audit_uuid", "audit_timestamp")]
-    assert list(schema.RunLinks.columns) == ddl
+    assert list(schema.PipelineRunLinks.columns) == ddl

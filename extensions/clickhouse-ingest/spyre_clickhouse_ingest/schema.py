@@ -821,10 +821,10 @@ class DispatchTargets(Table):
     required = ("published_at",)
 
 
-class RunLinks(Table):
+class PipelineRunLinks(Table):
     """A launcher-recorded run-to-run edge: an intent first, then the resolved child run."""
 
-    name = "run_links"
+    name = "pipeline_run_links"
     columns = (
         "link_id",
         "observed_at",
@@ -859,7 +859,7 @@ ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
 ARTIFACT_RESULT_REASONS = ArtifactResultReasons
 PIPELINE_RUNS = PipelineRuns
-RUN_LINKS = RunLinks
+PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
 DISPATCH_REQUESTS = DispatchRequests
@@ -881,7 +881,7 @@ TABLES = {
         Capabilities,
         CapabilityRuns,
         PipelineRuns,
-        RunLinks,
+        PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
         DispatchRequests,
