@@ -33,6 +33,12 @@ def main() -> int:
     before, rest = old.split(start, 1)
     _, after = rest.split(end, 1)
     new = before + start + registry["residency_rules_markdown"]() + end + after
+    ownership = runpy.run_path(str(root / "torch_spyre/_inductor/slice_ownership.py"))
+    start = "<!-- BEGIN GENERATED OWNERSHIP PROOFS -->\n"
+    end = "<!-- END GENERATED OWNERSHIP PROOFS -->"
+    before, rest = new.split(start, 1)
+    _, after = rest.split(end, 1)
+    new = before + start + ownership["ownership_proofs_markdown"]() + end + after
     path.write_text(new)
     return 0
 

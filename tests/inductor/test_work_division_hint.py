@@ -1152,6 +1152,34 @@ def test_work_division_from_view_examples(
     assert division.physical_core_count == view.num_cores
 
 
+@pytest.mark.parametrize("pair_extent,offset", [(2, 0), (3, 0), (2, 1)])
+def test_q_rope_ownership_keeps_the_whole_pair_in_its_slice(pair_extent, offset):
+    row, head, pair, feature = map(Symbol, ("row", "head", "pair", "feature"))
+    view = _view({0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32)
+    coordinates = [row, 2 * head + pair + offset, feature]
+    original_coordinates = list(coordinates)
+    extents = {row: 512, head: 8, pair: pair_extent, feature: 64}
+
+    if pair_extent != 2 or offset:
+        # The zero-pair line fits, but the full rectangle crosses a slice.
+        with pytest.raises(ValueError, match="cannot map device dimension 1"):
+            work_division_from_view(view, [512, 16, 64], coordinates, extents)
+    else:
+        division = work_division_from_view(view, [512, 16, 64], coordinates, extents)
+        assert division.work_slices == {row: 8, head: 4}
+        assert division.physical_core_count == 32
+        for core in range(32):
+            owners = {
+                loop: int(owner.subs(_CORE_ID, core))
+                for loop, owner in division.core_id_to_work_slice.items()
+            }
+            assert owners == {row: core % 8, head: core // 8}
+            for h in range(2 * owners[head], 2 * (owners[head] + 1)):
+                for p in range(2):
+                    assert (2 * h + p) // 4 == core // 8
+    assert coordinates == original_coordinates, "proof changed the tensor access"
+
+
 def test_diagonal_access_cannot_become_a_complete_relayout_source():
     loop = Symbol("loop")
     owner = Mod(_CORE_ID, 2)

@@ -407,6 +407,22 @@ conditions and its tests. Add later ownership exceptions to the registry.
 An ownership proof does not replace storage, lifetime or capacity checks.
 The untiled prefix case does not require same-tile-group search.
 
+The symbolic proof registry below is separate from storage permission. It
+selects the emitted-access containment proofs in order.
+
+<!-- BEGIN GENERATED OWNERSHIP PROOFS -->
+| Ownership proof | Certificate | Requires | Covering tests |
+|---|---|---|---|
+| Affine rectangle containment; emitted access | `project_affine_slice_axis` | one contained loop partition, complete read rectangle, unchanged physical coordinates | `test_q_rope_ownership_keeps_the_whole_pair_in_its_slice`; `test_q_projection_rope_handoff_preserves_pairs_and_other_consumer`; `test_ownership_callers_keep_their_admission_policy` |
+<!-- END GENERATED OWNERSHIP PROOFS -->
+
+`SPYRE_LX_EXTENDED_OWNERSHIP=0` disables the additional ownership proofs while
+retaining the earlier prefix-copy rules. Its default is ON. The flag does not
+disable storage, alias, lifetime or capacity validation. Compare successive
+revisions with this flag OFF in both; do not compare a later OFF result with
+the preceding revision's ON result. Default ON is intentional: the contained
+multi-loop affine path is enabled when this change lands.
+
 ### Per-core size and core-division mismatch
 
 A buffer's LX footprint is its **per-core** size, not its total size: a
@@ -779,3 +795,37 @@ bugs that the hand-written cases miss.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that
   LX planning did not claim into a shared HBM segment.
+
+### Matched OFF-plan comparison
+
+Use `tools/lx_planning/run_off_plan_capture.py` on the same existing fixture at each adjacent
+source pair, from the repository root in a clean developer checkout or Git
+worktree with the native test dependencies. The driver reads that checkout's
+HEAD and refuses tracked changes. It does not run from a source archive without
+Git metadata. Set `SPYRE_LX_EXTENDED_OWNERSHIP=0` before either process starts.
+Use fresh compile caches and the same upstream commit, inputs, hints, planner
+seed, worker count and other compiler settings. The contract records the
+verified input and hint hashes. Do not compare unmatched source configurations.
+
+The read-only observer records successful final codegen. It keeps final graph
+storage and physical layouts, dependencies, relayout registry, complete OpSpecs,
+argument binding and HBM pool size. It does not force a layout or a division.
+Unknown fields stop capture. Empty captures and cache hits cannot pass.
+Buffer names and program order remain significant; differences require review.
+
+Compare the two saved records with `tools/lx_planning/lx_semantic_plan.py`. Repeat the
+adjacent OFF/OFF comparison through the final stack, then compare its OFF plan
+with the matched #5160 OFF plan. Numerical checks remain separate. No recorded
+native OFF/OFF result is included in this PR. Separate historical receipts cover
+finite fixtures at pinned source revisions; they do not establish whole-model
+equality or plan equality after later upstream changes. Host tests of the
+recorder do not establish that native comparisons have passed.
+
+The pre-flag references are #5160 at `525dfd8c` and its squash merge on main,
+`10f40954`. A later main checkout is also accepted only when its recorded HEAD
+matches the checkout, it descends from that squash merge, it belongs to a local
+`main`, `origin/main` or `upstream/main` ref, and its config file has the same
+verified hash. Fetch the baseline history and main ref before using a later
+checkout. Only these verified sources may omit `lx_extended_ownership`; the
+missing flag represents OFF. Other missing settings stop capture. Iteration-axis
+order remains significant in the saved plan.
