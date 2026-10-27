@@ -107,13 +107,15 @@ LEFT JOIN v_result_run_context AS x ON x.run_id = cr.run_id;
 
 -- Per case and failure signature: how often, where and when it failed. passes_between counts
 -- passes inside [first_failed, last_failed]; > 0 means the failure comes and goes. failing_runners
--- are the failed jobs' runner names, empty for runs the GHA poller has not written yet.
+-- runners are those of every failed job in the failing runs (the failing job is not recorded per
+-- case, so a run with several failed jobs over-attributes); empty until the GHA poller has the run.
 -- ALWAYS filter by name.
 CREATE VIEW IF NOT EXISTS v_failure_recurrence AS
 SELECT
     f.component AS component, f.classname AS classname, f.name AS name, f.signature AS signature,
     f.failing_results AS failing_results, f.failing_runs AS failing_runs, f.failing_prs AS failing_prs,
-    f.failing_head_shas AS failing_head_shas, f.failing_runners AS failing_runners,
+    f.failing_head_shas AS failing_head_shas, f.failing_runner_count AS failing_runner_count,
+    f.failing_runner_sample AS failing_runner_sample,
     f.first_failed AS first_failed, f.last_failed AS last_failed,
     f.first_failed_run_key AS first_failed_run_key, f.last_failed_run_key AS last_failed_run_key,
     f.sample_prs AS sample_prs,
@@ -127,7 +129,8 @@ FROM
         uniqExact(run_id) AS failing_runs,
         uniqExactIf(pr_number, pr_number != 0) AS failing_prs,
         uniqExactIf(head_sha, head_sha != '') AS failing_head_shas,
-        arrayDistinct(arrayFlatten(groupArray(failed_job_agents))) AS failing_runners,
+        length(arrayDistinct(arrayFlatten(groupArray(failed_job_agents)))) AS failing_runner_count,
+        arraySlice(arrayDistinct(arrayFlatten(groupArray(failed_job_agents))), 1, 5) AS failing_runner_sample,
         min(ts) AS first_failed, max(ts) AS last_failed,
         argMin(run_key, ts) AS first_failed_run_key, argMax(run_key, ts) AS last_failed_run_key,
         groupUniqArrayIf(5)(pr_number, pr_number != 0) AS sample_prs
