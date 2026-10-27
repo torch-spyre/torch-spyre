@@ -259,16 +259,19 @@ class TestSpyre(TestCase):
         ],
     )
     def test_pinned_h2d_into_device_slice_keeps_conversion(self, dtype):
-        # The device side is the strided side here: a copy into d[64:] must
-        # keep its DCI, since a raw DMA would write storage-base-relative
-        # bytes instead of the slice's.
+        # The device side is the strided side here: a copy into a device slice
+        # must keep its DCI, since a raw DMA would write storage-base-relative
+        # bytes instead of the slice's. The offset is stick-aligned (128
+        # elements is a whole stick for both int8 and fp32) so the test does
+        # not depend on the pre-existing mid-stick int8 slice bug, which is
+        # flex-version dependent.
         pinned = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype).pin_memory()
         dev = torch.zeros(8192, dtype=dtype, device="spyre")
 
-        dev[64:4160].copy_(pinned)
-        torch.testing.assert_close(dev[64:4160].cpu(), pinned, rtol=0, atol=0)
+        dev[128:4224].copy_(pinned)
+        torch.testing.assert_close(dev[128:4224].cpu(), pinned, rtol=0, atol=0)
         torch.testing.assert_close(
-            dev[:64].cpu(), torch.zeros(64, dtype=dtype), rtol=0, atol=0
+            dev[:128].cpu(), torch.zeros(128, dtype=dtype), rtol=0, atol=0
         )
 
     @parametrize(
@@ -279,13 +282,38 @@ class TestSpyre(TestCase):
         ],
     )
     def test_pinned_d2h_from_device_slice_keeps_conversion(self, dtype):
-        # Mirror of the above: reading d[64:] out into a pinned host tensor
-        # must also keep the conversion for the device-side offset.
+        # Mirror of the above: reading a device slice out into a pinned host
+        # tensor must also keep the conversion for the device-side offset.
+        # Stick-aligned offset, same rationale as above.
         dev = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype).to("spyre")
         y = torch.empty(4096, dtype=dtype, pin_memory=True)
 
-        y.copy_(dev[64:4160])
-        torch.testing.assert_close(y, dev[64:4160].cpu(), rtol=0, atol=0)
+        y.copy_(dev[128:4224])
+        torch.testing.assert_close(y, dev[128:4224].cpu(), rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_slice_copy_into_same_size_host_buffer(self, dtype):
+        # Regression test: the identity-copy skip must compare the copied
+        # region, not the host storage size. y is exactly as large as the
+        # device allocation, but only y[:4096] is the copy destination -- a
+        # whole-allocation raw DMA here would overwrite y[4096:] with device
+        # data (silent corruption).
+        src = ((torch.arange(8192, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        for pin in (False, True):
+            y = torch.full((8192,), -1, dtype=dtype, pin_memory=pin)
+            y[:4096].copy_(dev[:4096])
+            torch.testing.assert_close(y[:4096], src[:4096], rtol=0, atol=0)
+            torch.testing.assert_close(
+                y[4096:], torch.full((4096,), -1, dtype=dtype), rtol=0, atol=0
+            )
 
     def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
         # 64x32 int8 maps to a partial-stick device layout: the DCI carries

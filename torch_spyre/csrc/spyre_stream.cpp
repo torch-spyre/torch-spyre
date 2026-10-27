@@ -278,15 +278,24 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // keeps a pinned source buffer attached -- attachStagedSource discards it
     // when a conversion stages into a fresh pageable buffer.
     //
-    // The skip is only safe when the dense region is the whole device
+    // The skip is only safe when the copied region is the whole device
     // allocation: the raw DMA is sized from the allocation's total_size(),
     // so a dense leading slice (e.g. d[:64].cpu()) would otherwise transfer
-    // past the end of the smaller host buffer. Slices keep their DCI and go
-    // through the conversion path, which carries the region extents.
+    // past the end of the smaller host buffer. Comparing the host storage
+    // size is not sufficient either -- a same-sized host buffer backing a
+    // slice view (y[:4096].copy_(d[:4096]) on an 8192-element y) would let
+    // the whole-allocation DMA overwrite the rest of y. Require the copied
+    // region extents themselves to match the allocation on both sides.
+    // Slices keep their DCI and go through the conversion path, which
+    // carries the region extents.
     const auto* allocation = get_composite_address(*dev_tensor);
+    const size_t dev_total_size = static_cast<size_t>(allocation->total_size());
     const DataConversionInfo* dci_arg =
         (dci_is_identity_copy(dci) &&
-         host_capacity == static_cast<size_t>(allocation->total_size()))
+         static_cast<size_t>(cpu_tensor->numel() *
+                             cpu_tensor->element_size()) == dev_total_size &&
+         static_cast<size_t>(dev_tensor->numel() *
+                             dev_tensor->element_size()) == dev_total_size)
             ? nullptr
             : &dci;
 
