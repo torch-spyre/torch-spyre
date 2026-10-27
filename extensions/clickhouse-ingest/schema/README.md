@@ -26,7 +26,6 @@ Applying them in filename order works from an empty database.
 | `54-ci-run-timing-views.sql` | `v_ci_run_timings`, `v_ci_runs`, `v_ci_runs_spyre_test`, `v_ci_runs_merge_queue`, `v_ci_runs_main_push`, `v_ci_lane_daily` | 48 |
 | `55-dispatch-views.sql` | `v_dispatch_verdicts`, `v_artifact_events`, `v_subscription_artifacts`, `v_artifact_subscribers`, `v_feed_events` (parameterized), `v_dispatch_targets` | 20, 25, 26, 49, 50 |
 | `56-pipeline-run-lineage.sql` | `pipeline_run_links`, `v_pipeline_run_links`, `v_pipeline_run_links_pending`, `v_pipeline_run_edges`, `v_pipeline_run_lineage`, `v_pipeline_run_lineage_gaps` | 47, 53 |
-| `57-failure-forensics-views.sql` | `v_result_run_context`, `v_case_run_history`, `v_failure_recurrence`, `v_failure_first_seen` | 10, 20, 47, 53 |
 | `57-failure-forensics-views.sql` | `v_result_run_context`, `v_failure_fingerprint`, `v_case_run_history`, `v_failure_recurrence`, `v_failure_first_seen`, `v_failure_groups` | 10, 20, 45, 47, 53 |
 | `58-ci-event-records.sql` | `poller_decisions`, `ci_write_failures`, `merge_queue_events` | — |
 | `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30, 50 |
