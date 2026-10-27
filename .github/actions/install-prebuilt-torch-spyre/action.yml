@@ -41,6 +41,13 @@ runs:
         # fleet requests it concurrently. Bumping setup-uv moves this version forward.
         version: latest-known
 
+    # Restores UV_CACHE_DIR from /storage-1 instead of PyPI; its post step saves it back at job end.
+    - name: uv cache (NFS)
+      uses: torch-spyre/spyre-inference/.github/actions/uv-nfs-cache@e353b30d6311b5872ab1176c4a0b47a2e8d571ab
+      with:
+        storage-root: /storage-1/torch-spyre/.cache/uv
+        key-files: ${{ inputs.torch_spyre_dir }}/uv.lock
+
     - name: Download prebuilt wheel
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:

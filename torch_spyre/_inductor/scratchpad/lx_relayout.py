@@ -47,6 +47,7 @@ from ..core_mapping import (
 )
 from ..cost_model import CostParams, relayout_ns
 from ..dump_cost_model import relayout_cost_features
+from ..slice_ownership import project_slice_axis
 from ..ir import FixedTiledLayout
 from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
@@ -326,6 +327,9 @@ def work_division_from_view(
         raise ValueError("duplicate physical dimensions")
     rows = owner_slots(slots, physical_splits, n)
     axes_by_loop: dict[sympy.Symbol, list[int]] = {}
+    # Only the local proof coordinates may be reduced. Callers and emitted
+    # tensor accesses retain the original multi-loop coordinate expressions.
+    proof_coordinates = list(device_coordinates)
     for axis, split in physical_splits.items():
         if (
             not 0 <= axis < len(device_size)
@@ -337,9 +341,18 @@ def work_division_from_view(
                 f"unsupported ownership input: axis {axis} not divisible by {split}"
             )
         symbols = device_coordinates[axis].free_symbols
-        if len(symbols) != 1 or not symbols <= iteration_space.keys():
-            raise ValueError(f"cannot map device dimension {axis} to one loop")
-        axes_by_loop.setdefault(next(iter(symbols)), []).append(axis)
+        if len(symbols) == 1 and symbols <= iteration_space.keys():
+            loop = next(iter(symbols))
+        else:
+            if not config.lx_extended_ownership:
+                raise ValueError(f"cannot map device dimension {axis} to one loop")
+            projected = project_slice_axis(
+                device_coordinates[axis], int(device_size[axis]), split, iteration_space
+            )
+            if projected is None:
+                raise ValueError(f"cannot map device dimension {axis} to one loop")
+            loop, proof_coordinates[axis] = projected
+        axes_by_loop.setdefault(loop, []).append(axis)
 
     any_fused = any(len(axes) > 1 for axes in axes_by_loop.values())
     splits, owners, expected = {}, {}, {}
@@ -391,9 +404,7 @@ def work_division_from_view(
         try:
             bounds = _loop_regions(
                 extent,
-                tuple(
-                    device_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes
-                ),
+                tuple(proof_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes),
                 tuple(int(device_size[a]) for a in axes),
                 split,
             )
