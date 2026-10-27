@@ -2872,22 +2872,30 @@ def spyre_linear_attention(
     v_3d = value.view(bh, seqlen_kv, head_dim_v)
 
     if is_causal:
-        # Causal linear attention: cumulative outer-product scan over time
-        # k_3d.unsqueeze(-1): [BH, L, Dk, 1], v_3d.unsqueeze(-2): [BH, L, 1, Dv] -> [BH, L, Dk, Dv] (rank 4)
-        delta_s = k_3d.unsqueeze(-1) * v_3d.unsqueeze(-2)
-        causal_state = torch.cumsum(delta_s, dim=1)  # [BH, L, Dk, Dv]
+        # Causal linear attention: lower-triangular causal attention product
+        # scores: [BH, Lq, Lkv]
+        scores = torch.bmm(q_3d, k_3d.transpose(-2, -1))
+
+        # Causal mask: 1.0 where j <= i, 0.0 where j > i
+        triu_m = torch.ops.spyre.triu_mask(seqlen_q, seqlen_kv, 1, query.dtype, query.device)
+        causal_mask = (1.0 - triu_m).unsqueeze(0)  # [1, Lq, Lkv]
+
+        scores_causal = scores * causal_mask  # [BH, Lq, Lkv]
+
+        # Numerator: scores_causal @ v_3d -> [BH, Lq, Dv]
+        out_3d = torch.bmm(scores_causal, v_3d)
 
         if initial_state is not None:
-            init_state_3d = initial_state.view(bh, head_dim_k, head_dim_v).unsqueeze(1)
-            causal_state = causal_state + init_state_3d
+            init_state_3d = initial_state.view(bh, head_dim_k, head_dim_v)
+            out_3d = out_3d + torch.bmm(q_3d, init_state_3d)
+            final_state_3d = init_state_3d + torch.bmm(k_3d.transpose(-2, -1), v_3d)
+        else:
+            final_state_3d = torch.bmm(k_3d.transpose(-2, -1), v_3d)
 
-        final_state = causal_state[:, -1, :, :].view(batch_size, num_heads, head_dim_k, head_dim_v)
+        final_state = final_state_3d.view(batch_size, num_heads, head_dim_k, head_dim_v)
 
-        q_expanded = q_3d.unsqueeze(-2)  # [BH, L, 1, Dk]
-        out_3d = torch.matmul(q_expanded, causal_state).squeeze(-2)  # [BH, L, Dv]
-
-        k_cumsum = torch.cumsum(k_3d, dim=1)  # [BH, L, Dk]
-        z_3d = torch.sum(q_3d * k_cumsum, dim=-1, keepdim=True)  # [BH, L, 1]
+        # Denominator: row sums of scores_causal -> [BH, Lq, 1]
+        z_3d = torch.sum(scores_causal, dim=-1, keepdim=True)
         out_3d = out_3d / (z_3d + eps)
 
         out = out_3d.view(batch_size, num_heads, seqlen_q, head_dim_v)
