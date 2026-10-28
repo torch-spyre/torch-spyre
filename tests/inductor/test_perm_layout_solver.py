@@ -828,7 +828,8 @@ class BatchUpdateDifferentialTests(TestCase):
     """``update(resizes, flags)`` re-places once for a whole batch. It must
     leave exactly the state the same ``resize`` calls then ``set_eligible``
     calls leave one at a time, on the native packer and on the from-scratch
-    reference, and report the quality change it made."""
+    reference, and report the quality change it made. ``allocated_indices``
+    must name exactly the buffers ``addresses`` places."""
 
     def test_random_batches_match_the_calls_made_one_at_a_time(self):
         seeds = 2000 if _STRESS else 400
@@ -871,6 +872,8 @@ class BatchUpdateDifferentialTests(TestCase):
                 )
                 self.assertAlmostEqual(delta, batched.quality() - before, msg=tag)
                 self.assertEqual(ref.addresses, batched.addresses, tag)
+                placed = [i for i, a in enumerate(batched.addresses) if a is not None]
+                self.assertEqual(batched.allocated_indices(), placed, tag)
                 self.assertAlmostEqual(ref.quality(), batched.quality(), msg=tag)
 
     def test_a_bad_index_or_size_raises_before_anything_changes(self):

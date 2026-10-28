@@ -2248,7 +2248,7 @@ class ApplyGroupAgreementTest(TestCase):
         # [KT] [S, V] [O]: KT escapes to S, S and V to O; each pays the copy's
         # write and one full-extent read while resident. One run would pay 0.
         solver = self._solver(_attention_ops())
-        self.assertEqual(solver._companion_bytes([0] * 4), 3 * 2 * 1024)
+        self.assertEqual(solver._companion_bytes({0, 1, 2, 3}), 3 * 2 * 1024)
 
 
 class CompanionBufferPricingTest(TestCase):
@@ -2261,17 +2261,13 @@ class CompanionBufferPricingTest(TestCase):
 
     SIZE = 1024  # ``_cdbuf``'s
 
-    @staticmethod
-    def _addresses(solver, resident):
-        return [0 if i in resident else None for i in range(len(solver._bufs))]
-
     def test_an_untiled_state_prices_no_companions(self):
         solver = _run_solver("AB", parents={"B": ["A"]})
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_a_search_with_no_tiling_space_prices_no_companions(self):
         solver = _run_solver("AB", parents={"B": ["A"]}, untiled="AB")
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_a_consumer_inside_the_run_costs_nothing(self):
         # Nothing escapes, so the apply keeps the buffer as loop-internal
@@ -2281,7 +2277,7 @@ class CompanionBufferPricingTest(TestCase):
         for idx in (0, 1):
             solver.chosen[idx] = _tiled(solver, idx)
         self.assertEqual(solver._run_bounds(0), (0, 1))
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+        self.assertEqual(solver._companion_bytes({0, 1}), 0)
 
     def test_the_search_tiles_a_run_its_output_stays_inside(self):
         # A feeds B and nothing else. Untiled, no per-core footprint fits beside
@@ -2340,7 +2336,7 @@ class CompanionBufferPricingTest(TestCase):
         solver.chosen[0] = _tiled(solver, 0)
         self.assertEqual(solver._run_bounds(0), (0, 0))
         self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, {0})),
+            solver._companion_bytes({0}),
             3 * self.SIZE,  # the copy's write + two full-extent reads
         )
 
@@ -2350,9 +2346,7 @@ class CompanionBufferPricingTest(TestCase):
         # Independent of how many readers there are.
         solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
-        )
+        self.assertEqual(solver._companion_bytes(set()), 2 * self.SIZE)
 
     def test_a_resident_tiled_graph_output_pays_nothing(self):
         # The copy's write IS the externally visible write, which the model
@@ -2361,7 +2355,7 @@ class CompanionBufferPricingTest(TestCase):
         solver = _run_solver("A")
         solver._bufs[0].boundary = BufferType.Output
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+        self.assertEqual(solver._companion_bytes({0}), 0)
 
     def test_a_consumer_with_no_operation_position_counts_as_outside(self):
         # Nothing can carry a tiling to a buffer in no run, so a group
@@ -2372,9 +2366,7 @@ class CompanionBufferPricingTest(TestCase):
         solver._precompute_topology()
         solver.chosen = solver._seed_configs()
         solver.chosen[0] = _tiled(solver, 0)
-        self.assertEqual(
-            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
-        )
+        self.assertEqual(solver._companion_bytes({0}), 2 * self.SIZE)
 
     def test_the_score_carries_the_companion_traffic(self):
         solver = _run_solver("AB", parents={"B": ["A"]})

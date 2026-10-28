@@ -420,6 +420,16 @@ class NativePermutationLayoutSolver {
     return total_allocated_count_;
   }
 
+  // The buffers holding an address, in index order: what ``addresses`` marks
+  // not-None, without materializing an entry for every buffer.
+  py::list allocated_indices() const {
+    py::list out;
+    for (int i = 0; i < st_->n; ++i) {
+      if (allocated_[i]) out.append(py::int_(i));
+    }
+    return out;
+  }
+
   py::list addresses() const {
     py::list out;
     for (int i = 0; i < st_->n; ++i) {
@@ -875,6 +885,8 @@ void register_perm_layout_native(py::module_& m) {
       .def("copy", &NativePermutationLayoutSolver::copy)
       .def("quality", &NativePermutationLayoutSolver::quality)
       .def("count_allocated", &NativePermutationLayoutSolver::count_allocated)
+      .def("allocated_indices",
+           &NativePermutationLayoutSolver::allocated_indices)
       .def("overlaps", &NativePermutationLayoutSolver::overlaps, py::arg("i"),
            py::arg("j"))
       .def("is_fully_allocated",
