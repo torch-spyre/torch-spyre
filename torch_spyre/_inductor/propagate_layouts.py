@@ -294,8 +294,6 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(dtype)
-    if stick_dim >= 0 and c_size[stick_dim] == 1:
-        return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -321,10 +319,14 @@ def _candidate_output_stls(
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
+    # Size-1 dims come last: one element per stick takes stick_size times the
+    # memory, so they are used only when no other dim yields a candidate.
     all_dims = [d for d in range(len(c_size)) if d != skip_dim]
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
+    size1_dims = [d for d in unaligned_dims if c_size[d] == 1]
+    unaligned_dims = [d for d in unaligned_dims if c_size[d] != 1]
     stls: list[SpyreTensorLayout] = []
-    for dims in (aligned_dims, unaligned_dims):
+    for dims in (aligned_dims, unaligned_dims, size1_dims):
         for d in dims:
             stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
@@ -467,6 +469,22 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     )
 
 
+def qfp8wt_dim_order(rank: int) -> list[int]:
+    """Default host dim order for a QFP8WT tensor [..., K, N]: [K, L0, .., N].
+
+    The 2D stick pairs K with N, but the device layout records only a 1D stick
+    of N, so readers (codegen, work division) take K from device coordinate -2.
+    This default places host dim -2 there, giving the device order
+    [L0, .., N-tile, K, stick]; it assumes the tensor is [..., K, N]. When a
+    matmul reads the tensor, nonstick_dim_order takes K from the matmul's
+    reduction variable instead and reorders this layout if they disagree.
+    Rank 2 stays [0, 1].
+    """
+    if rank < 2:
+        return list(range(rank))
+    return [rank - 2, *range(rank - 2), rank - 1]
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -479,7 +497,8 @@ def _qfp8wt_stl(
     Outer dimensions and strides are preserved from output layout, with the innermost
     stride always set to 1. For unaligned inputs where input stick size is not a
     multiple of input stick size, the last dimension is padded to the stick size.  For
-    aligned inputs, it retains the concrete output size.
+    aligned inputs, it retains the concrete output size. The device order puts K
+    directly outside the stick (see ``qfp8wt_dim_order``).
 
     Args:
         output: Inductor ``FixedLayout`` for the op's output tensor.
@@ -497,7 +516,7 @@ def _qfp8wt_stl(
         c_size,
         c_stride,
         output.dtype,
-        list(range(len(c_size))),
+        qfp8wt_dim_order(len(c_size)),
         ElementArrangement.QFP8WT,
     )
 
@@ -1944,6 +1963,10 @@ def _topk_layouts(
         if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
+            if not surviving_coords:
+                # Every other dim has host size 1 (e.g. (1, N) with dim=1),
+                # so the output falls back to a synthetic stick.
+                out_stick_dims.add(None)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
@@ -2609,8 +2632,9 @@ def _find_alt_target_stl(
     An offset write, or an offset-free sub-stick write (see
     ``_is_substick_write``), needs its stick dim relocated. The first candidate
     reachable from the write's input stick wins, meaning one an ordinary
-    stick-permutation restickify can produce, so a degenerate ``stick=0``
-    candidate cannot win a pairing the cost model would reject as a scatter.
+    stick-permutation restickify can produce. Candidates on a size-1 dim are
+    only generated when no other dim yields one (see _candidate_output_stls),
+    so a degenerate ``stick=0`` candidate cannot displace a real dim.
     Falls back to the first offset-free candidate.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)

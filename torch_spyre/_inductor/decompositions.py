@@ -3707,6 +3707,39 @@ def scaled_mm_decomp(
     return result
 
 
+@register_spyre_decompositions([torch.ops.spyre.scaled_bmm])
+def scaled_bmm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose spyre.scaled_bmm into:
+    1. Raw FP8 batched matmul via spyre.bmm_fp8 (no scales applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+
+    The batched counterpart of scaled_mm_decomp: it keeps the scale arithmetic
+    out of lower_bmm_fp8's matmul lowering, the same separation
+    dequantize_fp8_with_scale_decomp uses for its FP8->FP16 conversion.
+    """
+    result = torch.ops.spyre.bmm_fp8(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+
+    if use_fast_accum:
+        # Spyre has no fast 8-bit accumulation path
+        logger.warning("use_fast_accum parameter in scaled_bmm is not supported")
+
+    return result
+
+
 @register_spyre_decompositions([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
