@@ -216,6 +216,7 @@ def arg_dtype_for_layout(arg: PropArg) -> torch.dtype:
 
     A torch.bool operand takes it from its producer's format (fp32-backed bools
     hold 32 elements per stick, not the 64 that ``torch.bool`` implies).
+    Reads only ``arg.layouts[0]``: both callers handle single-layout operands only.
     """
     if arg.layout.dtype != torch.bool or not arg.layouts:
         return arg.layout.dtype
