@@ -2324,12 +2324,26 @@ def log2(arg):
 def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
-    Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
-    returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
-    ``True``) so the non-symbolic loop always returns."""
-    if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
-        return sympy.Piecewise(*args)
-    for expr, cond in args:
+    Arms whose condition is already false are dropped, and a condition that is
+    already true ends the list, so a decided condition selects its value
+    without building a sympy node. Dispatches to ``sympy.Piecewise`` when a
+    remaining condition is symbolic, otherwise returns the evaluated value. The
+    last ``cond`` must be a catch-all (e.g. ``True``) so the non-symbolic loop
+    always returns."""
+    kept = []
+    for value, cond in args:
+        if cond is False or cond is sympy.false:
+            continue
+        if cond is True or cond is sympy.true:
+            if not kept:
+                return value
+            kept.append((value, True))
+            break
+        kept.append((value, cond))
+
+    if any(isinstance(cond, sympy.Basic) for _expr, cond in kept):
+        return sympy.Piecewise(*kept)
+    for expr, cond in kept:
         if cond:
             return expr
     raise ValueError("piecewise(...) requires a catch-all True branch")
