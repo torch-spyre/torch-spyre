@@ -14,6 +14,23 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
       tests:
+        # unbind along the stick dim gives a wrong value: each output is a
+        # sub-stick slice, which DMA cannot move since flex #2061 (whole 128B
+        # flits only), so the copy back picks up neighbouring elements.
+        # Tracked by flex #2083 (sub-stick DMA transfers); remove when it
+        # lands. Non-strict because the outcome depends on the flex build:
+        # flex without #2061 still passes these. Exact names are matched
+        # before the test_unbind.* pattern below.
+        - names:
+            - TestOps::test_unbind_1d_dim0
+            - TestOps::test_unbind_2d_dim1
+            - TestOps::test_unbind_2d_dimneg1
+            - TestOps::test_unbind_3d_dim2
+            - TestOps::test_unbind_3d_dimneg1
+            - TestOps::test_unbind_4d_dim3
+          mode: xfail
+          tags:
+            - ops__inductor_misc_shape
         - names:
             # shape ops
             - TestOps::test_flatten.*
@@ -47,8 +64,6 @@ test_suite_config:
             - TestOps::test_trunc_.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
-            - TestOps::test_restickify_fp32_unsupported
-            - TestOps::test_restickify_int64_unsupported
             # multiops split test
             - TestOps::test_multiops_split.*
           mode: mandatory_success

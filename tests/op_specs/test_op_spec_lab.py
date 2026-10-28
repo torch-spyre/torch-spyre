@@ -374,7 +374,9 @@ def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
     a pool symbol. So this fails on a lab that forgets to forward the size, where
     a mocked ``generate_bundle`` would happily record the call and pass.
     """
-    with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+    with spyre_config.patch(  # type: ignore[attr-defined]
+        bundle_symbolic_args=True, frontend_pool_allocation=False
+    ):
         listing = runner.bundle_op_specs(
             "k", [_pool_op()], str(tmp_path), pool_size=32768
         )

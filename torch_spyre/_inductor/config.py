@@ -136,6 +136,14 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
+# Enable optional ownership proofs added after prefix relayout support.
+# Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
+lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # How many destination views the CP-SAT relayout enumeration keeps per
 # (source, consumer) edge, cheapest first: a consumer with many equal-core
 # divisions induces one distinct destination partition (one relayout copy the
@@ -411,6 +419,14 @@ _cpsat_warn_on_cost_expr: bool = True
 # PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
+
+# Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
+# if an optimal solution is fully priced. The check is a second solve with no
+# time limit, so it can run well past ``cpsat_time_limit_seconds`` on a hard model;
+# not for production compiles.
+enable_uniqueness_check: bool = (
+    os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
+)
 
 # solver_relayout_edge_context's same-tile-group exception (#5057): without it,
 # a coarse-tiled producer or consumer can never host a relayout candidate at

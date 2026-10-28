@@ -665,6 +665,80 @@ def _extractable_op(name, reads):
     )
 
 
+@pytest.mark.parametrize("execution_cores", [16, 32])
+def test_relayout_price_does_not_replace_execution_cores(monkeypatch, execution_cores):
+    from dataclasses import replace
+
+    import torch
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import Pointwise
+    from torch._inductor.virtualized import V, ops
+
+    price = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=64,
+        cores=16,
+        dtype_bytes=2,
+        args=[],
+        is_lx_relayout=True,
+        relayout_cores=16,
+        relayout_run_elems=8,
+        relayout_split=8,
+    )
+    monkeypatch.setattr(dcm, "_relayout_features", lambda *_: price)
+    op = _extractable_op("buf1", ["buf0"])
+    row = sympy.Symbol("row", integer=True)
+    op.data = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: ops.load("buf0", index[0]),
+        ranges=[64],
+    )
+    op.get_read_writes = lambda: SimpleNamespace(
+        reads=[MemoryDep("buf0", row, (row,), (64,))],
+        writes=[MemoryDep("buf1", row, (row,), (64,))],
+    )
+    graph = _StubGraph(inputs=[], outputs=[])
+    graph.get_buffer = lambda name: _extractable_op(name, [])
+    with V.set_graph_handler(graph):
+        feature = dcm.extract_op_features(
+            op, {row: execution_cores}, is_lx={"buf0": True, "buf1": True}
+        )
+
+    assert feature.cores == execution_cores
+    assert feature.relayout_cores == 16
+    assert feature.read_bytes() == feature.write_bytes() == 0
+    params = CostParams()
+    legacy = replace(feature, cores=16, relayout_cores=0)
+    assert cost_model.relayout_ns(feature, params) == cost_model.relayout_ns(
+        legacy, params
+    )
+    assert cost_model.predict_ops([feature], params) == cost_model.predict_ops(
+        [legacy], params
+    )
+
+
+@pytest.mark.parametrize(
+    "source_cores,destination_cores", [(16, 32), (32, 16), (32, 32)]
+)
+def test_relayout_features_keep_the_smaller_price_domain(
+    monkeypatch, source_cores, destination_cores
+):
+    monkeypatch.setattr(dcm, "governing_run_split", lambda *_: (64, 8))
+    feature = dcm.relayout_cost_features(
+        object(),
+        object(),
+        source_cores,
+        [512, 4096],
+        512 * 4096,
+        2,
+        destination_num_cores=destination_cores,
+    )
+    assert feature.cores == source_cores
+    assert feature.relayout_cores == min(source_cores, destination_cores)
+
+
 def _stamps(op, graph):
     """{(role, name): is_boundary} as the real extractor stamps them under ``graph``."""
     from torch._inductor.virtualized import V
