@@ -891,6 +891,9 @@ def _assert_eligible_count(solver):
     assert solver._n_eligible == sum(
         solver._eligible(i) for i in range(len(solver._bufs))
     ), "the incremental eligible count drifted from a recount"
+    assert solver._eligible_copies == {
+        c for c in solver._relayout_source if solver._eligible(c)
+    }, "the tracked eligible copies drifted from a recount"
 
 
 def test_annealer_seeds_with_every_copy_off():
@@ -1014,6 +1017,24 @@ def test_annealer_relayout_move_buys_the_seams_it_opens():
     for name in ("P", "M"):
         assert solver._eligible(_index(solver, name)), name
     assert solver._eligible(first) and solver._eligible(second)
+    _assert_eligible_count(solver)
+
+
+@pytest.mark.parametrize(
+    "bufs, spill",
+    [
+        (lambda: _chain(1000.0), {"M": 20000.0}),
+        (lambda: _fanout(8000.0, same_view=False), {}),
+        (lambda: _distant(5000.0, blocker_size=40), {"B": 1000.0}),
+    ],
+)
+def test_annealer_state_stays_consistent_through_a_full_anneal(bufs, spill):
+    """After a whole anneal (moves, rejections restored from snapshots, the best
+    state adopted), the incremental eligible count and the tracked eligible
+    copies must still equal a recount."""
+    buffers = bufs()
+    solver = SaCoOptimizingSolver(buffers, 64, alignment=1)
+    solver.plan_layout_and_core_divisions(_objective(buffers, spill))
     _assert_eligible_count(solver)
 
 

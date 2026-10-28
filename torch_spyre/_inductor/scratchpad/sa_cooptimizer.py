@@ -694,9 +694,11 @@ class _ViewRelation(_EdgeRelation):
 
 
 # The joint state ``(pi, W)`` as :meth:`SaCoOptimizingSolver._snapshot` takes it:
-# the packer, the division vector, the eligible count, and the relayout copies
-# switched on.
-_Snapshot = tuple[NativePermutationLayoutSolver, list[DivisionConfig], int, set[int]]
+# the packer, the division vector, the eligible count, the relayout copies
+# switched on, and the ones eligible.
+_Snapshot = tuple[
+    NativePermutationLayoutSolver, list[DivisionConfig], int, set[int], set[int]
+]
 
 
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
@@ -889,13 +891,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         except (ValueError, TypeError, ZeroDivisionError, RuntimeError):
             return None
 
+        charge_of = {name: (source, prices) for name, source, prices in charges}
+        charged = frozenset(charge_of)
+
         def score(chosen, resident) -> int:
             ns = fn(*(value_of[sym](chosen, resident) for sym in free))
-            for copy_name, source, prices in charges:
-                if copy_name in resident:
+            if charged:
+                # Over the resident copies only, a handful against the thousands
+                # a graph can carry; in name order, so the sum is the same
+                # whatever order the sets iterate in.
+                extra = 0.0
+                for name in sorted(charged.intersection(resident)):
+                    source, prices = charge_of[name]
                     position = self._known_menu_position(source, chosen[source])
                     if position is not None and 0 <= position < len(prices):
-                        ns += prices[position]
+                        extra += prices[position]
+                ns += extra
             return utils.to_fixed_us(max(0.0, ns) / 1000.0)
 
         return score
@@ -1110,6 +1121,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # on. All start off, so the seed is the plan without relayouts.
         self._relayout_copy_list = sorted(self._relayout_source)
         self._relayout_on: set[int] = set()
+        # The copies eligible under the current state, kept by every site that
+        # sets the packer's eligibility (:meth:`_note_copy_eligibility`): all
+        # the post-packing cleanup has to look at (:meth:`_resident_indices`).
+        self._eligible_copies: set[int] = set()
         if self._relayout_source:
             logger.debug(
                 "%d relayout copies over %d sources",
@@ -1471,6 +1486,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             )
         )
 
+    def _note_copy_eligibility(self, flags: dict[int, bool]) -> None:
+        """Record the eligibility ``flags`` set on the packer for the relayout
+        copies among them."""
+        if not self._relayout_source:
+            return
+        for idx, flag in flags.items():
+            if idx in self._relayout_source:
+                if flag:
+                    self._eligible_copies.add(idx)
+                else:
+                    self._eligible_copies.discard(idx)
+
     def _resident_addresses(self) -> list[Optional[int]]:
         """``packer.addresses`` with every buffer :meth:`_resident_indices`
         drops set to ``None``: the addresses the write-back commits."""
@@ -1496,32 +1523,25 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         buffer wastes its LX in this state, which the objective prices; it never
         reaches the write-back.
 
-        Only the copies switched on, and their sources, can be involved: a copy
-        that is off is never eligible, hence never placed, and a placed source
-        is eligible, so with none of its copies on every child matches it.
+        Only the eligible copies need looking at. A placed source is eligible,
+        so each consumer it does not match reads it through a copy that is
+        admissible and serves that consumer -- an eligible copy. So a placed
+        source loses a consumer's copy exactly when one of its eligible copies
+        is not placed; and every placed copy is an eligible one.
 
         Hot path: the packer reports the placed buffers only
         (``allocated_indices``), a few hundred against the thousands of
-        occupants a graph with relayout copies hands it.
+        occupants a graph with relayout copies hands it, and the eligible
+        copies are a handful.
         """
         placed = set(self.packer.allocated_indices())
-        if not self._relayout_on:
+        if not self._eligible_copies:
             return placed
-        dropped = []
-        for source in sorted({self._relayout_source[c] for c in self._relayout_on}):
-            if source not in placed:
-                continue
-            parent = self.chosen[source]
-            for consumer, relation in self._children[source]:
-                if relation.compatible(parent, self.chosen[consumer]):
-                    continue
-                read = self._relayout_read(source, consumer)
-                if read is None or read[0] not in placed:
-                    dropped.append(source)
-                    break
-        placed.difference_update(dropped)
         placed.difference_update(
-            [c for c in self._relayout_on if self._relayout_source[c] not in placed]
+            [self._relayout_source[c] for c in self._eligible_copies if c not in placed]
+        )
+        placed.difference_update(
+            [c for c in self._eligible_copies if self._relayout_source[c] not in placed]
         )
         return placed
 
@@ -1593,6 +1613,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         sizes = [self._per_core_size(i, self.chosen[i]) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
         self._n_eligible = sum(eligible)
+        self._note_copy_eligibility(dict(enumerate(eligible)))
 
         # pi from a FirstFit pass over the per-core sizes. FirstFit leaves the
         # fixed pins unplaced and ``SolverToPermutation`` sorts them after every
@@ -1806,6 +1827,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             [(idx, self._per_core_size(idx, config))],
             [(x, flags[x]) for x in affected],
         )
+        self._note_copy_eligibility(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _retile_boundary(self, idx: int, config: DivisionConfig) -> None:
@@ -1986,6 +2008,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         flags = self._eligibility(affected_sorted)
         # One re-place for the whole region rather than one per buffer.
         self.packer.update(resizes, [(x, flags[x]) for x in affected_sorted])
+        self._note_copy_eligibility(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _toggle_relayout(self, copy_idx: int) -> None:
@@ -2007,6 +2030,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._relayout_on ^= {copy_idx}
         flags = self._eligibility(affected)
         self.packer.update([], [(x, flags[x]) for x in affected])
+        self._note_copy_eligibility(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _relayout(self) -> None:
@@ -2162,12 +2186,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
         division vector, and the eligible count ``W`` implies -- rebuilding that
         from ``W`` would cost an O(n) pass the restore does not otherwise need --
-        and the relayout copies switched on, which nothing else can rebuild."""
+        the relayout copies switched on, which nothing else can rebuild, and the
+        ones eligible, kept for the same reason as the count."""
         return (
             self.packer.copy(),
             list(self.chosen),
             self._n_eligible,
             set(self._relayout_on),
+            set(self._eligible_copies),
         )
 
     def _adopt(self, snap: _Snapshot) -> None:
@@ -2176,7 +2202,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
         one O(n) packer copy for its snapshot.
         """
-        self.packer, self.chosen, self._n_eligible, self._relayout_on = snap
+        (
+            self.packer,
+            self.chosen,
+            self._n_eligible,
+            self._relayout_on,
+            self._eligible_copies,
+        ) = snap
 
     # -- move selection & execution -----------------------------------------
 
