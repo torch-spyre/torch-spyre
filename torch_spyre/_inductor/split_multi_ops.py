@@ -737,14 +737,14 @@ def _get_op_name(op) -> str:
 
 def _insert_shuffle_op(
     graph: GraphLowering, op, stg_name: str, stg_buf, target_ea: ElementArrangement
-) -> bool:
+) -> ComputedBuffer | None:
     """Create and insert a torch.ops.spyre.shuffle op."""
 
     # Find the origin FX node from the operation
     orig_node = origin_in_graph(op.data.origins, graph.graph)
     if orig_node is None:
         logger.warning(f"Cannot find origin node for op {op.get_name()}")
-        return False
+        return None
 
     try:
         insert_idx = graph.operations.index(op)
@@ -767,7 +767,7 @@ def _insert_shuffle_op(
         logger.warning(
             f"Cannot find FX node for buffer {stg_name} among origins {[o.name for o in stg_buf.origins]}"
         )
-        return False
+        return None
 
     shuffle_op = torch.ops.spyre.shuffle.default
     with graph.graph.inserting_before(orig_node):
@@ -792,7 +792,7 @@ def _insert_shuffle_op(
 
     if new_buf is None:
         logger.warning(f"Failed to lower shuffle node for {stg_name}")
-        return False
+        return None
 
     object.__setattr__(new_buf, "origins", OrderedSet([shuffle_node]))
 
@@ -847,7 +847,7 @@ def _insert_shuffle_op(
         )
 
     logger.info(f"Successfully inserted shuffle: {stg_name} -> {new_buf.get_name()}")
-    return True
+    return new_op
 
 
 def _has_indirect_access(op, read_writes, indirect_names) -> bool:
@@ -939,28 +939,49 @@ def validate_ops(graph: GraphLowering) -> None:
         # the staggered operand to STANDARD so the op sees one arrangement.
         # When either side broadcasts at the stick dim the stagger is
         # unobservable and no shuffle is needed.
-        if len(stl_eas) == 2 and ElementArrangement.STANDARD in stl_eas:
-            stg_idx = 1 - stl_eas.index(ElementArrangement.STANDARD)
-            stg_name = input_names[stg_idx]
-            stg_stl = buf_stls[stg_name]
-            std_stl = buf_stls[input_names[1 - stg_idx]]
-            if (
-                stl_eas[stg_idx] in SUPPORTED_EAS
-                and stg_stl.stride_map[-1] != -1
-                and std_stl.stride_map[-1] != -1
-            ):
-                target_ea = ElementArrangement.STANDARD
-                logger.debug(
-                    f"Inserting shuffle for buffer {stg_name} "
-                    f"(EA={stl_eas[stg_idx]} -> {target_ea})"
-                )
-                if not _insert_shuffle_op(
-                    graph, op, stg_name, V.graph.get_buffer(stg_name), target_ea
+        #
+        # buf_stls holds each input's first *candidate* layout; the candidates
+        # are not resolved until finalize_layouts, and the broadcast pruning done
+        # in _multi_arg_pointwise_layouts (case 3.1) only touches the consumer's
+        # copy. So an input can look non-broadcast here although the op was
+        # laid out with it broadcasting. The op's own output EA records the
+        # decision: it is staggered when the STANDARD operands broadcast (case
+        # 3.1), and shuffling then would compute in STANDARD order while the
+        # output is still tagged staggered. Only shuffle when the op produces
+        # STANDARD.
+        out_staggered = any(
+            isinstance(layout, SpyreTensorLayout)
+            and layout.element_arrangement in SUPPORTED_EAS
+            for layout in getattr(op, "layouts", ())
+        )
+        if ElementArrangement.STANDARD in stl_eas and not out_staggered:
+            std_names = [
+                n
+                for n, s in buf_stls.items()
+                if s.element_arrangement == ElementArrangement.STANDARD
+            ]
+            std_has_real_stick = any(
+                buf_stls[n].stride_map[-1] != -1 for n in std_names
+            )
+            for stg_name, stg_stl in list(buf_stls.items()):
+                if (
+                    stg_stl.element_arrangement in SUPPORTED_EAS
+                    and stg_stl.stride_map[-1] != -1
+                    and std_has_real_stick
                 ):
-                    raise Unsupported(
-                        f"Failed to insert EA shuffle for buffer {stg_name} "
-                        f"in op {op_name}"
+                    new_op = _insert_shuffle_op(
+                        graph,
+                        op,
+                        stg_name,
+                        V.graph.get_buffer(stg_name),
+                        ElementArrangement.STANDARD,
                     )
+                    if new_op is None:
+                        raise Unsupported(
+                            f"Failed to insert EA shuffle for buffer {stg_name} "
+                            f"in op {op_name}"
+                        )
+                    op = new_op
 
 
 def optimize_shuffling(graph: GraphLowering) -> None:
