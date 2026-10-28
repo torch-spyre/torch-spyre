@@ -682,20 +682,14 @@ def restickify_padding_blocked_vars(
 
 
 def ea_shuffle_stick_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Keep the stick dimension of a ``spyre.shuffle`` op on one core.
+    """Keep the stick dimension of an element-arrangement shuffle op on one core.
 
     A staggered element arrangement interleaves the columns of a whole stagger
     unit (one 64-element stick, or an fp32 stick pair of 64 columns). Splitting
     the stick dimension across cores would hand a core part of a unit, which the
-    shuffle's per-core elem_arr encoding cannot express. Only the explicit
-    shuffle (lowered with ``shuffle_ea``) is restricted: dtype conversions that
-    produce a staggered EA keep their own work division.
+    shuffle's per-core elem_arr encoding cannot express.
     """
-    if (
-        getattr(ctx.op, "shuffle_ea", None) is None
-        or not isinstance(ctx.op.data, Pointwise)
-        or len(ctx.input_tds) != 1
-    ):
+    if not isinstance(ctx.op.data, Pointwise) or len(ctx.input_tds) != 1:
         return ConstraintResult()
 
     in_ea = getattr(ctx.input_tds[0].layout.device_layout, "element_arrangement", None)

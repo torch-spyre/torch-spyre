@@ -678,6 +678,12 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 # ---------------------------------------------------------------------------
 # Shuffle op
 # ---------------------------------------------------------------------------
+def _is_narrow_dl16_to_fp32(name, shape):
+    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim narrower than
+    # 64 only gets a single fp32 stick, so half of each pair has nowhere to go.
+    return name == "dl16_to_fp32_to_std" and shape[-1] < 64
+
+
 def shuffle(x, ea):
     return torch.ops.spyre.shuffle(x, ea.value)
 
@@ -755,6 +761,12 @@ class TestEAShuffle:
             return shuffle(x_proc, target_ea)
 
         x = cached_randn(shape, dtype=base_dtype)
+
+        if _is_narrow_dl16_to_fp32(name, shape):
+            with pytest.raises(InductorError, match="no supported output layout"):
+                _run(fn, x.to(DEVICE_NAME))
+            return
+
         result = _run(fn, x.to(DEVICE_NAME))
 
         assert_ea(result, exp_ea)

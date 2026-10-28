@@ -384,7 +384,7 @@ def _shuffle_stick_levels(
         sticks = -(-size // 32)
         if sticks % 2:
             raise Unsupported(
-                f"shuffle to/from {ea.name} needs whole FP32 stick pairs, got "
+                f"shuffle: {ea.name} requires whole FP32 stick pairs, got "
                 f"{sticks} stick(s) for a stick dim of {size} per core"
             )
         levels = [(4, 1), (8, 8), (2, 4), (sticks // 2, 64)]

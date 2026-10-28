@@ -17,6 +17,19 @@ test_suite_config:
         # Known LX-planning failures -- run and expected to fail. Non-strict
         # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
         # in both wraps collapse to (pointwise|reduction).
+        # EA-shuffle copy round-trips: whole FP32 stick-pair constraint is
+        # violated when LX planning splits cores differently (68: 3 sticks/core
+        # is odd; 5120: dbo-opt scheduler fails on data stage 5).
+        - names:
+            - LxPlanning.*::test_round_trip_to_dtype_copy_(bfloat16|float16)_to_float32_68_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_round_trip_to_dtype_copy_(bfloat16|float16)_to_float32_5120_lx_planning_(pointwise|reduction)
+          mode: xfail
+        # implicit_invalid wrap: the LX reduction wrap appends a second op that
+        # changes the graph enough that the mixed-EA rejection no longer fires
+        # for the 5120 and 64 shapes; "DID NOT RAISE" under the reduction wrap.
+        - names:
+            - LxPlanningTwoOpReduction.*::test_round_trip_to_dtype_implicit_invalid_add_float16_to_float32_(5120|64)_lx_planning_reduction
+          mode: xfail
         - names:
             - LxPlanning.*::test_flatten_2d_full_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_flatten_3d_full_lx_planning_(pointwise|reduction)

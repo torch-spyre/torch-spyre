@@ -401,7 +401,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_working_implicit_add_fp16_to_fp32(self):
         """explicit fp16->fp32 cast still hits #2252 arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim01_x")
@@ -413,7 +412,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_arrangement_error(self):
         """direct add of H2D fp32 + on-device fp16 hits arrangement mismatch."""
         x = cached_randn((4, 64), differentiation="newim02_fp16")
@@ -424,7 +422,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_4d_stick_aligned(self):
         """direct fp16+fp32 add on 4D (2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 4, 64), differentiation="dir4d_fp16")
@@ -437,7 +434,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_5d_stick_aligned(self):
         """direct fp16+fp32 add on 5D (2,2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 2, 4, 64), differentiation="dir5d_fp16")
@@ -450,7 +446,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_large_values(self):
         """direct fp16+fp32 add with large values (scale=100)."""
         x = cached_randn((4, 64), differentiation="dirlrg_fp16", scale=100.0)
@@ -463,7 +458,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_mixed_dtype_add_small_values(self):
         """direct fp16+fp32 add with small values (scale=1e-3)."""
         x = cached_randn((4, 64), differentiation="dirsml_fp16", scale=1e-3)
@@ -569,9 +563,17 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "the mixed-EA sub compiles, but the final fp32 to fp16 cast leaves a "
+            "staggered element arrangement and the device-to-host copy reads it as "
+            "standard, so the elements come back permuted (#4393)"
+        ),
+    )
     def test_sub_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """sub with explicit fp16->fp32 cast hits #2252."""
+        """sub with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe09_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe09_y")
 
@@ -581,9 +583,17 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "the mixed-EA mul compiles, but the final fp32 to fp16 cast leaves a "
+            "staggered element arrangement and the device-to-host copy reads it as "
+            "standard, so the elements come back permuted (#4393)"
+        ),
+    )
     def test_mul_fp16_fp32_via_explicit_cast_roundtrip(self):
-        """mul with explicit fp16->fp32 cast hits #2252."""
+        """mul with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe10_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe10_y")
 
@@ -593,9 +603,17 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "the mixed-EA div compiles, but the final fp32 to fp16 cast leaves a "
+            "staggered element arrangement and the device-to-host copy reads it as "
+            "standard, so the elements come back permuted (#4393)"
+        ),
+    )
     def test_div_fp16_by_fp32_via_explicit_cast_workaround(self):
-        """div with explicit fp16->fp32 cast hits #2252."""
+        """div with explicit fp16->fp32 cast, then fp32->fp16 readback."""
         x = cached_randn((4, 64), differentiation="spe12_x")
         y = cached_randn((4, 64), dtype=torch.float32, differentiation="spe12_y")
 
@@ -616,7 +634,6 @@ class TestImplicitPromotion(unittest.TestCase):
         self.assertEqual(fn(x, y).dtype, torch.float16)
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
     def test_direct_sub_fp32_tensor_fp16_tensor(self):
         """fp32_tensor - fp16_tensor (reversed operand order)."""
         x = cached_randn((4, 64), dtype=torch.float32, differentiation="tp02_fp32")
@@ -739,9 +756,12 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @_rejected("Multi-arg pointwise with mixed EA", "#2252")
+    # TODO: the mixed-EA gate no longer rejects this; once fp32 restickify lands the
+    # test must become a positive one.
+    @_rejected("no mechanism to resolve stick incompatibility", "#2544")
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
-        """non-contiguous fp16 + fp32 hits arrangement mismatch."""
+        """non-contiguous fp16 + fp32: the transposed fp32 output needs an fp32
+        restickify, which is not supported."""
         x = cached_randn((64, 4), differentiation="ncim02_fp16")
         y = cached_randn((64, 4), dtype=torch.float32, differentiation="ncim02_fp32")
 

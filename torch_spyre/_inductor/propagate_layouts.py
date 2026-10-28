@@ -161,6 +161,17 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def _stick_in_extent(in_layout, stl):
+    target = concretize_expr(stl.stride_map[-1])
+    sizes = [int(concretize_expr(s)) for s in in_layout.size]
+    strides = [concretize_expr(s) for s in in_layout.stride]
+    # Size-1 dims share strides with their neighbours and are ambiguous; skip them.
+    cands = [
+        i for i, (st, n) in enumerate(zip(strides, sizes)) if st == target and n != 1
+    ]
+    return sizes[cands[-1]] if cands else None
+
+
 def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     """Remove physical extent from logical stride-zero dimensions.
 
@@ -869,6 +880,12 @@ def _single_arg_op_layout(
                     f"shuffle: invalid EA value {dst_ea_int!r} "
                     f"({type(dst_ea_int).__name__})"
                 )
+
+            if stl.element_arrangement == ElementArrangement.DL16_TO_FP32:
+                ext = _stick_in_extent(in_layout, stl)
+                pair_columns = 2 * 32  # 2 sticks x 32 fp32 elements
+                if ext is not None and ext < pair_columns:
+                    return []
 
             # Preserve the full device geometry (device_size, stride_map) and
             # only change the element_arrangement tag.
@@ -1963,9 +1980,10 @@ def _multi_arg_pointwise_layouts(
 
     ea_args = []
     for arg in args:
-        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
-        if lane0:
-            arg.layouts[:] = lane0
+        if arg.dep.name in ind_names:
+            lane0 = _lane0_candidates(arg)
+            if lane0:
+                arg.layouts[:] = lane0
         else:
             ea_args.append(arg)
 
@@ -2399,6 +2417,12 @@ def compute_layouts(
                 op, output, output_dep, args[0].dep, args[0].layout, stl
             )
             layouts.extend(result)
+        if not layouts:
+            raise Unsupported(
+                f"{op.get_name()} ({aten_op}): no supported output layout found for "
+                f"any of {len(args[0].layouts)} candidate input layouts; "
+                f"output size={output.size}"
+            )
         op.restick_cost_fn = AnyInNode.from_args()
         return layouts
 

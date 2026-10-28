@@ -23,6 +23,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
+    Scatter,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -34,10 +35,11 @@ from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
 from .errors import Unsupported
 from .pass_utils import (
-    replace_computed_buffer_body,
+    find_fx_node,
+    indirect_info_from_op,
     origin_in_graph,
     patch_env,
-    find_fx_node,
+    replace_computed_buffer_body,
 )
 from .constants import is_ea_compatible, SUPPORTED_EAS
 from .optimize_restickify import AllSameNode, AnyInNode
@@ -848,6 +850,17 @@ def _insert_shuffle_op(
     return True
 
 
+def _has_indirect_access(op, read_writes, indirect_names) -> bool:
+    """True if ``op`` is an indirect scatter/gather (index read or index write)."""
+    if isinstance(op.data, Scatter) or indirect_names:
+        return True
+    return any(
+        isinstance(d, MemoryDep)
+        and any(str(s).startswith(("indirect", "tmp")) for s in d.index.free_symbols)
+        for d in (*read_writes.reads, *read_writes.writes)
+    )
+
+
 def validate_ops(graph: GraphLowering) -> None:
     """Validate inputs to ops have same ElementArrangement.
 
@@ -861,7 +874,19 @@ def validate_ops(graph: GraphLowering) -> None:
             continue
 
         read_writes = op.get_read_writes()
-        inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
+        indirect_names, _, _ = indirect_info_from_op(op)
+
+        # Indirect scatter/gather never gets an EA shuffle: the index operand has
+        # no arrangement to match, and shuffling the data operand would un-stagger
+        # it while the output keeps its staggered tag.
+        if _has_indirect_access(op, read_writes, indirect_names):
+            continue
+
+        inputs = [
+            r
+            for r in read_writes.reads
+            if isinstance(r, MemoryDep) and r.name not in indirect_names
+        ]
 
         # Exclude single input ops
         if len(inputs) <= 1:
