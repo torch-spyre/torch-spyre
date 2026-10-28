@@ -5049,9 +5049,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         solver's ``decides_lx_relayouts`` and on ``config.lx_solver_relayout``.
 
         ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
-        gives each parent's cap-and-rank step the other parents' already-free
-        divisions, so it won't drop the one group that would let this parent
-        join them.
+        gives a coarse-tiled parent's cap-and-rank step the other parents'
+        already-free divisions, so it won't drop the one group that would let
+        this parent join them.
         """
         if (
             not self._decides_lx_relayouts
@@ -5298,10 +5298,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         consumer_op.get_name(),
                         exc,
                     )
+            # Sibling pins apply only inside one coarse-tiling loop, the edges
+            # solver_relayout_edge_context's same-tile-group exception admits.
+            # Elsewhere a sibling usually matches most consumer divisions, and
+            # pinning them all would leave the edge uncapped.
+            parent_loop_info = getattr(parent_op, "loop_info", None)
             sibling_pinned = frozenset(
                 j
                 for other_parent, pairs in (cd_parent_matches or {}).items()
-                if other_parent != parent
+                if isinstance(parent_loop_info, CoarseTileInfo)
+                and other_parent != parent
                 for _, j in pairs
             )
             candidates = self._cap_relayout_groups(
