@@ -19,6 +19,7 @@ import torch._dynamo
 import torch._higher_order_ops.effects
 from torch._inductor.fx_passes.reinplace import InplaceableOp, inplaceable_ops
 
+from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
@@ -169,6 +170,42 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     # Index materializes in the input dtype, not int64: a float that lies it
     # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
     return x.new_empty(out_size, dtype=x.dtype)
+
+
+@torch.library.custom_op("spyre::histc_count", mutates_args=(), device_types="spyre")
+def histc_count(
+    idx: torch.Tensor, bin_ids: torch.Tensor, bins: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """Counts of each value 0..bins-1 in the 1-D fp32 ``idx``, as a (bins,)
+    tensor of ``out_dtype``. Other values are ignored. ``bin_ids`` is
+    ``histc_bin_ids(bins_pad)``."""
+    pass
+
+
+@histc_count.register_fake
+def _(
+    idx: torch.Tensor, bin_ids: torch.Tensor, bins: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    return idx.new_empty((bins,), dtype=out_dtype)
+
+
+_HISTC_BIN_IDS_CACHE: dict[int, torch.Tensor] = {}
+
+
+@torch.library.custom_op("spyre::histc_bin_ids", mutates_args=())
+def histc_bin_ids(bins_pad: int) -> torch.Tensor:
+    """0..bins_pad-1 as an fp32 device tensor, cached per ``bins_pad``
+    (``torch.arange`` has no device lowering)."""
+    bin_ids = _HISTC_BIN_IDS_CACHE.get(bins_pad)
+    if bin_ids is None:
+        bin_ids = torch.arange(bins_pad, dtype=torch.float32).to(DEVICE_NAME)
+        _HISTC_BIN_IDS_CACHE[bins_pad] = bin_ids
+    return bin_ids
+
+
+@histc_bin_ids.register_fake
+def _(bins_pad: int) -> torch.Tensor:
+    return torch.empty((bins_pad,), dtype=torch.float32, device=DEVICE_NAME)
 
 
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
