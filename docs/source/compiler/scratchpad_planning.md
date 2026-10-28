@@ -408,13 +408,28 @@ An ownership proof does not replace storage, lifetime or capacity checks.
 The untiled prefix case does not require same-tile-group search.
 
 The symbolic proof registry below is separate from storage permission. It
-selects the emitted-access containment proofs in order.
+selects the existing containment proofs in order. The view-recovery caller
+keeps its floor-only, single-driven-axis restriction. An emitted-access proof
+alone does not authorize a recovery candidate.
 
 <!-- BEGIN GENERATED OWNERSHIP PROOFS -->
 | Ownership proof | Certificate | Requires | Covering tests |
 |---|---|---|---|
 | Affine rectangle containment; emitted access | `project_affine_slice_axis` | one contained loop partition, complete read rectangle, unchanged physical coordinates | `test_q_rope_ownership_keeps_the_whole_pair_in_its_slice`; `test_q_projection_rope_handoff_preserves_pairs_and_other_consumer`; `test_ownership_callers_keep_their_admission_policy` |
+| Floor-affine rectangle containment; floor-only recovery | `project_floor_affine_slice_axis` | one ascending affine floor, complete physical read rectangle, unchanged coordinates and caller admission | `test_floor_slice_projection_rejects_unproven_access`; `test_attention_output_repack_handoff`; `test_ownership_callers_keep_their_admission_policy` |
 <!-- END GENERATED OWNERSHIP PROOFS -->
+
+The following rows describe transfer checks and shortlist selection. They do
+not change admission order or authorize storage reuse. A reserved shortlist
+slot is a search heuristic, not an ownership proof or a performance guarantee.
+
+<!-- BEGIN GENERATED TRANSFER CERTIFICATES -->
+| Certificate | Function | Requires | Predicate tests | Integration tests |
+|---|---|---|---|---|
+| Full-replica gather | `torch_spyre._inductor.scratchpad.lx_relayout._movement_supported` | ownership flag ON; complete source partition; one destination slice; uniform fan-in/out; all source fragments; shuffle fan-in budget | `test_work_division_hint.py::test_full_replica_movement_tracks_ownership_flag`; `test_work_division_hint.py::test_movement_rule_reads_the_owner_maps` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Full-replica shortlist reservation | `torch_spyre._inductor.scratchpad.allocator.CoOptimizingAllocator._cap_relayout_groups` | ownership flag ON; cheapest priced full replica; an existing unpinned slot; sibling pins, prices and cap preserved; solver may decline the copy | `test_solver_relayout_decision.py::test_relayout_full_replica_preserves_sibling_pins` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+<!-- END GENERATED TRANSFER CERTIFICATES -->
 
 `SPYRE_LX_EXTENDED_OWNERSHIP=0` disables the additional ownership proofs while
 retaining the earlier prefix-copy rules. Its default is ON. The flag does not

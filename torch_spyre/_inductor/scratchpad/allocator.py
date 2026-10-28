@@ -4593,14 +4593,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         pinned_consumer_divisions: frozenset[int] = frozenset(),
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
-        cheapest destination views of one (source, consumer) edge.
+        cheapest destination views of one (source, consumer) edge, retaining
+        coverage of a fully replicated operand when one is available.
 
         Each distinct consumer read partition is its own
         relayout group, and every group becomes a copy buffer the solver must
         place, though the consumer will read through at most one of them. A
         group is ranked by copy plus consumer execution cost, not copy cost
         alone: a cheap copy can feed an expensive matmul division. This is a
-        shortlist estimate, not the whole-graph objective. Ties favor more
+        shortlist estimate, not the whole-graph objective. A full replica
+        serves consumer divisions that do not split this operand at all.
+        Partial views can crowd it out under this isolated-op estimate even
+        when the whole graph chooses such a division to preserve its other
+        LX handoffs. Reserve one of the existing slots for the cheapest full
+        replica if a slot remains after sibling-pinned groups; never add an
+        unpriced pair or increase the cap for a replica. Ties favor more
         consumer cores, the solver's existing preference. Dropping a group only
         removes an option:
         a consumer division without a copy is treated exactly like an unpriced
@@ -4641,12 +4648,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
-        remaining = cap - len(pinned_groups)
-        ranked = [item for item in by_group.items() if item[0] not in pinned_groups]
-        cost_kept = {
-            group for group, _ in sorted(ranked, key=rank)[: max(remaining, 0)]
-        }
+        ranked = sorted(by_group.items(), key=rank)
+        remaining = max(cap - len(pinned_groups), 0)
+        unpinned = [group for group, _ in ranked if group not in pinned_groups]
+        cost_kept = set(unpinned[:remaining])
         kept = pinned_groups | cost_kept
+        full_replica = next(
+            (
+                group
+                for group, members in ranked
+                if members[0].destination_view.split_product == 1
+                and members[0].destination_num_cores > 1
+            ),
+            None,
+        )
+        if (
+            config.lx_extended_ownership
+            and full_replica is not None
+            and full_replica not in kept
+            and cost_kept
+        ):
+            kept.remove(unpinned[remaining - 1])
+            kept.add(full_replica)
         logger.debug(
             "[lx solver relayout] %s -> %s: keeping %d of %d destination views"
             " (%d pinned by a sibling parent match)",

@@ -3645,6 +3645,41 @@ def _per_core_view_from_prep(
                 )
                 return unrepresentable
 
+        # Repack can put an outer loop inside one physical stick-count axis:
+        # 2*head + floor(width/64). Head's host stride128 has no direct match
+        # in [64, 1024, 1], yet head4 owns four contiguous stick groups. The
+        # multi-axis decomposition below cannot infer a single driven axis.
+        # Reuse the relayout projector's whole-rectangle containment proof;
+        # do not infer ownership just from a divisible host stride.
+        if (
+            dev_dim is None
+            and config.lx_planner_relayout
+            and config.lx_extended_ownership
+        ):
+            from .slice_ownership import project_slice_axis
+
+            driven = [
+                axis
+                for axis, coord in enumerate(prep.dep_device_coordinates)
+                if sym in coord.free_symbols
+            ]
+            if len(driven) == 1 and driven[0] != len(device_size) - 1:
+                axis = driven[0]
+                coordinate = prep.dep_device_coordinates[axis]
+                if device_size[axis] % split == 0 and all(
+                    per_sym.get(other, 1) == 1
+                    for other in coordinate.free_symbols - {sym}
+                ):
+                    projected = project_slice_axis(
+                        coordinate,
+                        int(device_size[axis]),
+                        split,
+                        iter_space,
+                        floor_only=True,
+                    )
+                    if projected is not None and projected[0] == sym:
+                        dev_dim = axis
+
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when
         # split*k fully covers num_stick_dim — partial coverage would

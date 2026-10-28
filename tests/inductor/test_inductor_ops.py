@@ -3391,13 +3391,88 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_ne_scalar_eager", "test_ne_scalar_eager_cpu"): {
+            "expect_fail": {
+                "int64_above_2e24": _CMP_BIGINT_REASON,
+                "fp16_nan": (
+                    "a NaN operand gives False for ne on device, True on CPU: "
+                    "spyreop.compare predicates are IEEE-ordered, same as "
+                    "torch.compile (#5190)"
+                ),
+            },
+            "expect_raise": {
+                # 3798
+                "fp16_offset_view": "requires a stick-aligned storage_offset",
+                # 5383
+                "fp16_unaligned_slice_32": "requires a stick-aligned storage_offset",
+            },
+            "param_sets": {
+                "fp16_int_scalar": (torch.arange(8, dtype=torch.float16), 3),
+                "fp16_float_scalar": (torch.arange(8, dtype=torch.float16), 3.0),
+                "int64_int_scalar": (torch.arange(8, dtype=torch.int64), 3),
+                "int32_int_scalar": (torch.arange(8, dtype=torch.int32), 3),
+                "int64_float_scalar": (torch.arange(8, dtype=torch.int64), 3.0),
+                "bool_int_scalar": (torch.tensor([True, False] * 4), 1),
+                "int64_unaligned_130": (torch.arange(130, dtype=torch.int64), 3),
+                "fp16_2d": (torch.arange(128, dtype=torch.float16).reshape(8, 16), 3),
+                "fp16_transposed": (
+                    torch.arange(128, dtype=torch.float16).reshape(8, 16),
+                    3,
+                    lambda x, s: x.t() != s,
+                ),
+                "fp16_0dim": (torch.tensor(3.0, dtype=torch.float16), 3),
+                "fp16_inf": (
+                    torch.tensor([1.0, float("inf"), float("-inf"), 3.0] * 16).to(
+                        torch.float16
+                    ),
+                    float("inf"),
+                ),
+                "fp16_out": (
+                    torch.arange(8, dtype=torch.float16),
+                    3.0,
+                    lambda x, s: torch.ne(
+                        x,
+                        s,
+                        out=torch.empty(x.shape, dtype=torch.bool, device=x.device),
+                    ),
+                ),
+                "fp16_inplace": (
+                    torch.arange(8, dtype=torch.float16),
+                    3,
+                    lambda x, s: x.clone().ne_(s),
+                ),
+                "int64_above_2e24": (
+                    torch.tensor(
+                        [2**24, 2**24 + 1, 2**24 + 2, 5, 3, 3] * 11, dtype=torch.int64
+                    )[:64],
+                    2**24 + 1,
+                ),
+                "fp16_nan": (
+                    torch.tensor([0.5, float("nan"), 3.0, 1.0] * 16).to(torch.float16),
+                    3,
+                ),
+                "fp16_offset_view": (
+                    torch.arange(128, dtype=torch.float16).reshape(8, 16),
+                    3,
+                    lambda x, s: x[1:] != s,
+                ),
+                "fp16_unaligned_slice_32": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    40,
+                    lambda x, s: x[:, 32:] != s,
+                ),
+                "fp16_aligned_slice_64": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    3,
+                    lambda x, s: x[:, 64:] != s,
+                ),
+            },
+        },
         # -----------------------------------------------------------------------
         # Regression: 0-dim integer compare inside a torch.cond branch.
         #
-        # eq/ne/le/gt/ge promote the integer operand through INT_TO_FLOAT before
-        # comparing, so they run on device.  lt is still expected to fail (#5551):
-        # the same promotion guard that protects while_loop trip counters (which
-        # must stay integer) also applies to lt inside torch.cond branches.
+        # Every compare promotes the integer operand through INT_TO_FLOAT before
+        # comparing, so all six run on device.
         # -----------------------------------------------------------------------
         ("test_cmp_cond_subgraph", "test_cmp_cond_subgraph_cpu"): {
             "ops_dict": {
@@ -3407,12 +3482,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "le": torch.le,
                 "gt": torch.gt,
                 "ge": torch.ge,
-            },
-            "expect_fail": {
-                "lt_int32_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int32_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int64_eq": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
-                "lt_int64_ne": "lt inside torch.cond branch skips INT_TO_FLOAT promotion (#5551)",
             },
             "param_sets": {
                 # int32 0-dim inside a torch.cond branch.
@@ -9447,11 +9516,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Integers large enough that int→fp32 loses the distinction between them.
         self.compare_with_cpu(op, x, y, run_eager=True)
 
+    def test_ne_scalar_eager_cpu(self, x, scalar, fn=None):
+        # Eager x != scalar must run on device. A CPU fallback gives the right
+        # values, so FallbackWarning is an error here; compile is off because
+        # this test focuses specifically on eager execution.
+        fn = fn or (lambda x, s: x != s)
+
+        def no_fallback(x, s):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FallbackWarning)
+                return fn(x, s)
+
+        self.compare_with_cpu(
+            no_fallback,
+            x,
+            scalar,
+            atol=0.0,
+            rtol=0.0,
+            run_compile=False,
+            run_eager=True,
+            cpu_eager_result=fn(x, scalar),
+        )
+
     def test_cmp_cond_subgraph_cpu(self, op, n, x):
-        # Regression: 0-dim int compare (eq/ne/le/gt/ge) inside a torch.cond
-        # branch must not be erroneously skipped by the trip-counter carve-out.
-        # Before the fix, _lower_cmp_impl checked only "inside SubgraphLowering"
-        # and passed the raw integer IR to Spyre, which has no integer compare.
+        # A 0-dim integer compare inside a torch.cond branch runs on the device
+        # like a top-level one: it is promoted through INT_TO_FLOAT, since Spyre
+        # has no integer compare.
         def fn(n, x):
             return torch.cond(
                 x.sum() > 0,
