@@ -8219,7 +8219,7 @@ class TestValidateTiling(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
         )
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         op = _ftl_pointwise((512, 256), name="val_not_iter_var")
         spec = TileSpec((TileAxis(0, 2),))
@@ -8233,7 +8233,7 @@ class TestValidateTiling(unittest.TestCase):
             self.assertIsNone(loop_vars)
             with self.assertRaises(Unsupported):
                 tile_spec_to_dim_hints(op, spec, [0])
-            self.assertFalse(_lowering_accepts(op, TileAxis(0, 2)))
+            self.assertIsNotNone(_lowering_rejection(op, TileAxis(0, 2)))
             self.assertEqual(_rejection_reason(op, spec), reason)
             self.assertIsNone(predict_frame(op, spec))
 
@@ -9078,25 +9078,31 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
                 with self.subTest(op=op.get_name(), spec=spec):
                     self.assertIsNotNone(predict_frame(op, spec))
 
-    def test_lowering_accepts_consults_the_lowering(self):
-        # _lowering_accepts rejects exactly what the shared resolver rejects.
-        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+    def test_lowering_rejection_consults_the_lowering(self):
+        # _lowering_rejection rejects exactly what the shared resolver rejects.
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_rejection
 
         pw = _make_real_tiled_op("pw_acc", [6, 128])
         red = _make_real_tiled_op("red_acc", [4, 64], [8])
         red_unit = _make_real_tiled_op("red_unit_acc", [4, 64], [1, 8])
-        self.assertTrue(_lowering_accepts(pw, TileAxis(0, 2)))
-        self.assertTrue(_lowering_accepts(red, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNone(_lowering_rejection(pw, TileAxis(0, 2)))
+        self.assertIsNone(_lowering_rejection(red, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the output frame.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(2, 2)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(2, 2)))
         # A reduction axis on an op with no reduction.
-        self.assertFalse(_lowering_accepts(pw, TileAxis(0, 2, is_reduction=True)))
+        self.assertIsNotNone(_lowering_rejection(pw, TileAxis(0, 2, is_reduction=True)))
         # Out of bounds for the one reduction loop variable.
-        self.assertFalse(_lowering_accepts(red, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNotNone(
+            _lowering_rejection(red, TileAxis(1, 2, is_reduction=True))
+        )
         # [1, 8] has one reduction loop variable, for the 8: host_dim 0 names
         # it, and host_dim 1 is out of bounds though [1, 8] has two entries.
-        self.assertTrue(_lowering_accepts(red_unit, TileAxis(0, 2, is_reduction=True)))
-        self.assertFalse(_lowering_accepts(red_unit, TileAxis(1, 2, is_reduction=True)))
+        self.assertIsNone(
+            _lowering_rejection(red_unit, TileAxis(0, 2, is_reduction=True))
+        )
+        self.assertIsNotNone(
+            _lowering_rejection(red_unit, TileAxis(1, 2, is_reduction=True))
+        )
 
 
 class TestPlannedFullBufferLayout(unittest.TestCase):
