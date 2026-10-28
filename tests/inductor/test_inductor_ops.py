@@ -2138,6 +2138,168 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     0,
                 ),
+                # Leading-dim-1 shapes where the reduction dim is the
+                # tensor's only non-trivial axis, so the natural device
+                # layout would otherwise stick the reduction dim itself.
+                "2d_batch1_k4_dim1_lt64": (
+                    unique_randn_along_dim((1, 32), dim=1),
+                    4,
+                    1,
+                ),
+                "2d_batch1_k4_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
+                    4,
+                    1,
+                ),
+                "3d_batch1x1_k4_dim2_lt64": (
+                    unique_randn_along_dim((1, 1, 32), dim=2),
+                    4,
+                    2,
+                ),
+                "3d_batch1x1_k4_dim2_gt64": (
+                    unique_randn_along_dim((1, 1, 128), dim=2),
+                    4,
+                    2,
+                ),
+                "2d_batch1_k6_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
+                    6,
+                    1,
+                ),
+                "3d_batch1x1_k6_dim2_gt64": (
+                    unique_randn_along_dim((1, 1, 128), dim=2),
+                    6,
+                    2,
+                ),
+                "2d_batch1_k8_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
+                    8,
+                    1,
+                ),
+                "3d_batch1x1_k8_dim2_gt64": (
+                    unique_randn_along_dim((1, 1, 128), dim=2),
+                    8,
+                    2,
+                ),
+                # N not a multiple of the 64-element stick size.
+                "2d_batch1_k4_dim1_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 100), dim=1),
+                    4,
+                    1,
+                ),
+                "3d_batch1x1_k4_dim2_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 1, 100), dim=2),
+                    4,
+                    2,
+                ),
+                "2d_batch1_k6_dim1_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 100), dim=1),
+                    6,
+                    1,
+                ),
+                "3d_batch1x1_k6_dim2_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 1, 100), dim=2),
+                    6,
+                    2,
+                ),
+                "2d_batch1_k8_dim1_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 100), dim=1),
+                    8,
+                    1,
+                ),
+                "3d_batch1x1_k8_dim2_non_multiple_of_64": (
+                    unique_randn_along_dim((1, 1, 100), dim=2),
+                    8,
+                    2,
+                ),
+                # Mirror of the (1, N) case: the size-1 dim is last instead
+                # of first, so the reduction dim (0) is the tensor's first
+                # dim rather than its last.
+                "2d_nx1_k4_dim0_lt64": (
+                    unique_randn_along_dim((32, 1), dim=0),
+                    4,
+                    0,
+                ),
+                "2d_nx1_k4_dim0_gt64": (
+                    unique_randn_along_dim((128, 1), dim=0),
+                    4,
+                    0,
+                ),
+                "2d_nx1_k4_dim0_non_multiple_of_64": (
+                    unique_randn_along_dim((100, 1), dim=0),
+                    4,
+                    0,
+                ),
+                # k=8 variant to catch any backend-side assumption that the
+                # reduction dim of a degenerate topk sits last rather than
+                # first (dim=0 here, vs. dim=1/2 for the (1, N)-family above).
+                "2d_nx1_k8_dim0_gt64": (
+                    unique_randn_along_dim((128, 1), dim=0),
+                    8,
+                    0,
+                ),
+                # Reduction dim sandwiched between two size-1 dims.
+                "3d_1xnx1_k4_dim1_lt64": (
+                    unique_randn_along_dim((1, 32, 1), dim=1),
+                    4,
+                    1,
+                ),
+                "3d_1xnx1_k4_dim1_gt64": (
+                    unique_randn_along_dim((1, 128, 1), dim=1),
+                    4,
+                    1,
+                ),
+                "3d_1xnx1_k8_dim1_gt64": (
+                    unique_randn_along_dim((1, 128, 1), dim=1),
+                    8,
+                    1,
+                ),
+                # Every dim is size 1: reduction dim, k dim, and the only
+                # "surviving" dim all collapse onto the same trivial axis.
+                # dim doesn't matter here -- (1, 1, 1) is the same degenerate
+                # tensor regardless of which axis is picked as the reduction.
+                "3d_1x1x1_k1_dim0": (
+                    unique_randn_along_dim((1, 1, 1), dim=0),
+                    1,
+                    0,
+                ),
+            },
+        },
+        ("test_topk_indices", "test_topk_indices_cpu"): {
+            "param_sets": {
+                "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
+                "2d_batch1_k4_dim1_lt64": (
+                    unique_randn_along_dim((1, 32), dim=1),
+                    4,
+                    1,
+                ),
+                # Degenerate (1, N) case with N > 64: unlike the lt64 variant
+                # above, this needs an actual restickify (multi-stick input ->
+                # synthetic-stick output), so it exercises index correctness
+                # through EdgeCostMap's forbidden-stick size-1 target.
+                "2d_batch1_k4_dim1_gt64": (
+                    unique_randn_along_dim((1, 128), dim=1),
+                    4,
+                    1,
+                ),
+            },
+            # The values and the fp16 indices are exact; the fp16 to int64 cast of
+            # the indices is not.
+            "expect_fail": {
+                "2d_k4_dim0": _STAGGERED_READBACK,
+            },
+            # The cast's fp32 value lacks the second stick of a stick pair, so it
+            # reads memory that was never written: the result is wrong on most runs
+            # and right on some, and a pass is reported, not an error.
+            "expect_fail_unstable": {
+                "2d_batch1_k4_dim1_lt64": (
+                    "the cast's fp32 value lacks the second stick of a stick pair "
+                    "(#3999), so the indices come back wrong on most runs"
+                ),
+                "2d_batch1_k4_dim1_gt64": (
+                    "the cast's fp32 value lacks the second stick of a stick pair "
+                    "(#3999), so the indices come back wrong on some runs"
+                ),
             },
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
@@ -4259,6 +4421,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(0, dtype=torch.float16),
                     cached_randn((1, 8, 14, 64), dtype=torch.float16),
                 ),
+                "2d_dim1_unaligned_fp16": (
+                    1,
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    cached_randn((1, 32), dtype=torch.float16),
+                ),
+                "2d_dim1_unaligned_small_fp16": (
+                    1,
+                    cached_randn((4, 100), dtype=torch.float16),
+                    cached_randn((4, 28), dtype=torch.float16),
+                ),
+                "2d_dim1_unaligned_fp32": (
+                    1,
+                    cached_randn((1, 993), dtype=torch.float32),
+                    cached_randn((1, 31), dtype=torch.float32),
+                ),
+                "2d_dim1_unaligned_three_tensors": (
+                    1,
+                    cached_randn((2, 100), dtype=torch.float16),
+                    cached_randn((2, 100), dtype=torch.float16),
+                    cached_randn((2, 56), dtype=torch.float16),
+                ),
             },
         },
         (
@@ -4365,6 +4548,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim2_negative_both": (
                     cached_randn((2, 5, 8, 64), dtype=torch.float16),
                     (0, 0, -2, -2),
+                ),
+                "2d_last_dim_unaligned_fp16": (
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    (0, 32),
+                ),
+                "2d_last_dim_unaligned_fp16_small_pad": (
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "2d_last_dim_unaligned_fp32": (
+                    cached_randn((1, 993), dtype=torch.float32),
+                    (0, 31),
+                ),
+                "2d_both_dims_unaligned": (
+                    cached_randn((3, 100), dtype=torch.float16),
+                    (0, 28),
+                ),
+                "3d_last_dim_unaligned": (
+                    cached_randn((2, 4, 100), dtype=torch.float16),
+                    (0, 28),
                 ),
             },
         },
@@ -9877,6 +10080,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
+    def test_topk_indices_cpu(self, x, k: int, dim: int):
+        # Companion to test_topk_cpu: also checks indices. Restricted to a
+        # couple of param_sets using unique_randn_along_dim, which avoids
+        # tied values, so there's a single unambiguous correct index to
+        # compare against (unlike the general case, where tie-breaking can
+        # legitimately differ between backends).
+        def fn(x):
+            values, indices = torch.topk(x, k, dim=dim)
+            return values, indices.to(torch.int64)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
     @expects_raise
     def test_topk_largest_false_rejected(self):
         # largest=False cannot be served by the topkvalue/topkindex reduction
@@ -9901,20 +10116,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=InductorError,
-        reason=(
-            "topk.ddl (dxp_standalone) does not support sparse input tensors; "
-            "the backend compiler fails (#4732)"
-        ),
-    )
     def test_topk_sparse_input(self):
         # amax over the stick dim produces a sparse output (constant 0 in the
-        # rightmost device coord). topk over a surviving dim of that sparse
-        # tensor must accept the zero-stick layout without forcing a restickify.
-        # Skipped: backend (dxp_standalone / topk.ddl) does not yet support sparse
-        # input tensors to topk ("None of the dimensions is mapped"); see #4732.
+        # rightmost device coord). topk.ddl does not accept sparse inputs
+        # (#4732), so the input is restickified onto a size-1 dim first.
         x = unique_randn_along_dim((32, 32, 64), dim=-1)
         self.compare_with_cpu(
             lambda x: torch.topk(torch.amax(x, dim=-1), 4, dim=-1)[0],
@@ -11548,6 +11753,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with pytest.raises(Exception) as exc_info:
             compiled(x, y)
         assert "no offset-free alternative stick dim" in str(exc_info.value)
+
+    def test_slice_stick_mutation_size1_alt_dim(self):
+        """An offset-stick slice write into [1, N] moves the stick to the size-1 dim.
+
+        Regression test for #3916, which raised "no offset-free alternative
+        stick dim" because the size-1 row could not be a stick candidate.
+        """
+
+        def fn(src):
+            out = torch.zeros(1, 256, dtype=src.dtype, device=src.device)
+            out[:, 32:160].copy_(src)
+            return out
+
+        self.compare_with_cpu(fn, cached_randn((1, 128)), run_eager=False)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):
