@@ -5732,6 +5732,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
+                # Starts inside a stick past the first: the slice offset splits
+                # into a stick index and an in-stick offset.
+                "2d_stick1": (1, 96, 160, cached_randn((128, 256))),
+                "2d_stick1_to_end": (1, 96, 256, cached_randn((128, 256))),
+                "2d_stick2": (1, 160, 224, cached_randn((128, 256))),
+                "3d_stick1": (2, 96, 160, cached_randn((128, 3, 256))),
+            },
+        },
+        ("test_slice_stick_folded_view", "test_slice_stick_folded_view_cpu"): {
+            "ops_dict": {
+                "exp": lambda x: torch.exp(x),
+                "neg": lambda x: -x,
+                "rotate_half": lambda x: torch.cat((-x, x), dim=-1),
+            },
+            "param_sets": {
+                # The upper half of each 64-element head of a [L, H * 64]
+                # tensor, as rotate_half reads it: the view folds the head and
+                # the element into the stick's host dim.
+                "heads2": (2, 64, 32, cached_randn((128, 128))),
+                "heads4": (4, 64, 32, cached_randn((64, 256))),
+                "heads2_fp32": (
+                    2,
+                    32,
+                    16,
+                    cached_randn((128, 64), dtype=torch.float32),
+                ),
+            },
+        },
+        ("test_slice_stick_folded_view_clone", "test_slice_stick_folded_view_cpu"): {
+            "ops_dict": {"clone": lambda x: torch.clone(x)},
+            "param_sets": {
+                "heads2": (2, 64, 32, cached_randn((128, 128))),
+            },
+            # TODO: a clone of the folded view needs a second restickify whose
+            # input coordinate 64*h + e + 32 reads overlapping stick windows,
+            # which insert_restickify_padding cannot pad yet.
+            "expect_raise": {
+                "heads2": "is neither dense nor a set of non-overlapping stick windows"
             },
         },
         ("test_slice_stick_reduce_dim0", "test_slice_cpu"): {
@@ -11789,6 +11827,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return op(dim, x[:, :, start:end], *args)
 
         self.compare_with_cpu(fn, x, *args, clone_inputs=True, run_eager=False)
+
+    def test_slice_stick_folded_view_cpu(self, op, heads, head_dim, start, x):
+        def fn(x):
+            return op(x.view(x.shape[0], heads, head_dim)[..., start:])
+
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_slice_stick_mutation_layout_update_cpu(self, dim, start, end, x, y):
         """Test that device_tensor_layout() updates to alt STL after slice-mutation."""
