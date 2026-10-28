@@ -912,9 +912,9 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
         folded_domains = overlapping_window_split_domains(ctx).allowed_splits
         self.assertEqual(folded_domains[b], frozenset({8}))
 
-    def test_reduced_equal_stride_window_keeps_reduction_whole(self):
+    def test_reduced_equal_stride_window_does_not_pin_reduction_var(self):
         # x.unfold(0, 3, 1): w + k has equal coefficients, but k's shorter
-        # range puts it inside w. The complete k reduction stays on one core.
+        # range puts it inside w. Pin w without pinning k itself.
         w, j, k = (_isym(n) for n in ("w", "j", "k"))
         op = _computed_buffer((8, 6), name="buf0", reduction_type="sum")
         output_td = _tensor_dep("buf0", (8, 6), (w, j))
@@ -932,10 +932,11 @@ class TestOverlappingWindowSplitDomains(unittest.TestCase):
         domains = overlapping_window_split_domains(ctx).allowed_splits
         self.assertEqual(domains[k], frozenset({1, 3}))
         self.assertEqual(domains[w], frozenset({8}))
-        self.assertEqual(
-            collect_work_division_constraints(ctx).allowed_splits[k],
-            frozenset({1}),
-        )
+        # Single-axis K-splits are now supported for plain reductions, so
+        # both the whole-window and split-K choices remain legal.
+        collected = collect_work_division_constraints(ctx).allowed_splits
+        self.assertEqual(collected[k], frozenset({1, 3}))
+        self.assertEqual(collected[w], frozenset({8}))
 
     def test_contiguous_read_is_unconstrained(self):
         rows, cols = _isym("d0"), _isym("d1")
