@@ -183,6 +183,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "keepbyindex",
     "log",
 ]
 
