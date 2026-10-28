@@ -602,6 +602,11 @@ def _single_arg_op_layout(
                 x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
             )
             if out_stl is not None:
+                if (
+                    stl.element_arrangement in STAGGERED_EAS
+                    and reduction_var not in x_stick_expr.free_symbols
+                ):
+                    out_stl = out_stl.with_element_arrangement(stl.element_arrangement)
                 return [out_stl]
 
         # Try alternative layouts when input layout is not supported.
