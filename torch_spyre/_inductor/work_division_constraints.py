@@ -704,13 +704,30 @@ def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
     return _has_ea_tensor(tds, STAGGERED_EAS)
 
 
+def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
+    """The batch dims are returned too. Splitting one gives wrong results on
+    device: with a [2, 12, 128, 128] weight written by qfp8wt in 12 head slices
+    and read by batchmatmulfp8 in 4, only the first head of each read slice is
+    correct, while the same graph on one core is exact.
+
+    TODO: this pin is a workaround. The fix is to adjust the strides to reflect
+    the 2D stick layout, which is not currently represented in the tensor's
+    device_size; that would make the per-core addressing correct and let the
+    pin be dropped.
+    """
+    if len(td.layout.size) <= 2:
+        return [td.device_coords[-2]]
+    return list(td.device_coords)
+
+
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict QFP8WT tensors' second stick dimension to split=1.
+    """Restrict QFP8WT tensors' second stick dimension and batch dims to split=1.
 
     QFP8WT uses a 2D stick layout (2x64 elements, 128 bytes); both stick dims
     must stay atomic 128-byte units, so any iteration var indexing the second
     stick coordinate of the matmul kernel tensor (second input) or the output
-    has the singleton legal domain ``{1}``.
+    has the singleton legal domain ``{1}``. So does any var indexing one of the
+    tensor's batch dims (see ``_qfp8wt_unsplittable_coords``).
     """
     all_tds = ctx.input_tds + [ctx.output_td]
     if not has_qfp8wt_tensor(all_tds):
@@ -721,14 +738,16 @@ def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if len(ctx.input_tds) > 1:
         kernel_td = ctx.input_tds[1]
         if len(kernel_td.device_coords) > 1 and has_qfp8wt_tensor([kernel_td]):
-            for var in kernel_td.device_coords[-2].free_symbols:
-                if isinstance(var, Symbol):
-                    allowed_splits[var] = frozenset({1})
+            for coord in _qfp8wt_unsplittable_coords(kernel_td):
+                for var in coord.free_symbols:
+                    if isinstance(var, Symbol):
+                        allowed_splits[var] = frozenset({1})
 
     if len(ctx.output_td.device_coords) > 1 and has_qfp8wt_tensor([ctx.output_td]):
-        for var in ctx.output_td.device_coords[-2].free_symbols:
-            if isinstance(var, Symbol):
-                allowed_splits[var] = frozenset({1})
+        for coord in _qfp8wt_unsplittable_coords(ctx.output_td):
+            for var in coord.free_symbols:
+                if isinstance(var, Symbol):
+                    allowed_splits[var] = frozenset({1})
 
     return ConstraintResult(allowed_splits=allowed_splits)
 

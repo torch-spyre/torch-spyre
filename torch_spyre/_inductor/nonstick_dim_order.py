@@ -81,7 +81,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
-from .constants import MATMUL_REDUCTION_OPS
+from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
@@ -427,6 +427,64 @@ def _ia_rotate_stl(
     )
 
 
+def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
+    """Reorder the device dims of stl; new dim i is old dim order[i].
+
+    Unlike the plain (device_size, stride_map, dtype) constructor, this keeps
+    the element arrangement and remaps valid_elements, so padded and
+    non-STANDARD layouts survive the reorder.
+    """
+    new_pos = {old: new for new, old in enumerate(order)}
+    valid_elements = {
+        tuple(sorted(new_pos[i] for i in dims)): count
+        for dims, count in stl.valid_elements.items()
+    }
+    return SpyreTensorLayout(
+        [stl.device_size[i] for i in order],
+        [stl.stride_map[i] for i in order],
+        stl.device_dtype,
+        stl.element_arrangement,
+        valid_elements,
+    )
+
+
+def _qfp8wt_k_rotation(
+    stl: SpyreTensorLayout,
+    coords: list[sympy.Expr],
+    k_sym: sympy.Symbol,
+    name: str = "",
+) -> SpyreTensorLayout | None:
+    """Move a QFP8WT tensor's K dim directly outside the stick.
+
+    The QFP8WT 2D stick pairs K with N (the stick dim), but the device layout
+    records only a 1D stick of N, so readers take K from device coordinate -2.
+    coords are the device coordinates of a matmul's read of the tensor and
+    k_sym is that matmul's reduction variable: the coordinate it appears in is
+    K. Returns the reordered layout, or None if K is already at -2.
+
+    Raises Unsupported when no non-stick reorder can place K: the matmul
+    reduces over the stick dim itself, or K does not index exactly one
+    non-stick device dim.
+    """
+    n = len(stl.device_size)
+    if k_sym in coords[-1].free_symbols:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduces over its stick dim "
+            f"({k_sym}); the 2D stick needs K outside the stick"
+        )
+    k_positions = [i for i in range(n - 1) if k_sym in coords[i].free_symbols]
+    if len(k_positions) != 1:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduction variable {k_sym} indexes "
+            f"device dims {k_positions}, expected exactly one non-stick dim"
+        )
+    k_pos = k_positions[0]
+    if k_pos == n - 2:
+        return None
+    order = [i for i in range(n - 1) if i != k_pos] + [k_pos, n - 1]
+    return _permute_stl(stl, order)
+
+
 def _try_gather_ia_constraint(
     buf: ComputedBuffer,
     dep: MemoryDep,
@@ -531,6 +589,75 @@ def _try_scatter_ia_constraint(
     # TODO: this pin is only validated for k=1; for k>1 the other indirect dims
     # may not land at 1..k-1 after a single-pivot rotation (follow-up PR).
     return new_stl, set(range(len(indirect_device_pos)))
+
+
+def _apply_qfp8wt_k_constraint(
+    graph: GraphLowering,
+    log: dict[str, SpyreTensorLayout],
+    pinned_dims: dict[str, set[int]],
+) -> None:
+    """Place K of every QFP8WT matmul weight directly outside the stick.
+
+    For each batchmatmulfp8, K of its QFP8WT weight is the matmul's reduction
+    variable (find_reduction_var on the weight read). The weight's producer
+    layout (typically the qfp8wt output) is reordered so that dim sits at
+    device position -2, and the position is pinned. A graph-input weight
+    cannot be reordered here, and two matmuls cannot ask for different K, so
+    both raise Unsupported instead of leaving K wrong.
+    """
+    decided: dict[str, sympy.Symbol] = {}  # buffer -> K symbol of first matmul
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer) or not hasattr(op, "data"):
+            continue
+        if not (
+            isinstance(op.data, Reduction)
+            and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+        ):
+            continue
+        out_dep = next(iter(op.get_read_writes().writes), None)
+        if out_dep is None:
+            continue
+        for dep in op.get_read_writes().reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            buf = V.graph.get_buffer(dep.name)
+            stl = _buf_stl(buf)
+            if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+                continue
+            try:
+                k_sym = find_reduction_var((dep,), out_dep)
+            except Unsupported:
+                # No single reduction variable on this read: K cannot be
+                # determined here, so the propagated layout is kept.
+                logger.debug("nonstick_dim_order: no K for QFP8WT %s", dep.name)
+                continue
+            coords = try_device_coordinates(stl, dep, {}, op=op)
+            if coords is None:
+                continue
+            new_stl = _qfp8wt_k_rotation(stl, coords, k_sym, dep.name)
+            if dep.name in decided and new_stl is not None:
+                raise Unsupported(
+                    f"QFP8WT tensor {dep.name} is read by matmuls that disagree "
+                    "on which dim is K"
+                )
+            decided.setdefault(dep.name, k_sym)
+            pinned_dims.setdefault(dep.name, set()).add(len(stl.device_size) - 2)
+            if new_stl is None:
+                continue
+            if not isinstance(buf, ComputedBuffer) or not hasattr(buf, "committed_stl"):
+                raise Unsupported(
+                    f"QFP8WT weight {dep.name} is a graph input with K "
+                    f"({k_sym}) away from the stick; its layout cannot be "
+                    "reordered here. Produce it with K at device position -2."
+                )
+            buf.committed_stl = new_stl
+            log[dep.name] = new_stl
+            logger.info(
+                "nonstick_dim_order: QFP8WT K constraint on %s — K (%s) -> pos %d",
+                dep.name,
+                k_sym,
+                len(stl.device_size) - 2,
+            )
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
@@ -656,6 +783,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                                     op, dest_buf.get_name(), new_stl, "copy"
                                 )
                             )
+
+    # QFP8WT K constraint: a batchmatmulfp8 knows which dim of its QFP8WT
+    # weight is K (its reduction variable), so the weight's producer layout is
+    # reordered to put K directly outside the stick, where readers take it.
+    _apply_qfp8wt_k_constraint(graph, log, pinned_dims)
 
     # Phase 2: performance transforms (matmul perf reorder).
     # For each matmul op, reorder its non-graph-input input buffers so they
