@@ -20,11 +20,13 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +44,73 @@
 
 namespace spyre {
 namespace {
+
+// Bound the device descriptor to the whole sticks covering the view, then
+// rebase DCI onto that staging buffer. When Flex's transfer spans this range
+// from offset zero, it can reuse the DCI instead of constructing another
+// compact conversion. Flex can still compact strided selections within the
+// bounded descriptor. For a final-token logits view, the range is one row
+// even when the tensor owns a complete prefill allocation.
+std::optional<flex::CompositeAddress> narrowD2HRange(
+    DataConversionInfo& dci, const SpyreTensorLayout& layout,
+    const flex::CompositeAddress& allocation) {
+  if (!allocation.is_single_chunk() ||
+      layout.element_arrangement != ElementArrangement::STANDARD ||
+      (layout.device_dtype != DataFormats::SEN169_FP16 &&
+       layout.device_dtype != DataFormats::IEEE_FP32 &&
+       layout.device_dtype != DataFormats::IEEE_INT32) ||
+      dci.dcsi_.empty() || dci.input_shape_.empty()) {
+    return std::nullopt;
+  }
+
+  const int64_t stick_elements = layout.elems_per_stick();
+  const int64_t element_bytes = 128 / stick_elements;
+  const int64_t allocation_elements = allocation.total_size() / element_bytes;
+  int64_t first = allocation_elements;
+  int64_t last = 0;
+  for (const auto& stride : dci.dcsi_) {
+    int64_t end = stride.offset_src_;
+    if (end < 0 || end >= allocation_elements) {
+      return std::nullopt;
+    }
+    for (size_t i = 0; i < stride.size_.size(); ++i) {
+      const int64_t count = stride.size_[i];
+      const int64_t step = stride.stride_src_[i];
+      // Check against the allocation before multiplying to avoid overflow.
+      if (count <= 0 || step < 0 ||
+          (step > 0 && count - 1 > (allocation_elements - 1 - end) / step)) {
+        return std::nullopt;
+      }
+      end += (count - 1) * step;
+    }
+    first = std::min(first, stride.offset_src_);
+    last = std::max(last, end + 1);
+  }
+  first = first / stick_elements * stick_elements;
+  last = (last + stick_elements - 1) / stick_elements * stick_elements;
+  if (last > allocation_elements || last <= first ||
+      (first == 0 && last == allocation_elements)) {
+    return std::nullopt;
+  }
+
+  // Single-chunk STANDARD storage is a dense sequence of 128-byte sticks.
+  // get_device_stride_infos builds contiguous physical device strides, so DCI
+  // offsets already include layout padding; no extra inter-stick/tile gaps
+  // need to be added when converting physical element offsets to byte offsets.
+  auto chunk = allocation.chunks().front();
+  chunk.addr.offset += first * element_bytes;
+  chunk.size = (last - first) * element_bytes;
+  for (auto& stride : dci.dcsi_) {
+    stride.offset_src_ -= first;
+  }
+  // Describe the flat staged range while preserving the original DCI rank.
+  // Shapes are innermost-first: collapse the outer dimensions to 1 so the
+  // product remains the staged element count. dcsi_ retains the view strides.
+  auto& shape = dci.input_shape_;
+  std::fill(shape.begin() + 1, shape.end(), 1);
+  shape.front() = last - first;
+  return flex::CompositeAddress(chunk);
+}
 
 // TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
 // creates/destroys individual streams when asked.
@@ -201,8 +270,16 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
-                  get_composite_address(*dev_tensor), &dci, host2device);
+    const auto* allocation = get_composite_address(*dev_tensor);
+    if (device2host) {
+      if (auto range = narrowD2HRange(dci, stl, *allocation)) {
+        // Flex clones the descriptor when enqueuing; the tensor continues to
+        // own the underlying allocation, just as in the full-storage path.
+        copyAsyncImpl(cpu_ptr, cpu_storage_bytes, &*range, &dci, host2device);
+        return;
+      }
+    }
+    copyAsyncImpl(cpu_ptr, cpu_storage_bytes, allocation, &dci, host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),

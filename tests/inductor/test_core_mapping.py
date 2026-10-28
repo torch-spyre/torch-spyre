@@ -1101,6 +1101,63 @@ def test_prepare_per_core_view_does_not_record_repeat_info():
     assert graph._repeat_info == before
 
 
+def _attention_repack_view_prep(*, width=128, offset=0):
+    """The actual GKSPILL5 buf7 write, before SDSC factors its feature axis."""
+    row, head, feature = sympy.symbols(
+        "row head feature", integer=True, nonnegative=True
+    )
+    prep = _view_prep(
+        iter_space={row: 512, head: 8, feature: width},
+        write_index=1024 * row + 128 * head + feature,
+        dep_coeff={row: 1024, head: 128, feature: 1},
+        dep_device_coordinates=(
+            2 * head + sympy.floor(feature / 64) + offset,
+            row,
+            sympy.Mod(feature, 64),
+        ),
+        device_size=[16, 512, 64],
+        stride_map=[64, 1024, 1],
+        device_stride_to_dim={64: 0, 1024: 1, 1: 2},
+        stick_host_stride=1,
+        num_stick_dim=0,
+        num_stick=16,
+        num_stick_stride=64,
+    )
+    return prep, row, head, feature
+
+
+@pytest.mark.parametrize(
+    "width,offset,relayout_enabled,representable",
+    [
+        (128, 0, True, True),
+        (192, 0, True, False),
+        (128, 1, True, False),
+        (128, 0, False, False),
+    ],
+)
+def test_attention_repack_maps_only_complete_head_shards(
+    monkeypatch, width, offset, relayout_enabled, representable
+):
+    monkeypatch.setattr(
+        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
+    )
+    prep, row, head, feature = _attention_repack_view_prep(width=width, offset=offset)
+    coordinates = prep.dep_device_coordinates
+    view, partial, actual = pass_utils_module._per_core_view_from_prep(
+        prep, {row: 8, head: 4, feature: 1}
+    )
+    assert actual is representable
+    assert not partial
+    assert prep.dep_device_coordinates == coordinates
+    if representable:
+        assert view.num_cores == 32
+        assert dict(view.work_slice_dims) == {0: 4, 1: 8}
+        owners = dict(view.core_to_slot)
+        for core in range(32):
+            assert int(owners[0].subs(_CORE_ID, core)) == core // 8
+            assert int(owners[1].subs(_CORE_ID, core)) == core % 8
+
+
 @pytest.mark.parametrize("relayout_enabled", [False, True])
 def test_reshape_changes_per_core_ownership_within_one_device_axis(
     monkeypatch, relayout_enabled
@@ -1410,7 +1467,7 @@ def test_the_probe_bound_covers_the_callers_filter_too():
     assert probes(1) == 1
 
 
-@pytest.mark.parametrize("kind", ["direct", "affine"])
+@pytest.mark.parametrize("kind", ["direct", "affine", "floor"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enabled):
     """Compare both production callers without widening the recovery policy."""
@@ -1420,10 +1477,23 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         "row head pair lane", integer=True, nonnegative=True
     )
     affine = kind == "affine"
-    iteration = {row: 512, head: 8, **({pair: 2} if affine else {}), lane: 64}
-    coordinate = 2 * head + pair if affine else head
-    width = 1024 if affine else 512
-    index = width * row + (128 if affine else 64) * head + lane
+    floor = kind == "floor"
+    combined = affine or floor
+    iteration = {
+        row: 512,
+        head: 8,
+        **({pair: 2} if affine else {}),
+        lane: 128 if floor else 64,
+    }
+    coordinate = (
+        2 * head + sympy.floor(lane / 64)
+        if floor
+        else 2 * head + pair
+        if affine
+        else head
+    )
+    width = 1024 if combined else 512
+    index = width * row + (128 if combined else 64) * head + lane
     if affine:
         index += 64 * pair
     coefficients = {symbol: index.coeff(symbol) for symbol in iteration}
@@ -1432,12 +1502,12 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         write_index=index,
         dep_coeff=coefficients,
         dep_device_coordinates=(coordinate, row, lane),
-        device_size=[16 if affine else 8, 512, 64],
+        device_size=[16 if combined else 8, 512, 64],
         stride_map=[64, width, 1],
         device_stride_to_dim={64: 0, width: 1, 1: 2},
         stick_host_stride=1,
         num_stick_dim=0,
-        num_stick=16 if affine else 8,
+        num_stick=16 if combined else 8,
         num_stick_stride=64,
     )
     physical = PerCoreView(
@@ -1459,10 +1529,10 @@ def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enable
         assert not partial
         # The affine emitter may accept while recovery declines: recovery is
         # floor-only, not a second route around the affine admission policy.
-        assert represented is (not affine)
+        assert represented is (not combined or (floor and enabled))
         if represented:
             assert recovered.same_partition(physical)
-        if affine and not enabled:
+        if combined and not enabled:
             with pytest.raises(ValueError, match="cannot map device dimension"):
                 work_division_from_view(
                     physical, prep.device_size, coordinates, iteration

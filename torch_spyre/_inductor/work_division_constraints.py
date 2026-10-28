@@ -988,26 +988,28 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep plain reductions on one core along every reduction axis.
+    """Apply backend constraints on plain reduction K-splits.
 
-    Even a single reduction variable cannot safely be split across cores in
-    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
-    encoder block outputs.
-    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
-    it does not establish a cross-core combine for arbitrary work divisions.
-    Keep this restriction until those divisions have a validated combine path.
+    Multi-axis plain reductions: pin all reduction vars to split=1. The
+    backend supports at most one split reduction dimension per op, but
+    combining partial results across cores for arbitrary plain reduction
+    types is not validated, so the frontend blocks all of them.
 
-    Structured reductions have their own backend combine or blocking rules.
-    Output axes remain available for parallelism, and reduction-range coarse
-    tiling is still handled separately by WSR.
+    Single-axis plain reductions: unconstrained — all types may K-split.
+
+    Structured reductions (matmul, conv, topk, pool) have their own blocking
+    or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
+    # Multi-axis: backend supports at most one split reduction dim.
+    if len(ctx.reduction_vars) > 1:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:

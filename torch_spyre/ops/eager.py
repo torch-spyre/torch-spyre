@@ -485,6 +485,8 @@ COMPILED_OPS = [
     aten.le,
     aten.ne.Tensor,
     aten.ne.Tensor_out,
+    aten.ne.Scalar,
+    aten.ne.Scalar_out,
     aten.ge,
     aten.gt,
     aten.lt,

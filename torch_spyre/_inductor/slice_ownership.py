@@ -83,11 +83,66 @@ def project_affine_slice_axis(
     return projections[0] if len(projections) == 1 else None
 
 
+def project_floor_affine_slice_axis(
+    coordinate: sympy.Expr,
+    device_extent: int,
+    split: int,
+    iteration_space: Mapping[sympy.Symbol, sympy.Expr],
+) -> tuple[sympy.Symbol, sympy.Expr] | None:
+    """Certify a single floor of an ascending affine coordinate.
+
+    Attention repack writes feature sticks at ``2*head + floor(width/64)``.
+    The width loop stays within a head shard, but is not itself affine. For
+    integer loops, an integer-affine A satisfies A + floor(B) = floor(A+B).
+    After clearing the positive integer denominator D, containment of the
+    integer numerator in [D*lo, D*hi) proves containment of its floor in
+    [lo, hi). Reuse the affine proof on that scaled physical axis, then return
+    the ORIGINAL access's representative line. No emitted access changes.
+
+    Only one floor with unit coefficient is admitted. Nonlinear numerators,
+    symbolic divisors, reversed accesses and crossing slices still fail the
+    existing affine containment proof.
+    """
+    floors = coordinate.atoms(sympy.floor)
+    if len(floors) != 1:
+        return None
+    quotient = next(iter(floors))
+    integer_part = sympy.expand(coordinate - quotient)
+    symbols = coordinate.free_symbols
+    origin = integer_part.xreplace(dict.fromkeys(symbols, sympy.S.Zero))
+    coefficients = {symbol: integer_part.coeff(symbol) for symbol in symbols}
+    if (
+        origin.is_Integer is not True
+        or any(c.is_Integer is not True for c in coefficients.values())
+        or sympy.expand(
+            integer_part - origin - sum(c * s for s, c in coefficients.items())
+        )
+        != 0
+    ):
+        return None
+    numerator, denominator = sympy.together(
+        integer_part + quotient.args[0]
+    ).as_numer_denom()
+    if denominator.is_Integer is not True or denominator <= 0:
+        return None
+    projected = project_affine_slice_axis(
+        sympy.expand(numerator),
+        device_extent * int(denominator),
+        split,
+        iteration_space,
+    )
+    if projected is None:
+        return None
+    loop, _ = projected
+    return loop, coordinate.xreplace(dict.fromkeys(symbols - {loop}, sympy.S.Zero))
+
+
 @dataclass(frozen=True)
 class SliceOwnershipProof:
     name: str
     certificate: str
     prove: Callable[..., tuple[sympy.Symbol, sympy.Expr] | None]
+    floor_recovery: bool
     requires: tuple[str, ...]
     tests: tuple[str, ...]
 
@@ -97,6 +152,7 @@ SLICE_OWNERSHIP_PROOFS = (
         "Affine rectangle containment",
         "project_affine_slice_axis",
         project_affine_slice_axis,
+        False,
         (
             "one contained loop partition",
             "complete read rectangle",
@@ -108,6 +164,22 @@ SLICE_OWNERSHIP_PROOFS = (
             "test_ownership_callers_keep_their_admission_policy",
         ),
     ),
+    SliceOwnershipProof(
+        "Floor-affine rectangle containment",
+        "project_floor_affine_slice_axis",
+        project_floor_affine_slice_axis,
+        True,
+        (
+            "one ascending affine floor",
+            "complete physical read rectangle",
+            "unchanged coordinates and caller admission",
+        ),
+        (
+            "test_floor_slice_projection_rejects_unproven_access",
+            "test_attention_output_repack_handoff",
+            "test_ownership_callers_keep_their_admission_policy",
+        ),
+    ),
 )
 
 
@@ -116,9 +188,13 @@ def project_slice_axis(
     device_extent: int,
     split: int,
     iteration_space: Mapping[sympy.Symbol, sympy.Expr],
+    *,
+    floor_only: bool = False,
 ) -> tuple[sympy.Symbol, sympy.Expr] | None:
     """Apply the caller's containment policy without changing its access."""
     for proof in SLICE_OWNERSHIP_PROOFS:
+        if floor_only and not proof.floor_recovery:
+            continue
         projected = proof.prove(coordinate, device_extent, split, iteration_space)
         if projected is not None:
             return projected
@@ -126,15 +202,16 @@ def project_slice_axis(
 
 
 def ownership_proofs_markdown() -> str:
-    """Describe the exact emitted-access proof order."""
+    """Describe the exact proof order and the restricted recovery policy."""
     lines = [
         "| Ownership proof | Certificate | Requires | Covering tests |",
         "|---|---|---|---|",
     ]
     for proof in SLICE_OWNERSHIP_PROOFS:
+        policy = "; floor-only recovery" if proof.floor_recovery else "; emitted access"
         tests = "; ".join(f"`{test}`" for test in proof.tests)
         lines.append(
-            f"| {proof.name}; emitted access | `{proof.certificate}` | "
+            f"| {proof.name}{policy} | `{proof.certificate}` | "
             f"{', '.join(proof.requires)} | {tests} |"
         )
     return "\n".join(lines) + "\n"

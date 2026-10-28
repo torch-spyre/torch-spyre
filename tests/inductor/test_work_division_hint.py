@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
+import sympy
 from sympy import Eq, floor, Integer, Mod, Piecewise, Symbol
 import torch
 import torch.fx.traceback
@@ -2170,7 +2171,7 @@ def test_completed_reduction_relayout_device(
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2**-8, atol=0)
     roots = [
         root
         for directory in directories
@@ -2412,6 +2413,33 @@ class TestAOTAnnotationAssumptions(DynamoTestCase):
                     return y
 
         self._compile_and_run(TestModule())
+
+
+@pytest.mark.parametrize(
+    "expression,width_extent",
+    [
+        ("2*h+floor(w/64)", 192),  # crosses a head shard
+        ("2*h+floor(w/64)+1", 128),
+        ("2*h-floor(w/64)", 128),
+        ("floor(h*w/64)", 128),
+        ("2*h+floor(w/divisor)", 128),
+        ("floor(h/2)+floor(w/64)", 128),  # two floors are out of scope
+        ("2*h+2*floor(w/64)", 128),  # nonunit floor coefficient
+        ("2*h+floor(w/64)+1/2", 128),  # nonintegral outside term
+    ],
+)
+def test_floor_slice_projection_rejects_unproven_access(expression, width_extent):
+    from torch_spyre._inductor.slice_ownership import (
+        project_floor_affine_slice_axis,
+    )
+
+    h, w = sympy.symbols("h w")
+    assert (
+        project_floor_affine_slice_axis(
+            sympy.sympify(expression), 16, 4, {h: 8, w: width_extent}
+        )
+        is None
+    )
 
 
 if __name__ == "__main__":

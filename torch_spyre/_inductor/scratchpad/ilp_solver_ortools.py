@@ -155,6 +155,14 @@ logger = logging.getLogger(__name__)
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
+# CP-SAT subsolvers the layout solve never runs (see where the solver
+# parameters are set).
+_CRASHING_SUBSOLVERS = (
+    "variables_shaving",
+    "variables_shaving_no_lp",
+    "variables_shaving_max_lp",
+)
+
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
 _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
@@ -1395,6 +1403,16 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
+        # OR-tools 9.15's variable-shaving workers can segfault on a model with
+        # a NoOverlap2D, which every LX layout model has: when copying the
+        # sub-model around one variable finds it infeasible, they still index
+        # the interval mapping the failed copy left empty. The crash is rarer
+        # than one in several hundred solves on an idle host and far more
+        # frequent under CPU contention. They only tighten domains for the
+        # other workers, so leaving them out costs no plan quality we measured.
+        # TODO: drop this workaround once the pinned OR-tools has the fix for
+        # google/or-tools#5532 (tracked in torch-spyre#5727).
+        solver.parameters.ignore_subsolvers.extend(_CRASHING_SUBSOLVERS)
 
         # Loop-group boundaries the tiling implies. Empty unless the joint
         # solve is actually choosing tilings, which makes the cut stage inert.
