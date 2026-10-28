@@ -127,7 +127,7 @@ class TestBroadcastCompiled(TestCase):
         )
 
     def test_broadcast_compiled_with_interleaved_compute(self):
-        """Verify compute between broadcast_async and wait_work compiles correctly."""
+        """Verify compute between broadcast_run and wait_work compiles correctly."""
 
         class BroadcastWithCompute(torch.nn.Module):
             def __init__(self, src_rank=0, group_name=_GROUP_NAME):

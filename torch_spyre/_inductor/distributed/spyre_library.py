@@ -57,7 +57,9 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_run"):
     # m.def+impl), so they need no separate fake kernel here.
 
     # ------------------------------------------------------------------
-    # Runtime run ops — shape inference matches the legacy async ops.
+    # Runtime run ops — what the collective kernels in ir.py emit. The
+    # *_async fakes above and below are legacy: nothing lowers to those ops
+    # any more; drop them together with their C++ schemas.
     # ------------------------------------------------------------------
 
     @torch.library.register_fake("spyre::broadcast_run")
@@ -73,6 +75,10 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_run"):
         output_size = list(x.shape)
         output_size[0] *= group_size
         return torch.empty(output_size, dtype=x.dtype, device=x.device)
+
+    @torch.library.register_fake("spyre::alltoall_run")
+    def _(x: torch.Tensor, plan_handle: int) -> torch.Tensor:
+        return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
 
     @torch.library.register_fake("spyre::all_gather_async")
     def _(

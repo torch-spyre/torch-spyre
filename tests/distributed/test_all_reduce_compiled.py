@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+from unittest.mock import patch
 
 import pytest
 import regex as re
@@ -182,6 +183,43 @@ class TestAllReduceCompiled(TestCase):
         self.assertTrue(
             torch.allclose(result.to("cpu"), expected),
             f"Rank {self.comm_rank}: allreduce fp16 result incorrect",
+        )
+
+    def test_independent_compute_after_wait_is_hoisted_before_it(self):
+        """Compute written after the wait, but not reading the collective's
+        result, is emitted between allreduce_run and wait_work as its own kernel.
+        """
+        m, k, n = 128, 256, 256
+        x = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+        w = torch.full((k, n), 0.01, dtype=torch.float16, device=DEVICE)
+        y = torch.full((m, k), 0.01, dtype=torch.float16, device=DEVICE)
+
+        def late(x, w, y):
+            r = torch.ops._c10d_functional.all_reduce(x @ w, "sum", _GROUP_NAME)
+            r = torch.ops._c10d_functional.wait_tensor(r)
+            return r + torch.relu(y @ w)
+
+        with patch.object(spyre_config, "sink_collective_waits", True):
+            result, (code, *_) = run_and_get_code(torch.compile(late), x, w, y)
+
+        body = code[code.index("def call") :].splitlines()
+        run = next(i for i, line in enumerate(body) if "allreduce_run(" in line)
+        wait = next(i for i, line in enumerate(body) if "wait_work(" in line)
+        between = [line for line in body[run + 1 : wait] if ".run(" in line]
+        self.assertEqual(
+            len(between), 1, "expected relu(y @ w) between run and wait:\n" + code
+        )
+        # The hoisted kernel must not read the collective's buffer.
+        reduced = re.search(r"allreduce_run\((\w+),", body[run]).group(1)
+        self.assertNotIn(reduced, between[0])
+
+        expected = self.comm_size * k * 1e-4 + k * 1e-4
+        self.assertTrue(
+            torch.allclose(
+                result.to("cpu").float(), torch.full((m, n), expected), rtol=1e-2
+            ),
+            f"Rank {self.comm_rank}: got {result[0, 0].to('cpu').item()}, "
+            f"expected {expected}",
         )
 
     def test_allreduce_compiled_with_interleaved_compute(self):

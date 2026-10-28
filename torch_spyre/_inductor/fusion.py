@@ -139,6 +139,31 @@ def group_contiguous_fusable(
     return groups
 
 
+def sink_collective_waits(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """Schedule each collective wait as late as its consumers allow.
+
+    Runs before :func:`spyre_fuse_nodes`, which bundles every contiguous run of
+    compute and only breaks at non-compute nodes such as the wait. Left in
+    traced order, compute that does not depend on the collective but is written
+    after the wait is bundled with the wait's consumers and so cannot start
+    until the collective finishes. Sinking the wait first leaves that compute
+    between the ``*_run`` call and ``wait_work``, in its own bundle.
+
+    Upstream's ``comms.sink_waits`` does the reordering; it recognises
+    ``WaitKernel`` through the ``is_wait`` patch in ``ir.py``. It is greedy and
+    only moves a wait past nodes that do not read the collective's result, so
+    the order stays topological.
+    """
+    if not config.sink_collective_waits:
+        return nodes
+    from torch._inductor.comms import sink_waits
+    from torch._inductor.utils import is_wait
+
+    if not any(is_wait(n.node) for n in nodes):
+        return nodes
+    return sink_waits(nodes)
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
