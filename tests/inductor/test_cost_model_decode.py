@@ -1536,8 +1536,8 @@ def test_operand_geometry_declines_an_indirect_bank_index(monkeypatch):
     op.get_read_writes = lambda: SimpleNamespace(
         reads=[rw.reads[0], bank], writes=rw.writes
     )
-    # The op now reads differently, in place: the extraction above is memoized
-    # on it (op_read_writes), so drop it as any in-place edit must.
+    # The read set changed in place: drop the memoized one, as every mutator
+    # of an op's dependencies must (``invalidate_op_read_writes``).
     invalidate_op_read_writes(op)
     feature = _features(monkeypatch, op, space, **kwargs)
     read = _read(feature, "arg1")
