@@ -824,6 +824,70 @@ class SetEligibleTests(TestCase):
         self.assertEqual(plan.count_allocated(), 1)
 
 
+class BatchUpdateDifferentialTests(TestCase):
+    """``update(resizes, flags)`` re-places once for a whole batch. It must
+    leave exactly the state the same ``resize`` calls then ``set_eligible``
+    calls leave one at a time, on the native packer and on the from-scratch
+    reference, and report the quality change it made."""
+
+    def test_random_batches_match_the_calls_made_one_at_a_time(self):
+        seeds = 2000 if _STRESS else 400
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            eligible = [rng.random() < 0.8 for _ in range(n)]
+            batched = NativePermutationLayoutSolver(buffers, perm, cap, align, eligible)
+            single = NativePermutationLayoutSolver(buffers, perm, cap, align, eligible)
+            ref = ReferencePermutationBasedLayoutSolver(
+                buffers, perm, cap, align, eligible=eligible
+            )
+            for step in range(rng.randint(1, 4)):
+                # Repeated indices included: the last write wins either way.
+                resizes = [
+                    (rng.randrange(n), rng.choice([0, 1, rng.randint(1, 1200)]))
+                    for _ in range(rng.randint(0, n + 1))
+                ]
+                flags = [
+                    (rng.randrange(n), rng.random() < 0.5)
+                    for _ in range(rng.randint(0, n + 1))
+                ]
+                tag = f"seed={seed} step={step} {resizes} {flags}"
+                before = batched.quality()
+                delta = batched.update(resizes, flags)
+                for plan in (single, ref):
+                    for idx, size in resizes:
+                        plan.resize(idx, size)
+                    for idx, flag in flags:
+                        plan.set_eligible(idx, flag)
+                self.assertEqual(batched.addresses, single.addresses, tag)
+                self.assertEqual(batched.quality(), single.quality(), tag)
+                self.assertEqual(
+                    batched.count_allocated(), single.count_allocated(), tag
+                )
+                self.assertAlmostEqual(delta, batched.quality() - before, msg=tag)
+                self.assertEqual(ref.addresses, batched.addresses, tag)
+                self.assertAlmostEqual(ref.quality(), batched.quality(), msg=tag)
+
+    def test_a_bad_index_or_size_raises_before_anything_changes(self):
+        rng = random.Random(0)
+        buffers = _random_buffers(rng, 4)
+        plan = NativePermutationLayoutSolver(buffers, [0, 1, 2, 3], 10_000, 1)
+        before = (plan.addresses, plan.quality())
+        for resizes, flags in (
+            ([(0, 5), (4, 5)], []),
+            ([(0, 5)], [(-1, True)]),
+            ([(0, -1)], []),
+        ):
+            with self.assertRaises(ValueError):
+                plan.update(resizes, flags)
+            self.assertEqual((plan.addresses, plan.quality()), before)
+
+
 class NativeSolverDifferentialTests(TestCase):
     """Randomized differential coverage for the native packer against the
     from-scratch reference.
