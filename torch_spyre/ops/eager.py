@@ -773,13 +773,28 @@ def spyre__copy_from(self, dst, non_blocking=False):
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:
-            # Pass storage_offsets explicitly: a graph input's storage_offset
-            # is dropped by Inductor, so the lowering must re-introduce it
-            # in-graph (see copy_from_d2d in customops.py and
-            # lower_spyre_from_d2d).
-            torch.ops.spyre.copy_from_d2d(
-                self, dst, self.storage_offset(), dst.storage_offset()
-            )
+            if self.dtype != dst.dtype:
+                # Same-device dtype cast: use to_dtype_d2d to perform conversion
+                # and attach the proper ElementArrangement layout tag.
+                converted = torch.ops.spyre.to_dtype_d2d(
+                    self, dst.dtype, self.storage_offset()
+                )
+                torch.ops.spyre.copy_from_d2d(
+                    converted, dst, converted.storage_offset(), dst.storage_offset()
+                )
+                from torch_spyre._C import get_spyre_tensor_layout, set_spyre_tensor_layout
+
+                conv_stl = get_spyre_tensor_layout(converted)
+                if conv_stl is not None:
+                    set_spyre_tensor_layout(dst, conv_stl)
+            else:
+                # Pass storage_offsets explicitly: a graph input's storage_offset
+                # is dropped by Inductor, so the lowering must re-introduce it
+                # in-graph (see copy_from_d2d in customops.py and
+                # lower_spyre_from_d2d).
+                torch.ops.spyre.copy_from_d2d(
+                    self, dst, self.storage_offset(), dst.storage_offset()
+                )
         return dst
     else:
         if non_blocking:

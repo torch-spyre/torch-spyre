@@ -894,15 +894,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"copy_ value mismatch: got {dst_spyre.cpu()}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            ".float() on a Spyre tensor gives a staggered (DL16_TO_FP32) result whose "
-            "readback is permuted (#4393), and the eager .half() of it is also wrong, "
-            "though the compiled .half() of the same tensor is right; see also #2205"
-        ),
-    )
     def test_float_half_methods_on_spyre_tensor(self):
         """.float() and .half() shortcut methods on Spyre tensors."""
         x_cpu = torch.randn(4, 64, dtype=torch.float16)
