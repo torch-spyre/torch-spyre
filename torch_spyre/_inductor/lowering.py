@@ -448,6 +448,91 @@ def lower_scaled_mm(
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+def lower_bmm_fp8(
+    mat1,
+    mat2,
+    out_dtype=None,
+):
+    # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
+    # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    # [B, M, K] × [B, K, N] → [B, M, N]  and
+    # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
+    # a matching contraction dim. Batch broadcasting is not supported.
+    if (
+        mat1_ndim != mat2_ndim
+        or mat1_ndim not in (3, 4)
+        or any(
+            sympy.simplify(d1 - d2) != 0
+            for d1, d2 in zip(
+                [*mat1_size[:-2], mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
+            )
+        )
+    ):
+        raise Unsupported(
+            f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]  # K
+    ranges = [*mat1_size[:-2], mat1_size[-2], mat2_size[-1]]
+
+    def inner_fn(index, reduction_index):
+        # Each batch dim keeps its own iteration symbol in both loaders.
+        # Recovering b and h from a fused batch index via // and % would put one
+        # symbol in two device coordinates, which garbles the dim-order scan in
+        # superdsc._get_device_dim_order.
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        return (
+            mat1_loader([*batch_index, row, contraction]),
+            mat2_loader([*batch_index, contraction, column]),
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm_fp8: mat1{[int(s) for s in mat1_size]} @ "
+            f"mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "
+            f"out_dtype={output_dtype}"
+        )
+
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x.realize()
@@ -2488,6 +2573,14 @@ def lower_qfp8wt(x):
         traceback=x.get_traceback(),
     )
     pw.realize()
+    # The QFP8WT 2D stick pairs host dims -2 (K) and -1 (N), so the output must
+    # be row-major [..., K, N]. Left flexible, ComputedBuffer.get_fill_order()
+    # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
+    # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
+    # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    pw.freeze_layout_with_stride_order(
+        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+    )
     return pw
 
 
