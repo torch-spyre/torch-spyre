@@ -2611,6 +2611,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 129)),
                     cached_randn((129, 64)),
                 ),
+                "10x20_add_transpose_fp32": (
+                    cached_randn((10, 20), dtype=torch.float32),
+                    cached_randn((20, 10), dtype=torch.float32),
+                ),
+                "7x13_add_transpose_fp32": (
+                    cached_randn((7, 13), dtype=torch.float32),
+                    cached_randn((13, 7), dtype=torch.float32),
+                ),
+                "64x129_add_transpose_fp32": (
+                    cached_randn((64, 129), dtype=torch.float32),
+                    cached_randn((129, 64), dtype=torch.float32),
+                ),
+                "10x20_add_transpose_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int32),
+                ),
+                "7x13_add_transpose_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int32),
+                ),
+                "64x129_add_transpose_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int32),
+                ),
+                "10x20_add_transpose_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                    torch.randint(0, 100, (20, 10), dtype=torch.int64),
+                ),
+                "7x13_add_transpose_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                    torch.randint(0, 100, (13, 7), dtype=torch.int64),
+                ),
+                "64x129_add_transpose_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
+                    torch.randint(0, 100, (129, 64), dtype=torch.int64),
+                ),
+            },
+        },
+        ("test_restickify_clone", "test_restickify_clone_cpu"): {
+            "param_sets": {
+                "10x20_clone_fp16": (cached_randn((10, 20)),),
+                "7x13_clone_fp16": (cached_randn((7, 13)),),
+                "64x129_clone_fp16": (cached_randn((64, 129)),),
+                "10x20_clone_fp32": (cached_randn((10, 20), dtype=torch.float32),),
+                "7x13_clone_fp32": (cached_randn((7, 13), dtype=torch.float32),),
+                "64x129_clone_fp32": (cached_randn((64, 129), dtype=torch.float32),),
+                "10x20_clone_int32": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int32),
+                ),
+                "7x13_clone_int32": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int32),
+                ),
+                "64x129_clone_int32": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int32),
+                ),
+                "10x20_clone_int64": (
+                    torch.randint(0, 100, (10, 20), dtype=torch.int64),
+                ),
+                "7x13_clone_int64": (
+                    torch.randint(0, 100, (7, 13), dtype=torch.int64),
+                ),
+                "64x129_clone_int64": (
+                    torch.randint(0, 100, (64, 129), dtype=torch.int64),
+                ),
             }
         },
         ("test_cmp", "test_binary_op_cpu"): {
@@ -3349,6 +3413,83 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int64_small": (
                     torch.tensor([1000, 1001] * 32, dtype=torch.int64),
                     torch.tensor([1001, 1000] * 32, dtype=torch.int64),
+                ),
+            },
+        },
+        ("test_ne_scalar_eager", "test_ne_scalar_eager_cpu"): {
+            "expect_fail": {
+                "int64_above_2e24": _CMP_BIGINT_REASON,
+                "fp16_nan": (
+                    "a NaN operand gives False for ne on device, True on CPU: "
+                    "spyreop.compare predicates are IEEE-ordered, same as "
+                    "torch.compile (#5190)"
+                ),
+            },
+            "expect_raise": {
+                # 3798
+                "fp16_offset_view": "requires a stick-aligned storage_offset",
+                # 5383
+                "fp16_unaligned_slice_32": "requires a stick-aligned storage_offset",
+            },
+            "param_sets": {
+                "fp16_int_scalar": (torch.arange(8, dtype=torch.float16), 3),
+                "fp16_float_scalar": (torch.arange(8, dtype=torch.float16), 3.0),
+                "int64_int_scalar": (torch.arange(8, dtype=torch.int64), 3),
+                "int32_int_scalar": (torch.arange(8, dtype=torch.int32), 3),
+                "int64_float_scalar": (torch.arange(8, dtype=torch.int64), 3.0),
+                "bool_int_scalar": (torch.tensor([True, False] * 4), 1),
+                "int64_unaligned_130": (torch.arange(130, dtype=torch.int64), 3),
+                "fp16_2d": (torch.arange(128, dtype=torch.float16).reshape(8, 16), 3),
+                "fp16_transposed": (
+                    torch.arange(128, dtype=torch.float16).reshape(8, 16),
+                    3,
+                    lambda x, s: x.t() != s,
+                ),
+                "fp16_0dim": (torch.tensor(3.0, dtype=torch.float16), 3),
+                "fp16_inf": (
+                    torch.tensor([1.0, float("inf"), float("-inf"), 3.0] * 16).to(
+                        torch.float16
+                    ),
+                    float("inf"),
+                ),
+                "fp16_out": (
+                    torch.arange(8, dtype=torch.float16),
+                    3.0,
+                    lambda x, s: torch.ne(
+                        x,
+                        s,
+                        out=torch.empty(x.shape, dtype=torch.bool, device=x.device),
+                    ),
+                ),
+                "fp16_inplace": (
+                    torch.arange(8, dtype=torch.float16),
+                    3,
+                    lambda x, s: x.clone().ne_(s),
+                ),
+                "int64_above_2e24": (
+                    torch.tensor(
+                        [2**24, 2**24 + 1, 2**24 + 2, 5, 3, 3] * 11, dtype=torch.int64
+                    )[:64],
+                    2**24 + 1,
+                ),
+                "fp16_nan": (
+                    torch.tensor([0.5, float("nan"), 3.0, 1.0] * 16).to(torch.float16),
+                    3,
+                ),
+                "fp16_offset_view": (
+                    torch.arange(128, dtype=torch.float16).reshape(8, 16),
+                    3,
+                    lambda x, s: x[1:] != s,
+                ),
+                "fp16_unaligned_slice_32": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    40,
+                    lambda x, s: x[:, 32:] != s,
+                ),
+                "fp16_aligned_slice_64": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    3,
+                    lambda x, s: x[:, 64:] != s,
                 ),
             },
         },
@@ -4800,6 +4941,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d_beta_50": (
                     cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
                     50.0,
+                ),
+                # Below about -4 the runtime primitive drifts and from -7 returns
+                # 0, while softplus(x) ~= e^x is still a normal fp16 value. Mamba's
+                # dt = softplus(dt + dt_bias) sits in [-12, -4]. The clamp keeps
+                # the result above the fp16 normal minimum (e^-9.7).
+                "2d_negative": (
+                    (
+                        cached_randn((256, 128), dtype=torch.float16, scale=2.0) - 6.0
+                    ).clamp(-9.5, -2.0),
+                    1.0,
+                ),
+                # The clamp applies before the scaling, so beta * x stays in
+                # [-9.5, -2] and the result above the fp16 normal minimum. Widened
+                # further, the expected values underflow and all zeros would pass.
+                "2d_negative_beta_0p5": (
+                    (
+                        cached_randn((256, 128), dtype=torch.float16, scale=4.0) - 12.0
+                    ).clamp(-19.0, -4.0),
+                    0.5,
                 ),
             },
         },
@@ -8196,6 +8356,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     -1,
                     False,
                 ),
+                "int64_dim1_2x2": (
+                    torch.randint(2, 10, (2, 2), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
                 "int64_dim1_keepdim": (
                     torch.randint(2, 10, (1, 2), dtype=torch.int64),
                     -1,
@@ -8234,15 +8399,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
-            # int64 prod over the stick dim decomposes to select+mul, and a
-            # stick-dim select reads one element per stick, a layout only a
-            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
-            "expect_fail": [
-                "int64_dim1",
-                "int64_dim1_keepdim",
-                "int64_dim1_2",
-                "int64_dim1_2_keepdim",
-            ],
+            "expect_fail": {
+                "int64_dim1": (
+                    "output size [1] triggers _make_output_stl c_size[stick_dim]==1 guard"
+                ),
+                "int64_dim1_keepdim": (
+                    "output size [1,1] triggers _make_output_stl c_size[stick_dim]==1 guard"
+                ),
+            },
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -9654,6 +9818,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Integers large enough that int→fp32 loses the distinction between them.
         self.compare_with_cpu(op, x, y, run_eager=True)
 
+    def test_ne_scalar_eager_cpu(self, x, scalar, fn=None):
+        # Eager x != scalar must run on device. A CPU fallback gives the right
+        # values, so FallbackWarning is an error here; compile is off because
+        # this test focuses specifically on eager execution.
+        fn = fn or (lambda x, s: x != s)
+
+        def no_fallback(x, s):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FallbackWarning)
+                return fn(x, s)
+
+        self.compare_with_cpu(
+            no_fallback,
+            x,
+            scalar,
+            atol=0.0,
+            rtol=0.0,
+            run_compile=False,
+            run_eager=True,
+            cpu_eager_result=fn(x, scalar),
+        )
+
     def test_cmp_cond_subgraph_cpu(self, op, n, x):
         # Regression: 0-dim int compare (eq/ne/le/gt/ge) inside a torch.cond
         # branch must not be erroneously skipped by the trip-counter carve-out.
@@ -10465,6 +10651,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, a, b, run_eager=False)
 
+    def test_restickify_clone_cpu(self, a):
+        def fn(a):
+            return a.t().clone()
+
+        self.compare_with_cpu(fn, a, run_eager=False)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_transpose_patterns_cpu(self, variant, execution_mode, *args):
         if variant == "attn_qkv_projection":
@@ -10934,6 +11126,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 dtype=torch.float64,
             )
             self.compare_with_cpu(fn, x, dlfloat16_reference=ref)
+        elif beta * x.max() <= -2.0:
+            # Every output here is below 0.13, under the default atol of 0.1, so an
+            # all-zero result would pass. Bound the error relative to the value
+            # instead: 2% covers fp16 rounding of e^x and the series.
+            self.compare_with_cpu(fn, x, atol=1e-7, rtol=2e-2)
         else:
             self.compare_with_cpu(fn, x)
 
@@ -13061,51 +13258,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
-
-    @expects_raise
-    def test_restickify_fp32_unsupported(self):
-        """An op that needs a restickify has no feasible layout for FP32.
-
-        ``x.t() + y`` needs a restickify, which only exists for the DL16 format
-        (fp16 and bf16; both compile and match the CPU). With FP32 operands the
-        layout optimizer finds no feasible layout. That is its generic "no
-        mechanism to resolve stick incompatibility" error, which also fires for
-        other causes (unaligned re-offsets, #1377), so the fragment pins the FP32
-        device dtype that the message lists for each input.
-        """
-        x = torch.randn((128, 128), dtype=torch.float32)
-        y = torch.randn((128, 128), dtype=torch.float32)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_FP32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
-
-    @expects_raise
-    def test_restickify_int64_unsupported(self):
-        """The same, for INT64: there is no feasible layout without a restickify.
-
-        int64 is stored as IEEE_INT32 on device and now uses the native
-        addi32toi32 path, so the error message names IEEE_INT32 for the
-        operands (not IEEE_FP32 as in the fp32 case above).
-        """
-        x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
-        # Transpose creates layout incompatibility that triggers restickify
-        with pytest.raises(
-            Exception, match=r"(?s)no mechanism to resolve stick incompat.*IEEE_INT32"
-        ):
-            self.compare_with_cpu(
-                lambda x, y: x.t() + y,
-                x,
-                y,
-                run_eager=False,
-            )
 
     def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""

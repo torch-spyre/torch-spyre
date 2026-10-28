@@ -991,6 +991,238 @@ def test_complete_partition_expansion_fires_and_preserves_values(
     assert torch.equal(out.cpu(), torch.relu(-host))
 
 
+@pytest.mark.parametrize(
+    "rows,inner,strided",
+    [(512, 4096, False), (64, 4096, False), (128, 4096, False), (64, 65, True)],
+)
+def test_q_projection_rope_handoff_preserves_pairs_and_other_consumer(
+    monkeypatch, rows, inner, strided
+):
+    """Compile producers and consumers together; never replay implicit LX inputs."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+
+    def fn(t, w, frequencies):
+        with spyre_hint(work_div={"R": 8, "H": 4}):
+            q = torch.nn.functional.linear(t, w)
+        with spyre_hint(work_div={"R": 32}):
+            shaped = q.reshape(1, rows, 8, 2, 64)
+            rotated = (frequencies * shaped.unsqueeze(-3)).sum(4, keepdim=True)
+            # This second read must be preserved when the private copy is
+            # inserted. Returning Q itself would require an HBM graph output.
+            side = q + 1
+            return rotated.flatten(3), side
+
+    storage_width = inner * (2 if strided else 1)
+    host = (
+        (torch.arange(rows * storage_width).reshape(1, rows, storage_width) * 13) % 127
+        - 63
+    ).to(torch.float16)
+    if strided:
+        host = host[:, :, ::2]
+        assert not host.is_contiguous()
+    # One nonzero weight per output makes the complete GEMM reference exact,
+    # including the padded K=65 case. Power-of-two scales distinguish heads
+    # when that small K causes input-column reuse.
+    columns = torch.arange(1024) % inner
+    scales = (2 ** ((torch.arange(1024) // inner) % 4)).to(torch.float16)
+    weight = torch.zeros(1024, inner, dtype=torch.float16)
+    weight[torch.arange(1024), columns] = scales
+    q_ref = host[:, :, columns] * scales
+    # Valid 0/90-degree rotations vary with both row and feature. A swapped
+    # pair, wrong sign, misplaced row fragment or wrong head changes values.
+    cos = ((torch.arange(rows)[:, None] + torch.arange(64)[None, :]) % 2).to(
+        torch.float16
+    )
+    sin = 1 - cos
+    frequencies = torch.stack(
+        (torch.stack((cos, -sin), dim=1), torch.stack((sin, cos), dim=1)), dim=1
+    ).reshape(1, rows, 1, 2, 2, 64)
+    expected = (
+        (frequencies.float() * q_ref.float().reshape(1, rows, 8, 2, 64).unsqueeze(-3))
+        .sum(4, keepdim=True)
+        .flatten(3)
+        .to(torch.float16)
+    )
+    # Preserve the factor names through Q's 1024 -> 8x2x64 RoPE view.
+    # H4 still partitions Q into four contiguous 256-feature shards.
+    for name, size in (
+        ("B", 1),
+        ("R", rows),
+        ("K", inner),
+        ("H", 8),
+        ("P", 2),
+        ("D", 64),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["H", "P", "D", "K"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        out, side = torch.compile(fn, dynamic=False, fullgraph=True)(
+            x, w, frequencies.to("spyre")
+        )
+
+    # The test is a capability/correctness gate, not a performance result.
+    # Both consumers use one destination view and hence one allocated copy.
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert len(plan.consumer_names) == 2
+    dims, strides, logical_strides = observed.source_layouts[plan.edge]
+    row_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims, strides))
+        if size == rows and stride == logical_strides[-2]
+    ]
+    column_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims[:-1], strides[:-1]))
+        if size == 16 and stride == logical_strides[-1] * dims[-1]
+    ]
+    assert len(row_axes) == len(column_axes) == 1
+    row_axis, column_axis = row_axes[0], column_axes[0]
+    assert _core_slices(plan.source_view, 32) == {
+        c: {row_axis: c % 8, column_axis: c // 8} for c in range(32)
+    }
+    assert _core_slices(plan.destination_view, 32) == {
+        c: {row_axis: c} for c in range(32)
+    }
+    assert plan.source_footprint_bytes == plan.destination_footprint_bytes == rows * 64
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "simultaneously live Q and its relayout copy overlap"
+    assert torch.equal(out.cpu(), expected)
+    assert torch.equal(side.cpu(), q_ref + 1)
+
+
+@pytest.mark.parametrize("rows", [512, 128, 64])
+def test_attention_output_repack_handoff(monkeypatch, rows):
+    """Produce softmax/PV/divide before repack/O; no implicit LX live-in.
+
+    One unmasked key per query makes exp and the denominator exactly 0/1.
+    Sparse O weights select every input feature, so wrong head/row/width
+    routing cannot hide in a wide GEMM tolerance. A second divide consumer
+    verifies that rewriting the repack read preserves the original lifetime.
+    The test ends at O's HBM graph output; distributed collectives remain a
+    separate production-harness requirement.
+    """
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.pass_utils import op_read_writes
+
+    observed = _Observed(monkeypatch, force=False)
+    restickify_inputs = {}
+    real_materialize = alloc_mod.materialize_lx_relayouts
+
+    def capture_restickify_inputs(graph, plans):
+        for plan in plans:
+            source = graph.get_buffer(plan.source_name)
+            if not (
+                isinstance(source, ComputedBuffer)
+                and isinstance(source.data, Pointwise)
+                and {node.target for node in source.origins}
+                == {torch.ops.spyre.restickify.default}
+            ):
+                continue
+            # This layout copy can merge head/width factors without changing
+            # the within-stick dimension. Require its actual lowering origin
+            # and one identity read, not a general path through other ops.
+            rw = op_read_writes(source)
+            assert len(rw.reads) == len(rw.writes) == 1
+            (read,), (write,) = list(rw.reads), list(rw.writes)
+            assert isinstance(read, MemoryDep) and isinstance(write, MemoryDep)
+            assert read.index == write.index and read.ranges == write.ranges
+            restickify_inputs[plan.source_name] = (
+                read.name,
+                graph.get_buffer(read.name).get_layout(),
+                source.get_layout(),
+            )
+        return real_materialize(graph, plans)
+
+    monkeypatch.setattr(
+        alloc_mod, "materialize_lx_relayouts", capture_restickify_inputs
+    )
+
+    def fn(scores, values, weight):
+        with spyre_hint(work_div={"R": 32}):
+            shifted = scores - scores.amax(-1, keepdim=True)
+            probability = torch.exp(shifted)
+            denominator = probability.sum(-1, keepdim=True)
+            numerator = torch.ops.spyre.batched_matmul(probability, values)
+            divided = numerator / denominator
+            side = torch.neg(divided)
+        # Reshape merges KV/G into one loop; a hint names that loop once.
+        with spyre_hint(work_div={"R": 8, "G": 4}):
+            packed = divided.reshape(1, 8, rows, 128).transpose(1, 2).contiguous()
+        with spyre_hint(work_div={"R": 4, "O": 8}):
+            result = torch.nn.functional.linear(packed.reshape(1, rows, 1024), weight)
+        return result, side
+
+    selected = (torch.arange(rows) * 13 + 17) % 512
+    scores = torch.full((1, 2, 4, rows, 512), -float("inf"), dtype=torch.float16)
+    scores[:, :, :, torch.arange(rows), selected] = 0
+    k = torch.arange(512).reshape(1, 1, 1, 512, 1)
+    h = torch.arange(2).reshape(1, 2, 1, 1, 1)
+    d = torch.arange(128).reshape(1, 1, 1, 1, 128)
+    values = ((k * 37 + h * 257 + d * 3) % 1021 / 1024).to(torch.float16)
+    selectors = (torch.arange(4096) * 37) % 1024
+    weight = torch.zeros(4096, 1024, dtype=torch.float16)
+    weight[torch.arange(4096), selectors] = 1
+    divided = values[:, :, :, selected, :].expand(1, 2, 4, rows, 128)
+    packed = divided.reshape(1, 8, rows, 128).transpose(1, 2).reshape(1, rows, 1024)
+    expected = packed[:, :, selectors]
+    for name, size in (
+        ("B", 1),
+        ("KV", 2),
+        ("G", 4),
+        ("R", rows),
+        ("S", 512),
+        ("D", 128),
+        ("O", 4096),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    score_arg = _pnd.name_tensor_dims(scores.to("spyre"), ["KV", "G", "R", "S"])
+    value_arg = _pnd.name_tensor_dims(values.to("spyre"), ["KV", "S", "D"])
+    weight_arg = _pnd.name_tensor_dims(weight.to("spyre"), ["O", "KV", "G", "D"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        result, side = torch.compile(fn, dynamic=False, fullgraph=True)(
+            score_arg, value_arg, weight_arg
+        )
+    observed.assert_emitted_in_lx(expected_plans=2)
+    first, second = observed.plans
+    if second.source_name not in first.consumer_names:
+        assert second.source_name in restickify_inputs
+        input_name, input_layout, output_layout = restickify_inputs[second.source_name]
+        assert input_name in first.consumer_names
+        assert (
+            set(input_layout.allocation) == set(output_layout.allocation) == {"lx"}
+        ), "the repack layout copy must keep both endpoints in LX"
+    assert first.source_view.split_product == first.destination_view.split_product == 32
+    assert second.source_view.split_product == 32
+    assert second.destination_view.split_product == 4
+    assert (
+        first.source_footprint_bytes == first.destination_footprint_bytes == rows * 64
+    )
+    assert second.source_footprint_bytes == rows * 64
+    assert second.destination_footprint_bytes == rows * 512
+    for plan in observed.plans:
+        assert (
+            plan.source_address + plan.source_footprint_bytes
+            <= plan.destination_address
+            or plan.destination_address + plan.destination_footprint_bytes
+            <= plan.source_address
+        ), "live source and copy overlap"
+    assert torch.equal(result.cpu(), expected)
+    assert torch.equal(side.cpu(), -divided)
+
+
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
     """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
     _run_prefix_linear_case(monkeypatch, mode="served")

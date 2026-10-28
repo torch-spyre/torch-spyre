@@ -271,6 +271,9 @@ _FP16_MIN = -65504.0
 # 16-bit halves are constructed directly from their bit patterns.
 _FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
 _FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+_FP32_ALMOST_1 = struct.unpack("<f", struct.pack("<I", 0x3F803F80))[
+    0
+]  # 1.0019378662109375
 
 _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
     "max": {
@@ -283,10 +286,27 @@ _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
     },
     "exp": {
         DataFormats.SEN169_FP16: -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+        DataFormats.IEEE_FP32: _FP32_MIN,
+    },
+    "reciprocal": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "rsqrt": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
+    },
+    "log": {
+        DataFormats.SEN169_FP16: 1,
+        DataFormats.IEEE_FP32: _FP32_ALMOST_1,
+    },
+    "realdiv": {
+        DataFormats.SEN169_FP16: float("inf"),
+        DataFormats.IEEE_FP32: _FP32_MAX,
     },
 }
 
-_POINTWISE_PADDING_OPS: set[str] = {"exp"}
+_POINTWISE_PADDING_OPS: set[str] = {"exp", "reciprocal", "rsqrt", "log", "realdiv"}
 
 
 def _get_mask_value(
@@ -296,7 +316,11 @@ def _get_mask_value(
 
 
 def _get_coordinate_mask(
-    iteration_space: dict, arg: SDSCArgs, dim_padding: dict, op: str = ""
+    iteration_space: dict,
+    arg: SDSCArgs,
+    dim_padding: dict,
+    op: str = "",
+    inputs: list[SDSCArgs] | None = None,
 ) -> dict:
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
@@ -305,27 +329,17 @@ def _get_coordinate_mask(
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
     #
-    # SAMV coordinate masking is limited to <=16-bit element types by the
-    # backend compiler ("Coordinate masking is supported only up to 16bit
-    # element types"), so the pointwise padding mask cannot be emitted for FP32.
-    # Skipping it is what lets unaligned FP32 `exp` compile at all.
-    #
-    # Risk: the padded lanes of an unaligned FP32 `exp` output hold
-    # `exp(uninitialized)`, so any consumer that ITERATES the padded extent may
-    # produce unexpected results -- a contraction does, since it reads the whole
-    # stick as an operand. Note a restickify also iterates the padded extent and
-    # emits no mask, so the values are relocated rather than dropped; they stay
-    # harmless only as long as the eventual consumer iterates the logical extent.
-    # Known use cases do not hit this limitation:
-    #   * SDPA (softmax -> matmul, the consumer the mask was added for, #3248)
-    #     runs in fp16, where the mask is still applied.
-    #   * The Gemma-4 MoE router (softmax with dtype=torch.float32 -> topk) uses
-    #     stick-aligned tensors, so there are no padded lanes to begin with.
-    # Revisit if either assumption changes. See #3799 (SAMV masking for exp) and
-    # #3290 (padded-stick-state layout enum, the principled replacement for this
-    # bandage).
-    mask_pointwise = (
-        op in _POINTWISE_PADDING_OPS and arg.data_format != DataFormats.IEEE_FP32
+    # Skip the pointwise mask when an input is broadcast along a padded dim
+    # (scale != 1, e.g. x / x.sum(-1, keepdim=True)). SAMV then substitutes the
+    # mask value only into the inputs that iterate the dim, so realdiv computes
+    # inf / y == inf instead of 0. Worse, for some widths (e.g. 6 sticks) the
+    # backend applies the mask to valid lanes and corrupts the result,
+    # whatever the mask value. Unmasked, the valid lanes are correct.
+    mask_pointwise = op in _POINTWISE_PADDING_OPS and all(
+        inp.scales.get(dim) == 1
+        for inp in inputs or []
+        for dim, padding in dim_padding.items()
+        if padding > 0
     )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
@@ -2423,7 +2437,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
         )
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op
+        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
     )
     masking_const_id = -1
     if coordinate_masking:

@@ -54,6 +54,7 @@ test_suite_config:
             - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_clone.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_div_rounding_mode_floor_fp16_rand_2d_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_div_scalar_dtypes_true_div_bool_int_scalar_lx_planning_(pointwise|reduction)

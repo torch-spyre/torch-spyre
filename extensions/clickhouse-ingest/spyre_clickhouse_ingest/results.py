@@ -2197,6 +2197,7 @@ def main(argv=None):
                             cases,
                             xml_path.name,
                             attempt=args.run_attempt,
+                            arch=args.platform or run["platform"],
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
