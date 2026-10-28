@@ -18,6 +18,7 @@ Tests hook into CustomPreSchedulingPasses after insert_bmm_padding runs to inspe
 the operations list directly, without requiring end-to-end compilation to succeed.
 """
 
+import math
 import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
@@ -35,6 +36,10 @@ from torch._inductor.ir import (
 )
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
@@ -51,6 +56,7 @@ from torch_spyre._inductor.padding import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
+from utils_inductor import try_reinterpret_host_shape
 
 
 Ts = TypeVarTuple("Ts")
@@ -903,6 +909,117 @@ class TestInsertPaddingIR(unittest.TestCase):
             F.linear(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
         )
 
+    def test_tiled_expert_weight_unaligned_k_pads_for_each_tile(self) -> None:
+        """A per-expert weight ``[E, K, N]`` tiled with x, with unaligned K.
+
+        Padding K to the stick boundary grows the per-expert stride of the weight
+        (67 * 128 to 128 * 128).  The per-trip step ``splice_while_loops`` stamped
+        before padding still held the unpadded stride, so every trip after the
+        first read the wrong place and the device faulted (#5573).  At K=64 there
+        is no padding and it was always correct.
+        """
+        dtype = torch.float16
+        E, M, K, N = 4, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(E, K, N, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                return None, torch.matmul(ops[0], ops[1])
+
+            return for_each_tile(body, (x, w), dims=(0, 0), tile_size=1, out_dim=0)[1]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_tiled_transposed_expert_weight_unaligned_k_pads_for_each_tile(
+        self,
+    ) -> None:
+        """A per-expert weight stored ``[E, N, K]`` and used transposed, K unaligned.
+
+        The same stale per-trip step as the ``[E, K, N]`` case, on a weight whose K
+        is its innermost dim, so the padded buffer's per-expert stride and the
+        within-expert strides all differ from the unpadded ones.  It returned NaN
+        for about 70% of the result before the step was re-strided (#5573).
+        """
+        dtype = torch.float16
+        E, M, K, N = 4, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(E, N, K, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                return None, torch.matmul(ops[0], ops[1].transpose(-1, -2))
+
+            return for_each_tile(body, (x, w), dims=(0, 0), tile_size=1, out_dim=0)[1]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        expected = torch.einsum("emk,enk->emn", x_cpu.float(), w_cpu.float())
+        torch.testing.assert_close(expected, result.cpu().float(), atol=0.1, rtol=0.1)
+
+    def test_padded_read_step_shared_by_two_dims_is_rejected(self) -> None:
+        """A per-trip step that two non-trivial dims of y could own is an error.
+
+        The stamped step is a stride of y's layout; when two dims of size above one
+        share it, there is no telling which one the loop walks, and re-striding the
+        wrong one would read the wrong place after the first trip.  It must raise
+        rather than leave the unpadded step in place (#5573).
+        """
+        from torch._inductor.ir import FixedLayout
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.padding import (
+            _refresh_loop_advance_for_padded_read,
+        )
+
+        class _Buf:
+            def __init__(self, name, size, stride):
+                self._name = name
+                self._layout = FixedLayout(
+                    torch.device("cpu"), torch.float16, size, stride
+                )
+
+            def get_name(self):
+                return self._name
+
+            def get_layout(self):
+                return self._layout
+
+        # Two dims of size 2 and 3 share stride 4 (an overlapping view).
+        y = _Buf("y", [2, 3, 5], [4, 4, 1])
+        padded = _Buf("y_padded", [2, 3, 8], [24, 8, 1])
+
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[2],
+            loop_tiled_dims=[[]],
+            squeezed_advance_per_read=[[[(4, 1)]]],
+        )
+
+        class _Op:
+            loop_info = info
+
+            def get_read_writes(self):
+                from torch._inductor.dependencies import MemoryDep
+                import sympy
+
+                x = sympy.Symbol("d0")
+                dep = MemoryDep("y_padded", x, (x,), (6,))
+                return type("RW", (), {"reads": [dep]})()
+
+        with self.assertRaisesRegex(Unsupported, "cannot tell which dim"):
+            _refresh_loop_advance_for_padded_read(_Op(), y, padded)
+
     def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
         """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
 
@@ -1079,6 +1196,284 @@ class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
         self.assertLess(stride[1], stride[2])
         self.assertNotEqual(stride[1], stride[0])
         self.assertNotEqual(stride[2], stride[0])
+
+
+def full_half_stick(dtype: torch.dtype):
+    elems = get_elem_in_stick(dtype)
+    return elems, elems // 2
+
+
+COORD_MASK_DTYPES = [torch.float32, torch.float16]
+
+# Shapes with stick dimension that doesn't line up with stick size, i.e. requires padding
+SHAPES = [
+    (64, 8),
+    # multiple sticks get split by work division. Coordinate masking in combination with splitting wasn't supported by the backend copmpiler
+    (64, 100),
+]
+
+
+def unpad_shape(shape, dtype):
+    elems = get_elem_in_stick(dtype)
+    stick_dim = shape[-1]
+    unpadded = int(math.ceil(stick_dim / elems) * elems)
+    return (*shape[:-1], unpadded)
+
+
+@instantiate_parametrized_tests
+class TestCoordinateMasking(unittest.TestCase):
+    """Regression tests for operations that can create NaNs in padding.
+
+    The creation of NaNs is suporessed by the coordinate masking
+    in `superdsc.py`.
+    """
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_division(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+        b_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+
+        def fn(x, y):
+            return x / y
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre, b_spyre)
+
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        print(f"{exposed_padding.shape=}")
+        print(f"{exposed_padding=}")
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("broadcast", ["divisor", "dividend"])
+    @parametrize("half_sticks", [1, 5, 11])
+    def test_division_broadcast(self, dtype, broadcast, half_sticks) -> None:
+        # An operand broadcast along the padded stick dim (e.g. a reduction
+        # result) must not get a coordinate mask: SAMV skips it, so realdiv's
+        # inf mask leaks into the padding (inf / y), and at 5.5 sticks the
+        # backend also corrupted valid lanes.
+        full, half = full_half_stick(dtype)
+        width = half * half_sticks
+        shapes = {
+            "divisor": ((full, width), (full, 1)),
+            "dividend": ((full, 1), (full, width)),
+        }
+        x_shape, y_shape = shapes[broadcast]
+        a_spyre = torch.full(x_shape, 3, dtype=dtype, device="spyre")
+        b_spyre = torch.full(y_shape, 2, dtype=dtype, device="spyre")
+
+        def fn(x, y):
+            return x / y
+
+        # dynamic=False: a recompile with symbolic widths takes another path.
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre, b_spyre)
+
+        torch.testing.assert_close(
+            result.cpu(), torch.full((full, width), 1.5, dtype=dtype)
+        )
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_exp(self, shape, dtype) -> None:
+        unpadded = unpad_shape(shape, dtype)
+        a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
+        a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
+
+        def fn(x):
+            return torch.exp(x)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_pow_neg(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.pow(x, -1.0)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_reciprocal(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.reciprocal(x)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_rsqrt(self, shape, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.rsqrt(x)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        assert (exposed_padding < 1e-4).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("shape", SHAPES)
+    def test_log(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.log(x)
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre)
+
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
+        ]
+        if dtype == torch.float16:
+            assert (exposed_padding == 0).all().item()
+        else:
+            assert (exposed_padding < 1e-2).all().item()
+
+
+class TestMatmulPaddingNaN(unittest.TestCase):
+    """Regression tests for matmul output corruption that surfaces as NaNs.
+
+    When the padding inside the sticks becomes corrupted by the presence of
+    NaNs, the result of the matmul in the valid region also becomes corrupted.
+    """
+
+    # For now batched matmuls aren't supported with float 32
+    DTYPE = torch.float16
+
+    def _assert_matches_cpu_and_has_no_nan(
+        self,
+        device_result: torch.Tensor,
+        cpu_expected: torch.Tensor,
+        atol: float = 0.1,
+        rtol: float = 0.1,
+    ) -> None:
+        result_cpu = device_result.cpu()
+        self.assertFalse(
+            torch.isnan(result_cpu).any().item(),
+            f"Compiled Spyre output contains NaN:\n{result_cpu}",
+        )
+        torch.testing.assert_close(result_cpu, cpu_expected, atol=atol, rtol=rtol)
+
+    def test_division(self) -> None:
+        """``(x / z) @ y`` -- division_compiled.py."""
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 2, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        c_cpu = torch.full((full, half), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+        c_spyre = c_cpu.to(device="spyre")
+
+        def fn(x, y, z):
+            return (x / z) @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre, c_spyre)
+        expected = fn(a_cpu, b_cpu, c_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_pow_neg(self) -> None:
+        """``torch.pow(x, -1.0) @ y`` -- pow_neg_compiled.py."""
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.pow(x, -1.0)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_reciprocal(self) -> None:
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.reciprocal(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_rsqrt(self) -> None:
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.rsqrt(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_log(self) -> None:
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.log(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
 
 
 if __name__ == "__main__":

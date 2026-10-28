@@ -120,6 +120,11 @@ class Sandbox:
             "(run_key, arch, component, image, kind)",
         ),
         (
+            "pipeline_run_links",
+            "from_run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
+            "link_id",
+        ),
+        (
             "ci_run_timings",
             "run_key GLOBAL IN (SELECT run_key FROM {db}.pipeline_runs)",
             "(run_key, entry, component, artifact_name, arch, leg, attempt)",

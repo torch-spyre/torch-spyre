@@ -16,8 +16,10 @@
 
 ``_would_produce_lx_back_gap`` asks whether a device dimension is *fully
 covered* by the iteration symbols that walk it: a backGap fires when
-``device_size[d]`` exceeds the extent the coordinate actually reaches, and the
-backend supports that for HBM but not for LX.
+``device_size[d]`` exceeds the extent the coordinate actually reaches, a bare
+coordinate iterates beyond its physical extent, or normalization splits an
+overlapping coordinate into a negative-gap inner axis.
+The backend supports these gaps for HBM but not for LX.
 
 The covered extent is a property of the whole coordinate expression, not of any
 one symbol in it. These tests pin that, because the two obvious cheaper
@@ -47,6 +49,8 @@ from torch._inductor.ir import (
     FallbackKernel,
     FixedLayout,
     MutationLayoutSHOULDREMOVE,
+    NonOwningLayout,
+    OperationBuffer,
     Pointwise,
 )
 from torch._inductor.sizevars import SizeVarAllocator
@@ -57,6 +61,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     get_ncores_for_buffers,
     ops_in_offset_mutation_component,
+    storage_has_single_writer,
 )
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
@@ -71,6 +76,76 @@ d0, d1, d2, d3 = sympy.symbols("d0 d1 d2 d3", integer=True, nonnegative=True)
 # one non-stick device dim, so ``device_size[0]`` is the dim under test.
 _STICK_COORD = sympy.Mod(d0, 64)
 _STICK_SIZE = 64
+
+
+class SingleWriterTest(TestCase):
+    """Exercise the shared proof with real IR and dependency extraction."""
+
+    @staticmethod
+    def _producer(name=_BUF, layout=None, input_name="input"):
+        return ComputedBuffer(
+            name=name,
+            layout=layout
+            if layout is not None
+            else FixedLayout(torch.device("cpu"), torch.float16, [4, 64], [64, 1]),
+            data=Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(input_name, 64 * index[0] + index[1]),
+                ranges=[4, 64],
+            ),
+        )
+
+    def setUp(self):
+        self.graph = SimpleNamespace(
+            operations=[],
+            sizevars=SizeVarAllocator(),
+            mark_buffer_mutated=lambda name: None,
+        )
+
+    def test_fresh_storage_and_read_only_consumer(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            reader = self._producer("reader", input_name=_BUF)
+            self.graph.operations = [producer, reader]
+            self.assertTrue(storage_has_single_writer(self.graph, producer))
+
+    def test_second_writer_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer, second_writer = self._producer(), self._producer()
+            self.assertIsNot(producer, second_writer)
+            self.assertEqual(
+                {dep.name for dep in second_writer.get_read_writes().writes}, {_BUF}
+            )
+            self.graph.operations = [producer, second_writer]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_mutation_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            mutation = self._producer("mutation", MutationLayoutSHOULDREMOVE(producer))
+            self.assertIn(_BUF, mutation.get_mutation_names())
+            self.graph.operations = [producer, mutation]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_output_alias_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            alias = OperationBuffer(name="alias", layout=NonOwningLayout(producer))
+            self.assertIn(_BUF, alias.get_inputs_that_alias_output())
+            self.graph.operations = [producer, alias]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
+
+    def test_unimplemented_dependency_proof_is_rejected(self):
+        with V.set_graph_handler(self.graph):
+            producer = self._producer()
+            # OperationBuffer cannot describe its writes. Unknown operations must
+            # fail closed rather than be treated as read-only.
+            unknown = OperationBuffer(name="unknown", layout=producer.get_layout())
+            with self.assertRaises(NotImplementedError):
+                unknown.get_read_writes()
+            self.graph.operations = [producer, unknown]
+            self.assertFalse(storage_has_single_writer(self.graph, producer))
 
 
 class PointwiseInPlaceInputsTest(TestCase):
@@ -163,6 +238,14 @@ def _back_gap(coord, extent, ranges):
 
 
 class BackGapTest(TestCase):
+    def test_negative_gap_bars_lx(self):
+        self.assertTrue(_back_gap(d0, 2, {d0: 4}))
+
+    def test_overlapping_affine_coordinate_bars_lx(self):
+        # The original row axis is fully covered, but normalization gives d1
+        # a two-row physical extent while it iterates over four rows.
+        self.assertTrue(_back_gap(2 * d0 + d1, 16, {d0: 7, d1: 4}))
+
     def test_multi_symbol_coordinate_that_covers_its_dim_has_no_gap(self):
         """``2*d1 + d3`` over ``d1 in [0,40)``, ``d3 in [0,2)`` reaches 0..79.
 

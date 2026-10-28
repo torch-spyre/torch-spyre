@@ -155,6 +155,87 @@ class TestLaunchJobPlan(TestCase):
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
+    @staticmethod
+    def _payload_hcm(payload: bytes) -> dict:
+        """Minimal valid HCM whose host compute output is exactly `payload`.
+
+        A single SYMBOL_SUBSTITUTE dci (int8 src/dst, host-to-sen, no symbols)
+        copies senConstants[0] verbatim into the output buffer. output_shape_ is
+        in int8 elements and must be a multiple of 8. senConstants[1] is the
+        empty trailer required by processComputeOnHostCommand.
+        """
+        return {
+            "vdci": {
+                "dsName_": "payload",
+                "isMarker_": 0,
+                "data_conversion_info_group_": [
+                    {
+                        "key": [],
+                        "dci": {
+                            "dsName_": "payload",
+                            "isHostToSen_": 1,
+                            "dataformat_src_": 8,
+                            "dataformat_dst_": 8,
+                            "dcOpName_": 6,
+                            "pre_expand_dcsi_": [],
+                            "pre_input_shape_": [],
+                            "dcsi_": [],
+                            "input_shape_": [],
+                            "output_shape_": [len(payload)],
+                            "post_slice_dcsi_": [],
+                            "post_output_shape_": [],
+                            "input_dimwise_ea_": [],
+                            "output_dimwise_ea_": [],
+                            "useSpi_": 0,
+                            "usePca_": 0,
+                            "usePadVal_": 0,
+                            "inputPadVal_": 0,
+                            "useWli_": 0,
+                            "dmdi_": {"perTensorInfo": []},
+                            "ssi_": {
+                                "value_and_locs_": [],
+                                "inputSym_": [],
+                                "unSubstitutedFlitStartOffset_": 0,
+                            },
+                        },
+                    }
+                ],
+                "group_tags_": [],
+                "inputSym_": [],
+                "dciIdxSym_": [],
+                "variableDefs_": [],
+            },
+            "senConstants": [{"senconst_": payload.hex()}, {"senconst_": ""}],
+        }
+
+    def test_host_compute_produces_nonzero_payload(self):
+        """A valid zero-symbol HCM runs through flex and emits its payload.
+
+        prepare_kernel rejects a HostCompute+H2D-only plan (the validator
+        requires a following Compute, see test_prepare_host_compute_sequence)
+        and executing a Compute from a mock SpyreCode faults the device, so
+        this drives the same flex host-compute path as
+        JobPlanStepHostCompute::construct through the _host_compute_bytes seam.
+        The payload is non-zero so a no-op producer cannot pass.
+        """
+        payload = b"\xab" * 16
+        correction_size = 128
+        out = torch_spyre._C._host_compute_bytes(
+            json.dumps(self._payload_hcm(payload)), correction_size
+        )
+        self.assertEqual(len(out), correction_size)
+        self.assertEqual(out[: len(payload)], payload)
+        self.assertEqual(
+            out[len(payload) :], b"\x00" * (correction_size - len(payload))
+        )
+
+    def test_host_compute_invalid_hcm_raises(self):
+        """An HCM with no DCI is rejected by the host compute path."""
+        with self.assertRaisesRegex(RuntimeError, "Expect one DCI"):
+            torch_spyre._C._host_compute_bytes(
+                json.dumps({"vdci": {}, "senConstants": []}), 128
+            )
+
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
     """Build a JobPlan with a single D2H DataTransfer step from dev_ptr.
