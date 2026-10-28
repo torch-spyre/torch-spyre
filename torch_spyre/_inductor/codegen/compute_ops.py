@@ -309,12 +309,13 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         and tensor.data_format == DataFormats.SEN143_FP8
         and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
     ):
-        # After device-size flattening a rank-4+ tensor produces a 3-element
-        # dim_order (one collapsed leading dim + the two trailing stick dims).
-        # The [-2:] slice always selects the two stick dims regardless of how
-        # many leading dims were collapsed, because flattening only touches
-        # leading dims and the trailing stick dims are preserved as-is by
-        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
+        # stickDimOrder_ must contain exactly the two QFP8WT stick dims (K and
+        # N), never the outer batch dim(s).  For a rank-3 KERNEL (no batch dims)
+        # dim_order is already ["in", "mb"] so [-2:] is a no-op.  For a rank-4+
+        # KERNEL (one or more batch dims collapsed into the leading positions by
+        # _flatten_device_size) dim_order is e.g. ["out","in","mb"] or
+        # ["x","in","mb"]; taking [-2:] strips the batch prefix and leaves only
+        # the 2D-stick pair, which is what deeptools ddl_conversion expects.
         dim_order = layout_info["dim_order"]
         if len(dim_order) < 2:
             raise ValueError(
@@ -323,7 +324,7 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
             )
         return {
             **layout_info,
-            "stick_dim_order": list(dim_order),
+            "stick_dim_order": list(dim_order[-2:]),
             "stick_size": [2, 64],
         }
     return layout_info
