@@ -28,6 +28,8 @@ the plan (views under the chosen divisions, solved addresses), the existing
 computes the right numbers on device.
 """
 
+import math
+
 import pytest
 
 pytest.importorskip("ortools")
@@ -1221,6 +1223,248 @@ def test_attention_output_repack_handoff(monkeypatch, rows):
         ), "live source and copy overlap"
     assert torch.equal(result.cpu(), expected)
     assert torch.equal(side.cpu(), -divided)
+
+
+def _assert_cache_update_persistence(
+    specs, cache_writes, source_address, elements, *, later_write=False
+):
+    """Require direct persistence or a complete ordered functionalized copyback."""
+    from torch_spyre._inductor.constants import RESTICKIFY_OP
+
+    snapshots = [
+        (i, spec.args[0])
+        for i, spec in enumerate(specs)
+        if spec.op == RESTICKIFY_OP
+        and len(spec.args) == 2
+        and spec.args[1].allocation == {"lx": source_address}
+    ]
+    assert len(snapshots) == 1, "expected one persistent-cache snapshot"
+    snapshot_index, cache = snapshots[0]
+    assert math.prod(cache.device_size) == elements
+    assert len(cache_writes) == 1 + int(later_write)
+    assert set(cache_writes).issubset(map(id, specs))
+    if later_write:
+        writes = [
+            (i, cache_writes[id(spec)])
+            for i, spec in enumerate(specs)
+            if id(spec) in cache_writes
+        ]
+        assert len(writes) == 2, (
+            "expected indexed updates before and after the snapshot"
+        )
+        assert writes[0][0] < snapshot_index < writes[1][0]
+        assert all(set(arg.allocation) in ({"hbm"}, {"hbm_pool"}) for _, arg in writes)
+        # Functionalization can snapshot the first pooled version and copy the
+        # second version back later. Exact outputs and the returned alias below
+        # check both versions, including untouched history in the final cache.
+        return
+    assert cache.arg_index >= 0 and cache.allocation == {"hbm": cache.arg_index}
+    for i, spec in enumerate(specs):
+        if id(spec) not in cache_writes:
+            continue
+        updated = cache_writes[id(spec)]
+        assert i < snapshot_index, "cache snapshot precedes its indexed update"
+        if updated.allocation == cache.allocation:
+            assert updated.arg_index == cache.arg_index
+            continue
+        assert set(updated.allocation) == {"hbm_pool"}, (
+            "indexed cache writes must remain in HBM"
+        )
+
+        # Returning an existing view can functionalize the mutation. Require
+        # history initialization and a full copyback to the exact external
+        # cache read by the snapshot, not merely some later external write.
+        def copies(source, destination):
+            return [
+                (j, candidate)
+                for j, candidate in enumerate(specs)
+                if candidate.op == "identity"
+                and len(candidate.args) == 2
+                and candidate.args[0].is_input
+                and not candidate.args[1].is_input
+                and candidate.args[0].allocation == source
+                and candidate.args[1].allocation == destination
+            ]
+
+        initializers = copies(cache.allocation, updated.allocation)
+        copybacks = copies(updated.allocation, cache.allocation)
+        assert len(initializers) == len(copybacks) == 1, (
+            "pooled cache update requires history initialization and copyback"
+        )
+        init_index, initializer = initializers[0]
+        copy_index, copyback = copybacks[0]
+        assert init_index < i < copy_index < snapshot_index, (
+            "cache initialization, indexed update, copyback and snapshot are unordered"
+        )
+        for copy in (initializer, copyback):
+            assert (
+                math.prod(int(size) for size, _ in copy.iteration_space.values())
+                == elements
+            )
+            assert all(math.prod(arg.device_size) == elements for arg in copy.args)
+        for original, restored in zip(initializer.args, reversed(copyback.args)):
+            assert original.arg_index == restored.arg_index
+            assert original.device_size == restored.device_size
+            assert original.device_coordinates == restored.device_coordinates
+            assert original.device_dtype == restored.device_dtype == cache.device_dtype
+        assert initializer.args[1].device_size == updated.device_size
+        assert initializer.args[0].arg_index == cache.arg_index
+        pool_writers = [
+            j
+            for j, candidate in enumerate(specs)
+            if init_index <= j <= copy_index
+            and any(
+                not arg.is_input and arg.allocation == updated.allocation
+                for arg in candidate.args
+            )
+        ]
+        assert pool_writers == [init_index, i], "cache history has an unrelated writer"
+
+
+@pytest.mark.parametrize(
+    "rows,later_write",
+    [(512, False), (128, False), (64, False), (512, True)],
+    ids=["512", "128", "64", "512-later-write"],
+)
+def test_attention_cache_transpose_handoff(monkeypatch, rows, later_write):
+    """Update persistent K, restickify its prefix, gather, then run two QKs.
+
+    The original cache holds history and has twice the attended capacity.
+    Nonmonotonic unique updates hit both halves. Exact one-hot queries check
+    every head/width/context value, and a second QK keeps the snapshot live.
+    Returning a pre-existing cache view checks mutation and alias semantics.
+    No test-side buffer is assumed to arrive in LX.
+    """
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    import torch_spyre._inductor.codegen.superdsc as sdsc_mod
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.constants import RESTICKIFY_OP
+    from torch_spyre._inductor.op_spec import IndirectAccess
+
+    observed = _Observed(monkeypatch, force=False)
+    restick_allocations, cache_writes, parsed_specs = [], {}, {}
+    real_parse = sdsc_mod.parse_op_spec
+
+    def observe_parse(spec):
+        parsed_specs.setdefault(id(spec), spec)
+        if spec.op == RESTICKIFY_OP:
+            restick_allocations.append([dict(arg.allocation) for arg in spec.args])
+        for arg in spec.args:
+            if not arg.is_input and any(
+                coordinate.has(IndirectAccess) for coordinate in arg.device_coordinates
+            ):
+                cache_writes[id(spec)] = arg
+        return real_parse(spec)
+
+    monkeypatch.setattr(sdsc_mod, "parse_op_spec", observe_parse)
+
+    def fn(cache, indices, keys, queries, other_queries, mask):
+        alias = cache.view_as(cache)
+        # The int32 indices occupy 32-element sticks: split only whole sticks.
+        with spyre_hint(work_div={"R": rows // 32}):
+            fresh = torch.neg(keys)
+            cache.index_copy_(2, indices, fresh)
+        with spyre_hint(work_div={"S": 2}, named_dims=["KV", "D", "S"]):
+            transposed = cache[0, :, :512, :].transpose(-1, -2).contiguous()
+        if later_write:
+            # The immutable snapshot must keep the first update, not these values.
+            with spyre_hint(work_div={"R": rows // 32}):
+                cache.index_copy_(2, indices, keys)
+        transposed = transposed.unsqueeze(0).unsqueeze(2)
+        with spyre_hint(work_div={"R": 32}):
+            query = torch.neg(queries)
+            scores = torch.ops.spyre.batched_matmul(query, transposed)
+            other = torch.ops.spyre.batched_matmul(other_queries, transposed)
+            masked = scores.masked_fill(mask, -float("inf"))
+        return masked, other, alias
+
+    c = torch.arange(1024).reshape(1, 1, 1024, 1)
+    h = torch.arange(2).reshape(1, 2, 1, 1)
+    d = torch.arange(128).reshape(1, 1, 1, 128)
+    cache = ((37 * c + 251 * h + 3 * d) % 1021).to(torch.float16)
+    keys = ((19 * torch.arange(rows).reshape(1, 1, rows, 1) + 131 * h + d) % 509).to(
+        torch.float16
+    )
+    indices = (torch.arange(rows) * 13 + 17) % 1024
+    expected_cache = cache.clone()
+    expected_cache.index_copy_(2, indices, -keys)
+    selectors = (
+        torch.arange(rows).reshape(1, 1, 1, rows)
+        + 17 * torch.arange(4).reshape(1, 1, 4, 1)
+        + 31 * torch.arange(2).reshape(1, 2, 1, 1)
+    ) % 128
+    query = torch.nn.functional.one_hot(selectors, 128).to(torch.float16)
+    other_selectors = (selectors * 7 + 9) % 128
+    other_query = torch.nn.functional.one_hot(other_selectors, 128).to(torch.float16)
+    # A causal mask with a position offset exercises both kept and discarded
+    # history. The raw second QK verifies the masked-out values as well.
+    mask = torch.arange(512)[None, :] > (torch.arange(rows)[:, None] + 11)
+    history = expected_cache[:, :, :512, :].transpose(-1, -2).unsqueeze(2)
+    expected = torch.gather(
+        history.expand(1, 2, 4, 128, 512),
+        3,
+        selectors[..., None].expand(1, 2, 4, rows, 512),
+    ).masked_fill(mask, -float("inf"))
+    expected_other = torch.gather(
+        history.expand(1, 2, 4, 128, 512),
+        3,
+        other_selectors[..., None].expand(1, 2, 4, rows, 512),
+    )
+    if later_write:
+        expected_cache.index_copy_(2, indices, keys)
+    for name, size in (
+        ("KV", 2),
+        ("C", 1024),
+        ("S", 512),
+        ("R", rows),
+        ("D", 128),
+        ("G", 4),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    cache_arg = _pnd.name_tensor_dims(cache.to("spyre"), ["KV", "C", "D"])
+    key_arg = _pnd.name_tensor_dims(keys.to("spyre"), ["KV", "R", "D"])
+    query_arg = _pnd.name_tensor_dims((-query).to("spyre"), ["KV", "G", "R", "D"])
+    other_arg = _pnd.name_tensor_dims(other_query.to("spyre"), ["KV", "G", "R", "D"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        result, other, alias = torch.compile(fn, dynamic=False, fullgraph=True)(
+            cache_arg,
+            indices.to("spyre"),
+            key_arg,
+            query_arg,
+            other_arg,
+            mask.to("spyre"),
+        )
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.source_view.num_cores == plan.source_view.split_product == 2
+    assert plan.destination_view.num_cores == 32
+    assert plan.destination_view.split_product == 1
+    assert len(plan.consumer_names) == 2
+    assert plan.source_footprint_bytes == 131072
+    assert plan.destination_footprint_bytes == 262144
+    assert any(
+        len(args) == 2
+        and "lx" not in args[0]
+        and args[1] == {"lx": plan.source_address}
+        for args in restick_allocations
+    ), "the transpose must read HBM cache and write the planned LX source"
+    _assert_cache_update_persistence(
+        list(parsed_specs.values()),
+        cache_writes,
+        plan.source_address,
+        cache.numel(),
+        later_write=later_write,
+    )
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "live K snapshot and its gathered replica overlap"
+    assert torch.equal(result.cpu(), expected)
+    assert torch.equal(other.cpu(), expected_other)
+    assert torch.equal(cache_arg.cpu(), expected_cache)
+    assert torch.equal(alias.cpu(), expected_cache)
+    assert alias.data_ptr() == cache_arg.data_ptr()
 
 
 def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
