@@ -170,6 +170,24 @@ class TestCoordinates(TestCase):
         # offset 1855 = 3*600 + 1*30 + 25*1
         self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
 
+        # rows [1:3] of an (A=2, s=2) pair merged into 4 rows: the var fits
+        # in the inner dim, but with the offset it carries into the outer one.
+        cx = compute_coordinates(
+            [2, 2, 9, 64],
+            [1152, 576, 64, 1],
+            {p0: 2, p1: 576},
+            576 * p0 + p1 + 576,
+        )
+        self.assertEqual(cx, [p0 // 2, p0 % 2 + 1, p1 // 64, p1 % 64])
+        # rows [2:4], aligned to the outer dim: no carry.
+        cx = compute_coordinates(
+            [2, 2, 9, 64],
+            [1152, 576, 64, 1],
+            {p0: 2, p1: 576},
+            576 * p0 + p1 + 1152,
+        )
+        self.assertEqual(cx, [1, p0, p1 // 64, p1 % 64])
+
     def test_stepped_nonstick_coordinate_bounds(self):
         # A valid ::step slice reaches at most rows - 1, including when
         # rows is not divisible by step. Test both common stick widths.
@@ -1188,6 +1206,29 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+    def test_adjacent_fusion_scales_outer_offset(self):
+        """An outer offset is scaled by the inner dim size when the pair fuses.
+
+        Slicing rows ``[8:24]`` of a ``[16, 2, 64]`` buffer viewed as 32 rows
+        (a depth-to-space output) gives the outer coordinate ``4 + ...``. Fused
+        into one 32-row dim that is row 8, not row 4: adding the offsets
+        unscaled read the slice from the wrong rows.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 1024},
+            [16, 2, 64],
+            [
+                4 + sympy.floor(k / 128),
+                sympy.floor(sympy.Mod(k, 128) / 64),
+                sympy.Mod(k, 64),
+            ],
+        )
+        self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+        addr = self._addr(terms)
+        for val in (0, 1, 63, 64, 127, 128, 1023):
+            self.assertEqual(int(addr.subs({k: val})), 512 + val)
 
 
 class TestFlatDenseProjectionLayout(TestCase):

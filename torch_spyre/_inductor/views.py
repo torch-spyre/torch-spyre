@@ -226,6 +226,24 @@ def _decompose_constant_offset(
     expected for a valid host position), so the caller can fall back to
     ``add_term``.
     """
+    digits = _constant_offset_digits(offset, size, stride)
+    if digits is None:
+        return False
+    for d, digit in digits:
+        coordinates[d] += digit
+    return True
+
+
+def _constant_offset_digits(
+    offset: sympy.Expr,
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+) -> "list[tuple[int, sympy.Expr]] | None":
+    """Peel ``offset`` into ``(dim, digit)`` pairs, largest stride first.
+
+    Returns None if the offset cannot be fully peeled.  See
+    ``_decompose_constant_offset``.
+    """
     n = len(size)
     dims = sorted(
         (d for d in range(n) if size[d] > 1 and stride[d] > 0),
@@ -241,10 +259,8 @@ def _decompose_constant_offset(
         digits.append((d, digit))
         remaining -= digit * stride[d]
     if remaining != 0:
-        return False
-    for d, digit in digits:
-        coordinates[d] += digit
-    return True
+        return None
+    return digits
 
 
 def compute_coordinates(
@@ -353,15 +369,48 @@ def compute_coordinates(
 
     vars = index.free_symbols
     offset = index.xreplace(dict.fromkeys(vars, 0))
+    offset_digits: list[tuple[int, sympy.Expr]] = []
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
         # not leak a modular residual onto the stick coordinate (see
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
-        handled = _decompose_constant_offset(offset, size, stride, coordinates)
-        if not handled:
+        digits = _constant_offset_digits(offset, size, stride)
+        if digits is None:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+        else:
+            offset_digits = digits
+            for d, digit in digits:
+                coordinates[d] += digit
+    widen_for_offset = False
+    if offset_digits:
+        last = index.xreplace(
+            {
+                v: int(var_ranges[v]) - 1
+                for v in vars
+                if v in var_ranges and isinstance(var_ranges[v], (int, sympy.Integer))
+            }
+        )
+        extent = max(
+            (int(sz) * int(st) for sz, st in zip(size, stride) if st > 0), default=0
+        )
+        widen_for_offset = (
+            isinstance(last, (int, sympy.Integer)) and last + offset < extent
+        )
+
+    def other_spans(var: sympy.Symbol) -> list[tuple[int, int]]:
+        """``[step, step * range)`` of each other loop var's own term."""
+        spans = []
+        for other in vars - {var}:
+            rng = var_ranges.get(other)
+            if not isinstance(rng, (int, sympy.Integer)) or int(rng) <= 1:
+                continue
+            other_term = index.xreplace(dict.fromkeys(vars - {other}, 0))
+            other_step = other_term.xreplace({other: 1})
+            if isinstance(other_step, (int, sympy.Integer)) and other_step > 0:
+                spans.append((int(other_step), int(other_step) * int(rng)))
+        return spans
 
     for var in vars:
         # Skip symbols that are not loop variables (e.g. size symbols
@@ -423,6 +472,38 @@ def compute_coordinates(
             # produces the required modulo and carry. Other expressions keep
             # the existing bound; their last value need not be their maximum.
             limit = step * (range_val - 1) + 1
+            # The offset's digits on the dims this var walks shift its range:
+            # a slice of rows [1, 3) over a merged (A, 2) dim fits in the inner
+            # dim on its own but carries into the outer one once the offset is
+            # added. Widen the limit by that part of the offset so add_term
+            # emits the carry terms, which normalize_coordinates then fuses
+            # back into one ``var + offset`` coordinate. A carry only means
+            # something for an in-bounds access, and only into dims no other
+            # var walks: a padded layout reads a row's tail past its end, and
+            # carrying that into the next row's dim would mix two vars.
+            while widen_for_offset:
+                concrete_limit = _concretize_for_cmp(limit)
+                concrete_step = _concretize_for_cmp(step)
+                walked_offset = sum(
+                    (
+                        digit * stride[d]
+                        for d, digit in offset_digits
+                        if concrete_step <= stride[d] < concrete_limit
+                    ),
+                    sympy.S.Zero,
+                )
+                widened = step * (range_val - 1) + 1 + walked_offset
+                if widened == limit:
+                    break
+                concrete_widened = _concretize_for_cmp(widened)
+                if any(
+                    size[d] > 1
+                    and concrete_limit <= stride[d] < concrete_widened
+                    and any(lo <= stride[d] < hi for lo, hi in other_spans(var))
+                    for d in range(n)
+                ):
+                    break
+                limit = widened
 
         add_term(var=var, step=step, limit=limit)
 
@@ -766,9 +847,9 @@ def normalize_coordinates(
             # any (dim, coordinate) pair encodes.  It provably does not when
             # the pair is densely packed (``den == term.den * term.dim_size``),
             # the inner term skips no elements (``num == 1``), and the outer
-            # term carries no offset -- the outer offset counts in units of the
-            # outer ``den`` and is not rescaled when ``den`` shrinks on fusion.
-            # Adjacent terms keep the historical predicate unchanged.
+            # term carries no offset (kept conservative: the outer offset counts
+            # in units of the outer ``den``; fusion below rescales it by the
+            # inner dim size). Adjacent terms keep the historical predicate.
             and (
                 not skipped_placeholder
                 or (
@@ -778,11 +859,13 @@ def normalize_coordinates(
                 )
             )
         ):
-            # fuse terms
+            # fuse terms; the fused coordinate is outer * inner_size + inner,
+            # so the outer offset is scaled by the inner dim size (an outer
+            # offset of 1 over an inner dim of size 2 is 2 fused rows, not 1).
             fused_term.num = term.num
             fused_term.den = term.den
+            fused_term.offset = fused_term.offset * term.dim_size + term.offset
             fused_term.dim_size *= term.dim_size
-            fused_term.offset += term.offset
         else:
             if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
