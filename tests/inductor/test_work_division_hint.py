@@ -1200,9 +1200,20 @@ def test_diagonal_access_cannot_become_a_complete_relayout_source():
     )
 
 
+def test_full_replica_movement_tracks_ownership_flag():
+    source = _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2)
+    destination = _view({}, {}, 32)
+    for enabled in (False, True, False):
+        with config.patch(lx_extended_ownership=enabled):
+            assert (
+                lx_relayout_module.movement_supported(source, destination, 2, 32)
+                is enabled
+            )
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
-    dep = SimpleNamespace(name="input")
-    graph = SimpleNamespace()
+    dep = SimpleNamespace(name="input", is_indirect=lambda: False)
+    graph = SimpleNamespace(graph_inputs={"input": None}, operations=[])
     producer = SimpleNamespace()
     with (
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=True),
@@ -1216,6 +1227,22 @@ def test_lx_relayout_activation_policy_is_source_wide():
     ):
         assert not lx_relayout_module._is_activation_source(graph, {}, producer)
         assert lx_relayout_module._is_activation_source(graph, {"input": dep}, producer)
+        mutation = SimpleNamespace(
+            layout=SimpleNamespace(
+                get_buffer=lambda: SimpleNamespace(get_name=lambda: "input")
+            ),
+            loop_info=None,
+        )
+        with (
+            config.patch(lx_extended_ownership=True),
+            mock_patch.object(
+                lx_relayout_module, "MutationLayoutSHOULDREMOVE", SimpleNamespace
+            ),
+        ):
+            graph.operations = [mutation, producer, mutation]
+            assert lx_relayout_module._is_activation_source(graph, {}, producer)
+            graph.operations = [producer, mutation]
+            assert not lx_relayout_module._is_activation_source(graph, {}, producer)
 
 
 @config.patch({"sencores": 32, "lx_planner_relayout": True})
