@@ -338,9 +338,10 @@ the input arg.
 ## Current limitations
 
 - Only 1-D index tensors (a single indirect symbol per data dep) are supported.
-- Scatter index tensors (`aten.scatter_`, `aten.index_put_`) are correctly
-  detected via `_find_scatter_index_buf_names` and excluded from stick
-  compatibility checks. However, `IndirectAccess` coordinates on output args
-  (the codegen side of scatter) are not yet wired up in SuperDSC generation.
-- The fused (single op spec) path is disabled because `IndirectAccess` coordinates
-  are not yet handled in SuperDSC generation.
+- Scatter index tensors (`aten.scatter_`, `aten.index_put_`) are detected via
+  `_find_scatter_index_buf_names` and excluded from stick compatibility checks.
+  A runtime-indexed scatter carried through a counted loop is supported; see the
+  partial-scatter-carry section of
+  [Working Set Reduction](working_set_reduction.md).
+- The fused (single op spec) gather path is disabled because `IndirectAccess`
+  coordinates are not yet handled in SuperDSC generation.

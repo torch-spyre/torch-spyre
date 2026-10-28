@@ -81,6 +81,7 @@ test_suite_config:
           mode: xfail
           tags:
             - model__Qwen2.5-7B-Instruct
+            - exclude__plat_ppc64le
           edits:
             ops:
               include:

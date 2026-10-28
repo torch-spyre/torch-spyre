@@ -14,11 +14,24 @@
 
 import torch
 
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+
+# Relative restickify cost per device byte, by device dtype. The restickify cost
+# is (device size in bytes) x this weight. 32-bit formats take 2 passes per stick,
+# so they are 2x slower than fp16 for the same number of bytes (and therefore 4x
+# per element, since they also have 2x the bytes). Single source of truth for the
+# supported dtypes below.
+RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT = {
+    DataFormats.SEN169_FP16: 1,
+    DataFormats.IEEE_FP32: 2,
+    DataFormats.IEEE_INT32: 2,
+    DataFormats.SENUINT32: 2,
+}
+RESTICKIFY_SUPPORTED_DEVICE_DTYPES = frozenset(RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT)
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 KEEP_BY_INDEX_OP = "keepbyindex"
@@ -170,6 +183,7 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
+    "log",
 ]
 
 # Native integer op names.  SpyreOpFuncs.add/mul emit these names directly when

@@ -148,6 +148,7 @@ def collect_work_division_constraints(
         keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
         plain_reduction_k_split_domains,
+        overlapping_window_split_domains,
     ):
         result = constraint(ctx)
 
@@ -457,8 +458,8 @@ _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_reduce_copy_",)
 # the user ``work_div`` hint exemption there. Keyed on the op rather than a
 # config flag: the greedy passes run on the same graph and stay pinned, and an
 # op the hint pass tiled carries ``loop_info`` before the menu is enumerated, so
-# its candidates respect the pin. Written by whoever applies such a solve
-# (``CoOptimizingAllocator._apply_chosen_tilings``) and never cleared: nothing
+# its candidates respect the pin. Written by ``coarse_tiling.apply_tilings`` on
+# each op it tiles or adds to a nest, and never cleared: nothing
 # after scratchpad planning re-derives a work division, so its lifetime is the
 # rest of the compile.
 JOINT_TILING_AND_DIVISION_ATTR = "_work_division_chosen_with_tiling"
@@ -704,13 +705,30 @@ def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
     return _has_ea_tensor(tds, STAGGERED_EAS)
 
 
+def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
+    """The batch dims are returned too. Splitting one gives wrong results on
+    device: with a [2, 12, 128, 128] weight written by qfp8wt in 12 head slices
+    and read by batchmatmulfp8 in 4, only the first head of each read slice is
+    correct, while the same graph on one core is exact.
+
+    TODO: this pin is a workaround. The fix is to adjust the strides to reflect
+    the 2D stick layout, which is not currently represented in the tensor's
+    device_size; that would make the per-core addressing correct and let the
+    pin be dropped.
+    """
+    if len(td.layout.size) <= 2:
+        return [td.device_coords[-2]]
+    return list(td.device_coords)
+
+
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict QFP8WT tensors' second stick dimension to split=1.
+    """Restrict QFP8WT tensors' second stick dimension and batch dims to split=1.
 
     QFP8WT uses a 2D stick layout (2x64 elements, 128 bytes); both stick dims
     must stay atomic 128-byte units, so any iteration var indexing the second
     stick coordinate of the matmul kernel tensor (second input) or the output
-    has the singleton legal domain ``{1}``.
+    has the singleton legal domain ``{1}``. So does any var indexing one of the
+    tensor's batch dims (see ``_qfp8wt_unsplittable_coords``).
     """
     all_tds = ctx.input_tds + [ctx.output_td]
     if not has_qfp8wt_tensor(all_tds):
@@ -721,14 +739,16 @@ def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if len(ctx.input_tds) > 1:
         kernel_td = ctx.input_tds[1]
         if len(kernel_td.device_coords) > 1 and has_qfp8wt_tensor([kernel_td]):
-            for var in kernel_td.device_coords[-2].free_symbols:
-                if isinstance(var, Symbol):
-                    allowed_splits[var] = frozenset({1})
+            for coord in _qfp8wt_unsplittable_coords(kernel_td):
+                for var in coord.free_symbols:
+                    if isinstance(var, Symbol):
+                        allowed_splits[var] = frozenset({1})
 
     if len(ctx.output_td.device_coords) > 1 and has_qfp8wt_tensor([ctx.output_td]):
-        for var in ctx.output_td.device_coords[-2].free_symbols:
-            if isinstance(var, Symbol):
-                allowed_splits[var] = frozenset({1})
+        for coord in _qfp8wt_unsplittable_coords(ctx.output_td):
+            for var in coord.free_symbols:
+                if isinstance(var, Symbol):
+                    allowed_splits[var] = frozenset({1})
 
     return ConstraintResult(allowed_splits=allowed_splits)
 
@@ -988,26 +1008,28 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep plain reductions on one core along every reduction axis.
+    """Apply backend constraints on plain reduction K-splits.
 
-    Even a single reduction variable cannot safely be split across cores in
-    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
-    encoder block outputs.
-    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
-    it does not establish a cross-core combine for arbitrary work divisions.
-    Keep this restriction until those divisions have a validated combine path.
+    Multi-axis plain reductions: pin all reduction vars to split=1. The
+    backend supports at most one split reduction dimension per op, but
+    combining partial results across cores for arbitrary plain reduction
+    types is not validated, so the frontend blocks all of them.
 
-    Structured reductions have their own backend combine or blocking rules.
-    Output axes remain available for parallelism, and reduction-range coarse
-    tiling is still handled separately by WSR.
+    Single-axis plain reductions: unconstrained — all types may K-split.
+
+    Structured reductions (matmul, conv, topk, pool) have their own blocking
+    or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
+    # Multi-axis: backend supports at most one split reduction dim.
+    if len(ctx.reduction_vars) > 1:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -1023,3 +1045,189 @@ def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
             sym: frozenset({1}) for sym in indirect_forbidden_split_syms(ctx.op)
         }
     )
+
+
+def _ordered_affine_coordinate_terms(
+    coordinate: Expr, ranges: dict[Symbol, int]
+) -> list[tuple[int, int, Symbol]] | None:
+    """Affine terms in the inner-to-outer order used by normalize_coordinates.
+
+    For an affine term, normalize_coordinates sorts by its step (``num``),
+    then its iteration range (``mod``). Return None when that ordering cannot
+    be determined for the whole coordinate.
+    """
+    # A slice before unfold adds a constant base offset. It changes where the
+    # read starts, but not the stride ratio or the overlap between loop vars.
+    _, variable_part = coordinate.as_coeff_Add()
+    terms = []
+    for term, coeff in variable_part.as_coefficients_dict().items():
+        if not isinstance(term, Symbol) or term not in ranges or coeff <= 0:
+            return None
+        if ranges[term] > 1:
+            terms.append((int(coeff), ranges[term], term))
+    terms.sort(key=lambda t: (t[0], t[1], str(t[2])))
+    return terms
+
+
+def overlapping_coordinate_extents(
+    coordinate: Expr, ranges: dict[Symbol, int]
+) -> dict[Symbol, tuple[int, Symbol]]:
+    """Overlapped variables of one device coordinate.
+
+    A coordinate whose variables sweep overlapping element ranges, such as
+    ``2*w + k`` with ``k`` in ``[0, 4)`` from ``x.unfold(dim, 4, 2)``, has no
+    nested-dimension form. ``normalize_coordinates`` (views.py) splits the
+    device dimension by stride ratio, so ``k`` gets a device dimension of size
+    ``2`` while it iterates over ``4`` values. The backend lays every dimension
+    out by its iteration extent, so with ``k`` sweeping 4 values and ``w``
+    sweeping several on one core, ``w`` -- and every dimension outside it -- is
+    addressed with ``4/2`` times its real stride (issue #5347).
+
+    Returns ``{inner: (size, outer)}`` for every term whose range exceeds the
+    device dimension ``size`` that ``normalize_coordinates`` gives it (same
+    ``(num, mod)`` term order), ``outer`` being the term it overlaps.
+    Coordinates with a non-linear term (``floor``, ``Mod``), or whose strides
+    do not nest, are not analysed.
+    """
+    terms = _ordered_affine_coordinate_terms(coordinate, ranges)
+    if terms is None:
+        return {}
+    overlaps: dict[Symbol, tuple[int, Symbol]] = {}
+    for (step, extent, var), (next_step, _, outer) in zip(terms, terms[1:]):
+        if next_step % step:
+            return {}
+        size = next_step // step
+        if extent > size:
+            overlaps[var] = (size, outer)
+    return overlaps
+
+
+def _moves_coordinate(coordinate: Expr, var: Symbol, extent: int) -> bool:
+    """Whether ``var`` changes ``coordinate`` (``floor(c/64)`` with ``c < 64`` does not)."""
+    others = {v: 0 for v in coordinate.free_symbols if v != var}
+    base = coordinate.subs(others)
+    return extent > 1 and base.subs(var, 0) != base.subs(var, extent - 1)
+
+
+def overlapping_window_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Split an overlapping (unfold-style) read so no core sweeps an overlap.
+
+    See ``overlapping_coordinate_extents``. Either of two divisions makes the
+    in-core addressing exact:
+
+    - the overlapped (window) variable keeps at most its device-dimension size
+      on each core (``x.unfold(0, 3, 1)``'s window variable is split three
+      ways); SuperDSC then emits that dimension with a negative backGap so its
+      layout extent is the physical one, and the per-core start address carries
+      the overlap;
+    - or, when the window variable is reduced (``unfold(...).sum(-1)``) and so
+      cannot be split across cores, every core gets a single value of the
+      overlapping outer variable and of every variable on a device dimension
+      outside it, so the inflated outer strides are never applied.
+
+    A core budget too small for the required split surfaces as an Unsupported
+    domain conflict rather than a kernel that reads the wrong rows. Pooling and
+    convolution reads realize their windows through dedicated SDSC fields and
+    are left alone.
+    """
+    # Convolution and pooling use dedicated window fields in SuperDSC. Other
+    # structured reductions still use ordinary coordinates for their inputs.
+    if isinstance(ctx.op.data, Reduction) and ctx.op.data.reduction_type in {
+        CONV2D_FWD_OP,
+        DEPTHWISE_CONV2D_OP,
+        *POOL_OPS,
+    }:
+        return ConstraintResult()
+    ranges = {
+        v: int(concretize_expr(e))
+        for v, e in ctx.it_space.items()
+        if not getattr(e, "free_symbols", None)
+    }
+    symbolic_vars = ctx.it_space.keys() - ranges.keys()
+    caps: dict[Symbol, int] = {}
+    pinned: set[Symbol] = set()
+    for td in ctx.input_tds:
+        coords = td.device_coords
+        for axis, coordinate in enumerate(coords[:-1]):
+            coord_terms = coordinate.as_coeff_Add()[1].as_coefficients_dict()
+            coord_ranges = ranges
+            if symbolic_vars & coordinate.free_symbols:
+                # An inner symbolic extent can grow past its stride-ratio box
+                # at runtime. A symbolic outer extent does not affect that
+                # ratio, provided it is unambiguously the outermost term.
+                terms = [
+                    (int(coeff), term)
+                    for term, coeff in coord_terms.items()
+                    if isinstance(term, Symbol)
+                    and term in ctx.it_space
+                    and coeff.is_Integer
+                    and coeff > 0
+                ]
+                terms.sort(key=lambda term: term[0])
+                loop_vars = coordinate.free_symbols & ctx.it_space.keys()
+                if len(loop_vars) > 1 and {var for _, var in terms} != loop_vars:
+                    raise Unsupported(
+                        f"{ctx.op.get_name()}: symbolic read coordinate "
+                        f"{coordinate} cannot be divided safely"
+                    )
+                if len(terms) > 1:
+                    outer_step, outer_var = terms[-1]
+                    if any(var in symbolic_vars for _, var in terms[:-1]) or (
+                        outer_var in symbolic_vars and terms[-2][0] == outer_step
+                    ):
+                        raise Unsupported(
+                            f"{ctx.op.get_name()}: symbolic overlapping read "
+                            f"coordinate {coordinate} cannot be divided safely"
+                        )
+                    if outer_var in symbolic_vars:
+                        coord_ranges = {**ranges, outer_var: 2}
+            ordered_terms = _ordered_affine_coordinate_terms(coordinate, coord_ranges)
+            overlaps = overlapping_coordinate_extents(coordinate, coord_ranges)
+            for var, (size, outer) in overlaps.items():
+                if var in ctx.reduction_vars and outer in symbolic_vars:
+                    raise Unsupported(
+                        f"{ctx.op.get_name()}: reduced overlapping read "
+                        f"requires a concrete outer extent for {outer}"
+                    )
+                caps[var] = min(size, caps.get(var, size))
+                if var in ctx.reduction_vars:
+                    pinned.add(outer)
+                    # Pin only terms after this window in the same ordered
+                    # coordinate. Equal coefficients can describe different
+                    # nesting levels: for w + k, k's shorter range puts it
+                    # inside w, so pinning by coefficient would also pin k.
+                    assert ordered_terms is not None
+                    ordered_vars = [term for _, _, term in ordered_terms]
+                    pinned.update(
+                        term
+                        for term in ordered_vars[ordered_vars.index(var) + 1 :]
+                        if term in ranges
+                    )
+                    # Device axes need not be listed in physical stride order:
+                    # a permuted layout can place a higher-stride batch axis
+                    # after the overlapping row axis. Compare stride_map.
+                    strides = td.layout.device_layout.stride_map
+                    pinned.update(
+                        v
+                        for other_axis, c in enumerate(coords[:-1])
+                        if other_axis != axis and strides[other_axis] > strides[axis]
+                        for v in c.free_symbols
+                        if v in ranges and _moves_coordinate(c, v, ranges[v])
+                    )
+    # Keep the per-core extent bound below in sync with the negative-backGap
+    # guard in codegen.superdsc._create_sdsc_tensors.
+    # A reduced window variable may also stay whole (split 1): its outer
+    # variables are then pinned instead.
+    allowed = {
+        var: frozenset(
+            s
+            for s in divisors(ranges[var])
+            if ranges[var] // s <= size or (s == 1 and var in ctx.reduction_vars)
+        )
+        for var, size in caps.items()
+    }
+    for var in pinned:
+        allowed[var] = allowed.get(var, frozenset({ranges[var]})) & {ranges[var]}
+    return ConstraintResult(allowed_splits=allowed)

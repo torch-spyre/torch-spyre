@@ -329,7 +329,11 @@ run_key that already has another run's or bundle's results. The verdict's `props
 **vLLM bundles** hold the runner's `results/`: `<test_name>.json` from
 `vllm bench latency|throughput|serve`, and `<test_name>.pytorch.json` when
 `SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1`. Keep the latter: the `latency` samples and the model name
-come from it.
+come from it. The runner's host resource sampler also writes `<test_name>.host_resources.json`:
+JSON lines of `{"test_name", "metric", "value"[, "model"]}`, e.g. `host_cpu_pct_total_mean` (%)
+or `compile_host_mem_mb_peak` (MB). A bundle need not include it. The record's
+`test_name` and `model` take precedence over the file name and the sibling
+`.pytorch.json`.
 - `test_name` is `<latency|throughput|serve>_<model>_tp<N>_in<N>_out<N>`, as in spyre-inference's
   `vllm-benchmarks/` configs. The mode and shapes are the benchmark's identity, and must agree
   with `perf` when it gives them. A concurrency sweep, `serving_<model>_c<N>_n<N>_..._len<N>_seqs<N>`,

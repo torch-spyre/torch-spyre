@@ -46,6 +46,7 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
     RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
 )
@@ -976,6 +977,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Check if operation supports the argument's dtype
             if not (
                 op == IDENTITY_OP
+                or (
+                    op == RESTICKIFY_OP
+                    and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+                )
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (

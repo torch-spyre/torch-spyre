@@ -294,8 +294,6 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(dtype)
-    if stick_dim >= 0 and c_size[stick_dim] == 1:
-        return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -321,10 +319,14 @@ def _candidate_output_stls(
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
+    # Size-1 dims come last: one element per stick takes stick_size times the
+    # memory, so they are used only when no other dim yields a candidate.
     all_dims = [d for d in range(len(c_size)) if d != skip_dim]
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
+    size1_dims = [d for d in unaligned_dims if c_size[d] == 1]
+    unaligned_dims = [d for d in unaligned_dims if c_size[d] != 1]
     stls: list[SpyreTensorLayout] = []
-    for dims in (aligned_dims, unaligned_dims):
+    for dims in (aligned_dims, unaligned_dims, size1_dims):
         for d in dims:
             stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
@@ -394,7 +396,7 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
         if arg.layouts and representable == 0:
             # Every candidate layout for this input was unrepresentable. This
             # is not fatal here, but the downstream layout selection will fail
-            # (find_stick_compatible_input_layout raises "cannot restickify any
+            # (generate_stl_with_required_stick raises "cannot restickify any
             # input layout"). Log the more specific cause so that error is
             # easier to diagnose.
             logger.warning(
@@ -467,6 +469,22 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     )
 
 
+def qfp8wt_dim_order(rank: int) -> list[int]:
+    """Default host dim order for a QFP8WT tensor [..., K, N]: [K, L0, .., N].
+
+    The 2D stick pairs K with N, but the device layout records only a 1D stick
+    of N, so readers (codegen, work division) take K from device coordinate -2.
+    This default places host dim -2 there, giving the device order
+    [L0, .., N-tile, K, stick]; it assumes the tensor is [..., K, N]. When a
+    matmul reads the tensor, nonstick_dim_order takes K from the matmul's
+    reduction variable instead and reorders this layout if they disagree.
+    Rank 2 stays [0, 1].
+    """
+    if rank < 2:
+        return list(range(rank))
+    return [rank - 2, *range(rank - 2), rank - 1]
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -479,7 +497,8 @@ def _qfp8wt_stl(
     Outer dimensions and strides are preserved from output layout, with the innermost
     stride always set to 1. For unaligned inputs where input stick size is not a
     multiple of input stick size, the last dimension is padded to the stick size.  For
-    aligned inputs, it retains the concrete output size.
+    aligned inputs, it retains the concrete output size. The device order puts K
+    directly outside the stick (see ``qfp8wt_dim_order``).
 
     Args:
         output: Inductor ``FixedLayout`` for the op's output tensor.
@@ -497,7 +516,7 @@ def _qfp8wt_stl(
         c_size,
         c_stride,
         output.dtype,
-        list(range(len(c_size))),
+        qfp8wt_dim_order(len(c_size)),
         ElementArrangement.QFP8WT,
     )
 
@@ -663,6 +682,7 @@ def _single_arg_op_layout(
                 if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
                     in_coords = host_coordinates(in_layout, dep, None)
                     source_device_coords = device_coordinates(stl, dep, None)
+                    staggered_arg = PropArg(dep, in_layout, [stl])
                     for target_stick_expr in in_coords:
                         if not target_stick_expr.free_symbols:
                             continue
@@ -672,6 +692,7 @@ def _single_arg_op_layout(
                             target_stick_expr,
                             in_coords,
                             source_device_coords,
+                            arg=staggered_arg,
                         )
                         if target_stl is None:
                             continue
@@ -689,7 +710,10 @@ def _single_arg_op_layout(
             # stick dim is unaligned, force a full input-stick depth so stick
             # padding is reflected in the device layout (see #1756 example above).
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
+            if (
+                in_layout.size
+                and concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0
+            ):
                 c_size = [concretize_expr(s) for s in output.size[:-1]] + [
                     in_elems_per_stick
                 ]
@@ -844,7 +868,12 @@ def _clone_layout(
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
-            in_stl, in_layout, target_stick, in_host_coords, in_device_coords
+            in_stl,
+            in_layout,
+            target_stick,
+            in_host_coords,
+            in_device_coords,
+            arg=args[0],
         )
         if target_stl is not None:
             required_in_stl = target_stl
@@ -879,8 +908,8 @@ def _exx2_layout(
     out_stl = SpyreTensorLayout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
-    reduction_var = find_reduction_var((x.dep,), output_dep)
-    req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
+    stick_var = find_reduction_var((x.dep,), output_dep)
+    req_in_stl = generate_stl_with_required_stick(x, stick_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(
         args, out_stl, [req_in_stl], op, output_dep
     )
@@ -902,20 +931,18 @@ def _layernormnorm_layout(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    reduction_var = find_reduction_var((x.dep,), output_dep)
-    req_in_stl = find_stick_compatible_input_layout(
-        x, reduction_var, "layernormnorm", "x"
-    )
+    stick_var = find_reduction_var((x.dep,), output_dep)
+    req_in_stl = generate_stl_with_required_stick(x, stick_var, "layernormnorm", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(
         args[:1], out_stl, [req_in_stl], op, output_dep
     )
     return [out_stl]
 
 
-def _dev_coord_for_var(dev_coords, arg_host_coords, var):
-    """Return the first device coord that carries var and is resolvable via matching_dim."""
+def _dev_coord_for_var(dev_coords, var):
+    """Return the first device coord that carries var as its sole free symbol."""
     for c in dev_coords:
-        if var in c.free_symbols and matching_dim(arg_host_coords, c) is not None:
+        if c.free_symbols == {var}:
             return c
     return None
 
@@ -962,13 +989,17 @@ def _find_layout_avoiding_var_on_stick(
         dev_coords = device_coordinates(stl, arg.dep, None)
         if dev_coords is None:
             continue
-        target_stick_expr = _dev_coord_for_var(
-            dev_coords, arg_host_coords, surviving_var
-        )
+        target_stick_expr = _dev_coord_for_var(dev_coords, surviving_var)
         if target_stick_expr is None:
             continue
         result = compute_restickify_target_layout(
-            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+            stl,
+            arg.layout,
+            target_stick_expr,
+            arg_host_coords,
+            dev_coords,
+            arg=arg,
+            label=label,
         )
         if result is not None:
             return result
@@ -1047,64 +1078,80 @@ def _factorized_chain(
     return host_dims, var_range, int(var_stride)
 
 
-def _canonical_stl_from_collapsed_host(
-    arg: PropArg,
-    matmul_var: sympy.Symbol,
+def _collapse_outer_stick_dims(
+    stl: "SpyreTensorLayout",
+    dev_coords: list,
+    var: sympy.Symbol,
+) -> "tuple[SpyreTensorLayout, list, int]":
+    """Collapse outer device dims that carry var into a single dim.
+
+    When var is factorized across multiple outer device dims (e.g. 8 heads ×
+    4 head-tiles both carrying d1), merges them into the first: size becomes
+    the product, stride_map becomes the minimum across the merged dims.
+
+    stride_map values are host memory strides (device layout is always
+    row-major; stride_map maps each device dim to its host stride).  The
+    collapsed dim must carry the smallest host stride among the merged dims —
+    the stride that steps through the variable's innermost extent in host
+    memory — so min is the correct reduction.
+
+    Returns the collapsed STL, updated dev_coords, and the index of the
+    surviving outer dim (so the caller needs no recompute).
+    """
+    outer_dims = [
+        j for j in range(len(dev_coords) - 1) if var in dev_coords[j].free_symbols
+    ]
+    keep = outer_dims[0]
+    remove = outer_dims[1:]
+    new_size = list(stl.device_size)
+    new_stride = list(stl.stride_map)
+    new_coords = list(dev_coords)
+    new_size[keep] = math.prod(new_size[d] for d in outer_dims)
+    new_stride[keep] = min(new_stride[d] for d in outer_dims)
+    for d in sorted(remove, reverse=True):
+        del new_size[d]
+        del new_stride[d]
+        del new_coords[d]
+    return SpyreTensorLayout(new_size, new_stride, stl.device_dtype), new_coords, keep
+
+
+def _rebuild_stl_for_matmul(
+    arg: "PropArg",
+    stick_var: sympy.Symbol,
+    nosplit_var: sympy.Symbol | None,
     reduction_type: str,
     label: str,
-    collapse_var: sympy.Symbol | None = None,
-) -> SpyreTensorLayout:
-    """Build the canonical STL for a matmul input by collapsing host dims.
+) -> "SpyreTensorLayout":
+    """Rebuild a canonical STL to satisfy matmul outer-dim constraints.
 
-    Constructs the canonical ``SpyreTensorLayout`` directly from the host
-    geometry, collapsing any mixed-radix dims that jointly carry ``matmul_var``
-    into one logical dim (the stick).  This is the single authoritative path for
-    Pass 3.
-
-    ``collapse_var`` names a second variable whose host dims must also be
-    merged, without being the stick.  For ``y`` that is the contraction
-    variable K: the backend needs K on exactly one outer axis.
-
-    Single-host-dim case (Case A): the host already has exactly one dim for
-    ``matmul_var``; build the STL directly from it (``compute_restickify_target_layout``
-    can produce different results depending on candidate order, so we bypass it).
-
-    Multi-host-dim case (Case B): validate the chain is affine and contiguous and
-    that the variable covers a window of it, then merge the dims into one dim
-    spanning the whole chain (the buffer's full extent along it).
-
-    Raises ``Unsupported`` on invalid chains.  Does not call ``matching_dim`` or
-    ``compute_restickify_target_layout``.
+    Derives the target layout directly from the host geometry by collapsing
+    any multi-dim factorized chains into single dims.
     """
     host_coords = host_coordinates(arg.layout, arg.dep, None)
     host_size = [concretize_expr(size) for size in arg.layout.size]
     host_stride = [concretize_expr(stride) for stride in arg.layout.stride]
 
-    # (host dims, merged size, merged stride) for every group of host dims that
-    # becomes one canonical dim.
     groups: list[tuple[list[int], int, int]] = []
     stick_group = -1
-    for var, is_stick in ((matmul_var, True), (collapse_var, False)):
+    for var, is_stick in ((stick_var, True), (nosplit_var, False)):
         if var is None:
             continue
-        host_dims, _, var_stride = _factorized_chain(
+        hdims, _, var_stride = _factorized_chain(
             arg, host_coords, host_size, host_stride, var, reduction_type, label
         )
-        if len(host_dims) == 1 and not is_stick:
+        if len(hdims) == 1 and not is_stick:
             continue
         if is_stick:
             stick_group = len(groups)
-        if len(host_dims) == 1:
-            dim = host_dims[0]
-            groups.append((host_dims, host_size[dim], host_stride[dim]))
+        if len(hdims) == 1:
+            d = hdims[0]
+            groups.append((hdims, host_size[d], host_stride[d]))
         else:
-            groups.append(
-                (host_dims, math.prod(host_size[d] for d in host_dims), var_stride)
-            )
+            groups.append((hdims, math.prod(host_size[d] for d in hdims), var_stride))
     if len({d for g in groups for d in g[0]}) != sum(len(g[0]) for g in groups):
         raise Unsupported(
             f"{reduction_type}: {label} host dims are shared by the stick variable "
-            f"{matmul_var} and the collapsed variable {collapse_var}"
+            f"{stick_var} and the no-split variable {nosplit_var}"
         )
 
     first_dim = {min(g[0]): idx for idx, g in enumerate(groups)}
@@ -1124,9 +1171,9 @@ def _canonical_stl_from_collapsed_host(
             canonical_stride.append(stride)
     assert stick_dim >= 0
 
-    dim_order = [dim for dim in range(len(canonical_size)) if dim != stick_dim]
+    dim_order = [d for d in range(len(canonical_size)) if d != stick_dim]
     dim_order.append(stick_dim)
-    return SpyreTensorLayout(
+    canonical = SpyreTensorLayout(
         canonical_size,
         canonical_stride,
         arg.layout.dtype,
@@ -1134,161 +1181,230 @@ def _canonical_stl_from_collapsed_host(
         ElementArrangement.STANDARD,
     )
 
-
-def _on_multiple_outer_axes(dev_coords: list, var: sympy.Symbol) -> bool:
-    """True if ``var`` appears on more than one non-stick device axis."""
-    return sum(var in c.free_symbols for c in dev_coords[:-1]) > 1
-
-
-def find_stick_compatible_input_layout(
-    arg: PropArg,
-    reduction_var: sympy.Symbol,
-    reduction_type: str,
-    label: str,
-    collapse_var: sympy.Symbol | None = None,
-) -> SpyreTensorLayout:
-    """Find the required STL for a matmul input by iterating all candidate layouts.
-
-    1. Return the first layout whose stick already carries reduction_var and no
-       outer axis also carries it (zero cost, no restickify needed).
-    2. Else return the first layout that can be restickified to put reduction_var
-       on the stick via compute_restickify_target_layout.
-    3. (BATCH_MATMUL_OP only) Else collapse mixed-radix host dims and construct
-       the canonical STL directly.
-    4. Else raise Unsupported.
-
-    ``collapse_var`` (BATCH_MATMUL_OP only) is a variable that must sit on a single
-    outer axis, not on several: the contraction variable of ``y``, whose stick is
-    the generated variable.  A candidate that spreads it over several outer axes
-    (a factorized K) is skipped and Pass 3 collapses it.
-    """
     logger.debug(
-        "[find_stick_compatible_input_layout] label=%r reduction_type=%r\n"
-        "  arg.dep.name      = %s\n"
-        "  reduction_var     = %s\n"
-        "  arg.layout.size   = %s\n"
-        "  arg.layout.stride = %s\n"
-        "  arg.layouts       = %s",
+        "[generate_stl_with_required_stick] rebuilt STL for matmul"
+        " for %r stick_var=%s\n  before: size=%s stride=%s\n  after:  %s",
         label,
-        reduction_type,
-        arg.dep.name,
-        reduction_var,
+        stick_var,
         list(arg.layout.size),
         list(arg.layout.stride),
-        arg.layouts,
+        canonical,
     )
-    # Skip candidates whose stick expression the backend cannot represent
-    # (e.g. floor(var/N) from a cross-stick access); they are not usable inputs
-    # and another candidate may work.
-    candidates = [
+    return canonical
+
+
+def _violates_matmul_outer_dim_constraints(
+    dev_coords: list,
+    stick_var: sympy.Symbol,
+    nosplit_var: sympy.Symbol | None,
+) -> bool:
+    """True if this STL cannot be used as-is for BATCH_MATMUL_OP.
+
+    Two conditions force a rebuild from host geometry:
+    - stick_var is factorized across outer dims in a way the backend cannot
+      handle directly (deeper than a pure tile index floor(var/N)).
+    - nosplit_var is spread across more than one outer device dim.
+    """
+
+    def _is_pure_tile_index(expr: sympy.Expr) -> bool:
+        if not isinstance(expr, sympy.floor):
+            return False
+        inner = expr.args[0]
+        return inner.free_symbols == {stick_var} and not inner.has(sympy.Mod)
+
+    stick_factorized = any(
+        stick_var in c.free_symbols and not _is_pure_tile_index(c)
+        for c in dev_coords[:-1]
+    )
+    nosplit_split = nosplit_var is not None and (
+        sum(nosplit_var in c.free_symbols for c in dev_coords[:-1]) > 1
+    )
+    return stick_factorized or nosplit_split
+
+
+def _parseable_candidates(
+    arg: "PropArg",
+) -> "list[tuple[SpyreTensorLayout, list]]":
+    """Return (stl, dev_coords) pairs for layouts whose coords can be computed.
+
+    Candidates whose stick expression the backend cannot represent
+    (e.g. floor(var/N) from a cross-stick access) are dropped here;
+    another candidate may work.
+    """
+    return [
         (stl, coords)
         for stl in arg.layouts
         if (coords := try_device_coordinates(stl, arg.dep, None)) is not None
     ]
 
-    # Pass 1: already stick-compatible.
-    # stick_compatible() checks cross-tensor compatibility; here we only need
-    # to know if this input's stick coord already carries the target loop variable.
-    # For BATCH_MATMUL_OP: also reject layouts where the reduction variable appears
-    # on any outer axis in addition to the stick (factorized layout, e.g. SDPA's
-    # [L, D/64, H, 64]).  The backend treats a variable present on both an outer
-    # axis and the stick as two separate contraction dimensions, producing wrong
-    # output.  Such candidates fall through to Pass 2 / Pass 3 so a restickify
-    # collapses the factorization first.
-    # Other reduction types (exx2, layernormnorm, …): the backend correctly handles
-    # a tiled layout where the reduction var appears on one outer axis (floor(v/64))
-    # and the stick (Mod(v, 64)), so no special check is needed.
-    # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
-    # structure; the backend handles them regardless of device coord shape,
-    # so return immediately without checking the stick.
+
+def _find_quantized_candidate(
+    candidates: "list[tuple[SpyreTensorLayout, list]]",
+    stick_var: sympy.Symbol,
+    reduction_type: str,
+) -> "SpyreTensorLayout | None":
+    """Return the first quantized (FP8/QFP8) candidate that is usable, or None.
+
+    Quantized arrangements carry their own contraction structure and are
+    returned immediately without restickify logic.
+    Exception: BATCH_MATMUL_FP8_OP requires stick_var on the stick — a sparse
+    QFP8CH candidate without it is skipped so the dense candidate can be used.
+    """
+    for stl, dev_coords in candidates:
+        if stl.element_arrangement == ElementArrangement.STANDARD:
+            continue
+        if reduction_type != BATCH_MATMUL_FP8_OP or (
+            stick_var in dev_coords[-1].free_symbols
+        ):
+            return stl
+    return None
+
+
+def _prepare_for_restickify(
+    stl: "SpyreTensorLayout",
+    dev_coords: list,
+    reduction_type: str,
+) -> "tuple[SpyreTensorLayout, list]":
+    """Satisfy compute_restickify_target_layout's outer-dim precondition.
+
+    compute_restickify_target_layout requires the old-stick variable to appear
+    on at most one outer device dim. For BATCH_MATMUL_OP, collapse factorized
+    outer dims via _collapse_outer_stick_dims if that condition is violated.
+    Returns (stl, dev_coords) unchanged for other reduction types.
+    """
+    if reduction_type != BATCH_MATMUL_OP:
+        return stl, dev_coords
+    old_stick_expr = dev_coords[-1]
+    if not old_stick_expr.free_symbols:
+        return stl, dev_coords
+    old_var = next(iter(old_stick_expr.free_symbols))
+    old_var_outer_dims = [
+        j for j in range(len(dev_coords) - 1) if old_var in dev_coords[j].free_symbols
+    ]
+    if len(old_var_outer_dims) > 1:
+        stl, dev_coords, _ = _collapse_outer_stick_dims(stl, dev_coords, old_var)
+    return stl, dev_coords
+
+
+def _find_existing_candidate(
+    candidates: "list[tuple[SpyreTensorLayout, list]]",
+    stick_var: sympy.Symbol,
+    nosplit_var: sympy.Symbol | None,
+    reduction_type: str,
+    arg: "PropArg",
+    label: str,
+) -> "SpyreTensorLayout | None":
+    """Return an existing candidate where stick_var is on the stick, or None.
+
+    If a candidate has stick_var on the stick but violates BATCH_MATMUL_OP
+    outer-dim constraints, rebuilds from host geometry. Raises on rebuild
+    failure — if stick_var is already on the stick there is no better fallback.
+
+    Returns None if no candidate has stick_var on the stick at all.
+    """
+    needs_rebuild = False
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
-            # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
-            # structure and are normally returned immediately.  However for
-            # batchmatmulfp8 the activation input (QFP8CH) must have
-            # reduction_var on its stick.  A sparse QFP8CH candidate has
-            # reduction_var on an outer dim, not the stick — returning it here
-            # would propagate an incompatible layout and crash downstream.
-            # Skip it so the loop continues to the next candidate (typically a
-            # dense QFP8CH where K is already on the stick).
-            if reduction_type != BATCH_MATMUL_FP8_OP or (
-                reduction_var in dev_coords[-1].free_symbols
-            ):
-                return stl
             continue
-        if reduction_var not in dev_coords[-1].free_symbols:
+        if stick_var not in dev_coords[-1].free_symbols:
             continue
-        if reduction_type == BATCH_MATMUL_OP and any(
-            reduction_var in c.free_symbols for c in dev_coords[:-1]
+        if reduction_type == BATCH_MATMUL_OP and _violates_matmul_outer_dim_constraints(
+            dev_coords, stick_var, nosplit_var
         ):
-            continue
-        if collapse_var is not None and _on_multiple_outer_axes(
-            dev_coords, collapse_var
-        ):
-            continue
-        return stl
+            needs_rebuild = True
+        else:
+            return stl
+    if needs_rebuild:
+        return _rebuild_stl_for_matmul(
+            arg, stick_var, nosplit_var, reduction_type, label
+        )
+    return None
 
-    # Pass 2: can be restickified — find the resolvable device coord for reduction_var
-    # and use it as target_stick_expr for compute_restickify_target_layout.
-    # Skip non-STANDARD arrangements: compute_restickify_target_layout always
-    # produces a STANDARD layout and would silently drop the arrangement.
-    # For BATCH_MATMUL_OP: skip candidates where reduction_var is on the stick AND
-    # on any outer axis (factorized, e.g. SDPA [L,D/64,H,64]).
-    # compute_restickify_target_layout cannot correctly collapse this factorization.
-    # Such candidates are handled by Pass 3 instead.
+
+def _stl_via_restickify(
+    candidates: "list[tuple[SpyreTensorLayout, list]]",
+    stick_var: sympy.Symbol,
+    nosplit_var: sympy.Symbol | None,
+    reduction_type: str,
+    arg: "PropArg",
+    label: str,
+) -> "SpyreTensorLayout | None":
+    """Return an STL obtained by restickifying to place stick_var on the stick, or None."""
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
             continue
-        if (
-            reduction_type == BATCH_MATMUL_OP
-            and reduction_var in dev_coords[-1].free_symbols
-            and any(reduction_var in c.free_symbols for c in dev_coords[:-1])
-        ):
+        if stick_var in dev_coords[-1].free_symbols:
             continue
-        target_stick_expr = _dev_coord_for_var(
-            dev_coords, arg_host_coords, reduction_var
-        )
+        target_stick_expr = _dev_coord_for_var(dev_coords, stick_var)
         if target_stick_expr is None:
             continue
+        stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
         result = compute_restickify_target_layout(
-            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+            stl,
+            arg.layout,
+            target_stick_expr,
+            arg_host_coords,
+            dev_coords,
+            arg=arg,
+            reduction_type=reduction_type,
+            label=label,
         )
-        if result is not None and collapse_var is not None:
-            result_coords = try_device_coordinates(result, arg.dep, None)
-            if result_coords is None or _on_multiple_outer_axes(
-                result_coords, collapse_var
-            ):
-                continue
         if result is not None:
+            if nosplit_var is not None:
+                result_coords = try_device_coordinates(result, arg.dep, None)
+                if result_coords is None or (
+                    sum(nosplit_var in c.free_symbols for c in result_coords[:-1]) > 1
+                ):
+                    logger.warning(
+                        "[_stl_via_restickify] result splits nosplit_var=%s "
+                        "across outer dims: %s; skipping candidate",
+                        nosplit_var,
+                        result_coords,
+                    )
+                    continue
             return result
+    return None
 
-    # Pass 3 (BATCH_MATMUL_OP only): all candidates were factorized (reduction_var
-    # on outer axes), so Pass 2 found nothing.  Build the canonical STL directly
-    # from the host geometry, collapsing mixed-radix dims if needed.
-    # This fires for:
-    #   Case A: single host dim but only factorized STL candidates — Pass 2
-    #           correctly skipped them; derive from host geometry instead.
-    #   Case B: multiple host dims (mixed-radix view) — collapse and construct.
-    # Does NOT fire when Pass 2 returned successfully (normal weight tensors where
-    # the generated var is on the stick and reduction_var is only on outer axes in
-    # a non-factorized sense).
-    if reduction_type == BATCH_MATMUL_OP:
-        canonical = _canonical_stl_from_collapsed_host(
-            arg, reduction_var, reduction_type, label, collapse_var
-        )
-        logger.debug(
-            "[find_stick_compatible_input_layout] Pass 3: canonical STL"
-            " for %r %s_var=%s → %s",
-            label,
-            label,
-            reduction_var,
-            canonical,
-        )
-        return canonical
+
+def generate_stl_with_required_stick(
+    arg: PropArg,
+    stick_var: sympy.Symbol,
+    reduction_type: str,
+    label: str,
+    nosplit_var: sympy.Symbol | None = None,
+) -> SpyreTensorLayout:
+    """Find the required STL for a matmul input with stick_var on the stick.
+
+    Tries three strategies in order:
+    1. Accept a non-STANDARD candidate (FP8 etc.) directly.
+    2. Find a candidate where stick_var is already on the stick.  For
+       BATCH_MATMUL_OP, if every such candidate violates outer-dim constraints,
+       rebuilds the STL from host geometry via ``_rebuild_stl_for_matmul``
+       instead of falling through to strategy 3.
+    3. Restickify a candidate to move stick_var onto the stick.
+    """
+    candidates = _parseable_candidates(arg)
+
+    stl = _find_quantized_candidate(candidates, stick_var, reduction_type)
+    if stl is not None:
+        return stl
+
+    stl = _find_existing_candidate(
+        candidates, stick_var, nosplit_var, reduction_type, arg, label
+    )
+    if stl is not None:
+        return stl
+
+    stl = _stl_via_restickify(
+        candidates, stick_var, nosplit_var, reduction_type, arg, label
+    )
+    if stl is not None:
+        return stl
 
     raise Unsupported(
-        f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
+        f"{reduction_type}: cannot restickify any input layout of {label} "
+        f"to carry {label}_var={stick_var}"
     )
 
 
@@ -1360,10 +1476,10 @@ def _matmul_layouts(
     x, y = args[0], args[1]
 
     # Hardware stick constraints (DF16):
-    #   Input1 (x): stick on reduction_var (loop var absent from output)
+    #   Input1 (x): stick on stick_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
-    reduction_var = find_reduction_var((x.dep,), output_dep)
+    stick_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
 
@@ -1371,8 +1487,8 @@ def _matmul_layouts(
         # N has no loop symbol after size-one simplification, so there is no
         # generated_var to discover.  Build an explicit sparse-stick layout for y
         # so K is not mistaken for a second contraction dimension.
-        x_req_stl = find_stick_compatible_input_layout(
-            x, reduction_var, data.reduction_type, "x"
+        x_req_stl = generate_stl_with_required_stick(
+            x, stick_var, data.reduction_type, "x"
         )
         y_dim_order = list(range(len(y.layout.size))) + [-1]
         y_req_stl = SpyreTensorLayout(
@@ -1389,8 +1505,8 @@ def _matmul_layouts(
         # dep index (x iterates over both N and K because M=1 contributes nothing),
         # so the normal set-exclusion (y & out) - x returns set().  Skip
         # find_matmul_generated_var and read N directly from the output dep.
-        x_req_stl = find_stick_compatible_input_layout(
-            x, reduction_var, data.reduction_type, "x"
+        x_req_stl = generate_stl_with_required_stick(
+            x, stick_var, data.reduction_type, "x"
         )
         if not output_dep.var_names:
             raise Unsupported(
@@ -1400,18 +1516,18 @@ def _matmul_layouts(
         # places N last in ranges regardless of M's size (M=1 folds M's loop
         # symbol away but does not reorder the output dep).
         generated_var = output_dep.var_names[-1]
-        y_req_stl = find_stick_compatible_input_layout(
-            y, generated_var, data.reduction_type, "y", collapse_var=reduction_var
+        y_req_stl = generate_stl_with_required_stick(
+            y, generated_var, data.reduction_type, "y", nosplit_var=stick_var
         )
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
     else:
-        x_req_stl = find_stick_compatible_input_layout(
-            x, reduction_var, data.reduction_type, "x"
+        x_req_stl = generate_stl_with_required_stick(
+            x, stick_var, data.reduction_type, "x"
         )
         generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
-        y_req_stl = find_stick_compatible_input_layout(
-            y, generated_var, data.reduction_type, "y", collapse_var=reduction_var
+        y_req_stl = generate_stl_with_required_stick(
+            y, generated_var, data.reduction_type, "y", nosplit_var=stick_var
         )
         _out_stick_dim = next(
             (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
@@ -1488,18 +1604,16 @@ def _conv_layouts(
     x, y = args[0], args[1]
 
     reduction_candidates = x.dep.index.free_symbols - output_dep.index.free_symbols
-    reduction_var = _conv_reduction_var(x, reduction_candidates)
-    if reduction_var is None:
+    stick_var = _conv_reduction_var(x, reduction_candidates)
+    if stick_var is None:
         raise Unsupported(
             f"{data.reduction_type}: could not identify the input-channel "
             f"contraction var among {reduction_candidates}"
         )
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
 
-    x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
-    )
-    y_req_stl = find_stick_compatible_input_layout(
+    x_req_stl = generate_stl_with_required_stick(x, stick_var, data.reduction_type, "x")
+    y_req_stl = generate_stl_with_required_stick(
         y, generated_var, data.reduction_type, "y"
     )
 
@@ -1982,6 +2096,10 @@ def _topk_layouts(
         if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
+            if not surviving_coords:
+                # Every other dim has host size 1 (e.g. (1, N) with dim=1),
+                # so the output falls back to a synthetic stick.
+                out_stick_dims.add(None)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
@@ -2647,8 +2765,9 @@ def _find_alt_target_stl(
     An offset write, or an offset-free sub-stick write (see
     ``_is_substick_write``), needs its stick dim relocated. The first candidate
     reachable from the write's input stick wins, meaning one an ordinary
-    stick-permutation restickify can produce, so a degenerate ``stick=0``
-    candidate cannot win a pairing the cost model would reject as a scatter.
+    stick-permutation restickify can produce. Candidates on a size-1 dim are
+    only generated when no other dim yields one (see _candidate_output_stls),
+    so a degenerate ``stick=0`` candidate cannot displace a real dim.
     Falls back to the first offset-free candidate.
     """
     dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
@@ -2689,6 +2808,7 @@ def _find_alt_target_stl(
                     target_stick,
                     in_host_coords,
                     in_device_coords,
+                    arg=in_arg,
                 )
                 is not None
             ):
@@ -2905,31 +3025,108 @@ def propagate_spyre_tensor_layouts(
     operations = graph.operations
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
     if len(graph.graph_input_names) > 0:
-        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-            if isinstance(real_input, torch.Tensor):
-                stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # A CPU tensor lifted as a graph input, or a host tensor
-                    # feeding a FallbackKernel has no Spyre layout;
-                    # leave its FixedLayout and .layouts untouched,
-                    # mirroring the non-Spyre ComputedBuffer skip below.
-                    continue
-                tb = graph.graph_inputs[name]
-                if (
-                    not isinstance(tb, TensorBox)
-                    or not isinstance(tb.data, StorageBox)
-                    or not isinstance(tb.data.data, InputBuffer)
-                ):
-                    raise Unsupported(
-                        f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+        if getattr(graph, "parent", None) is not None:
+            # SubgraphLowering: resolve input layouts from parent operands rather than V.get_real_inputs()
+            parent_operands = None
+            for op in graph.parent.operations:
+                if hasattr(op, "get_subgraphs"):
+                    subgraphs = op.get_subgraphs()
+                    if any(getattr(sg, "graph", None) is graph for sg in subgraphs):
+                        if getattr(op, "operands", None) is not None:
+                            parent_operands = op.operands
+                        elif hasattr(op, "inputs"):
+                            parent_operands = op.inputs
+                        elif hasattr(op, "carried_inputs") and hasattr(
+                            op, "additional_inputs"
+                        ):
+                            parent_operands = [
+                                *op.carried_inputs,
+                                *op.additional_inputs,
+                            ]
+                        break
+            if parent_operands is not None:
+                for name, operand in zip(graph.graph_input_names, parent_operands):
+                    tb = graph.graph_inputs[name]
+                    stl = None
+                    if hasattr(operand, "layouts") and operand.layouts:
+                        stl = operand.layouts[0]
+                    elif hasattr(operand, "get_layout"):
+                        lay = operand.get_layout()
+                        if hasattr(lay, "device_layout"):
+                            stl = lay.device_layout
+                    if (
+                        stl is None
+                        and hasattr(operand, "data")
+                        and hasattr(operand.data, "data")
+                    ):
+                        inner = operand.data.data
+                        if hasattr(inner, "layout") and hasattr(
+                            inner.layout, "device_layout"
+                        ):
+                            stl = inner.layout.device_layout
+                    if stl is None and hasattr(operand, "get_name"):
+                        # A parent pass may replace a buffer after the HOP
+                        # captured it; resolve by name to the current one.
+                        cur = next(
+                            (
+                                o
+                                for o in graph.parent.operations
+                                if o.get_name() == operand.get_name()
+                            ),
+                            None,
+                        )
+                        if cur is not None and hasattr(
+                            getattr(cur, "layout", None), "device_layout"
+                        ):
+                            stl = cur.layout.device_layout
+                    if stl is None:
+                        ptl = tb.data.data.layout
+                        stl = SpyreTensorLayout(
+                            [concretize_expr(s) for s in ptl.size],
+                            [concretize_expr(s) for s in ptl.stride],
+                            ptl.dtype,
+                            list(range(len(ptl.size))),
+                        )
+                    tb.layouts = [stl]
+            else:
+                for name in graph.graph_input_names:
+                    tb = graph.graph_inputs[name]
+                    ptl = tb.data.data.layout
+                    stl = SpyreTensorLayout(
+                        [concretize_expr(s) for s in ptl.size],
+                        [concretize_expr(s) for s in ptl.stride],
+                        ptl.dtype,
+                        list(range(len(ptl.size))),
                     )
-                ptl = tb.data.data.layout
-                if not isinstance(ptl, FixedLayout):
-                    raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                new_layout = _eager_view_input_layout(real_input, ptl, name)
-                if new_layout is not None:
-                    tb.data.data.layout = new_layout
-                tb.layouts = [stl]
+                    tb.layouts = [stl]
+        else:
+            for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+                if isinstance(real_input, torch.Tensor):
+                    stl = real_input.device_tensor_layout()
+                    if stl is None:
+                        # A CPU tensor lifted as a graph input, or a host tensor
+                        # feeding a FallbackKernel has no Spyre layout;
+                        # leave its FixedLayout and .layouts untouched,
+                        # mirroring the non-Spyre ComputedBuffer skip below.
+                        continue
+                    tb = graph.graph_inputs[name]
+                    if (
+                        not isinstance(tb, TensorBox)
+                        or not isinstance(tb.data, StorageBox)
+                        or not isinstance(tb.data.data, InputBuffer)
+                    ):
+                        raise Unsupported(
+                            f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                        )
+                    ptl = tb.data.data.layout
+                    if not isinstance(ptl, FixedLayout):
+                        raise Unsupported(
+                            f"graph input {name} does not have a FixedLayout"
+                        )
+                    new_layout = _eager_view_input_layout(real_input, ptl, name)
+                    if new_layout is not None:
+                        tb.data.data.layout = new_layout
+                    tb.layouts = [stl]
 
     mutation_alts, mutation_consumer_counts, mutation_writers = (
         _scan_mutation_layout_inputs(operations)
