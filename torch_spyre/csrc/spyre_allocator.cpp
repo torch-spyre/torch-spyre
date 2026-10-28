@@ -15,9 +15,11 @@
  */
 #include "spyre_allocator.h"
 
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "logging.h"
 #include "module.h"
@@ -227,6 +229,83 @@ c10::DataPtr SpyreAllocator::allocate(
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
 
   return data_ptr_result;
+}
+
+namespace {
+
+// Backing for sharded storage on plain Flex (no allocator-side sharding API):
+// one ordinary allocation per shard, indexed by shard ordinal. The shard table
+// is torch-spyre-owned — shard i backs core i — and the physical placement
+// (region, segment, offset) is whatever the Flex allocator chose. Device sizes
+// are stick-multiples, so each shard's chunk is exactly shard_device_bytes.
+std::vector<flex::CompositeAddress> allocateShardTable(
+    const std::shared_ptr<flex::FlexAllocator>& flex_alloc,
+    uint64_t shard_device_bytes, uint32_t logical_chunks) {
+  std::vector<flex::CompositeAddress> shards;
+  shards.reserve(logical_chunks);
+  for (uint32_t i = 0; i < logical_chunks; ++i) {
+    flex::CompositeAddress shard = flex_alloc->allocate(
+        static_cast<size_t>(shard_device_bytes), flex::AllocationDirective());
+    TORCH_CHECK(shard.num_chunks() == 1, "plain per-shard allocation ", i,
+                " is not single-chunk");
+    TORCH_CHECK(shard.chunks()[0].size == shard_device_bytes,
+                "plain per-shard allocation ", i, " covers ",
+                shard.chunks()[0].size, " bytes, expected ",
+                shard_device_bytes);
+    shards.push_back(std::move(shard));
+  }
+  return shards;
+}
+
+// Non-owning whole-storage view over the shard table's chunks, in shard order.
+// Hand-built, so its destructor never frees; the shard table owns the memory.
+flex::CompositeAddress wholeStorageView(
+    const std::vector<flex::CompositeAddress>& shards) {
+  std::vector<flex::Chunk> chunks;
+  chunks.reserve(shards.size());
+  for (const auto& shard : shards) {
+    chunks.push_back(shard.chunks()[0]);
+  }
+  return flex::CompositeAddress(chunks);
+}
+
+}  // namespace
+
+c10::DataPtr SpyreAllocator::allocateShardedStorage(
+    int64_t shard_dim, uint32_t logical_chunks, uint64_t shard_device_bytes) {
+  TORCH_CHECK(shard_device_bytes != 0,
+              "sharded storage requires nonzero shard bytes");
+  TORCH_CHECK(logical_chunks == 8 || logical_chunks == 16,
+              "sharded storage supports 8 or 16 shards, got ", logical_chunks);
+  TORCH_CHECK(shard_device_bytes % 128 == 0,
+              "sharded storage requires device-aligned shard bytes, got ",
+              shard_device_bytes);
+  TORCH_CHECK(
+      shard_device_bytes <= std::numeric_limits<size_t>::max() / logical_chunks,
+      "sharded storage size overflows");
+
+  c10::Device curr_device =
+      c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
+  auto flex_alloc = getFlexAllocator();
+  TORCH_CHECK(flex_alloc != nullptr, "Flex allocator is not available");
+
+  // Each shard is its own aligned plain allocation; shard i backs core i by
+  // the torch-spyre-owned shard table (Flex places it wherever it fits).
+  std::vector<flex::CompositeAddress> shards =
+      allocateShardTable(flex_alloc, shard_device_bytes, logical_chunks);
+
+  const size_t actual_nbytes =
+      static_cast<size_t>(shard_device_bytes) * logical_chunks;
+  auto device_id = curr_device.index();
+  auto* ctx = new SharedOwnerCtx(wholeStorageView(shards), device_id,
+                                 flex::MemoryType::Tensor);
+  ctx->shard_addrs = std::move(shards);
+  ctx->sharding =
+      ShardedStorageInfo{shard_dim, logical_chunks, shard_device_bytes};
+  void* ctx_void = static_cast<void*>(ctx);
+  SpyreAllocator::instance().recordAlloc(actual_nbytes, ctx_void, device_id,
+                                         flex::MemoryType::Tensor);
+  return c10::DataPtr(ctx_void, ctx_void, &ReportAndDelete, curr_device);
 }
 
 void SpyreAllocator::ReportAndDelete(void* ctx_void) {

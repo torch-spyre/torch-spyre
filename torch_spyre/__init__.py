@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import importlib
 import os
 import threading
 import types
-import importlib
 
 import torch
 
+from . import memory, profiler
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
-from . import memory
-from . import profiler
-
 
 _runtime_init_lock = threading.Lock()
 
@@ -41,10 +40,8 @@ class _SpyreImpl:
             # so, we want only the main process can have access to the actual device
             self._in_bad_fork = True
             self._initialized = True
-        try:
+        with contextlib.suppress(Exception):
             os.register_at_fork(after_in_child=self._mark_after_fork)
-        except Exception:
-            pass
 
     def __getattr__(self, name):
         if name == "_C":
@@ -193,12 +190,23 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = lambda: impl.device_count()
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
+    from torch_spyre._sharded_api import (
+        distribute_tensor,
+        full_tensor,
+        is_sharded,
+        sharding_info,
+    )
+
+    mod.distribute_tensor = distribute_tensor
+    mod.full_tensor = full_tensor
+    mod.is_sharded = is_sharded
+    mod.sharding_info = sharding_info
     mod._is_compiled = lambda: True
     mod.memory = memory
     # Public profiler API (eagerly imported above); avoid private _ffdc import.
     mod.get_diagnostic_report = profiler.get_diagnostic_report
 
-    import torch  # noqa: E402
+    import torch
 
     mod.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16]
 
@@ -222,9 +230,9 @@ def make_spyre_module() -> types.ModuleType:
             impl._lazy_init()
             from torch_spyre.streams import (
                 Stream,
-                stream,
                 current_stream,
                 default_stream,
+                stream,
                 synchronize,
             )
 
@@ -286,13 +294,13 @@ def _autoload():
 
 
 def _autoload_impl():
-    import torch  # noqa: E402
+    import torch
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
 
-    import torch_spyre.ops.eager  # noqa: F401
+    import torch_spyre.ops.eager
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()

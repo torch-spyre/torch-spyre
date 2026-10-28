@@ -62,6 +62,25 @@ at::Tensor py_empty_with_layout(
     std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt);
 
+// Sharded tensors. A sharded tensor has the global logical shape, and
+// its storage holds num_shards segment-emulated chunks; shard i (the i-th
+// equal slice along shard_dim) lives in the chunk whose logical_chunk_id is i,
+// encoded in the shard-local default SpyreTensorLayout.
+at::Tensor spyre_empty_sharded(c10::IntArrayRef size, c10::ScalarType dtype,
+                               int64_t shard_dim, int64_t num_shards,
+                               std::optional<c10::Device> device_opt);
+
+// Whether `tensor`'s storage is sharded storage.
+bool spyre_is_sharded(const at::Tensor& tensor);
+
+// Device address of shard `shard_index` of a sharded tensor: the start of the
+// chunk whose logical_chunk_id == shard_index. Resolved per launch for
+// non-unified kernels; never baked into compiled artifacts. Fails unless the
+// tensor has the shard count and per-shard bytes the kernel was compiled for.
+uint64_t shard_device_address(const at::Tensor& sharded, int64_t shard_index,
+                              int64_t expected_num_shards,
+                              int64_t expected_shard_bytes);
+
 auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, bool host2device)
     -> DataConversionInfo;
