@@ -5409,9 +5409,89 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
 
 
 class TestRecoverSpyreHints(unittest.TestCase):
-    """collect_spyre_hints/recover_spyre_hints: scan<->while_loop_body hint
-    recovery through decompose_scan_to_while_loop's retrace.
+    """collect_spyre_hints/recover_spyre_hints: flat-snapshot alignment across
+    post-grad insertions, and scan<->while_loop_body hint recovery through
+    decompose_scan_to_while_loop's retrace.
     """
+
+    @staticmethod
+    def _hinted_names(gm: torch.fx.GraphModule) -> list[str]:
+        return [
+            n.name
+            for n in gm.graph.nodes
+            if any(k.startswith("_hint_") for k in n.meta.get("custom") or {})
+        ]
+
+    def test_inserted_node_does_not_take_a_later_scopes_hint(self):
+        """An op inserted after the snapshot whose target recurs further down
+        must not take that later scope's hint, nor shift the nodes after it
+        onto it.
+
+        A reduced gpt-oss block graph: mm_to_bmm_pass inserts unsqueeze/expand
+        into RoPE after the snapshot, and the in-graph MoE's hinted scope further
+        down holds the same targets. On the target-only scan the inserted pair
+        consumes the scope's unsqueeze/expand entries, so the unhinted KV-store
+        reshape in between (kv_view) matches the scope's reshape and takes its
+        work_div={"T": 32}, the "size=8 is not evenly divisible by split=32"
+        failure, while the scope's own unsqueeze/expand lose theirs. Asserting
+        the exact hinted names covers both.
+        """
+        import torch_spyre  # noqa: F401  registers the spyre ops
+        from torch_spyre._inductor.propagate_hints import (
+            collect_spyre_hints,
+            recover_spyre_hints,
+        )
+
+        aten = torch.ops.aten
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        rope = graph.call_function(aten.clone.default, (x,))
+        rotated = graph.call_function(aten.mul.Tensor, (rope, x))
+        kv_view = graph.call_function(aten.reshape.default, (rotated, [-1]))
+        moe = [graph.call_function(aten.unsqueeze.default, (kv_view, 0))]
+        moe.append(graph.call_function(aten.expand.default, (moe[-1], [2, -1])))
+        moe.append(graph.call_function(aten.reshape.default, (moe[-1], [-1])))
+        graph.output(moe[-1])
+        for node in moe:
+            node.meta["custom"] = {"_hint_0": {"work_div": {"T": 32}}}
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        collect_spyre_hints(gm.graph)
+        with gm.graph.inserting_before(rotated):
+            unsqueezed = gm.graph.call_function(aten.unsqueeze.default, (rope, 0))
+            gm.graph.call_function(aten.expand.default, (unsqueezed, [2, -1]))
+        recover_spyre_hints(gm.graph)
+
+        self.assertEqual(self._hinted_names(gm), [n.name for n in moe])
+
+    def test_post_snapshot_copy_of_a_hinted_node_keeps_its_hint(self):
+        """A copy made after the snapshot next to its hinted original (#2592's
+        add(mm, mm_default)) still inherits the hint now that the next surviving
+        node bounds the target scan.
+        """
+        import torch_spyre  # noqa: F401  registers the spyre ops
+        from torch_spyre._inductor.propagate_hints import (
+            collect_spyre_hints,
+            recover_spyre_hints,
+        )
+
+        aten = torch.ops.aten
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        w = graph.placeholder("w")
+        mm = graph.call_function(aten.mm.default, (x, w))
+        add = graph.call_function(aten.add.Tensor, (mm, mm))
+        graph.output(add)
+        mm.meta["custom"] = {"_hint_0": {"work_div": {"M": 2}}}
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        collect_spyre_hints(gm.graph)
+        with gm.graph.inserting_after(mm):
+            copy = gm.graph.call_function(aten.mm.default, (x, w))
+        add.update_arg(1, copy)
+        recover_spyre_hints(gm.graph)
+
+        self.assertEqual(self._hinted_names(gm), [mm.name, copy.name])
 
     def test_one_unhinted_scan_does_not_block_the_other(self):
         """Two sibling for_each_tile scans (paged_gather_kv_fn's K/V-page
@@ -5731,7 +5811,7 @@ class TestRecoverSpyreHints(unittest.TestCase):
 
         gm = torch.fx.GraphModule(root, graph)
 
-        snapshot = [(add.target, {"_hint_0": {"work_div": {"K": 2}}})]
+        snapshot = [(add.target, {"_hint_0": {"work_div": {"K": 2}}}, None)]
         _recover_hop_subgraph_hints(gm.graph, [snapshot])
 
         recovered = [n for n in body_gm.graph.nodes if n.meta.get("custom")]
@@ -5841,10 +5921,10 @@ class TestRecoverSpyreHints(unittest.TestCase):
         # subgraph_snapshots[i] pairs with the scan stamped seq i: seq 0 is
         # the add body, seq 1 the sub body.
         snapshot_add = [
-            (torch.ops.aten.add.Tensor, {"_hint_0": {"work_div": {"K": 2}}})
+            (torch.ops.aten.add.Tensor, {"_hint_0": {"work_div": {"K": 2}}}, None)
         ]
         snapshot_sub = [
-            (torch.ops.aten.sub.Tensor, {"_hint_0": {"work_div": {"L": 3}}})
+            (torch.ops.aten.sub.Tensor, {"_hint_0": {"work_div": {"L": 3}}}, None)
         ]
         _recover_hop_subgraph_hints(gm.graph, [snapshot_add, snapshot_sub])
 

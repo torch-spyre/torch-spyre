@@ -48,6 +48,7 @@ from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .paging import at_smaller_pages
 from .schema import PipelineRuns
 
 API = "https://api.github.com"
@@ -272,6 +273,10 @@ class Stop(Exception):
     """The poll must end here, cleanly: the budget, the deadline or the token is used up."""
 
 
+class Unavailable(SystemExit):
+    """GitHub kept failing a request through every retry; one run can be skipped, the poll goes on."""
+
+
 class GitHub:
     """The few Actions API reads the poller needs, over stdlib HTTP, within a rate budget."""
 
@@ -289,8 +294,9 @@ class GitHub:
         self.limit = self.remaining = self.reset = None
         self.requests, self.first = 0, ""
         self.authed = self.expired = False
+        self.skipped: list[str] = []
 
-    def get(self, path: str, **query: Any) -> dict[str, Any]:
+    def get(self, path: str, *, tries: int = RETRIES, **query: Any) -> dict[str, Any]:
         url = f"{API}{path}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
         req = urllib.request.Request(
             url,
@@ -300,7 +306,7 @@ class GitHub:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        for attempt in range(RETRIES):
+        for attempt in range(tries):
             self._guard()
             self.requests += 1
             try:
@@ -327,8 +333,8 @@ class GitHub:
             ):
                 wait = 2**attempt
             self._sleep(wait)
-        raise SystemExit(
-            f"[error] GitHub API still failing after {RETRIES} tries: {url}"
+        raise Unavailable(
+            f"[error] GitHub API still failing after {tries} tries: {url}"
         )
 
     @staticmethod
@@ -412,13 +418,18 @@ class GitHub:
         return self.get(f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}")
 
     def jobs(self, repo: str, run_id: int, attempt: int) -> list[dict[str, Any]]:
+        path = f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+        return at_smaller_pages(
+            lambda size, tries: self._listing(path, size, tries),
+            last_attempts=RETRIES,
+            failed=(Unavailable,),
+        )
+
+    def _listing(self, path: str, size: int, tries: int) -> list[dict[str, Any]]:
+        """Every job at one page size, from page 1: a partial listing never carries over to another size."""
         out, page = [], 1
         while True:
-            batch = self.get(
-                f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs",
-                per_page=PAGE,
-                page=page,
-            )
+            batch = self.get(path, tries=tries, per_page=size, page=page)
             out += batch.get("jobs") or []
             if len(out) >= batch.get("total_count", 0) or not batch.get("jobs"):
                 return out
@@ -512,8 +523,14 @@ def poll(
                     and (a < n or have[0] == _ts(latest.get("updated_at")))
                 ):
                     continue
-                run = run or gh.attempt(repo, latest["id"], a)
-                jobs = gh.jobs(repo, latest["id"], a)
+                try:
+                    run = run or gh.attempt(repo, latest["id"], a)
+                    jobs = gh.jobs(repo, latest["id"], a)
+                except Unavailable as err:
+                    # Not stored, so any later poll whose window still holds the run retries it.
+                    gh.skipped.append(f"{repo} run {latest['id']} attempt {a}")
+                    print(f"[warn] skipped {gh.skipped[-1]}: {err}", file=sys.stderr)
+                    continue
                 batch.append(workflow_row(repo, run, jobs))
                 batch += [r for r in (job_row(repo, run, j) for j in jobs) if r]
                 attempts += 1
@@ -622,6 +639,12 @@ def main(argv=None) -> None:
             # The budget and the token are shared by every repo; a deadline share is not.
             if gh.expired or (gh.exhausted() and not gh.wait_for_reset):
                 break
+    if gh.skipped:
+        print(
+            f"[warn] {len(gh.skipped)} run attempt(s) skipped after GitHub kept failing; "
+            "a later poll retries those still in its window",
+            file=sys.stderr,
+        )
     print(
         f"[info] rate limit {gh.first or 'unseen'} at the first response, "
         f"{gh.rate()} at the last, {gh.requests} request(s)",

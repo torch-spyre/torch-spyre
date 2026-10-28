@@ -1840,19 +1840,48 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
+# Below this input the log1p series replaces the runtime primitive, which is up to
+# 1.4% off in [-2, -1) and returns 0 below -7 (#5741). The series' truncation error
+# peaks here at 3.1e-4, but the primitive just above is up to 0.6% off, so the
+# output can step by that much at the cutoff.
+_SOFTPLUS_SERIES_CUTOFF = -1.0
+# Terms of log1p(u) = u - u^2/2 + u^3/3 - ...; at u = e^-1 the next one is below
+# fp16 resolution.
+_SOFTPLUS_SERIES_TERMS = 6
+
+
+def _softplus_unit_beta(input: torch.Tensor, threshold: float) -> torch.Tensor:
+    """``softplus(x, beta=1)``: the primitive above the cutoff, log1p(e^x) below.
+
+    There is no log1p on Spyre and log(1 + e^x) rounds to 0 just like the
+    primitive, so the small-x branch is the log1p series in Horner form. PyTorch
+    returns x only for x > threshold, so a threshold below the cutoff lowers it.
+    """
+    cutoff = min(_SOFTPLUS_SERIES_CUTOFF, threshold)
+    u = torch.exp(torch.clamp_max(input, cutoff))
+    acc = torch.full_like(u, 1.0 / _SOFTPLUS_SERIES_TERMS)
+    for k in range(_SOFTPLUS_SERIES_TERMS - 1, 0, -1):
+        acc = 1.0 / k - u * acc
+    return torch.where(
+        input < cutoff,
+        u * acc,
+        torch.ops.spyre.softplus(input, 1.0, threshold),
+    )
+
+
 @register_spyre_decompositions([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     if beta == 1.0:
-        return torch.ops.spyre.softplus(input, beta, threshold)
+        return _softplus_unit_beta(input, threshold)
     # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
     # only exact path. Scale into it and back out; the threshold branch stays
     # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
     # aten accepts beta == 0 and saturates every element to +-inf, so take the
     # reciprocal under IEEE rules rather than letting Python raise here.
     inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
-    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
+    return _softplus_unit_beta(input * beta, threshold) * inv_beta
 
 
 def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
@@ -3674,6 +3703,39 @@ def scaled_mm_decomp(
         logger.warning("scale_result parameter in _scaled_mm is not yet supported")
     if use_fast_accum:
         logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    return result
+
+
+@register_spyre_decompositions([torch.ops.spyre.scaled_bmm])
+def scaled_bmm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose spyre.scaled_bmm into:
+    1. Raw FP8 batched matmul via spyre.bmm_fp8 (no scales applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+
+    The batched counterpart of scaled_mm_decomp: it keeps the scale arithmetic
+    out of lower_bmm_fp8's matmul lowering, the same separation
+    dequantize_fp8_with_scale_decomp uses for its FP8->FP16 conversion.
+    """
+    result = torch.ops.spyre.bmm_fp8(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+
+    if use_fast_accum:
+        # Spyre has no fast 8-bit accumulation path
+        logger.warning("use_fast_accum parameter in scaled_bmm is not supported")
 
     return result
 

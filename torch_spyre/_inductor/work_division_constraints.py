@@ -704,13 +704,30 @@ def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
     return _has_ea_tensor(tds, STAGGERED_EAS)
 
 
+def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
+    """The batch dims are returned too. Splitting one gives wrong results on
+    device: with a [2, 12, 128, 128] weight written by qfp8wt in 12 head slices
+    and read by batchmatmulfp8 in 4, only the first head of each read slice is
+    correct, while the same graph on one core is exact.
+
+    TODO: this pin is a workaround. The fix is to adjust the strides to reflect
+    the 2D stick layout, which is not currently represented in the tensor's
+    device_size; that would make the per-core addressing correct and let the
+    pin be dropped.
+    """
+    if len(td.layout.size) <= 2:
+        return [td.device_coords[-2]]
+    return list(td.device_coords)
+
+
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict QFP8WT tensors' second stick dimension to split=1.
+    """Restrict QFP8WT tensors' second stick dimension and batch dims to split=1.
 
     QFP8WT uses a 2D stick layout (2x64 elements, 128 bytes); both stick dims
     must stay atomic 128-byte units, so any iteration var indexing the second
     stick coordinate of the matmul kernel tensor (second input) or the output
-    has the singleton legal domain ``{1}``.
+    has the singleton legal domain ``{1}``. So does any var indexing one of the
+    tensor's batch dims (see ``_qfp8wt_unsplittable_coords``).
     """
     all_tds = ctx.input_tds + [ctx.output_td]
     if not has_qfp8wt_tensor(all_tds):
@@ -721,14 +738,16 @@ def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if len(ctx.input_tds) > 1:
         kernel_td = ctx.input_tds[1]
         if len(kernel_td.device_coords) > 1 and has_qfp8wt_tensor([kernel_td]):
-            for var in kernel_td.device_coords[-2].free_symbols:
-                if isinstance(var, Symbol):
-                    allowed_splits[var] = frozenset({1})
+            for coord in _qfp8wt_unsplittable_coords(kernel_td):
+                for var in coord.free_symbols:
+                    if isinstance(var, Symbol):
+                        allowed_splits[var] = frozenset({1})
 
     if len(ctx.output_td.device_coords) > 1 and has_qfp8wt_tensor([ctx.output_td]):
-        for var in ctx.output_td.device_coords[-2].free_symbols:
-            if isinstance(var, Symbol):
-                allowed_splits[var] = frozenset({1})
+        for coord in _qfp8wt_unsplittable_coords(ctx.output_td):
+            for var in coord.free_symbols:
+                if isinstance(var, Symbol):
+                    allowed_splits[var] = frozenset({1})
 
     return ConstraintResult(allowed_splits=allowed_splits)
 
@@ -988,26 +1007,28 @@ _STRUCTURED_REDUCTION_TYPES: frozenset[str] = frozenset(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep plain reductions on one core along every reduction axis.
+    """Apply backend constraints on plain reduction K-splits.
 
-    Even a single reduction variable cannot safely be split across cores in
-    a fused graph: splitting layer norm's exx2 reduction corrupts BERT-family
-    encoder block outputs.
-    WSR's ``_insert_combine_op`` combines successive coarse-loop iterations;
-    it does not establish a cross-core combine for arbitrary work divisions.
-    Keep this restriction until those divisions have a validated combine path.
+    Multi-axis plain reductions: pin all reduction vars to split=1. The
+    backend supports at most one split reduction dimension per op, but
+    combining partial results across cores for arbitrary plain reduction
+    types is not validated, so the frontend blocks all of them.
 
-    Structured reductions have their own backend combine or blocking rules.
-    Output axes remain available for parallelism, and reduction-range coarse
-    tiling is still handled separately by WSR.
+    Single-axis plain reductions: unconstrained — all types may K-split.
+
+    Structured reductions (matmul, conv, topk, pool) have their own blocking
+    or combine rules and are excluded via _STRUCTURED_REDUCTION_TYPES.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _STRUCTURED_REDUCTION_TYPES:
         return ConstraintResult()
-    return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
-    )
+    # Multi-axis: backend supports at most one split reduction dim.
+    if len(ctx.reduction_vars) > 1:
+        return ConstraintResult(
+            allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:

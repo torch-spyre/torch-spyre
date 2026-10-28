@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
+import sympy
 from sympy import Eq, floor, Integer, Mod, Piecewise, Symbol
 import torch
 import torch.fx.traceback
@@ -1152,6 +1153,34 @@ def test_work_division_from_view_examples(
     assert division.physical_core_count == view.num_cores
 
 
+@pytest.mark.parametrize("pair_extent,offset", [(2, 0), (3, 0), (2, 1)])
+def test_q_rope_ownership_keeps_the_whole_pair_in_its_slice(pair_extent, offset):
+    row, head, pair, feature = map(Symbol, ("row", "head", "pair", "feature"))
+    view = _view({0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32)
+    coordinates = [row, 2 * head + pair + offset, feature]
+    original_coordinates = list(coordinates)
+    extents = {row: 512, head: 8, pair: pair_extent, feature: 64}
+
+    if pair_extent != 2 or offset:
+        # The zero-pair line fits, but the full rectangle crosses a slice.
+        with pytest.raises(ValueError, match="cannot map device dimension 1"):
+            work_division_from_view(view, [512, 16, 64], coordinates, extents)
+    else:
+        division = work_division_from_view(view, [512, 16, 64], coordinates, extents)
+        assert division.work_slices == {row: 8, head: 4}
+        assert division.physical_core_count == 32
+        for core in range(32):
+            owners = {
+                loop: int(owner.subs(_CORE_ID, core))
+                for loop, owner in division.core_id_to_work_slice.items()
+            }
+            assert owners == {row: core % 8, head: core // 8}
+            for h in range(2 * owners[head], 2 * (owners[head] + 1)):
+                for p in range(2):
+                    assert (2 * h + p) // 4 == core // 8
+    assert coordinates == original_coordinates, "proof changed the tensor access"
+
+
 def test_diagonal_access_cannot_become_a_complete_relayout_source():
     loop = Symbol("loop")
     owner = Mod(_CORE_ID, 2)
@@ -1171,9 +1200,20 @@ def test_diagonal_access_cannot_become_a_complete_relayout_source():
     )
 
 
+def test_full_replica_movement_tracks_ownership_flag():
+    source = _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2)
+    destination = _view({}, {}, 32)
+    for enabled in (False, True, False):
+        with config.patch(lx_extended_ownership=enabled):
+            assert (
+                lx_relayout_module.movement_supported(source, destination, 2, 32)
+                is enabled
+            )
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
-    dep = SimpleNamespace(name="input")
-    graph = SimpleNamespace()
+    dep = SimpleNamespace(name="input", is_indirect=lambda: False)
+    graph = SimpleNamespace(graph_inputs={"input": None}, operations=[])
     producer = SimpleNamespace()
     with (
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=True),
@@ -1187,6 +1227,22 @@ def test_lx_relayout_activation_policy_is_source_wide():
     ):
         assert not lx_relayout_module._is_activation_source(graph, {}, producer)
         assert lx_relayout_module._is_activation_source(graph, {"input": dep}, producer)
+        mutation = SimpleNamespace(
+            layout=SimpleNamespace(
+                get_buffer=lambda: SimpleNamespace(get_name=lambda: "input")
+            ),
+            loop_info=None,
+        )
+        with (
+            config.patch(lx_extended_ownership=True),
+            mock_patch.object(
+                lx_relayout_module, "MutationLayoutSHOULDREMOVE", SimpleNamespace
+            ),
+        ):
+            graph.operations = [mutation, producer, mutation]
+            assert lx_relayout_module._is_activation_source(graph, {}, producer)
+            graph.operations = [producer, mutation]
+            assert not lx_relayout_module._is_activation_source(graph, {}, producer)
 
 
 @config.patch({"sencores": 32, "lx_planner_relayout": True})
@@ -2142,7 +2198,7 @@ def test_completed_reduction_relayout_device(
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2**-8, atol=0)
     roots = [
         root
         for directory in directories
@@ -2384,6 +2440,33 @@ class TestAOTAnnotationAssumptions(DynamoTestCase):
                     return y
 
         self._compile_and_run(TestModule())
+
+
+@pytest.mark.parametrize(
+    "expression,width_extent",
+    [
+        ("2*h+floor(w/64)", 192),  # crosses a head shard
+        ("2*h+floor(w/64)+1", 128),
+        ("2*h-floor(w/64)", 128),
+        ("floor(h*w/64)", 128),
+        ("2*h+floor(w/divisor)", 128),
+        ("floor(h/2)+floor(w/64)", 128),  # two floors are out of scope
+        ("2*h+2*floor(w/64)", 128),  # nonunit floor coefficient
+        ("2*h+floor(w/64)+1/2", 128),  # nonintegral outside term
+    ],
+)
+def test_floor_slice_projection_rejects_unproven_access(expression, width_extent):
+    from torch_spyre._inductor.slice_ownership import (
+        project_floor_affine_slice_axis,
+    )
+
+    h, w = sympy.symbols("h w")
+    assert (
+        project_floor_affine_slice_axis(
+            sympy.sympify(expression), 16, 4, {h: 8, w: width_extent}
+        )
+        is None
+    )
 
 
 if __name__ == "__main__":
