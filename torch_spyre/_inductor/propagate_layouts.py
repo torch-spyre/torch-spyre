@@ -37,6 +37,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
     StorageBox,
     TensorBox,
 )
@@ -96,6 +97,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    rank_changing_target_view_layout,
     rescale_stl_for_dtype,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -3442,6 +3444,21 @@ def _clean_mutation_op_output_layout(node: ComputedBuffer) -> FixedLayout:
     )
 
 
+def _is_scatter_through_rank_changing_view(node: ComputedBuffer, real) -> bool:
+    """Is ``node`` a scatter writing a committed destination through a view of
+    a different rank, at a fixed (symbol-free) offset?
+
+    Narrowly scoped to indirect-access scatters: they are the ops whose
+    destination device layout is a hard requirement rather than a preference.
+    """
+    if not isinstance(node.data, Scatter) or not isinstance(real, FixedTiledLayout):
+        return False
+    view_layout = rank_changing_target_view_layout(node)
+    if view_layout is None:
+        return False
+    return not sympy.sympify(view_layout.offset).free_symbols
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -3465,6 +3482,23 @@ def propagate_mutation_layouts(
                 n.node, real
             ):
                 n.node.layout = real
+            elif _is_scatter_through_rank_changing_view(n.node, real):
+                # The scatter writes the destination in the destination's own
+                # device layout: indirect access needs the scattered dim at
+                # device position 0, which the relayout passes already arranged
+                # on the destination. Recomputing a layout from the op's inputs
+                # (the branch below) ignores that and addresses the destination
+                # with a different device layout (torch-spyre#5125). Keep the
+                # view's host geometry but reuse the destination's device layout.
+                output = _clean_mutation_op_output_layout(n.node)
+                n.node.layout = FixedTiledLayout(
+                    output.device,
+                    output.dtype,
+                    output.size,
+                    output.stride,
+                    real.device_layout,
+                    offset=output.offset,
+                )
             else:
                 rw = n.read_writes
                 output_dep = next(iter(rw.writes))

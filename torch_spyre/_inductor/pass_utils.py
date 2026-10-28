@@ -39,10 +39,12 @@ from torch._inductor.ir import (
     IRNode,
     Layout,
     Loops,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     Scatter,
     StorageBox,
     TensorBox,
@@ -850,6 +852,41 @@ def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     """Return names of deps whose loaded values are used as indices in scatter output_indexer."""
     return set(_scatter_index_buf_names_ordered(op))
+
+
+def rank_changing_target_view_layout(op: ComputedBuffer) -> "Layout | None":
+    """Layout of the view ``op`` writes through, when that view changes rank.
+
+    A mutation op's ``MutationLayoutSHOULDREMOVE.target`` can be a
+    ``ReinterpretView`` of the real destination buffer. Every helper that
+    unwraps the target (``_resolve_mutation_target``, ``real_layout()``) walks
+    through the view to the underlying buffer and so sees the *base's* host
+    geometry. For a view of the same rank (a slice) that is harmless: the dims
+    line up one to one. For a view of a different rank, e.g. the flattened
+    ``cache.view(-1, H, D)`` of a 4-D paged KV cache, the op's index expression
+    and loop ranges are in the *view's* coordinates and the base's size/stride
+    do not describe them (torch-spyre#5125).
+
+    Returns the view's own FixedLayout (size/stride/offset in the base's storage
+    terms) when the target is a ``ReinterpretView`` whose rank differs from the
+    underlying buffer's; otherwise None.
+    """
+    layout = op.layout
+    if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+        return None
+    view = layout.target
+    while isinstance(view, MutableBox):
+        view = view.data
+    if not isinstance(view, ReinterpretView):
+        return None
+    base = view
+    while isinstance(base, (ReinterpretView, MutableBox)):
+        base = base.data
+    base_layout = base.maybe_get_layout() if hasattr(base, "maybe_get_layout") else None
+    view_layout = view.get_layout()
+    if base_layout is None or len(view_layout.size) == len(base_layout.size):
+        return None
+    return view_layout
 
 
 def _build_indirect_store_subs(

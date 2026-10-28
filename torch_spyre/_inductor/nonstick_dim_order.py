@@ -99,6 +99,7 @@ from .pass_utils import (
     get_matmul_m_size,
     get_matmul_n_size,
     indirect_info_from_op,
+    rank_changing_target_view_layout,
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
@@ -427,6 +428,137 @@ def _ia_rotate_stl(
     )
 
 
+def _merge_device_dims_for_view(
+    stl: SpyreTensorLayout, view_layout: FixedLayout
+) -> SpyreTensorLayout:
+    """Merge non-stick device dims that ``view_layout`` collapses into one.
+
+    ``stl`` is the destination buffer's device layout, expressed in the *base*
+    buffer's host strides. A scatter through a flattening view (e.g. the 4-D
+    paged KV cache ``[num_blocks, block_size, heads, head_dim]`` seen as
+    ``[num_blocks*block_size, heads, head_dim]``) indexes a view dim whose
+    extent spans two (or more) base dims.  Those base dims can map to any set
+    of non-adjacent device positions (e.g. ``device_size=[16, 8, 2, 512, 64]``
+    with ``BLOCK_SIZE=16`` at pos 0 and ``NUM_BLOCKS=512`` at pos 3).
+
+    Indirect access needs the scattered index in exactly one device dim, but
+    with separate device dims the flat slot index is split across both.
+
+    **Algorithm — view-dim-at-a-time** (prevents cross-view-dim merges):
+
+    For each ``(want, sv)`` pair from ``view_layout`` (host size, host stride):
+
+    1. Build the set of *movable* (non-stick) device dims not yet claimed by a
+       previous view dim.
+    2. Walk outward from stride ``sv`` along host-contiguous chains:
+       - if ``sv == 1``: start at the stick dim (stride 1), treating
+         ``stick_size`` as the first partial product.
+       - otherwise: set ``product = 1``, ``next_stride = sv``.
+       - At each step find the unique movable dim ``d`` with
+         ``stride_map[d] == next_stride``; if none or more than one exists,
+         stop the chain.
+       - Accumulate: ``members.append(d)``, ``product *= device_size[d]``,
+         ``next_stride = product * sv`` (the expected stride of the next outer
+         level).
+       - Stop when ``product == want`` (exact match) or
+         ``product > want`` (over-shot, give up for this view dim).
+    3. If ``product == want`` and ``len(members) >= 2``: merge those non-stick
+       dims into a single dim (smallest stride wins as the representative;
+       the others are dropped).  Mark all members as claimed.
+
+    This guarantees that dims from *different* view dims are never merged, even
+    when their sizes happen to be divisors of another view dim's size.
+
+    Only merges the view actually performs are applied; returns ``stl`` itself
+    when there are none.
+    """
+    device_size = [int(s) for s in stl.device_size]
+    stride_map = [int(s) for s in stl.stride_map]
+    stick_pos = len(device_size) - 1
+    stick_size = device_size[stick_pos]
+    n_nonstick = stick_pos  # number of non-stick dims
+
+    # Collect (host_size, host_stride) for each view dim.
+    view_dims = [
+        (int(concretize_expr(sz)), int(concretize_expr(st)))
+        for sz, st in zip(view_layout.size, view_layout.stride)
+    ]
+
+    # claimed[i] == True means non-stick dim i has already been assigned to a
+    # view dim and must not be considered again.
+    claimed = [False] * n_nonstick
+
+    # List of merge groups: each entry is a sorted list of non-stick positions
+    # to merge (inner-most stride first).
+    merge_groups: list[list[int]] = []
+
+    for want, sv in view_dims:
+        if want <= 1:
+            continue  # size-1 dim: nothing to merge
+
+        # Build a stride -> list-of-dim-index mapping over unclaimed dims.
+        # Size-1 dims are left out: their stride is arbitrary (e.g. the
+        # stick-split dim of a head_dim that fits one stick, ``[.., 1, 64]``,
+        # shares its stride with the dim next to it), so keeping them would make
+        # an otherwise unambiguous chain look ambiguous.
+        stride_to_dims: dict[int, list[int]] = {}
+        for d in range(n_nonstick):
+            if not claimed[d] and device_size[d] > 1:
+                stride_to_dims.setdefault(stride_map[d], []).append(d)
+
+        if sv == 1:
+            # Chain starts from the stick boundary.
+            # The first contribution is the stick itself (size = stick_size,
+            # effective stride = 1).  Then we look for the non-stick dim with
+            # stride == stick_size, and so on.
+            product = stick_size
+            next_stride = stick_size
+        else:
+            product = 1
+            next_stride = sv
+
+        members: list[int] = []
+        while product < want:
+            hits = stride_to_dims.get(next_stride, [])
+            if len(hits) != 1:
+                break  # ambiguous or missing: cannot safely extend chain
+            d = hits[0]
+            members.append(d)
+            product *= device_size[d]
+            next_stride = product * sv  # next expected host stride
+
+        if product == want and len(members) >= 2:
+            # Sort by stride (innermost first) so the representative (members[0])
+            # carries the smallest stride — it becomes the merged dim.
+            members.sort(key=lambda d: stride_map[d])
+            merge_groups.append(members)
+            for d in members:
+                claimed[d] = True
+
+    if not merge_groups:
+        return stl
+
+    # Apply all merges.  Each group keeps members[0] (smallest stride) with the
+    # product of the members' sizes; the rest are dropped.  Every index in
+    # ``merge_groups`` refers to the *original* layout, so all groups are
+    # applied to it first and the dropped dims are removed in a single pass.
+    # Popping while looping over the groups would shift the indices of every
+    # later group and corrupt the layout (e.g. fold a size into the stick dim).
+    dropped: set[int] = set()
+    for group in merge_groups:
+        # Groups are disjoint, so a group's members are still unmodified here.
+        device_size[group[0]] = math.prod(device_size[d] for d in group)
+        dropped.update(group[1:])
+    new_device_size = [s for d, s in enumerate(device_size) if d not in dropped]
+    new_stride_map = [s for d, s in enumerate(stride_map) if d not in dropped]
+
+    return SpyreTensorLayout(
+        device_size=new_device_size,
+        stride_map=new_stride_map,
+        device_dtype=stl.device_dtype,
+    )
+
+
 def _try_gather_ia_constraint(
     buf: ComputedBuffer,
     dep: MemoryDep,
@@ -482,6 +614,17 @@ def _try_scatter_ia_constraint(
     stl = _buf_stl(buf)
     if stl is None:
         return None
+    # A scatter through a view that changes rank (the flattened
+    # ``cache.view(-1, H, D)`` of a 4-D paged cache, torch-spyre#5125) indexes a
+    # view dim spanning several base dims. ``stl`` describes the base, so first
+    # merge the device dims the view merges; the required layout is derived from
+    # that merged layout, not from the base's.
+    view_layout = rank_changing_target_view_layout(op)
+    layout_stl = (
+        _merge_device_dims_for_view(stl, view_layout)
+        if view_layout is not None
+        else stl
+    )
     write_deps = [d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)]
     if not write_deps:
         return None
@@ -502,27 +645,44 @@ def _try_scatter_ia_constraint(
     if not access_subs:
         return None
     try:
-        write_coords = device_coordinates(stl, write_dep, sizes)
+        write_coords = device_coordinates(layout_stl, write_dep, sizes)
     except Unsupported:
+        if view_layout is not None:
+            raise
         return None
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
         substituted = coord.xreplace(access_subs)
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
             indirect_stride_idxs.append(idx)
+    if view_layout is not None and len(indirect_stride_idxs) != len(access_subs):
+        # Fail loudly: letting this through is the silent dropped-write bug.
+        raise Unsupported(
+            f"scatter {op.get_name()} writes through a rank-changing view of "
+            f"{buf.get_name()}, but its {len(access_subs)} scattered index(es) "
+            f"map onto {len(indirect_stride_idxs)} device dim(s) of the "
+            f"destination layout (device_size={list(layout_stl.device_size)}, "
+            f"stride_map={list(layout_stl.stride_map)}); indirect access needs "
+            f"each scattered index in a single device dim (torch-spyre#5125)"
+        )
     if not indirect_stride_idxs:
         return None
     indirect_device_pos = sorted(
-        len(stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
+        len(layout_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
     )
     # Compliant means all indirect dims are already at positions 0..k-1.
     expected_pos = list(range(len(indirect_stride_idxs)))
-    if indirect_device_pos == expected_pos:
+    compliant = indirect_device_pos == expected_pos
+    # The merged layout can be compliant while the buffer's actual layout (the
+    # unmerged base) is not, so only skip when nothing about it changed.
+    if compliant and layout_stl == stl:
         return None
     # Rotate the last (innermost) indirect dim to position 0, reproducing the
     # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
     # write coords right-to-left and rotated the first hit.
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
+    new_stl = (
+        layout_stl if compliant else _ia_rotate_stl(layout_stl, indirect_device_pos[-1])
+    )
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -791,12 +951,24 @@ def _insert_mutation_relayout_copy(
     buf_tmp_name = buf_tmp.get_name()
     buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
 
-    # Step 2: retarget the mutation to buf_tmp, preserving any slice offset.
+    # Step 2: retarget the mutation to buf_tmp, preserving any slice offset and
+    # any rank-changing view.
     mutation_name = mutation_op.get_name()
     original_layout = mutation_op.layout
     assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
     slice_layout = original_layout.target.get_layout()
-    if isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0:
+    rank_changing_view_layout = rank_changing_target_view_layout(mutation_op)
+    if rank_changing_view_layout is not None:
+        # Keep the view even at offset 0. The op's index expression is in the
+        # view's coordinates, and later passes (propagate_mutation_layouts) need
+        # to see that the write goes through a rank-changing view to give the op
+        # the destination's device layout (torch-spyre#5125).
+        mutation_op.layout = MutationLayoutSHOULDREMOVE(
+            ReinterpretView(data=StorageBox(buf_tmp), layout=rank_changing_view_layout)
+        )
+    elif (
+        isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0
+    ):
         mutation_op.layout = MutationLayoutSHOULDREMOVE(
             ReinterpretView(data=StorageBox(buf_tmp), layout=slice_layout)
         )

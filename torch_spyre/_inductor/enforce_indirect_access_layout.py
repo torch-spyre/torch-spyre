@@ -34,6 +34,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     ReinterpretView,
     Scatter,
@@ -61,6 +62,7 @@ from .pass_utils import (
     iteration_space_with_splits,
     padded_entry_output_stl,
     per_trip_index,
+    rank_changing_target_view_layout,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
 from . import config
@@ -113,10 +115,22 @@ def _scatter_access_subs_and_sizes(
     sizing against a different buffer's strides can silently mismatch or
     misresolve a symbol's size.
 
+    When the scatter writes through a view that changes rank (e.g. the
+    flattened ``cache.view(-1, H, D)`` of a 4-D paged cache), the symbol's
+    coefficient in ``write_dep.index`` is a stride of the *view*, and the
+    scattered extent is the *view's* dim (8192 slots), not the base dim whose
+    stride happens to equal that coefficient (the 16-entry block dim). Sizing
+    the symbol against the base layout clamps its range to the wrong extent
+    and silently drops writes (torch-spyre#5125), so size against the view.
+
     For each scatter symbol, compute its device dimension via device_coordinates
     to find the corresponding size in coord_layout.device_size.
     Returns ({sym: IndirectAccess(...)}, {sym: size}).
     """
+
+    view_layout = rank_changing_target_view_layout(scatter_op)
+    if view_layout is not None:
+        coord_layout = view_layout
 
     store_subs, _ = _build_indirect_store_subs(scatter_op)
 
@@ -416,12 +430,14 @@ def _output_real_layout(op: ComputedBuffer) -> FixedTiledLayout:
 def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
     """Unwrap a MutationLayoutSHOULDREMOVE op's layout to (target_name, target_buf).
 
-    Mirrors propagate_layouts.py's MutationLayoutSHOULDREMOVE branch, which
-    unwraps ReinterpretView chains the same way to resolve the mutation target.
+    Unwraps MutableBox wrappers (TensorBox, StorageBox) and ReinterpretView
+    chains to reach the underlying buffer, which carries the committed
+    FixedTiledLayout after finalize_layouts.  A single loop handles arbitrary
+    interleaving of MutableBox and ReinterpretView wrappers.
     """
     assert isinstance(op.layout, MutationLayoutSHOULDREMOVE)
     target = op.layout.target
-    while isinstance(target, ReinterpretView):
+    while isinstance(target, (MutableBox, ReinterpretView)):
         target = target.data
     return target.get_name(), target
 
