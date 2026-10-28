@@ -541,7 +541,7 @@ def _ia_rotate_stl(
         device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
-        reorder_valid_elements(stl, order),
+        valid_elements=reorder_valid_elements(stl, order),
     )
 
 

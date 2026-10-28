@@ -328,27 +328,26 @@ def restickify_valid_elements(
 ) -> dict[tuple[int, ...], int]:
     """Update valid_elements after moving the stick to a new host dimension.
 
-    For an ordinary transpose (old != new), the old-stick group
-    (outer dim + stick dim) and new-stick outer dim are regrouped: the lanes
-    and old_sd_outer_dim form the new stick's group with new_sd_host_size, and
-    new_sd_outer_dim becomes its own key with old_sd_host_size.  Any dim that
-    falls outside both touched sets but shared a key with a touched dim is
-    split out as a singleton with count 1.  When old == new, no move is
-    possible so an empty map is returned.  Parallel to restickify_device_size
-    and restickify_stride_map.
+    Finds the existing stick group (the key containing stick_dim) and updates
+    its count to new_sd_host_size; new_sd_outer_dim becomes a standalone key
+    with old_sd_host_size.  Any dim that shared a key with a touched dim but
+    is not itself touched is split out as a singleton with count 1.  When
+    old == new, no move is possible so an empty map is returned.  Parallel to
+    restickify_device_size and restickify_stride_map.
     """
     if old_sd_outer_dim == new_sd_outer_dim:
         return {}
     stick_dim = len(stl.device_size) - 1
-    touched = {old_sd_outer_dim, new_sd_outer_dim, stick_dim}
+    old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+    regrouped = set(old_stick_key) | {new_sd_outer_dim}
     result = {}
     for key, val in stl.valid_elements.items():
-        if touched.isdisjoint(key):
+        if regrouped.isdisjoint(key):
             result[key] = val
         else:
-            for d in set(key) - touched:
+            for d in set(key) - regrouped:
                 result[(d,)] = 1
-    result[tuple(sorted((old_sd_outer_dim, stick_dim)))] = new_sd_host_size
+    result[old_stick_key] = new_sd_host_size
     result[(new_sd_outer_dim,)] = old_sd_host_size
     return result
 
