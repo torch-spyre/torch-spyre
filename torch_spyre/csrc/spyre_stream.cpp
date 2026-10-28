@@ -288,6 +288,14 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // region extents themselves to match the allocation on both sides.
     // Slices keep their DCI and go through the conversion path, which
     // carries the region extents.
+    //
+    // The host-side and device-side extent checks are currently equivalent:
+    // spyre_copy_ rejects mismatched region sizes up front
+    // (TORCH_CHECK(cpu_sizes == dev_sizes)), and dci_is_identity_copy
+    // requires matching data formats (hence equal element sizes), so the
+    // two products are always equal here. Both halves are kept anyway as
+    // defense-in-depth, in case the size precondition is ever relaxed or
+    // copyAsync gains a caller that bypasses spyre_copy_'s check.
     const auto* allocation = get_composite_address(*dev_tensor);
     const size_t dev_total_size = static_cast<size_t>(allocation->total_size());
     const DataConversionInfo* dci_arg =
