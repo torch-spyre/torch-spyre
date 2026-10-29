@@ -308,7 +308,7 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       return "aiuInitializeP2P";
 
-    // Scheduler submit/barrier CBIDS (102-105)
+    // Scheduler submit/barrier CBIDS (102-106)
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
       return "aiuSubmitDMA";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
@@ -317,6 +317,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuSubmitFill";
     case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_BARRIER:
       return "aiuIssueBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_NULL_OP:
+      return "aiuSubmitNullOp";
     default:
       break;
   }
