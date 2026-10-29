@@ -1884,22 +1884,28 @@ def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
     # represent yet (future: insert an explicit EA conversion at extra
     # cost). Report the offending STANDARD operand (there is always one
     # here, since 3.1 failed).
-    arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
-    stl = arg.layouts[0]
-    c_stride = [concretize_expr(s) for s in arg.layout.stride]
-    mapped = next(
-        (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-        None,
-    )
-    mapped_size = (
-        concretize_expr(arg.layout.size[mapped]) if mapped is not None else "unknown"
-    )
-    raise Unsupported(
-        f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-        f"must broadcast (device stick dimension size 1) to be compatible "
-        f"with a staggered EA, and no staggered operand is broadcastable "
-        f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
-    )
+    stag_eas = [arg.layouts[0].element_arrangement for arg, _, _ in stag_split]
+    if stag_eas and all(ea in SUPPORTED_EAS for ea in stag_eas):
+        return ElementArrangement.STANDARD
+    else:
+        arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
+        stl = arg.layouts[0]
+        c_stride = [concretize_expr(s) for s in arg.layout.stride]
+        mapped = next(
+            (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
+            None,
+        )
+        mapped_size = (
+            concretize_expr(arg.layout.size[mapped])
+            if mapped is not None
+            else "unknown"
+        )
+        raise Unsupported(
+            f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
+            f"must broadcast (device stick dimension size 1) to be compatible "
+            f"with a staggered EA, and no staggered operand is broadcastable "
+            f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
+        )
 
 
 def _is_supported_pointwise_layout(
