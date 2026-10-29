@@ -1102,7 +1102,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             consumers: set[int] = set()
             for candidate in buf.candidates:
                 consumer = self._name_to_idx.get(candidate.consumer)
-                if consumer is None:
+                # Only an edge the solve carries can be served: the coupling
+                # prices the read by that edge's relation.
+                if consumer is None or (source, consumer) not in self._relations:
                     continue
                 consumers.add(consumer)
                 pairs = self._relayout_reads.setdefault((source, consumer), {})
@@ -1123,13 +1125,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             for idx in self._relayout_source
         }
         # The copies a relayout move draws from and a seam may buy: the ones
-        # that could ever be resident. One that does not fit, or whose source
-        # is pinned out of LX, is never eligible, so switching it on would only
-        # move divisions for nothing.
+        # that could ever be resident and serve. One that does not fit, whose
+        # source is pinned out of LX, or that no consumer in the solve reads,
+        # is never eligible, so switching it on would only move divisions for
+        # nothing.
         self._relayout_copy_list = sorted(
             idx
             for idx, source in self._relayout_source.items()
-            if self._relayout_fits[idx] and self._bufs[source].residency_reason is None
+            if self._relayout_fits[idx]
+            and self._bufs[source].residency_reason is None
+            and self._relayout_consumers[idx]
         )
         self._relayout_buyable = frozenset(self._relayout_copy_list)
         # The copies switched on. All start off, so the seed is the plan
@@ -2579,6 +2584,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         for i, b in enumerate(self._bufs):
             addr = addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])
+            # Replaced, not merged, as ``CpSatLayoutSolver`` does: only this
+            # solve's reads are recorded below.
+            b.chosen_relayouts = {}
             b.address = addr
             spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
             b.spill_reason = spilled if addr is None else None

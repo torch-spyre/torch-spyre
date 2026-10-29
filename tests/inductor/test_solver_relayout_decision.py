@@ -1089,6 +1089,45 @@ def test_annealer_never_draws_a_copy_whose_source_is_pinned_out():
     assert "relayout" not in solver._applicable_moves()
 
 
+def _unread_copy():
+    """P and C with one copy whose only candidate names the edge P -> C, which
+    the solve does not carry: C does not list P as a parent."""
+    reader = CoreDivisionBuffer(
+        "C",
+        64,
+        [1, 2],
+        core_divisions=[CoreDivision(splits={1: 4})],
+        cd_parent_relayouts={"P": [_candidate("C", 0, 5000.0)]},
+    )
+    return _with_copies(_producer([0, 1]), reader)
+
+
+def test_annealer_never_draws_a_copy_no_edge_in_the_solve_reads():
+    """A copy whose candidates name no edge the solve carries can never serve.
+    The relayout move must not draw it (it would have no division to set), and
+    the eligibility ripple must not look up a relation the edge does not have."""
+    bufs = _unread_copy()
+    solver = _primed_annealer(bufs)
+    copy = _index(solver, relayout_copy_name("P", 0))
+    assert solver._relayout_consumers[copy] == []
+    assert solver._relayout_copy_list == []
+    assert "relayout" not in solver._applicable_moves()
+    r = _solve("annealer", bufs)
+    assert r[relayout_copy_name("P", 0)].address is None
+
+
+def test_a_solve_replaces_chosen_relayouts(engine):
+    """Every consumer's ``chosen_relayouts`` holds only this solve's reads: an
+    entry left on the buffer from before is dropped, not merged."""
+    bufs = _pc(50000.0)
+    c = next(b for b in bufs if b.name == "C")
+    c.chosen_relayouts = {
+        "Q": ChosenRelayout(_candidate("C", 0, 5000.0, parent="Q"), 16)
+    }
+    r = _solve(engine, bufs)
+    assert r["C"].chosen_relayouts == {}
+
+
 @pytest.mark.parametrize(
     "bufs, spill",
     [
