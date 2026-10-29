@@ -20,11 +20,13 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
@@ -38,10 +40,78 @@
 #include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
 namespace {
+
+// Bound the device descriptor to the whole sticks covering the view, then
+// rebase DCI onto that staging buffer. When Flex's transfer spans this range
+// from offset zero, it can reuse the DCI instead of constructing another
+// compact conversion. Flex can still compact strided selections within the
+// bounded descriptor. For a final-token logits view, the range is one row
+// even when the tensor owns a complete prefill allocation.
+std::optional<flex::CompositeAddress> narrowD2HRange(
+    DataConversionInfo& dci, const SpyreTensorLayout& layout,
+    const flex::CompositeAddress& allocation) {
+  if (!allocation.is_single_chunk() ||
+      layout.element_arrangement != ElementArrangement::STANDARD ||
+      (layout.device_dtype != DataFormats::SEN169_FP16 &&
+       layout.device_dtype != DataFormats::IEEE_FP32 &&
+       layout.device_dtype != DataFormats::IEEE_INT32) ||
+      dci.dcsi_.empty() || dci.input_shape_.empty()) {
+    return std::nullopt;
+  }
+
+  const int64_t stick_elements = layout.elems_per_stick();
+  const int64_t element_bytes = 128 / stick_elements;
+  const int64_t allocation_elements = allocation.total_size() / element_bytes;
+  int64_t first = allocation_elements;
+  int64_t last = 0;
+  for (const auto& stride : dci.dcsi_) {
+    int64_t end = stride.offset_src_;
+    if (end < 0 || end >= allocation_elements) {
+      return std::nullopt;
+    }
+    for (size_t i = 0; i < stride.size_.size(); ++i) {
+      const int64_t count = stride.size_[i];
+      const int64_t step = stride.stride_src_[i];
+      // Check against the allocation before multiplying to avoid overflow.
+      if (count <= 0 || step < 0 ||
+          (step > 0 && count - 1 > (allocation_elements - 1 - end) / step)) {
+        return std::nullopt;
+      }
+      end += (count - 1) * step;
+    }
+    first = std::min(first, stride.offset_src_);
+    last = std::max(last, end + 1);
+  }
+  first = first / stick_elements * stick_elements;
+  last = (last + stick_elements - 1) / stick_elements * stick_elements;
+  if (last > allocation_elements || last <= first ||
+      (first == 0 && last == allocation_elements)) {
+    return std::nullopt;
+  }
+
+  // Single-chunk STANDARD storage is a dense sequence of 128-byte sticks.
+  // get_device_stride_infos builds contiguous physical device strides, so DCI
+  // offsets already include layout padding; no extra inter-stick/tile gaps
+  // need to be added when converting physical element offsets to byte offsets.
+  auto chunk = allocation.chunks().front();
+  chunk.addr.offset += first * element_bytes;
+  chunk.size = (last - first) * element_bytes;
+  for (auto& stride : dci.dcsi_) {
+    stride.offset_src_ -= first;
+  }
+  // Describe the flat staged range while preserving the original DCI rank.
+  // Shapes are innermost-first: collapse the outer dimensions to 1 so the
+  // product remains the staged element count. dcsi_ retains the view strides.
+  auto& shape = dci.input_shape_;
+  std::fill(shape.begin() + 1, shape.end(), 1);
+  shape.front() = last - first;
+  return flex::CompositeAddress(chunk);
+}
 
 // TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
 // creates/destroys individual streams when asked.
@@ -172,7 +242,7 @@ void SpyreStream::copyProgramAsync(
     void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, /*cpu_storage_bytes=*/0, device_address, nullptr,
+  copyAsyncImpl(prog_cpu_ptr, /*host_capacity=*/0, device_address, nullptr,
                 /*host2device=*/true);
 }
 
@@ -191,9 +261,10 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   const at::Tensor* cpu_tensor = host2device ? &src : &dst;
 
   if (host2device || device2host) {
-    // Host-to-device or device-to-host copy
+    // DCI offsets are relative to storage, so pass the storage base and its
+    // complete accessible extent rather than the tensor's logical view.
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
-    const size_t cpu_storage_bytes = cpu_tensor->storage().nbytes();
+    const size_t host_capacity = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
@@ -201,8 +272,71 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
-                  get_composite_address(*dev_tensor), &dci, host2device);
+    // A DCI that describes a dense same-format copy is a no-op conversion.
+    // Dropping it skips flex's host-side staging (deeptools::ConvertData runs
+    // a per-element strided loop even for identical formats) and, on H2D,
+    // keeps a pinned source buffer attached -- attachStagedSource discards it
+    // when a conversion stages into a fresh pageable buffer.
+    //
+    // The skip is only safe when the copied region is the whole device
+    // allocation: the raw DMA is sized from the allocation's total_size(),
+    // so a dense leading slice (e.g. d[:64].cpu()) would otherwise transfer
+    // past the end of the smaller host buffer. Comparing the host storage
+    // size is not sufficient either -- a same-sized host buffer backing a
+    // slice view (y[:4096].copy_(d[:4096]) on an 8192-element y) would let
+    // the whole-allocation DMA overwrite the rest of y. Require the copied
+    // region extents themselves to match the allocation on both sides.
+    // Slices keep their DCI and go through the conversion path, which
+    // carries the region extents.
+    //
+    // The host-side and device-side extent checks are currently equivalent:
+    // spyre_copy_ rejects mismatched region sizes up front
+    // (TORCH_CHECK(cpu_sizes == dev_sizes)), and dci_is_identity_copy
+    // requires matching data formats (hence equal element sizes), so the
+    // two products are always equal here. Both halves are kept anyway as
+    // defense-in-depth, in case the size precondition is ever relaxed or
+    // copyAsync gains a caller that bypasses spyre_copy_'s check.
+    const auto* allocation = get_composite_address(*dev_tensor);
+    const size_t dev_total_size = static_cast<size_t>(allocation->total_size());
+    const DataConversionInfo* dci_arg =
+        (dci_is_identity_copy(dci) &&
+         static_cast<size_t>(cpu_tensor->numel() *
+                             cpu_tensor->element_size()) == dev_total_size &&
+         static_cast<size_t>(dev_tensor->numel() *
+                             dev_tensor->element_size()) == dev_total_size)
+            ? nullptr
+            : &dci;
+
+    // The narrowed-range path is a conversion-path optimization: it rebases
+    // the DCI onto the sticks covering the view. It has nothing to offer a
+    // stripped identity copy (the region is the whole allocation by then),
+    // so only take it when the DCI is kept.
+    if (device2host && dci_arg != nullptr) {
+      if (auto range = narrowD2HRange(dci, stl, *allocation)) {
+        // Flex clones the descriptor when enqueuing; the tensor continues to
+        // own the underlying allocation, just as in the full-storage path.
+        copyAsyncImpl(cpu_ptr, host_capacity, &*range, &dci, host2device,
+                      std::make_shared<c10::Storage>(cpu_tensor->storage()));
+        return;
+      }
+    }
+
+    // Hold the host storage alive across the DMA when flex will touch the
+    // user pages after launchOperation returns: that is every D2H (the raw
+    // DMA or the conversion's write-back runs on the scheduler thread) and
+    // any DCI-less H2D (with the DCI stripped there is no caller-thread
+    // staging copy, so the scheduler thread reads the source pages
+    // directly). Hold c10::Storage rather than at::Tensor: a tensor copy
+    // shares the TensorImpl, which resize_/set_ mutate in place by swapping
+    // in a new storage -- the old pages would be freed under the in-flight
+    // DMA. The pinned branches in copyAsyncImpl replace this token with the
+    // pinned-buffer owner.
+    std::shared_ptr<void> host_lifetime;
+    if (device2host || dci_arg == nullptr) {
+      host_lifetime = std::make_shared<c10::Storage>(cpu_tensor->storage());
+    }
+    copyAsyncImpl(cpu_ptr, host_capacity, allocation, dci_arg, host2device,
+                  std::move(host_lifetime));
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -226,32 +360,98 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
+void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                                 const flex::CompositeAddress* device_address,
-                                const DataConversionInfo* dci,
-                                bool host2device) const {
+                                const DataConversionInfo* dci, bool host2device,
+                                std::shared_ptr<void> host_lifetime) const {
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
+  // A pinned CPU source/destination skips flex's IOMMU shadow-buffer path:
+  // the pre-mapped pinned buffer is submitted directly. The allocation state
+  // rides along as host_lifetime so the buffer outlives in-flight DMA even if
+  // the caller drops the tensor right after a non-blocking copy.
+  auto* allocator =
+      static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+  const auto pinned_allocation = allocator->retain(cpu_ptr);
+
   // Create and launch operation through SpyreStream's typed launch methods.
   if (host2device) {
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
-    launchH2D(params);
+    flex::DmaParams* params = nullptr;
+    if (pinned_allocation) {
+      TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
+                  "H2D host storage exceeds pinned allocation capacity: ",
+                  host_capacity, " vs ", pinned_allocation.capacity, " bytes");
+      host_lifetime = std::static_pointer_cast<void>(pinned_allocation.owner);
+      params = flex::createDmaParamsWithPinnedBuffer(
+          pinned_allocation.buffer, pinned_allocation.offset, host_capacity,
+          device_address->total_size(), host2device, device_address,
+          std::move(dci_ptr),
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else if (host_capacity > 0) {
+      params = flex::createDmaParamsWithHostCapacity(
+          cpu_ptr, device_address->total_size(), host2device, device_address,
+          host_capacity, std::move(dci_ptr),
+          /*iova=*/nullptr,
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else {
+      // host_capacity == 0 means the caller cannot state the accessible
+      // extent (program uploads assume the buffer matches the device
+      // allocation); skip the bounds-checked factory, as before.
+      params = flex::createDmaParams(cpu_ptr, device_address->total_size(),
+                                     host2device, device_address,
+                                     std::move(dci_ptr));
+    }
+    try {
+      launchH2D(params);
+    }
+    catch (...) {
+      flex::destroyDmaParams(params);
+      throw;
+    }
     flex::destroyDmaParams(params);
   } else {
-    // Pass the true host buffer capacity so flex can give ConvertData the
-    // correct out_capacity_bytes for dtype-upscaling D2H transfers (e.g.
-    // bf16→fp32), where the host buffer is larger than the device staging
-    // buffer.
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr),
-                              /*iova=*/nullptr, /*use_compute_pipeline=*/false,
-                              /*pipeline_barrier=*/false, /*skip_hazard=*/false,
-                              /*host_capacity_bytes=*/cpu_storage_bytes);
-    launchD2H(params);
+    flex::DmaParams* params = nullptr;
+    if (pinned_allocation) {
+      TORCH_CHECK(host_capacity <= pinned_allocation.capacity,
+                  "D2H host storage exceeds pinned allocation capacity: ",
+                  host_capacity, " vs ", pinned_allocation.capacity, " bytes");
+      host_lifetime = std::static_pointer_cast<void>(pinned_allocation.owner);
+      params = flex::createDmaParamsWithPinnedBuffer(
+          pinned_allocation.buffer, pinned_allocation.offset, host_capacity,
+          device_address->total_size(), host2device, device_address,
+          std::move(dci_ptr),
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    } else {
+      params = flex::createDmaParamsWithHostCapacity(
+          cpu_ptr, device_address->total_size(), host2device, device_address,
+          host_capacity, std::move(dci_ptr),
+          /*iova=*/nullptr,
+          /*use_compute_pipeline=*/false,
+          /*pipeline_barrier=*/false,
+          /*skip_hazard=*/false, std::move(host_lifetime));
+    }
+    // Neither factory forwards the D2H conversion out-buffer capacity: flex's
+    // handleDmaDataConversionD2H reads host_capacity_bytes (falling back to
+    // the device-format dma_size, which under-reports the host buffer for
+    // dtype-upscaling conversions like bf16 -> fp32).
+    // TODO(#2149-flex): writing a public DmaParams field after the factory is
+    // fragile — flex should take the D2H out-capacity as a factory argument.
+    // Tracked in a flex issue; remove this write once the factory is extended.
+    params->host_capacity_bytes = host_capacity;
+    try {
+      launchD2H(params);
+    }
+    catch (...) {
+      flex::destroyDmaParams(params);
+      throw;
+    }
     flex::destroyDmaParams(params);
   }
 }

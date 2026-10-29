@@ -21,14 +21,15 @@ path is pinned to, so the enumeration path and the reporting path cannot
 drift apart.
 """
 
-from types import SimpleNamespace
+import math
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
 from torch_spyre._inductor.cost_model import OpFeatures, relayout_ns
-from torch_spyre._inductor.dump_cost_model import governing_run_split
+from torch_spyre._inductor.cost_features import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
 from torch_spyre._inductor.scratchpad.allocator import _intern_view_group
@@ -71,19 +72,78 @@ def test_governing_run_split_picks_the_finer_view():
     assert governing_run_split(_DST, _SRC, _DEVICE_DIMS) == (128, 4)
 
 
-def test_pair_cost_reproduces_the_canonical_row():
+@pytest.mark.parametrize("kind", ["canonical", "full_replica"])
+def test_pair_cost_reproduces_the_canonical_row(kind, monkeypatch):
     # The 2.10 MB / 8 cores / run 256 B / split 4 row: direct measurement
     # 8.721 us, model 8.778 us. The enumeration price must be the same number
     # the reporting path produces (one law, two callers).
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._inductor import cost_features as dcm
+
+    source, destination, dims, expected = _SRC, _DST, _DEVICE_DIMS, 8778
+    if kind == "full_replica":
+        source = PerCoreView(((1, 2),), ((1, _CORE_ID),), num_cores=2)
+        destination = PerCoreView((), (), num_cores=32)
+        dims, expected = [2, 8, 128, 64], 484.79948811700183
+    elems = math.prod(dims)
     cost = solver_relayout_pair_cost(
-        _SRC, _DST, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
+        source,
+        destination,
+        source.num_cores,
+        dims,
+        elems,
+        _DTYPE_BYTES,
+        destination_num_cores=destination.num_cores,
     )
-    assert cost == pytest.approx(8778, rel=0.01)
+    assert cost == pytest.approx(expected, rel=0.01)
+
+    # Exercise the reporting extractor, not a second hand-written feature vector.
+    # The full replica's iteration split differs from both physical domains.
+    plan = lx_relayout.LXRelayoutPlan(
+        "source", ("consumer",), source, destination, source.num_cores
+    )
+    graph = SimpleNamespace(
+        _spyre_lx_relayout_copies={plan.edge: ("copy", plan)},
+        graph_input_names=[],
+        get_output_names=lambda: [],
+    )
+    layout = SimpleNamespace(
+        allocation={"lx": 0}, device_layout=SimpleNamespace(device_size=dims)
+    )
+    op = SimpleNamespace(
+        name="copy",
+        get_name=lambda: "copy",
+        get_operation_name=lambda: "copy_op",
+        get_layout=lambda: layout,
+        get_size=lambda: dims,
+        get_dtype=lambda: SimpleNamespace(itemsize=2),
+    )
+    monkeypatch.setattr(
+        dcm,
+        "_resolved_work_slices",
+        lambda *args: {Symbol("copy_loop"): destination.split_product},
+    )
+    with V.set_graph_handler(graph):
+        reported = dcm.extract_op_features(op)
+    assert reported.is_lx_relayout
+    assert reported.cores == destination.split_product
+    assert reported.relayout_cores == min(source.num_cores, destination.num_cores)
+    assert relayout_ns(reported) == pytest.approx(cost, rel=1e-12)
     # Direction does not enter (measured: 8.721 vs 8.701 us reversed).
     reverse = solver_relayout_pair_cost(
-        _DST, _SRC, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
+        destination,
+        source,
+        destination.num_cores,
+        dims,
+        elems,
+        _DTYPE_BYTES,
+        destination_num_cores=source.num_cores,
     )
-    assert reverse == pytest.approx(cost, rel=1e-9)
+    if kind == "full_replica":
+        assert reverse is None  # A replicated source is still unsupported.
+    else:
+        assert reverse == pytest.approx(cost, rel=1e-9)
 
 
 def test_equal_views_are_not_a_relayout():
@@ -120,7 +180,7 @@ def test_broadcast_report_uses_the_solver_price_domain(source_cores):
 
     from torch._inductor.virtualized import V
 
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     source = PerCoreView(((0, source_cores),), ((0, _CORE_ID),), num_cores=source_cores)
     destination = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=8)
@@ -203,7 +263,7 @@ def _law(run_elems, split, out_elems=_NORM_ELEMS, cores=32):
     )
 
 
-@pytest.mark.parametrize("groups", [8])
+@pytest.mark.parametrize("groups", [4, 8])
 def test_split_past_fitted_range_is_declined_not_clamped(groups):
     # A GROUPED movement keeps the old range [2, 8]: the law is fitted on
     # permutations, and a gather into a matmul's replicated operand measured
@@ -559,7 +619,8 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
     with config.patch({"sencores": 32}):
         assert core_domain_rejection(8, 8) is None
         assert core_domain_rejection(2, 32) is None
-        assert "fewer physical cores" in core_domain_rejection(32, 8)
+        assert core_domain_rejection(32, 8) is None
+        assert "integral ratio" in core_domain_rejection(32, 12)
         assert "all compute cores" in core_domain_rejection(2, 16)
     grouped = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=8)
     assert grouped_gather_rejection(matmul, 8, grouped) is None
@@ -567,7 +628,121 @@ def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
         pointwise, 8, grouped
     )
     assert grouped_gather_rejection(pointwise, 8, _DST) is None  # a permutation
+    complete = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=4)
+    assert grouped_gather_rejection(pointwise, 8, complete) is None
+    assert not lx_relayout.movement_supported(_DST, grouped, 8, 4)
     assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
+
+
+@pytest.mark.parametrize(
+    "enabled,violation",
+    [
+        (True, violation)
+        for violation in [
+            None,
+            "view_target",
+            "internal_target",
+            "late_producer",
+            "lx_target",
+            "cache_read",
+            "direct_write",
+            "mutation_name",
+            "opaque_aliases",
+            "other_write",
+            "source_mutated",
+            "source_aliased",
+            "producer_alias",
+            "tiled_consumer",
+            "tiled_producer",
+        ]
+    ]
+    + [(False, None)],
+)
+def test_persistent_scatter_requires_independent_immutable_source(
+    monkeypatch, violation, enabled
+):
+    """Structural proof must reject alias/order violations before placement."""
+    from types import SimpleNamespace
+    from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
+
+    class Input(SimpleNamespace):
+        pass
+
+    class Pointwise(SimpleNamespace):
+        pass
+
+    class Fixed(SimpleNamespace):
+        pass
+
+    class Dep(SimpleNamespace):
+        def is_indirect(self):
+            return self.indirect
+
+    source = SimpleNamespace(layout=Fixed(), get_name=lambda: "value")
+    cache = Input(
+        get_name=lambda: "cache", get_layout=lambda: Fixed(allocation={"hbm": 0})
+    )
+    update = SimpleNamespace(
+        layout=SimpleNamespace(target=cache),
+        data=Pointwise(),
+        get_name=lambda: "update",
+    )
+    later = SimpleNamespace(get_name=lambda: "later")
+    graph = SimpleNamespace(
+        graph_inputs={"cache": cache}, operations=[source, update, later]
+    )
+    for op in graph.operations:
+        op.get_mutation_names = lambda: ()
+        op.get_inputs_that_alias_output = lambda: ()
+        op.deps = SimpleNamespace(reads=[], writes=[])
+    update.get_mutation_names = lambda: ("cache",)
+    update.deps = SimpleNamespace(
+        reads=[Dep(name="value", indirect=False), Dep(name="indices", indirect=False)],
+        writes=[Dep(name="update", indirect=True)],
+    )
+    if violation == "view_target":
+        update.layout.target = SimpleNamespace(data=cache)
+    elif violation == "internal_target":
+        graph.graph_inputs = {}
+    elif violation == "lx_target":
+        cache.get_layout = lambda: Fixed(allocation={"lx": 0})
+    elif violation == "cache_read":
+        update.deps.reads.append(Dep(name="cache", indirect=False))
+    elif violation == "direct_write":
+        update.deps.writes[0].indirect = False
+    elif violation == "other_write":
+        update.deps.writes.append(Dep(name="other", indirect=True))
+    elif violation == "mutation_name":
+        update.get_mutation_names = lambda: ("other",)
+    elif violation == "source_mutated":
+        later.get_mutation_names = lambda: ("value",)
+    elif violation == "source_aliased":
+        later.get_inputs_that_alias_output = lambda: ("value",)
+    elif violation == "late_producer":
+        graph.operations = [update, source, later]
+    elif violation == "producer_alias":
+        source.get_inputs_that_alias_output = lambda: ("external",)
+    elif violation == "tiled_producer":
+        source.loop_info = object()
+    elif violation == "tiled_consumer":
+        update.loop_info = object()
+    elif violation == "opaque_aliases":
+
+        def unknown():
+            raise NotImplementedError
+
+        later.get_inputs_that_alias_output = unknown
+    monkeypatch.setattr(lx_relayout, "InputBuffer", Input)
+    monkeypatch.setattr(lx_relayout, "Pointwise", Pointwise)
+    monkeypatch.setattr(lx_relayout, "FixedTiledLayout", Fixed)
+    monkeypatch.setattr(lx_relayout, "MemoryDep", Dep)
+    monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda op: op is source)
+    monkeypatch.setattr(lx_relayout, "op_read_writes", lambda op: op.deps)
+    monkeypatch.setattr(scratchpad_utils, "op_read_writes", lambda op: op.deps)
+    with config.patch(lx_extended_ownership=enabled):
+        assert lx_relayout._persistent_scatter_consumer(
+            graph, source, update, "value"
+        ) is (enabled and violation is None)
 
 
 @pytest.mark.parametrize(

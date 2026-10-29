@@ -32,9 +32,14 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_size_in_bytes
+from .constants import (
+    RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
+)
 from .pass_utils import (
     compute_restickify_needed,
+    compute_size1_restickify_target,
     device_coordinates,
     host_coordinates,
 )
@@ -90,7 +95,9 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input device size in bytes weighted by the
+        device dtype (RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT; 32-bit formats cost 2x fp16
+        per byte) if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
@@ -103,10 +110,23 @@ class EdgeCostMap:
             stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
             if self._forbidden_stick_sym in stick_expr.free_symbols:
                 # Input stick contains a forbidden symbol (e.g. topk reduction
-                # var): this pairing is invalid even though stick_compatible
-                # accepted it. Mark as infeasible so the optimizer is forced to
-                # pick a different input candidate or output STL.
-                needed, tgt = True, None
+                # var): invalid even though stick_compatible accepted it, because
+                # the output stick is synthetic (zero) and carries no input var.
+                # Restickify the input onto a size-1 dim to move the var off the
+                # stick. tgt must either move the stick off the forbidden symbol
+                # or stay None, which is INFEASIBLE below; a target whose stick
+                # still carries the symbol is rejected rather than trusted.
+                needed = True
+                if in_stl.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES:
+                    tgt = compute_size1_restickify_target(
+                        in_stl, self._dep_layout, self.dep, self._op
+                    )
+                    if (
+                        tgt is not None
+                        and self._forbidden_stick_sym
+                        in device_coordinates(tgt, self.dep, None)[-1].free_symbols
+                    ):
+                        tgt = None
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -114,7 +134,10 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
             self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
-            cost = float(math.prod(in_stl.device_size))
+            cost = float(
+                get_device_size_in_bytes(in_stl)
+                * RESTICKIFY_DEVICE_DTYPE_COST_WEIGHT[in_stl.device_dtype]
+            )
             self._layout[in_stl][target_stl] = tgt
         self._cost[in_stl][target_stl] = cost
 

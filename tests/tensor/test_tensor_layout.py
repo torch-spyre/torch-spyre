@@ -15,11 +15,13 @@
 # Owner(s): ["module: cpp"]
 
 import copy
+import json
 import pickle
 
 import torch
 from torch.testing._internal.common_utils import (
     TestCase,
+    TemporaryFileName,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
@@ -542,6 +544,163 @@ class TestSpyreTensorLayout(TestCase):
         # Once this is implemented, this test should pass.
         self.assertEqual(x_expanded.contiguous(), x_dev.cpu())
 
+    def _assert_d2h_bytes(self, prof, expected):
+        with TemporaryFileName(mode="w+") as trace_path:
+            prof.export_chrome_trace(trace_path)
+            with open(trace_path) as trace:
+                copies = [
+                    event
+                    for event in json.load(trace)["traceEvents"]
+                    if event.get("cat") == "gpu_memcpy" and "DtoH" in event["name"]
+                ]
+        self.assertTrue(copies, "The profiler must record the actual device transfer")
+        self.assertEqual(
+            sum(event.get("args", {}).get("bytes", 0) for event in copies), expected
+        )
+
+    @parametrize(
+        "dtype,device_format",
+        [
+            (torch.float16, DataFormats.SEN169_FP16),
+            (torch.bfloat16, DataFormats.SEN169_FP16),
+            (torch.int64, DataFormats.IEEE_INT32),
+            (torch.float32, DataFormats.IEEE_FP32),
+        ],
+    )
+    @parametrize("width", [128, 130])
+    @parametrize("row", [0, 3, 7])
+    def test_d2h_row_view_transfers_only_covered_sticks(
+        self, dtype, device_format, width, row
+    ):
+        rows = 8
+        # A period coprime to the row widths makes wrong-row reads observable.
+        host = (
+            ((torch.arange(rows * width) % 251) - 125).to(dtype).reshape(1, rows, width)
+        )
+        eps = device_format.elems_per_stick()
+        sticks = (width + eps - 1) // eps
+        # The row-major physical layout produced by the compiled LM head.
+        layout = SpyreTensorLayout(
+            [rows, sticks, 1, eps], [width, eps, -1, 1], device_format
+        )
+        device = host.to("spyre", device_layout=layout)
+        view = device[:, row, :]
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = view.cpu()
+        torch.testing.assert_close(actual, host[:, row, :], rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, sticks * 128)
+
+    @parametrize(
+        "dtype,device_format",
+        [
+            (torch.float16, DataFormats.SEN169_FP16),
+            (torch.float32, DataFormats.IEEE_FP32),
+        ],
+    )
+    @parametrize("start,stop", [(5, 31), (64, 128), (5, 67), (65, 130)])
+    @parametrize("row", [0, 3, 7])
+    def test_d2h_partial_stick_view_transfer(
+        self, dtype, device_format, start, stop, row
+    ):
+        rows, width = 8, 130
+        host = ((torch.arange(rows * width) % 251) - 125).to(dtype).reshape(rows, width)
+        eps = device_format.elems_per_stick()
+        layout = SpyreTensorLayout(
+            [rows, (width + eps - 1) // eps, eps], [width, eps, 1], device_format
+        )
+        device = host.to("spyre", device_layout=layout)
+        # Offsets within one stick and aligned multi-stick slices can use DCI
+        # directly. Crossing a tile from an unaligned start uses the existing
+        # full-allocation CPU staging fallback in spyre_copy_from.
+        # A slice within one stick must transfer just that stick and preserve
+        # the source displacement within it during data conversion.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[row, start:stop].cpu()
+        torch.testing.assert_close(actual, host[row, start:stop], rtol=0, atol=0)
+        if start % eps and start % eps + stop - start > eps:
+            expected_bytes = rows * ((width + eps - 1) // eps) * 128
+        else:
+            expected_bytes = ((stop + eps - 1) // eps - start // eps) * 128
+        self._assert_d2h_bytes(prof, expected_bytes)
+
+    def test_d2h_strided_batch_slice_and_destination_dtype(self):
+        host = (
+            ((torch.arange(2 * 8 * 128) % 251) - 125)
+            .to(torch.float16)
+            .reshape(2, 8, 128)
+        )
+        layout = SpyreTensorLayout(
+            [2, 8, 2, 1, 64], [1024, 128, 64, -1, 1], DataFormats.SEN169_FP16
+        )
+        device = host.to("spyre", device_layout=layout)
+        # The bounded descriptor must preserve source strides when rebasing.
+        # Flex then compacts the two selected rows, omitting the gap and using
+        # the device item size even though the CPU destination is float32.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[:, 3, :].to(device="cpu", dtype=torch.float32)
+        torch.testing.assert_close(actual, host[:, 3, :].float(), rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, 2 * 128 * 2)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_d2h_slice_to_larger_host_dtype(self, dtype):
+        host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
+        layout = SpyreTensorLayout([8, 2, 64], [128, 64, 1], DataFormats.SEN169_FP16)
+        device = host.to("spyre", device_layout=layout)
+        # The 512-byte destination needs more capacity than the 256-byte DMA.
+        # Flex must receive the CPU storage capacity, not the staging buffer size.
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[3].to(device="cpu", dtype=torch.float32)
+        torch.testing.assert_close(actual, host[3].float(), rtol=0, atol=0)
+        self._assert_d2h_bytes(prof, 256)
+
+    @parametrize(
+        "dtype,device_format",
+        [(torch.float32, DataFormats.BFLOAT16), (torch.int32, DataFormats.IEEE_INT64)],
+    )
+    def test_d2h_other_storage_formats_use_flex_slice_transfer(
+        self, dtype, device_format
+    ):
+        host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
+        eps = device_format.elems_per_stick()
+        layout = SpyreTensorLayout([8, 128 // eps, eps], [128, eps, 1], device_format)
+        device = host.to("spyre", device_layout=layout)
+        torch.spyre.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
+            actual = device[3].cpu()
+        torch.testing.assert_close(actual, host[3], rtol=0, atol=0)
+        # torch-spyre leaves these allocation descriptors unchanged. Flex still
+        # transfers just the selected row, using its explicit device encoding.
+        self._assert_d2h_bytes(prof, (128 // eps) * 128)
+
     def test_to_layout_patched(self):
         x = torch.rand([512, 256], dtype=torch.float16)
         x_stl = SpyreTensorLayout([512, 256], torch.float16)
@@ -797,6 +956,45 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(
             list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
         )
+
+    def test_qfp8wt_layout_puts_k_next_to_the_stick(self):
+        """qfp8wt's QFP8WT output pairs K with N in a 2D stick, but the device
+        layout records only a 1D stick of N. The layout places K directly
+        outside the stick, so K is device dim -2 at every rank and readers can
+        take it from there. Rank 2 keeps its existing layout."""
+        from torch._inductor.ir import FixedLayout
+
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _qfp8wt_stl
+
+        def contiguous(size):
+            stride, acc = [], 1
+            for s in reversed(size):
+                stride.insert(0, acc)
+                acc *= s
+            return stride
+
+        cases = {
+            # host [..., K, N]: (expected device_size, expected stride_map)
+            (128, 256): ([2, 128, 128], [128, 256, 1]),
+            (4, 128, 64): ([4, 1, 128, 128], [8192, 64, 64, 1]),
+            (2, 12, 128, 128): ([2, 12, 1, 128, 128], [196608, 16384, 128, 128, 1]),
+            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [-1, 98304, 128, 384, 1]),
+        }
+        cpu = torch.device("cpu")
+        for size, (device_size, stride_map) in cases.items():
+            with self.subTest(size=size):
+                size = list(size)
+                out = _qfp8wt_stl(
+                    FixedLayout(cpu, torch.float8_e4m3fn, size, contiguous(size)),
+                    FixedLayout(cpu, torch.float16, size, contiguous(size)),
+                )
+                self.assertEqual(out.element_arrangement, ElementArrangement.QFP8WT)
+                self.assertEqual(list(out.device_size), device_size)
+                self.assertEqual(list(out.stride_map), stride_map)
+                # K: device dim -2, with K's host stride.
+                self.assertEqual(out.device_size[-2], size[-2])
+                self.assertEqual(out.stride_map[-2], contiguous(size)[-2])
 
     def test_explicit_layout_rejects_malformed_device_size(self):
         """The explicit (device_size, stride_map) constructor validates the one
