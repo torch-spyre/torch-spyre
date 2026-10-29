@@ -3058,7 +3058,7 @@ def test_compute_restickify_target_layout_factorized_new_sd():
     # so the old code returned None here.  The new code must succeed.
     target_stick_expr = sympy.floor(k / 128)
     result = compute_restickify_target_layout(
-        stl, host, target_stick_expr, ic, idc, arg=arg, reduction_type="test", label="x"
+        stl, host, target_stick_expr, ic, idc, arg=arg, label="x"
     )
     assert result is not None, (
         "compute_restickify_target_layout returned None for factorized "
