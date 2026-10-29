@@ -35,6 +35,7 @@ import torch_spyre._inductor.pass_utils as pass_utils
 from torch_spyre._inductor.propagate_layouts import PropArg
 from torch_spyre._inductor.patches import _unique_operation_names
 from torch_spyre._inductor.pass_utils import (
+    collapse_valid_elements,
     forward_valid_elements,
     prepend_dim_valid_elements,
     reorder_valid_elements,
@@ -639,6 +640,45 @@ def test_compact_broadcast_device_dims_caps_valid_elements():
     assert result.valid_elements[(1,)] == 1, (
         "collapsed broadcast dim count must be 1, not the original 8"
     )
+
+
+def test_compact_broadcast_device_dims_no_broadcast_unchanged():
+    """Non-broadcast STL: _compact_broadcast_device_dims returns it unchanged."""
+    stl = SpyreTensorLayout([4, 8, 64], [512, 64, 1], torch.float16, [0, 1, 2])
+    result = _compact_broadcast_device_dims(stl)
+    assert result is stl, "no-broadcast STL should be returned as-is"
+
+
+def test_collapse_valid_elements_basic():
+    """Two dims collapse into one; renumbering shifts the stick group."""
+    _ds = [2, 4, 8, 64]
+    stl = _stl(_ds, [2048, 512, 64, 1], {(0,): 2, (1,): 4, (2, 3): 8})
+    result = collapse_valid_elements(stl, outer_dims=[0, 1], keep=0)
+    # old dims 0 and 1 merge into new dim 0 (size 2*4=8); old dims 2,3 → 1,2.
+    assert result == {(0,): 2 * 4, (1, 2): 8}
+
+
+def test_collapse_valid_elements_renumbers_stick_group():
+    """Stick group indices shift down when intermediate dims are removed."""
+    _ds = [2, 3, 5, 64]
+    stl = _stl(_ds, [960, 320, 64, 1], {(0,): 2, (1,): 3, (2, 3): 5})
+    result = collapse_valid_elements(stl, outer_dims=[0, 1], keep=0)
+    # old dim 0 and 1 → new dim 0; old dim 2 → new dim 1; old stick 3 → new dim 2.
+    assert result == {(0,): 2 * 3, (1, 2): 5}
+
+
+def test_collapse_valid_elements_unrelated_dim_preserved():
+    """A dim not in outer_dims but between them gets renumbered correctly."""
+    _ds = [2, 5, 3, 8, 64]
+    stl = _stl(
+        _ds,
+        [5 * 3 * 8 * 64, 3 * 8 * 64, 8 * 64, 64, 1],
+        {(0,): 2, (1,): 5, (2,): 3, (3, 4): 8},
+    )
+    # Collapse dims 0 and 2 into dim 0 (keep=0); dim 1 and dims 3,4 renumber.
+    result = collapse_valid_elements(stl, outer_dims=[0, 2], keep=0)
+    # remove={2}; dims 0,2 merge → new (0,) val=6; (1,)→(1,); (3,4)→(2,3).
+    assert result == {(0,): 2 * 3, (1,): 5, (2, 3): 8}
 
 
 # Propagation through compiled ops: send tensors to device, compile the op,

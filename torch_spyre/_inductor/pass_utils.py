@@ -207,6 +207,111 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
+def forward_valid_elements(
+    stl: SpyreTensorLayout,
+) -> dict[tuple[int, ...], int]:
+    """Copy valid_elements from stl unchanged.
+
+    Use when the new STL has identical geometry to the input: dtype rescale,
+    element_arrangement-only change, broadcast-zero, clone, or any reshape
+    that does not move which device dims belong to which host dim.
+    """
+    return dict(stl.valid_elements)
+
+
+def reorder_valid_elements(
+    stl: SpyreTensorLayout,
+    new_order: list[int],
+) -> dict[tuple[int, ...], int]:
+    """Remap device-dim indices through a permutation.
+
+    new_order[new_pos] = old_pos.  Use when device dims are reordered without
+    changing which host dim they map to (e.g. nonstick_dim_order swaps).
+    """
+    inv = {old: new for new, old in enumerate(new_order)}
+    return {
+        tuple(sorted(inv[d] for d in key)): val
+        for key, val in stl.valid_elements.items()
+    }
+
+
+def collapse_valid_elements(
+    stl: SpyreTensorLayout,
+    outer_dims: list[int],
+    keep: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after collapsing several outer dims into one.
+
+    outer_dims is the sorted list of device dim indices being merged; keep is
+    the surviving dim (must be outer_dims[0]).  The merged dims' valid counts
+    are multiplied together (they all covered the same variable, so the product
+    is the total valid tile count for the new dim).  Remaining dims are
+    renumbered to account for the removed indices.
+    """
+    remove = set(outer_dims[1:])
+    # Map old dim index → new dim index after deletions.
+    shift = {d: d - sum(r < d for r in remove) for d in range(len(stl.device_size))}
+    new_ve: dict[tuple[int, ...], int] = {}
+    merged_val = 1
+    for key, val in stl.valid_elements.items():
+        if any(d in outer_dims for d in key):
+            merged_val *= val
+        else:
+            new_key = tuple(sorted(shift[d] for d in key))
+            new_ve[new_key] = val
+    new_ve[(shift[keep],)] = merged_val
+    return new_ve
+
+
+def prepend_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new outermost device dimension at index 0.
+
+    Shifts all existing dim indices by +1. The new dim at index 0 has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()
+    }
+    shifted[(0,)] = new_dim_size
+    return shifted
+
+
+def restickify_valid_elements(
+    stl: SpyreTensorLayout,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after moving the stick to a new host dimension.
+
+    Finds the existing stick group (the key containing stick_dim) and updates
+    its count to new_sd_host_size; new_sd_outer_dim becomes a standalone key
+    with old_sd_host_size.  Any dim that shared a key with a touched dim but
+    is not itself touched is split out as a singleton with count 1.  When
+    old == new, no move is possible so an empty map is returned.  Parallel to
+    restickify_device_size and restickify_stride_map.
+    """
+    if old_sd_outer_dim == new_sd_outer_dim:
+        return {}
+    stick_dim = len(stl.device_size) - 1
+    old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+    regrouped = set(old_stick_key) | {new_sd_outer_dim}
+    result = {}
+    for key, val in stl.valid_elements.items():
+        if regrouped.isdisjoint(key):
+            result[key] = val
+        else:
+            for d in set(key) - regrouped:
+                result[(d,)] = 1
+    result[old_stick_key] = new_sd_host_size
+    result[(new_sd_outer_dim,)] = old_sd_host_size
+    return result
+
+
 def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
@@ -273,83 +378,6 @@ def rescale_stl_for_dtype(
         forward_valid_elements(stl),
         ea,
     )
-
-
-def forward_valid_elements(
-    stl: SpyreTensorLayout,
-) -> dict[tuple[int, ...], int]:
-    """Copy valid_elements from stl unchanged.
-
-    Use when the new STL has identical geometry to the input: dtype rescale,
-    element_arrangement-only change, broadcast-zero, clone, or any reshape
-    that does not move which device dims belong to which host dim.
-    """
-    return dict(stl.valid_elements)
-
-
-def reorder_valid_elements(
-    stl: SpyreTensorLayout,
-    new_order: list[int],
-) -> dict[tuple[int, ...], int]:
-    """Remap device-dim indices through a permutation.
-
-    new_order[new_pos] = old_pos.  Use when device dims are reordered without
-    changing which host dim they map to (e.g. nonstick_dim_order swaps).
-    """
-    inv = {old: new for new, old in enumerate(new_order)}
-    return {
-        tuple(sorted(inv[d] for d in key)): val
-        for key, val in stl.valid_elements.items()
-    }
-
-
-def prepend_dim_valid_elements(
-    stl: SpyreTensorLayout,
-    new_dim_size: int,
-) -> dict[tuple[int, ...], int]:
-    """Add a new outermost device dimension at index 0.
-
-    Shifts all existing dim indices by +1. The new dim at index 0 has
-    new_dim_size valid elements.
-    """
-    shifted = {
-        tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()
-    }
-    shifted[(0,)] = new_dim_size
-    return shifted
-
-
-def restickify_valid_elements(
-    stl: SpyreTensorLayout,
-    old_sd_outer_dim: int,
-    old_sd_host_size: int,
-    new_sd_outer_dim: int,
-    new_sd_host_size: int,
-) -> dict[tuple[int, ...], int]:
-    """Update valid_elements after moving the stick to a new host dimension.
-
-    Finds the existing stick group (the key containing stick_dim) and updates
-    its count to new_sd_host_size; new_sd_outer_dim becomes a standalone key
-    with old_sd_host_size.  Any dim that shared a key with a touched dim but
-    is not itself touched is split out as a singleton with count 1.  When
-    old == new, no move is possible so an empty map is returned.  Parallel to
-    restickify_device_size and restickify_stride_map.
-    """
-    if old_sd_outer_dim == new_sd_outer_dim:
-        return {}
-    stick_dim = len(stl.device_size) - 1
-    old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
-    regrouped = set(old_stick_key) | {new_sd_outer_dim}
-    result = {}
-    for key, val in stl.valid_elements.items():
-        if regrouped.isdisjoint(key):
-            result[key] = val
-        else:
-            for d in set(key) - regrouped:
-                result[(d,)] = 1
-    result[old_stick_key] = new_sd_host_size
-    result[(new_sd_outer_dim,)] = old_sd_host_size
-    return result
 
 
 def op_read_writes(op: Operation) -> ReadWrites:
@@ -2535,9 +2563,9 @@ def compute_restickify_target_layout(
         restickify_valid_elements(
             stl,
             old_sd_outer_dim,
-            host_size[old_sd],
+            old_sd_host_size,
             new_sd_outer_dim,
-            host_size[new_sd],
+            new_sd_host_size,
         ),
     )
 
@@ -2614,7 +2642,23 @@ def compute_size1_restickify_layout(
         -1,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    if old_sd_outer_dim == new_sd_outer_dim:
+        # Synthetic size-1 dim reuses the old outer slot: the stick group keeps
+        # its key but its count becomes 1 (one element per stick).
+        stick_dim = len(stl.device_size) - 1
+        old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+        new_ve = {
+            k: (1 if k == old_stick_key else v) for k, v in stl.valid_elements.items()
+        }
+    else:
+        new_ve = restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            host_size[old_sd],
+            new_sd_outer_dim,
+            1,
+        )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype, new_ve)
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:

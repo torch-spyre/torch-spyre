@@ -82,6 +82,7 @@ from .ir import (
     WaitWorkFallback,
 )
 from .pass_utils import (
+    collapse_valid_elements,
     compute_restickify_target_layout,
     concretize_expr,
     expand_sparse,
@@ -1177,7 +1178,12 @@ def _collapse_outer_stick_dims(
         del new_size[d]
         del new_stride[d]
         del new_coords[d]
-    return SpyreTensorLayout(new_size, new_stride, stl.device_dtype), new_coords, keep
+    new_ve = collapse_valid_elements(stl, outer_dims, keep)
+    return (
+        SpyreTensorLayout(new_size, new_stride, stl.device_dtype, new_ve),
+        new_coords,
+        keep,
+    )
 
 
 def _rebuild_stl_for_matmul(
