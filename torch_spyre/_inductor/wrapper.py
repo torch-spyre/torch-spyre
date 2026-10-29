@@ -204,6 +204,15 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
             )
         return SpyrePythonWrapperCodegen()
 
+    def codegen(self):
+        res = super().codegen()
+        try:
+            with open("/tmp/last_inductor_wrapper.py", "w") as f:
+                f.write(res)
+        except Exception:
+            pass
+        return res
+
     def generate(self, is_inference=False):
         res = super().generate(is_inference=is_inference)
         try:
