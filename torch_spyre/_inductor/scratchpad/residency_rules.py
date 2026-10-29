@@ -312,3 +312,97 @@ def residency_rules_markdown() -> str:
             f"{exceptions} | {'; '.join(f'`{t}`' for t in tests)} |"
         )
     return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True)
+class TransferCertificate:
+    """Describe transfer and shortlist checks; these rows never dispatch admission."""
+
+    name: str
+    certificate: str
+    requires: str
+    predicate_tests: tuple[str, ...]
+    integration_tests: tuple[str, ...]
+
+
+TRANSFER_CERTIFICATES = (
+    TransferCertificate(
+        "Full-replica gather",
+        "torch_spyre._inductor.scratchpad.lx_relayout._movement_supported",
+        "ownership flag ON; complete source partition; one destination slice; "
+        "uniform fan-in/out; all source fragments; shuffle fan-in budget",
+        (
+            "test_work_division_hint.py::test_full_replica_movement_tracks_ownership_flag",
+            "test_work_division_hint.py::test_movement_rule_reads_the_owner_maps",
+        ),
+        ("test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff",),
+    ),
+    TransferCertificate(
+        "Full-replica shortlist reservation",
+        "torch_spyre._inductor.scratchpad.allocator.CoOptimizingAllocator._cap_relayout_groups",
+        "ownership flag ON; cheapest priced full replica; an existing unpinned "
+        "slot; sibling pins, prices and cap preserved; solver may decline the copy",
+        (
+            "test_solver_relayout_decision.py::test_relayout_full_replica_preserves_sibling_pins",
+        ),
+        ("test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff",),
+    ),
+    TransferCertificate(
+        "Updated-input cache snapshot",
+        "torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source",
+        "earlier direct cache mutation; immutable restickified snapshot; "
+        "original cache load and dependencies preserved",
+        (
+            "test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide",
+        ),
+        ("test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff",),
+    ),
+    TransferCertificate(
+        "Fewer-core complete partitions",
+        "torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection",
+        "integral core ratio; complete disjoint partitions; "
+        "larger domain uses every compute core; physical spans stay separate",
+        (
+            "test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector",
+        ),
+        ("test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction",),
+    ),
+    TransferCertificate(
+        "Persistent external cache scatter",
+        "torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer",
+        "fresh immutable matmul source; one external indirect overwrite; "
+        "no source alias or cache read; mutation order and lifetime preserved",
+        (
+            "test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source",
+        ),
+        (
+            "test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias",
+        ),
+    ),
+    TransferCertificate(
+        "Factored ownership",
+        "torch_spyre._inductor.slice_ownership.factor_slice_axis",
+        "exact zero-origin dense product; independent digits; "
+        "complete rectangular slices; no address rewrite or storage permission",
+        ("test_work_division_hint.py::test_factored_slice_rejects_inexact_products",),
+        ("test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction",),
+    ),
+)
+
+
+def transfer_certificates_markdown() -> str:
+    """List certificates outside the ordered residency/projection dispatch."""
+    lines = [
+        "| Certificate | Function | Requires | Predicate tests | Integration tests |",
+        "|---|---|---|---|---|",
+    ]
+    for row in TRANSFER_CERTIFICATES:
+        tests = [
+            "; ".join(f"`{test}`" for test in group) or "None"
+            for group in (row.predicate_tests, row.integration_tests)
+        ]
+        lines.append(
+            f"| {row.name} | `{row.certificate}` | {row.requires} | "
+            f"{tests[0]} | {tests[1]} |"
+        )
+    return "\n".join(lines) + "\n"

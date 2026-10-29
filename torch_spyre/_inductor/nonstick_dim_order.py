@@ -79,9 +79,14 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_size_in_bytes,
+)
 
-from .constants import MATMUL_REDUCTION_OPS
+from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
@@ -93,6 +98,7 @@ from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    compute_size1_restickify_target,
     concretize_expr,
     device_coordinates,
     find_reduction_var,
@@ -102,6 +108,7 @@ from .pass_utils import (
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
+from .work_division import MAX_SPAN_BYTES
 
 # Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
@@ -386,15 +393,6 @@ def _indirect_stride_idx(
     return None
 
 
-def _reject_stick_indexed_gather(stl: SpyreTensorLayout, stride_idx: int) -> None:
-    """Refuse a non-DL16 gather indexed along its stick dim until #4360 is fixed."""
-    if stride_idx == 0 and stl.device_dtype != DataFormats.SEN169_FP16:
-        raise Unsupported(
-            f"gather from a {stl.device_dtype} tensor indexed along its stick "
-            "dimension (#4360)"
-        )
-
-
 def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
     """Check if indirect access is at the outermost (leftmost) device position."""
     v_n = len(value_stl.stride_map)
@@ -406,7 +404,10 @@ def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    """Build a new STL with the indirect coordinate rotated to device position 0.
+
+    When the indexed coordinate is the stick, use _retile_entry_per_stick.
+    """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
@@ -415,16 +416,156 @@ def _ia_rotate_stl(
     if indirect_device_pos == 0:
         return stl
 
+    assert indirect_device_pos != stick_pos, "the indexed stick needs a re-tile"
+
     order = (
         [indirect_device_pos]
         + [i for i in range(n) if i != indirect_device_pos and i != stick_pos]
         + [stick_pos]
     )
+    new_device_size = [device_size[i] for i in order]
+    assert len(new_device_size) == n, (
+        f"rotation changed rank {n} -> {len(new_device_size)} (order={order})"
+    )
     return SpyreTensorLayout(
-        device_size=[device_size[i] for i in order],
+        device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
     )
+
+
+def _retile_entry_per_stick(
+    value_stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Re-tile a tensor whose indexed coordinate is the stick.
+
+    Rotating cannot help: it lists the stick twice and grows the rank. Instead
+    the stick moves onto a size-1 dim, so each entry sits alone on a stick and
+    the indexed coordinate becomes an outer device dim. This is the layout a
+    host ``[N, 1]`` input already receives.
+    """
+    retiled_stl = compute_size1_restickify_target(value_stl, host_layout, dep, op)
+    if retiled_stl is None:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: no size-1 stick target for {value_stl}"
+        )
+    stride_idx = _indirect_stride_idx(
+        device_coordinates(retiled_stl, dep, sizes), access_subs
+    )
+    if stride_idx is None or stride_idx == 0:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: the indexed coordinate of {retiled_stl} "
+            f"is not an outer device dim"
+        )
+    if not _dim_order_is_compliant(retiled_stl, stride_idx):
+        # The entries may land in a spare size-1 dim; a reorder brings them out.
+        indirect_device_pos = len(retiled_stl.stride_map) - 1 - stride_idx
+        retiled_stl = _ia_rotate_stl(retiled_stl, indirect_device_pos)
+
+    # A stick per entry, so a large table can outgrow the span limit. The
+    # whole table is the per-core span: it is a shared gather table or scatter
+    # destination, at one base address on every core, any of whose rows a core
+    # may address, and indirect_forbidden_split_syms keeps work division from
+    # splitting its data dims. raise_if_per_core_overflow skips indirectly
+    # accessed tensors, so this is the only check.
+    retiled_bytes = get_device_size_in_bytes(retiled_stl)
+    if retiled_bytes > MAX_SPAN_BYTES:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: one entry per stick would take "
+            f"{retiled_bytes / (1024 * 1024):.2f} MB, over the "
+            f"{MAX_SPAN_BYTES / (1024 * 1024):.2f} MB per-core limit. "
+            f"Give the tensor a trailing dimension so its entries already sit "
+            f"on separate sticks."
+        )
+    return retiled_stl
+
+
+def _ia_required_stl(
+    stl: SpyreTensorLayout,
+    stride_idx: int,
+    host_layout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Put the indexed coordinate where the indirect access can address it."""
+    if stride_idx == 0:
+        return _retile_entry_per_stick(stl, host_layout, dep, op, access_subs, sizes)
+    return _ia_rotate_stl(stl, len(stl.stride_map) - 1 - stride_idx)
+
+
+def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Whether ``b`` just reorders ``a``'s device dims.
+
+    Relabelling a producer moves no bytes, so it is only safe for a reorder.
+    """
+    return sorted(zip(a.device_size, a.stride_map)) == sorted(
+        zip(b.device_size, b.stride_map)
+    )
+
+
+def _permute_stl(stl: SpyreTensorLayout, order: list[int]) -> SpyreTensorLayout:
+    """Reorder the device dims of stl; new dim i is old dim order[i].
+
+    Unlike the plain (device_size, stride_map, dtype) constructor, this keeps
+    the element arrangement and remaps valid_elements, so padded and
+    non-STANDARD layouts survive the reorder.
+    """
+    new_pos = {old: new for new, old in enumerate(order)}
+    valid_elements = {
+        tuple(sorted(new_pos[i] for i in dims)): count
+        for dims, count in stl.valid_elements.items()
+    }
+    return SpyreTensorLayout(
+        [stl.device_size[i] for i in order],
+        [stl.stride_map[i] for i in order],
+        stl.device_dtype,
+        stl.element_arrangement,
+        valid_elements,
+    )
+
+
+def _qfp8wt_k_rotation(
+    stl: SpyreTensorLayout,
+    coords: list[sympy.Expr],
+    k_sym: sympy.Symbol,
+    name: str = "",
+) -> SpyreTensorLayout | None:
+    """Move a QFP8WT tensor's K dim directly outside the stick.
+
+    The QFP8WT 2D stick pairs K with N (the stick dim), but the device layout
+    records only a 1D stick of N, so readers take K from device coordinate -2.
+    coords are the device coordinates of a matmul's read of the tensor and
+    k_sym is that matmul's reduction variable: the coordinate it appears in is
+    K. Returns the reordered layout, or None if K is already at -2.
+
+    Raises Unsupported when no non-stick reorder can place K: the matmul
+    reduces over the stick dim itself, or K does not index exactly one
+    non-stick device dim.
+    """
+    n = len(stl.device_size)
+    if k_sym in coords[-1].free_symbols:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduces over its stick dim "
+            f"({k_sym}); the 2D stick needs K outside the stick"
+        )
+    k_positions = [i for i in range(n - 1) if k_sym in coords[i].free_symbols]
+    if len(k_positions) != 1:
+        raise Unsupported(
+            f"QFP8WT tensor {name}: the matmul reduction variable {k_sym} indexes "
+            f"device dims {k_positions}, expected exactly one non-stick dim"
+        )
+    k_pos = k_positions[0]
+    if k_pos == n - 2:
+        return None
+    order = [i for i in range(n - 1) if i != k_pos] + [k_pos, n - 1]
+    return _permute_stl(stl, order)
 
 
 def _try_gather_ia_constraint(
@@ -455,8 +596,9 @@ def _try_gather_ia_constraint(
     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
     if _dim_order_is_compliant(stl, stride_idx):
         return None
-    _reject_stick_indexed_gather(stl, stride_idx)
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos)
+    new_stl = _ia_required_stl(
+        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -519,10 +661,12 @@ def _try_scatter_ia_constraint(
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
         return None
-    # Rotate the last (innermost) indirect dim to position 0, reproducing the
+    # Move the last (innermost) indirect dim to position 0, reproducing the
     # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
     # write coords right-to-left and rotated the first hit.
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
+    new_stl = _ia_required_stl(
+        stl, indirect_stride_idxs[0], buf_layout, write_dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -531,6 +675,75 @@ def _try_scatter_ia_constraint(
     # TODO: this pin is only validated for k=1; for k>1 the other indirect dims
     # may not land at 1..k-1 after a single-pivot rotation (follow-up PR).
     return new_stl, set(range(len(indirect_device_pos)))
+
+
+def _apply_qfp8wt_k_constraint(
+    graph: GraphLowering,
+    log: dict[str, SpyreTensorLayout],
+    pinned_dims: dict[str, set[int]],
+) -> None:
+    """Place K of every QFP8WT matmul weight directly outside the stick.
+
+    For each batchmatmulfp8, K of its QFP8WT weight is the matmul's reduction
+    variable (find_reduction_var on the weight read). The weight's producer
+    layout (typically the qfp8wt output) is reordered so that dim sits at
+    device position -2, and the position is pinned. A graph-input weight
+    cannot be reordered here, and two matmuls cannot ask for different K, so
+    both raise Unsupported instead of leaving K wrong.
+    """
+    decided: dict[str, sympy.Symbol] = {}  # buffer -> K symbol of first matmul
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer) or not hasattr(op, "data"):
+            continue
+        if not (
+            isinstance(op.data, Reduction)
+            and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+        ):
+            continue
+        out_dep = next(iter(op.get_read_writes().writes), None)
+        if out_dep is None:
+            continue
+        for dep in op.get_read_writes().reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            buf = V.graph.get_buffer(dep.name)
+            stl = _buf_stl(buf)
+            if stl is None or stl.element_arrangement != ElementArrangement.QFP8WT:
+                continue
+            try:
+                k_sym = find_reduction_var((dep,), out_dep)
+            except Unsupported:
+                # No single reduction variable on this read: K cannot be
+                # determined here, so the propagated layout is kept.
+                logger.debug("nonstick_dim_order: no K for QFP8WT %s", dep.name)
+                continue
+            coords = try_device_coordinates(stl, dep, {}, op=op)
+            if coords is None:
+                continue
+            new_stl = _qfp8wt_k_rotation(stl, coords, k_sym, dep.name)
+            if dep.name in decided and new_stl is not None:
+                raise Unsupported(
+                    f"QFP8WT tensor {dep.name} is read by matmuls that disagree "
+                    "on which dim is K"
+                )
+            decided.setdefault(dep.name, k_sym)
+            pinned_dims.setdefault(dep.name, set()).add(len(stl.device_size) - 2)
+            if new_stl is None:
+                continue
+            if not isinstance(buf, ComputedBuffer) or not hasattr(buf, "committed_stl"):
+                raise Unsupported(
+                    f"QFP8WT weight {dep.name} is a graph input with K "
+                    f"({k_sym}) away from the stick; its layout cannot be "
+                    "reordered here. Produce it with K at device position -2."
+                )
+            buf.committed_stl = new_stl
+            log[dep.name] = new_stl
+            logger.info(
+                "nonstick_dim_order: QFP8WT K constraint on %s — K (%s) -> pos %d",
+                dep.name,
+                k_sym,
+                len(stl.device_size) - 2,
+            )
 
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
@@ -576,11 +789,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     stride_idx = _indirect_stride_idx(coords_sub, access_subs)
                     if stride_idx is None:
                         continue
-                    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
                     if _dim_order_is_compliant(stl, stride_idx):
                         continue  # already compliant
-                    _reject_stick_indexed_gather(stl, stride_idx)
-                    required_stl = _ia_rotate_stl(stl, indirect_device_pos)
+                    required_stl = _ia_required_stl(
+                        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+                    )
                     key = (dep.name, op.get_name())
                     if key in seen_p1:
                         continue
@@ -608,6 +821,12 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 result = _try_gather_ia_constraint(buf, dep, op)
                 if result is not None:
                     new_stl, pinned = result
+                    if not _is_permutation_of(buf.committed_stl, new_stl):
+                        # A re-tile moves bytes: copy rather than relabel.
+                        V.graph.nonstick_deferred.append(
+                            _DeferredReorder(op, dep.name, new_stl, "copy")
+                        )
+                        continue
                     buf.committed_stl = new_stl
                     log[buf.get_name()] = new_stl
                     pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
@@ -638,8 +857,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                         pinned_dims.setdefault(dest_buf.get_name(), set()).update(
                             pinned
                         )
-                        # Decide execution strategy for phase 2.
-                        if _can_mutate_producer_in_place(
+                        # Decide execution strategy for phase 2. A re-tile
+                        # moves bytes, so only a reorder may relabel in place.
+                        if _is_permutation_of(
+                            dest_stl, new_stl
+                        ) and _can_mutate_producer_in_place(
                             dest_buf, set(graph.get_output_names())
                         ):
                             V.graph.nonstick_deferred.append(
@@ -656,6 +878,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                                     op, dest_buf.get_name(), new_stl, "copy"
                                 )
                             )
+
+    # QFP8WT K constraint: a batchmatmulfp8 knows which dim of its QFP8WT
+    # weight is K (its reduction variable), so the weight's producer layout is
+    # reordered to put K directly outside the stick, where readers take it.
+    _apply_qfp8wt_k_constraint(graph, log, pinned_dims)
 
     # Phase 2: performance transforms (matmul perf reorder).
     # For each matmul op, reorder its non-graph-input input buffers so they

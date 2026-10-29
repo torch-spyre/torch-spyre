@@ -1200,9 +1200,20 @@ def test_diagonal_access_cannot_become_a_complete_relayout_source():
     )
 
 
+def test_full_replica_movement_tracks_ownership_flag():
+    source = _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2)
+    destination = _view({}, {}, 32)
+    for enabled in (False, True, False):
+        with config.patch(lx_extended_ownership=enabled):
+            assert (
+                lx_relayout_module.movement_supported(source, destination, 2, 32)
+                is enabled
+            )
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
-    dep = SimpleNamespace(name="input")
-    graph = SimpleNamespace()
+    dep = SimpleNamespace(name="input", is_indirect=lambda: False)
+    graph = SimpleNamespace(graph_inputs={"input": None}, operations=[])
     producer = SimpleNamespace()
     with (
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=True),
@@ -1216,6 +1227,22 @@ def test_lx_relayout_activation_policy_is_source_wide():
     ):
         assert not lx_relayout_module._is_activation_source(graph, {}, producer)
         assert lx_relayout_module._is_activation_source(graph, {"input": dep}, producer)
+        mutation = SimpleNamespace(
+            layout=SimpleNamespace(
+                get_buffer=lambda: SimpleNamespace(get_name=lambda: "input")
+            ),
+            loop_info=None,
+        )
+        with (
+            config.patch(lx_extended_ownership=True),
+            mock_patch.object(
+                lx_relayout_module, "MutationLayoutSHOULDREMOVE", SimpleNamespace
+            ),
+        ):
+            graph.operations = [mutation, producer, mutation]
+            assert lx_relayout_module._is_activation_source(graph, {}, producer)
+            graph.operations = [producer, mutation]
+            assert not lx_relayout_module._is_activation_source(graph, {}, producer)
 
 
 @config.patch({"sencores": 32, "lx_planner_relayout": True})
@@ -2446,3 +2473,142 @@ if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
     run_tests()
+
+
+@pytest.mark.parametrize(
+    "case", ["hole", "offset", "reversed", "overlap", "tail", "crossing", "dynamic"]
+)
+def test_factored_slice_rejects_inexact_products(case):
+    from torch_spyre._inductor.slice_ownership import factor_slice_axis
+
+    h, f = Symbol("head"), Symbol("feature")
+    coordinate, extents, size, split = 2 * h + floor(f / 64), {h: 2, f: 128}, 4, 4
+    if case == "hole":
+        coordinate, size = 3 * h + floor(f / 64), 6
+    elif case == "offset":
+        coordinate += 1
+    elif case == "reversed":
+        coordinate = 2 * h - floor(f / 64)
+    elif case == "overlap":
+        coordinate = h + floor(f / 64)
+    elif case == "tail":
+        extents[f] = 127
+    elif case == "crossing":
+        coordinate, extents, size, split = 3 * h + f, {h: 2, f: 3}, 6, 3
+    else:
+        extents[f] = Symbol("dynamic")
+    assert factor_slice_axis(coordinate, size, split, _CORE_ID, extents) is None
+
+
+@pytest.mark.parametrize(
+    "source_address,destination_address,source_bytes,destination_bytes,error",
+    [
+        (0, 8192, 8192, 16384, None),
+        (16384, 0, 8192, 16384, None),
+        (0, 8191, 8192, 16384, "overlap"),
+        (16383, 0, 8192, 16384, "overlap"),
+        (-1, 8192, 8192, 16384, "invalid physical span"),
+        (16384, -1, 8192, 16384, "invalid physical span"),
+        (0, 8192, 0, 16384, "invalid physical span"),
+        (16384, 0, 8192, 0, "invalid physical span"),
+        (None, 8192, 8192, 16384, "missing an allocated address"),
+        (16384, None, 8192, 16384, "missing an allocated address"),
+    ],
+)
+def test_contraction_requires_disjoint_full_physical_spans(
+    source_address, destination_address, source_bytes, destination_bytes, error
+):
+    plan = replace(
+        _relayout_plan(),
+        source_view=_view({0: 32}, {0: _CORE_ID}, 32),
+        destination_view=_view({0: 16}, {0: _CORE_ID}, 16),
+        num_cores=32,
+        source_address=source_address,
+        destination_address=destination_address,
+        source_footprint_bytes=source_bytes,
+        destination_footprint_bytes=destination_bytes,
+    )
+    if error is None:
+        lx_relayout_module.validate_relayout_spans(plan)
+    else:
+        with pytest.raises(RuntimeError, match=error):
+            lx_relayout_module.validate_relayout_spans(plan)
+
+
+@pytest.mark.parametrize(
+    "source_cores,destination_cores", [(32, 16), (16, 16), (16, 32)]
+)
+def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination_cores):
+    """Contraction repeats the operation frame, not tensor ownership domains."""
+    from torch_spyre._inductor.core_mapping import owner_slots, transfer_edges
+
+    row, lane = Symbol("frame_row"), Symbol("frame_lane")
+    source_owner = (
+        source_cores - 1 - _CORE_ID if source_cores == destination_cores else _CORE_ID
+    )
+    source = _view({0: source_cores}, {0: source_owner}, source_cores)
+    destination = _view({0: destination_cores}, {0: _CORE_ID}, destination_cores)
+    source_rows = owner_slots(
+        dict(source.core_to_slot), dict(source.work_slice_dims), source_cores
+    )
+    destination_rows = owner_slots(
+        dict(destination.core_to_slot),
+        dict(destination.work_slice_dims),
+        destination_cores,
+    )
+    routes = sorted(
+        transfer_edges(
+            dict(source.work_slice_dims),
+            dict(destination.work_slice_dims),
+            dict(enumerate(source_rows)),
+            dict(enumerate(destination_rows)),
+        )
+    )
+    assert {source for source, _ in routes} == set(range(source_cores))
+    assert {destination for _, destination in routes} == set(range(destination_cores))
+    # Ordinary copies do not select terminal reduction producers. Production
+    # leaves this field empty; route edges can repeat a source on expansion.
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [512, 64],
+        [row, lane],
+        {row: (512, destination_cores), lane: (64, 1)},
+        (),
+        65536,
+    )
+    assert spec.completed_producer_cores == ()
+    simplify_op_spec(spec)
+    operation_cores = math.prod(count for _, count in spec.iteration_space.values())
+    original_tensor_domains = [arg.work_division.num_cores for arg in spec.args]
+    parsed, _ = parse_op_spec(spec)
+    assert operation_cores == destination_cores
+    assert parsed.num_cores == max(source_cores, destination_cores)
+    assert (
+        [arg.work_division.num_cores for arg in parsed.args]
+        == original_tensor_domains
+        == [source_cores, destination_cores]
+    )
+    (split_dim,) = [dim for dim, count in parsed.work_slices.items() if count > 1]
+    owner = parsed.core_id_to_work_slice[split_dim]
+    if source_cores <= destination_cores:
+        core = Symbol("physical_core", integer=True)
+        assert (
+            sympy.simplify(Mod(owner.subs(_CORE_ID, core) - core, parsed.num_cores))
+            == 0
+        ), "equal/expanded operation frame was repeated"
+    assert [int(owner.subs(_CORE_ID, core)) for core in range(parsed.num_cores)] == [
+        core % destination_cores for core in range(parsed.num_cores)
+    ]
+    for argument, physical_count, expected in zip(
+        parsed.args, [source_cores, destination_cores], [source_owner, _CORE_ID]
+    ):
+        (dimension,) = [
+            dim
+            for dim, count in argument.work_division.work_slices.items()
+            if count > 1
+        ]
+        formula = argument.work_division.core_id_to_work_slice[dimension]
+        assert [
+            int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
+        ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]

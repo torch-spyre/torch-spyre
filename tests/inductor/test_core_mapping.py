@@ -1467,6 +1467,51 @@ def test_the_probe_bound_covers_the_callers_filter_too():
     assert probes(1) == 1
 
 
+def test_geometry_and_feature_import_layers():
+    """Planner queries must not import a reporting module."""
+    import ast
+    from pathlib import Path
+
+    root = Path(core_mapping_module.__file__).resolve().parent
+    for path in (root / "scratchpad").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.endswith("dump_cost_model")
+            for node in ast.walk(tree)
+        ), path
+    tree = ast.parse((root / "core_mapping.py").read_text())
+    bindings = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            bindings.update(
+                child.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bindings.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+                "core_mapping"
+            ):
+                assert {alias.name for alias in node.names} <= bindings, path
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and ("scratchpad" in node.module or node.module.endswith("pass_utils"))
+        for node in ast.walk(tree)
+    )
+
+
 @pytest.mark.parametrize("kind", ["direct", "affine", "floor"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_ownership_callers_keep_their_admission_policy(monkeypatch, kind, enabled):

@@ -88,6 +88,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index,
     _should_patch_retiled_load_indexes,
     _squeezed_retile_dims,
+    _undivided_ranges,
     coarse_tile_post_stickify,
     plan_coarse_tile_groups,
     reduction_loop_vars,
@@ -1857,6 +1858,15 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(16))
 
+    def test_pointwise_non_dividing_count_raises(self):
+        # _undivided_ranges multiplies the count back in, so it is exact only
+        # while this refusal holds.
+        data = _make_pointwise([Integer(100)])
+        op = _make_op(data)
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _divide_ranges(op, Integer(3), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(100))
+
     def test_pointwise_symbolic_count(self):
         k = Symbol("K", positive=True)
         n = Symbol("N", positive=True)
@@ -2961,6 +2971,28 @@ class TestCoarseTileNested(unittest.TestCase):
         self.assertEqual(per_level[0], {0: Integer(64)})
         # Inner level (count 2): extent = final_extent(32).
         self.assertEqual(per_level[1], {0: Integer(32)})
+
+    def test_planned_tile_extents_per_level_non_dividing_count_raises(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _planned_tile_extents_per_level,
+        )
+
+        data = _make_pointwise([Integer(100)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0),))
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
+
+    def test_undivided_ranges_restores_the_ranges_before_tiling(self):
+        data = _make_pointwise([Integer(256), Integer(128), Integer(16)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0), (3, 1)))
+        coarse_tile_post_stickify(
+            _graph([op]),
+            [([op], [(1, Integer(4)), (2, Integer(2)), (3, Integer(8))])],
+        )
+        self.assertEqual(list(data.ranges), [Integer(32), Integer(16), Integer(16)])
+        self.assertEqual(
+            _undivided_ranges(op), ((Integer(256), Integer(128), Integer(16)), ())
+        )
 
     def test_coarse_tile_plans_before_any_transformation(self):
         """coarse_tile() must fully plan every group before transforming any.
@@ -10055,6 +10087,395 @@ class TestDrainedCollective(unittest.TestCase):
                 all_reduce, "carry", self._buffer("drain", size=(16, 64))
             )
         self.assertIs(all_reduce.inputs[0], operand)
+
+    def test_output_stage_rejects_overwrite_hidden_from_liveness(self):
+        """A no-read mutation names its own write, not its storage target."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            MutationLayoutSHOULDREMOVE,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch._inductor.virtualized import ops
+
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+        from torch_spyre._inductor.pass_utils import op_read_writes
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _collective_stage_storage_is_private,
+        )
+        from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+
+            def constant(name):
+                buf = ComputedBuffer(
+                    name=name,
+                    layout=FixedLayout(torch.device("cpu"), torch.float32, [8], [1]),
+                    data=Pointwise(
+                        device=torch.device("cpu"),
+                        dtype=torch.float32,
+                        inner_fn=lambda index: ops.constant(1, torch.float32),
+                        ranges=[8],
+                    ),
+                )
+                V.graph.name_to_buffer[name] = buf
+                return buf
+
+            result = constant("result")
+            collective = AllReduceAsyncFallback(
+                torch.ops.spyre.all_reduce_async.default,
+                TensorBox(StorageBox(result)),
+                "sum",
+                "group",
+            )
+            V.graph.operations = [result, collective]
+            self.assertTrue(
+                _collective_stage_storage_is_private(V.graph, result, collective)
+            )
+            overwrite = constant("overwrite")
+            overwrite.layout = MutationLayoutSHOULDREMOVE(result)
+            V.graph.operations.insert(1, overwrite)
+            self.assertEqual(overwrite.get_mutation_names(), ["result"])
+            self.assertEqual(op_read_writes(overwrite).reads, OrderedSet())
+            self.assertEqual(
+                {dep.name for dep in op_read_writes(overwrite).writes}, {"overwrite"}
+            )
+            self.assertEqual(calculate_liveness(V.graph)["result"], [0, 2])
+            self.assertFalse(
+                _collective_stage_storage_is_private(V.graph, result, collective)
+            )
+
+
+class TestCollectiveStageCurrentUses(unittest.TestCase):
+    """Post-solve staging uses current accesses, not saved operation positions."""
+
+    def _run_stage(self, extra_reader=False, *, placed=(), span=64, real_gaps=False):
+        from contextlib import nullcontext
+
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        def access(name, reads=(), writes=()):
+            deps = inductor_deps.ReadWrites(
+                OrderedSet(
+                    inductor_deps.MemoryDep(n, sympy.S.Zero, (), ()) for n in reads
+                ),
+                OrderedSet(
+                    inductor_deps.MemoryDep(n, sympy.S.Zero, (), ()) for n in writes
+                ),
+                OrderedSet(),
+            )
+            return SimpleNamespace(
+                get_name=lambda: name,
+                get_read_writes=lambda: deps,
+                origins=(),
+            )
+
+        inserted = access("inserted", writes=("other",))
+        producer = MagicMock(spec=ComputedBuffer)
+        producer.get_name.return_value = "result"
+        producer.layout = MagicMock(spec=FixedTiledLayout)
+        producer.origins = ()
+        producer.get_read_writes.return_value = access(
+            "result", writes=("result",)
+        ).get_read_writes()
+        collective = access("all_reduce", reads=("result",))
+        operations = [inserted, producer, collective]
+        if extra_reader:
+            operations.insert(2, access("reader", reads=("result",)))
+        graph = SimpleNamespace(
+            operations=operations,
+            graph_input_names=[],
+            get_output_names=lambda: [],
+            get_buffer=lambda name: producer,
+            graph=object(),
+        )
+        buffer = LifetimeBoundBuffer("result", 64, [0, 1])
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator.size = 1024
+        gap_solver = MagicMock()
+        gap_solver.alignment = 64
+        gap_solver._pick_gap.return_value = SimpleNamespace(start=0)
+        with (
+            allocator_module.config.patch(lx_collective_output_staging=True),
+            patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=True
+            ),
+            patch.object(
+                allocator_module, "_is_matmul_op", side_effect=lambda op: op is producer
+            ),
+            patch.object(allocator_module, "_access_group_path", return_value=()),
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module.GraphEditor,
+                "collective_operand_name",
+                side_effect=lambda op: "result" if op is collective else None,
+            ),
+            patch.object(allocator_module, "origin_in_graph", return_value=object()),
+            patch.object(
+                allocator_module, "_extern_kernel_in_live_range", return_value=False
+            ) as external,
+            patch.object(
+                allocator_module,
+                "_collective_stage_storage_is_private",
+                return_value=True,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ) as gap,
+            patch.object(
+                allocator_module,
+                "get_ncores_for_buffers",
+                return_value=({}, {}, {"result": object()}),
+            ) as views,
+            patch.object(allocator_module, "partition_footprint", return_value=span),
+            nullcontext()
+            if real_gaps
+            else patch.object(
+                allocator_module, "FirstFitLayoutSolver", return_value=gap_solver
+            ),
+        ):
+            allocator._stage_collective_outputs(
+                graph, [*placed, buffer], [SimpleNamespace(consumer_names=("result",))]
+            )
+        self.assertEqual(buffer.uses, [0, 1])
+        return allocator, buffer, graph, collective, external, gap, views
+
+    def test_staging_switch_declines_before_placement(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator.size = 1024
+        allocator._collective_output_stages = {"stale": object()}
+        held = LifetimeBoundBuffer("held", 128, [0], address=64)
+        with (
+            allocator_module.config.patch(lx_collective_output_staging=False),
+            patch.object(
+                allocator_module, "calculate_liveness", return_value={}
+            ) as live,
+            patch.object(allocator_module, "FirstFitLayoutSolver") as gaps,
+            patch.object(
+                allocator_module, "clone_at_graph_boundaries", return_value=True
+            ) as clone,
+        ):
+            self.assertFalse(
+                allocator_module.config.save_config_portable()[
+                    "lx_collective_output_staging"
+                ]
+            )
+            allocator._stage_collective_outputs(
+                SimpleNamespace(get_output_names=lambda: []), [held], []
+            )
+        self.assertEqual(allocator._collective_output_stages, {})
+        self.assertEqual(held.address, 64)
+        live.assert_not_called()
+        gaps.assert_not_called()
+        clone.assert_not_called()
+        with allocator_module.config.patch(lx_collective_output_staging=True):
+            self.assertTrue(
+                allocator_module.config.save_config_portable()[
+                    "lx_collective_output_staging"
+                ]
+            )
+
+    def test_inserted_operation_does_not_hide_eligible_stage(self):
+        allocator, buffer, graph, collective, external, gap, views = self._run_stage()
+        self.assertEqual(allocator._collective_output_stages, {"result": collective})
+        self.assertEqual(buffer.address, 0)
+        external.assert_called_once_with(graph, [1, 2], excluded_op=collective)
+        gap.assert_called_once_with(graph, "result", [1, 2])
+        views.assert_called_once()
+
+    def test_new_current_reader_prevents_stage(self):
+        allocator, buffer, _, _, external, gap, views = self._run_stage(
+            extra_reader=True
+        )
+        self.assertEqual(allocator._collective_output_stages, {})
+        self.assertIsNone(buffer.address)
+        external.assert_not_called()
+        gap.assert_not_called()
+        views.assert_not_called()
+
+    def test_real_gap_solver_keeps_stages_disjoint_or_declines(self):
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            LifetimeBoundBuffer,
+            RelayoutCopyBuffer,
+        )
+
+        out, reduction = sympy.symbols("out reduction", integer=True)
+        placed = [
+            CoreDivisionBuffer(
+                "split_k",
+                512,
+                [90],
+                address=0,
+                core_divisions=[
+                    CoreDivision(
+                        splits={out: 2, reduction: 4},
+                        reduction_syms=frozenset({reduction}),
+                    )
+                ],
+                chosen_division=0,
+            ),
+            RelayoutCopyBuffer(
+                "__spyre_lx_relayout__:copy",
+                128,
+                [91],
+                address=384,
+                core_divisions=[CoreDivision()],
+                chosen_division=0,
+            ),
+            LifetimeBoundBuffer("late", 256, [92], address=768),
+        ]
+        # Reduction cores retain the full output part. Lifetimes do not
+        # overlap the candidate, but staging must still avoid every span.
+        self.assertEqual(placed[0].per_core_size(0), 256)
+        spans = ((0, 256), (384, 512), (768, 1024))
+        for span in (256, 384):
+            with self.subTest(span=span):
+                allocator, staged, _, collective, *_ = self._run_stage(
+                    placed=placed,
+                    span=span,
+                    real_gaps=True,
+                )
+                self.assertEqual([b.address for b in placed], [0, 384, 768])
+                if span == 384:
+                    self.assertIsNone(staged.address)
+                    self.assertEqual(allocator._collective_output_stages, {})
+                else:
+                    self.assertEqual(staged.address, 512)
+                    self.assertEqual(
+                        allocator._collective_output_stages, {"result": collective}
+                    )
+                    for start, end in spans:
+                        self.assertTrue(
+                            staged.address + span <= start or end <= staged.address
+                        )
+
+    def test_stage_push_rewrites_a_captured_matmul_collective(self):
+        from torch._inductor.ir import ComputedBuffer
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback, FixedTiledLayout
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.pass_utils import (
+            _is_matmul_op,
+            op_read_writes,
+            origin_in_graph,
+        )
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.graph_editor import (
+            GraphEditor,
+            unwrapped_buffer_name,
+        )
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+        def fn(x, weight):
+            return torch.ops._c10d_functional.all_reduce.default(
+                x @ weight, "sum", "test_staging"
+            )
+
+        args = (
+            torch.empty(8, 16, dtype=torch.float16),
+            torch.empty(16, 64, dtype=torch.float16),
+        )
+        gm = make_fx(fn, tracing_mode="fake")(*args)
+        inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
+        fake_mode = inputs[0].fake_mode
+        graph = GraphLowering(gm, example_inputs=inputs, shape_env=fake_mode.shape_env)
+        with (
+            V.set_graph_handler(graph),
+            V.set_fake_mode(fake_mode),
+            enable_spyre_lowerings(),
+        ):
+            graph.run(*inputs)
+            (collective,) = [
+                op for op in graph.operations if isinstance(op, AllReduceAsyncFallback)
+            ]
+            source = graph.get_buffer(GraphEditor.collective_operand_name(collective))
+            self.assertIsInstance(source, ComputedBuffer)
+            self.assertTrue(_is_matmul_op(source))
+            size, stride = list(source.layout.size), list(source.layout.stride)
+            source.layout = FixedTiledLayout(
+                torch.device("cpu"),
+                torch.float16,
+                size,
+                stride,
+                SpyreTensorLayout(size, stride, torch.float16, [0, 1]),
+            )
+            # CPU lowering does not index the extern operand's users. Include
+            # the real collective wrapper to test the editor's index update.
+            collective_user = graph.graph_outputs[0]
+            self.assertEqual(
+                unwrapped_buffer_name(collective_user), collective.get_name()
+            )
+            if collective_user not in graph.name_to_users[source.get_name()]:
+                graph.name_to_users[source.get_name()].append(collective_user)
+            original_operand = collective.inputs[0]
+            old_users = list(graph.name_to_users[source.get_name()])
+            moved_users = [
+                user
+                for user in old_users
+                if unwrapped_buffer_name(user) == collective.get_name()
+            ]
+            kept_users = [user for user in old_users if user not in moved_users]
+            self.assertTrue(moved_users)
+            allocator = ScratchpadAllocator(GreedyLayoutSolver, 4096)
+            allocator._collective_output_stages = {source.get_name(): collective}
+            view = object()
+            allocator._push_allocation(
+                graph,
+                [
+                    LifetimeBoundBuffer(
+                        source.get_name(),
+                        1024,
+                        [0, 1],
+                        address=128,
+                        lx_view=view,
+                    )
+                ],
+                [],
+            )
+
+            drain_name = GraphEditor.collective_operand_name(collective)
+            self.assertNotEqual(drain_name, source.get_name())
+            drain = graph.get_buffer(drain_name)
+            self.assertIs(graph.operations[graph.operations.index(source) + 1], drain)
+            self.assertLess(
+                graph.operations.index(drain), graph.operations.index(collective)
+            )
+            self.assertEqual(collective.get_mutation_names(), [drain_name])
+            self.assertIn(
+                drain_name, {dep.name for dep in op_read_writes(collective).reads}
+            )
+            self.assertEqual(original_operand.get_name(), source.get_name())
+            self.assertEqual(graph.name_to_users[drain_name], moved_users)
+            self.assertEqual(graph.name_to_users[source.get_name()], kept_users)
+            self.assertEqual(source.layout.allocation, {"lx": 128})
+            self.assertIs(source.layout.lx_view, view)
+            self.assertEqual(drain.layout.allocation, {})
+            self.assertIsNone(drain.layout.lx_view)
+            self.assertEqual(drain.layout.stride, source.layout.stride)
+            self.assertIs(
+                drain.origin_node.args[0], origin_in_graph(source.origins, gm.graph)
+            )
+            self.assertIs(
+                origin_in_graph(collective.origins, gm.graph).args[0], drain.origin_node
+            )
+            gm.graph.lint()
 
 
 class _LoopOp:

@@ -202,6 +202,7 @@ uint64_t emitBatch(uint32_t batch, const std::string& mode) {
     kernel.activity_kind = AIUPTI_ACTIVITY_KIND_CMPT;
     kernel.operation_kind = AIUPTI_ACTIVITY_CMPT_KIND_EXEC;
     kernel.correlation_id = batch;
+    kernel.stream_id = 3;
     kernel.start = now + 2000;
     kernel.end = now + 4000;
     std::memcpy(kernel.name, "synthetic_kernel", sizeof("synthetic_kernel"));
@@ -216,6 +217,7 @@ void emitMemcpy(uint32_t batch, bool launch, bool calibration = false) {
   copy.activity_kind = AIUPTI_ACTIVITY_KIND_MEMCPY;
   copy.copy_kind = AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD;
   copy.correlation_id = batch;
+  copy.stream_id = 5;
   copy.start = now + 1000;
   copy.end = now + 3000;
   copy.bytes = 64;

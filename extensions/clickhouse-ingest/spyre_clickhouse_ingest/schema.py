@@ -71,6 +71,9 @@ CAPABILITY_STATUS_VALUES = frozenset(
 )
 
 RUN_SOURCE_VALUES = frozenset({"jenkins", "gha"})
+RUN_LINK_RELATION_VALUES = frozenset({"launched", "retry_of"})
+RUN_LINK_EVIDENCE_VALUES = frozenset({"recorded", "cited", "inferred"})
+RUN_LINK_CONFIDENCE_VALUES = frozenset({"exact", "timestamp", "low", "unresolved"})
 PIPELINE_TYPE_VALUES = frozenset(
     {"orchestrator", "component-build", "product-test", "gha-workflow", "gha-job"}
 )
@@ -818,6 +821,31 @@ class DispatchTargets(Table):
     required = ("published_at",)
 
 
+class PipelineRunLinks(Table):
+    """A launcher-recorded run-to-run edge: an intent first, then the resolved child run."""
+
+    name = "pipeline_run_links"
+    columns = (
+        "link_id",
+        "observed_at",
+        "from_run_key",
+        "to_run_key",
+        "relation",
+        "evidence_kind",
+        "confidence",
+        "target",
+        "dispatched_at",
+        "recorded_by",
+        "props",
+    )
+    required = ("link_id", "from_run_key")
+    enums = (
+        ("relation", RUN_LINK_RELATION_VALUES),
+        ("evidence_kind", RUN_LINK_EVIDENCE_VALUES),
+        ("confidence", RUN_LINK_CONFIDENCE_VALUES),
+    )
+
+
 # Constant API, kept so installed consumers name one table model rather than copying it.
 TEST_CASES = TestCases
 TEST_CASE_RUNS = TestCaseRuns
@@ -831,6 +859,7 @@ ARTIFACT_TAGS = ArtifactTags
 ARTIFACT_RESULTS = ArtifactResults
 ARTIFACT_RESULT_REASONS = ArtifactResultReasons
 PIPELINE_RUNS = PipelineRuns
+PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
 DISPATCH_REQUESTS = DispatchRequests
@@ -852,6 +881,7 @@ TABLES = {
         Capabilities,
         CapabilityRuns,
         PipelineRuns,
+        PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
         DispatchRequests,

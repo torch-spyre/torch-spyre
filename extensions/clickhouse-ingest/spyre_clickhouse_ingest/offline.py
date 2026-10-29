@@ -71,6 +71,8 @@ SHAPE_PREFIXES = (
     ("tp", "tensor_parallel"), ("in", "input_len"), ("out", "output_len"),
     ("c", "concurrency"), ("n", "num_prompts"), ("len", "max_model_len"), ("seqs", "max_num_seqs"),
 )  # fmt: skip
+# The host resource sampler's file: records of {test_name, metric, value[, model]}.
+HOST_RESOURCES_SUFFIX = ".host_resources.json"
 # A record carrying any of these is a vLLM bench result (native) or vLLM's pytorch format.
 VLLM_SIGNATURES = (
     "avg_latency", "requests_per_second", "tokens_per_second", "request_throughput",
@@ -289,11 +291,21 @@ def check_vllm(root: Path, meta: dict, results: list) -> None:
     with `perf`. The ingest re-reads them through the live leg's extraction."""
     perf = meta.get("perf", {})
     for p in results:
-        name = Path(p).name.removesuffix(".json").removesuffix(".pytorch")
+        host = Path(p).name.endswith(HOST_RESOURCES_SUFFIX)
+        name = (
+            Path(p)
+            .name.removesuffix(".json")
+            .removesuffix(".pytorch")
+            .removesuffix(".host_resources")
+        )
         if name.split("_")[0] not in RUN_MODES:
             raise BundleError(f"{p}: the name must start with one of {RUN_MODES}_")
         records = [r for r in read_records(root / p) if isinstance(r, dict)]
-        if not any(
+        if host:
+            # The host resource sampler's records: {test_name, metric, value[, model]}.
+            if not any("metric" in r and "value" in r for r in records):
+                raise BundleError(f"{p}: no host resource metric in it")
+        elif not any(
             any(k in r for k in VLLM_SIGNATURES) or ("benchmark" in r and "metric" in r)
             for r in records
         ):

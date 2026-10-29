@@ -147,6 +147,32 @@ class _CondInnerFnRecorder(DefaultHandler):
         return f"__unexpected_{name}__"
 
 
+class _CounterStepRecorder(DefaultHandler):
+    """Records the ops a body's counter-update inner_fn issues.
+
+    The counter update the frontend produces is exactly
+    ``ops.load(<body's first placeholder>, 0) + ops.constant(1, int64)``.
+    Anything else is routed through ``_default`` and recorded as an
+    unexpected op so the caller can decline with a useful reason, mirroring
+    ``_CondInnerFnRecorder``.
+    """
+
+    def __init__(self) -> None:
+        self.loads: list[tuple[str, Any]] = []
+        self.constants: list[Any] = []
+        self.ops: list[str] = []
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if name == "load":
+            self.loads.append((args[0], args[1]))
+            return f"__load_{len(self.loads) - 1}__"
+        if name == "constant":
+            self.constants.append(args[0])
+            return f"__constant_{len(self.constants) - 1}__"
+        self.ops.append(name)
+        return f"__{name}__"
+
+
 def _first_placeholder_name(cond_graph) -> str | None:
     """The cond subgraph's own first graph input -- the iteration carry."""
     graph_inputs = getattr(cond_graph, "graph_inputs", None)
@@ -209,8 +235,165 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     return sympy.sympify(bound)
 
 
+def _unwrap_to_buffer(node: Any) -> Any:
+    """Peel TensorBox/StorageBox wrappers down to the underlying IR node."""
+    from torch._inductor import ir
+
+    seen = 0
+    while (
+        hasattr(node, "data")
+        and not isinstance(
+            node,
+            (ir.ComputedBuffer, ir.MultiOutput, ir.InputBuffer, ir.ExternKernel),
+        )
+        and seen < 8
+    ):
+        node = node.data
+        seen += 1
+    return node
+
+
+def _pointwise_zero_failure(init: Any) -> str | None:
+    """Why a scalar Pointwise buffer is not provably the constant 0, or None.
+
+    Without Spyre's lowerings (the CPU re-lowering the unit tests use) the
+    frontend's ``torch.zeros([], int64)`` becomes a scalar Pointwise computing
+    ``ops.constant(0)`` instead of an ``aten.full`` fallback kernel. Same value,
+    different IR, so both forms are proven.
+    """
+    data = getattr(init, "data", None)
+    inner_fn = getattr(data, "inner_fn", None)
+    if inner_fn is None or list(init.get_size()) != []:
+        return "counter init is not a scalar pointwise constant"
+    recorder = _CounterStepRecorder()
+    with V.set_ops_handler(recorder):
+        inner_fn(())
+    if recorder.ops or recorder.loads or len(recorder.constants) != 1:
+        return "counter init is not a single constant"
+    fill = recorder.constants[0]
+    if isinstance(fill, bool) or not isinstance(fill, (int, sympy.Integer)):
+        return f"counter init fill value {fill!r} is not an integer"
+    if int(fill) != 0:
+        return f"counter init fill value is {int(fill)}, not 0"
+    return None
+
+
+def _counter_init_failure(while_op: "ir.WhileLoop") -> str | None:
+    """Why the loop counter is not provably initialized to 0, or None if it is.
+
+    The trip count ``N`` of ``lt(counter, N)`` is the number of iterations only
+    if the counter starts at 0. The frontend's counter (``carried_inputs[0]``)
+    is always ``torch.zeros([], int64)``, which reaches the IR as a
+    ``MultiOutput`` of an ``aten.full.default`` ``FallbackKernel`` with no
+    tensor inputs. Anything else -- a caller-provided tensor, a different fill
+    value, a non-scalar -- is not proven.
+    """
+    from torch._inductor import ir
+
+    carried = getattr(while_op, "carried_inputs", None)
+    if not carried:
+        return "loop has no carried inputs, so no counter to prove"
+    init = _unwrap_to_buffer(carried[0])
+    get_dtype = getattr(init, "get_dtype", None)
+    dtype = get_dtype() if get_dtype is not None else None
+    if dtype != torch.int64:
+        return (
+            f"counter init dtype {dtype} is not the int64 the frontend's counter uses"
+        )
+    if isinstance(init, ir.ComputedBuffer):
+        return _pointwise_zero_failure(init)
+    if not isinstance(init, ir.MultiOutput):
+        return (
+            "counter init is a "
+            f"{type(init).__name__}, not a constant fill the prover can read"
+        )
+    kernel = init.inputs[0] if init.inputs else None
+    if not isinstance(kernel, ir.FallbackKernel):
+        return "counter init is not produced by a fallback kernel"
+    if getattr(kernel, "op_overload", None) is not torch.ops.aten.full.default:
+        return (
+            "counter init is produced by "
+            f"{getattr(kernel, 'op_overload', None)}, not aten.full"
+        )
+    if kernel.inputs:
+        return "counter init fill takes tensor inputs, so it is not a constant"
+    try:
+        args, _kwargs = kernel.unflatten_args(kernel.inputs, kernel.constant_args)
+    except Exception as exc:  # noqa: BLE001 -- any failure means "not proven"
+        return f"could not read the counter init arguments ({type(exc).__name__})"
+    if len(args) != 2 or list(args[0]) != []:
+        return f"counter init is not a scalar fill (args={args})"
+    fill = args[1]
+    if isinstance(fill, bool) or not isinstance(fill, (int, sympy.Integer)):
+        return f"counter init fill value {fill!r} is not an integer"
+    if int(fill) != 0:
+        return f"counter init fill value is {int(fill)}, not 0"
+    return None
+
+
+def _counter_step_failure(while_op: "ir.WhileLoop") -> str | None:
+    """Why the body does not provably advance the counter by exactly 1, or None.
+
+    The body's first output is the next value of ``carried_inputs[0]``. The
+    frontend produces ``counter + 1`` as a scalar ComputedBuffer computing
+    ``ops.load(<body's first placeholder>, 0) + ops.constant(1)``. This runs
+    that ``inner_fn`` under a recorder (the same read-only pattern as
+    ``_extract_trip_count``) and requires exactly that shape.
+    """
+    from torch._inductor import ir
+
+    body_subgraph = getattr(while_op, "body_subgraph", None)
+    body_graph = getattr(body_subgraph, "graph", None) if body_subgraph else None
+    if body_graph is None:
+        return "no body_subgraph.graph to inspect"
+    outputs = getattr(body_graph, "graph_outputs", None)
+    graph_inputs = getattr(body_graph, "graph_inputs", None)
+    if not outputs or not graph_inputs:
+        return "body subgraph has no outputs or inputs"
+    first_placeholder = next(iter(graph_inputs), None)
+
+    out0 = _unwrap_to_buffer(outputs[0])
+    if not isinstance(out0, ir.ComputedBuffer):
+        return (
+            "body does not compute a new counter in a ComputedBuffer "
+            f"(first output is a {type(out0).__name__})"
+        )
+    data = getattr(out0, "data", None)
+    inner_fn = getattr(data, "inner_fn", None)
+    if inner_fn is None or list(out0.get_size()) != []:
+        return "body's counter update is not a scalar pointwise computation"
+
+    recorder = _CounterStepRecorder()
+    with V.set_ops_handler(recorder):
+        inner_fn(())
+    if recorder.ops != ["add"]:
+        return f"body's counter update is {recorder.ops}, not a single add"
+    if len(recorder.loads) != 1 or len(recorder.constants) != 1:
+        return "body's counter update is not load(counter) + constant"
+    loaded_name, loaded_index = recorder.loads[0]
+    if loaded_name != first_placeholder or loaded_index != 0:
+        return "body's counter update does not read its own counter input"
+    step = recorder.constants[0]
+    if isinstance(step, bool) or not isinstance(step, (int, sympy.Integer)):
+        return f"body's counter step {step!r} is not an integer"
+    if int(step) != 1:
+        return f"body advances the counter by {int(step)}, not 1"
+    return None
+
+
 def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
-    """Decide whether while_op matches for_each_tile's known WhileLoop shape."""
+    """Decide whether while_op is exactly the counted loop for_each_tile builds.
+
+    Accepts only a loop whose counter (``carried_inputs[0]``) provably
+
+    * starts at 0 (``_counter_init_failure``),
+    * is advanced by exactly 1 each iteration (``_counter_step_failure``), and
+    * is compared ``counter < N`` for a provable ``N`` (``_extract_trip_count``),
+
+    so that ``N`` is the iteration count. The caller treats any declined loop as
+    ``Unsupported``: this backend does not run WhileLoops in general, and a
+    declined loop that is left in the graph compiles to wrong results.
+    """
     cond_subgraph = getattr(while_op, "cond_subgraph", None)
     cond_graph = getattr(cond_subgraph, "graph", None) if cond_subgraph else None
     if cond_graph is None:
@@ -225,6 +408,9 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
                 "lt(iteration_sym, N) comparison"
             ),
         )
+    for failure in (_counter_init_failure(while_op), _counter_step_failure(while_op)):
+        if failure is not None:
+            return ProverResult(accepted=False, reason=failure)
     return ProverResult(accepted=True, trip_count=trip_count)
 
 
@@ -3166,6 +3352,7 @@ def splice_while_loops(graph) -> None:
     """
     from torch._inductor import ir
 
+    from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.wsr.coarse_tile import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
@@ -3186,15 +3373,23 @@ def splice_while_loops(graph) -> None:
         if not while_ops:
             break
 
-        progressed = False
         for while_op in while_ops:
             result = try_prove_for_each_tile(while_op)
             if not result.accepted:
-                continue  # leave untouched; falls through to upstream's default path
+                # This backend does not run WhileLoop in general, and a loop left
+                # in the graph compiles to wrong results, so refuse it here.
+                raise Unsupported(
+                    f"WhileLoop {while_op.get_name()} is not a counted for_each_tile "
+                    f"loop this backend can run: {result.reason}"
+                )
 
             loop_var = _body_loop_var(while_op)
             if loop_var is None:
-                continue  # body shape doesn't match; leave untouched
+                raise Unsupported(
+                    f"WhileLoop {while_op.get_name()}: the body has no scalar read of "
+                    "its counter to take the loop variable from, so it is not a "
+                    "for_each_tile loop this backend can run"
+                )
 
             # Operations synthesized while splicing this loop (notably a
             # carry snapshot and STAR_DEP_KEPT tile markers) did not exist
@@ -3257,11 +3452,6 @@ def splice_while_loops(graph) -> None:
             )
 
             group_idx += 1
-            progressed = True
-
-        if not progressed:
-            # Every remaining WhileLoop was declined; stop rather than loop forever.
-            break
 
     # Stamp phase: every level has been spliced, so every op that will ever
     # exist for this compile is present in graph.operations now. Resolve each
@@ -3269,8 +3459,6 @@ def splice_while_loops(graph) -> None:
     # objects recorded during the splice phase above, which may have gone
     # stale (see this function's own docstring) -- and stamp in level order
     # (group_idx ascending, i.e. outermost first).
-    from torch_spyre._inductor.errors import Unsupported
-
     name_to_op = {op.get_name(): op for op in graph.operations}
     for loop_var, trip_count, level_group_idx, op_names in pending_levels:
         missing = [name for name in op_names if name not in name_to_op]

@@ -16,8 +16,10 @@
 
 ``_would_produce_lx_back_gap`` asks whether a device dimension is *fully
 covered* by the iteration symbols that walk it: a backGap fires when
-``device_size[d]`` exceeds the extent the coordinate actually reaches, and the
-backend supports that for HBM but not for LX.
+``device_size[d]`` exceeds the extent the coordinate actually reaches, a bare
+coordinate iterates beyond its physical extent, or normalization splits an
+overlapping coordinate into a negative-gap inner axis.
+The backend supports these gaps for HBM but not for LX.
 
 The covered extent is a property of the whole coordinate expression, not of any
 one symbol in it. These tests pin that, because the two obvious cheaper
@@ -236,6 +238,14 @@ def _back_gap(coord, extent, ranges):
 
 
 class BackGapTest(TestCase):
+    def test_negative_gap_bars_lx(self):
+        self.assertTrue(_back_gap(d0, 2, {d0: 4}))
+
+    def test_overlapping_affine_coordinate_bars_lx(self):
+        # The original row axis is fully covered, but normalization gives d1
+        # a two-row physical extent while it iterates over four rows.
+        self.assertTrue(_back_gap(2 * d0 + d1, 16, {d0: 7, d1: 4}))
+
     def test_multi_symbol_coordinate_that_covers_its_dim_has_no_gap(self):
         """``2*d1 + d3`` over ``d1 in [0,40)``, ``d3 in [0,2)`` reaches 0..79.
 

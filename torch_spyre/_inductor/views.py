@@ -473,6 +473,12 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
     values (both expressed in the single free variable of expr).  Return None if
     expr does not have exactly one free variable or if there is not exactly one
     matching dimension in coords.
+
+    .. deprecated::
+        Does not handle factorized layouts where a variable spans multiple host
+        dims. New code should use ``_host_size_stride_for_expr`` in
+        ``pass_utils.py`` instead, which resolves factorized expressions via
+        ``_factorized_chain``.
     """
     if len(expr.free_symbols) != 1:
         return None

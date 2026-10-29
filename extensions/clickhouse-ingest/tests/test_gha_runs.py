@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import time
 import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -499,6 +500,15 @@ def test_the_watermark_extends_the_window_after_an_outage():
     )
 
 
+def test_the_default_overlap_keeps_a_catch_up_chunk_from_relisting_hours():
+    mark = NOW - timedelta(days=1)
+    overlap = timedelta(hours=gha_runs.OVERLAP_HOURS)
+    start, resumed = gha_runs.window_start(
+        NOW, timedelta(hours=8), mark, overlap, timedelta(days=90)
+    )
+    assert resumed and mark - start <= timedelta(hours=1)
+
+
 def test_catch_up_is_capped_but_an_explicit_backfill_is_not():
     day = timedelta(days=1)
     args = (timedelta(hours=6), timedelta(days=90))
@@ -605,7 +615,7 @@ def _cli(monkeypatch, clock, runs, order, **api):
     monkeypatch.setattr(
         gha_runs, "GitHub", lambda token, **kw: FakeAPI(runs, clock=clock, **api, **kw)
     )
-    argv = ["poll", "--deadline-minutes", "12", "--dry-run"]
+    argv = ["poll", "--deadline-minutes", "12", "--workers", "1", "--dry-run"]
     try:
         gha_runs.main(argv + [a for repo in order for a in ("--repo", repo)])
     except SystemExit as stop:
@@ -789,3 +799,84 @@ def test_a_skipped_run_is_fetched_again_on_the_next_poll():
     gh.fail = False
     gha_runs.poll(gh, client, "db", REPO, start, end)
     assert any("/7#1" in r["run_key"] for r in client.inserted)
+
+
+class SlowGitHub(FakeGitHub):
+    """Earlier runs answer slowest, so a concurrent poll finishes them out of order."""
+
+    def __init__(self, runs, stop_at=None):
+        super().__init__(runs)
+        self.stop_at = stop_at
+
+    def jobs(self, repo, run_id, attempt):
+        if run_id == self.stop_at:
+            raise gha_runs.Stop("deadline reached")
+        time.sleep(0.002 * (20 - run_id % 20))
+        return super().jobs(repo, run_id, attempt)
+
+
+def _workflow_keys(client):
+    return [
+        r["run_key"] for r in client.inserted if r["pipeline_type"] == "gha-workflow"
+    ]
+
+
+def test_concurrent_workers_store_the_same_rows_in_order():
+    runs = [_run(id=100 + i, run_attempt=1 + i % 2) for i in range(12)]
+    seq, par = FakeClient(), FakeClient()
+    a = gha_runs.poll(SlowGitHub(runs), seq, "db", REPO, *_window())
+    b = gha_runs.poll(SlowGitHub(runs), par, "db", REPO, *_window(), workers=4)
+    assert a == b and a[0] == 18
+    assert par.inserted == seq.inserted
+
+
+def test_a_stop_with_concurrent_workers_leaves_a_prefix_not_a_hole():
+    runs = [_run(id=100 + i) for i in range(12)]
+    client = FakeClient()
+    _, _, reason = gha_runs.poll(
+        SlowGitHub(runs, stop_at=106), client, "db", REPO, *_window(), workers=4
+    )
+    assert reason == "deadline reached"
+    assert _workflow_keys(client) == [f"gha:{REPO}/{100 + i}#1" for i in range(6)]
+
+
+def test_poll_output_is_the_recorded_rows_of_the_sequential_loop():
+    # The 15-minute path (workers=1) must keep writing exactly these rows, in this order.
+    gh = FakeGitHub([_run(id=1, run_attempt=2), _run(id=2)])
+    client = FakeClient()
+    assert gha_runs.poll(gh, client, "db", REPO, *_window()) == (3, 6, "")
+    assert [(r["run_key"], r["pipeline_type"]) for r in client.inserted] == [
+        (f"gha:{REPO}/1#1", "gha-workflow"),
+        (client.inserted[1]["run_key"], "gha-job"),
+        (f"gha:{REPO}/1#2", "gha-workflow"),
+        (client.inserted[3]["run_key"], "gha-job"),
+        (f"gha:{REPO}/2#1", "gha-workflow"),
+        (client.inserted[5]["run_key"], "gha-job"),
+    ]
+    assert gh.calls == [("attempt", 1), ("jobs", 1), ("jobs", 2), ("jobs", 1)]
+
+
+def test_the_freshest_repo_polls_first_and_the_laggard_inherits_its_time(
+    clock, monkeypatch, capsys
+):
+    busy, hf, si = REPOS
+    now = datetime.now(timezone.utc)
+    marks = {busy: now - timedelta(hours=7), hf: now, si: now - timedelta(minutes=5)}
+    monkeypatch.setattr(gha_runs, "watermark", lambda c, db, repo: marks[repo])
+    monkeypatch.setattr(gha_runs, "connect", lambda database="": (Store(), "db"))
+    runs = {busy: _recent(1, 50), hf: _recent(2, 1), si: _recent(3, 1)}
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setattr(
+        gha_runs, "GitHub", lambda token, **kw: FakeAPI(runs, clock=clock, **kw)
+    )
+    with pytest.raises(SystemExit):
+        gha_runs.main(
+            ["poll", "--deadline-minutes", "12", "--workers", "1"]
+            + [a for r in (busy, hf, si) for a in ("--repo", r)]
+        )
+    err = capsys.readouterr().err
+    starts = [
+        line.split(":")[0].split()[-1] for line in err.splitlines() if "from " in line
+    ]
+    assert starts == [hf, si, busy]
+    assert "lag 7.0 h" in err
