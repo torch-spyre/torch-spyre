@@ -130,6 +130,314 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
 
+    @parametrize(
+        "factory",
+        [
+            subtest(
+                lambda: torch.empty((64, 64), dtype=torch.float16, pin_memory=True),
+                name="empty",
+            ),
+            subtest(
+                lambda: torch.empty_strided(
+                    (64, 64),
+                    (1, 64),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="empty_strided",
+            ),
+        ],
+    )
+    def test_cpu_factory_pin_memory(self, factory):
+        cpu = factory()
+
+        self.assertEqual(cpu.device.type, "cpu")
+        self.assertTrue(cpu.is_pinned())
+
+        expected = (torch.arange(cpu.numel(), dtype=torch.int64) % 31).to(cpu.dtype)
+        cpu.copy_(expected.reshape(cpu.shape))
+        actual = cpu.to("spyre").cpu()
+        torch.testing.assert_close(actual, cpu, rtol=0, atol=0)
+
+    def test_cpu_pin_memory_method_and_interior_view(self):
+        values = (torch.arange(4128, dtype=torch.int64) % 31).to(torch.float16)
+        base = values.pin_memory()
+        view = base[17:4113]
+
+        self.assertTrue(base.is_pinned())
+        self.assertTrue(view.is_pinned())
+        self.assertEqual(
+            view.data_ptr(),
+            base.data_ptr() + 17 * base.element_size(),
+        )
+
+    def test_explicit_pinned_d2h(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=True)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertTrue(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    def test_pageable_d2h_remains_supported(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=False)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertFalse(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    # The DCI-skip optimization must reject anything that is not a dense
+    # same-format copy: for each layout below, dci_is_identity_copy has to
+    # keep the conversion descriptor, and a round trip through the device
+    # must reproduce the view's values exactly. (If the predicate wrongly
+    # accepted the layout, the raw DMA would move storage bytes a plain
+    # memcpy would — including bytes before a storage offset or stride
+    # gaps — and the comparison would fail.)
+    #
+    # These run in same-format dtypes (int8, fp32): fp16/bf16 host and
+    # device formats differ, so their DCIs are rejected at the dataformat
+    # check before the offset/stride/broadcast logic is ever reached and
+    # would not exercise the layout rejection at all.
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_storage_offset_view_keeps_conversion(self, dtype):
+        base = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        pinned = base.pin_memory()
+        view = pinned[37:8101]  # non-zero storage offset + partial slice
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_strided_view_keeps_conversion(self, dtype):
+        base = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype)
+        pinned = base.pin_memory()
+        view = pinned.view(64, 64)[:, ::2]  # stride gaps between rows
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_broadcast_strides_keeps_conversion(self, dtype):
+        row = (torch.arange(64, dtype=torch.int64) % 31).to(dtype)
+        pinned = row.pin_memory()
+        view = pinned.unsqueeze(0).expand(32, 64)  # broadcast (zero) stride
+
+        dev = view.to("spyre")
+        torch.testing.assert_close(dev.cpu(), view, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_h2d_into_device_slice_keeps_conversion(self, dtype):
+        # The device side is the strided side here: a copy into a device slice
+        # must keep its DCI, since a raw DMA would write storage-base-relative
+        # bytes instead of the slice's. The offset is stick-aligned (128
+        # elements is a whole stick for both int8 and fp32) so the test does
+        # not depend on the pre-existing mid-stick int8 slice bug, which is
+        # flex-version dependent.
+        pinned = (torch.arange(4096, dtype=torch.int64) % 31).to(dtype).pin_memory()
+        dev = torch.zeros(8192, dtype=dtype, device="spyre")
+
+        dev[128:4224].copy_(pinned)
+        torch.testing.assert_close(dev[128:4224].cpu(), pinned, rtol=0, atol=0)
+        torch.testing.assert_close(
+            dev[:128].cpu(), torch.zeros(128, dtype=dtype), rtol=0, atol=0
+        )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_d2h_from_device_slice_keeps_conversion(self, dtype):
+        # Mirror of the above: reading a device slice out into a pinned host
+        # tensor must also keep the conversion for the device-side offset.
+        # Stick-aligned offset, same rationale as above.
+        dev = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype).to("spyre")
+        y = torch.empty(4096, dtype=dtype, pin_memory=True)
+
+        y.copy_(dev[128:4224])
+        torch.testing.assert_close(y, dev[128:4224].cpu(), rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_slice_copy_into_same_size_host_buffer(self, dtype):
+        # Regression test: the identity-copy skip must compare the copied
+        # region, not the host storage size. y is exactly as large as the
+        # device allocation, but only y[:4096] is the copy destination -- a
+        # whole-allocation raw DMA here would overwrite y[4096:] with device
+        # data (silent corruption).
+        src = ((torch.arange(8192, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        for pin in (False, True):
+            y = torch.full((8192,), -1, dtype=dtype, pin_memory=pin)
+            y[:4096].copy_(dev[:4096])
+            torch.testing.assert_close(y[:4096], src[:4096], rtol=0, atol=0)
+            torch.testing.assert_close(
+                y[4096:], torch.full((4096,), -1, dtype=dtype), rtol=0, atol=0
+            )
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_pinned_round_trip_same_format(self, dtype):
+        # The flagship fast-path combination: a same-format pinned tensor is
+        # submitted as a raw pinned DMA (DCI stripped) in both directions.
+        # fp16 keeps the conversion path and never exercises this.
+        x = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        pinned = x.pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), x, rtol=0, atol=0)
+
+        y = torch.empty(8192, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(y, x, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_d2h_dense_leading_slice(self, dtype):
+        # d[:4096].cpu() is dense with offset 0 but covers only part of the
+        # device allocation: the identity-copy skip must not fire, or the raw
+        # DMA (sized from the whole allocation) would overrun the 4096-element
+        # host buffer returned by .cpu().
+        src = (torch.arange(8192, dtype=torch.int64) % 31).to(dtype)
+        dev = src.to("spyre")
+
+        out = dev[:4096].cpu()
+        torch.testing.assert_close(out, src[:4096], rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pageable_h2d_source_freed(self, dtype):
+        # With the DCI stripped there is no caller-thread staging copy, so
+        # flex reads the pageable source pages from the scheduler thread
+        # after the copy call returns. Dropping the only reference right
+        # after a non-blocking copy must not free those pages under the
+        # in-flight DMA.
+        n = 8192
+        dev = torch.empty(n, dtype=dtype, device="spyre")
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        expected = src.clone()
+
+        dev.copy_(src, non_blocking=True)
+        del src
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize(
+        "dtype",
+        [
+            subtest(torch.int8, name="int8"),
+            subtest(torch.float32, name="fp32"),
+        ],
+    )
+    def test_non_blocking_pinned_d2h_freed_and_reused(self, dtype):
+        # A pinned destination freed to the staging cache right after a
+        # non-blocking D2H must not be handed back out while the DMA is
+        # still writing it (the in-flight buffer is retained by the DMA's
+        # completion callback). Whether the next allocation recycles the
+        # freed buffer is timing-dependent, so this checks the observable
+        # contract: the copy completes without error and later pinned
+        # traffic through the cache is intact.
+        n = 8192
+        src = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        dev = src.to("spyre")
+
+        y = torch.empty(n, dtype=dtype, pin_memory=True)
+        y.copy_(dev, non_blocking=True)
+        del y
+
+        z = torch.empty(n, dtype=dtype, pin_memory=True)
+        z.fill_(-1)
+        torch.accelerator.synchronize()
+
+        expected = ((torch.arange(n, dtype=torch.int64) % 31) + 1).to(dtype)
+        torch.testing.assert_close(
+            z.copy_(dev, non_blocking=False), expected, rtol=0, atol=0
+        )
+
+    def test_pinned_h2d_partial_stick_layout_keeps_conversion(self):
+        # 64x32 int8 maps to a partial-stick device layout: the DCI carries
+        # real stickification and must survive the identity-copy skip.
+        expected = (torch.arange(64 * 32, dtype=torch.int64) % 31).to(torch.int8)
+        pinned = expected.reshape(64, 32).pin_memory()
+
+        dev = pinned.to("spyre")
+        torch.testing.assert_close(dev.cpu(), pinned, rtol=0, atol=0)
+
+    def test_zero_size_pinned_allocation(self):
+        cpu = torch.empty(0, dtype=torch.float16, pin_memory=True)
+        self.assertEqual(cpu.numel(), 0)
+        self.assertEqual(cpu.device.type, "cpu")
+
+    def test_empty_host_cache_preserves_active_allocation(self):
+        active = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        active.fill_(7)
+
+        torch.accelerator.empty_host_cache()
+
+        self.assertTrue(active.is_pinned())
+        self.assertTrue(active.eq(7).all())
+
+        del active
+        torch.accelerator.empty_host_cache()
+        replacement = torch.empty(4096, dtype=torch.float16, pin_memory=True)
+        self.assertTrue(replacement.is_pinned())
+
     def test_empty_factory_in_device_context(self):
         # The error only repros if at least one allocation
         # has already happened

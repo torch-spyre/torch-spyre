@@ -18,20 +18,26 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from itertools import permutations
 from typing import Any, Callable
 
+import sympy
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
+from .slice_ownership import factor_slice_axis, project_slice_axis
 
 
-# pass_utils imports this module; keep its PerCoreView type out of this layer.
 # TensorWorkDivision imports the comparator only when its method is called.
 _MAX_OWNER_PERMUTATION_DIMS = 5
+
+
+# Conservative physical incoming-fragment bound; not a measured cost limit.
+_MAX_SHUFFLE_FANIN = 8
 
 
 _MAX_EXACT_OWNERSHIP_POINTS = 1024
@@ -1019,3 +1025,262 @@ def _core_mappings_equal_cached(
         return True
     except (TypeError, ValueError):
         return False
+
+
+@dataclass(frozen=True)
+class PerCoreView:
+    """Geometric description of a buffer's per-core slicing.
+
+    - work_slice_dims: (device-dim index, split factor) pairs, one per
+      split dim.
+    - core_to_slot: (device-dim index, slice-index expression in core_id)
+      pairs giving each core's position along that split dim.
+    - num_cores: physical cores over which ``core_to_slot`` is defined. This
+      can exceed the number of logical slices when data is replicated.
+      If omitted, the split product is used. Views that omit a reduction axis
+      or describe broadcast copies must retain the explicit physical count.
+
+    The first two fields are keyed by the buffer's device-dim index — not by
+    op-local iter symbols — so the value depends only on the buffer's physical
+    slicing.
+
+    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
+        work_slice_dims = ((0, 4),)
+        core_to_slot    = ((0, Mod(core_id, 4)),)
+    so core_id=2 owns slot 2 along dim 0.
+    """
+
+    work_slice_dims: tuple[tuple[int, int], ...]
+    core_to_slot: tuple[tuple[int, Expr], ...]
+    split_product: int
+    num_cores: int | None = None
+
+    def __init__(
+        self,
+        work_slice_dims: tuple[tuple[int, int], ...],
+        core_to_slot: tuple[tuple[int, Expr], ...],
+        num_cores: int | None = None,
+        *,
+        split_product: int = 0,  # dummy arg to absorb automatically copied args
+    ):
+        object.__setattr__(self, "work_slice_dims", work_slice_dims)
+        object.__setattr__(self, "core_to_slot", core_to_slot)
+        object.__setattr__(
+            self, "split_product", math.prod(split for _, split in work_slice_dims)
+        )
+        object.__setattr__(self, "num_cores", num_cores)
+
+    def same_partition(self, other: "PerCoreView") -> bool:
+        """Whether both views assign every physical core the same buffer slice."""
+
+        return same_owner_maps(
+            dict(self.work_slice_dims),
+            dict(self.core_to_slot),
+            self.num_cores if self.num_cores is not None else self.split_product,
+            dict(other.work_slice_dims),
+            dict(other.core_to_slot),
+            other.num_cores if other.num_cores is not None else other.split_product,
+        )
+
+
+def work_division_from_view(
+    view: PerCoreView | None,
+    device_size: Sequence[int],
+    device_coordinates: Sequence[sympy.Expr],
+    iteration_space: Mapping[sympy.Symbol, sympy.Expr],
+    *,
+    allow_extended: bool,
+) -> TensorWorkDivision | None:
+    """Interpret physical slices through an access, without choosing new owners."""
+    if view is None:
+        return None
+    n = view.num_cores
+    if n is None or n <= 0:
+        raise ValueError("LX ownership must carry its physical core domain")
+    if len(device_size) != len(device_coordinates):
+        raise ValueError("sizes and coordinates differ in rank")
+    physical_splits, slots = dict(view.work_slice_dims), dict(view.core_to_slot)
+    if len(physical_splits) != len(view.work_slice_dims) or len(slots) != len(
+        view.core_to_slot
+    ):
+        raise ValueError("duplicate physical dimensions")
+    rows = owner_slots(slots, physical_splits, n)
+    axes_by_loop: dict[sympy.Symbol, list[int]] = {}
+    # Only the local proof coordinates may be reduced. Callers and emitted
+    # tensor accesses retain the original multi-loop coordinate expressions.
+    proof_coordinates = list(device_coordinates)
+    for axis, split in physical_splits.items():
+        if (
+            not 0 <= axis < len(device_size)
+            or sympy.sympify(device_size[axis]).is_Integer is not True
+            or device_size[axis] <= 0
+            or device_size[axis] % split
+        ):
+            raise ValueError(
+                f"unsupported ownership input: axis {axis} not divisible by {split}"
+            )
+        symbols = device_coordinates[axis].free_symbols
+        if len(symbols) == 1 and symbols <= iteration_space.keys():
+            loop = next(iter(symbols))
+        else:
+            if not allow_extended:
+                raise ValueError(f"cannot map device dimension {axis} to one loop")
+            projected = project_slice_axis(
+                device_coordinates[axis], int(device_size[axis]), split, iteration_space
+            )
+            if projected is None:
+                # Keep the physical stick axis intact. Expand only the local
+                # proof frame, then reuse the exact loop-region proof below.
+                factors = (
+                    factor_slice_axis(
+                        device_coordinates[axis],
+                        int(device_size[axis]),
+                        split,
+                        slots[axis],
+                        iteration_space,
+                    )
+                    if axis != len(device_size) - 1
+                    else None
+                )
+                if factors is None:
+                    raise ValueError(f"cannot map device dimension {axis} to one loop")
+                shift = len(factors) - 1
+                new_splits, new_slots = {}, {}
+                for a, count in physical_splits.items():
+                    if a != axis:
+                        new_axis = a + shift if a > axis else a
+                        new_splits[new_axis], new_slots[new_axis] = count, slots[a]
+                for offset, (_, _, count, owner) in enumerate(factors):
+                    if count > 1:
+                        new_splits[axis + offset] = count
+                        new_slots[axis + offset] = owner
+                return work_division_from_view(
+                    PerCoreView(
+                        tuple(sorted(new_splits.items())),
+                        tuple(sorted(new_slots.items())),
+                        num_cores=n,
+                    ),
+                    [
+                        *device_size[:axis],
+                        *(f[0] for f in factors),
+                        *device_size[axis + 1 :],
+                    ],
+                    [
+                        *device_coordinates[:axis],
+                        *(f[1] for f in factors),
+                        *device_coordinates[axis + 1 :],
+                    ],
+                    iteration_space,
+                    allow_extended=allow_extended,
+                )
+            loop, proof_coordinates[axis] = projected
+        axes_by_loop.setdefault(loop, []).append(axis)
+
+    any_fused = any(len(axes) > 1 for axes in axes_by_loop.values())
+    splits, owners, expected = {}, {}, {}
+    fused_states = 0
+    for loop, axes in axes_by_loop.items():
+        extent = iteration_space[loop]
+        extent = sympy.sympify(extent[0] if isinstance(extent, tuple) else extent)
+        if extent.is_Integer is not True or extent <= 0:
+            raise ValueError(
+                f"unsupported ownership input: loop extent {extent} is not concrete"
+            )
+        extent = int(extent)
+        first = axes[0]
+        same = all(
+            physical_splits[a] == physical_splits[first]
+            and core_mappings_equal({loop: slots[a]}, {loop: slots[first]}, n)
+            for a in axes
+        )
+        split = (
+            physical_splits[first]
+            if same
+            else math.prod(physical_splits[a] for a in axes)
+        )
+        splits[loop] = split
+        if len(axes) == 1:
+            stick = len(device_size) - 1
+            if (
+                first != stick
+                and stick not in physical_splits
+                and loop in device_coordinates[-1].free_symbols
+            ):
+                padded = int(device_size[first] * device_size[-1])
+                if padded - device_size[-1] < extent <= padded:
+                    extent = padded
+            if extent > _MAX_EXACT_DIRECT_AXIS_POINTS:
+                raise ValueError(
+                    f"proof limit: direct axis needs {extent} points; limit is {_MAX_EXACT_DIRECT_AXIS_POINTS}"
+                )
+        else:
+            fused_states += extent + split
+            if fused_states > _MAX_EXACT_OWNERSHIP_POINTS:
+                raise ValueError(
+                    f"proof limit: fused axes need {fused_states} states; limit is {_MAX_EXACT_OWNERSHIP_POINTS}"
+                )
+        if extent % split:
+            raise ValueError(
+                f"unsupported ownership input: loop {loop} not divisible by {split}"
+            )
+        try:
+            bounds = _loop_regions(
+                extent,
+                tuple(proof_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes),
+                tuple(int(device_size[a]) for a in axes),
+                split,
+            )
+        except _EVALUATION_ERRORS as exc:
+            raise ValueError(
+                f"unsupported ownership evaluation: {type(exc).__name__}: {exc}"
+            ) from exc
+        widths = [int(device_size[a]) // physical_splits[a] for a in axes]
+        signatures = [
+            tuple(low // width for (low, _), width in zip(region, widths))
+            for region in bounds
+        ]
+        if any(
+            low // width != high // width
+            for region in bounds
+            for (low, high), width in zip(region, widths)
+        ):
+            raise ValueError(
+                "ownership mismatch: one loop partition crosses physical slices"
+            )
+        if len(set(signatures)) != split:
+            raise ValueError(
+                "ownership mismatch: loop partitions do not cover distinct physical slices"
+            )
+        try:
+            table = tuple(signatures.index(tuple(row[a] for a in axes)) for row in rows)
+        except ValueError:
+            raise ValueError(
+                "ownership mismatch: a core owns slices no loop partition covers"
+            ) from None
+        if set(table) != set(range(split)) or (
+            not any_fused and signatures != [(p,) for p in range(split)]
+        ):
+            raise ValueError(
+                "ownership mismatch: loop and physical slices have different core owners"
+            )
+        expected[loop] = table
+        owners[loop] = slots[first]
+
+    if not any_fused:
+        return TensorWorkDivision(splits, owners, num_cores=n)
+    # The physical slices already determine every loop owner. Search only for
+    # the existing supported spelling, never re-prove the access per candidate.
+    expected_rows = tuple(
+        {loop: table[core] for loop, table in expected.items()} for core in range(n)
+    )
+    candidate = select_unique_partition_division(
+        tuple(loop for loop in iteration_space if loop in splits),
+        splits,
+        n,
+        lambda division: (
+            owner_slots(division.core_id_to_work_slice, splits, n) == expected_rows
+        ),
+    )
+    if candidate is None:
+        raise ValueError("no unique certified canonical mapping for fused ownership")
+    return candidate

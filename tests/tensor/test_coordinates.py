@@ -48,7 +48,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
-    find_stick_compatible_input_layout,
+    generate_stl_with_required_stick,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -966,7 +966,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         for layouts in ([factorized, canonical], [canonical, factorized]):
             with self.subTest(first=layouts[0]):
                 arg, contraction = self._scenario(layouts)
-                result = find_stick_compatible_input_layout(
+                result = generate_stl_with_required_stick(
                     arg, contraction, BATCH_MATMUL_OP, "x"
                 )
                 self.assertEqual(result, canonical)
@@ -981,7 +981,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [0, 1, 2],
         )
 
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
 
@@ -1011,7 +1011,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 contraction_range=arg.dep.ranges[contraction],
             ):
                 with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
-                    find_stick_compatible_input_layout(
+                    generate_stl_with_required_stick(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
 
@@ -1026,7 +1026,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         arg, contraction, _ = self._same_graph_attention_scenario(
             contraction_range=2048
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [64, 64, 1, 64])
@@ -1061,7 +1061,7 @@ class TestFactorizedMatmulCandidates(TestCase):
         dep = MemoryDep(
             "x", 4096 * outer + contraction, (outer, contraction), (heads // 32, 4096)
         )
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             PropArg(dep, host, [source]), contraction, BATCH_MATMUL_OP, "x"
         )
         self.assertEqual(list(result.device_size), [1, 128, 1, 64])
@@ -1077,7 +1077,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             ElementArrangement.QFP8WT,
         )
         arg, contraction = self._scenario([qfp8wt])
-        result = find_stick_compatible_input_layout(
+        result = generate_stl_with_required_stick(
             arg, contraction, BATCH_MATMUL_FP8_OP, "x"
         )
         self.assertEqual(result, qfp8wt)

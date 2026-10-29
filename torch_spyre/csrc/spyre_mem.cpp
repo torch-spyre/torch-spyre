@@ -848,6 +848,66 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   return dci;
 }
 
+/*
+ * True when a DCI describes a pure memcpy: same source and destination
+ * element format, a single descriptor, identical src/dst strides and zero
+ * offsets, and strides that densely cover the element range (each
+ * non-degenerate dimension sits exactly at the running element count, so
+ * there are no gaps and no stick padding). Such a conversion moves the same
+ * bytes a raw DMA would, so the caller can submit the copy without a DCI and
+ * skip flex's host-side staging (deeptools::ConvertData) entirely.
+ *
+ * Anything else -- dtype conversion, strided/sliced views (non-zero offsets),
+ * stickified or padded device layouts, specialized ops -- keeps the DCI.
+ */
+bool dci_is_identity_copy(const DataConversionInfo& dci) {
+  if (dci.dataformat_src_ != dci.dataformat_dst_) return false;
+  if (dci.dcOpName_ != DataConvertOpFuncs::GENERAL_SHUFFLE) return false;
+  if (!dci.pre_input_shape_.empty() || !dci.post_output_shape_.empty())
+    return false;
+  if (!dci.pre_expand_dcsi_.empty() || !dci.post_slice_dcsi_.empty())
+    return false;
+  if (!dci.input_dimwise_ea_.empty() || !dci.output_dimwise_ea_.empty())
+    return false;
+  if (dci.useSpi_ || dci.usePca_ || dci.usePadVal_ || dci.useWli_) return false;
+  if (dci.dcsi_.size() != 1) return false;
+
+  const auto& dcsi = dci.dcsi_[0];
+  // Non-zero (even if equal) offsets mean positions before the offset are
+  // zero-filled by ConvertData but would hold stale bytes after a raw DMA;
+  // keep the DCI for views with a storage offset.
+  if (dcsi.offset_src_ != 0 || dcsi.offset_dst_ != 0) return false;
+  if (dcsi.stride_src_ != dcsi.stride_dst_) return false;
+
+  const auto& sizes = dcsi.size_;
+  const auto& strides = dcsi.stride_src_;
+  const size_t rank = sizes.size();
+  if (rank == 0 || strides.size() != rank) return false;
+
+  // Densely covering: ordered from the innermost (smallest) stride outward,
+  // every non-degenerate dimension must start exactly where the inner
+  // dimensions end. A padding gap or a broadcast stride fails this and keeps
+  // the DCI.
+  std::vector<std::pair<int64_t, int64_t>> dims;
+  dims.reserve(rank);
+  for (size_t i = 0; i < rank; i++) dims.emplace_back(strides[i], sizes[i]);
+  std::sort(dims.begin(), dims.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  int64_t numel = 1;
+  for (const auto& [stride, size] : dims) {
+    if (size < 1) return false;
+    if (size == 1) continue;
+    if (stride != numel) return false;
+    numel *= size;
+  }
+
+  // The covered elements must be the whole tensor, not a dense slice of it.
+  int64_t volume = 1;
+  for (const auto& dim : dci.output_shape_) volume *= dim;
+  return volume == numel;
+}
+
 // Empty op needs C++ code and cannot be handled by python side fallback
 at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::ScalarType> dtype_opt,
