@@ -96,6 +96,7 @@ EVENT_TYPE_VALUES = frozenset(
 )
 DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
 REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
+UPLOAD_GRANT_ROLE_VALUES = frozenset({"auto", "reviewer"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
@@ -749,6 +750,32 @@ class ArtifactSubscriptions(Table):
     enums = (("target_type", TARGET_TYPE_VALUES),)
 
 
+class UploadGrants(Table):
+    """Who uploads results unreviewed (auto) or reviews others' uploads; newest updated_at wins."""
+
+    name = "upload_grants"
+    columns = (
+        "grant_id",
+        "updated_at",
+        "grantee",
+        "role",
+        "active",
+        "formats",
+        "arches",
+        "components",
+        "test_types",
+        "tag_families",
+        "tags",
+        "artifact_ids",
+        "models",
+        "updated_by",
+        "notes",
+        "props",
+    )
+    required = ("grant_id", "grantee")
+    enums = (("role", UPLOAD_GRANT_ROLE_VALUES),)
+
+
 class DispatchRequests(Table):
     """A person's or pipeline's "run this subscription against this artifact"."""
 
@@ -862,6 +889,7 @@ PIPELINE_RUNS = PipelineRuns
 PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
+UPLOAD_GRANTS = UploadGrants
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
@@ -884,6 +912,7 @@ TABLES = {
         PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
+        UploadGrants,
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,

@@ -100,6 +100,7 @@ class Sandbox:
         ("artifact_results", "{runs}", "run_id"),
         ("artifact_result_reasons", "{runs}", "run_id"),
         ("artifact_subscriptions", "1", "subscription_id"),
+        ("upload_grants", "1", "grant_id"),
         (
             "artifact_dispatches",
             "artifact_id GLOBAL IN (SELECT artifact_id FROM {db}.artifacts)",

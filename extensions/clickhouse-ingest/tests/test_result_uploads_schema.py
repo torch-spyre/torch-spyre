@@ -72,7 +72,7 @@ def test_rows_must_be_linked_and_the_view_names_the_uploader():
     def insert(row):
         s.query("INSERT INTO result_uploads FORMAT JSONEachRow\n" + json.dumps(row))
 
-    for bad in ({"artifact_id": NIL}, {"run_id": NIL}, {"format": "xml"}, {"state": "rejected"},
+    for bad in ({"artifact_id": NIL}, {"run_id": NIL}, {"format": "xml"}, {"state": "approved"},
                 {"test_type": "nightly"}, {"result_kind": "tests"}):  # fmt: skip
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             insert(_upload(**bad))
@@ -189,3 +189,49 @@ def test_a_retracted_upload_leaves_the_capability_views():
         .split()
     )
     assert got == [f'"{CI_RUN}"']
+
+
+def test_a_pending_upload_is_not_published_and_grants_keep_the_newest_version():
+    session = pytest.importorskip("chdb.session")
+
+    s = session.Session()
+    for name in (
+        "10-functional-tests.sql",
+        "20-artifacts.sql",
+        "49-result-uploads.sql",
+        "64-upload-grants.sql",
+    ):
+        for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
+            s.query(stmt)
+    for state in ("pending", "rejected", "expired"):
+        s.query(
+            "INSERT INTO result_uploads FORMAT JSONEachRow\n"
+            + json.dumps(_upload(state=state))
+        )
+    got = s.query("SELECT state FROM v_result_uploads", "JSONEachRow").data()
+    assert json.loads(got) == {"state": "expired"}
+
+    def grant(**over):
+        row = {
+            "grant_id": "g1",
+            "grantee": "alice@ibm.com",
+            "role": "auto",
+            "updated_at": "2026-01-01 00:00:00",
+        }
+        s.query(
+            "INSERT INTO upload_grants FORMAT JSONEachRow\n"
+            + json.dumps({**row, **over})
+        )
+
+    with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
+        grant(role="admin")
+    grant(arches=["s390x"])
+    grant(arches=[], active=False, updated_at="2026-02-01 00:00:00")
+    got = s.query(
+        "SELECT active, arches FROM upload_grants FINAL", "JSONEachRow"
+    ).data()
+    assert json.loads(got) == {"active": False, "arches": []}
+    assert (
+        s.query("SELECT count() FROM upload_grant_versions", "CSV").data().strip()
+        == "2"
+    )
