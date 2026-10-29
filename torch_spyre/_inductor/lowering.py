@@ -24,7 +24,6 @@ import sympy
 import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
-from torch._inductor.graph import SubgraphLowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -444,6 +443,91 @@ def lower_scaled_mm(
             f"scaled_mm: mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
             f"-> {[int(s) for s in result_buf.get_size()]}, "
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
+        )
+
+    return result
+
+
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+def lower_bmm_fp8(
+    mat1,
+    mat2,
+    out_dtype=None,
+):
+    # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
+    # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    # [B, M, K] × [B, K, N] → [B, M, N]  and
+    # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
+    # a matching contraction dim. Batch broadcasting is not supported.
+    if (
+        mat1_ndim != mat2_ndim
+        or mat1_ndim not in (3, 4)
+        or any(
+            sympy.simplify(d1 - d2) != 0
+            for d1, d2 in zip(
+                [*mat1_size[:-2], mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
+            )
+        )
+    ):
+        raise Unsupported(
+            f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]  # K
+    ranges = [*mat1_size[:-2], mat1_size[-2], mat2_size[-1]]
+
+    def inner_fn(index, reduction_index):
+        # Each batch dim keeps its own iteration symbol in both loaders.
+        # Recovering b and h from a fused batch index via // and % would put one
+        # symbol in two device coordinates, which garbles the dim-order scan in
+        # superdsc._get_device_dim_order.
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        return (
+            mat1_loader([*batch_index, row, contraction]),
+            mat2_loader([*batch_index, contraction, column]),
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm_fp8: mat1{[int(s) for s in mat1_size]} @ "
+            f"mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "
+            f"out_dtype={output_dtype}"
         )
 
     return result
@@ -1931,8 +2015,8 @@ def lower_trunc(x):
 
     The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
     with no compare or select. A negative fraction gives 0.0 rather than -0.0,
-    since the device multiply makes no negative zero. Integers and bools are
-    returned as is.
+    since the device multiply makes no negative zero. An integer or bool input
+    comes back as a copy, since an op's result must not alias its input.
 
     The clip is Spyre's single clip op (lower_clamp). It and the product are
     realized with origins of their own, so split_multi_ops can split the bodies
@@ -1940,7 +2024,8 @@ def lower_trunc(x):
     a view only as a body's last op.
     """
     if not x.get_dtype().is_floating_point:
-        return x
+        # Upstream's clone keeps x's layout; ours forces the standard one.
+        return lowering.clone(x)
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
@@ -2341,7 +2426,7 @@ def _cmp_operand_dtype(tensors):
     return operand_dtype
 
 
-def _lower_cmp_impl(x, y, pointwise_fn, op_name: str):
+def _lower_cmp_impl(x, y, pointwise_fn):
     """Convert both operands to a common float dtype, then apply pointwise_fn.
 
     The operand dtype is computed from the TENSOR operands only, and a Python
@@ -2360,32 +2445,6 @@ def _lower_cmp_impl(x, y, pointwise_fn, op_name: str):
     _cmp_operand_dtype deliberately does not -- see its docstring.
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
-
-    # A 0-dim integer predicate of the form ``iter < N`` (while_loop /
-    # for_each_tile trip counter) must keep Inductor's stock integer form
-    # unchanged.  _extract_trip_count (wsr/for_each_tile_lowering.py) matches
-    # exactly one ``load(iter) < constant(int N)`` op in the cond graph; the
-    # int -> float cast below would insert a second op and coerce N to float,
-    # breaking both the single-op check and the loop count.
-    #
-    # The guard is narrowed to two conditions that are jointly precise:
-    #   1. op_name == "lt" -- _extract_trip_count only accepts lt; every other
-    #      0-dim integer compare (eq/ne/le/gt/ge) in a torch.cond branch or
-    #      while_loop body must still fall through to INT_TO_FLOAT promotion.
-    #   2. isinstance(V.graph, SubgraphLowering) -- the cond graph is always
-    #      compiled inside a SubgraphLowering.  Top-level 0-dim integer compares
-    #      (e.g. model-level torch.eq(i64[], N)) are compiled in a plain
-    #      GraphLowering and must not be skipped.
-    dtypes = {t.get_dtype() for t in tensors}
-    if (
-        op_name == "lt"
-        and isinstance(V.graph, SubgraphLowering)
-        and len(dtypes) == 1
-        and not next(iter(dtypes)).is_floating_point
-        and all(len(t.get_size()) == 0 for t in tensors)
-        and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
-    ):
-        return pointwise_fn(x, y)
 
     operand_dtype = _cmp_operand_dtype(tensors)
 
@@ -2442,7 +2501,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _tensor(x, y):
         if _is_host_cmp(x, y):
             return stock_tensor(x, y)
-        return _lower_cmp_impl(x, y, pw, op_name=op_name)
+        return _lower_cmp_impl(x, y, pw)
 
     @register_spyre_lowering(
         aten_packet.Scalar,
@@ -2453,7 +2512,7 @@ def _register_cmp_lowerings(aten_op, op_name: str):
     def _scalar(x, y):
         if _is_host_cmp(x, y):
             return stock_scalar(x, y)
-        return _lower_cmp_impl(x, y, pw, op_name=op_name)
+        return _lower_cmp_impl(x, y, pw)
 
     return _tensor, _scalar
 
@@ -2515,6 +2574,14 @@ def lower_qfp8wt(x):
         traceback=x.get_traceback(),
     )
     pw.realize()
+    # The QFP8WT 2D stick pairs host dims -2 (K) and -1 (N), so the output must
+    # be row-major [..., K, N]. Left flexible, ComputedBuffer.get_fill_order()
+    # copies the stride order of a permuted input (e.g. k.transpose(-1, -2) in
+    # attention), the stick lands on the wrong dim, and the layout _qfp8wt_stl
+    # builds cannot be read by batchmatmulfp8. Same fix as the clone lowering.
+    pw.freeze_layout_with_stride_order(
+        ir.get_stride_order(ir.FlexibleLayout.contiguous_strides(pw.get_size()))
+    )
     return pw
 
 
@@ -2649,6 +2716,15 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
 @register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
 def lower_c10d_broadcast_async(tensor, src_rank, group_name):
     """
@@ -2669,7 +2745,7 @@ def lower_c10d_broadcast_async(tensor, src_rank, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         BroadcastAsyncFallback(
             torch.ops.spyre.broadcast_async.default,
@@ -2685,7 +2761,7 @@ def lower_c10d_wait_tensor_async(tensor):
     """
     Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
+    Synchronizes on the async collective operation, blocking until communication completes.
 
     Flow:
       _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
@@ -2694,12 +2770,21 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        # The first wait already copied back. Preserve aliases of the current
+        # target, including mutations performed since that wait.
+        return WaitWorkFallback.copy_back_view(
+            tensor, producer, producer.copy_back_result
         )
-    )
+    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
+    result = ir.TensorBox.create(wait)
+    if wait.copy_back_producer is not None:
+        producer = wait.copy_back_producer
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return wait.copy_back_view(wait.waited_tensor, producer, target)
+    return result
 
 
 @register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
@@ -2722,7 +2807,7 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         AllGatherAsyncFallback(
             torch.ops.spyre.all_gather_async.default,
@@ -2741,7 +2826,7 @@ def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
     Creates an async all_reduce operation that returns immediately without blocking.
     Output tensor has shape[0] = input.shape[0].
     """
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2767,7 +2852,8 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
     all_reduce_ when the output shape matches the input. This lowering catches
     that case and emits the same Spyre all_reduce op (always in-place on device).
     """
-    tensor.realize()
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2780,5 +2866,6 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
             tensor,
             reduce_op,
             group_name,
+            mutation_target=mutation_target,
         )
     )

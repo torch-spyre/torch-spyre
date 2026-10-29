@@ -37,6 +37,8 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+from dataclasses import replace
+
 import pytest
 import sympy
 
@@ -80,6 +82,42 @@ def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expecte
         "P", "C", candidates, divisions, costs
     )
     assert [c.group for c in kept] == expected
+
+
+@pytest.mark.parametrize(
+    "cap,pinned,expected",
+    [
+        (2, (), [0, 2]),
+        (2, (1,), [1, 2]),
+        (1, (1,), [1]),
+        (1, (0, 1), [0, 1]),
+        (1, (2,), [2]),
+        (0, (1,), [0, 1, 2]),
+    ],
+)
+def test_relayout_full_replica_preserves_sibling_pins(
+    monkeypatch, cap, pinned, expected
+):
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 100, group=0, j=0),
+        _candidate("C", 0, 200, group=1, j=1),
+        replace(
+            _candidate("C", 0, 1000, group=2, j=2),
+            destination_view=PerCoreView((), (), num_cores=4),
+            destination_footprint_bytes=64,
+        ),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 3
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P",
+        "C",
+        candidates,
+        divisions,
+        pinned_consumer_divisions=frozenset(pinned),
+    )
+    assert [c.group for c in kept] == expected
+    assert all(any(c is original for original in candidates) for c in kept)
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -245,23 +283,54 @@ def test_cpu_count_detects_when_the_setting_is_unset(monkeypatch):
     assert config.get_cpu_count() == detected
 
 
-def test_num_cpus_stays_out_of_the_inductor_cache_key():
-    """The worker count describes the machine, not the graph: setting it must not
+def _inductor_cache_key_config():
+    return config.save_config_portable(
+        ignore_private_configs=False, readonly_values=True
+    )
+
+
+# Settings that describe the machine, or where logs and kernels go, not the
+# graph. Each maps to a function giving a value that differs from the current
+# one, so the test also changes something when the environment sets it.
+_KEPT_OUT_OF_THE_CACHE_KEY = {
+    "num_cpus": lambda value: (value or 1) + 2,
+    "timing": lambda value: not value,
+    "timing_out": lambda value: value + ".other",
+    "dump_cost_expr_file": lambda value: value + ".other",
+    "spyre_kernel_cache": lambda value: not value,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_KEPT_OUT_OF_THE_CACHE_KEY))
+def test_setting_stays_out_of_the_inductor_cache_key(name):
+    """These settings do not change the compiled code: setting one must not
     change the FX graph cache key, which ``save_config_portable`` of this config
     module feeds (it is the backend's ``device_custom_config``). A setting that
     does shape the compile still changes the key, so the config is still in it."""
-
-    def key():
-        return config.save_config_portable(
-            ignore_private_configs=False, readonly_values=True
-        )
-
-    base = key()
-    assert "num_cpus" not in base
-    with config.patch(num_cpus=3):
-        assert key() == base
+    base = _inductor_cache_key_config()
+    assert name not in base
+    new_value = _KEPT_OUT_OF_THE_CACHE_KEY[name](getattr(config, name))
+    with config.patch({name: new_value}):
+        assert _inductor_cache_key_config() == base
     with config.patch(cpsat_time_limit_seconds=config.cpsat_time_limit_seconds + 1):
-        assert key() != base
+        assert _inductor_cache_key_config() != base
+
+
+def test_each_cache_key_ignore_prefix_matches_only_known_settings():
+    """The ignore list matches by prefix, so a new setting whose name starts with
+    one of them would leave the cache key without notice. Pin what each prefix
+    matches today: such a setting fails here first."""
+    names = config.get_config_copy()
+    matched = {
+        prefix: sorted(name for name in names if name.startswith(prefix))
+        for prefix in config._cache_config_ignore_prefix
+    }
+    assert matched == {
+        "num_cpus": ["num_cpus"],
+        "timing": ["timing", "timing_out"],
+        "dump_cost_expr_file": ["dump_cost_expr_file"],
+        "spyre_kernel_cache": ["spyre_kernel_cache"],
+    }
 
 
 def test_cpu_count_is_read_per_call(monkeypatch):
@@ -398,7 +467,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
     plan = group.plan(source_address=0)
     assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
     assert plan.destination_view.num_cores == 8
-    with pytest.raises(ValueError, match="not a multiple"):
+    with pytest.raises(ValueError, match="destination on 6 cores is incompatible.*4"):
         _candidate("C", 0, 5000.0, destination_cores=6)
     with pytest.raises(ValueError, match="no physical core count"):
         RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)

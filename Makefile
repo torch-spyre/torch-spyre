@@ -151,6 +151,10 @@ ifeq ($(TEST_TYPE),trunk)
 	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk $(_EXCLUDE_ARG) --format paths))
 else
 	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths))
+# The default scan also takes upstream PyTorch configs carrying this label, as integration-tests.yaml does on amd64.
+ifeq ($(TEST_CONFIGS),tests/configs/torch_spyre_tests)
+	$(eval _ALL += $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/upstream_tests --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths 2>/dev/null))
+endif
 endif
 	$(eval _DISTRIBUTED := $(abspath $(wildcard tests/configs/distributed_tests/*.yaml)))
 	$(eval _PATHS := $(filter-out $(_DISTRIBUTED),$(_ALL)))
