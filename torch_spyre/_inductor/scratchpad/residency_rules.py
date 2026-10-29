@@ -357,6 +357,36 @@ TRANSFER_CERTIFICATES = (
         ),
         ("test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff",),
     ),
+    TransferCertificate(
+        "Fewer-core complete partitions",
+        "torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection",
+        "integral core ratio; complete disjoint partitions; "
+        "larger domain uses every compute core; physical spans stay separate",
+        (
+            "test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector",
+        ),
+        ("test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction",),
+    ),
+    TransferCertificate(
+        "Persistent external cache scatter",
+        "torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer",
+        "fresh immutable matmul source; one external indirect overwrite; "
+        "no source alias or cache read; mutation order and lifetime preserved",
+        (
+            "test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source",
+        ),
+        (
+            "test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias",
+        ),
+    ),
+    TransferCertificate(
+        "Factored ownership",
+        "torch_spyre._inductor.slice_ownership.factor_slice_axis",
+        "exact zero-origin dense product; independent digits; "
+        "complete rectangular slices; no address rewrite or storage permission",
+        ("test_work_division_hint.py::test_factored_slice_rejects_inexact_products",),
+        ("test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction",),
+    ),
 )
 
 

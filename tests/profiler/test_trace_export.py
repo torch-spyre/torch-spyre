@@ -77,6 +77,7 @@ def test_standard_export_contains_both_flow_stages(native_traces, filename):
     assert len(submits) == 6
     assert all(event["dur"] == 5 for event in submits)
     assert all(event["dur"] == 2 for event in kernels)
+    assert all(event["args"]["stream"] == 3 for event in kernels)
     assert all(event["dur"] == 0 for event in markers)
     assert all(
         (event["pid"], event["tid"], event["ts"]) == (cpu["pid"], cpu["tid"], cpu["ts"])
@@ -126,6 +127,7 @@ def test_device_flows_require_both_endpoints(native_traces):
     spans = [event for event in events if event.get("ph") == "X"]
     copies = [event for event in spans if event["name"] == "Memcpy (HtoD)"]
     assert {event["args"]["correlation"] for event in copies} == {13, 14, 16, 17}
+    assert all(event["args"]["stream"] == 5 for event in copies)
     assert any(event["name"] == "synthetic_kernel" for event in spans)
     assert any(event["args"].get("correlation") == 18 for event in spans)
     # Only 13 has both a non-calibration launch and a device record. Orphan

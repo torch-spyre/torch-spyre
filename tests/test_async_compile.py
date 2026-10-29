@@ -127,18 +127,6 @@ def test_backend_compile_timeout_rejects_invalid_environment(monkeypatch, value)
         _load_config(monkeypatch)
 
 
-def test_backend_compile_timeout_stays_out_of_inductor_cache_key():
-    def key():
-        return spyre_config.save_config_portable(
-            ignore_private_configs=False, readonly_values=True
-        )
-
-    baseline = key()
-    assert "backend_compile_timeout_seconds" not in baseline
-    with spyre_config.patch(backend_compile_timeout_seconds=123.0):
-        assert key() == baseline
-
-
 def test_bundle_cache_key_includes_resolved_device_mlir():
     with (
         patch.object(

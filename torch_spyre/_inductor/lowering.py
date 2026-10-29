@@ -2015,8 +2015,8 @@ def lower_trunc(x):
 
     The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
     with no compare or select. A negative fraction gives 0.0 rather than -0.0,
-    since the device multiply makes no negative zero. Integers and bools are
-    returned as is.
+    since the device multiply makes no negative zero. An integer or bool input
+    comes back as a copy, since an op's result must not alias its input.
 
     The clip is Spyre's single clip op (lower_clamp). It and the product are
     realized with origins of their own, so split_multi_ops can split the bodies
@@ -2024,7 +2024,8 @@ def lower_trunc(x):
     a view only as a body's last op.
     """
     if not x.get_dtype().is_floating_point:
-        return x
+        # Upstream's clone keeps x's layout; ours forces the standard one.
+        return lowering.clone(x)
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
@@ -2145,6 +2146,43 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
+def _promoted_dtype(*args, kind):
+    """Return the result dtype for elementwise promotion of *args under kind.
+
+    Arguments in *args can be:
+    - Tensor IR nodes (objects with get_dtype())
+    - torch.dtype objects
+    - Python numbers (int, float, bool, complex, etc.) or sympy expressions
+    """
+
+    def _to_elementwise_arg(v):
+        if hasattr(v, "get_dtype"):
+            ndim = len(v.get_size()) if hasattr(v, "get_size") else 1
+            return torch.zeros([1] * ndim, dtype=v.get_dtype())
+        if isinstance(v, torch.dtype):
+            return torch.empty(0, dtype=v)
+        return v
+
+    return elementwise_dtypes(
+        *(_to_elementwise_arg(v) for v in args if v is not None),
+        type_promotion_kind=kind,
+    )[1]
+
+
+def _convert_to_dtype(v, dtype):
+    """Convert v to dtype for use in a pointwise lowering.
+
+    - Tensor operands: convert via to_dtype if not already at dtype, else return as-is.
+    - Python int scalars: coerce to float() when dtype is floating-point.
+    - Everything else (Python float, already-correct tensor, etc.): return unchanged.
+    """
+    if hasattr(v, "get_dtype"):
+        return v if v.get_dtype() == dtype else to_dtype(v, dtype)
+    if dtype.is_floating_point and isinstance(v, int):
+        return float(v)
+    return v
+
+
 @register_spyre_lowering(torch.ops.aten.where.self, type_promotion_kind=None)
 def lower_where(condition, self, other):
     # where3 requires all operands to share the same stick size.
@@ -2179,23 +2217,20 @@ def lower_where(condition, self, other):
     #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
     #   int64:      CPU fallback for int→fp32; cast back to int64 after
 
-    self_t = torch.empty(0, dtype=self.get_dtype())
-    other_t = torch.empty(0, dtype=other.get_dtype())
-
     # result_dtype: what aten.where.self must return — NO_OPMATH promotion, which
     # prevents unintended fp16->fp32 promotion and ensures output dtype is correct
-    result_dtype, _ = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    result_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
     )
 
     # val_dtype: the dtype we run the hardware op in — INT_TO_FLOAT promotes
     # integers to fp32 since Spyre has no integer where3.
-    _, val_dtype = elementwise_dtypes(
-        self_t,
-        other_t,
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    val_dtype = _promoted_dtype(
+        self.get_dtype(),
+        other.get_dtype(),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
 
     converted_self = (
@@ -2293,6 +2328,218 @@ def lower_sub(x, y, *, alpha=1):
         y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
     return with_int64_fallback(lowering.sub, x, y)
+
+
+def _realized(t):
+    """Return t after realizing it as a fusion barrier in multi-step lowerings."""
+    t.realize()
+    return t
+
+
+def _div_operand_dtypes(x, y):
+    """Return (comp_dtype, result_dtype) for a division of x and y.
+
+    comp_dtype   — INT_TO_FLOAT promoted dtype; the dtype to run the hardware op
+                   in.  Integers promote to fp32; floats are unchanged.
+    result_dtype — NO_OPMATH promoted dtype; the natural output dtype for
+                   rounding_mode="floor"/"trunc" (e.g. int32/int32 → int32,
+                   fp16/fp16 → fp16).  Not used for true division, which always
+                   returns a float per PyTorch semantics.
+
+    Returns (None, None) when neither operand is a tensor (pure Python scalars).
+
+    Promotion table (cast-back applies to floor/trunc only, not true-div):
+
+      Operand pair    | comp_dtype| result_dtype | cast-back?
+      ----------------+-----------+--------------+-------------------------
+      fp32 / fp32     | fp32      | fp32         | no
+      fp16 / fp16     | fp16      | fp16         | no
+      fp16 / fp32     | fp32      | fp32         | no
+      int32 / int32   | fp32      | int32        | yes (floor only)
+      int64 / int64   | fp32      | int64        | yes (floor only)
+      int32 / fp32    | fp32      | fp32         | no
+      int32 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      int64 / fp32    | fp32      | fp32         | no
+      int64 / fp16    | fp16      | fp16         | no (fp16 dominates)
+      bool / fp16     | fp16      | fp16         | no (fp16 dominates)
+      bool / fp32     | fp32      | fp32         | no (fp32 dominates)
+      bool / int32    | fp32      | int32        | yes (floor only)
+      bool / int64    | fp32      | int64        | yes (floor only)
+    """
+    if not any(hasattr(v, "get_dtype") for v in (x, y)):
+        return None, None
+    comp_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+    result_dtype = _promoted_dtype(
+        x,
+        y,
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+    return comp_dtype, result_dtype
+
+
+def _lower_div_impl(x, y, *, rounding_mode=None):
+    """Shared implementation for lower_div and lower_floor_divide.
+
+    Operand type promotion follows the same two-dtype pattern as lower_where:
+    - comp_dtype   (INT_TO_FLOAT): dtype to cast inputs to before the hardware op.
+                   Integers promote to fp32; floats stay at their native width.
+    - result_dtype (NO_OPMATH):   natural output dtype, used only for
+                   rounding_mode="floor"/"trunc" where int inputs return int.
+
+    Result dtype per mode:
+    - rounding_mode=None  : always comp_dtype (float), even for integer inputs —
+                            consistent with PyTorch true-division semantics.
+    - rounding_mode="floor": comp_dtype for the correction arithmetic; cast back
+                             to result_dtype at the end (int inputs → int out).
+                             Emits ~20 realize() barriers for a tensor divisor
+                             (~15 for a scalar divisor) — one per SDSC op; this
+                             is the minimum required for the sign-aware correction.
+    - rounding_mode="trunc": not yet implemented (raises Unsupported).
+
+    The scalar-divisor sign optimisation (y < 0 fold) requires y to be a
+    concrete Python int or float; sympy/symbolic scalars are not supported.
+    """
+    comp_dtype, result_dtype = _div_operand_dtypes(x, y)
+
+    if comp_dtype is not None:
+        x = _convert_to_dtype(x, comp_dtype)
+        y = _convert_to_dtype(y, comp_dtype)
+
+    if rounding_mode == "floor":
+        # All operands are now at comp_dtype (fp32 for integer inputs).
+        # Each _realized call is a fusion barrier (Spyre requires one op per SDSC).
+        # Inductor built-ins (lowering.<fn> / lowering.lowerings[...]) are used
+        # throughout rather than the Spyre lower_* wrappers: all operands are
+        # already at comp_dtype, and using the built-ins avoids emitting compound
+        # or non-composable intermediate wrapper ops that break SDSC single-op invariants.
+        #
+        # The +-1 quotient correction is only meaningful while the compute dtype's
+        # spacing is below 1 -- |q| <= 1024 for device fp16, |q| <= 2**24 for fp32.
+        # Above that, qf +- 1 rounds back to qf and the result is whatever the divider
+        # returned. Exact integer division beyond that range needs the quotient carried
+        # in more than one float; out of scope here.
+        #
+        # Two further limits apply within the quotient-magnitude bound:
+        #
+        # (1) Residual destruction. Even with |q| <= 1024, the correction can fail
+        #     when qf*y rounds back to exactly x, leaving rem=0 and the correction
+        #     blind. This affects ~2.7% of random fp16 pairs that are representable
+        #     on device and have |q| <= 1024. The bound is necessary but not
+        #     sufficient for exact floor division.
+        #
+        # (2) fp16 host inputs are re-rounded on arrival. Device fp16 is DL16, not
+        #     IEEE fp16, so values like 1853 arrive as 1854 before any lowering
+        #     runs. A host-side .float() before transfer preserves the intended
+        #     value; no on-device upcast can recover it. A host-fp16 reference is
+        #     therefore not a valid expectation for this op.
+        qf = _realized(lowering.div(x, y))
+        qf = _realized(lowering.floor(qf))
+        qf_initial = qf
+        # Quotient correction. Correct floor-division satisfies
+        #   0 <= rem*sign(y) < |y|,   where rem = x - qf*y        … (*)
+        # which holds for EITHER sign of y.  rem is computed via multiply-
+        # subtract (exact); re-dividing rem/y would reintroduce the same
+        # rounding error being corrected.
+        #
+        # Normalising by sign(y) gives rem_s = rem*sign(y), abs_y = |y|,
+        # turning (*) into the sign-independent test  0 <= rem_s < abs_y:
+        #   rem_s >= abs_y  => qf underestimated by 1  (add 1)
+        #   rem_s <  0      => qf overestimated  by 1  (subtract 1)
+        # The two conditions are mutually exclusive (rem_s < 0 and rem_s >= abs_y
+        # cannot both hold), so at most one correction is applied per element.
+        aten_ge = lowering.lowerings[torch.ops.aten.ge.Tensor]
+        aten_lt = lowering.lowerings[torch.ops.aten.lt.Tensor]
+        prod = _realized(lowering.mul(qf, y))
+        rem = _realized(lowering.sub(x, prod))
+        if hasattr(y, "get_dtype"):
+            y_neg = _realized(aten_lt(y, 0.0))
+            neg_rem = _realized(lowering.neg(rem))
+            neg_y = _realized(lowering.neg(y))
+            rem_s = _realized(lowering.where(y_neg, neg_rem, rem))
+            abs_y = _realized(lowering.where(y_neg, neg_y, y))
+        else:
+            # y is a Python scalar: its sign is known at compile time, so fold
+            # it statically instead of emitting the select.
+            # Only concrete int/float scalars reach here; symbolic values are
+            # not supported (comparison with sympy raises TypeError).
+            assert isinstance(y, (int, float)), (
+                f"_lower_div_impl: scalar divisor must be int or float, got {type(y)}"
+            )
+            rem_s = _realized(lowering.neg(rem)) if y < 0 else rem
+            abs_y = -y if y < 0 else y
+        over_est = _realized(aten_ge(rem_s, abs_y))
+        under_est = _realized(aten_lt(rem_s, 0.0))
+        qf_plus1 = _realized(lowering.add(qf, 1.0))
+        qf = _realized(lowering.where(over_est, qf_plus1, qf))
+        # qf_minus1 must derive from the UPDATED qf, so the two corrections
+        # compose instead of the second silently discarding the first.
+        qf_minus1 = _realized(lowering.sub(qf, 1.0))
+        qf = _realized(lowering.where(under_est, qf_minus1, qf))
+        # |x| < |y| => the quotient is 0 or -1 by sign alone. Do not apply
+        # residual correction there: x + y is not always representable, and a
+        # rounded-up residual trips over_est and turns a correct -1 into 0.
+        #
+        # The initial floor(div(x, y)) is exact when |x/y| is representable,
+        # but underflows to -0.0 when |x/y| < ~2^-32 (device DL16 subnormal
+        # floor). When it underflows, the residual path is correct (prod=0,
+        # rem=x, rem_s<0 → qf corrects to -1) and the unconditional restore
+        # breaks it. Guard with qf_initial < 0.0: only restore when floor(x/y)
+        # is representable as -1. lt(-0.0, 0.0) is false, so -0.0 falls
+        # through to the residual path.
+        abs_x = _realized(lowering.abs(x))
+        degenerate = _realized(aten_lt(abs_x, abs_y))
+        keep = _realized(
+            lowering.where(_realized(aten_lt(qf_initial, 0.0)), qf_initial, qf)
+        )
+        qf = _realized(lowering.where(degenerate, keep, qf))
+        # Cast back to result_dtype (e.g. fp32 → int32/int64 for integer inputs).
+        if result_dtype is not None and result_dtype != comp_dtype:
+            return to_dtype(qf, result_dtype, skip_trunc=True)
+        return qf
+
+    elif rounding_mode == "trunc":
+        # TODO(PR#3610): implement trunc-mode floor-division
+        raise Unsupported("div with rounding_mode='trunc' is not yet implemented")
+
+    else:
+        # rounding_mode=None (true division): result is always comp_dtype (float),
+        # even for integer inputs — consistent with PyTorch semantics.
+        # Inputs are already at comp_dtype; call lowering.div directly.
+        return lowering.div(x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Tensor_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.div.Scalar_mode, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Tensor, type_promotion_kind=None, broadcast=True
+)
+@register_spyre_lowering(
+    torch.ops.aten.true_divide.Scalar, type_promotion_kind=None, broadcast=True
+)
+def lower_div(x, y, *, rounding_mode=None):
+    return _lower_div_impl(x, y, rounding_mode=rounding_mode)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.floor_divide, type_promotion_kind=None, broadcast=True
+)
+def lower_floor_divide(x, y):
+    # aten.floor_divide has no rounding_mode parameter; always floor division.
+    return _lower_div_impl(x, y, rounding_mode="floor")
 
 
 @register_spyre_lowering(
@@ -2418,9 +2665,9 @@ def _cmp_operand_dtype(tensors):
     """
     if all(t.get_dtype() == torch.bool for t in tensors):
         return torch.bool
-    _, operand_dtype = elementwise_dtypes(
-        *(torch.empty(0, dtype=t.get_dtype()) for t in tensors),
-        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    operand_dtype = _promoted_dtype(
+        *(t.get_dtype() for t in tensors),
+        kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
     return operand_dtype
 
@@ -2447,16 +2694,9 @@ def _lower_cmp_impl(x, y, pointwise_fn):
 
     operand_dtype = _cmp_operand_dtype(tensors)
 
-    def convert(v):
-        if hasattr(v, "get_dtype"):
-            if v.get_dtype() == operand_dtype:
-                return v
-            return to_dtype(v, operand_dtype)
-        if operand_dtype.is_floating_point and isinstance(v, int):
-            return float(v)
-        return v
-
-    return pointwise_fn(convert(x), convert(y))
+    return pointwise_fn(
+        _convert_to_dtype(x, operand_dtype), _convert_to_dtype(y, operand_dtype)
+    )
 
 
 def _is_host_cmp(x, y):
@@ -2715,6 +2955,15 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
 @register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
 def lower_c10d_broadcast_async(tensor, src_rank, group_name):
     """
@@ -2735,7 +2984,7 @@ def lower_c10d_broadcast_async(tensor, src_rank, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         BroadcastAsyncFallback(
             torch.ops.spyre.broadcast_async.default,
@@ -2751,7 +3000,7 @@ def lower_c10d_wait_tensor_async(tensor):
     """
     Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
+    Synchronizes on the async collective operation, blocking until communication completes.
 
     Flow:
       _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
@@ -2760,12 +3009,21 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        # The first wait already copied back. Preserve aliases of the current
+        # target, including mutations performed since that wait.
+        return WaitWorkFallback.copy_back_view(
+            tensor, producer, producer.copy_back_result
         )
-    )
+    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
+    result = ir.TensorBox.create(wait)
+    if wait.copy_back_producer is not None:
+        producer = wait.copy_back_producer
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return wait.copy_back_view(wait.waited_tensor, producer, target)
+    return result
 
 
 @register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
@@ -2788,7 +3046,7 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         AllGatherAsyncFallback(
             torch.ops.spyre.all_gather_async.default,
@@ -2807,7 +3065,7 @@ def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
     Creates an async all_reduce operation that returns immediately without blocking.
     Output tensor has shape[0] = input.shape[0].
     """
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2833,7 +3091,8 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
     all_reduce_ when the output shape matches the input. This lowering catches
     that case and emits the same Spyre all_reduce op (always in-place on device).
     """
-    tensor.realize()
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2846,5 +3105,6 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
             tensor,
             reduce_op,
             group_name,
+            mutation_target=mutation_target,
         )
     )

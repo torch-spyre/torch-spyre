@@ -77,6 +77,42 @@ def load_labels(config_files: list[Path]) -> dict[Path, list | None]:
     return result
 
 
+def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
+    """
+    Read exclude__plat_<arch> tag suffixes from each config file's test entries.
+
+    Platform exclusion is declared per test entry (a tag like
+    "exclude__plat_ppc64le" in that entry's `tags:` list), not per file or
+    suite, so a merged multi-config run only ever excludes the tagged entry.
+
+    Parameters
+    ----------
+    config_files : list[Path]
+        Paths to OOT YAML config files.
+
+    Returns
+    -------
+    dict[Path, list]
+        Maps each config file to the list of platform suffixes named by its
+        entries' exclude__plat_* tags (empty list when none are present).
+    """
+    result: dict[Path, list] = {}
+    for cf in config_files:
+        try:
+            cfg = yaml.safe_load(cf.read_text()) or {}
+        except Exception as e:
+            _warn(f"Cannot load {cf}: {e}")
+            continue
+        suffixes = []
+        for file_entry in cfg.get("test_suite_config", {}).get("files", []):
+            for block in file_entry.get("tests", []):
+                for tag in block.get("tags", []):
+                    if tag.startswith("exclude__plat_"):
+                        suffixes.append(tag[len("exclude__plat_") :])
+        result[cf] = suffixes
+    return result
+
+
 def _warn(msg: str) -> None:
     import sys
 
