@@ -62,9 +62,8 @@ export TORCH_LOGS="+torch_spyre,+inductor"
   `_lazy_init()` (first device op). If you only `import torch_spyre` without
   running anything on-device, call
   `torch_spyre.logging_config._sync_cpp_config()` explicitly.
-- Legacy vars (`SPYRE_INDUCTOR_LOG`, `SPYRE_INDUCTOR_LOG_LEVEL`,
-  `TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE`) still work but emit deprecation
-  warnings — see the migration table in the full reference doc for their
+- Deprecated vars (`TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE`) still work but
+  emit deprecation warnings — see the full reference doc for their
   `TORCH_LOGS` equivalents.
 
 ## Finer control than TORCH_LOGS allows (WARNING/CRITICAL, log-to-file)

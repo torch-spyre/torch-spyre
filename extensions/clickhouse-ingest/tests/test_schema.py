@@ -343,6 +343,7 @@ def test_registry_covers_exactly_the_v2_tables():
         "capabilities",
         "capability_runs",
         "pipeline_runs",
+        "pipeline_run_links",
         "ci_run_timings",
         "artifact_subscriptions",
         "dispatch_requests",

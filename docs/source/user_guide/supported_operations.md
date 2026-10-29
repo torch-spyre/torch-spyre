@@ -54,6 +54,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.floor` | Y | Y | Spyre | |
+| `torch.trunc` | Y | Y | Spyre | Custom lowering `floor(\|x\|) * clip(x, -1, 1)`, since the device has no native trunc op; a negative fraction gives `0.0`, not `-0.0` |
 | `torch.ceil` | Y | Y | Spyre | Custom decomposition |
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
@@ -64,9 +65,9 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
-| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter |
+| `torch.add` | Y | Y | Spyre | Supports `alpha` parameter; int32 runs natively via `addi32toi32` |
 | `torch.sub` | Y | Y | Spyre | Supports `alpha` parameter |
-| `torch.mul` | Y | Y | Spyre | |
+| `torch.mul` | Y | Y | Spyre | int32 runs natively via `muli32toi32` |
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
@@ -110,6 +111,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
+| `torch.index_copy` | Y | Y | Spyre | `index_copy.out` is registered on the compiled path (`ops/eager.py` `COMPILED_OPS`), which also serves `index_copy` and `index_copy_`. Scattering along the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
 | `torch.slice_scatter` | | Y | Spyre | Compiled only (`lower_slice_scatter`); unit-step slices only, strided writes raise `Unsupported` |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
@@ -134,7 +136,7 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
-| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
+| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported. Converts fp16, bf16, int32, int64, and bool on device; int32 and int64 share one storage layout, so a cast between them is an identity |
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
@@ -144,7 +146,6 @@ dot-product attention, the [RMS norm example](https://github.com/torch-spyre/tor
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.index_copy` | Y | | CPU fallback | Eager only; runs on CPU |
 
 > **Column key:**
 >
