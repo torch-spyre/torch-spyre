@@ -369,16 +369,10 @@ def _resize_device_layout(
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
 
-    # Build new valid_elements: for dims matched to a host dim, update the count
-    # to the new host size; dims not matched (inner stick, size-1 placeholders)
-    # keep their existing valid count.
+    # The resized layout gets no valid_elements: coarse tiling uses it under the
+    # buffer's full host layout as well as the tile's, and counts of either host
+    # shape are wrong for the other.
     new_ve: dict[tuple[int, ...], int] = {}
-    for key, val in orig_stl.valid_elements.items():
-        matched_dev = [d for d in key if d in matched_host]
-        if matched_dev:
-            new_ve[key] = new_host_size[matched_host[matched_dev[0]]]
-        else:
-            new_ve[key] = val
 
     if pstar is None:  # reduction output: tile-count / inner-stick entries frozen
         return SpyreTensorLayout(
@@ -425,11 +419,6 @@ def _resize_device_layout(
     elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; physical stride invariant.
-
-    # Update the stick group's valid count to the new stick host dim size.
-    for key in list(new_ve):
-        if j in key:
-            new_ve[key] = new_host_size[pstar]
 
     return SpyreTensorLayout(
         new_ds, new_sm, orig_stl.device_dtype, new_ve, orig_stl.element_arrangement

@@ -314,7 +314,8 @@ def aligned_ownership_split_domains(
     """
     tensor_deps = [*ctx.input_tds, ctx.output_td]
     accesses = [
-        AlignmentAccess(td.layout.device_layout, td.dep.index) for td in tensor_deps
+        AlignmentAccess(td.layout.device_layout, td.dep.index, td.layout)
+        for td in tensor_deps
     ]
     try:
         alignment_inputs = build_operation_alignment_inputs(

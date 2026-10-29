@@ -452,6 +452,22 @@ lx_collective_output_staging: bool = (
     os.environ.get("SPYRE_LX_COLLECTIVE_OUTPUT_STAGING", "1") == "1"
 )
 
+
+def _valid_elements_coords_from_env() -> str:
+    value = os.environ.get("SPYRE_VALID_ELEMENTS_COORDS", "on")
+    if value not in ("on", "off", "shadow"):
+        raise ValueError(
+            f"SPYRE_VALID_ELEMENTS_COORDS must be on, off or shadow, got {value!r}"
+        )
+    return value
+
+
+# How alignment derives device coordinates: "on" through the layout's
+# valid_elements groups where they can be derived (stride matching otherwise),
+# "off" by stride matching only, "shadow" by stride matching while logging every
+# access where the two disagree (for debugging). See valid_elements.py.
+valid_elements_coords: str = _valid_elements_coords_from_env()
+
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every
 # other setting's value in the key. A setting belongs here when it describes the

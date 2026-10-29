@@ -265,11 +265,14 @@ def _scatter_alignment_inputs(
             AlignmentAccess(
                 overrides.get(dep.name, layout.device_layout),
                 per_trip_index(op, dep.index),
+                layout,
             )
         )
     accesses.append(
         AlignmentAccess(
-            output_layout.device_layout, per_trip_index(op, write_dep.index)
+            output_layout.device_layout,
+            per_trip_index(op, write_dep.index),
+            output_layout,
         )
     )
     space = iteration_space_from_op(op)

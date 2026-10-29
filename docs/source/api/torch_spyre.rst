@@ -751,6 +751,13 @@ Environment Variables
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
+   * - ``SPYRE_VALID_ELEMENTS_COORDS``
+     - How device coordinates are derived (default ``on``): ``on`` through
+       the layout's ``valid_elements`` groups where they can be derived, and by
+       stride matching otherwise; ``off`` by stride matching only; ``shadow``
+       by stride matching while logging, as warnings on the
+       ``spyre.inductor.valid_elements`` logger, every access where the two
+       disagree (for debugging)
    * - ``ALLOW_EXHAUSTIVE_SEARCH``
      - Allow ``CO_OPTIMIZING_LX_PLANNING`` to fall back to
        ``ExhaustiveSearchSolver`` (an expensive DFS over core-division
