@@ -125,6 +125,16 @@ _PERF_NAME_RE = re.compile(
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
+_MODEL_CONFIGS = frozenset({"full_model", "one_block"})
+
+
+def _is_model_record(op_name: str, tags: dict) -> bool:
+    # The config tag is the explicit marker; the granite_ prefix covers older reports.
+    return op_name.startswith("granite_") or tags.get("config") in _MODEL_CONFIGS
+
+
+def _model_operation_name(op_name: str) -> str:
+    return "granite" if op_name.startswith("granite_") else op_name
 
 
 KERNEL_CLASSNAME = "kernel_benchmark"
@@ -285,7 +295,7 @@ def parse_benchmark_xml(
             if regression_status == "N/A":
                 regression_status = None
 
-        is_granite = op_name.startswith("granite_")
+        is_granite = _is_model_record(op_name, tags)
         if is_granite:
             config_m = _GRANITE_CONFIG_RE.search(op_name)
             batch_size = int(config_m.group("batch_size")) if config_m else None
@@ -309,7 +319,9 @@ def parse_benchmark_xml(
             {
                 "benchmark_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else op_name,
+                "operation_name": _model_operation_name(op_name)
+                if is_granite
+                else op_name,
                 "config_name": config_name,
                 "input_shapes": None if is_granite else (shapes_str or None),
                 "batch_size": batch_size,
@@ -392,7 +404,7 @@ def parse_kernel_xml(
             continue
 
         operation_name = tags.get("op", "")
-        is_granite = operation_name.startswith("granite_")
+        is_granite = _is_model_record(operation_name, tags)
         num_runs = _opt_float(tags, "num_runs")
 
         # config__/mode__ carry only full_model|one_block and prefill|decode, so
@@ -409,7 +421,9 @@ def parse_kernel_xml(
             {
                 "kernel_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": "granite" if is_granite else (operation_name or None),
+                "operation_name": _model_operation_name(operation_name)
+                if is_granite
+                else (operation_name or None),
                 "kernel_name": kernel_name,
                 # A section's Total is the sum of its siblings; flagged so
                 # queries can aggregate without double-counting.
