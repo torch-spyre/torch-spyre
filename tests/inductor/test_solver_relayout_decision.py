@@ -1020,6 +1020,60 @@ def test_annealer_relayout_move_buys_the_seams_it_opens():
     _assert_eligible_count(solver)
 
 
+class _CountingPacker:
+    """The packer, counting its re-places."""
+
+    def __init__(self, packer):
+        self._packer = packer
+        self.updates = 0
+
+    def update(self, *args):
+        self.updates += 1
+        return self._packer.update(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._packer, name)
+
+
+def test_annealer_relayout_move_is_one_re_place():
+    """The divisions, the drawn copy and the seam it opens all land in one
+    packer update: a re-place is O(n), and one per copy would cost a recolor
+    whose boundary opens k seams k + 1 of them."""
+    solver = _primed_annealer(_chain(1000.0))
+    first = _index(solver, relayout_copy_name("P", 0))
+    second = _index(solver, relayout_copy_name("M", 0))
+    solver._rng.choice = lambda options: first if second in options else options[0]
+    solver.packer = _CountingPacker(solver.packer)
+    solver._relayout()
+    assert {first, second} <= solver._relayout_on
+    assert solver.packer.updates == 1
+    _assert_eligible_count(solver)
+
+
+@pytest.mark.parametrize("expr", ["default", None])
+def test_annealer_buys_seams_only_under_the_cost_objective(expr):
+    """The memory-only fallback has no price for a shuffle, so a division
+    change there leaves every copy off rather than switching on copies that can
+    never be admitted. Under the cost objective the divisions that price
+    P -> M open both edges' seams, so both copies are bought."""
+    solver = _primed_annealer(_chain(1000.0), expr=expr)
+    first = _index(solver, relayout_copy_name("P", 0))
+    second = _index(solver, relayout_copy_name("M", 0))
+    solver._apply_assignment(solver._relayout_assignment(first), buy_seams=True)
+    assert solver._relayout_on == (set() if expr is None else {first, second})
+    _assert_eligible_count(solver)
+
+
+def test_annealer_never_draws_a_copy_whose_source_is_pinned_out():
+    """A copy whose source can never be resident can never fire: the relayout
+    move must not draw it, so it does not move divisions for nothing."""
+    bufs = _pc(5000.0)
+    next(b for b in bufs if b.name == "P").residency_reason = "pinned to HBM"
+    solver = _primed_annealer(bufs)
+    assert solver._relayout_source and solver._relayout_copy_list == []
+    assert "relayout" not in solver._applicable_moves()
+
+
 @pytest.mark.parametrize(
     "bufs, spill",
     [
