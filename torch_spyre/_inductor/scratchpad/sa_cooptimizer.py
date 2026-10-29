@@ -694,10 +694,15 @@ class _ViewRelation(_EdgeRelation):
 
 
 # The joint state ``(pi, W)`` as :meth:`SaCoOptimizingSolver._snapshot` takes it:
-# the packer, the division vector, the eligible count, the relayout copies
+# the packer, the division vector, the eligible count and mask, the relayout copies
 # switched on, and the ones eligible.
 _Snapshot = tuple[
-    NativePermutationLayoutSolver, list[DivisionConfig], int, set[int], set[int]
+    NativePermutationLayoutSolver,
+    list[DivisionConfig],
+    int,
+    bytearray,
+    set[int],
+    set[int],
 ]
 
 
@@ -778,11 +783,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # the types.
         self._best_score: int
         self._best_snap: _Snapshot
-        # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
-        # as a count, not a mask: the two ripple sites already evaluate
-        # ``_eligible`` over the buffers a move can change, so they carry the
-        # count by differencing that set before and after.
+        # Number of buffers passing :meth:`_eligible` under the live ``W``,
+        # carried by the two ripple sites as the change over the buffers a move
+        # can change.
         self._n_eligible: int
+        # The eligibility the packer holds, per buffer (``_note_eligibility``).
+        # A ripple reads the old flags of the buffers it changes here instead
+        # of re-deriving them, which on a graph with thousands of relayout
+        # copies was half of every move's eligibility work.
+        self._eligible_mask: bytearray
 
     # -- public interface ----------------------------------------------------
 
@@ -1141,7 +1150,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # without relayouts.
         self._relayout_on: set[int] = set()
         # The copies eligible under the current state, kept by every site that
-        # sets the packer's eligibility (:meth:`_note_copy_eligibility`): all
+        # sets the packer's eligibility (:meth:`_note_eligibility`): all
         # the post-packing cleanup has to look at (:meth:`_resident_indices`).
         self._eligible_copies: set[int] = set()
         if self._relayout_source:
@@ -1505,9 +1514,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             )
         )
 
-    def _note_copy_eligibility(self, flags: dict[int, bool]) -> None:
-        """Record the eligibility ``flags`` set on the packer for the relayout
-        copies among them."""
+    def _note_eligibility(self, flags: dict[int, bool]) -> None:
+        """Record the eligibility ``flags`` set on the packer: in the mask,
+        and for the relayout copies among them, in the eligible copies."""
+        mask = self._eligible_mask
+        for idx, flag in flags.items():
+            mask[idx] = flag
         if not self._relayout_source:
             return
         for idx, flag in flags.items():
@@ -1655,7 +1667,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         sizes = [self._per_core_size(i, self.chosen[i]) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
         self._n_eligible = sum(eligible)
-        self._note_copy_eligibility(dict(enumerate(eligible)))
+        self._eligible_mask = bytearray(n)
+        self._note_eligibility(dict(enumerate(eligible)))
 
         # pi from a FirstFit pass over the per-core sizes. FirstFit leaves the
         # fixed pins unplaced and ``SolverToPermutation`` sorts them after every
@@ -2037,14 +2050,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         one re-place.
         """
         # The affected set is division-invariant, so it is built (and its old
-        # eligibility counted) before the coloring lands. A copy switched on
-        # here was off, so ineligible before; its source is in the set.
+        # eligibility counted, off the mask) before the coloring lands. A copy
+        # switched on here was off, so ineligible before; its source is in the
+        # set.
         affected = set(assignment)
         for op in assignment:
             affected |= self._parents_idx[op]
         affected.update(self._relayout_source[c] for c in switch_on)
         affected = self._with_relayout_copies(affected)
-        before = sum(self._eligibility(sorted(affected)).values())
+        before = sum(self._eligible_mask[x] for x in affected)
         for op, config in assignment.items():
             self.chosen[op] = config
         bought = set(switch_on)
@@ -2059,7 +2073,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         flags = self._eligibility(affected_sorted)
         # One re-place for the whole region rather than one per buffer.
         self.packer.update(resizes, [(x, flags[x]) for x in affected_sorted])
-        self._note_copy_eligibility(flags)
+        self._note_eligibility(flags)
         self._switch_off_stale_copies(flags)
         self._n_eligible += sum(flags.values()) - before
 
@@ -2078,11 +2092,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         affected = sorted(
             self._with_relayout_copies({self._relayout_source[copy_idx]}) | {copy_idx}
         )
-        before = sum(self._eligibility(affected).values())
+        before = sum(self._eligible_mask[x] for x in affected)
         self._relayout_on ^= {copy_idx}
         flags = self._eligibility(affected)
         self.packer.update([], [(x, flags[x]) for x in affected])
-        self._note_copy_eligibility(flags)
+        self._note_eligibility(flags)
         self._n_eligible += sum(flags.values()) - before
 
     def _relayout(self) -> None:
@@ -2246,14 +2260,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _snapshot(self) -> _Snapshot:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
-        division vector, and the eligible count ``W`` implies -- rebuilding that
-        from ``W`` would cost an O(n) pass the restore does not otherwise need --
-        the relayout copies switched on, which nothing else can rebuild, and the
-        ones eligible, kept for the same reason as the count."""
+        division vector, and the eligible count and mask ``W`` implies --
+        rebuilding those from ``W`` would cost an O(n) pass of ``_eligible`` the
+        restore does not otherwise need -- the relayout copies switched on,
+        which nothing else can rebuild, and the ones eligible, kept for the same
+        reason as the count."""
         return (
             self.packer.copy(),
             list(self.chosen),
             self._n_eligible,
+            bytearray(self._eligible_mask),
             set(self._relayout_on),
             set(self._eligible_copies),
         )
@@ -2268,6 +2284,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self.packer,
             self.chosen,
             self._n_eligible,
+            self._eligible_mask,
             self._relayout_on,
             self._eligible_copies,
         ) = snap

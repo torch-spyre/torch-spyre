@@ -893,6 +893,9 @@ def _assert_eligible_count(solver):
     assert solver._n_eligible == sum(
         solver._eligible(i) for i in range(len(solver._bufs))
     ), "the incremental eligible count drifted from a recount"
+    assert list(solver._eligible_mask) == [
+        solver._eligible(i) for i in range(len(solver._bufs))
+    ], "the eligibility mask drifted from a recount"
     assert solver._eligible_copies == {
         c for c in solver._relayout_source if solver._eligible(c)
     }, "the tracked eligible copies drifted from a recount"
