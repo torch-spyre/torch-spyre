@@ -111,6 +111,27 @@ def test_a_feature_memo_derives_an_access_once_and_only_inside(monkeypatch):
     assert len(calls) == 3
 
 
+def test_reads_are_memoized_only_inside_a_feature_memo():
+    """The post-pass report extracts after every pass, and not every pass that
+    rewrites an op's loads drops the planner's memo of them; outside a scope
+    the reads are re-derived, so a stale memo never reaches the report."""
+
+    class Op:
+        def __init__(self):
+            self.reads = "first"
+
+        def get_read_writes(self):
+            return self.reads
+
+    op = Op()
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"
+    op.reads = "rewritten"  # in place, without invalidate_op_read_writes
+    assert dcm._read_writes(op) == "rewritten"
+    with dcm.feature_memo():
+        assert dcm._read_writes(op) == "first"  # the planner's memo, by design
+
+
 def test_geometry_keeps_symbolic_splits_and_physical_gaps():
     sb, sx = sympy.symbols("sb sx", integer=True, positive=True)
     expr = run_bytes(sb, sx)
