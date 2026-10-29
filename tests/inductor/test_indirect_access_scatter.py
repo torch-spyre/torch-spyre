@@ -176,16 +176,12 @@ class _ScatterScenarios:
         src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)
         freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype, generator=generator)
         dst = torch.zeros(Bn, H, M, D, dtype=dtype)
+        eps = get_elem_in_stick(dtype)
         cache_layout = SpyreTensorLayout(
-            device_size=[
-                M,
-                H,
-                D // get_elem_in_stick(dtype),
-                Bn,
-                get_elem_in_stick(dtype),
-            ],
-            stride_map=[D, M * D, get_elem_in_stick(dtype), H * M * D, 1],
+            device_size=[M, H, D // eps, Bn, eps],
+            stride_map=[D, M * D, eps, H * M * D, 1],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={(0,): M, (1,): H, (2, 4): D // eps, (3,): Bn},
         )
 
         def apply_rope(src, freqs):
@@ -543,12 +539,7 @@ class _ScatterScenarios:
         (the indirectly-accessed dim) outermost, then H, then D split into
         (stick_count, elems_per_stick) -- mirroring the real paged-KV-cache
         layout used by attention decode/prefill (see test_paged.py)."""
-        eps = get_elem_in_stick(torch.float16)
-        return SpyreTensorLayout(
-            device_size=[L, H, (D + eps - 1) // eps, eps],
-            stride_map=[H * D, D, eps, 1],
-            device_dtype=get_device_dtype(torch.float16),
-        )
+        return SpyreTensorLayout([L, H, D], [H * D, D, 1], torch.float16, [0, 1, 2])
 
     def _paged_kv_cache_operands(self, L=576, H=8, D=128, P=3):
         """A paged-KV-store-shaped scatter target: cache[L, H, D] on the paged

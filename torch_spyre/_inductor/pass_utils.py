@@ -263,15 +263,93 @@ def rescale_stl_for_dtype(
                     f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
                     f"not a whole number of {out_eps}-element output sticks"
                 )
-            out_device_size[i] = total_elems // out_eps
+            out_device_size[i] = (total_elems + out_eps - 1) // out_eps
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
         get_device_dtype(out_dtype),
+        forward_valid_elements(stl),
         ea,
     )
+
+
+def forward_valid_elements(
+    stl: SpyreTensorLayout,
+) -> dict[tuple[int, ...], int]:
+    """Copy valid_elements from stl unchanged.
+
+    Use when the new STL has identical geometry to the input: dtype rescale,
+    element_arrangement-only change, broadcast-zero, clone, or any reshape
+    that does not move which device dims belong to which host dim.
+    """
+    return dict(stl.valid_elements)
+
+
+def reorder_valid_elements(
+    stl: SpyreTensorLayout,
+    new_order: list[int],
+) -> dict[tuple[int, ...], int]:
+    """Remap device-dim indices through a permutation.
+
+    new_order[new_pos] = old_pos.  Use when device dims are reordered without
+    changing which host dim they map to (e.g. nonstick_dim_order swaps).
+    """
+    inv = {old: new for new, old in enumerate(new_order)}
+    return {
+        tuple(sorted(inv[d] for d in key)): val
+        for key, val in stl.valid_elements.items()
+    }
+
+
+def prepend_dim_valid_elements(
+    stl: SpyreTensorLayout,
+    new_dim_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Add a new outermost device dimension at index 0.
+
+    Shifts all existing dim indices by +1. The new dim at index 0 has
+    new_dim_size valid elements.
+    """
+    shifted = {
+        tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()
+    }
+    shifted[(0,)] = new_dim_size
+    return shifted
+
+
+def restickify_valid_elements(
+    stl: SpyreTensorLayout,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+) -> dict[tuple[int, ...], int]:
+    """Update valid_elements after moving the stick to a new host dimension.
+
+    Finds the existing stick group (the key containing stick_dim) and updates
+    its count to new_sd_host_size; new_sd_outer_dim becomes a standalone key
+    with old_sd_host_size.  Any dim that shared a key with a touched dim but
+    is not itself touched is split out as a singleton with count 1.  When
+    old == new, no move is possible so an empty map is returned.  Parallel to
+    restickify_device_size and restickify_stride_map.
+    """
+    if old_sd_outer_dim == new_sd_outer_dim:
+        return {}
+    stick_dim = len(stl.device_size) - 1
+    old_stick_key = next(k for k in stl.valid_elements if stick_dim in k)
+    regrouped = set(old_stick_key) | {new_sd_outer_dim}
+    result = {}
+    for key, val in stl.valid_elements.items():
+        if regrouped.isdisjoint(key):
+            result[key] = val
+        else:
+            for d in set(key) - regrouped:
+                result[(d,)] = 1
+    result[old_stick_key] = new_sd_host_size
+    result[(new_sd_outer_dim,)] = old_sd_host_size
+    return result
 
 
 def op_read_writes(op: Operation) -> ReadWrites:
@@ -1738,9 +1816,10 @@ def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
         device_size[out_pos],
     )
     return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=list(out_stl.stride_map),
-        device_dtype=out_stl.device_dtype,
+        device_size,
+        list(out_stl.stride_map),
+        out_stl.device_dtype,
+        forward_valid_elements(out_stl),
     )
 
 
@@ -2471,7 +2550,18 @@ def compute_restickify_target_layout(
         new_sd_host_stride,
         stick_size,
     )
-    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        stl.device_dtype,
+        restickify_valid_elements(
+            stl,
+            old_sd_outer_dim,
+            old_sd_host_size,
+            new_sd_outer_dim,
+            new_sd_host_size,
+        ),
+    )
 
 
 def compute_size1_restickify_layout(
@@ -2627,10 +2717,12 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
     if restick:
+        eps = in_stl.elems_per_stick()
         out_stl = SpyreTensorLayout(
-            [in_stl.elems_per_stick()] + out_stl.device_size,
+            [eps] + out_stl.device_size,
             [c_stride[0] * c_size[0]] + out_stl.stride_map,
             out_stl.device_dtype,
+            prepend_dim_valid_elements(out_stl, eps),
         )
         return True, out_stl
 
@@ -2757,7 +2849,23 @@ def compute_restickify_needed(
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = -1
-            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+            stick_dim = len(ds) - 1
+            y_ve: dict[tuple[int, ...], int] = {}
+            for key, val in in_stl.valid_elements.items():
+                if k_chunk_dim in key:
+                    # The key contains both k_chunk_dim and stick_dim (the
+                    # stick's tile group).  After moving K onto the stick,
+                    # k_chunk_dim becomes independent (count = original val)
+                    # and stick_dim gets a count of 1.
+                    assert stick_dim in key, (
+                        f"expected stick_dim {stick_dim} in key {key} "
+                        f"for k_chunk_dim {k_chunk_dim}"
+                    )
+                    y_ve[(k_chunk_dim,)] = val
+                    y_ve[(stick_dim,)] = 1
+                else:
+                    y_ve[key] = val
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype, y_ve)
         assert False, (
             f"k_chunk_dim not found in sparse-N=1 restickify path: "
             f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
