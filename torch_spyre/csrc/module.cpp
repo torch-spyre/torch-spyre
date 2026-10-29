@@ -1101,6 +1101,16 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("tensor"),
       "Address-free sharding record and per-chunk placement receipt.");
+  m.def(
+      "num_memory_domains",
+      []() -> size_t {
+        auto allocator = flex::RuntimeContext::getInstance()->getAllocator();
+        TORCH_CHECK(allocator != nullptr,
+                    "num_memory_domains requires the Flex runtime to be "
+                    "initialized");
+        return allocator->topology().num_domains();
+      },
+      "Number of memory domains in the Flex device topology.");
 
   // Allocator statistics functions
   m.def(

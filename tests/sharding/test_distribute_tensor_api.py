@@ -331,6 +331,30 @@ def test_device_gather_forms(gather):
 
 
 @_requires_spyre
+@pytest.mark.parametrize("num_shards", [8, 16])
+def test_device_shards_spread_round_robin_across_domains(active_cores, num_shards):
+    """Each shard names its Flex memory domain: shard i lands in i % N."""
+
+    from torch_spyre import _C
+
+    active_cores["cores"] = num_shards
+    source = torch.randn(num_shards * 4, 64, dtype=torch.float32)
+
+    # distribute_tensor initializes the Flex runtime; num_memory_domains
+    # reports the topology of the initialized allocator.
+    result = torch.spyre.distribute_tensor(source, Shard(0), num_shards=num_shards)
+    num_domains = _C.num_memory_domains()
+
+    info = torch.spyre.sharding_info(result)
+    expected = [i % num_domains for i in range(num_shards)]
+    assert [e.physical["physical_domain_id"] for e in info.receipt.entries] == (
+        expected
+    )
+    # Placement is an allocation-time fact: the round trip is unaffected.
+    assert torch.equal(result.cpu(), source)
+
+
+@_requires_spyre
 def test_device_each_shard_is_in_its_own_chunk():
     source = torch.randn(32, 64, dtype=torch.float32)
     result = torch.spyre.distribute_tensor(source, Shard(0))

@@ -235,17 +235,29 @@ namespace {
 
 // Backing for sharded storage on plain Flex (no allocator-side sharding API):
 // one ordinary allocation per shard, indexed by shard ordinal. The shard table
-// is torch-spyre-owned — shard i backs core i — and the physical placement
-// (region, segment, offset) is whatever the Flex allocator chose. Device sizes
-// are stick-multiples, so each shard's chunk is exactly shard_device_bytes.
+// is torch-spyre-owned — shard i backs core i — and each shard names its Flex
+// memory domain explicitly: shard i is bound to domain i % num_domains from
+// the topology. On single-domain backends that is domain 0 for every shard
+// (the domain first-fit chose, now by statement); under multi-domain
+// emulation it spreads the shards so the per-domain region bookkeeping,
+// multi-chunk scheduler, and DMA paths are exercised. The domain is an
+// allocation-time fact only — it enters no guard, cache key, or kernel, and
+// the region/segment/offset placement within the domain remains the Flex
+// allocator's choice. Device sizes are stick-multiples, so each shard's chunk
+// is exactly shard_device_bytes.
 std::vector<flex::CompositeAddress> allocateShardTable(
     const std::shared_ptr<flex::FlexAllocator>& flex_alloc,
     uint64_t shard_device_bytes, uint32_t logical_chunks) {
+  const uint32_t num_domains =
+      static_cast<uint32_t>(flex_alloc->topology().num_domains());
   std::vector<flex::CompositeAddress> shards;
   shards.reserve(logical_chunks);
   for (uint32_t i = 0; i < logical_chunks; ++i) {
+    flex::AllocationDirective directive(flex::PlacementPolicy::Bind,
+                                        {i % num_domains}, std::nullopt,
+                                        flex::MemoryType::Tensor);
     flex::CompositeAddress shard = flex_alloc->allocate(
-        static_cast<size_t>(shard_device_bytes), flex::AllocationDirective());
+        static_cast<size_t>(shard_device_bytes), directive);
     TORCH_CHECK(shard.num_chunks() == 1, "plain per-shard allocation ", i,
                 " is not single-chunk");
     TORCH_CHECK(shard.chunks()[0].size == shard_device_bytes,
@@ -290,7 +302,8 @@ c10::DataPtr SpyreAllocator::allocateShardedStorage(
   TORCH_CHECK(flex_alloc != nullptr, "Flex allocator is not available");
 
   // Each shard is its own aligned plain allocation; shard i backs core i by
-  // the torch-spyre-owned shard table (Flex places it wherever it fits).
+  // the torch-spyre-owned shard table (Flex places it within the named
+  // domain — see allocateShardTable).
   std::vector<flex::CompositeAddress> shards =
       allocateShardTable(flex_alloc, shard_device_bytes, logical_chunks);
 
