@@ -500,7 +500,7 @@ def test_permutation_past_split_8_fires(monkeypatch):
     against a 4 MB HBM write and re-read). Read-only spies."""
     import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
     from torch_spyre._inductor import spyre_hint
-    from torch_spyre._inductor.dump_cost_model import governing_run_split
+    from torch_spyre._inductor.cost_features import governing_run_split
 
     observed = _Observed(monkeypatch, force=False)
     recorded = observed.plans

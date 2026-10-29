@@ -2015,8 +2015,8 @@ def lower_trunc(x):
 
     The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
     with no compare or select. A negative fraction gives 0.0 rather than -0.0,
-    since the device multiply makes no negative zero. Integers and bools are
-    returned as is.
+    since the device multiply makes no negative zero. An integer or bool input
+    comes back as a copy, since an op's result must not alias its input.
 
     The clip is Spyre's single clip op (lower_clamp). It and the product are
     realized with origins of their own, so split_multi_ops can split the bodies
@@ -2024,7 +2024,8 @@ def lower_trunc(x):
     a view only as a body's last op.
     """
     if not x.get_dtype().is_floating_point:
-        return x
+        # Upstream's clone keeps x's layout; ours forces the standard one.
+        return lowering.clone(x)
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
     origin_args = () if origin is None else (origin,)
     sign = lower_clamp(x, -1.0, 1.0)
@@ -2715,6 +2716,15 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
 @register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
 def lower_c10d_broadcast_async(tensor, src_rank, group_name):
     """
@@ -2735,7 +2745,7 @@ def lower_c10d_broadcast_async(tensor, src_rank, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         BroadcastAsyncFallback(
             torch.ops.spyre.broadcast_async.default,
@@ -2751,7 +2761,7 @@ def lower_c10d_wait_tensor_async(tensor):
     """
     Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
+    Synchronizes on the async collective operation, blocking until communication completes.
 
     Flow:
       _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
@@ -2760,12 +2770,21 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    return ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        # The first wait already copied back. Preserve aliases of the current
+        # target, including mutations performed since that wait.
+        return WaitWorkFallback.copy_back_view(
+            tensor, producer, producer.copy_back_result
         )
-    )
+    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
+    result = ir.TensorBox.create(wait)
+    if wait.copy_back_producer is not None:
+        producer = wait.copy_back_producer
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return wait.copy_back_view(wait.waited_tensor, producer, target)
+    return result
 
 
 @register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
@@ -2788,7 +2807,7 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         AllGatherAsyncFallback(
             torch.ops.spyre.all_gather_async.default,
@@ -2807,7 +2826,7 @@ def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
     Creates an async all_reduce operation that returns immediately without blocking.
     Output tensor has shape[0] = input.shape[0].
     """
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2833,7 +2852,8 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
     all_reduce_ when the output shape matches the input. This lowering catches
     that case and emits the same Spyre all_reduce op (always in-place on device).
     """
-    tensor.realize()
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2846,5 +2866,6 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
             tensor,
             reduce_op,
             group_name,
+            mutation_target=mutation_target,
         )
     )

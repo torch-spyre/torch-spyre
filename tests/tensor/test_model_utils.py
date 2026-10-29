@@ -14,8 +14,10 @@
 
 # Owner(s): ["module: spyre"]
 
+import os
 import threading
 import unittest
+import warnings
 from unittest import mock
 
 import torch
@@ -401,6 +403,44 @@ class TestLoadModelToSpyre(TestCase):
         listed = [(id(u.module), u.name) for u in uploads]
         self.assertEqual(len(listed), 4)  # weight and bias of each
         self.assertEqual(len(set(listed)), 4)
+
+    def test_modules_that_compare_equal_are_both_listed(self):
+        """The visited set uses identity: two modules under different parents
+        whose class overrides ``__eq__`` and ``__hash__`` are both uploaded, as
+        ``nn.Module.to`` moves both. (Equal siblings are one child to
+        ``named_children``, and so to ``nn.Module.to`` as well.)"""
+        from torch_spyre.model_utils import _transfer_module
+
+        class SameLinear(nn.Linear):
+            def __eq__(self, other):
+                return isinstance(other, SameLinear)
+
+            def __hash__(self):
+                return 0
+
+        model = nn.Module()
+        model.first = nn.Module()
+        model.first.proj = SameLinear(8, 8)
+        model.second = nn.Module()
+        model.second.proj = SameLinear(8, 8)
+        uploads = []
+        _transfer_module(model, None, uploads)
+        self.assertEqual(len(uploads), 4)  # weight and bias of each
+
+    def test_embedding_fallback_warning_points_at_the_caller(self):
+        """However deep the embedding is, the warning names the caller's file,
+        not a frame inside the recursive walk."""
+        from torch_spyre.model_utils import _transfer_module
+
+        table = nn.Embedding(1000, 100, dtype=torch.float16)  # 100 % 64 != 0
+        model = nn.Sequential(nn.Sequential(table))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _transfer_module(model, None, [])
+        self.assertEqual(
+            [os.path.basename(w.filename) for w in caught],
+            [os.path.basename(__file__)],
+        )
 
     def test_embedding_fallback_warns_while_walking(self):
         """The fallback warning comes from the caller's thread, before any

@@ -310,9 +310,39 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    `change_graph_output` to promote a producer to LX and clone the value
    back to a graph output.
 
+### Matmul output staging before a collective
+
+After the solver commits LX buffers and relayout copies, the co-optimizing
+allocator can stage a fresh matmul output in a gap that is free for the whole
+graph. Its sole reader must be a bare all-reduce. The allocator inserts an HBM
+clone after the matmul and makes the collective read and mutate that clone.
+This changes the matmul's output placement; it does not remove the HBM copy
+required by the collective.
+
+Staging uses only space left after other allocations. It cannot displace a
+chosen relayout copy. Enabling another relayout can remove a free gap and change
+which outputs are staged. This is a performance dependency, not a reason to
+relax either path's safety checks.
+
+Staging is a named post-solve exception to ordinary buffer residency. It requires
+one fresh, untiled matmul output, one bare all-reduce reader, private single-writer
+storage, complete reads and an accepted ownership view. Other opaque users,
+aliases, unsupported back gaps and K-split writers are refused. The selected
+collective uses the HBM clone. It does not read LX directly.
+
+`test_real_gap_solver_keeps_stages_disjoint_or_declines` checks full placed spans,
+including reduction splits and relayout copies. The captured-graph test
+`test_stage_push_rewrites_a_captured_matmul_collective` checks the clone and rewire.
+
+Set `SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0` to disable staging independently of
+ownership certificates. The switch clears staging state before placement and
+leaves solver allocations and ordinary output clones unchanged. Its value is
+part of the compile cache key. `test_staging_switch_declines_before_placement`
+checks this boundary.
+
 ### Declarative exclusion
 
-Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
+The ordinary pre-solve verdict is computed in `ScratchpadAllocator._residency_reasons`
 in `allocator.py`, and carried
 to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
@@ -815,6 +845,17 @@ bugs that the hand-written cases miss.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that
   LX planning did not claim into a shared HBM segment.
+
+### Physical geometry and feature extraction
+
+`core_mapping.py` owns immutable `PerCoreView` values and physical owner
+interpretation. Symbolic projections stay in `slice_ownership.py`. A caller
+passes its rollout choice explicitly. Geometry cannot grant storage permission.
+The old `pass_utils.PerCoreView` name remains an import alias.
+
+`cost_features.py` owns feature extraction. Planning and reporting use the same
+functions. `dump_cost_model.py` keeps diagnostic output and latest-report state.
+This extraction does not change coefficients, units or physical core domains.
 
 ### Matched OFF-plan comparison
 

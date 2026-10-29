@@ -2479,6 +2479,8 @@ if __name__ == "__main__":
     "case", ["hole", "offset", "reversed", "overlap", "tail", "crossing", "dynamic"]
 )
 def test_factored_slice_rejects_inexact_products(case):
+    from torch_spyre._inductor.slice_ownership import factor_slice_axis
+
     h, f = Symbol("head"), Symbol("feature")
     coordinate, extents, size, split = 2 * h + floor(f / 64), {h: 2, f: 128}, 4, 4
     if case == "hole":
@@ -2495,10 +2497,7 @@ def test_factored_slice_rejects_inexact_products(case):
         coordinate, extents, size, split = 3 * h + f, {h: 2, f: 3}, 6, 3
     else:
         extents[f] = Symbol("dynamic")
-    assert (
-        lx_relayout_module.factor_slice_axis(coordinate, size, split, _CORE_ID, extents)
-        is None
-    )
+    assert factor_slice_axis(coordinate, size, split, _CORE_ID, extents) is None
 
 
 @pytest.mark.parametrize(

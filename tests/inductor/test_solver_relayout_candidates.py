@@ -29,7 +29,7 @@ import pytest
 from sympy import Eq, Mod, Piecewise, Symbol, floor
 
 from torch_spyre._inductor.cost_model import OpFeatures, relayout_ns
-from torch_spyre._inductor.dump_cost_model import governing_run_split
+from torch_spyre._inductor.cost_features import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
 from torch_spyre._inductor.scratchpad.allocator import _intern_view_group
@@ -79,7 +79,7 @@ def test_pair_cost_reproduces_the_canonical_row(kind, monkeypatch):
     # the reporting path produces (one law, two callers).
     from torch._inductor.virtualized import V
 
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     source, destination, dims, expected = _SRC, _DST, _DEVICE_DIMS, 8778
     if kind == "full_replica":
@@ -180,7 +180,7 @@ def test_broadcast_report_uses_the_solver_price_domain(source_cores):
 
     from torch._inductor.virtualized import V
 
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     source = PerCoreView(((0, source_cores),), ((0, _CORE_ID),), num_cores=source_cores)
     destination = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=8)

@@ -446,6 +446,12 @@ lx_same_tile_group_relayout: bool = (
     os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
 )
 
+# Allow post-solve matmul output staging before an all-reduce's HBM copy.
+# Set SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0 to disable this step alone.
+lx_collective_output_staging: bool = (
+    os.environ.get("SPYRE_LX_COLLECTIVE_OUTPUT_STAGING", "1") == "1"
+)
+
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every
 # other setting's value in the key. A setting belongs here when it describes the
