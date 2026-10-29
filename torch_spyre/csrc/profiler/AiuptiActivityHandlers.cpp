@@ -321,6 +321,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuSubmitNullOp";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_SIGNAL:
       return "aiuSubmitP2PFirmwareSignal";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_WAIT:
+      return "aiuSubmitP2PFirmwareWait";
     default:
       break;
   }
@@ -506,6 +508,10 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
 
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_SIGNAL:
       runtime_activity->addMetadata("is_ack", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_WAIT:
+      runtime_activity->addMetadata("expected_count", activity->data);
       break;
 
     default:
