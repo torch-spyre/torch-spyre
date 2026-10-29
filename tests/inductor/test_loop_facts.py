@@ -110,22 +110,45 @@ def test_scheduler_skips_nodes_without_loop_info():
     assert lvl.trip_count == 5
 
 
-def test_scheduler_extern_node_yields_empty():
+def test_scheduler_node_without_scheduler_nodes_yields_empty():
     node = MagicMock()
     node.get_nodes.return_value = [MagicMock()]
     assert scheduler_enclosing_loops(node) == ()
 
 
+def test_default_tiled_reduction_dims_is_still_a_loop():
+    # Like test_restickify_cost_model: loop_tiled_reduction_dims left empty.
+    op = _op(CoarseTileInfo((0,), [32], [[]]))
+    (lvl,) = enclosing_loops(op)
+    assert lvl.trip_count == 32
+    assert lvl.tiled_dims == () and lvl.tiled_reduction_dims == ()
+    assert len(enclosing_loops(op)) == len(counted_loop_path(op)) == 1
+
+
+def test_short_loop_count_is_malformed():
+    assert enclosing_loops(_op(_info((0, 1), [4], [[0]], [[]]))) == ()
+
+
 def test_agrees_with_existing_readers():
     ops = [
         _op(),
-        _op(_info((0,), [4])),
-        _op(_info((0, 1), [2, 8])),
-        _op(_info((3, 0, 2), [2, 3, 4])),
+        _op(_info((0,), [4], [[1]], [[]])),
+        _op(_info((0, 1), [2, 8], [[0], [1]], [[], [0]])),
+        _op(_info((3, 0, 2), [2, 3, 4], [[0], [], [1]], [[], [], []])),
+        _op(CoarseTileInfo((0,), [32], [[]])),
     ]
     for op in ops:
-        assert counted_loop_path(op) == counted_loop_group_path(op)
-        gid = cost_gid(op)
-        assert tuple(lvl.group_path for lvl in enclosing_loops(op))[-1:] == (
-            (gid,) if gid else ()
-        )
+        path = counted_loop_group_path(op)
+        assert counted_loop_path(op) == path
+        levels = enclosing_loops(op)
+        assert len(levels) == len(path)
+        gid = cost_gid(op) or ()
+        assert [lvl.group_path for lvl in levels] == [
+            gid[: i + 1] for i in range(len(gid))
+        ]
+        if levels:
+            info = op.loop_info
+            assert [lvl.trip_count for lvl in levels] == list(info.loop_count)
+            assert [lvl.tiled_dims for lvl in levels] == [
+                tuple(d) for d in info.loop_tiled_dims
+            ] + [()] * (len(levels) - len(info.loop_tiled_dims))

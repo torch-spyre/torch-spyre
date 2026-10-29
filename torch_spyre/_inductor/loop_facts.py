@@ -55,24 +55,32 @@ def _group_path(loop_info) -> tuple[int, ...]:
 
 
 def _levels(loop_info) -> tuple[LoopLevel, ...]:
+    """One ``LoopLevel`` per ``loop_group_id`` entry; ``()`` if none or malformed.
+
+    ``loop_tiled_dims`` / ``loop_tiled_reduction_dims`` may be shorter than the
+    path (``loop_tiled_reduction_dims`` defaults to ``[]``); a level with no
+    entry gets ``()``.  A ``loop_count`` shorter than the path is genuinely
+    malformed (a trip count cannot be invented) and yields ``()``.
+    """
     if loop_info is None:
         return ()
     path = _group_path(loop_info)
-    if not path:
-        return ()
     counts = loop_info.loop_count
+    if not path or len(counts) < len(path):
+        return ()
     tiled = loop_info.loop_tiled_dims
     tiled_red = loop_info.loop_tiled_reduction_dims
-    # coarse_tile stamps one entry per nesting level; anything else is malformed.
-    if not (len(counts) == len(tiled) == len(tiled_red) == len(path)):
-        return ()
+
+    def at(lists, i):
+        return tuple(lists[i]) if i < len(lists) else ()
+
     return tuple(
         LoopLevel(
             group_path=path[: i + 1],
-            trip_count=counts[i],
+            trip_count=sympy.sympify(counts[i]),
             induction=None,
-            tiled_dims=tuple(tiled[i]),
-            tiled_reduction_dims=tuple(tiled_red[i]),
+            tiled_dims=at(tiled, i),
+            tiled_reduction_dims=at(tiled_red, i),
         )
         for i in range(len(path))
     )
