@@ -2382,7 +2382,7 @@ def compute_restickify_target_layout(
     ic: list,
     idc: list,
     *,
-    arg: "PropArg | None" = None,
+    arg: "PropArg",
     reduction_type: str = "",
     label: str = "",
 ) -> "SpyreTensorLayout | None":
@@ -2407,8 +2407,6 @@ def compute_restickify_target_layout(
     if target_stick_expr == sympy.S.Zero:
         return compute_size1_restickify_layout(stl, host_layout, ic, idc)
     if not target_stick_expr.free_symbols:
-        return None
-    if arg is None:
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
