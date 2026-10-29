@@ -69,6 +69,7 @@ from .pass_utils import (
     iteration_space,
     iteration_space_with_splits,
     indirect_access_subs_from_kernel,
+    indirect_index_range,
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
@@ -490,7 +491,10 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
-            self.kernel.indirect_sizes[sym] = int(size)
+            # A symbolic source extent (a gathered pool reserved with
+            # dynamic=) resolves to its declared maximum: a table length
+            # bounds the index values, it is never a trip count.
+            self.kernel.indirect_sizes[sym] = indirect_index_range(size)
             return sym
         return sympy_index_symbol(str(index_var))
 
