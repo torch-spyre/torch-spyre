@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import decimal
+import math
 import os
 import sys
 from typing import Literal
@@ -137,12 +139,18 @@ ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 def _backend_compile_timeout_from_env() -> float:
     value = os.environ.get("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", "60")
     try:
-        return float(value)
+        timeout = float(value)
     except ValueError as exc:
         raise ValueError(
             "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds, "
             f"got {value!r}"
         ) from exc
+    if not math.isfinite(timeout) or (timeout == 0 and decimal.Decimal(value) != 0):
+        raise ValueError(
+            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a finite number "
+            f"of seconds representable as a float, got {value!r}"
+        )
+    return timeout
 
 
 backend_compile_timeout_seconds: float = _backend_compile_timeout_from_env()
@@ -476,6 +484,8 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # A limit on compiler execution time, not an input to generated code.
+    "backend_compile_timeout_seconds",
 ]
 
 install_config_module(sys.modules[__name__])

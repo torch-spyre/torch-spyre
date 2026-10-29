@@ -52,7 +52,7 @@ def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
 def _load_config(monkeypatch):
     # Exercise import-time environment resolution without replacing the config
     # module used by other tests or launching a fresh Python for every spelling.
-    name = "_test_loop_unroll_config"
+    name = "_test_async_compile_config"
     spec = importlib.util.spec_from_file_location(name, spyre_config.__file__)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -115,14 +115,42 @@ def test_backend_compile_timeout_environment(monkeypatch, value, expected):
     assert _load_config(monkeypatch).backend_compile_timeout_seconds == expected
 
 
-@pytest.mark.parametrize("value", ["", "abc"])
+@pytest.mark.parametrize(
+    "value", ["", "abc", "nan", "inf", "-inf", "1e400", "1e-400", "-1e-400"]
+)
 def test_backend_compile_timeout_rejects_invalid_environment(monkeypatch, value):
     monkeypatch.setenv("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", value)
     with pytest.raises(
         ValueError,
-        match="SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds",
+        match="SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be",
     ):
         _load_config(monkeypatch)
+
+
+def test_backend_compile_timeout_stays_out_of_inductor_cache_key():
+    def key():
+        return spyre_config.save_config_portable(
+            ignore_private_configs=False, readonly_values=True
+        )
+
+    baseline = key()
+    assert "backend_compile_timeout_seconds" not in baseline
+    with spyre_config.patch(backend_compile_timeout_seconds=123.0):
+        assert key() == baseline
+
+
+def test_bundle_cache_key_includes_resolved_device_mlir():
+    with (
+        patch.object(
+            kernel_cache, "_get_backend_compiler_version", return_value="test"
+        ),
+        patch.object(kernel_cache, "_get_torch_spyre_version", return_value="test"),
+    ):
+        default = kernel_cache.compute_specs_hash([], ktir_device_mlir="")
+        custom = kernel_cache.compute_specs_hash(
+            [], ktir_device_mlir="/some/device.mlir"
+        )
+    assert default != custom
 
 
 @pytest.mark.parametrize("unroll", [False, True])
@@ -134,16 +162,19 @@ def test_backend_compiler_forwards_loop_unroll_control(tmp_path, unroll, timeout
     # A worker's environment and imported config may disagree with the parent.
     env = {"SPYRE_BACKEND_LOOP_UNROLL": str(int(not unroll))}
     with (
-        spyre_config.patch(backend_loop_unroll=not unroll),
+        spyre_config.patch(
+            backend_loop_unroll=not unroll, ktir_device_mlir="/worker/device.mlir"
+        ),
         patch.object(async_compile_mod, "_check_backend_compiler_on_path"),
         patch.object(async_compile_mod.subprocess, "run") as run,
     ):
         assert async_compile_mod._run_backend_compiler(
-            "kernel", str(tmp_path), env, unroll, timeout
+            "kernel", str(tmp_path), env, unroll, "/parent/device.mlir", timeout
         ) == str(tmp_path)
     args = run.call_args.args[0]
     flags = [arg for arg in args if arg.startswith("--enable-loop-unroll=")]
     assert flags == [f"--enable-loop-unroll={int(unroll)}"]
+    assert "--device=/parent/device.mlir" in args
     assert run.call_args.kwargs["env"] == env
     assert run.call_args.kwargs["timeout"] == timeout
 
@@ -155,25 +186,37 @@ def test_single_worker_compiles_inline_without_starting_pool(unroll):
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
         spyre_config.patch(
-            backend_loop_unroll=unroll, backend_compile_timeout_seconds=60.0
+            backend_loop_unroll=unroll,
+            backend_compile_timeout_seconds=123.0,
+            ktir_device_mlir="/parent/device.mlir",
         ),
         patch.object(compiler, "wait_pool_ready") as wait_ready,
         patch.object(compiler, "process_pool") as pool,
         patch.object(async_compile_mod, "_run_backend_compiler") as compile_backend,
     ):
-        task = compiler._submit_backend_compile("sdsc_0", "/tmp/kernel")
+        task = compiler._submit_backend_compile(
+            "sdsc_0",
+            "/tmp/kernel",
+            backend_loop_unroll=spyre_config.backend_loop_unroll,
+            ktir_device_mlir=spyre_config.ktir_device_mlir,
+            timeout=async_compile_mod._backend_compile_timeout(),
+        )
 
     assert task is None
     wait_ready.assert_not_called()
     pool.assert_not_called()
     compile_backend.assert_called_once_with(
-        "sdsc_0", "/tmp/kernel", dict(os.environ), unroll, 60.0
+        "sdsc_0",
+        "/tmp/kernel",
+        dict(os.environ),
+        unroll,
+        "/parent/device.mlir",
+        123.0,
     )
 
 
-def test_backend_timeout_is_resolved_in_parent_for_pool_workers():
-    """A runtime config change must reach the pool, whose workers import config
-    fresh and would otherwise see only the env-derived default."""
+def test_backend_settings_are_forwarded_to_pool_workers():
+    """The pool gets resolved settings, not its own config module's values."""
     pool = _RecordingPool()
     compiler = async_compile_mod.SpyreAsyncCompile()
 
@@ -190,12 +233,19 @@ def test_backend_timeout_is_resolved_in_parent_for_pool_workers():
             patch.object(compiler, "use_process_pool", return_value=True),
             patch.object(compiler, "process_pool", return_value=pool),
         ):
-            compiler._submit_backend_compile("sdsc_0", "/tmp/kernel")
+            compiler._submit_backend_compile(
+                "sdsc_0",
+                "/tmp/kernel",
+                backend_loop_unroll=spyre_config.backend_loop_unroll,
+                ktir_device_mlir="/parent/device.mlir",
+                timeout=async_compile_mod._backend_compile_timeout(),
+            )
 
         fn, args = pool.calls[-1]
         assert fn is async_compile_mod._run_backend_compiler
         assert args[3] is False
-        assert args[4] == expected
+        assert args[4] == "/parent/device.mlir"
+        assert args[5] == expected
 
 
 def test_sdsc_submits_all_backend_jobs_before_wait():
@@ -269,11 +319,20 @@ def test_async_cache_commit_is_deferred_until_wait():
     def generate_bundle(*args, **kwargs):
         # Changing config after hashing must not change the submitted setting.
         spyre_config.backend_loop_unroll = True
+        spyre_config.ktir_device_mlir = "/changed/device.mlir"
+        spyre_config.backend_compile_timeout_seconds = 1.0
         return fake_symbol_kinds
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"spyre_kernel_cache": True, "backend_loop_unroll": False}),
+        spyre_config.patch(
+            {
+                "spyre_kernel_cache": True,
+                "backend_loop_unroll": False,
+                "ktir_device_mlir": "/parent/device.mlir",
+                "backend_compile_timeout_seconds": 123.0,
+            }
+        ),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -297,7 +356,14 @@ def test_async_cache_commit_is_deferred_until_wait():
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
         assert hash_specs.call_args.kwargs["backend_loop_unroll"] is False
-        assert pool.calls[0][1][-2] is False
+        assert hash_specs.call_args.kwargs["ktir_device_mlir"] == (
+            "/parent/device.mlir"
+        )
+        assert pool.calls[0][1][3:] == (
+            False,
+            "/parent/device.mlir",
+            123.0,
+        )
         commit.assert_not_called()
 
         pool.futures[0].set_result("compiled")
@@ -518,7 +584,11 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
                 with spyre_config.patch(backend_loop_unroll=bool(index)):  # type: ignore[attr-defined]
                     tasks.append(
                         compiler._submit_backend_compile(
-                            f"sdsc_{index}", str(compile_dir)
+                            f"sdsc_{index}",
+                            str(compile_dir),
+                            backend_loop_unroll=spyre_config.backend_loop_unroll,
+                            ktir_device_mlir=spyre_config.ktir_device_mlir,
+                            timeout=async_compile_mod._backend_compile_timeout(),
                         )
                     )
             assert all(task is not None for task in tasks)
