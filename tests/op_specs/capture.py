@@ -281,7 +281,7 @@ def capture_kernels(
     def spy(method: str):
         real = originals[method]
 
-        def wrapper(self, kernel_name, specs, pool_size=0):
+        def wrapper(self, kernel_name, specs, pool_size=0, precomputed_key=None):
             rec = KernelRecord(
                 name=kernel_name,
                 specs=list(specs),
@@ -297,7 +297,13 @@ def capture_kernels(
             if method == "ktir":
                 runner = real(self, kernel_name, specs)
             else:
-                runner = real(self, kernel_name, specs, pool_size=pool_size)
+                runner = real(
+                    self,
+                    kernel_name,
+                    specs,
+                    pool_size=pool_size,
+                    precomputed_key=precomputed_key,
+                )
             if isinstance(runner, CodeCacheFuture):
                 return _RunRecorderFuture(runner, rec, save_inputs)
             return _RunRecorder(runner, rec, save_inputs)
