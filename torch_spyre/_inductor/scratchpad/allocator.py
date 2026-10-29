@@ -98,6 +98,7 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import (
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.utils import (
+    storage_has_single_writer,
     round_up_to_alignment,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
@@ -235,7 +236,9 @@ def _handoff_parent_end(
     return max(last, lifetime_end_overrides.get(name, last + 1) - 1)
 
 
-def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
+def _extern_kernel_in_live_range(
+    graph: GraphLowering, uses: list[int], *, excluded_op: Operation | None = None
+) -> bool:
     """True if an opaque extern kernel runs at any point while the buffer is live.
 
     The LX scratchpad is a fixed per-core resource shared by *every* compiled
@@ -258,6 +261,7 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
     return any(
         isinstance(graph.operations[i], ExternKernel)
         and not isinstance(graph.operations[i], SpyreEmptyFallback)
+        and graph.operations[i] is not excluded_op
         for i in range(min(uses), max(uses) + 1)
     )
 
@@ -293,6 +297,19 @@ def _is_loop_carry_storage(op: Any) -> bool:
 
     record = getattr(op, "_loop_carry_record", None)
     return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
+
+def _collective_stage_storage_is_private(
+    graph: GraphLowering, producer: Operation, collective: Operation
+) -> bool:
+    """Prove a drain will observe the sole producer's final value.
+
+    Liveness dependencies alone do not find every writer: a ComputedBuffer
+    mutation can name its own write while its layout targets another buffer.
+    The selected collective's mutation is moved onto the drain; any other
+    mutation, alias or extra writer makes this transformation unsafe.
+    """
+    return storage_has_single_writer(graph, producer, transferred_mutation=collective)
 
 
 def _coarse_tile_loop_trip_count(op: Any) -> int:
@@ -964,6 +981,7 @@ class ScratchpadAllocator:
         # residency gate, the lifetime extension and the post-solve push.  The
         # placement path leaves this empty, which is its pre-change behavior.
         self._validated_drain_plans: dict[str, DrainPlan] = {}
+        self._collective_output_stages: dict[str, Operation] = {}
 
     @staticmethod
     def _planned_lx_buffer_names(
@@ -2087,6 +2105,19 @@ class ScratchpadAllocator:
                 graph_editor.change_graph_output(buf, new_buffer)
 
             else:
+                collective = self._collective_output_stages.get(b.name)
+                if collective is not None:
+                    # The result has private, disjoint frontend storage. Keep
+                    # the collective's required HBM operand and its mutation
+                    # on a separate ordinary clone with identical addressing.
+                    drained = graph_editor.push_allocation_with_clone(
+                        buf,
+                        [collective],
+                        input=False,
+                        private=True,
+                        lower_anchor=buf,
+                    )
+                    graph_editor.replace_collective_operand(collective, b.name, drained)
                 drain_plan = drain_plans.get(b.name)
                 if drain_plan is not None and drain_plan.collective is not None:
                     # The collective needs an HBM operand: give it a post-loop
@@ -3100,7 +3131,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     @staticmethod
     def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
         from torch_spyre._inductor.cost_model import transport_dma_cost_available
-        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         if op is None or not any(buf.name == op.get_name() for buf in buffers):
@@ -3336,7 +3367,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         variable for that axis. With no tiled candidate there are none, and the
         extractor reads the op's committed tiling (``loop_info``) as before.
         """
-        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
         )
@@ -3434,7 +3465,131 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             accepted_lx_relayouts,
             drained_readers=_drained_collectives(self._validated_drain_plans),
         )
+        self._stage_collective_outputs(graph, allocation, accepted_lx_relayouts)
         log_solver_decisions(graph, allocation)
+
+    def _stage_collective_outputs(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[LifetimeBoundBuffer],
+        relayouts: Sequence[LXRelayoutPlan],
+    ) -> None:
+        """Use otherwise unused frontend LX for a matmul's collective drain.
+
+        A matmul with an LX operand can still need backend scratch for its HBM
+        result. Producing that result in a separate frontend allocation and
+        draining it once gives the backend more room for its streaming inputs,
+        without changing either reservation or the collective's HBM traffic.
+
+        This conservative completion runs after the solve. It moves no chosen
+        allocation and uses only gaps unused for the *entire graph*, including
+        all relayout copies. Stages also have distinct addresses from each
+        other. Thus it needs no lifetime relaxation, in-place alias, synthetic
+        spill saving, or backend reservation hint. No free gap means no change.
+        Only a fresh, untiled matmul result with one bare collective consumer
+        qualifies; aliases, graph outputs and other readers retain HBM.
+        """
+        self._collective_output_stages = {}
+        if not config.lx_collective_output_staging or not clone_at_graph_boundaries():
+            return
+        # Chosen tilings can insert operations after the solve. Read current
+        # graph positions without changing the solver's lifetime records.
+        current_uses = calculate_liveness(graph)
+        by_name = {b.name: b for b in allocation}
+        gaps = FirstFitLayoutSolver([], self.size)
+        placed: list[LifetimeBoundBuffer] = []
+        for b in allocation:
+            if b.address is None:
+                continue
+            if isinstance(b, CoreDivisionBuffer):
+                if b.chosen_division is None:
+                    logger.debug(
+                        "collective output staging stopped: %s has no chosen division",
+                        b.name,
+                    )
+                    return
+                # Use the span actually reserved by the solver, including
+                # integer/index buffers and pending relayout copies. The
+                # relayout-specific size helper only accepts standard sticks.
+                span = b.per_core_size(b.chosen_division)
+            else:
+                span = b.size
+            span = round_up_to_alignment(span, gaps.alignment)
+            placed.append(LifetimeBoundBuffer(b.name, span, [0], address=b.address))
+
+        outputs = set(graph.get_output_names())
+        candidates: dict[str, Operation] = {}
+        copy_readers = {n for plan in relayouts for n in plan.consumer_names}
+        for b in allocation:
+            uses = current_uses.get(b.name, [])
+            if b.address is not None or b.name in outputs or len(uses) != 2:
+                continue
+            op, consumer = (graph.operations[i] for i in uses)
+            if (
+                not isinstance(op, ComputedBuffer)
+                or op.get_name() != b.name
+                or not _is_matmul_op(op)
+                or not isinstance(op.layout, FixedTiledLayout)
+                or _access_group_path(op)
+                or _access_group_path(consumer)
+                or _is_tiled_advancing(op)
+                or GraphEditor.collective_operand_name(consumer) != b.name
+                or origin_in_graph(op.origins, graph.graph) is None
+                or origin_in_graph(consumer.origins, graph.graph) is None
+            ):
+                continue
+            # The selected collective reads the HBM drain.
+            if _extern_kernel_in_live_range(graph, uses, excluded_op=consumer):
+                continue
+            if not _collective_stage_storage_is_private(graph, op, consumer):
+                continue
+            if buffer_not_read_in_full(graph, b.name) or _would_produce_lx_back_gap(
+                graph, b.name, uses
+            ):
+                continue
+            if b.name not in copy_readers and not any(
+                by_name.get(dep.name) is not None
+                and by_name[dep.name].address is not None
+                for dep in op_read_writes(op).reads
+            ):
+                continue
+            candidates[b.name] = consumer
+        if not candidates:
+            return
+        _, _, views = get_ncores_for_buffers(
+            graph,
+            drained_readers={name: op.get_name() for name, op in candidates.items()},
+        )
+        for name, collective in candidates.items():
+            view = views.get(name)
+            if view is None:
+                # The ownership judge also rejects K-split writers: only the
+                # last reduction cores hold the complete result.
+                logger.debug(
+                    "collective output staging skipped: %s has no accepted ownership",
+                    name,
+                )
+                continue
+            try:
+                span = partition_footprint(graph.get_buffer(name).layout, view)
+            except (ValueError, TypeError):
+                continue
+            scratch = LifetimeBoundBuffer(name, span, [0])
+            gap = gaps._pick_gap(gaps._build_gaps(scratch, placed), span)
+            if gap is None:
+                continue
+            scratch.address = round_up_to_alignment(gap.start, gaps.alignment)
+            placed.append(scratch)
+            b = by_name[name]
+            b.address, b.lx_view, b.spill_reason = scratch.address, view, None
+            self._collective_output_stages[name] = collective
+            logger.debug(
+                "collective output stage: %s LX [%d, %d), HBM drain before %s",
+                name,
+                b.address,
+                b.address + span,
+                collective.get_name(),
+            )
 
     def _get_spill_reasons(
         self,
@@ -4690,7 +4845,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Extract once per consumer division, not once per source/destination pair.
         """
         from torch_spyre._inductor.cost_model import predict_ops
-        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.cost_features import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}

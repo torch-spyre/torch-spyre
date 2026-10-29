@@ -1444,6 +1444,106 @@ class TestSpliceWhileLoops(unittest.TestCase):
             graph.run(*placeholders)
         return graph
 
+    def _rewrite_counter_constant(self, while_op, which, mapping):
+        """Rewrite constants in a real loop's counter init ('init') or step ('step')."""
+        from torch._inductor.ops_handler import WrapperHandler
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _unwrap_to_buffer,
+        )
+
+        class _Rewrite(WrapperHandler):
+            def constant(self, value, dtype):
+                return super().constant(mapping.get(value, value), dtype)
+
+        buf = _unwrap_to_buffer(
+            while_op.carried_inputs[0]
+            if which == "init"
+            else while_op.body_subgraph.graph.graph_outputs[0]
+        )
+        data = buf.data
+        original = data.inner_fn
+
+        def inner_fn(*args, **kwargs):
+            with V.set_ops_handler(_Rewrite(V.ops)):
+                return original(*args, **kwargs)
+
+        object.__setattr__(data, "inner_fn", inner_fn)
+        self.addCleanup(object.__setattr__, data, "inner_fn", original)
+
+    def test_unprovable_counter_raises_unsupported_and_names_the_reason(self):
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        cases = (
+            ("init", {0: 1}, "fill value is 1, not 0"),
+            ("step", {1: 2}, "advances the counter by 2, not 1"),
+        )
+        for which, mapping, expected in cases:
+            with self.subTest(which=which):
+                (X, Y), _ref = matmul_inputs()
+                graph = self._run_graph(split_k_fn, (X, Y))
+                (while_op,) = [
+                    op for op in graph.operations if isinstance(op, ir.WhileLoop)
+                ]
+                self._rewrite_counter_constant(while_op, which, mapping)
+
+                with V.set_graph_handler(graph):
+                    with self.assertRaisesRegex(Unsupported, expected):
+                        splice_while_loops(graph)
+
+    def test_loop_without_a_counter_read_raises_unsupported(self):
+        # The prover accepts, but the body has no scalar read of its counter to
+        # take the loop variable from. That used to leave the WhileLoop in the
+        # graph (which compiles to wrong results); it must raise instead.
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+        self.assertTrue(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
+
+        with V.set_graph_handler(graph):
+            with mock.patch.object(lowering, "_body_loop_var", return_value=None):
+                with self.assertRaisesRegex(
+                    Unsupported, "no scalar read of its counter"
+                ):
+                    lowering.splice_while_loops(graph)
+
+    def test_every_nested_level_is_checked(self):
+        # Break only the INNER loop's step: the outer loop splices fine, then the
+        # inner loop is found and must still be refused.
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.wsr import for_each_tile_lowering as lowering
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(nested_split_m_then_k_fn, (X, Y))
+        outer_loops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(outer_loops), 1)
+
+        real_prove = lowering.try_prove_for_each_tile
+        calls = []
+
+        def prove(while_op):
+            calls.append(while_op.get_name())
+            if len(calls) == 2:  # the inner loop, found after the outer is spliced
+                return lowering.ProverResult(accepted=False, reason="inner broken")
+            return real_prove(while_op)
+
+        with V.set_graph_handler(graph):
+            with mock.patch.object(lowering, "try_prove_for_each_tile", prove):
+                with self.assertRaisesRegex(Unsupported, "inner broken"):
+                    lowering.splice_while_loops(graph)
+        self.assertEqual(len(calls), 2)
+
     def test_map_mode_group_gets_loop_info(self):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
@@ -2873,6 +2973,221 @@ class TestTryProveForEachTile(unittest.TestCase):
 
         self.assertTrue(result.accepted, result.reason)
         self.assertIsNotNone(result.trip_count)
+
+    # The prover must prove the trip count N is the iteration count: the counter
+    # starts at 0 and the body advances it by exactly 1. Each test below changes
+    # one property of a real loop's IR and expects a rejection that names it.
+
+    @staticmethod
+    def _constant_rewriter(mapping):
+        from torch._inductor.ops_handler import WrapperHandler
+
+        class _Rewrite(WrapperHandler):
+            def constant(self, value, dtype):
+                return super().constant(mapping.get(value, value), dtype)
+
+        return _Rewrite
+
+    def _with_rewritten_constant(self, buf, mapping):
+        """Make buf's inner_fn see constants rewritten per mapping; return undo."""
+        data = buf.data
+        original = data.inner_fn
+        rewrite = self._constant_rewriter(mapping)
+
+        def inner_fn(*args, **kwargs):
+            with V.set_ops_handler(rewrite(V.ops)):
+                return original(*args, **kwargs)
+
+        object.__setattr__(data, "inner_fn", inner_fn)
+        self.addCleanup(object.__setattr__, data, "inner_fn", original)
+
+    def _counter_init_buffer(self, while_op):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _unwrap_to_buffer,
+        )
+
+        return _unwrap_to_buffer(while_op.carried_inputs[0])
+
+    def _counter_step_buffer(self, while_op):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _unwrap_to_buffer,
+        )
+
+        return _unwrap_to_buffer(while_op.body_subgraph.graph.graph_outputs[0])
+
+    def test_declines_counter_that_does_not_start_at_zero(self):
+        for start in (1, 3):
+            with self.subTest(start=start):
+                (X, Y), _ref = matmul_inputs()
+                while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+                self._with_rewritten_constant(
+                    self._counter_init_buffer(while_op), {0: start}
+                )
+
+                result = try_prove_for_each_tile(while_op)
+
+                self.assertFalse(result.accepted)
+                self.assertIn(f"fill value is {start}, not 0", result.reason)
+
+    def test_declines_counter_that_does_not_step_by_one(self):
+        for step in (2, 0, -1):
+            with self.subTest(step=step):
+                (X, Y), _ref = matmul_inputs()
+                while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+                self._with_rewritten_constant(
+                    self._counter_step_buffer(while_op), {1: step}
+                )
+
+                result = try_prove_for_each_tile(while_op)
+
+                self.assertFalse(result.accepted)
+                self.assertIn(f"advances the counter by {step}, not 1", result.reason)
+
+    def test_declines_counter_update_that_is_not_an_add(self):
+        from torch._inductor.ops_handler import WrapperHandler
+
+        class _AddToSub(WrapperHandler):
+            def add(self, a, b):
+                return super().sub(a, b)
+
+        (X, Y), _ref = matmul_inputs()
+        while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+        data = self._counter_step_buffer(while_op).data
+        original = data.inner_fn
+
+        def inner_fn(*args, **kwargs):
+            with V.set_ops_handler(_AddToSub(V.ops)):
+                return original(*args, **kwargs)
+
+        object.__setattr__(data, "inner_fn", inner_fn)
+        self.addCleanup(object.__setattr__, data, "inner_fn", original)
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("not a single add", result.reason)
+
+    def test_declines_counter_update_that_reads_another_carry(self):
+        from torch._inductor.ops_handler import WrapperHandler
+
+        (X, Y), _ref = matmul_inputs()
+        while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+        body_inputs = list(while_op.body_subgraph.graph.graph_inputs)
+
+        class _ReadOther(WrapperHandler):
+            def load(self, name, index):
+                return super().load(body_inputs[1], index)
+
+        data = self._counter_step_buffer(while_op).data
+        original = data.inner_fn
+
+        def inner_fn(*args, **kwargs):
+            with V.set_ops_handler(_ReadOther(V.ops)):
+                return original(*args, **kwargs)
+
+        object.__setattr__(data, "inner_fn", inner_fn)
+        self.addCleanup(object.__setattr__, data, "inner_fn", original)
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("does not read its own counter input", result.reason)
+
+    def test_declines_counter_init_that_is_not_a_constant(self):
+        # A counter whose start is a caller tensor has an unknown value. Point
+        # carried_inputs[0] at a graph input (the loop's own K operand) instead of
+        # the in-graph fill.
+        from torch._inductor import ir
+
+        (X, Y), _ref = matmul_inputs()
+        while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+        graph_input = next(
+            carried
+            for carried in while_op.carried_inputs
+            if isinstance(self._unwrap(carried), ir.InputBuffer)
+        )
+        original = list(while_op.carried_inputs)
+        while_op.carried_inputs[0] = graph_input
+        self.addCleanup(setattr, while_op, "carried_inputs", original)
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("not the int64", result.reason)
+
+    def test_declines_counter_init_computed_by_a_non_constant_pointwise(self):
+        # An int64 scalar that is computed (here: loaded from another buffer), not
+        # a constant, must not be taken for a zero fill.
+        from torch._inductor.ops_handler import WrapperHandler
+
+        (X, Y), _ref = matmul_inputs()
+        while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+        init = self._counter_init_buffer(while_op)
+
+        class _LoadInstead(WrapperHandler):
+            def constant(self, value, dtype):
+                return self._inner.load("arg0_1", 0)
+
+        data = init.data
+        original = data.inner_fn
+
+        def inner_fn(*args, **kwargs):
+            with V.set_ops_handler(_LoadInstead(V.ops)):
+                return original(*args, **kwargs)
+
+        object.__setattr__(data, "inner_fn", inner_fn)
+        self.addCleanup(object.__setattr__, data, "inner_fn", original)
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("not a single constant", result.reason)
+
+    @staticmethod
+    def _unwrap(node):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _unwrap_to_buffer,
+        )
+
+        return _unwrap_to_buffer(node)
+
+    def test_declines_loop_with_no_carried_inputs(self):
+        (X, Y), _ref = matmul_inputs()
+        while_op = _find_while_loop_ir_op(split_k_fn, (X, Y))
+        original = list(while_op.carried_inputs)
+        while_op.carried_inputs = []
+        self.addCleanup(setattr, while_op, "carried_inputs", original)
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("no carried inputs", result.reason)
+
+    def test_accepts_every_for_each_tile_shape(self):
+        # The proofs must not reject a loop the frontend really builds: map mode,
+        # carry mode, a caller-provided init, and both levels of a nested pair.
+        from torch._inductor import ir
+
+        cases = (
+            ("map", split_m_fn),
+            ("carry", split_k_fn),
+            ("nested", nested_split_m_then_k_fn),
+        )
+        for name, fn in cases:
+            with self.subTest(name=name):
+                (X, Y), _ref = matmul_inputs()
+                graph_loops = self._all_while_loops(fn, (X, Y))
+                self.assertTrue(graph_loops)
+                for loop in graph_loops:
+                    result = try_prove_for_each_tile(loop)
+                    self.assertTrue(result.accepted, result.reason)
+                    self.assertIsInstance(loop, ir.WhileLoop)
+
+    def _all_while_loops(self, fn, args):
+        from torch._inductor import ir
+
+        graph = TestSpliceWhileLoops()._run_graph(fn, args)
+        return [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
 
 
 class TestPassPipelineRegistration(unittest.TestCase):

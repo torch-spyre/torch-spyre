@@ -1,6 +1,6 @@
 name: upstream-pytorch-tests
 
-# One of torch-spyre's trunk (push-to-main) workflows: runs every trunk-labeled config in tests/configs/upstream_tests/.
+# One of torch-spyre's trunk (push-to-main) workflows: runs upstream configs labeled with this event's tier (trunk on push, regression on PR/merge queue, as spyre-test).
 on:
   # Run automatically on every merge to main
   push:
@@ -52,6 +52,7 @@ jobs:
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests
+  # has_configs=false  --> no upstream config carries this event's tier --> skip tests (an empty matrix would fail)
   # ---------------------------------------------------------------------------
   changes:
     name: Detect changed files
@@ -59,11 +60,16 @@ jobs:
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
       integration_labeled: ${{ steps.label.outputs.labeled }}
+      test_type: ${{ steps.tier.outputs.test_type }}
+      has_configs: ${{ steps.tier.outputs.has_configs }}
     steps:
-      - name: Checkout composite actions
+      - name: Checkout composite actions and upstream configs
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          sparse-checkout: .github/actions
+          sparse-checkout: |
+            .github/actions
+            tests/configs/upstream_tests
+            tests/oot_framework/utils/filter_configs.py
           sparse-checkout-cone-mode: false
 
       - name: Check which paths changed
@@ -74,11 +80,31 @@ jobs:
         id: label
         uses: ./.github/actions/detect-integration-test-label
 
+      - name: Check which upstream configs carry this event's tier
+        id: tier
+        env:
+          # Same tier per event as tests (torch_spyre_tests.yaml) and spyre-test.
+          TEST_TYPE: ${{ github.event_name == 'push' && 'trunk' || 'regression' }}
+        run: |
+          pip install pyyaml --quiet
+          configs=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/upstream_tests \
+            --test-type "${TEST_TYPE}" \
+            --format paths)
+          has_configs=false
+          if [ -n "${configs}" ]; then
+            has_configs=true
+          fi
+          echo "tier=${TEST_TYPE} upstream configs carrying it: ${has_configs}"
+          echo "test_type=${TEST_TYPE}" >> "$GITHUB_OUTPUT"
+          echo "has_configs=${has_configs}" >> "$GITHUB_OUTPUT"
+
   run-tests:
     needs: changes
-    # Skipped for integration-test-labeled, auto-merge-enabled, and merge-queue runs, as in tests.
+    # Skipped when no upstream config carries this event's tier, and for integration-test-labeled, auto-merge-enabled, and merge-queue runs, as in tests.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
+      needs.changes.outputs.has_configs == 'true' &&
       needs.changes.outputs.integration_labeled != 'true' &&
       !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
       github.event_name != 'merge_group'
@@ -86,7 +112,7 @@ jobs:
     with:
       runner_label: linux
       config_dir: upstream_tests
-      test_type: trunk
+      test_type: ${{ needs.changes.outputs.test_type }}
       extra_test_flags: -v
       checkout_pytorch: true
       report_retention_days: 90

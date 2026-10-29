@@ -79,7 +79,12 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_size_in_bytes,
+)
 
 from .constants import BATCH_MATMUL_FP8_OP, MATMUL_REDUCTION_OPS
 from .errors import Unsupported
@@ -93,6 +98,7 @@ from . import config
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    compute_size1_restickify_target,
     concretize_expr,
     device_coordinates,
     find_reduction_var,
@@ -102,6 +108,7 @@ from .pass_utils import (
     try_device_coordinates,
 )
 from .propagate_layouts import PropArg
+from .work_division import MAX_SPAN_BYTES
 
 # Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
@@ -386,15 +393,6 @@ def _indirect_stride_idx(
     return None
 
 
-def _reject_stick_indexed_gather(stl: SpyreTensorLayout, stride_idx: int) -> None:
-    """Refuse a non-DL16 gather indexed along its stick dim until #4360 is fixed."""
-    if stride_idx == 0 and stl.device_dtype != DataFormats.SEN169_FP16:
-        raise Unsupported(
-            f"gather from a {stl.device_dtype} tensor indexed along its stick "
-            "dimension (#4360)"
-        )
-
-
 def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
     """Check if indirect access is at the outermost (leftmost) device position."""
     v_n = len(value_stl.stride_map)
@@ -406,7 +404,10 @@ def _ia_rotate_stl(
     stl: SpyreTensorLayout,
     indirect_device_pos: int,
 ) -> SpyreTensorLayout:
-    """Build a new STL with the indirect coordinate rotated to device position 0."""
+    """Build a new STL with the indirect coordinate rotated to device position 0.
+
+    When the indexed coordinate is the stick, use _retile_entry_per_stick.
+    """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
     n = len(device_size)
@@ -415,15 +416,97 @@ def _ia_rotate_stl(
     if indirect_device_pos == 0:
         return stl
 
+    assert indirect_device_pos != stick_pos, "the indexed stick needs a re-tile"
+
     order = (
         [indirect_device_pos]
         + [i for i in range(n) if i != indirect_device_pos and i != stick_pos]
         + [stick_pos]
     )
+    new_device_size = [device_size[i] for i in order]
+    assert len(new_device_size) == n, (
+        f"rotation changed rank {n} -> {len(new_device_size)} (order={order})"
+    )
     return SpyreTensorLayout(
-        device_size=[device_size[i] for i in order],
+        device_size=new_device_size,
         stride_map=[stride_map[i] for i in order],
         device_dtype=stl.device_dtype,
+    )
+
+
+def _retile_entry_per_stick(
+    value_stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Re-tile a tensor whose indexed coordinate is the stick.
+
+    Rotating cannot help: it lists the stick twice and grows the rank. Instead
+    the stick moves onto a size-1 dim, so each entry sits alone on a stick and
+    the indexed coordinate becomes an outer device dim. This is the layout a
+    host ``[N, 1]`` input already receives.
+    """
+    retiled_stl = compute_size1_restickify_target(value_stl, host_layout, dep, op)
+    if retiled_stl is None:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: no size-1 stick target for {value_stl}"
+        )
+    stride_idx = _indirect_stride_idx(
+        device_coordinates(retiled_stl, dep, sizes), access_subs
+    )
+    if stride_idx is None or stride_idx == 0:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: the indexed coordinate of {retiled_stl} "
+            f"is not an outer device dim"
+        )
+    if not _dim_order_is_compliant(retiled_stl, stride_idx):
+        # The entries may land in a spare size-1 dim; a reorder brings them out.
+        indirect_device_pos = len(retiled_stl.stride_map) - 1 - stride_idx
+        retiled_stl = _ia_rotate_stl(retiled_stl, indirect_device_pos)
+
+    # A stick per entry, so a large table can outgrow the span limit. The
+    # whole table is the per-core span: it is a shared gather table or scatter
+    # destination, at one base address on every core, any of whose rows a core
+    # may address, and indirect_forbidden_split_syms keeps work division from
+    # splitting its data dims. raise_if_per_core_overflow skips indirectly
+    # accessed tensors, so this is the only check.
+    retiled_bytes = get_device_size_in_bytes(retiled_stl)
+    if retiled_bytes > MAX_SPAN_BYTES:
+        raise Unsupported(
+            f"cannot re-tile {dep.name}: one entry per stick would take "
+            f"{retiled_bytes / (1024 * 1024):.2f} MB, over the "
+            f"{MAX_SPAN_BYTES / (1024 * 1024):.2f} MB per-core limit. "
+            f"Give the tensor a trailing dimension so its entries already sit "
+            f"on separate sticks."
+        )
+    return retiled_stl
+
+
+def _ia_required_stl(
+    stl: SpyreTensorLayout,
+    stride_idx: int,
+    host_layout,
+    dep: MemoryDep,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> SpyreTensorLayout:
+    """Put the indexed coordinate where the indirect access can address it."""
+    if stride_idx == 0:
+        return _retile_entry_per_stick(stl, host_layout, dep, op, access_subs, sizes)
+    return _ia_rotate_stl(stl, len(stl.stride_map) - 1 - stride_idx)
+
+
+def _is_permutation_of(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Whether ``b`` just reorders ``a``'s device dims.
+
+    Relabelling a producer moves no bytes, so it is only safe for a reorder.
+    """
+    return sorted(zip(a.device_size, a.stride_map)) == sorted(
+        zip(b.device_size, b.stride_map)
     )
 
 
@@ -513,8 +596,9 @@ def _try_gather_ia_constraint(
     indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
     if _dim_order_is_compliant(stl, stride_idx):
         return None
-    _reject_stick_indexed_gather(stl, stride_idx)
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos)
+    new_stl = _ia_required_stl(
+        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: gather IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -577,10 +661,12 @@ def _try_scatter_ia_constraint(
     expected_pos = list(range(len(indirect_stride_idxs)))
     if indirect_device_pos == expected_pos:
         return None
-    # Rotate the last (innermost) indirect dim to position 0, reproducing the
+    # Move the last (innermost) indirect dim to position 0, reproducing the
     # pre-#5213 behavior from enforce_indirect_access_layout.py which scanned
     # write coords right-to-left and rotated the first hit.
-    new_stl = _ia_rotate_stl(stl, indirect_device_pos[-1])
+    new_stl = _ia_required_stl(
+        stl, indirect_stride_idxs[0], buf_layout, write_dep, op, access_subs, sizes
+    )
     logger.info(
         "nonstick_dim_order: scatter IA constraint on %s — indirect dim %d -> pos 0",
         buf.get_name(),
@@ -703,11 +789,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     stride_idx = _indirect_stride_idx(coords_sub, access_subs)
                     if stride_idx is None:
                         continue
-                    indirect_device_pos = len(stl.stride_map) - 1 - stride_idx
                     if _dim_order_is_compliant(stl, stride_idx):
                         continue  # already compliant
-                    _reject_stick_indexed_gather(stl, stride_idx)
-                    required_stl = _ia_rotate_stl(stl, indirect_device_pos)
+                    required_stl = _ia_required_stl(
+                        stl, stride_idx, buf.get_layout(), dep, op, access_subs, sizes
+                    )
                     key = (dep.name, op.get_name())
                     if key in seen_p1:
                         continue
@@ -735,6 +821,12 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 result = _try_gather_ia_constraint(buf, dep, op)
                 if result is not None:
                     new_stl, pinned = result
+                    if not _is_permutation_of(buf.committed_stl, new_stl):
+                        # A re-tile moves bytes: copy rather than relabel.
+                        V.graph.nonstick_deferred.append(
+                            _DeferredReorder(op, dep.name, new_stl, "copy")
+                        )
+                        continue
                     buf.committed_stl = new_stl
                     log[buf.get_name()] = new_stl
                     pinned_dims.setdefault(buf.get_name(), set()).update(pinned)
@@ -765,8 +857,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                         pinned_dims.setdefault(dest_buf.get_name(), set()).update(
                             pinned
                         )
-                        # Decide execution strategy for phase 2.
-                        if _can_mutate_producer_in_place(
+                        # Decide execution strategy for phase 2. A re-tile
+                        # moves bytes, so only a reorder may relabel in place.
+                        if _is_permutation_of(
+                            dest_stl, new_stl
+                        ) and _can_mutate_producer_in_place(
                             dest_buf, set(graph.get_output_names())
                         ):
                             V.graph.nonstick_deferred.append(

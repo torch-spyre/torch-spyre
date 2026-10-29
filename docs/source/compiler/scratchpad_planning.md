@@ -310,9 +310,39 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    `change_graph_output` to promote a producer to LX and clone the value
    back to a graph output.
 
+### Matmul output staging before a collective
+
+After the solver commits LX buffers and relayout copies, the co-optimizing
+allocator can stage a fresh matmul output in a gap that is free for the whole
+graph. Its sole reader must be a bare all-reduce. The allocator inserts an HBM
+clone after the matmul and makes the collective read and mutate that clone.
+This changes the matmul's output placement; it does not remove the HBM copy
+required by the collective.
+
+Staging uses only space left after other allocations. It cannot displace a
+chosen relayout copy. Enabling another relayout can remove a free gap and change
+which outputs are staged. This is a performance dependency, not a reason to
+relax either path's safety checks.
+
+Staging is a named post-solve exception to ordinary buffer residency. It requires
+one fresh, untiled matmul output, one bare all-reduce reader, private single-writer
+storage, complete reads and an accepted ownership view. Other opaque users,
+aliases, unsupported back gaps and K-split writers are refused. The selected
+collective uses the HBM clone. It does not read LX directly.
+
+`test_real_gap_solver_keeps_stages_disjoint_or_declines` checks full placed spans,
+including reduction splits and relayout copies. The captured-graph test
+`test_stage_push_rewrites_a_captured_matmul_collective` checks the clone and rewire.
+
+Set `SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0` to disable staging independently of
+ownership certificates. The switch clears staging state before placement and
+leaves solver allocations and ordinary output clones unchanged. Its value is
+part of the compile cache key. `test_staging_switch_declines_before_placement`
+checks this boundary.
+
 ### Declarative exclusion
 
-Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
+The ordinary pre-solve verdict is computed in `ScratchpadAllocator._residency_reasons`
 in `allocator.py`, and carried
 to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
@@ -411,6 +441,8 @@ The symbolic proof registry below is separate from storage permission. It
 selects the existing containment proofs in order. The view-recovery caller
 keeps its floor-only, single-driven-axis restriction. An emitted-access proof
 alone does not authorize a recovery candidate.
+`factor_slice_axis` is listed as "Factored ownership" in the transfer-certificate
+table below. It is separate from `SLICE_OWNERSHIP_PROOFS`.
 
 <!-- BEGIN GENERATED OWNERSHIP PROOFS -->
 | Ownership proof | Certificate | Requires | Covering tests |
@@ -429,6 +461,9 @@ slot is a search heuristic, not an ownership proof or a performance guarantee.
 | Full-replica gather | `torch_spyre._inductor.scratchpad.lx_relayout._movement_supported` | ownership flag ON; complete source partition; one destination slice; uniform fan-in/out; all source fragments; shuffle fan-in budget | `test_work_division_hint.py::test_full_replica_movement_tracks_ownership_flag`; `test_work_division_hint.py::test_movement_rule_reads_the_owner_maps` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
 | Full-replica shortlist reservation | `torch_spyre._inductor.scratchpad.allocator.CoOptimizingAllocator._cap_relayout_groups` | ownership flag ON; cheapest priced full replica; an existing unpinned slot; sibling pins, prices and cap preserved; solver may decline the copy | `test_solver_relayout_decision.py::test_relayout_full_replica_preserves_sibling_pins` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
 | Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
+| Fewer-core complete partitions | `torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection` | integral core ratio; complete disjoint partitions; larger domain uses every compute core; physical spans stay separate | `test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
+| Persistent external cache scatter | `torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer` | fresh immutable matmul source; one external indirect overwrite; no source alias or cache read; mutation order and lifetime preserved | `test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source` | `test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias` |
+| Factored ownership | `torch_spyre._inductor.slice_ownership.factor_slice_axis` | exact zero-origin dense product; independent digits; complete rectangular slices; no address rewrite or storage permission | `test_work_division_hint.py::test_factored_slice_rejects_inexact_products` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
 <!-- END GENERATED TRANSFER CERTIFICATES -->
 
 `SPYRE_LX_EXTENDED_OWNERSHIP=0` disables the additional ownership proofs while
@@ -810,6 +845,17 @@ bugs that the hand-written cases miss.
 - [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
   complementary device-memory pass, which packs every intermediate that
   LX planning did not claim into a shared HBM segment.
+
+### Physical geometry and feature extraction
+
+`core_mapping.py` owns immutable `PerCoreView` values and physical owner
+interpretation. Symbolic projections stay in `slice_ownership.py`. A caller
+passes its rollout choice explicitly. Geometry cannot grant storage permission.
+The old `pass_utils.PerCoreView` name remains an import alias.
+
+`cost_features.py` owns feature extraction. Planning and reporting use the same
+functions. `dump_cost_model.py` keeps diagnostic output and latest-report state.
+This extraction does not change coefficients, units or physical core domains.
 
 ### Matched OFF-plan comparison
 

@@ -436,7 +436,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
     plan = group.plan(source_address=0)
     assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
     assert plan.destination_view.num_cores == 8
-    with pytest.raises(ValueError, match="not a multiple"):
+    with pytest.raises(ValueError, match="destination on 6 cores is incompatible.*4"):
         _candidate("C", 0, 5000.0, destination_cores=6)
     with pytest.raises(ValueError, match="no physical core count"):
         RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)

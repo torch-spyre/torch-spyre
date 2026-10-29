@@ -26,6 +26,8 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    InputBuffer,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -34,20 +36,15 @@ from torch_spyre._C import ElementArrangement
 
 from .. import config
 from ..core_mapping import (
-    core_mappings_equal,
+    _MAX_SHUFFLE_FANIN,
+    work_division_from_view as physical_work_division_from_view,
     owner_slots,
     partition_lx_size_bytes,
-    _loop_regions,
-    _LOOP_POINT,
-    _MAX_EXACT_DIRECT_AXIS_POINTS,
-    _MAX_EXACT_OWNERSHIP_POINTS,
-    _EVALUATION_ERRORS,
     select_unique_partition_division,
     transfer_edges,
 )
 from ..cost_model import CostParams, relayout_ns
-from ..dump_cost_model import relayout_cost_features
-from ..slice_ownership import project_slice_axis
+from ..cost_features import relayout_cost_features
 from ..ir import FixedTiledLayout
 from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
@@ -73,7 +70,6 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 # does not common these values per core for fully global programs, so a
 # larger gather can fail register initialization even when individual cores
 # need fewer distinct values. Apply this conservative bound before placement.
-_MAX_SHUFFLE_FANIN = 8
 # Largest governing split the solver may be offered for a GROUPED movement.
 _GROUPED_SPLIT_MAX = 8
 
@@ -153,11 +149,10 @@ class RelayoutCandidate:
 
     @property
     def destination_num_cores(self) -> int:
-        """The destination view's physical core count.
-
-        The copy lives on these cores. The plan's ``num_cores`` remains the
-        source count, including when the two domains differ.
-        """
+        """The consumer's core count, carried by the destination view: equal to
+        ``num_cores`` for permutations and grouped gathers. Complete repartitions
+        may use an integral expansion or contraction; the copy lives on the
+        destination's cores while the plan's ``num_cores`` stays the source's."""
         return cast(int, self.destination_view.num_cores)
 
     def __post_init__(self) -> None:
@@ -170,12 +165,21 @@ class RelayoutCandidate:
                     f"relayout candidate {self.parent} -> {self.consumer}: the {side} "
                     "view carries no physical core count"
                 )
-        if self.destination_num_cores < self.num_cores or (
-            self.destination_num_cores % self.num_cores
+        if (
+            min(self.destination_num_cores, self.num_cores) <= 0
+            or max(self.destination_num_cores, self.num_cores)
+            % min(self.destination_num_cores, self.num_cores)
+            or (
+                self.destination_num_cores < self.num_cores
+                and (
+                    self.source_view.split_product != self.num_cores
+                    or self.destination_view.split_product != self.destination_num_cores
+                )
+            )
         ):
             raise ValueError(
                 f"relayout candidate {self.parent} -> {self.consumer}: destination "
-                f"on {self.destination_num_cores} cores is not a multiple of the "
+                f"on {self.destination_num_cores} cores is incompatible with the "
                 f"source's {self.num_cores}"
             )
         if self.source_view.same_partition(self.destination_view):
@@ -312,156 +316,14 @@ def work_division_from_view(
     device_coordinates: Sequence[sympy.Expr],
     iteration_space: Mapping[sympy.Symbol, sympy.Expr],
 ) -> TensorWorkDivision | None:
-    """Interpret physical slices through an access, without choosing new owners."""
-    if view is None:
-        return None
-    n = view.num_cores
-    if n is None or n <= 0:
-        raise ValueError("LX ownership must carry its physical core domain")
-    if len(device_size) != len(device_coordinates):
-        raise ValueError("sizes and coordinates differ in rank")
-    physical_splits, slots = dict(view.work_slice_dims), dict(view.core_to_slot)
-    if len(physical_splits) != len(view.work_slice_dims) or len(slots) != len(
-        view.core_to_slot
-    ):
-        raise ValueError("duplicate physical dimensions")
-    rows = owner_slots(slots, physical_splits, n)
-    axes_by_loop: dict[sympy.Symbol, list[int]] = {}
-    # Only the local proof coordinates may be reduced. Callers and emitted
-    # tensor accesses retain the original multi-loop coordinate expressions.
-    proof_coordinates = list(device_coordinates)
-    for axis, split in physical_splits.items():
-        if (
-            not 0 <= axis < len(device_size)
-            or sympy.sympify(device_size[axis]).is_Integer is not True
-            or device_size[axis] <= 0
-            or device_size[axis] % split
-        ):
-            raise ValueError(
-                f"unsupported ownership input: axis {axis} not divisible by {split}"
-            )
-        symbols = device_coordinates[axis].free_symbols
-        if len(symbols) == 1 and symbols <= iteration_space.keys():
-            loop = next(iter(symbols))
-        else:
-            if not config.lx_extended_ownership:
-                raise ValueError(f"cannot map device dimension {axis} to one loop")
-            projected = project_slice_axis(
-                device_coordinates[axis], int(device_size[axis]), split, iteration_space
-            )
-            if projected is None:
-                raise ValueError(f"cannot map device dimension {axis} to one loop")
-            loop, proof_coordinates[axis] = projected
-        axes_by_loop.setdefault(loop, []).append(axis)
-
-    any_fused = any(len(axes) > 1 for axes in axes_by_loop.values())
-    splits, owners, expected = {}, {}, {}
-    fused_states = 0
-    for loop, axes in axes_by_loop.items():
-        extent = iteration_space[loop]
-        extent = sympy.sympify(extent[0] if isinstance(extent, tuple) else extent)
-        if extent.is_Integer is not True or extent <= 0:
-            raise ValueError(
-                f"unsupported ownership input: loop extent {extent} is not concrete"
-            )
-        extent = int(extent)
-        first = axes[0]
-        same = all(
-            physical_splits[a] == physical_splits[first]
-            and core_mappings_equal({loop: slots[a]}, {loop: slots[first]}, n)
-            for a in axes
-        )
-        split = (
-            physical_splits[first]
-            if same
-            else math.prod(physical_splits[a] for a in axes)
-        )
-        splits[loop] = split
-        if len(axes) == 1:
-            stick = len(device_size) - 1
-            if (
-                first != stick
-                and stick not in physical_splits
-                and loop in device_coordinates[-1].free_symbols
-            ):
-                padded = int(device_size[first] * device_size[-1])
-                if padded - device_size[-1] < extent <= padded:
-                    extent = padded
-            if extent > _MAX_EXACT_DIRECT_AXIS_POINTS:
-                raise ValueError(
-                    f"proof limit: direct axis needs {extent} points; limit is {_MAX_EXACT_DIRECT_AXIS_POINTS}"
-                )
-        else:
-            fused_states += extent + split
-            if fused_states > _MAX_EXACT_OWNERSHIP_POINTS:
-                raise ValueError(
-                    f"proof limit: fused axes need {fused_states} states; limit is {_MAX_EXACT_OWNERSHIP_POINTS}"
-                )
-        if extent % split:
-            raise ValueError(
-                f"unsupported ownership input: loop {loop} not divisible by {split}"
-            )
-        try:
-            bounds = _loop_regions(
-                extent,
-                tuple(proof_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes),
-                tuple(int(device_size[a]) for a in axes),
-                split,
-            )
-        except _EVALUATION_ERRORS as exc:
-            raise ValueError(
-                f"unsupported ownership evaluation: {type(exc).__name__}: {exc}"
-            ) from exc
-        widths = [int(device_size[a]) // physical_splits[a] for a in axes]
-        signatures = [
-            tuple(low // width for (low, _), width in zip(region, widths))
-            for region in bounds
-        ]
-        if any(
-            low // width != high // width
-            for region in bounds
-            for (low, high), width in zip(region, widths)
-        ):
-            raise ValueError(
-                "ownership mismatch: one loop partition crosses physical slices"
-            )
-        if len(set(signatures)) != split:
-            raise ValueError(
-                "ownership mismatch: loop partitions do not cover distinct physical slices"
-            )
-        try:
-            table = tuple(signatures.index(tuple(row[a] for a in axes)) for row in rows)
-        except ValueError:
-            raise ValueError(
-                "ownership mismatch: a core owns slices no loop partition covers"
-            ) from None
-        if set(table) != set(range(split)) or (
-            not any_fused and signatures != [(p,) for p in range(split)]
-        ):
-            raise ValueError(
-                "ownership mismatch: loop and physical slices have different core owners"
-            )
-        expected[loop] = table
-        owners[loop] = slots[first]
-
-    if not any_fused:
-        return TensorWorkDivision(splits, owners, num_cores=n)
-    # The physical slices already determine every loop owner. Search only for
-    # the existing supported spelling, never re-prove the access per candidate.
-    expected_rows = tuple(
-        {loop: table[core] for loop, table in expected.items()} for core in range(n)
+    """Keep the planner's explicit rollout policy outside physical geometry."""
+    return physical_work_division_from_view(
+        view,
+        device_size,
+        device_coordinates,
+        iteration_space,
+        allow_extended=config.lx_extended_ownership,
     )
-    candidate = select_unique_partition_division(
-        tuple(loop for loop in iteration_space if loop in splits),
-        splits,
-        n,
-        lambda division: (
-            owner_slots(division.core_id_to_work_slice, splits, n) == expected_rows
-        ),
-    )
-    if candidate is None:
-        raise ValueError("no unique certified canonical mapping for fused ownership")
-    return candidate
 
 
 def materialized_lx_relayouts(
@@ -575,7 +437,7 @@ def _movement_supported(
 
     Edges are ownership intersections, never a separate geometry calculation.
     A complete source may feed uniformly repeated destination slices. Across
-    unequal core counts, a larger complete destination partition may gather
+    unequal core counts, a complete destination partition may gather
     several disjoint source fragments. A full replicated destination may also
     gather a complete source partition (the cache-transpose to QK handoff).
     Partially partitioned replicas retain the one-source broadcast rule.
@@ -585,10 +447,12 @@ def _movement_supported(
     """
     if (
         source_num_cores <= 0
-        or destination_num_cores < source_num_cores
+        or destination_num_cores <= 0
+        or (not extended_ownership and destination_num_cores < source_num_cores)
         or source.num_cores != source_num_cores
         or destination.num_cores != destination_num_cores
-        or destination_num_cores % source_num_cores
+        or max(destination_num_cores, source_num_cores)
+        % min(destination_num_cores, source_num_cores)
         or (
             source_num_cores == destination_num_cores
             and source.same_partition(destination)
@@ -601,6 +465,10 @@ def _movement_supported(
         destination_slices <= 0
         or destination_num_cores % destination_slices
         or source.split_product != source_num_cores
+        or (
+            destination_num_cores < source_num_cores
+            and destination_slices != destination_num_cores
+        )
     ):
         return False
 
@@ -648,12 +516,14 @@ def _movement_supported(
         return False
     if max(fanin) > _MAX_SHUFFLE_FANIN:
         return False
-    # A complete destination is an exact repartition, including an expansion
-    # onto more cores. The shuffle's per-tensor maps describe the two domains;
-    # STCDP intersects their pieces rather than assuming one source per reader.
-    # Every destination slice is present. One distinct slice per core is a
-    # complete partition; a full replica instead joins all disjoint sources.
-    # The latter remains part of the optional ownership proofs.
+    # A complete destination is an exact repartition, including contraction
+    # onto fewer cores and expansion onto more cores. The shuffle's per-tensor
+    # maps describe the two domains; STCDP intersects their pieces rather than
+    # assuming one source per reader.
+    # A full replica is the union of every complete, disjoint source slice.
+    # STCDP already multicasts each source piece to every destination; the
+    # same-core piece uses its local LX path. The fanin bound above still
+    # applies. Do not generalize to partially partitioned replica expansions.
     return (
         source_num_cores == destination_num_cores
         or destination_slices == destination_num_cores
@@ -671,15 +541,19 @@ def core_domain_rejection(source_num_cores: int, consumer_num_cores: int) -> str
     ``consumer_num_cores`` through a relayout, from the core counts alone, or
     ``None`` when they are compatible. Equal counts are always fine
     (permutations and gathers). A larger consumer domain is either a complete
-    repartition, a grouped broadcast, or a full replicated gather, supported
-    only onto every compute core.
+    repartition, a grouped broadcast, or a full replicated gather. The larger
+    domain must use every compute core. Contraction requires complete
+    partitions, never replicated output.
     The geometric half of that rule is :func:`movement_supported`'s.
     Shared by the committed collector and the solver's enumeration so the two
     paths cannot drift."""
-    if consumer_num_cores < source_num_cores:
+    if not config.lx_extended_ownership and consumer_num_cores < source_num_cores:
         return "cannot emit: consumer uses fewer physical cores than producer"
-    if consumer_num_cores > source_num_cores and consumer_num_cores != config.sencores:
-        return "cannot emit: larger relayout domain must target all compute cores"
+    smaller, larger = sorted((source_num_cores, consumer_num_cores))
+    if smaller <= 0 or larger % smaller:
+        return "cannot emit: relayout domains must have an integral ratio"
+    if smaller != larger and larger != config.sencores:
+        return "cannot emit: larger relayout domain must use all compute cores"
     return None
 
 
@@ -697,7 +571,11 @@ def grouped_gather_rejection(
     this consumer rule.
     """
     owners = math.prod(dict(destination_view.work_slice_dims).values())
-    if owners < source_num_cores and not _is_matmul_op(consumer):
+    if (
+        owners < source_num_cores
+        and (not config.lx_extended_ownership or owners != destination_view.num_cores)
+        and not _is_matmul_op(consumer)
+    ):
         return "cannot emit: grouped gather requires a matmul consumer"
     return None
 
@@ -844,6 +722,85 @@ def _unsupported_relayout_transition_reason(
     return None
 
 
+def _persistent_scatter_consumer(
+    graph: GraphLowering,
+    producer: ComputedBuffer,
+    consumer: ComputedBuffer,
+    source_name: str,
+) -> bool:
+    """Permit only a fresh matmul value feeding an external cache scatter.
+
+    A direct read is insufficient: the value must have independent storage,
+    no aliasing users or later writes, and precede this mutation. Require a
+    bare input-buffer target (no view), an indirect write to that same target,
+    and no cache reads. The existing load-only clone rewrite preserves the
+    mutation's target, indices, dependencies and position in the graph. The
+    external target is never a candidate LX allocation.
+    """
+    if (
+        not config.lx_extended_ownership
+        or not _is_matmul_op(producer)
+        or not isinstance(consumer.data, Pointwise)
+        or getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+    ):
+        return False
+    try:
+        if producer.get_mutation_names() or producer.get_inputs_that_alias_output():
+            return False
+    except NotImplementedError:
+        return False
+    target = consumer.layout.target
+    while isinstance(target, MutableBox):
+        target = target.data
+    if not isinstance(target, InputBuffer):
+        return False
+    target_name = target.get_name()
+    inputs = {
+        value.get_name()
+        for value in graph.graph_inputs.values()
+        if hasattr(value, "get_name")
+    }
+    if (
+        target_name not in inputs
+        or source_name in inputs
+        or not isinstance(producer.layout, FixedTiledLayout)
+        or "lx" in getattr(target.get_layout(), "allocation", {})
+    ):
+        return False
+    operations = graph.operations
+    if producer not in operations or consumer not in operations:
+        return False
+    if operations.index(producer) >= operations.index(consumer):
+        return False
+    deps = op_read_writes(consumer)
+    writes = list(deps.writes)
+    if (
+        len(writes) != 1
+        or not isinstance(writes[0], MemoryDep)
+        # Before scheduling, ComputedBuffer names its own write; the mutation
+        # layout binds that name to the external target.
+        or writes[0].name not in (consumer.get_name(), target_name)
+        or not writes[0].is_indirect()
+        or set(consumer.get_mutation_names()) != {target_name}
+        or any(dep.name == target_name for dep in deps.reads)
+    ):
+        return False
+    # FixedTiledLayout is fresh storage, but aliases introduced by other ops
+    # could still mutate it or extend its lifetime behind the planner's back.
+    # Reject those graphs rather than infer safety from a solver placement.
+    if source_name != producer.get_name():
+        return False
+    return storage_has_single_writer(graph, producer)
+
+
+def _supported_consumer_layout(graph, producer, consumer, source_name) -> bool:
+    return isinstance(consumer, ComputedBuffer) and (
+        not isinstance(consumer.layout, MutationLayoutSHOULDREMOVE)
+        or _persistent_scatter_consumer(graph, producer, consumer, source_name)
+    )
+
+
 def solver_relayout_edge_context(
     graph: GraphLowering,
     producer: Operation,
@@ -898,9 +855,7 @@ def solver_relayout_edge_context(
         or not _is_activation_source(graph, operations, producer)
     ):
         return None
-    if not isinstance(consumer, ComputedBuffer) or isinstance(
-        consumer.layout, MutationLayoutSHOULDREMOVE
-    ):
+    if not _supported_consumer_layout(graph, producer, consumer, source_name):
         return None
     if not _is_matmul_op(consumer) and not isinstance(consumer.data, Pointwise):
         return None
@@ -1215,9 +1170,7 @@ def collect_lx_relayout_plans(
                     "cannot emit: consumer reads the source more than once"
                 )
                 break
-            if not isinstance(consumer, ComputedBuffer) or isinstance(
-                consumer.layout, MutationLayoutSHOULDREMOVE
-            ):
+            if not _supported_consumer_layout(graph, producer, consumer, source_name):
                 rejection_reason = (
                     "cannot emit: consumer is not a supported computed buffer"
                 )
@@ -1563,6 +1516,25 @@ def anchor_lx_relayout_ownership(graph: GraphLowering) -> list[LXRelayoutPlan] |
     return plans
 
 
+def validate_relayout_spans(plan: LXRelayoutPlan) -> None:
+    """Require disjoint positive byte spans on every shared physical core."""
+    if plan.source_address is None or plan.destination_address is None:
+        raise RuntimeError("LX relayout plan is missing an allocated address")
+    if (
+        plan.source_address < 0
+        or plan.destination_address < 0
+        or plan.source_footprint_bytes <= 0
+        or plan.destination_footprint_bytes <= 0
+    ):
+        raise RuntimeError("LX relayout plan has an invalid physical span")
+    if (
+        plan.source_address
+        < plan.destination_address + plan.destination_footprint_bytes
+        and plan.destination_address < plan.source_address + plan.source_footprint_bytes
+    ):
+        raise RuntimeError("LX relayout source and destination spans overlap")
+
+
 def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) -> None:
     if not plans:
         if materialized_lx_relayouts(graph):
@@ -1573,11 +1545,13 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
     copies = materialized_lx_relayouts(graph)
     if copies:
         raise RuntimeError("LX relayouts were already materialized")
+    # Check every span before editing any consumer. A solver placement alone
+    # must not authorize overwriting a live source during a cross-core gather.
+    for plan in plans:
+        validate_relayout_spans(plan)
     editor = GraphEditor(graph)
     setattr(graph, _REGISTRY, copies)
     for plan in plans:
-        if plan.source_address is None or plan.destination_address is None:
-            raise RuntimeError("LX relayout plan is missing an allocated address")
         source = cast(ComputedBuffer, graph.get_buffer(plan.source_name))
         if plan.source_view.same_partition(plan.destination_view):
             raise RuntimeError("LX relayout plan has identical source and destination")
@@ -1599,18 +1573,35 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
                     or dict(plan.destination_view.work_slice_dims).get(axis, 1) != 1
                 ):
                     raise RuntimeError("padded LX gather lost its full-K read contract")
-            if not (
-                plan.source_address + plan.source_footprint_bytes
-                <= plan.destination_address
-                or plan.destination_address + plan.destination_footprint_bytes
-                <= plan.source_address
-            ):
-                raise RuntimeError("padded LX gather source and destination overlap")
+        mutations = []
+        for consumer in consumers:
+            if isinstance(consumer.layout, MutationLayoutSHOULDREMOVE):
+                if not _persistent_scatter_consumer(
+                    graph, source, consumer, plan.source_name
+                ):
+                    raise RuntimeError(
+                        "relayout cache mutation no longer has a safe source"
+                    )
+                mutations.append(
+                    (
+                        consumer,
+                        consumer.layout,
+                        op_read_writes(consumer).writes,
+                        tuple(consumer.get_mutation_names()),
+                    )
+                )
         copy = editor.insert_clone_before_consumers(
             source,
             consumers,
             lx_view=plan.destination_view,
         )
+        for consumer, layout, writes, names in mutations:
+            if (
+                consumer.layout is not layout
+                or op_read_writes(consumer).writes != writes
+                or tuple(consumer.get_mutation_names()) != names
+            ):
+                raise RuntimeError("LX input rewrite changed a persistent cache write")
         copies[plan.edge] = (copy.get_name(), plan)
 
         copy_layout = cast(FixedTiledLayout, copy.layout)
