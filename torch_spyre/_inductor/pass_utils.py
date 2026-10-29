@@ -75,7 +75,6 @@ from .core_mapping import (
     decompose_fused_split_view,
 )
 from .constants import (
-    BATCH_MATMUL_OP,
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
@@ -2431,11 +2430,9 @@ def compute_restickify_target_layout(
             j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols
         ]
     else:
-        # Zero stick (placeholder dim with no variable): only valid for BATCH_MATMUL_OP,
-        # where a size-1 contraction dim produces a constant stick expression.
-        # For all other ops, this layout is infeasible.
-        if reduction_type != BATCH_MATMUL_OP:
-            return None
+        # Constant stick expression: the old stick dim has no variable (size-1
+        # contraction dim in matmul).  Callers are responsible for rejecting this
+        # case for non-matmul ops before calling here.
         old_sd_host_size, old_sd_host_stride = 1, 1
         old_var_outer_dims = []
         old_var = None

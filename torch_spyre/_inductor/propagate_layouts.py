@@ -67,6 +67,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -1381,6 +1382,11 @@ def _stl_via_restickify(
         if target_stick_expr is None:
             continue
         stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
+        if (
+            not dev_coords[-1].free_symbols
+            and reduction_type not in MATMUL_REDUCTION_OPS
+        ):
+            continue
         result = compute_restickify_target_layout(
             stl,
             arg.layout,
