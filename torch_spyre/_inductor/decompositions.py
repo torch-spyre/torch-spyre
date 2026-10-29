@@ -2879,13 +2879,7 @@ def spyre_linear_attention(
         # Causal linear attention: lower-triangular causal attention product
         # scores: [BH, Lq, Lkv]
         scores = torch.bmm(q_3d, k_3d.transpose(-2, -1))
-
-        # Causal additive mask from spyre::causal_mask: 0.0 for keep, -inf for masked
-        additive_mask = torch.ops.spyre.causal_mask(seqlen_q, seqlen_kv, query.dtype, query.device)
-        # Convert additive mask to 0/1 multiplier: clamp(additive_mask + 1.0, min=0.0) -> [1, Lq, Lkv]
-        causal_mask = torch.clamp(additive_mask.squeeze(1) + 1.0, min=0.0)
-
-        scores_causal = scores * causal_mask  # [BH, Lq, Lkv]
+        scores_causal = torch.tril(scores)  # [BH, Lq, Lkv]
 
         # Numerator: scores_causal @ v_3d -> [BH, Lq, Dv]
         out_3d = torch.bmm(scores_causal, v_3d)
