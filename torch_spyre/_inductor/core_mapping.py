@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import permutations, product
@@ -28,7 +28,7 @@ from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
-from .op_spec import TensorWorkDivision
+from .op_spec import TensorArg, TensorWorkDivision
 from .slice_ownership import factor_slice_axis, project_slice_axis
 
 
@@ -588,6 +588,36 @@ def core_to_slice_mapping(
         result[dims[dim]] = coordinate
         stride *= split
     return result
+
+
+def matmul_reduction_dim(
+    iteration_space: Iterable[Symbol], args: Iterable[TensorArg]
+) -> Symbol | None:
+    """Return a matmul's reduction loop K: both inputs index it, the output does not.
+
+    Find K by identity, not by position: alignment adds range-1 loops for
+    elided device dimensions after K, so the last loop is not always K. The
+    test on the inputs excludes an M or N of 1 that the output folds away.
+    Returns None if no loop or more than one loop agrees with the rule.
+    """
+    inputs: list[set[Symbol]] = []
+    outputs: set[Symbol] = set()
+    for arg in args:
+        indexed = {
+            symbol
+            for coordinate in arg.device_coordinates
+            for symbol in sympify(coordinate).free_symbols
+        }
+        if arg.is_input:
+            inputs.append(indexed)
+        else:
+            outputs |= indexed
+    reduced = [
+        dim
+        for dim in iteration_space
+        if dim not in outputs and all(dim in indexed for indexed in inputs)
+    ]
+    return reduced[0] if len(reduced) == 1 else None
 
 
 def derive_core_mapping(

@@ -1784,6 +1784,7 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
+        _capture_backend_output_dirs() as directories,
     ):
         actual, _ = run_and_get_code(
             torch.compile(
@@ -1806,6 +1807,34 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     assert [split for split in splits if split > 1] == [4, 4, 2]
     assert math.prod(splits) == config.sencores
     down_arg = next(arg for arg in bmm_specs[0].args if not arg.is_input)
+    # The two K halves of each output slice sit on neighbouring cores, so their
+    # partial sums cross one ring hop and the pairs never share a ring segment.
+    output_dims = [
+        dim
+        for dim, (_, split) in bmm_specs[0].iteration_space.items()
+        if split > 1
+        and any(
+            dim in coordinate.free_symbols for coordinate in down_arg.device_coordinates
+        )
+    ]
+    partners = {}
+    for core in range(config.sencores):
+        owner = tuple(
+            int(bmm_specs[0].core_id_to_work_slice[dim].subs(Symbol("core_id"), core))
+            for dim in output_dims
+        )
+        partners.setdefault(owner, []).append(core)
+    pairs = [[core, core + 1] for core in range(0, config.sencores, 2)]
+    assert sorted(partners.values()) == pairs
+    # The emitted SDSC gives K's split to `in`, not to the restored unit loop.
+    (bmm_sdsc,) = [
+        root
+        for directory in directories
+        for path in directory.glob("sdsc_*.json")
+        for name, root in json.loads(path.read_text()).items()
+        if name.endswith(BATCH_MATMUL_OP)
+    ]
+    assert bmm_sdsc["numWkSlicesPerDim_"]["in"] == 2
     if enabled:
         copies = [spec for spec in specs if spec.completed_producer_cores]
         assert len(copies) == 1
