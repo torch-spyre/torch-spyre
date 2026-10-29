@@ -37,8 +37,8 @@ def test_supported_shard_counts_are_the_slot_core_shapes():
     assert SUPPORTED_SHARD_COUNTS == (8, 16)
 
 
-def test_default_spec_uses_eight_shards_and_is_immutable():
-    spec = SpyreShardingSpec(Shard(0))
+def test_spec_is_immutable():
+    spec = SpyreShardingSpec(Shard(0), 8)
 
     assert spec.placement == Shard(0)
     assert spec.num_shards == 8
@@ -79,7 +79,7 @@ def test_plan_matches_planner(num_shards):
 @pytest.mark.parametrize("placement", [Replicate(), object(), None])
 def test_placement_must_be_exact_shard(placement):
     with pytest.raises(TypeError, match="Shard"):
-        SpyreShardingSpec(placement)
+        SpyreShardingSpec(placement, 8)
 
 
 @pytest.mark.parametrize("num_shards", [8.0, "8", True, None])

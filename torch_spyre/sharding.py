@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
-import torch
-from torch.distributed.tensor import Shard
 
-_DEFAULT_SHARD_COUNT = 8
+if TYPE_CHECKING:
+    from torch.distributed.tensor import Shard
+
 SUPPORTED_SHARD_COUNTS = (8, 16)
-_SUPPORTED_TORCH_VERSION = (2, 13)
 
 
 class ShardPlanningUnavailableError(RuntimeError):
@@ -136,9 +136,11 @@ class SpyreShardingSpec:
     """
 
     placement: Shard
-    num_shards: int = _DEFAULT_SHARD_COUNT
+    num_shards: int
 
     def __post_init__(self) -> None:
+        from torch.distributed.tensor import Shard
+
         if type(self.placement) is not Shard:
             raise TypeError("placement must be exactly torch.distributed.tensor.Shard")
         _require_shard_count(self.num_shards)
@@ -162,17 +164,8 @@ class SpyreShardingSpec:
 
 
 def _require_supported_helper():
-    version = torch.__version__.split("+", 1)[0].split(".")
-    try:
-        major_minor = (int(version[0]), int(version[1]))
-    except (IndexError, ValueError) as error:
-        raise ShardPlanningUnavailableError(
-            f"cannot identify supported PyTorch version: {torch.__version__}"
-        ) from error
-    if major_minor != _SUPPORTED_TORCH_VERSION:
-        raise ShardPlanningUnavailableError(
-            "semantic shard planning requires PyTorch 2.13"
-        )
+    from torch.distributed.tensor import Shard
+
     helper = getattr(Shard, "local_shard_size_and_offset", None)
     if not callable(helper):
         raise ShardPlanningUnavailableError(
@@ -189,6 +182,8 @@ def compute_shard_range(
     shard_ordinal: int,
 ) -> ShardRange:
     """Return one helper-derived logical range without runtime side effects."""
+
+    from torch.distributed.tensor import Shard
 
     if type(placement) is not Shard:
         raise TypeError("placement must be exactly torch.distributed.tensor.Shard")
@@ -258,7 +253,7 @@ def _require_shard_count(shard_count: object) -> int:
 def plan_equal_shards(
     global_shape: Sequence[int],
     placement: Shard,
-    shard_count: int = _DEFAULT_SHARD_COUNT,
+    shard_count: int,
 ) -> tuple[ShardRange, ...]:
     """Admit exactly ``shard_count`` (8 or 16) equal, non-empty shard ranges."""
 
@@ -276,6 +271,8 @@ def plan_equal_shards(
     # Placement type is re-proven per ordinal by compute_shard_range, but
     # placement.dim is read below before that, so the type must hold here.
     # Only the dim range check is left to compute_shard_range.
+    from torch.distributed.tensor import Shard
+
     if type(placement) is not Shard:
         raise TypeError("placement must be exactly torch.distributed.tensor.Shard")
     dim = placement.dim

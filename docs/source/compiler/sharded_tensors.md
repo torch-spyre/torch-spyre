@@ -77,10 +77,11 @@ Copies a CPU tensor into a sharded Spyre tensor. Arguments:
   placement is admitted (there is no multi-dimensional mesh); `dim` may be
   negative. The named dimension must divide into `num_shards` equal,
   non-empty shards.
-* **`num_shards`** — keyword-only. Defaults to the active core count
-  (`SENCORES`); an explicit value must be 8 or 16 and must equal `SENCORES`,
-  so storage and the kernels that consume it agree on how many cores
-  participate.
+* **`num_shards`** — keyword-only. Must be 8 or 16 and must equal the active
+  core count (`SENCORES`), so storage and the kernels that consume it agree
+  on how many cores participate. Omitted, it defaults to the active core
+  count; since the default `SENCORES` is 32, a default environment must set
+  `SENCORES` to 8 or 16 first.
 
 Returns a plain `torch.Tensor` on the `spyre` device carrying the global
 shape; its storage holds `num_shards` placement slots with shard *i*

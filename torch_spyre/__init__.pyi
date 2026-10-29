@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
+
 import torch
-from torch.distributed.tensor import Shard
+
+if TYPE_CHECKING:
+    from torch.distributed.tensor import Shard
 
 from torch_spyre._sharded_api import ShardedTensorInfo
 

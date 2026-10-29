@@ -140,7 +140,7 @@ def test_exact_shard_placement_is_required(placement):
     with pytest.raises(TypeError, match="exactly"):
         compute_shard_range(placement, 2, 16, 8, 0)
     with pytest.raises(TypeError, match="exactly"):
-        plan_equal_shards((16, 2), placement)
+        plan_equal_shards((16, 2), placement, 8)
 
 
 def test_shard_boolean_dimension_has_public_observable_value():
@@ -213,14 +213,8 @@ def test_raising_helper_fails_closed_without_fallback(monkeypatch):
     assert isinstance(error.value.__cause__, RuntimeError)
 
 
-def test_unsupported_torch_version_fails_closed(monkeypatch):
-    monkeypatch.setattr(torch, "__version__", "2.14.0")
-    with pytest.raises(ShardPlanningUnavailableError, match="2.13"):
-        compute_shard_range(Shard(0), 2, 16, 8, 0)
-
-
 def test_plan_accepts_exactly_eight_equal_nonempty_ranges():
-    result = plan_equal_shards([3, 32], Shard(-1))
+    result = plan_equal_shards([3, 32], Shard(-1), 8)
     assert len(result) == 8
     assert tuple(r.shard_ordinal for r in result) == tuple(range(8))
     assert tuple(r.logical_offset for r in result) == tuple(range(0, 32, 4))
@@ -236,7 +230,7 @@ def test_plan_accepts_exactly_eight_equal_nonempty_ranges():
 @pytest.mark.parametrize("shape", [(), [], (8, 0), (0, 8), (8, -1)])
 def test_plan_rejects_scalar_zero_and_negative_shapes(shape):
     with pytest.raises(ValueError):
-        plan_equal_shards(shape, Shard(0))
+        plan_equal_shards(shape, Shard(0), 8)
 
 
 @pytest.mark.parametrize(
@@ -251,25 +245,25 @@ def test_plan_rejects_scalar_zero_and_negative_shapes(shape):
 )
 def test_plan_rejects_nonconcrete_shape_entries(shape):
     with pytest.raises(TypeError, match="concrete ints"):
-        plan_equal_shards(shape, Shard(0))
+        plan_equal_shards(shape, Shard(0), 8)
 
 
 @pytest.mark.parametrize("extent", [3, 7, 10, 15])
 def test_plan_rejects_uneven_or_empty_tail_geometry(extent):
     with pytest.raises(ValueError):
-        plan_equal_shards((extent, 2), Shard(0))
+        plan_equal_shards((extent, 2), Shard(0), 8)
 
 
 def test_planner_does_not_mutate_mutable_input():
     accepted = [16, 3]
     before = accepted.copy()
-    plan_equal_shards(accepted, Shard(0))
+    plan_equal_shards(accepted, Shard(0), 8)
     assert accepted == before
 
     rejected = [10, 3]
     before = rejected.copy()
     with pytest.raises(ValueError):
-        plan_equal_shards(rejected, Shard(0))
+        plan_equal_shards(rejected, Shard(0), 8)
     assert rejected == before
 
 
@@ -284,7 +278,7 @@ def test_planner_calls_helper_once_for_each_ordinal(monkeypatch):
     monkeypatch.setattr(
         Shard, "local_shard_size_and_offset", staticmethod(recording_helper)
     )
-    plan_equal_shards((24, 3), Shard(0))
+    plan_equal_shards((24, 3), Shard(0), 8)
     assert calls == [(24, 8, ordinal) for ordinal in range(8)]
 
 
@@ -299,12 +293,12 @@ def test_planner_rejects_inconsistent_helper_geometry(monkeypatch):
         Shard, "local_shard_size_and_offset", staticmethod(gapped_helper)
     )
     with pytest.raises(ValueError, match="gap-free"):
-        plan_equal_shards((16, 2), Shard(0))
+        plan_equal_shards((16, 2), Shard(0), 8)
 
 
 def test_planning_has_no_distributed_side_effects(monkeypatch):
     assert not torch.distributed.is_initialized()
     forbid_distributed(monkeypatch)
     compute_shard_range(Shard(0), 2, 16, 8, 0)
-    plan_equal_shards((16, 2), Shard(0))
+    plan_equal_shards((16, 2), Shard(0), 8)
     assert not torch.distributed.is_initialized()

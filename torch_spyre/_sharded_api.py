@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
 import torch
-from torch.distributed.tensor import Shard
+
+if TYPE_CHECKING:
+    from torch.distributed.tensor import Shard
 
 from torch_spyre._native_placement import (
     _ensure_spyre_runtime_initialized,
@@ -194,6 +197,8 @@ def sharding_info(tensor: torch.Tensor) -> ShardedTensorInfo:
         shard_device_bytes,
         _require_exact_int("total_bytes", native["total_bytes"]),
     )
+    from torch.distributed.tensor import Shard
+
     return ShardedTensorInfo(
         placement=Shard(shard_dim),
         num_shards=num_shards,
@@ -220,9 +225,11 @@ def distribute_tensor(
     equal.
 
     ``placement`` is a ``Shard(dim)`` or the single-element list
-    ``[Shard(dim)]``. ``num_shards`` defaults to the active core count
-    (``SENCORES``) — like tensor parallel, the shard count is a property of
-    the hardware, not a free parameter — and an explicit value must equal it.
+    ``[Shard(dim)]``. ``num_shards`` must be 8 or 16 and must equal the
+    active core count (``SENCORES``) — like tensor parallel, the shard count
+    is a property of the hardware, not a free parameter. ``num_shards``
+    omitted means "the active core count"; since the default ``SENCORES`` is
+    32, a default environment must set ``SENCORES`` to 8 or 16 first.
 
     The result carries the global shape and dtype of ``tensor``. Its storage
     holds ``num_shards`` (8 or 16) backend

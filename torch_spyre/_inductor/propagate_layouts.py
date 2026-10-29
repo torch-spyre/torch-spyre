@@ -3306,7 +3306,16 @@ def propagate_spyre_tensor_layouts(
                     )
                     tb.layouts = [stl]
         else:
-            for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+            real_inputs = V.get_real_inputs()
+            # Sharding is resolved only from real inputs below; a mismatched
+            # length would silently zip-truncate and let a sharded input
+            # compile as unified storage, so fail closed instead.
+            if len(real_inputs) != len(graph.graph_input_names):
+                raise Unsupported(
+                    f"graph has {len(graph.graph_input_names)} inputs but "
+                    f"{len(real_inputs)} real inputs; cannot resolve sharding"
+                )
+            for name, real_input in zip(graph.graph_input_names, real_inputs):
                 if isinstance(real_input, torch.Tensor):
                     stl = real_input.device_tensor_layout()
                     placement = (
