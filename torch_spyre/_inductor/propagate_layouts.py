@@ -652,6 +652,7 @@ def _convert_layout(
         if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
             in_coords = host_coordinates(in_layout, dep, None)
             source_device_coords = device_coordinates(stl, dep, None)
+            staggered_arg = PropArg(dep, in_layout, [stl])
             for target_stick_expr in in_coords:
                 if not target_stick_expr.free_symbols:
                     continue
@@ -661,6 +662,7 @@ def _convert_layout(
                     target_stick_expr,
                     in_coords,
                     source_device_coords,
+                    arg=staggered_arg,
                 )
                 if target_stl is None:
                     continue
