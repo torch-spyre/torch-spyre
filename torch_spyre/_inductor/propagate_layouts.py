@@ -1642,6 +1642,204 @@ def _conv_layouts(
     return [out_stl]
 
 
+def _broadcast_split(
+    arg: PropArg,
+) -> tuple[list[SpyreTensorLayout], list[SpyreTensorLayout]]:
+    """Partition arg.layouts into (broadcast, non_broadcast) candidates.
+
+    A stick is a broadcast when stride_map[-1] == -1 (sparse last device dim).
+    Scalars (0-d layout) are always broadcastable.
+    """
+    if len(arg.layout.size) == 0:
+        return list(arg.layouts), []
+    broadcast: list[SpyreTensorLayout] = []
+    non_broadcast: list[SpyreTensorLayout] = []
+    for stl in arg.layouts:
+        (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
+    return broadcast, non_broadcast
+
+
+def _resolve_pointwise_ea(ea_args: list[PropArg]) -> ElementArrangement:
+    """Resolve the output ElementArrangement for a multi-arg pointwise op.
+
+    Enforces the mixed-EA compatibility rule over STAGGERED_EAS =
+    {DL16_TO_FP32, FP32_TO_DL16}. As a side effect, prunes arg.layouts in
+    place on operands that must broadcast to be EA-compatible, so the cost
+    solver sees only compatible candidates.
+
+    Cases:
+      1.  all STANDARD                            -> STANDARD output
+      2a. >1 distinct staggered EA                -> unsupported (raise)
+      2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
+      3.  one staggered EA mixed with STANDARD operands:
+          3.1 every STANDARD operand can broadcast   -> staggered output
+          3.2 every staggered operand can broadcast  -> STANDARD output
+          3.3 otherwise (a STANDARD and a staggered full operand coexist)
+                                                     -> unsupported (raise)
+    In the overlap, prefer the direction whose broadcast condition holds for
+    every candidate of the opposite-EA inputs. That choice remains valid no
+    matter which producer layouts the optimizer can actually reach. If both
+    directions are equally stable (or unstable), retain the 3.1 preference.
+
+    EXX2 is intentionally out of scope: it is a reduction ordering handled by
+    the layernorm layouts, and is_ea_compatible in split_multi_ops likewise
+    excludes it from the broadcast pattern. The ops that bypass that check --
+    layernormnorm / layernormscale carrying EXX2 -- have dedicated layout
+    handlers and never reach this path.
+    """
+    input_eas: set[ElementArrangement] = set()
+    for arg in ea_args:
+        if arg.layouts:
+            input_eas.add(arg.layouts[0].element_arrangement)
+
+    staggered_inputs = input_eas & STAGGERED_EAS
+
+    if len(staggered_inputs) > 1:
+        # Case 2a: multiple distinct staggered EAs - not supported.
+        raise Unsupported(
+            f"Multi-arg pointwise with multiple staggered EAs not supported: {input_eas}"
+        )
+
+    if len(staggered_inputs) == 0:
+        # Case 1: all STANDARD (or no staggered) EAs.
+        return ElementArrangement.STANDARD
+
+    staggered_ea = next(iter(staggered_inputs))
+
+    # A device *stick* is a broadcast (carries at most one distinct host
+    # element) exactly when it maps to a size-1 / sparse host axis. In an STL
+    # the stick is the last device dim and the layout constructor
+    # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
+    # case. This is the correct, dim_order-independent test — reading
+    # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
+    # size [1, 64, 1] with the stick on a size-1 axis that is not last would
+    # be mishandled).
+    #
+    # `arg.layouts` is a per-consumer list of *candidate* device layouts (see
+    # _get_prop_args: `list(buf.layouts)`), from which the cost solver later
+    # picks one. So an operand "can broadcast" as long as it has at least one
+    # broadcast candidate; pruning the non-broadcast candidates in place is
+    # safe and steers the solver to a compatible stick.
+    std_split = [
+        (arg, *_broadcast_split(arg))
+        for arg in ea_args
+        if arg.layouts
+        and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
+    ]
+    stag_split = [
+        (arg, *_broadcast_split(arg))
+        for arg in ea_args
+        if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
+    ]
+
+    std_can_broadcast = all(broadcast for _, broadcast, _ in std_split)
+    stag_can_broadcast = bool(stag_split) and all(
+        broadcast for _, broadcast, _ in stag_split
+    )
+    std_always_broadcasts = all(not non_broadcast for _, _, non_broadcast in std_split)
+    stag_always_broadcasts = all(
+        not non_broadcast for _, _, non_broadcast in stag_split
+    )
+
+    if std_can_broadcast and (std_always_broadcasts or not stag_always_broadcasts):
+        # Case 3.1 (and case 2b with no STANDARD operands): preserve the
+        # staggered arrangement and keep only broadcast-compatible STANDARD
+        # candidates.
+        for arg, broadcast, non_broadcast in std_split:
+            if non_broadcast:
+                arg.layouts[:] = broadcast
+        return staggered_ea
+
+    if stag_can_broadcast:
+        # Case 3.2: every staggered operand has a broadcast candidate, so
+        # the operation can use STANDARD ordering.
+        #
+        # ElementArrangement changes only the order of elements *within* a
+        # stick. Every candidate retained here has a sparse stick
+        # (stride_map[-1] == -1), so all its logical loads address the same
+        # within-stick element and the stagger is unobservable. Its outer
+        # device geometry may still be noncanonical (dtype conversion keeps
+        # its producer's geometry); that geometry remains on the input and
+        # is handled independently by the coordinate compatibility solver.
+        # Comparing it with a freshly constructed canonical STANDARD layout
+        # would therefore reject valid broadcasts such as Gemma 4's fp32
+        # RMSNorm mean downcast.
+        for arg, broadcast, non_broadcast in stag_split:
+            if non_broadcast:
+                arg.layouts[:] = broadcast
+        return ElementArrangement.STANDARD
+
+    # Case 3.3: a STANDARD operand and a staggered operand are both
+    # non-broadcast full tensors — a genuine mixed-order op we cannot
+    # represent yet (future: insert an explicit EA conversion at extra
+    # cost). Report the offending STANDARD operand (there is always one
+    # here, since 3.1 failed).
+    arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
+    stl = arg.layouts[0]
+    c_stride = [concretize_expr(s) for s in arg.layout.stride]
+    mapped = next(
+        (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
+        None,
+    )
+    mapped_size = (
+        concretize_expr(arg.layout.size[mapped]) if mapped is not None else "unknown"
+    )
+    raise Unsupported(
+        f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
+        f"must broadcast (device stick dimension size 1) to be compatible "
+        f"with a staggered EA, and no staggered operand is broadcastable "
+        f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
+    )
+
+
+def _is_supported_pointwise_layout(
+    dim_order: list[int],
+    args: list[PropArg],
+    output_ndim: int,
+    out_dtype_for_layout: torch.dtype,
+    output_ea: ElementArrangement,
+    ind_names: set[str],
+    ind_sizes: dict | None,
+    stick_size: int,
+    op: Operation,
+) -> bool:
+    """Return True if dim_order is a valid output layout for all pointwise inputs.
+
+    For each input, projects dim_order to the input's rank, constructs a
+    candidate STL, and checks that the resulting stick coordinate is
+    offset-free and (for value tensors in indirect ops) free of index symbols.
+    """
+    for arg in args:
+        projected_dim_order = _project_pointwise_dim_order(
+            dim_order, output_ndim, len(arg.layout.size)
+        )
+        c_in_size = [concretize_expr(s) for s in arg.layout.size]
+        c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+        if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+            c_in_size.append(0)
+            c_in_stride.append(0)
+        assert len(c_in_size) == len(projected_dim_order)
+        in_stl = SpyreTensorLayout(
+            c_in_size,
+            c_in_stride,
+            out_dtype_for_layout,
+            projected_dim_order,
+            output_ea,
+        )
+        coord = try_device_coordinates(in_stl, arg.dep, ind_sizes, op=op)
+        if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
+            return False
+        # For indirect-access value tensors, the stick dimension cannot
+        # depend on the index symbol. If it does, a restickify will be needed
+        # to move the indirect coordinate away from the stick.
+        if arg.dep.name not in ind_names and ind_sizes:
+            stick_coord = coord[-1]
+            for index_sym in ind_sizes:
+                if index_sym in stick_coord.free_symbols:
+                    return False
+    return True
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1649,17 +1847,13 @@ def _multi_arg_pointwise_layouts(
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     """
-    Multi-arg pointwise is a join point so handled specially.
-    Algorithm is
-       1. Compute set of output stick expressions possible given the input layouts,
-          keeping only those that produce a supported stick expression on every input.
-       2. Compute an out STL for each; fall back to alternate output dims if none survive.
-       3. Determine output ElementArrangement based on input EAs (propagate staggered EA if present)
-       4. Construct the AllSameNode cost function since in and out sticks must always match
+    Compute candidate output layouts for a multi-arg pointwise op.
+    Four phases, each described inline below.
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
 
+    # Phase 1 — index-operand pruning.
     # An index operand read only at lane 0 of each stick takes no part in the
     # arrangement: a stagger keeps lane 0 in place, so a staggered index read
     # there yields the same indices as a standard one. An index with such a
@@ -1682,151 +1876,18 @@ def _multi_arg_pointwise_layouts(
         else:
             ea_args.append(arg)
 
-    # Determine output ElementArrangement from inputs
-    # Collect all unique EAs from input SpyreTensorLayouts
-    input_eas = set()
-    for arg in ea_args:
-        if arg.layouts:
-            # Get EA from first SpyreTensorLayout (all should have same EA for this input)
-            input_eas.add(arg.layouts[0].element_arrangement)
+    # Phase 2 — EA resolution.
+    # Determine output ElementArrangement from inputs; prunes arg.layouts in
+    # place for EA compatibility so the cost solver sees only valid candidates.
+    output_ea = _resolve_pointwise_ea(ea_args)
 
-    # Determine output EA and enforce the multi-arg mixed-EA compatibility rule
-    # over STAGGERED_EAS = {DL16_TO_FP32, FP32_TO_DL16}. (EXX2 is intentionally
-    # out of scope here: it is a reduction ordering handled by the layernorm
-    # layouts, and is_ea_compatible in split_multi_ops likewise excludes it from
-    # the broadcast pattern. The ops that bypass that check -- layernormnorm /
-    # layernormscale carrying EXX2 -- have dedicated layout handlers and never
-    # reach this multi-arg-pointwise path, so no EXX2 operand can slip through
-    # case 3.1/3.2 here.) The cases are:
-    #   1.  all STANDARD                            -> STANDARD output
-    #   2a. >1 distinct staggered EA                -> unsupported (raise)
-    #   2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
-    #   3.  one staggered EA mixed with STANDARD operands:
-    #       3.1 every STANDARD operand can broadcast   -> staggered output
-    #       3.2 every staggered operand can broadcast  -> STANDARD output
-    #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
-    #                                                  -> unsupported (raise)
-    # In the overlap, prefer the direction whose broadcast condition holds for
-    # every candidate of the opposite-EA inputs. That choice remains valid no
-    # matter which producer layouts the optimizer can actually reach. If both
-    # directions are equally stable (or unstable), retain the 3.1 preference.
-    # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
-    # at extra cost.
-    staggered_inputs = input_eas & STAGGERED_EAS
-
-    if len(staggered_inputs) > 1:
-        # Case 2a: multiple distinct staggered EAs - not supported.
-        raise Unsupported(
-            f"Multi-arg pointwise with multiple staggered EAs not supported: {input_eas}"
-        )
-    elif len(staggered_inputs) == 1:
-        staggered_ea = next(iter(staggered_inputs))
-
-        # A device *stick* is a broadcast (carries at most one distinct host
-        # element) exactly when it maps to a size-1 / sparse host axis. In an STL
-        # the stick is the last device dim and the layout constructor
-        # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
-        # case. This is the correct, dim_order-independent test — reading
-        # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
-        # size [1, 64, 1] with the stick on a size-1 axis that is not last would
-        # be mishandled).
-        #
-        # `arg.layouts` is a per-consumer list of *candidate* device layouts (see
-        # _get_prop_args: `list(buf.layouts)`), from which the cost solver later
-        # picks one. So an operand "can broadcast" as long as it has at least one
-        # broadcast candidate; pruning the non-broadcast candidates in place is
-        # safe and steers the solver to a compatible stick.
-        def _broadcast_split(arg):
-            """Partition arg.layouts into (broadcast, non_broadcast) candidates."""
-            if len(arg.layout.size) == 0:
-                return list(arg.layouts), []  # scalar: always broadcastable
-            broadcast: list[SpyreTensorLayout] = []
-            non_broadcast: list[SpyreTensorLayout] = []
-            for stl in arg.layouts:
-                (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
-            return broadcast, non_broadcast
-
-        std_split = [
-            (arg, *_broadcast_split(arg))
-            for arg in ea_args
-            if arg.layouts
-            and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
-        ]
-        stag_split = [
-            (arg, *_broadcast_split(arg))
-            for arg in ea_args
-            if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
-        ]
-
-        std_can_broadcast = all(broadcast for _, broadcast, _ in std_split)
-        stag_can_broadcast = bool(stag_split) and all(
-            broadcast for _, broadcast, _ in stag_split
-        )
-        std_always_broadcasts = all(
-            not non_broadcast for _, _, non_broadcast in std_split
-        )
-        stag_always_broadcasts = all(
-            not non_broadcast for _, _, non_broadcast in stag_split
-        )
-
-        if std_can_broadcast and (std_always_broadcasts or not stag_always_broadcasts):
-            # Case 3.1 (and case 2b with no STANDARD operands): preserve the
-            # staggered arrangement and keep only broadcast-compatible STANDARD
-            # candidates.
-            output_ea = staggered_ea
-            for arg, broadcast, non_broadcast in std_split:
-                if non_broadcast:
-                    arg.layouts[:] = broadcast
-        elif stag_can_broadcast:
-            # Case 3.2: every staggered operand has a broadcast candidate, so
-            # the operation can use STANDARD ordering.
-            #
-            # ElementArrangement changes only the order of elements *within* a
-            # stick. Every candidate retained here has a sparse stick
-            # (stride_map[-1] == -1), so all its logical loads address the same
-            # within-stick element and the stagger is unobservable. Its outer
-            # device geometry may still be noncanonical (dtype conversion keeps
-            # its producer's geometry); that geometry remains on the input and
-            # is handled independently by the coordinate compatibility solver.
-            # Comparing it with a freshly constructed canonical STANDARD layout
-            # would therefore reject valid broadcasts such as Gemma 4's fp32
-            # RMSNorm mean downcast.
-            output_ea = ElementArrangement.STANDARD
-            for arg, broadcast, non_broadcast in stag_split:
-                if non_broadcast:
-                    arg.layouts[:] = broadcast
-            staggered_inputs = set()
-        else:
-            # Case 3.3: a STANDARD operand and a staggered operand are both
-            # non-broadcast full tensors — a genuine mixed-order op we cannot
-            # represent yet (future: insert an explicit EA conversion at extra
-            # cost). Report the offending STANDARD operand (there is always one
-            # here, since 3.1 failed).
-            arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
-            stl = arg.layouts[0]
-            c_stride = [concretize_expr(s) for s in arg.layout.stride]
-            mapped = next(
-                (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-                None,
-            )
-            mapped_size = (
-                concretize_expr(arg.layout.size[mapped])
-                if mapped is not None
-                else "unknown"
-            )
-            raise Unsupported(
-                f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-                f"must broadcast (device stick dimension size 1) to be compatible "
-                f"with a staggered EA, and no staggered operand is broadcastable "
-                f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
-            )
-    else:
-        # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
-        output_ea = ElementArrangement.STANDARD
-
-    in_coords = [
-        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
-    ]
+    # Phase 3 — candidate generation.
+    # Collect candidate stick expressions from inputs, validate each via
+    # _is_supported_pointwise_layout, and build one output STL per surviving dim.
+    # Fast path when all inputs share identical indexing, size, and dtype.
+    # Then scan all output dims (aligned first) to catch dims absent from any
+    # input stick expression (e.g. an outer broadcast dim); deduplicate against
+    # the input-stick results.
     out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     stick_exprs = {
         stick
@@ -1846,13 +1907,14 @@ def _multi_arg_pointwise_layouts(
         output.dtype, bool_device_dtype
     )
 
-    # If the indexing and device element size are identical
-    # across all inputs and the output we can just propagate the device layout.
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
         can_use_same_layout = False
     else:
+        in_coords = [
+            host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+        ]
         for arg, arg_coors in zip(args, in_coords):
             if (
                 arg_coors != out_coords
@@ -1866,49 +1928,26 @@ def _multi_arg_pointwise_layouts(
     stick_size = get_elem_in_stick(out_dtype_for_layout)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-
-    def _is_supported_layout(dim_order):
-        for arg in args:
-            projected_dim_order = _project_pointwise_dim_order(
-                dim_order, len(output.size), len(arg.layout.size)
-            )
-            c_in_size = [concretize_expr(s) for s in arg.layout.size]
-            c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
-                c_in_size.append(0)
-                c_in_stride.append(0)
-            assert len(c_in_size) == len(projected_dim_order)
-            in_stl = SpyreTensorLayout(
-                c_in_size,
-                c_in_stride,
-                out_dtype_for_layout,
-                projected_dim_order,
-                output_ea,
-            )
-            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes, op=op)
-            if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
-                return False
-            # For indirect-access value tensors, the stick dimension cannot
-            # depend on the index symbol. If it does, a restickify will be needed
-            # to move the indirect coordinate away from the stick.
-            if arg.dep.name not in ind_names and ind_sizes:
-                stick_coord = coord[-1]
-                # Check if stick coordinate depends on any index symbol
-                for index_sym in ind_sizes:
-                    if index_sym in stick_coord.free_symbols:
-                        return False
-        return True
-
     results: list[SpyreTensorLayout] = []
+    output_ndim = len(output.size)
 
-    def _try_stick_dim(stick_dim):
+    def _try_stick_dim(stick_dim) -> SpyreTensorLayout | None:
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-        if _is_supported_layout(dim_order):
-            results.append(
-                SpyreTensorLayout(
-                    c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
-                )
+        if _is_supported_pointwise_layout(
+            dim_order,
+            args,
+            output_ndim,
+            out_dtype_for_layout,
+            output_ea,
+            ind_names,
+            ind_sizes,
+            stick_size,
+            op,
+        ):
+            return SpyreTensorLayout(
+                c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
             )
+        return None
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
@@ -1921,14 +1960,18 @@ def _multi_arg_pointwise_layouts(
             )
         )
     elif not stick_exprs:
-        _try_stick_dim(-1)
+        if (stl := _try_stick_dim(-1)) is not None:
+            results.append(stl)
     else:
         offset_free_stick_exprs = {
             e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
         }
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+            if (
+                stl := _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+            ) is not None:
+                results.append(stl)
 
     # Always scan all dims so that dims absent from any input stick expression
     # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate
@@ -1941,23 +1984,21 @@ def _multi_arg_pointwise_layouts(
     # Aligned dims are scanned first; unaligned dims (padded later by
     # insert_restickify_padding) only when nothing aligned yielded a candidate.
     seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
-    all_dims = range(len(output.size)) if not staggered_inputs else []
+    all_dims = range(len(output.size)) if output_ea not in STAGGERED_EAS else []
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
     for dims in (aligned_dims, unaligned_dims):
         for alt_stick_dim in dims:
-            pre_len = len(results)
-            _try_stick_dim(alt_stick_dim)
-            if len(results) > pre_len:
-                key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
-                if key in seen_keys:
-                    results.pop()
-                else:
+            if (stl := _try_stick_dim(alt_stick_dim)) is not None:
+                key = (tuple(stl.device_size), tuple(stl.stride_map))
+                if key not in seen_keys:
+                    results.append(stl)
                     seen_keys.add(key)
         if results:
             break
 
-    # LX in-place: promote a same-frame input's layout to FIRST so the beam
-    # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
+    # Phase 4 — LX in-place promotion.
+    # Promote a same-frame input's layout to FIRST so the beam commits it on a
+    # cost tie, avoiding a free-but-in-place-defeating permutation
     # (allocator.py _determine_in_place). Two skips guard it:
     #   - footprint mismatch: an fp8-unpack layout has a different total device
     #     element count than the plain output, so its stride_map cannot tile the
@@ -1968,7 +2009,7 @@ def _multi_arg_pointwise_layouts(
     natural_footprints = {
         math.prod([s for s in r.device_size if s > 0]) for r in results
     }
-    for arg in args if not staggered_inputs else []:
+    for arg in args if output_ea not in STAGGERED_EAS else []:
         if (
             arg.layout.size != output.size
             # Sympy structural (syntactic) equality: two semantically identical
@@ -2007,7 +2048,7 @@ def _multi_arg_pointwise_layouts(
     if not results:
         # Reaches here when no stick-compatible output layout survives — e.g. in
         # the mixed-EA case (3.1) a STANDARD operand pruned to its only broadcast
-        # candidate then fails `_is_supported_layout`. Surface the EA context so
+        # candidate then fails `_is_supported_pointwise_layout`. Surface the EA context so
         # the diagnostic is as localized as the pre-pruning gate's was.
         raise Unsupported(
             f"Multi-arg pointwise ({op.get_name()}): no supported output layout "

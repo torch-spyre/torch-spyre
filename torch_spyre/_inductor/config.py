@@ -461,6 +461,16 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # Where logs go and whether kernels are kept on disk: these do not change
+    # the compiled code (spyre_kernel_cache only picks between the kernel disk
+    # cache and a fresh backend compile). Without them, a run that only writes
+    # its timing log to a new file cannot reuse any cached graph and compiles
+    # everything again. These are prefixes: "timing" covers both timing and
+    # timing_out. A test in test_solver_relayout_decision.py pins what each
+    # prefix matches.
+    "timing",
+    "dump_cost_expr_file",
+    "spyre_kernel_cache",
 ]
 
 install_config_module(sys.modules[__name__])
