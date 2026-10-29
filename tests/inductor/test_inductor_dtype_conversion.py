@@ -758,7 +758,7 @@ class TestImplicitPromotion(unittest.TestCase):
 
     # TODO: the mixed-EA gate no longer rejects this; once fp32 restickify lands the
     # test must become a positive one.
-    @_rejected("no mechanism to resolve stick incompatibility", "#2544")
+    @_rejected("requires whole FP32 stick pairs", "#5361")
     def test_implicit_tensor_add_non_contiguous_fp16_fp32(self):
         """non-contiguous fp16 + fp32: the transposed fp32 output needs an fp32
         restickify, which is not supported."""
@@ -881,15 +881,6 @@ class TestDataTransfer(unittest.TestCase):
             msg=f"D2H fp32→fp16 value mismatch: got {result}, expected {expected}",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "the copy compiles (#2852 is fixed), but the fp16 result is staggered and "
-            "its readback is permuted: converting it back on the device restores the "
-            "values (#4393)"
-        ),
-    )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
         """Compiled copy_() from fp32 into fp16 Spyre tensor."""
         src_fp32 = cached_randn(
