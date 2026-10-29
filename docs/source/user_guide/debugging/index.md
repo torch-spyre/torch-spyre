@@ -97,6 +97,8 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
+| `SPYRE_COORD_CACHE=0` | Recompute every device-coordinate query instead of reusing results within a compile. Use it to check whether the cache changes a result |
+| `SPYRE_COORD_CACHE_VERIFY=1` | Recompute every cached device-coordinate result and fail with an error if it differs. Slower; for debugging |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 To find an operation that silently ran on the host, promote its warning to an

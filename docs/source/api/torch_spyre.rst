@@ -799,6 +799,12 @@ Environment Variables
    * - ``SPYRE_VALIDATE_OP_SPECS``
      - Validate OpSpecs at pipeline stage boundaries to catch invariant
        violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_COORD_CACHE``
+     - Reuse device-coordinate results within a compile (default ``1``; set
+       ``0`` to recompute every query)
+   * - ``SPYRE_COORD_CACHE_VERIFY``
+     - Recompute every cached device-coordinate result and raise if it
+       differs (default ``0``)
    * - ``SPYRE_CONV2D_DIRECT``
      - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
        unit) instead of the im2col + matmul decomposition. Off by default

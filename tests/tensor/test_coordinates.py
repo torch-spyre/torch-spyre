@@ -32,7 +32,14 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor import config
+from torch_spyre._inductor.pass_counters import (
+    DEVICE_COORDINATES,
+    DEVICE_COORDINATES_REQUESTS,
+    counted_region,
+)
 from torch_spyre._inductor.pass_utils import (
+    _COORD_CACHE,
     device_coordinates,
     try_device_coordinates,
 )
@@ -740,6 +747,100 @@ class TestUnrepresentableStickCandidates(TestCase):
         self.assertIsNotNone(try_device_coordinates(good, dep, None))
         d2 = sympy.Symbol("d2", integer=True, nonnegative=True)
         self.assertEqual(device_coordinates(good, dep, None)[-1].free_symbols, {d2})
+
+    class _Graph:
+        """A stand-in for V.graph carrying the shape state the coordinate cache
+        keys on. A class, because the cache ignores a graph it cannot weakly
+        reference, as it does a SimpleNamespace."""
+
+        def __init__(self):
+            self.sizevars = SimpleNamespace(
+                shape_env=SimpleNamespace(_version_counter=0),
+                precomputed_replacements={},
+            )
+
+    def test_cache_serves_repeats_without_recomputing(self):
+        dep, _, good = self._traced_scenario()
+        expected = device_coordinates(good, dep, None)
+        with V.set_graph_handler(self._Graph()), counted_region() as counts:
+            first = device_coordinates(good, dep, None)
+            second = device_coordinates(good, dep, None)
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        # A fresh list each time, so a caller mutating its result cannot change
+        # what the cache hands the next one.
+        self.assertIsNot(first, second)
+        self.assertEqual(counts[DEVICE_COORDINATES_REQUESTS], 2)
+        self.assertEqual(counts[DEVICE_COORDINATES], 1)
+
+    def test_unsupported_stick_raises_every_time(self):
+        dep, bad, _ = self._traced_scenario()
+        with V.set_graph_handler(self._Graph()), counted_region() as counts:
+            for _ in range(2):
+                with self.assertRaises(Unsupported):
+                    device_coordinates(bad, dep, None)
+            self.assertIsNone(try_device_coordinates(bad, dep, None))
+        # A raise is never stored, so each ask recomputes.
+        self.assertEqual(counts[DEVICE_COORDINATES], 3)
+
+    def test_cache_is_dropped_when_shape_state_or_graph_changes(self):
+        dep, _, good = self._traced_scenario()
+        graph = self._Graph()
+        with counted_region() as counts:
+            with V.set_graph_handler(graph):
+                device_coordinates(good, dep, None)
+                graph.sizevars.shape_env._version_counter += 1
+                device_coordinates(good, dep, None)
+                graph.sizevars.precomputed_replacements[sympy.Symbol("ps0")] = 2
+                device_coordinates(good, dep, None)
+            with V.set_graph_handler(self._Graph()):
+                device_coordinates(good, dep, None)
+        self.assertEqual(counts[DEVICE_COORDINATES], 4)
+
+    def test_cache_off_without_a_usable_graph_or_when_disabled(self):
+        dep, _, good = self._traced_scenario()
+        unreferenceable = SimpleNamespace(sizevars=self._Graph().sizevars)
+        with counted_region() as counts:
+            device_coordinates(good, dep, None)
+            device_coordinates(good, dep, None)
+            with V.set_graph_handler(unreferenceable):
+                device_coordinates(good, dep, None)
+                device_coordinates(good, dep, None)
+            with V.set_graph_handler(self._Graph()), config.patch(coord_cache=False):
+                device_coordinates(good, dep, None)
+                device_coordinates(good, dep, None)
+        self.assertEqual(counts[DEVICE_COORDINATES], 6)
+
+    def test_verify_mode_catches_a_stale_entry(self):
+        dep, _, good = self._traced_scenario()
+        with (
+            V.set_graph_handler(self._Graph()),
+            config.patch(coord_cache_verify=True),
+        ):
+            device_coordinates(good, dep, None)
+            # Corrupt the entry the way a missing invalidation would.
+            for coords in _COORD_CACHE.entries().values():
+                coords[-1] = sympy.Integer(0)
+            with self.assertRaisesRegex(AssertionError, "recomputing gives"):
+                device_coordinates(good, dep, None)
+
+    def test_cache_separates_pinned_and_unpinned_queries(self):
+        # An op reaches device_coordinates only through per_trip_index, so a key
+        # without the pinned index would serve a spliced op's trip-zero
+        # coordinates to a query that never pinned the trip counter.
+        _, _, good = self._traced_scenario()
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        u0 = sympy.Symbol("u0", integer=True, nonnegative=True)
+        dep = MemoryDep(
+            "buf", 4096 * d0 + d2 + 2097152 * u0, (d0, d1, d2), (512, 4096, 4096)
+        )
+        op = SimpleNamespace(dim_hints=[SimpleNamespace(loop_var=u0, loop_var_range=4)])
+        expected = device_coordinates(good, dep, {}, op=op)
+        with V.set_graph_handler(self._Graph()):
+            self.assertEqual(device_coordinates(good, dep, {}, op=op), expected)
+            # Unpinned, u0 is neither a loop var nor a known indirect symbol.
+            with self.assertRaises(Unsupported):
+                device_coordinates(good, dep, {})
 
     def test_reversed_dim_rejected(self):
         # prims.rev / Tensor.flip(0) on a (4, 64) tensor reads

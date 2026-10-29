@@ -71,9 +71,12 @@ READ_WRITES_MISSES = "read_writes.misses"
 # the normal state rather than a finding. Read this against a baseline record of
 # the same workload; a change in the relationship is what means something.
 READ_WRITES_EXTRACTIONS = "read_writes.extractions"
-# Coordinate construction, the second analysis tier. Nothing memoizes these, so
-# the count is the work.
+# Coordinate construction, the second analysis tier. device_coordinates is
+# memoized per graph, so DEVICE_COORDINATES counts constructions (the work) and
+# DEVICE_COORDINATES_REQUESTS counts asks. host_coordinates is unmemoized, so its
+# count is the work.
 DEVICE_COORDINATES = "device_coordinates"
+DEVICE_COORDINATES_REQUESTS = "device_coordinates.requests"
 HOST_COORDINATES = "host_coordinates"
 # Nanoseconds spent inside ComputedBuffer.get_read_writes. The call count alone
 # cannot size the waste: extraction cost varies with body complexity, so a pass
@@ -190,6 +193,7 @@ def counted_region() -> Iterator[dict[str, int]]:
 __all__ = [
     "COUNTERS",
     "DEVICE_COORDINATES",
+    "DEVICE_COORDINATES_REQUESTS",
     "HOST_COORDINATES",
     "PassCounters",
     "READ_WRITES_EXTRACTIONS",

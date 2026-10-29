@@ -15,7 +15,9 @@
 import io
 import itertools
 import math
+import threading
 import warnings
+import weakref
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -88,6 +90,7 @@ from .loop_info import copy_op_metadata
 from .pass_counters import (
     COUNTERS,
     DEVICE_COORDINATES,
+    DEVICE_COORDINATES_REQUESTS,
     HOST_COORDINATES,
     READ_WRITES_MISSES,
     READ_WRITES_REQUESTS,
@@ -1489,6 +1492,52 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
         )
 
 
+class _CoordCache(threading.local):
+    """``device_coordinates`` results for the current graph.
+
+    The result depends on the arguments and on the graph's size hints, which
+    concretization reads from ``V.graph.sizevars``. The arguments compare by
+    value: SpyreTensorLayout's equality covers every field the computation reads,
+    and MemoryDep is frozen. So entries are tied to the current graph and to the
+    shape state they were computed under, and are dropped when either changes or
+    the graph is freed. Thread-local, like ``V.graph``.
+    """
+
+    def __init__(self) -> None:
+        self._graph: "weakref.ref[Any] | None" = None
+        self._state: "tuple[int, int] | None" = None
+        self._entries: dict = {}
+
+    def entries(self) -> "dict | None":
+        """The current graph's entries, or None if there is no graph to key them on."""
+        graph = V.graph
+        sizevars = getattr(graph, "sizevars", None)
+        shape_env = getattr(sizevars, "shape_env", None)
+        version = getattr(shape_env, "_version_counter", None)
+        if sizevars is None or version is None:
+            return None
+        # ShapeEnv bumps _version_counter when its replacements, divisibility
+        # facts or deferred runtime asserts change. Precomputed replacements live
+        # on the SizeVarAllocator.
+        state = (version, len(sizevars.precomputed_replacements))
+        if self._graph is None or self._graph() is not graph or self._state != state:
+            entries: dict = {}
+            try:
+                # Free the entries with the graph rather than at the next compile.
+                self._graph = weakref.ref(graph, lambda _: entries.clear())
+            except TypeError:
+                # A stand-in graph (a test's SimpleNamespace) cannot be weakly
+                # referenced, and without one an entry could outlive it.
+                self._graph = None
+                return None
+            self._state = state
+            self._entries = entries
+        return self._entries
+
+
+_COORD_CACHE = _CoordCache()
+
+
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
@@ -1498,6 +1547,9 @@ def device_coordinates(
     op: "Operation | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
+
+    Results are memoized per graph (see ``_CoordCache``); ``config.coord_cache``
+    turns that off and ``config.coord_cache_verify`` checks every hit.
 
     Args:
         stl: Device layout (SpyreTensorLayout) of the tensor being accessed.
@@ -1513,13 +1565,40 @@ def device_coordinates(
         the stick expression.
     """
     if COUNTERS.enabled:
-        # Defined as constructions, not asks: a reader treats the count as the
-        # work because nothing memoizes this today. #4245 adds a shared memo, and
-        # whichever of the two lands second must bump this only on the miss path
-        # and count asks under a separate ``device_coordinates.requests`` -- a
-        # single counter spanning both stops measuring either.
-        COUNTERS.bump(DEVICE_COORDINATES)
+        COUNTERS.bump(DEVICE_COORDINATES_REQUESTS)
     index = per_trip_index(op, dep.index) if op is not None else dep.index
+    entries = _COORD_CACHE.entries() if config.coord_cache else None
+    if entries is None:
+        return _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+    # op enters through the pinned index, so ops that pin nothing share entries.
+    sizes = None if indirect_sizes is None else frozenset(indirect_sizes.items())
+    key = (stl, dep, index, sizes, check_stick_expr)
+    hit = entries.get(key)
+    if hit is None:
+        # Unsupported stick expressions raise before the store, so the raising
+        # path is the same with or without the cache.
+        hit = _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+        entries[key] = hit
+    elif config.coord_cache_verify:
+        fresh = _device_coordinates(stl, dep, index, indirect_sizes, check_stick_expr)
+        if fresh != hit:
+            raise AssertionError(
+                f"device_coordinates cache returned {hit} for {dep} under {stl}, "
+                f"but recomputing gives {fresh}"
+            )
+    # A fresh list, so no caller can mutate another's result through the cache.
+    return list(hit)
+
+
+def _device_coordinates(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    index: sympy.Expr,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+    check_stick_expr: bool,
+) -> list[sympy.Expr]:
+    if COUNTERS.enabled:
+        COUNTERS.bump(DEVICE_COORDINATES)
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
     if check_stick_expr:
         _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
