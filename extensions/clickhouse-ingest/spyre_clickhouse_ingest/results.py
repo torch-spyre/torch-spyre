@@ -125,16 +125,32 @@ _PERF_NAME_RE = re.compile(
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
-_MODEL_CONFIGS = frozenset({"full_model", "one_block"})
 
 
 def _is_model_record(op_name: str, tags: dict) -> bool:
-    # The config tag is the explicit marker; the granite_ prefix covers older reports.
-    return op_name.startswith("granite_") or tags.get("config") in _MODEL_CONFIGS
+    # The explicit model tag wins; the granite_ prefix covers reports that predate it.
+    return bool(tags.get("model")) or op_name.startswith("granite_")
 
 
-def _model_operation_name(op_name: str) -> str:
-    return "granite" if op_name.startswith("granite_") else op_name
+def _model_operation_name(op_name: str, tags: dict) -> str:
+    # granite_ ops keep the single "granite" series so existing history stays continuous.
+    return "granite" if op_name.startswith("granite_") else tags["model"]
+
+
+def _model_shape(op_name: str, tags: dict):
+    """batch_size, prompt_length: explicit tags first, else parsed from the granite_ op name."""
+    batch = _opt_float(tags, "batch_size")
+    prompt = _opt_float(tags, "prompt_length")
+    if batch is None and prompt is None:
+        m = _GRANITE_CONFIG_RE.search(op_name)
+        if m:
+            batch = float(m.group("batch_size"))
+            pl_raw = m.group("prompt_length")
+            prompt = float(pl_raw) if pl_raw and pl_raw.isdigit() else None
+    return (
+        int(batch) if batch is not None else None,
+        int(prompt) if prompt is not None else None,
+    )
 
 
 KERNEL_CLASSNAME = "kernel_benchmark"
@@ -297,10 +313,7 @@ def parse_benchmark_xml(
 
         is_granite = _is_model_record(op_name, tags)
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(op_name)
-            batch_size = int(config_m.group("batch_size")) if config_m else None
-            pl_raw = config_m.group("prompt_length") if config_m else None
-            prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(op_name, tags)
             config_name = tags.get("config")
             run_mode = tags.get("mode")
             pt_util = _opt_float(tags, "pt_util")
@@ -319,7 +332,7 @@ def parse_benchmark_xml(
             {
                 "benchmark_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": _model_operation_name(op_name)
+                "operation_name": _model_operation_name(op_name, tags)
                 if is_granite
                 else op_name,
                 "config_name": config_name,
@@ -411,17 +424,13 @@ def parse_kernel_xml(
         # without bs/pl two Granite configs would be indistinguishable here.
         batch_size = prompt_length = None
         if is_granite:
-            config_m = _GRANITE_CONFIG_RE.search(operation_name)
-            if config_m:
-                batch_size = int(config_m.group("batch_size"))
-                pl_raw = config_m.group("prompt_length")
-                prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            batch_size, prompt_length = _model_shape(operation_name, tags)
 
         kernels.append(
             {
                 "kernel_id": uuid.uuid4().int >> 64,
                 "record_type": "model" if is_granite else "op",
-                "operation_name": _model_operation_name(operation_name)
+                "operation_name": _model_operation_name(operation_name, tags)
                 if is_granite
                 else (operation_name or None),
                 "kernel_name": kernel_name,
