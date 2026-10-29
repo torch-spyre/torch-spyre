@@ -96,7 +96,7 @@ EVENT_TYPE_VALUES = frozenset(
 )
 DISPATCH_STATE_VALUES = frozenset({"queued", "triggered", "failed", "skipped"})
 REQUESTED_BY_VALUES = frozenset({"user", "pipeline"})
-UPLOAD_GRANT_ROLE_VALUES = frozenset({"auto", "reviewer"})
+RBAC_SUBJECT_TYPE_VALUES = frozenset({"user", "group"})
 DISPATCHED_BY_VALUES = REQUESTED_BY_VALUES | {"auto"}
 
 # NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
@@ -750,30 +750,41 @@ class ArtifactSubscriptions(Table):
     enums = (("target_type", TARGET_TYPE_VALUES),)
 
 
-class UploadGrants(Table):
-    """Who uploads results unreviewed (auto) or reviews others' uploads; newest updated_at wins."""
+class RbacRoles(Table):
+    """A named set of '<resource>:<action>' permissions; the newest updated_at wins."""
 
-    name = "upload_grants"
+    name = "rbac_roles"
     columns = (
-        "grant_id",
+        "role_id",
         "updated_at",
-        "grantee",
-        "role",
         "active",
-        "formats",
-        "arches",
-        "components",
-        "test_types",
-        "tag_families",
-        "tags",
-        "artifact_ids",
-        "models",
+        "permissions",
+        "description",
+        "updated_by",
+        "props",
+    )
+    required = ("role_id",)
+
+
+class RbacBindings(Table):
+    """A role given to a user or OpenShift group, limited to a scope; the newest updated_at wins."""
+
+    name = "rbac_bindings"
+    columns = (
+        "binding_id",
+        "updated_at",
+        "active",
+        "subject_type",
+        "subject",
+        "role_id",
+        "scope",
+        "expires_at",
         "updated_by",
         "notes",
         "props",
     )
-    required = ("grant_id", "grantee")
-    enums = (("role", UPLOAD_GRANT_ROLE_VALUES),)
+    required = ("binding_id", "subject", "role_id")
+    enums = (("subject_type", RBAC_SUBJECT_TYPE_VALUES),)
 
 
 class DispatchRequests(Table):
@@ -889,7 +900,8 @@ PIPELINE_RUNS = PipelineRuns
 PIPELINE_RUN_LINKS = PipelineRunLinks
 CI_RUN_TIMINGS = CiRunTimings
 ARTIFACT_SUBSCRIPTIONS = ArtifactSubscriptions
-UPLOAD_GRANTS = UploadGrants
+RBAC_ROLES = RbacRoles
+RBAC_BINDINGS = RbacBindings
 DISPATCH_REQUESTS = DispatchRequests
 ARTIFACT_DISPATCHES = ArtifactDispatches
 DISPATCH_TARGETS = DispatchTargets
@@ -912,7 +924,8 @@ TABLES = {
         PipelineRunLinks,
         CiRunTimings,
         ArtifactSubscriptions,
-        UploadGrants,
+        RbacRoles,
+        RbacBindings,
         DispatchRequests,
         ArtifactDispatches,
         DispatchTargets,

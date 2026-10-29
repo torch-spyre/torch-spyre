@@ -191,7 +191,7 @@ def test_a_retracted_upload_leaves_the_capability_views():
     assert got == [f'"{CI_RUN}"']
 
 
-def test_a_pending_upload_is_not_published_and_grants_keep_the_newest_version():
+def test_a_pending_upload_is_not_published():
     session = pytest.importorskip("chdb.session")
 
     s = session.Session()
@@ -199,7 +199,6 @@ def test_a_pending_upload_is_not_published_and_grants_keep_the_newest_version():
         "10-functional-tests.sql",
         "20-artifacts.sql",
         "49-result-uploads.sql",
-        "64-upload-grants.sql",
     ):
         for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
             s.query(stmt)
@@ -211,27 +210,57 @@ def test_a_pending_upload_is_not_published_and_grants_keep_the_newest_version():
     got = s.query("SELECT state FROM v_result_uploads", "JSONEachRow").data()
     assert json.loads(got) == {"state": "expired"}
 
-    def grant(**over):
-        row = {
-            "grant_id": "g1",
-            "grantee": "alice@ibm.com",
-            "role": "auto",
-            "updated_at": "2026-01-01 00:00:00",
-        }
-        s.query(
-            "INSERT INTO upload_grants FORMAT JSONEachRow\n"
-            + json.dumps({**row, **over})
-        )
+
+def test_rbac_keeps_the_newest_version_and_logs_every_one():
+    session = pytest.importorskip("chdb.session")
+
+    s = session.Session()
+    for stmt in SchemaApplier.statements((SCHEMA_DIR / "64-rbac.sql").read_text()):
+        s.query(stmt)
+
+    def put(table, row):
+        s.query(f"INSERT INTO {table} FORMAT JSONEachRow\n" + json.dumps(row))
 
     with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
-        grant(role="admin")
-    grant(arches=["s390x"])
-    grant(arches=[], active=False, updated_at="2026-02-01 00:00:00")
-    got = s.query(
-        "SELECT active, arches FROM upload_grants FINAL", "JSONEachRow"
-    ).data()
-    assert json.loads(got) == {"active": False, "arches": []}
+        put("rbac_roles", {"role_id": "r", "permissions": ["uploads"]})
+    put(
+        "rbac_roles",
+        {
+            "role_id": "uploader",
+            "permissions": ["uploads:publish"],
+            "updated_at": "2026-01-01 00:00:00",
+        },
+    )
+    put(
+        "rbac_roles",
+        {
+            "role_id": "uploader",
+            "permissions": ["uploads:*"],
+            "updated_at": "2026-02-01 00:00:00",
+        },
+    )
+    got = s.query("SELECT permissions FROM rbac_roles FINAL", "JSONEachRow").data()
+    assert json.loads(got) == {"permissions": ["uploads:*"]}
+
+    b = {
+        "binding_id": "b1",
+        "subject": "alice@ibm.com",
+        "role_id": "uploader",
+        "subject_type": "user",
+    }
+    with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
+        put("rbac_bindings", {**b, "subject_type": "team"})
+    put(
+        "rbac_bindings",
+        {**b, "scope": {"arch": ["s390x"]}, "updated_at": "2026-01-01 00:00:00"},
+    )
+    put("rbac_bindings", {**b, "active": False, "updated_at": "2026-02-01 00:00:00"})
+    got = s.query("SELECT active, scope FROM rbac_bindings FINAL", "JSONEachRow").data()
+    assert json.loads(got) == {"active": False, "scope": {}}
     assert (
-        s.query("SELECT count() FROM upload_grant_versions", "CSV").data().strip()
+        s.query("SELECT count() FROM rbac_binding_versions", "CSV").data().strip()
         == "2"
+    )
+    assert (
+        s.query("SELECT count() FROM rbac_role_versions", "CSV").data().strip() == "2"
     )
