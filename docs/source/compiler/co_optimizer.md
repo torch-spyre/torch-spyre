@@ -331,20 +331,18 @@ At a high level: both solvers decide tiling jointly with LX placement and work d
 rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
 objective. When `auto_coarse_tiling` is on,
 `cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
-cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
-step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
-apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
-second joint solve, not a continuation of the first, since tiling is no longer offered as a
-choice at that point. Simulated annealing picks a tiling jointly with division too, through
-`OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its tile-count
-symbols: the loop reaches the price mainly through the operands it re-reads, beside the
-residency the tiling makes possible. Its chosen tilings are applied the same way, and its
-placement stands: there is no second solve.
+now ranked by an ordered sequence of tie-breaks instead: HBM traffic first, then fewest
+tiling cuts, then parallelism, then division shape, then tile count, each one only resolving
+ties the step before leaves open. Simulated annealing picks a tiling jointly with division too,
+through `OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its
+tile-count symbols: the loop reaches the price mainly through the operands it re-reads, beside
+the residency the tiling makes possible. Either way there is one solve: once it picks a tiling,
+the graph is physically rewritten to apply it, the divisions the solve chose are committed onto
+the tiled graph's ops, and the placement stands.
 
 **Status: landed for both solvers, off by default.** `CoreDivision.tiling`
 / `min_footprint` in `plan_solver.py` account for a tiling if one is present, and
-`scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
+`scratchpad/coarse_tiling.py`'s `apply_tilings` — taking a `TileSpec` and lowering it to
 `DimHint`s — applies the chosen tilings, both shared by the two solvers:
 
 - **CP-SAT**: landed via `#4768` (`main` as of this update). Each op is offered a menu of
@@ -352,9 +350,16 @@ placement stands: there is no second solve.
   compatible if they agree on which slice of the shared buffer each tile and core owns.
   Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
   inside one must be compatible. The solve ranks plans with the lexicographic ladder described
-  above, not `cost_expr`. Once it picks a tiling, `CoarseTilingPass` applies it to the graph
-  and the allocation is solved again over the now-tiled graph, with no further tilings
-  offered — that second plan is the one committed.
+  above, not `cost_expr`. It places the graph its tilings produce: a *cut* (a tiled op whose
+  value must leave its nest) gets a copy op that drains each tile into a full-sized HBM
+  buffer, and the first ladder stage charges that copy's traffic. The tile itself stays an LX
+  candidate, but only under a division with no reduction split, since the copy reads it core
+  for core. A buffer a tiled op reads lives until that op's nest ends, and an input clone it
+  reads is held from the nest's start. Once it picks a tiling, `apply_chosen_tilings`
+  applies it and each op takes the division the solve chose for it, a cut's copy op that of
+  the op it drains. A division that splits a dim its tile no longer iterates raises
+  `Unsupported`: the tilings are already applied by then, so the greedy fallback, which
+  catches only `SolveError`, cannot replan the graph.
 
 - **Simulated annealing**: landed via `#4456` through `#4894`. `OpSplitSpace`'s `TilingSpace`
   half offers each op its tilings; the **flip** move shifts a tiled run's boundary, and the

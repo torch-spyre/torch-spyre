@@ -214,14 +214,8 @@ def _dump_buffers(
 
         layout = buf.layout
         assert isinstance(layout, FixedTiledLayout)
-        dump_layout = FixedTiledLayout(
-            layout.device,
-            layout.dtype,
-            list(layout.size),
-            list(layout.stride),
-            layout.device_layout,
-            offset=layout.offset,
-        )  # allocation dict starts empty: invisible to LX planning (already
+        dump_layout = layout.unallocated_copy()
+        # allocation dict starts empty: invisible to LX planning (already
         # run by this point) and picked up later by ordinary HBM/hbm_pool
         # buffer addressing, same as any other un-pinned intermediate.
         clone_tb = clone_lowering(buf)

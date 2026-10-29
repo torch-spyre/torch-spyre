@@ -150,6 +150,69 @@ class TestExhaustiveSearchResidency(TestCase):
         self.assertIsNotNone(result["consumer"].address)
         self.assertEqual(result["producer"].spill_reason, "core div mismatch")
 
+    @staticmethod
+    def _four_output_cores():
+        return CoreDivision(splits={sympy.Symbol("output"): 4})
+
+    @staticmethod
+    def _solve(buffers, lx_size):
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            buffers, size=lx_size, alignment=1
+        )
+        return {b.name: b for b in solver.plan_layout_and_core_divisions()}
+
+    def test_tiled_candidates_are_rejected(self):
+        """A tile-sized reservation is unsafe without matching graph tiling."""
+        buffer = CoreDivisionBuffer(
+            "buffer",
+            1024,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(tiling=TileSpec((TileAxis(host_dim=0, count=4),))),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "requires untiled candidates"):
+            self._solve([buffer], lx_size=256)
+
+    def test_in_place_reuse_compares_per_core_sizes(self):
+        """In-place reuse compares the bytes that one core holds of each buffer."""
+        # In each case, the child starts at the last use of the parent. At that
+        # tick, both buffers are live.
+        with self.subTest("partitioned parent, whole child"):
+            parent = CoreDivisionBuffer(
+                "parent", 1024, [0, 1], core_divisions=[self._four_output_cores()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                512,
+                [1, 2],
+                core_divisions=[CoreDivision()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the parent. The 512-byte child
+            # cannot reuse that slot; both fit side by side in 768 bytes.
+            result = self._solve([parent, child], lx_size=768)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 256)
+
+        with self.subTest("whole parent, partitioned child"):
+            parent = CoreDivisionBuffer(
+                "parent", 512, [0, 1], core_divisions=[CoreDivision()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                1024,
+                [1, 2],
+                core_divisions=[self._four_output_cores()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the child, which fits in the
+            # parent's 512-byte slot. LX is full, so the child must reuse it.
+            result = self._solve([parent, child], lx_size=512)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 0)
+
 
 class TestAllocatorSpillReasons(TestCase):
     """The allocator reports spill reasons from the solved buffers alone."""
@@ -164,8 +227,9 @@ class TestAllocatorSpillReasons(TestCase):
     def test_placement_allocator(self):
         # "late" is live while "first" fills the scratchpad.
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        graph = types.SimpleNamespace(operations=[])
         reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            allocation
+            graph, allocation
         )
         self.assertEqual(set(reasons), {"barred", "late"})
         self.assertEqual(reasons["barred"], "op not allowed")
@@ -173,8 +237,9 @@ class TestAllocatorSpillReasons(TestCase):
 
     def test_joint_allocator_reports_only_what_the_solver_said(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        graph = types.SimpleNamespace(operations=[])
         reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            allocation
+            graph, allocation
         )
         self.assertEqual(reasons, {"barred": "op not allowed"})
 
@@ -1336,6 +1401,33 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertEqual(result.chosen_division, 1)
         self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
 
+    def test_solve_runs_without_the_variable_shaving_subsolvers(self):
+        from ortools.sat.python import cp_model
+
+        ignored = []
+        solve = cp_model.CpSolver.Solve
+
+        def record_and_solve(solver, model, *args, **kwargs):
+            ignored.append(list(solver.parameters.ignore_subsolvers))
+            return solve(solver, model, *args, **kwargs)
+
+        buf = CoreDivisionBuffer("out", 100, [0, 1], core_divisions=_whole())
+        with mock.patch.object(cp_model.CpSolver, "Solve", record_and_solve):
+            self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+
+        self.assertTrue(ignored)
+        for names in ignored:
+            self.assertEqual(
+                set(names),
+                {
+                    "variables_shaving",
+                    "variables_shaving_no_lp",
+                    "variables_shaving_max_lp",
+                },
+            )
+
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
         # child.start_time + 1) with whole-only divisions and capacity for just
@@ -1678,6 +1770,228 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             cd_parent_matches={"c": [(0, 0)]},
         )
         self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
+
+    def _plan(self, buffers, size):
+        return {
+            buf.name: buf
+            for buf in self.solver_class(
+                buffers, size=size, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+
+    @staticmethod
+    def _sink(parent):
+        return CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [99],
+            core_divisions=_whole(),
+            parents=[parent],
+            cd_parent_matches={parent: [(0, 0)]},
+        )
+
+    def test_a_cut_tile_resides_though_its_reader_is_outside_the_nest(self):
+        # p can only be tiled and its reader c only untiled, so c reads p's
+        # copied-out full buffer from HBM and asks nothing of the tile. The
+        # table has no pair for the edge, which once held p out of LX; the
+        # tile is read by its copy op and resides.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p", 128, [0, 1], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+
+    def test_a_cut_tile_takes_the_space_it_resides_in(self):
+        # q is alive across p's write. p's tile (64) and q (64) do not both fit
+        # in 100, and keeping the tile saves more traffic than keeping q: a
+        # spilled tile is written to HBM and read back by its copy. With p
+        # held out of LX, as it once was at a cut, q would have resided.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        q = CoreDivisionBuffer("q", 64, [0, 2], core_divisions=_whole())
+        p = CoreDivisionBuffer(
+            "p", 128, [1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        r = CoreDivisionBuffer(
+            "r",
+            1,
+            [2, 3],
+            core_divisions=_whole(),
+            parents=["q", "p"],
+            cd_parent_matches={"q": [(0, 0)]},
+        )
+        res = self._plan([q, p, r, self._sink("r")], size=100)
+        self.assertIsNotNone(res["p"].address)
+        self.assertIsNone(res["q"].address)
+
+    def test_a_cut_tile_resides_only_as_its_copy_can_read_it(self):
+        # p is a cut, so its copy op is the tile's reader. The copy walks p's
+        # output and has no reduction axis: it reads the tile from LX only
+        # where each core holds a slice of that output. Splitting the
+        # reduction axis as well uses twice the cores, and the solve once took
+        # that division for a tile it had placed in LX, which the tiled graph
+        # then spilled, as no division of the copy could read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out, red = sympy.Symbol("d0"), sympy.Symbol("d1")
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={out: 2}, tiling=spec),
+                CoreDivision(
+                    splits={out: 2, red: 2},
+                    reduction_syms=frozenset({red}),
+                    tiling=spec,
+                ),
+            ],
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+        self.assertEqual(res["p"].chosen_division, 0)
+
+    def test_a_buffer_read_by_a_nest_lives_until_the_nest_ends(self):
+        # w is untiled and read by b, the first op of the nest b, c. Every
+        # iteration of the nest reads w again, so it stays alive through c and
+        # c's copy. Untiled lifetimes end w at b, and then w + b (80) and
+        # b + c (80) both fit in 100; held to the end of the nest, w + b + c
+        # (120) do not, and w is the cheapest of the three to spill.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled = [CoreDivision(tiling=spec)]
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=tiled,
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            80,
+            [2, 3],
+            core_divisions=tiled,
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0)]},
+        )
+        res = self._plan([w, b, c, self._sink("c")], size=100)
+        self.assertIsNone(res["w"].address)
+        self.assertIsNotNone(res["b"].address)
+        self.assertIsNotNone(res["c"].address)
+
+    def test_a_tiled_graph_output_resides_as_a_tile(self):
+        # Nothing reads a graph output from LX while it is untiled. Tiled, its
+        # copy op does, so the bar holds only for the untiled candidate.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        reason = "no consumer reads it from LX"
+        tiled_out = CoreDivisionBuffer(
+            "tiled_out",
+            128,
+            [0],
+            core_divisions=[CoreDivision(tiling=spec)],
+            boundary=BufferType.Output,
+            untiled_bar=reason,
+        )
+        untiled_out = CoreDivisionBuffer(
+            "untiled_out",
+            128,
+            [1],
+            core_divisions=_whole(),
+            boundary=BufferType.Output,
+            untiled_bar=reason,
+        )
+        res = self._plan([tiled_out, untiled_out], size=1 << 20)
+        self.assertIsNotNone(res["tiled_out"].address)
+        self.assertIsNone(res["untiled_out"].address)
+        self.assertEqual(res["untiled_out"].spill_reason, reason)
+
+    def test_an_untiled_bar_is_absolute_for_a_solver_without_tilings(self):
+        buf = CoreDivisionBuffer(
+            "out", 128, [0], untiled_bar="no consumer reads it from LX"
+        )
+        solver = GreedyLayoutSolver([buf], size=1 << 20)
+        self.assertEqual(solver.excluded(buf), "no consumer reads it from LX")
+
+    def test_a_cut_is_charged_the_traffic_of_its_copy(self):
+        # Untiled, p (128) does not fit in 100 and spills: one write and c's
+        # read. Tiled, its tile fits -- but c is outside the nest, so the copy
+        # still writes p to HBM and c still reads it from there. Tiling saves
+        # nothing, and with no charge for the copy it would look free.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(), CoreDivision(tiling=spec)],
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            1,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0)]},
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        chosen = res["p"].core_divisions[res["p"].chosen_division]
+        self.assertTrue(chosen.tiling.is_untiled)
+
+    def test_tiling_is_chosen_when_it_keeps_a_chain_resident(self):
+        # Untiled, neither p nor c (128 each) fits in 100. Tiled into one nest,
+        # p's tile hands its slot to c's in place and both reside; only c's
+        # copy and the sink's read reach HBM.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        either = [CoreDivision(), CoreDivision(tiling=spec)]
+        p = CoreDivisionBuffer("p", 128, [0, 1], core_divisions=list(either))
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [1, 2],
+            core_divisions=list(either),
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0), (1, 1)]},
+            in_place_parents=["p"],
+        )
+        res = self._plan([p, c, self._sink("c")], size=100)
+        for name in ("p", "c"):
+            chosen = res[name].core_divisions[res[name].chosen_division]
+            self.assertEqual(chosen.tiling, spec, name)
+            self.assertIsNotNone(res[name].address, name)
+        self.assertEqual(res["p"].address, res["c"].address)
+
+    def test_a_skip_connection_is_cut_where_an_untiled_op_splits_the_run(self):
+        # Op order a, b, c: b reads a, and c reads a and b. a and c can only be
+        # tiled and b only untiled, so b splits the run although a feeds c
+        # directly. a is then a cut: b and c both read its full copy from HBM,
+        # and its tile is free once the copy has drained it. LX holds one tile
+        # (64), so a's and c's both reside only because a's does not wait for
+        # c, its last reader in op order.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        a = CoreDivisionBuffer(
+            "a", 128, [0, 1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["a"],
+            residency_reason="keep b out of the choice",
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)]},
+        )
+        res = self._plan([a, b, c, self._sink("c")], size=64)
+        self.assertIsNotNone(res["a"].address)
+        self.assertIsNotNone(res["c"].address)
 
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the
@@ -2569,6 +2883,64 @@ class SolveStatsTest(TestCase):
         with config.patch({"_cpsat_warn_on_cost_expr": True}):
             solver.plan_layout_and_core_divisions(unlowerable)
         self.assertFalse(solver.last_solve_stats["objective_used"])
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class UniquenessCheckTest(TestCase):
+    """The tie probe that follows a priced solve: a second plan at the optimum's
+    cost is reported with a warning, and the probe never replaces the plan.
+    """
+
+    _LOGGER = "torch_spyre._inductor.scratchpad.ilp_solver_ortools"
+
+    def setUp(self):
+        # The probe is off by default (SPYRE_ENABLE_UNIQUENESS_CHECK).
+        self.enterContext(config.patch({"enable_uniqueness_check": True}))
+
+    @staticmethod
+    def _solver(size=1 << 20):
+        return CpSatLayoutSolver(
+            [
+                CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+                CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+            ],
+            size,
+        )
+
+    @staticmethod
+    def _spill_cost(buffers):
+        return sum(4000 * (1 - b.sym_is_lx) for b in buffers)
+
+    def test_an_unpriced_residency_is_reported_as_a_tie(self):
+        """Only ``b0`` is priced, so ``b1`` resident or spilled costs the same."""
+        solver = self._solver()
+        with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+            solver.plan_layout_and_core_divisions(self._spill_cost(solver.buffers[:1]))
+        self.assertTrue(
+            any("cannot prove uniqueness" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_fully_priced_plan_is_not_reported(self):
+        """Every other plan spills a priced buffer, so the runner-up is dearer.
+
+        The probe solves for that runner-up, and a plan extracted from
+        it would spill a buffer here despite the probe returning OPTIMAL."""
+        solver = self._solver()
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is not None for b in plan))
+
+    def test_a_plan_with_no_alternative_is_not_reported(self):
+        """Neither buffer fits, force the probe the report INFEASIBLE."""
+        solver = self._solver(size=64)
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = solver.plan_layout_and_core_divisions(
+                self._spill_cost(solver.buffers)
+            )
+        self.assertTrue(all(b.address is None for b in plan))
 
 
 class TestCpSatUnallocatedReads(TestCase):

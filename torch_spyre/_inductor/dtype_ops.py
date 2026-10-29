@@ -110,6 +110,8 @@ class DtypeOpTable:
         (torch.float16, torch.bool),
         (torch.bfloat16, torch.bool),
         (torch.float32, torch.bool),
+        (torch.int32, torch.int64),
+        (torch.int64, torch.int32),
     ]
 
     _FP16_TO_FP32_DTYPES = [

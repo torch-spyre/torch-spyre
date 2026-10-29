@@ -309,8 +309,7 @@ The layers between user code and the device. Green boxes are in-tree (Apache-2.0
 
 ### Supported collectives
 
-The following collectives are implemented today, all in synchronous (blocking)
-mode:
+The following collectives are implemented:
 
 | Collective | Status |
 |---|---|
@@ -322,11 +321,74 @@ mode:
 | `reduce` | Implemented |
 | `allreduce` | Implemented |
 
-`asyncOp=True` is rejected uniformly across these methods. The remaining
-process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
+`broadcast`, `gather`, `allgather`, `reduce`, and `allreduce` also support
+`async_op=True`; wait for completion with the returned work handle's `wait()`.
+The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
 `SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
 unsupported: the protocol overhead is high and call sites are rare.
+
+### BF16 collective tensors
+
+`torch.bfloat16` Spyre tensors use DL16 (`SEN169_FP16`) device storage by
+default. Eager broadcast, gather, allgather, SUM reduce, and SUM allreduce communicate
+that storage directly, preserving the public BF16 dtype. Compiled broadcast,
+allgather, and SUM allreduce use the same device format. No intermediate
+conversion through `torch.float16` is required.
+
+As with other BF16 Spyre operations, computation uses DL16 arithmetic.
+Explicit tensor layouts containing native BF16 device storage are rejected;
+their bytes cannot be interpreted as DL16. This storage check runs when a
+tensor is submitted, since compile-time plans contain scalar metadata only.
+Both eager and compiled collective plans include the device allocation's
+padding, including padding introduced by a producer operation before a
+compiled collective. The storage-extent guard compares `numel()` with
+`dma_sizes`, which records the logical allocation shape, not the padded
+`device_size`. Ordinary allocated tensors therefore pass this guard even
+when their physical storage includes stick padding.
+
+Collectives require contiguous inputs with zero storage offset and a device
+storage descriptor covering the input's own elements. Eager allgather also accepts
+contiguous zero-offset input prefixes with larger base descriptors. When the input
+and outputs have linear DL16 storage without lazy value transforms, it borrows
+the input and limits the transfer to the output allocation, including the final
+stick's padding. Single-row logits prefixes take this path with no extra tensor
+allocation or device copy on repeated calls. This contract applies to every
+eligible FP16/BF16 prefix: output padding may contain values from the source
+beyond the logical prefix, and downstream operations must ignore that padding.
+Logical tensor elements remain unchanged. Tiled prefixes are materialized
+into their own allocation. The work handle
+retains the borrowed or materialized input through asynchronous completion.
+Other eager collectives and allgather outputs reject these views. A compiled collective buffer
+must have a finalized device layout describing its own size, stride, offset,
+and dtype; missing or incompatible metadata is rejected instead
+of planning from an unpadded logical element count. Compiled broadcast,
+allgather, and allreduce materialize view inputs into their own allocation
+before planning. Compiled broadcast and allgather preserve that finalized layout
+in their receive buffers, including padding beyond the default stick layout.
+Compiled allgather retains both its input and receive buffers until communication
+completes. In-place compiled allreduce copies the full completed result
+back to the original view even when waiting on a slice or reshape of the
+collective result. Reshapes or other stride-changing views before a wait require
+the original target to cover its full allocation; a stride-changing wait on a
+partial-allocation target raises an explicit error.
+Repeated waits reuse the current target, preserving mutations made after the first wait.
+Dtype-changing views of an outstanding in-place collective result are rejected;
+wait before changing the view's dtype.
+Eager callers must materialize other unsupported views explicitly before submission.
+
+**Compatibility note:** eager collectives now diagnose nonzero storage offsets
+and descriptors that still cover a larger base allocation. Contiguity was
+already required. Eager allgather borrows compatible linear zero-offset prefixes
+and materializes other zero-offset input views, while
+compiled broadcast, allgather, and allreduce materialize view inputs automatically.
+Materialize other unsupported views before submission.
+
+Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
+A scalar has one logical element (`dma_sizes` is empty, whose product is
+one), while its DL16 allocation occupies a full 64-element stick. Collective
+plans communicate that physical allocation, just as they do for padded
+multidimensional tensors; the host result remains a single scalar.
 
 ### One device per process
 

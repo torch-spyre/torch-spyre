@@ -293,6 +293,36 @@ def is_empty_tiled_layout(layout: object) -> bool:
     )
 
 
+def storage_has_single_writer(
+    graph: GraphLowering,
+    producer: Operation,
+    *,
+    transferred_mutation: Operation | None = None,
+) -> bool:
+    """Prove fresh storage has no aliases or writers beyond its producer.
+
+    An explicitly transferred mutation (a collective moved onto a private
+    drain) may be exempted. Ordinary gathered sources have no exemption.
+    Inspect mutation/alias declarations as well as liveness dependencies.
+    """
+    name = producer.get_name()
+    for op in graph.operations:
+        try:
+            if (
+                (op is not transferred_mutation and name in op.get_mutation_names())
+                or name in op.get_inputs_that_alias_output()
+                or (
+                    op is not producer
+                    and op is not transferred_mutation
+                    and any(dep.name == name for dep in op_read_writes(op).writes)
+                )
+            ):
+                return False
+        except NotImplementedError:
+            return False
+    return True
+
+
 def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
@@ -726,9 +756,11 @@ def _would_produce_lx_back_gap(
 ) -> bool:
     """Check if pinning a buffer to LX would produce a backGapCore_.
 
-    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
-    The backend supports backGap for HBM but not for LX, so buffers triggering
-    this condition must stay in HBM.
+    A backGap fires when the in-core iteration and physical device extents
+    differ, including the negative gap used for overlapping unfold reads.
+    Generic LX gaps remain unsupported. The allocator may admit only a
+    certified prefix-slice gather whose unsplit-K consumer uses a uniform
+    outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout
@@ -769,7 +801,21 @@ def _would_produce_lx_back_gap(
                     )
                     + 1
                 )
-                if device_size[d] > covered:
+                if device_size[d] > covered or (
+                    device_size[d] < covered and coord_expr.as_coeff_Add()[1] in syms
+                ):
+                    return True
+                # Normalization splits an affine coordinate such as 2*w + k
+                # into nested axes. The original axis can be fully covered
+                # while its inner k axis needs a negative backGap. Check that
+                # overlap before allowing this buffer to reside in LX.
+                from torch_spyre._inductor.work_division_constraints import (
+                    overlapping_coordinate_extents,
+                )
+
+                if overlapping_coordinate_extents(
+                    coord_expr, {sym: int(dep.ranges[sym]) for sym in syms}
+                ):
                     return True
     return False
 

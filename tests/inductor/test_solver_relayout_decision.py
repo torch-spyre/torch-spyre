@@ -37,6 +37,8 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+from dataclasses import replace
+
 import pytest
 import sympy
 
@@ -80,6 +82,42 @@ def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expecte
         "P", "C", candidates, divisions, costs
     )
     assert [c.group for c in kept] == expected
+
+
+@pytest.mark.parametrize(
+    "cap,pinned,expected",
+    [
+        (2, (), [0, 2]),
+        (2, (1,), [1, 2]),
+        (1, (1,), [1]),
+        (1, (0, 1), [0, 1]),
+        (1, (2,), [2]),
+        (0, (1,), [0, 1, 2]),
+    ],
+)
+def test_relayout_full_replica_preserves_sibling_pins(
+    monkeypatch, cap, pinned, expected
+):
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 100, group=0, j=0),
+        _candidate("C", 0, 200, group=1, j=1),
+        replace(
+            _candidate("C", 0, 1000, group=2, j=2),
+            destination_view=PerCoreView((), (), num_cores=4),
+            destination_footprint_bytes=64,
+        ),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 3
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P",
+        "C",
+        candidates,
+        divisions,
+        pinned_consumer_divisions=frozenset(pinned),
+    )
+    assert [c.group for c in kept] == expected
+    assert all(any(c is original for original in candidates) for c in kept)
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -398,7 +436,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
     plan = group.plan(source_address=0)
     assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
     assert plan.destination_view.num_cores == 8
-    with pytest.raises(ValueError, match="not a multiple"):
+    with pytest.raises(ValueError, match="destination on 6 cores is incompatible.*4"):
         _candidate("C", 0, 5000.0, destination_cores=6)
     with pytest.raises(ValueError, match="no physical core count"):
         RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)

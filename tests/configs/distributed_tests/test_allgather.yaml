@@ -20,5 +20,6 @@ test_suite_config:
     # These tests use the spyreccl backend for distributed operations
     supported_dtypes:
       - name: float16
+      - name: bfloat16
       - name: float32
       - name: int32

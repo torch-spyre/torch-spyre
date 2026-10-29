@@ -724,6 +724,37 @@ def spyre_conv2d(
     pass
 
 
+def _conv_output_shape(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> list[int]:
+    """Output shape for spyre.conv2d, for a rank-3 (1-D) or rank-4 (2-D) input.
+
+    Rank 3 is a conv1d, which is lowered natively at rank 3 rather than via a
+    reshape to rank 4 (``lower_depthwise_conv2d`` for the depthwise case,
+    ``lower_convolution`` for the direct path), so the output keeps the input's
+    rank: ``(N, C_in, L) -> (N, C_out, L_out)``.  ``C_out`` is read from the
+    weight's dim 0, which holds for both, so the arithmetic is grouping-agnostic.
+    """
+    if input.dim() == 3:
+        N, _C_in, L_in = input.shape
+        C_out, _C_in_g, kL = weight.shape
+        L_out = (L_in + 2 * padding[0] - dilation[0] * (kL - 1) - 1) // stride[0] + 1
+        return [N, C_out, L_out]
+
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    return [N, C_out, H_out, W_out]
+
+
 @spyre_conv2d.register_fake
 def _(
     input: torch.Tensor,
@@ -733,15 +764,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op(
@@ -769,15 +792,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
@@ -1027,6 +1042,76 @@ def _(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:
     output_shape = [mat1.shape[0], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op("spyre::bmm_fp8", mutates_args=(), device_types="spyre")
+def bmm_fp8(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Raw FP8 batched matrix multiplication, with no scaling applied.
+
+    The batched counterpart to spyre.scaled_mm: mat1 [*batch, M, K] @
+    mat2 [*batch, K, N] -> [*batch, M, N], with matching leading batch dims.
+
+    Scaling is intentionally NOT applied here - scaled_bmm_decomp applies it
+    afterward, exactly as scaled_mm_decomp does for spyre.scaled_mm.
+
+    Maps to: deeptools batchmatmulfp8.
+    """
+    pass
+
+
+@bmm_fp8.register_fake
+def _(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:
+    # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
+    output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op("spyre::scaled_bmm", mutates_args=(), device_types="spyre")
+def scaled_bmm(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    FP8 batched matrix multiplication with per-tensor scales applied.
+
+    mat1 [*batch, M, K] @ mat2 [*batch, K, N] -> [*batch, M, N], with matching
+    leading batch dims. Used for FP8 attention QK, e.g.
+    query[B, H, S, D] @ key_T[B, H, D, S].
+
+    aten has no batched equivalent of _scaled_mm to decompose from, so this op
+    plays that role: scaled_bmm_decomp rewrites it into the raw spyre.bmm_fp8
+    followed by the scale multiplies, the same split scaled_mm_decomp performs
+    for torch._scaled_mm.
+
+    ``use_fast_accum`` is accepted for signature compatibility with the
+    consumers' scaled_bmm and with torch._scaled_mm, but is ignored: Spyre has
+    no fast 8-bit accumulation path, so there is no faster mode to select.
+    Passing True logs a warning rather than changing behaviour.
+    """
+    pass
+
+
+@scaled_bmm.register_fake
+def _(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    # [*batch, M, K] @ [*batch, K, N] -> [*batch, M, N]
+    output_shape = [*mat1.shape[:-2], mat1.shape[-2], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
 
 
@@ -1322,23 +1407,6 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
 @stagger_to_standard_ea.register_fake
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
-
-
-@torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
-def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    pass
-
-
-@prod_dim_int.register_fake
-def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
-    if dim < 0:
-        dim += input.ndim
-    out_shape = list(input.shape)
-    if keepdim:
-        out_shape[dim] = 1
-    else:
-        out_shape = out_shape[:dim] + out_shape[dim + 1 :]
-    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op(

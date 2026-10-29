@@ -46,6 +46,7 @@ from .constants import (
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
     RESTICKIFY_OP,
+    RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
 )
@@ -54,12 +55,12 @@ from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
     remap_work_division,
+    work_division_from_view,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
-    work_division_from_view,
 )
 from .pass_utils import (
     concretize_expr,
@@ -890,6 +891,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             it_space,
+            allow_extended=_spyre_config.lx_extended_ownership,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -976,6 +978,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Check if operation supports the argument's dtype
             if not (
                 op == IDENTITY_OP
+                or (
+                    op == RESTICKIFY_OP
+                    and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
+                )
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or (

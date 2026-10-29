@@ -58,7 +58,7 @@ class TestLegacyEnvVarEnablesDebug:
         result = _run_subprocess(script, {"TORCH_SPYRE_DEBUG": "1"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "LEVEL=DEBUG" in result.stdout
-        assert "SOURCE=legacy:TORCH_SPYRE_DEBUG" in result.stdout
+        assert "SOURCE=env:TORCH_SPYRE_DEBUG" in result.stdout
 
     def test_legacy_env_var_emits_deprecation_warning(self):
         """TORCH_SPYRE_DEBUG=1 must emit a deprecation warning."""

@@ -28,6 +28,8 @@ the plan (views under the chosen divisions, solved addresses), the existing
 computes the right numbers on device.
 """
 
+import math
+
 import pytest
 
 pytest.importorskip("ortools")
@@ -82,6 +84,8 @@ class _Observed:
         # plan edge -> materialized copy buffer name, and each consumer's read
         # names right after materialization (V.graph is live inside the pass).
         self.copies: dict = {}
+        self.source_layouts: dict = {}
+        self.copy_layouts: dict = {}
         self.consumer_reads: dict[str, set[str]] = {}
         real_materialize = alloc_mod.materialize_lx_relayouts
 
@@ -102,6 +106,19 @@ class _Observed:
                 for edge, (copy_name, _plan) in materialized_lx_relayouts(graph).items()
             }
             for plan in plans:
+                layout = graph.get_buffer(plan.source_name).get_layout()
+                self.source_layouts[plan.edge] = (
+                    list(layout.device_layout.device_size),
+                    list(layout.device_layout.stride_map),
+                    list(layout.stride),
+                )
+                copy_layout = graph.get_buffer(self.copies[plan.edge]).get_layout()
+                self.copy_layouts[plan.edge] = (
+                    list(copy_layout.size),
+                    list(copy_layout.stride),
+                    list(copy_layout.device_layout.device_size),
+                    list(copy_layout.device_layout.stride_map),
+                )
                 for name in plan.consumer_names:
                     op = graph.get_buffer(name)
                     self.consumer_reads[name] = {
@@ -470,6 +487,48 @@ def test_relayout_into_a_matmul_x_operand(monkeypatch):
     torch.testing.assert_close(out.cpu().float(), ref, rtol=2e-2, atol=2e-1)
 
 
+def test_permutation_past_split_8_fires(monkeypatch):
+    """The row-split normalization geometry on a hinted pointwise pair: neg
+    hinted {R: 32} (16 whole rows per core, as a row reduction needs) feeds
+    relu hinted {R: 4, H: 8}. Logical [512, 4096] fp16 lays out as
+    [64 sticks, 512 rows, 64], so the pair's governing split is 32 (a run of
+    16 * 64 elements); both views are complete partitions of the 32 cores, so
+    the move is a permutation, and each destination gathers its 128 rows from
+    8 sources, inside the shuffle budget. The relayout law is measured for
+    permutations up to split 32, so the solver is offered the pair at the law's
+    price and fires it on economics alone (a shuffle of a few microseconds
+    against a 4 MB HBM write and re-read). Read-only spies."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.cost_features import governing_run_split
+
+    observed = _Observed(monkeypatch, force=False)
+    recorded = observed.plans
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 32}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(512, 4096, dtype=torch.float16)
+    for name, size in (("R", 512), ("H", 4096)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["R", "H"])
+    with config.patch(_COOPT):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = recorded
+    assert plan.num_cores == 32
+    assert governing_run_split(
+        plan.source_view, plan.destination_view, [64, 512, 64]
+    ) == (1024, 32)
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
 def test_two_relayout_edges_into_one_consumer(monkeypatch):
     """add(neg(a), abs(b)) with both edges forced: two destination rectangles
     at the consumer's tick, and two clones inserted before one consumer."""
@@ -585,47 +644,77 @@ def test_relayout_on_other_dtypes(monkeypatch, dtype):
 
 
 def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
-    """A coarse-tiled edge that crosses for_each_tile scopes must enumerate NO
-    relayout candidates, even though a same-group coarse-tiled edge now can
-    (see test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip
-    below, torch-spyre#5057).
+    """Relayouts must stay within one coarse-tile scope.
 
-    The producer sits in one for_each_tile body and the consumer in a
-    separate, sibling body with its own loop_group_id, so this is a true
-    cross-group edge, not merely two ops that happen to both be tiled. A
-    relayout taken at that seam would still be stale on the next outer
-    iteration the same way an in-loop one would be; the solver path must
-    decline at enumeration (loop_info gate), not merely decline to fire.
-
-    The two for_each_tile calls tile different axes of the intermediate (dim
-    0 then dim 1) specifically to force two genuinely distinct loop scopes.
-    Verified empirically, not just by inspection: equal tile_size/dims
-    siblings over the same shape fuse into one shared while_loop body (both
-    intermediates named ``while_loop_body_graph_0_0_*``); giving the second
-    call a different tile_size ALONE (same dim) still fuses the same way,
-    byte-identical candidate list. Only a different tiled axis keeps the
-    splicer from inlining the producer directly into the consumer's body --
-    which is not the cross-group case this test means to cover."""
+    The two for_each_tile bodies tile different axes to retain distinct
+    scopes. Check every offered and materialized edge by its endpoint
+    metadata; valid edges inside either body may still offer relayouts.
+    The candidate unit test also probes real sibling and nested group IDs
+    to prove that the scope gate rejects them before layout inspection.
+    """
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
-    tables = []
+    groups_seen = set()
+
+    def assert_same_scope(producer, consumer):
+        prod_info = getattr(producer, "loop_info", None)
+        cons_info = getattr(consumer, "loop_info", None)
+        if prod_info is None and cons_info is None:
+            return
+        assert isinstance(prod_info, CoarseTileInfo)
+        assert isinstance(cons_info, CoarseTileInfo)
+        assert prod_info.loop_group_id == cons_info.loop_group_id, (
+            f"cross-group relayout: {producer.get_name()} "
+            f"{prod_info.loop_group_id} -> {consumer.get_name()} "
+            f"{cons_info.loop_group_id}"
+        )
+
     orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
 
-    def spy_tables(self, *args, **kwargs):
-        out = orig_tables(self, *args, **kwargs)
-        if out:
-            tables.append(out)
+    def spy_tables(
+        self,
+        graph,
+        consumer_op,
+        consumer_divs,
+        parent_names,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        out = orig_tables(
+            self,
+            graph,
+            consumer_op,
+            consumer_divs,
+            parent_names,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for op in [consumer_op, *(op_by_name.get(name) for name in parent_names)]:
+            info = getattr(op, "loop_info", None)
+            if isinstance(info, CoarseTileInfo):
+                groups_seen.add(info.loop_group_id)
+        for parent, candidates in out.items():
+            if candidates:
+                assert_same_scope(op_by_name[parent], consumer_op)
         return out
 
     monkeypatch.setattr(
         alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
     )
 
-    recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
 
     def spy_mat(graph, plans):
-        recorded.extend(plans)
+        for plan in plans:
+            for name in plan.consumer_names:
+                assert_same_scope(
+                    graph.get_buffer(plan.source_name), graph.get_buffer(name)
+                )
         return real_materialize(graph, plans)
 
     monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy_mat)
@@ -658,15 +747,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     ):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
-    # Graph-global, same as the test this replaces: also covers each body's
-    # own within-scope edges, which happen to offer nothing for this graph's
-    # shapes. A future same-group change that makes one of those offer could
-    # fail this assert looking like a cross-group regression when it isn't;
-    # the printed table disambiguates by parent/consumer name.
-    assert tables == [], (
-        f"cross-group coarse-tiled edges were offered relayout: {tables}"
-    )
-    assert recorded == []
+    assert len(groups_seen) >= 2, "fixture did not retain distinct coarse-tile scopes"
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
@@ -674,7 +755,8 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
 def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch):
     """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
     relayout candidate (the same-group exception in
-    ``solver_relayout_edge_context``, torch-spyre#5057), and that candidate's
+    ``solver_relayout_edge_context``, torch-spyre#5057), when
+    ``lx_same_tile_group_relayout`` is enabled, and that candidate's
     cost must carry the loop's own trip-count multiplier
     (``_coarse_tile_loop_trip_count``, see TestCoarseTileLoopTripCount in
     test_scratchpad_solver.py) -- a relayout taken once but paid on every
@@ -724,7 +806,11 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             a = ha.to("spyre")
             b = hb.to("spyre")
             with config.patch(
-                {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+                {
+                    "co_optimizing_lx_planning": True,
+                    "layout_solver": "cpsat",
+                    "lx_same_tile_group_relayout": True,
+                }
             ):
                 out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
         candidates = [c for table in tables for cs in table.values() for c in cs]
@@ -822,3 +908,975 @@ def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch)
         )
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,width,dtype,batched,strided",
+    [(512, 4096, torch.float16, True, False), (64, 512, torch.float32, False, True)],
+)
+def test_complete_partition_expansion_fires_and_preserves_values(
+    monkeypatch, rows, width, dtype, batched, strided
+):
+    """A real 16-to-32-core transfer with four-source destination gathers."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+
+    def fn(t):
+        with spyre_hint(work_div={"R": 16}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"R": 4, "H": 8}):
+            return torch.relu(hidden)
+
+    # Give all 128 source/feature fragments distinct value ranges.
+    # Keep inputs negative so relu(-t) observes every destination.
+    storage_width = width * (2 if strided else 1)
+    row_ids = torch.arange(rows).reshape(-1, 1)
+    column_ids = torch.arange(storage_width).reshape(1, -1) // (2 if strided else 1)
+    fragment = (row_ids // (rows // 16)) * 8 + column_ids // (width // 8)
+    offset = (row_ids * 37 + column_ids * 17) % 8
+    host = -(fragment * 8 + offset + 1).to(dtype)
+    if strided:
+        host = host[:, ::2]
+        assert not host.is_contiguous()
+    names = ["R", "H"]
+    if batched:
+        host = host.unsqueeze(0)
+        names = ["B", *names]
+        _pnd.declare_tensor_dim("B", 1)
+    for name, size in (("R", rows), ("H", width)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), names)
+    with config.patch({**_COOPT, "sencores": 32}):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == 16 and plan.destination_view.num_cores == 32
+    # Physical dimension order may change when a singleton batch is present.
+    # Locate row and outer-stick axes from the committed tensor's strides,
+    # independently of the per-core views being checked.
+    dims, strides, logical_strides = observed.source_layouts[plan.edge]
+    row_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims, strides))
+        if size == rows and stride == logical_strides[-2]
+    ]
+    column_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims[:-1], strides[:-1]))
+        if size == width // dims[-1] and stride == logical_strides[-1] * dims[-1]
+    ]
+    assert len(row_axes) == len(column_axes) == 1
+    row_axis, column_axis = row_axes[0], column_axes[0]
+    assert row_axis != column_axis
+    assert _core_slices(plan.source_view, 16) == {c: {row_axis: c} for c in range(16)}
+    assert _core_slices(plan.destination_view, 32) == {
+        c: {column_axis: c // 4, row_axis: c % 4} for c in range(32)
+    }
+    # Striding doubles host backing storage, not this logical device tensor's LX span.
+    assert plan.source_footprint_bytes == rows * width * host.element_size() // 16
+    assert plan.destination_footprint_bytes == rows * width * host.element_size() // 32
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "live source and destination LX spans overlap"
+    assert torch.equal(out.cpu(), torch.relu(-host))
+
+
+@pytest.mark.parametrize(
+    "rows,inner,strided",
+    [(512, 4096, False), (64, 4096, False), (128, 4096, False), (64, 65, True)],
+)
+def test_q_projection_rope_handoff_preserves_pairs_and_other_consumer(
+    monkeypatch, rows, inner, strided
+):
+    _check_projection_rope_handoff(monkeypatch, rows, inner, strided, heads=8)
+
+
+@pytest.mark.parametrize("rows,inner,strided", [(128, 65, True)])
+def test_k_projection_rope_complete_contraction(monkeypatch, rows, inner, strided):
+    _check_projection_rope_handoff(
+        monkeypatch, rows, inner, strided, heads=2, contract=True
+    )
+
+
+def _check_projection_rope_handoff(
+    monkeypatch, rows, inner, strided, *, heads, contract=False
+):
+    """Compile producers and consumers together; never replay implicit LX inputs."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    observed = _Observed(monkeypatch, force=False)
+    features = heads * 128
+    feature_groups = 4 if contract else min(heads, 4)
+    cores = 8 * feature_groups
+    destination_cores = 16 if contract else cores
+    # Linear merges head/pair into one output loop; name its total split once.
+    producer_hint = {"R": 8, "H": feature_groups}
+
+    def fn(t, w, frequencies):
+        with spyre_hint(work_div=producer_hint):
+            q = torch.nn.functional.linear(t, w)
+        with spyre_hint(work_div={"R": destination_cores}):
+            shaped = q.reshape(1, rows, heads, 2, 64)
+            rotated = (frequencies * shaped.unsqueeze(-3)).sum(4, keepdim=True)
+            # This second read must be preserved when the private copy is
+            # inserted. Returning Q itself would require an HBM graph output.
+            side = q + 1
+            return rotated.flatten(3), side
+
+    storage_width = inner * (2 if strided else 1)
+    host = (
+        (torch.arange(rows * storage_width).reshape(1, rows, storage_width) * 13) % 127
+        - 63
+    ).to(torch.float16)
+    if strided:
+        host = host[:, :, ::2]
+        assert not host.is_contiguous()
+    # One nonzero weight per output makes the complete GEMM reference exact,
+    # including the padded K=65 case. Power-of-two scales distinguish heads
+    # when that small K causes input-column reuse.
+    columns = torch.arange(features) % inner
+    scales = (2 ** ((torch.arange(features) // inner) % 4)).to(torch.float16)
+    weight = torch.zeros(features, inner, dtype=torch.float16)
+    weight[torch.arange(features), columns] = scales
+    q_ref = host[:, :, columns] * scales
+    # Valid 0/90-degree rotations vary with both row and feature. A swapped
+    # pair, wrong sign, misplaced row fragment or wrong head changes values.
+    cos = ((torch.arange(rows)[:, None] + torch.arange(64)[None, :]) % 2).to(
+        torch.float16
+    )
+    sin = 1 - cos
+    frequencies = torch.stack(
+        (torch.stack((cos, -sin), dim=1), torch.stack((sin, cos), dim=1)), dim=1
+    ).reshape(1, rows, 1, 2, 2, 64)
+    expected = (
+        (
+            frequencies.float()
+            * q_ref.float().reshape(1, rows, heads, 2, 64).unsqueeze(-3)
+        )
+        .sum(4, keepdim=True)
+        .flatten(3)
+        .to(torch.float16)
+    )
+    # Preserve head/pair/feature names through the RoPE view. Each feature
+    # shard contains complete rotation pairs, including the two-head K case.
+    for name, size in (
+        ("B", 1),
+        ("R", rows),
+        ("K", inner),
+        ("H", heads),
+        ("P", 2),
+        ("D", 64),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["H", "P", "D", "K"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        out, side = torch.compile(fn, dynamic=False, fullgraph=True)(
+            x, w, frequencies.to("spyre")
+        )
+
+    # The test is a capability/correctness gate, not a performance result.
+    # Both consumers use one destination view and hence one allocated copy.
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert len(plan.consumer_names) == 2
+    dims, strides, logical_strides = observed.source_layouts[plan.edge]
+    row_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims, strides))
+        if size == rows and stride == logical_strides[-2]
+    ]
+    column_axes = [
+        i
+        for i, (size, stride) in enumerate(zip(dims[:-1], strides[:-1]))
+        if size == features // 64 and stride == logical_strides[-1] * dims[-1]
+    ]
+    assert len(row_axes) == len(column_axes) == 1
+    row_axis, column_axis = row_axes[0], column_axes[0]
+    assert _core_slices(plan.source_view, cores) == {
+        c: {row_axis: c % 8, column_axis: c // 8} for c in range(cores)
+    }
+    assert _core_slices(plan.destination_view, destination_cores) == {
+        c: {row_axis: c} for c in range(destination_cores)
+    }
+    assert plan.source_footprint_bytes == rows * features * 2 // cores
+    assert plan.destination_footprint_bytes == rows * features * 2 // destination_cores
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "simultaneously live projection and its relayout copy overlap"
+    assert torch.equal(out.cpu(), expected)
+    assert torch.equal(side.cpu(), q_ref + 1)
+
+
+@pytest.mark.parametrize("rows", [512, 128, 64])
+def test_attention_output_repack_handoff(monkeypatch, rows):
+    """Produce softmax/PV/divide before repack/O; no implicit LX live-in.
+
+    One unmasked key per query makes exp and the denominator exactly 0/1.
+    Sparse O weights select every input feature, so wrong head/row/width
+    routing cannot hide in a wide GEMM tolerance. A second divide consumer
+    verifies that rewriting the repack read preserves the original lifetime.
+    The test ends at O's HBM graph output; distributed collectives remain a
+    separate production-harness requirement.
+    """
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.pass_utils import op_read_writes
+
+    observed = _Observed(monkeypatch, force=False)
+    restickify_inputs = {}
+    real_materialize = alloc_mod.materialize_lx_relayouts
+
+    def capture_restickify_inputs(graph, plans):
+        for plan in plans:
+            source = graph.get_buffer(plan.source_name)
+            if not (
+                isinstance(source, ComputedBuffer)
+                and isinstance(source.data, Pointwise)
+                and {node.target for node in source.origins}
+                == {torch.ops.spyre.restickify.default}
+            ):
+                continue
+            # This layout copy can merge head/width factors without changing
+            # the within-stick dimension. Require its actual lowering origin
+            # and one identity read, not a general path through other ops.
+            rw = op_read_writes(source)
+            assert len(rw.reads) == len(rw.writes) == 1
+            (read,), (write,) = list(rw.reads), list(rw.writes)
+            assert isinstance(read, MemoryDep) and isinstance(write, MemoryDep)
+            assert read.index == write.index and read.ranges == write.ranges
+            restickify_inputs[plan.source_name] = (
+                read.name,
+                graph.get_buffer(read.name).get_layout(),
+                source.get_layout(),
+            )
+        return real_materialize(graph, plans)
+
+    monkeypatch.setattr(
+        alloc_mod, "materialize_lx_relayouts", capture_restickify_inputs
+    )
+
+    def fn(scores, values, weight):
+        with spyre_hint(work_div={"R": 32}):
+            shifted = scores - scores.amax(-1, keepdim=True)
+            probability = torch.exp(shifted)
+            denominator = probability.sum(-1, keepdim=True)
+            numerator = torch.ops.spyre.batched_matmul(probability, values)
+            divided = numerator / denominator
+            side = torch.neg(divided)
+        # Reshape merges KV/G into one loop; a hint names that loop once.
+        with spyre_hint(work_div={"R": 8, "G": 4}):
+            packed = divided.reshape(1, 8, rows, 128).transpose(1, 2).contiguous()
+        with spyre_hint(work_div={"R": 4, "O": 8}):
+            result = torch.nn.functional.linear(packed.reshape(1, rows, 1024), weight)
+        return result, side
+
+    selected = (torch.arange(rows) * 13 + 17) % 512
+    scores = torch.full((1, 2, 4, rows, 512), -float("inf"), dtype=torch.float16)
+    scores[:, :, :, torch.arange(rows), selected] = 0
+    k = torch.arange(512).reshape(1, 1, 1, 512, 1)
+    h = torch.arange(2).reshape(1, 2, 1, 1, 1)
+    d = torch.arange(128).reshape(1, 1, 1, 1, 128)
+    values = ((k * 37 + h * 257 + d * 3) % 1021 / 1024).to(torch.float16)
+    selectors = (torch.arange(4096) * 37) % 1024
+    weight = torch.zeros(4096, 1024, dtype=torch.float16)
+    weight[torch.arange(4096), selectors] = 1
+    divided = values[:, :, :, selected, :].expand(1, 2, 4, rows, 128)
+    packed = divided.reshape(1, 8, rows, 128).transpose(1, 2).reshape(1, rows, 1024)
+    expected = packed[:, :, selectors]
+    for name, size in (
+        ("B", 1),
+        ("KV", 2),
+        ("G", 4),
+        ("R", rows),
+        ("S", 512),
+        ("D", 128),
+        ("O", 4096),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    score_arg = _pnd.name_tensor_dims(scores.to("spyre"), ["KV", "G", "R", "S"])
+    value_arg = _pnd.name_tensor_dims(values.to("spyre"), ["KV", "S", "D"])
+    weight_arg = _pnd.name_tensor_dims(weight.to("spyre"), ["O", "KV", "G", "D"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        result, side = torch.compile(fn, dynamic=False, fullgraph=True)(
+            score_arg, value_arg, weight_arg
+        )
+    observed.assert_emitted_in_lx(expected_plans=2)
+    first, second = observed.plans
+    if second.source_name not in first.consumer_names:
+        assert second.source_name in restickify_inputs
+        input_name, input_layout, output_layout = restickify_inputs[second.source_name]
+        assert input_name in first.consumer_names
+        assert (
+            set(input_layout.allocation) == set(output_layout.allocation) == {"lx"}
+        ), "the repack layout copy must keep both endpoints in LX"
+    assert first.source_view.split_product == first.destination_view.split_product == 32
+    assert second.source_view.split_product == 32
+    assert second.destination_view.split_product == 4
+    assert (
+        first.source_footprint_bytes == first.destination_footprint_bytes == rows * 64
+    )
+    assert second.source_footprint_bytes == rows * 64
+    assert second.destination_footprint_bytes == rows * 512
+    for plan in observed.plans:
+        assert (
+            plan.source_address + plan.source_footprint_bytes
+            <= plan.destination_address
+            or plan.destination_address + plan.destination_footprint_bytes
+            <= plan.source_address
+        ), "live source and copy overlap"
+    assert torch.equal(result.cpu(), expected)
+    assert torch.equal(side.cpu(), -divided)
+
+
+def _assert_cache_update_persistence(
+    specs, cache_writes, source_address, elements, *, later_write=False
+):
+    """Require direct persistence or a complete ordered functionalized copyback."""
+    from torch_spyre._inductor.constants import RESTICKIFY_OP
+
+    snapshots = [
+        (i, spec.args[0])
+        for i, spec in enumerate(specs)
+        if spec.op == RESTICKIFY_OP
+        and len(spec.args) == 2
+        and spec.args[1].allocation == {"lx": source_address}
+    ]
+    assert len(snapshots) == 1, "expected one persistent-cache snapshot"
+    snapshot_index, cache = snapshots[0]
+    assert math.prod(cache.device_size) == elements
+    assert len(cache_writes) == 1 + int(later_write)
+    assert set(cache_writes).issubset(map(id, specs))
+    if later_write:
+        writes = [
+            (i, cache_writes[id(spec)])
+            for i, spec in enumerate(specs)
+            if id(spec) in cache_writes
+        ]
+        assert len(writes) == 2, (
+            "expected indexed updates before and after the snapshot"
+        )
+        assert writes[0][0] < snapshot_index < writes[1][0]
+        assert all(set(arg.allocation) in ({"hbm"}, {"hbm_pool"}) for _, arg in writes)
+        # Functionalization can snapshot the first pooled version and copy the
+        # second version back later. Exact outputs and the returned alias below
+        # check both versions, including untouched history in the final cache.
+        return
+    assert cache.arg_index >= 0 and cache.allocation == {"hbm": cache.arg_index}
+    for i, spec in enumerate(specs):
+        if id(spec) not in cache_writes:
+            continue
+        updated = cache_writes[id(spec)]
+        assert i < snapshot_index, "cache snapshot precedes its indexed update"
+        if updated.allocation == cache.allocation:
+            assert updated.arg_index == cache.arg_index
+            continue
+        assert set(updated.allocation) == {"hbm_pool"}, (
+            "indexed cache writes must remain in HBM"
+        )
+
+        # Returning an existing view can functionalize the mutation. Require
+        # history initialization and a full copyback to the exact external
+        # cache read by the snapshot, not merely some later external write.
+        def copies(source, destination):
+            return [
+                (j, candidate)
+                for j, candidate in enumerate(specs)
+                if candidate.op == "identity"
+                and len(candidate.args) == 2
+                and candidate.args[0].is_input
+                and not candidate.args[1].is_input
+                and candidate.args[0].allocation == source
+                and candidate.args[1].allocation == destination
+            ]
+
+        initializers = copies(cache.allocation, updated.allocation)
+        copybacks = copies(updated.allocation, cache.allocation)
+        assert len(initializers) == len(copybacks) == 1, (
+            "pooled cache update requires history initialization and copyback"
+        )
+        init_index, initializer = initializers[0]
+        copy_index, copyback = copybacks[0]
+        assert init_index < i < copy_index < snapshot_index, (
+            "cache initialization, indexed update, copyback and snapshot are unordered"
+        )
+        for copy in (initializer, copyback):
+            assert (
+                math.prod(int(size) for size, _ in copy.iteration_space.values())
+                == elements
+            )
+            assert all(math.prod(arg.device_size) == elements for arg in copy.args)
+        for original, restored in zip(initializer.args, reversed(copyback.args)):
+            assert original.arg_index == restored.arg_index
+            assert original.device_size == restored.device_size
+            assert original.device_coordinates == restored.device_coordinates
+            assert original.device_dtype == restored.device_dtype == cache.device_dtype
+        assert initializer.args[1].device_size == updated.device_size
+        assert initializer.args[0].arg_index == cache.arg_index
+        pool_writers = [
+            j
+            for j, candidate in enumerate(specs)
+            if init_index <= j <= copy_index
+            and any(
+                not arg.is_input and arg.allocation == updated.allocation
+                for arg in candidate.args
+            )
+        ]
+        assert pool_writers == [init_index, i], "cache history has an unrelated writer"
+
+
+@pytest.mark.parametrize(
+    "rows,later_write",
+    [(512, False), (128, False), (64, False), (512, True)],
+    ids=["512", "128", "64", "512-later-write"],
+)
+def test_attention_cache_transpose_handoff(monkeypatch, rows, later_write):
+    """Update persistent K, restickify its prefix, gather, then run two QKs.
+
+    The original cache holds history and has twice the attended capacity.
+    Nonmonotonic unique updates hit both halves. Exact one-hot queries check
+    every head/width/context value, and a second QK keeps the snapshot live.
+    Returning a pre-existing cache view checks mutation and alias semantics.
+    No test-side buffer is assumed to arrive in LX.
+    """
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    import torch_spyre._inductor.codegen.superdsc as sdsc_mod
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.constants import RESTICKIFY_OP
+    from torch_spyre._inductor.op_spec import IndirectAccess
+
+    observed = _Observed(monkeypatch, force=False)
+    restick_allocations, cache_writes, parsed_specs = [], {}, {}
+    real_parse = sdsc_mod.parse_op_spec
+
+    def observe_parse(spec):
+        parsed_specs.setdefault(id(spec), spec)
+        if spec.op == RESTICKIFY_OP:
+            restick_allocations.append([dict(arg.allocation) for arg in spec.args])
+        for arg in spec.args:
+            if not arg.is_input and any(
+                coordinate.has(IndirectAccess) for coordinate in arg.device_coordinates
+            ):
+                cache_writes[id(spec)] = arg
+        return real_parse(spec)
+
+    monkeypatch.setattr(sdsc_mod, "parse_op_spec", observe_parse)
+
+    def fn(cache, indices, keys, queries, other_queries, mask):
+        alias = cache.view_as(cache)
+        # The int32 indices occupy 32-element sticks: split only whole sticks.
+        with spyre_hint(work_div={"R": rows // 32}):
+            fresh = torch.neg(keys)
+            cache.index_copy_(2, indices, fresh)
+        with spyre_hint(work_div={"S": 2}, named_dims=["KV", "D", "S"]):
+            transposed = cache[0, :, :512, :].transpose(-1, -2).contiguous()
+        if later_write:
+            # The immutable snapshot must keep the first update, not these values.
+            with spyre_hint(work_div={"R": rows // 32}):
+                cache.index_copy_(2, indices, keys)
+        transposed = transposed.unsqueeze(0).unsqueeze(2)
+        with spyre_hint(work_div={"R": 32}):
+            query = torch.neg(queries)
+            scores = torch.ops.spyre.batched_matmul(query, transposed)
+            other = torch.ops.spyre.batched_matmul(other_queries, transposed)
+            masked = scores.masked_fill(mask, -float("inf"))
+        return masked, other, alias
+
+    c = torch.arange(1024).reshape(1, 1, 1024, 1)
+    h = torch.arange(2).reshape(1, 2, 1, 1)
+    d = torch.arange(128).reshape(1, 1, 1, 128)
+    cache = ((37 * c + 251 * h + 3 * d) % 1021).to(torch.float16)
+    keys = ((19 * torch.arange(rows).reshape(1, 1, rows, 1) + 131 * h + d) % 509).to(
+        torch.float16
+    )
+    indices = (torch.arange(rows) * 13 + 17) % 1024
+    expected_cache = cache.clone()
+    expected_cache.index_copy_(2, indices, -keys)
+    selectors = (
+        torch.arange(rows).reshape(1, 1, 1, rows)
+        + 17 * torch.arange(4).reshape(1, 1, 4, 1)
+        + 31 * torch.arange(2).reshape(1, 2, 1, 1)
+    ) % 128
+    query = torch.nn.functional.one_hot(selectors, 128).to(torch.float16)
+    other_selectors = (selectors * 7 + 9) % 128
+    other_query = torch.nn.functional.one_hot(other_selectors, 128).to(torch.float16)
+    # A causal mask with a position offset exercises both kept and discarded
+    # history. The raw second QK verifies the masked-out values as well.
+    mask = torch.arange(512)[None, :] > (torch.arange(rows)[:, None] + 11)
+    history = expected_cache[:, :, :512, :].transpose(-1, -2).unsqueeze(2)
+    expected = torch.gather(
+        history.expand(1, 2, 4, 128, 512),
+        3,
+        selectors[..., None].expand(1, 2, 4, rows, 512),
+    ).masked_fill(mask, -float("inf"))
+    expected_other = torch.gather(
+        history.expand(1, 2, 4, 128, 512),
+        3,
+        other_selectors[..., None].expand(1, 2, 4, rows, 512),
+    )
+    if later_write:
+        expected_cache.index_copy_(2, indices, keys)
+    for name, size in (
+        ("KV", 2),
+        ("C", 1024),
+        ("S", 512),
+        ("R", rows),
+        ("D", 128),
+        ("G", 4),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    cache_arg = _pnd.name_tensor_dims(cache.to("spyre"), ["KV", "C", "D"])
+    key_arg = _pnd.name_tensor_dims(keys.to("spyre"), ["KV", "R", "D"])
+    query_arg = _pnd.name_tensor_dims((-query).to("spyre"), ["KV", "G", "R", "D"])
+    other_arg = _pnd.name_tensor_dims(other_query.to("spyre"), ["KV", "G", "R", "D"])
+    with config.patch({**_COOPT, "sencores": 32}):
+        result, other, alias = torch.compile(fn, dynamic=False, fullgraph=True)(
+            cache_arg,
+            indices.to("spyre"),
+            key_arg,
+            query_arg,
+            other_arg,
+            mask.to("spyre"),
+        )
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.source_view.num_cores == plan.source_view.split_product == 2
+    assert plan.destination_view.num_cores == 32
+    assert plan.destination_view.split_product == 1
+    assert len(plan.consumer_names) == 2
+    assert plan.source_footprint_bytes == 131072
+    assert plan.destination_footprint_bytes == 262144
+    assert any(
+        len(args) == 2
+        and "lx" not in args[0]
+        and args[1] == {"lx": plan.source_address}
+        for args in restick_allocations
+    ), "the transpose must read HBM cache and write the planned LX source"
+    _assert_cache_update_persistence(
+        list(parsed_specs.values()),
+        cache_writes,
+        plan.source_address,
+        cache.numel(),
+        later_write=later_write,
+    )
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "live K snapshot and its gathered replica overlap"
+    assert torch.equal(result.cpu(), expected)
+    assert torch.equal(other.cpu(), expected_other)
+    assert torch.equal(cache_arg.cpu(), expected_cache)
+    assert torch.equal(alias.cpu(), expected_cache)
+    assert alias.data_ptr() == cache_arg.data_ptr()
+
+
+@pytest.mark.parametrize("rows,inner,strided", [(512, 65, True), (64, 65, True)])
+def test_v_projection_cache_handoff_preserves_persistent_alias(
+    monkeypatch, rows, inner, strided
+):
+    """Relayout the fresh V input while preserving persistent cache writes.
+
+    Include the complete producer, a later reader of its original ownership,
+    and unique reversed non-contiguous cache indices. Untouched rows and the
+    caller's cache alias must retain exactly their original semantics.
+    """
+    import torch_spyre._inductor.codegen.superdsc as sdsc_mod
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    observed = _Observed(monkeypatch, force=False)
+    specs = {}
+    real_parse = sdsc_mod.parse_op_spec
+
+    def capture(spec):
+        specs[id(spec)] = spec
+        return real_parse(spec)
+
+    monkeypatch.setattr(sdsc_mod, "parse_op_spec", capture)
+
+    def fn(t, w, cache, index):
+        with spyre_hint(work_div={"R": 8, "H": 4}):
+            v = torch.nn.functional.linear(t, w)
+        with spyre_hint(work_div={"R": 16} if rows == 512 else {}):
+            values = v.reshape(1, rows, 2, 128).transpose(1, 2)
+            cache.index_copy_(2, index, values)
+        with spyre_hint(work_div={"R": 8, "H": 4}):
+            side = v + 1
+        return cache, side
+
+    storage_width = inner * (2 if strided else 1)
+    host = (
+        (torch.arange(rows * storage_width).reshape(1, rows, storage_width) * 13) % 127
+        - 63
+    ).to(torch.float16)
+    if strided:
+        host = host[:, :, ::2]
+        assert not host.is_contiguous()
+    columns = torch.arange(256) % inner
+    scales = (2 ** ((torch.arange(256) // inner) % 4)).to(torch.float16)
+    weight = torch.zeros(256, inner, dtype=torch.float16)
+    weight[torch.arange(256), columns] = scales
+    v_ref = host[:, :, columns] * scales
+    index = torch.arange(2 * rows - 1, 0, -2, dtype=torch.int64)
+    cache_host = torch.full((1, 2, 1024, 128), -777, dtype=torch.float16)
+    expected = cache_host.clone()
+    expected.index_copy_(2, index, v_ref.reshape(1, rows, 2, 128).transpose(1, 2))
+    # V's cache view splits the flat output into head and 128-wide feature
+    # loops. Unlike RoPE, it never exposes a separate rotation-pair loop.
+    # The producer's H:4 hint still applies to the merged H*D output loop.
+    for name, size in (
+        ("B", 1),
+        ("R", rows),
+        ("K", inner),
+        ("H", 2),
+        ("D", 128),
+    ):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "R", "K"])
+    w = _pnd.name_tensor_dims(weight.to("spyre"), ["H", "D", "K"])
+    # Match the production cache allocator: the indexed position is the first
+    # physical axis. A generic layout inserts an unrelated cache restickify
+    # buffer and no longer exercises the direct external mutation contract.
+    cache_layout = SpyreTensorLayout(
+        device_size=[1024, 2, 2, 1, 64],
+        stride_map=[128, 1024 * 128, 64, 2 * 1024 * 128, 1],
+        device_dtype=get_device_dtype(torch.float16),
+    )
+    cache = cache_host.to("spyre", device_layout=cache_layout)
+    alias = cache
+    with config.patch({**_COOPT, "sencores": 32}):
+        out, side = torch.compile(fn, dynamic=False, fullgraph=True)(
+            x, w, cache, index.to("spyre")
+        )
+
+    assert torch.equal(alias.cpu(), expected), "persistent cache alias lost its update"
+    assert torch.equal(out.cpu(), expected)
+    assert torch.equal(side.cpu(), v_ref + 1), "cache write changed a live projection"
+    projections = [s for s in specs.values() if s.op == "batchmatmul"]
+    assert len(projections) == 1
+    projection = projections[0]
+    projected = projection.args[-1]
+    # Match the actual indirect cache store, not another identity/host copy.
+    updates = [
+        s
+        for s in specs.values()
+        if s.op == "identity"
+        and any("IndirectAccess" in str(c) for c in s.args[-1].device_coordinates)
+    ]
+    assert len(updates) == 1
+    update = updates[0]
+    if rows == 64:
+        observed.assert_emitted_in_lx(expected_plans=0)
+        assert set(projected.allocation) == {"hbm_pool"}
+        assert set(update.args[-1].allocation) == {"hbm"}
+        assert any(
+            arg.allocation == projected.allocation for arg in update.args[:-1]
+        ), "the short scatter must read the original HBM projection"
+        assert (
+            math.prod(int(split) for _, split in update.iteration_space.values())
+            <= rows // 32
+        ), "index sticks do not permit a larger scatter division"
+        assert all("lx" not in arg.allocation for arg in update.args)
+        return
+    observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.source_view.num_cores == 32
+    assert plan.destination_view.num_cores == 16
+    assert len(plan.consumer_names) == 1, (
+        "later original reader was unnecessarily rewritten"
+    )
+    assert set(projected.allocation) == {"lx"}, "V projection still stages in HBM"
+    assert set(update.args[-1].allocation) == {"hbm"}, "cache persistence was removed"
+    values = [a for a in update.args[:-1] if set(a.allocation) == {"lx"}]
+    assert len(values) == 1, "cache update did not read the LX projection copy"
+    assert values[0].allocation["lx"] == plan.destination_address
+    assert projected.allocation["lx"] == plan.source_address
+    assert sorted(
+        int(split) for _, split in projection.iteration_space.values() if int(split) > 1
+    ) == [4, 8]
+    assert [
+        int(split) for _, split in update.iteration_space.values() if int(split) > 1
+    ] == [16]
+
+
+def test_prefix_linear_reads_a_separate_full_backing_lx_gather(monkeypatch):
+    """A 3200-wide linear reads a gathered 3328-wide physical allocation."""
+    _run_prefix_linear_case(monkeypatch, mode="served")
+
+
+def test_prefix_linear_without_served_copy_spills_the_source(monkeypatch):
+    """Removing this edge's candidates must remove its route to LX residency."""
+    _run_prefix_linear_case(monkeypatch, mode="no_copy")
+
+
+def test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone(monkeypatch):
+    """Amended D6-2: retry through the ordinary HBM clone, not topology rollback."""
+    _run_prefix_linear_case(monkeypatch, mode="demoted")
+
+
+def _run_prefix_linear_case(monkeypatch, *, mode):
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    import torch_spyre._inductor.scheduler as sched_mod
+    import torch_spyre._inductor.passes as passes_mod
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.pass_utils import op_read_writes
+    from torch_spyre._inductor.scratchpad.utils import storage_has_single_writer
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        prefix_lx_contraction_axis,
+        materialized_lx_relayouts,
+    )
+
+    observed = _Observed(monkeypatch, force=False)
+    prefix_sources, removed_candidates, source_residency = set(), [], []
+    real_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+
+    def tables(
+        allocator,
+        graph,
+        consumer,
+        consumer_divs,
+        parents,
+        divisions,
+        op_by_name,
+        *args,
+        **kwargs,
+    ):
+        result = real_tables(
+            allocator,
+            graph,
+            consumer,
+            consumer_divs,
+            parents,
+            divisions,
+            op_by_name,
+            *args,
+            **kwargs,
+        )
+        for parent in parents:
+            if parent not in op_by_name or consumer is None:
+                continue
+            if prefix_lx_contraction_axis(op_by_name[parent], consumer) is None:
+                continue
+            prefix_sources.add(parent)
+            if mode == "no_copy":
+                # cap=0 means unlimited. Remove only the actual prefix edge's
+                # candidates, leaving all unrelated allocator choices intact.
+                removed_candidates.extend(result.pop(parent, []))
+        return result
+
+    real_post_solve = alloc_mod.CoOptimizingAllocator._post_solve
+
+    def post_solve(allocator, graph, allocation, plans):
+        source_residency.extend(
+            (buffer.name, buffer.address)
+            for buffer in allocation
+            if buffer.name in prefix_sources
+        )
+        return real_post_solve(allocator, graph, allocation, plans)
+
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", tables)
+    monkeypatch.setattr(alloc_mod.CoOptimizingAllocator, "_post_solve", post_solve)
+
+    rejected, restored, final_kernels = [], [], []
+    if mode == "demoted":
+        real_prepare = sched_mod.SuperDSCScheduling.prepare_kernel
+        real_prepare_all = sched_mod.prepare_spyre_kernels
+
+        def layout_facts(layout):
+            return (
+                tuple(layout.size),
+                tuple(layout.stride),
+                tuple(layout.device_layout.device_size),
+                tuple(layout.device_layout.stride_map),
+            )
+
+        def prepare(backend, bundle, kernel):
+            graph = V.graph
+            if rejected:
+                plan, copy_name, copy_buffer, original_facts, unrelated, _ = rejected[0]
+                assert all(
+                    edge[0] != plan.source_name
+                    for edge in materialized_lx_relayouts(graph)
+                )
+                source_layout = graph.get_buffer(plan.source_name).get_layout()
+                copy_layout = copy_buffer.get_layout()
+                for layout in (source_layout, copy_layout):
+                    assert "lx" not in layout.allocation
+                    assert layout.lx_view is None
+                assert graph.get_buffer(copy_name) is copy_buffer
+                assert copy_buffer in graph.operations
+                assert layout_facts(copy_layout) == original_facts
+                assert storage_has_single_writer(graph, copy_buffer)
+                for name in plan.consumer_names:
+                    reads = {
+                        dep.name for dep in op_read_writes(graph.get_buffer(name)).reads
+                    }
+                    assert copy_name in reads and plan.source_name not in reads
+                assert plan.source_name in {
+                    dep.name for dep in op_read_writes(copy_buffer).reads
+                }
+                for name, allocation, view in unrelated:
+                    layout = graph.get_buffer(name).get_layout()
+                    assert layout.allocation == allocation and layout.lx_view == view
+                restored.append(copy_name)
+            else:
+                for copy_name, plan in materialized_lx_relayouts(graph).values():
+                    if plan.source_name not in prefix_sources:
+                        continue
+                    for node in sched_mod._all_scheduler_nodes([bundle]):
+                        if not any(
+                            dep.name == copy_name for dep in node.read_writes.writes
+                        ):
+                            continue
+                        copy_buffer = graph.get_buffer(copy_name)
+                        assert storage_has_single_writer(graph, copy_buffer)
+                        unrelated = []
+                        for op in graph.operations:
+                            name = op.get_name()
+                            layout = op.get_layout()
+                            if (
+                                name not in (plan.source_name, copy_name)
+                                and hasattr(layout, "allocation")
+                                and "lx" in layout.allocation
+                            ):
+                                unrelated.append(
+                                    (name, dict(layout.allocation), layout.lx_view)
+                                )
+                        rejected.append(
+                            (
+                                plan,
+                                copy_name,
+                                copy_buffer,
+                                layout_facts(copy_buffer.get_layout()),
+                                unrelated,
+                                kernel,
+                            )
+                        )
+                        kernel.failed_node = node
+                        raise ValueError("prefix gather test: reject LX finalization")
+            result = real_prepare(backend, bundle, kernel)
+            if rejected:
+                plan, copy_name, _, _, _, _ = rejected[0]
+                for name, arg in kernel.spyre_kernel_args:
+                    if name in (plan.source_name, copy_name):
+                        assert "lx" not in arg.allocation
+                        assert arg.work_division is None
+            return result
+
+        def prepare_all(nodes):
+            result = real_prepare_all(nodes)
+            if rejected:
+                failed_kernel = rejected[0][-1]
+                for node in result:
+                    prepared = getattr(node, "prepared_kernel", None)
+                    if prepared is not None:
+                        assert prepared is not failed_kernel
+                        final_kernels.append(prepared)
+            return result
+
+        monkeypatch.setattr(sched_mod.SuperDSCScheduling, "prepare_kernel", prepare)
+        monkeypatch.setattr(sched_mod, "prepare_spyre_kernels", prepare_all)
+        monkeypatch.setattr(passes_mod, "prepare_spyre_kernels", prepare_all)
+
+    rows, physical, logical, outputs = 512, 3328, 3200, 512
+
+    def fn(value, weight):
+        with spyre_hint(work_div={"M": 8, "P": 4}):
+            backing = torch.neg(value)
+        with spyre_hint(work_div={"M": 4, "N": 8}):
+            return torch.nn.functional.linear(backing[:, :logical], weight)
+
+    for name, size in (("M", rows), ("P", physical), ("K", logical), ("N", outputs)):
+        _pnd.declare_tensor_dim(name, size)
+    selected = (torch.arange(outputs) * 37) % logical
+    selected[-1] = logical - 1
+    weight = torch.zeros(outputs, logical, dtype=torch.float16)
+    weight[torch.arange(outputs), selected] = 1
+    device_weight = _pnd.name_tensor_dims(weight.to("spyre"), ["N", "K"])
+    eps = get_elem_in_stick(torch.float16)
+    assert eps == 64
+    layout = SpyreTensorLayout(
+        device_size=[physical // eps, rows, eps],
+        stride_map=[eps, physical, 1],
+        device_dtype=get_device_dtype(torch.float16),
+    )
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+    options = {**_COOPT, "sencores": 32, "lx_same_tile_group_relayout": False}
+    if mode == "no_copy":
+        options["lx_solver_relayout_groups_per_edge"] = 0
+    with config.patch(options):
+        for tail in (512.0, float("nan")):
+            # One selected element per output makes the reduction exact. Every
+            # row differs; a compacted stride or a read into the tail is visible.
+            host = (
+                (torch.arange(rows * physical).reshape(rows, physical) * 17) % 251 - 125
+            ).to(torch.float16)
+            host[:, logical:] = tail
+            value = _pnd.name_tensor_dims(
+                host.to("spyre", device_layout=layout), ["M", "P"]
+            )
+            out = compiled(value, device_weight).cpu()
+            expected = -host[:, selected]
+            control = torch.nn.functional.linear(
+                -host[:, :logical].float(), weight.float()
+            )
+            assert torch.equal(control, expected.float())
+            assert torch.isfinite(out).all()
+            assert torch.equal(out, expected)
+
+    assert prefix_sources and source_residency, (
+        "the fixture did not reach the prefix edge"
+    )
+    if mode == "no_copy":
+        assert removed_candidates, "the negative arm removed no prefix candidates"
+        assert all(address is None for _, address in source_residency), (
+            f"a prefix producer resided without a served gather: {source_residency}"
+        )
+        observed.assert_nothing_emitted()
+        return
+    if mode == "demoted":
+        assert rejected and restored and final_kernels
+        assert observed.demotions and not observed.emitted and not observed.emitted_ops
+    else:
+        observed.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = observed.plans
+    assert plan.num_cores == plan.destination_view.num_cores == 32
+    assert observed.source_layouts[plan.edge] == (
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+        [physical, 1],
+    )
+    assert observed.copy_layouts[plan.edge] == (
+        [rows, physical],
+        [physical, 1],
+        [physical // eps, rows, eps],
+        [eps, physical, 1],
+    )
+    assert dict(plan.source_view.work_slice_dims) == {0: 4, 1: 8}
+    destination = dict(plan.destination_view.work_slice_dims)
+    assert destination.get(0, 1) == 1, "the linear reader must not split K"
+    assert destination.get(1, 1) == 4
+    assert plan.source_footprint_bytes == rows * physical * 2 // 32
+    assert plan.destination_footprint_bytes == rows * physical * 2 // 4
+    assert (
+        plan.source_address + plan.source_footprint_bytes <= plan.destination_address
+        or plan.destination_address + plan.destination_footprint_bytes
+        <= plan.source_address
+    ), "the full-backing gather must have separate LX storage"
