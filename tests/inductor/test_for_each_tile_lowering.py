@@ -176,6 +176,82 @@ class TestCarryBindingsFor(unittest.TestCase):
         self.assertEqual(bindings, [])
 
 
+class TestDelinearizeIndex(unittest.TestCase):
+    """_delinearize_index: recovering per-dim coordinates from a flat index.
+
+    Regression coverage for issue #5311: a dim whose own coordinate is a
+    compile-time literal (an unrolled ``t[j]`` select) used to always
+    recover coordinate 0 for ``j >= 2``, aliasing every such read onto
+    whatever consumed coordinate 0 instead of raising or reading the right
+    data.
+    """
+
+    def _delinearize(self, index, size, stride, offset):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _delinearize_index,
+        )
+
+        return _delinearize_index(index, size, stride, offset)
+
+    def test_recovers_symbolic_coordinate_per_dim(self):
+        import sympy
+
+        i0, i1 = sympy.symbols("i0 i1")
+        coords = self._delinearize(i0 * 8 + i1, size=[4, 8], stride=[8, 1], offset=0)
+        self.assertEqual(coords, [i0, i1])
+
+    def test_recovers_literal_coordinate_for_every_value_in_range(self):
+        """Core #5311 repro: an all-literal index for j in 0..3, not just j < 2."""
+        import sympy
+
+        for j in range(4):
+            index = sympy.Integer(1 * 4 + j)
+            coords = self._delinearize(index, size=[2, 4], stride=[4, 1], offset=0)
+            self.assertEqual(coords, [sympy.Integer(1), sympy.Integer(j)])
+
+    def test_mixed_symbolic_and_literal_dims(self):
+        import sympy
+
+        i0 = sympy.Symbol("i0")
+        index = i0 * 12 + 2 * 4 + 3 * 1
+        coords = self._delinearize(index, size=[2, 3, 4], stride=[12, 4, 1], offset=0)
+        self.assertEqual(coords, [i0, sympy.Integer(2), sympy.Integer(3)])
+
+    def test_broadcast_dim_with_zero_stride_is_always_zero(self):
+        import sympy
+
+        i1 = sympy.Symbol("i1")
+        coords = self._delinearize(i1, size=[4, 5], stride=[0, 1], offset=0)
+        self.assertEqual(coords, [sympy.Integer(0), i1])
+
+    def test_offset_is_subtracted_before_delinearizing(self):
+        import sympy
+
+        index = sympy.Integer(10 + 1 * 2 + 1)
+        coords = self._delinearize(index, size=[2, 2], stride=[2, 1], offset=10)
+        self.assertEqual(coords, [sympy.Integer(1), sympy.Integer(1)])
+
+    def test_collision_on_shared_nonzero_stride_raises(self):
+        import sympy
+
+        i0 = sympy.Symbol("i0")
+        with self.assertRaises(AssertionError):
+            self._delinearize(i0 * 4, size=[4, 4], stride=[4, 4], offset=0)
+
+    def test_out_of_range_literal_digit_raises(self):
+        import sympy
+
+        with self.assertRaises(AssertionError):
+            self._delinearize(sympy.Integer(5), size=[3], stride=[1], offset=0)
+
+    def test_leftover_constant_residual_raises(self):
+        import sympy
+
+        # 7 does not decompose evenly across a single size-2, stride-4 dim.
+        with self.assertRaises(AssertionError):
+            self._delinearize(sympy.Integer(7), size=[2], stride=[4], offset=0)
+
+
 class TestIndirectIndexStepGuard(unittest.TestCase):
     """_check_indirect_index_step refuses a sub-stick per-trip index advance."""
 
