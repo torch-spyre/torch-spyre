@@ -885,6 +885,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             self.indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
+            host_layout=tensor.layout,
         )
         work_division = work_division_from_view(
             tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
