@@ -668,6 +668,8 @@ class TestAllReduceCompiled(TestCase):
     def test_allreduce_compiled_row_parallel_linear(self, dtype):
         from unittest.mock import patch
 
+        from torch._inductor import config as inductor_config
+
         from torch_spyre._inductor import lowering as spyre_lowering
 
         def fn(x, weight):
@@ -686,10 +688,16 @@ class TestAllReduceCompiled(TestCase):
 
         x = torch.full((4, 64), self.comm_rank + 1, dtype=dtype).to(DEVICE)
         weight = torch.full((96, 64), 1.0 / 64, dtype=dtype).to(DEVICE)
-        with patch.object(
-            spyre_lowering,
-            "_realize_collective_input",
-            side_effect=require_direct_input,
+        # Lowering is skipped on an FX graph cache hit, so the patched hook
+        # would never run. Disable the cache so the graph is lowered here.
+        torch._dynamo.reset()
+        with (
+            inductor_config.patch(fx_graph_cache=False),
+            patch.object(
+                spyre_lowering,
+                "_realize_collective_input",
+                side_effect=require_direct_input,
+            ),
         ):
             result = torch.compile(fn, fullgraph=True)(x, weight)
         self.assertTrue(direct_inputs)
