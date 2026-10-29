@@ -90,9 +90,7 @@ class CandidateDivisionTest(TestCase):
                 "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
                 return_value={m: 32, n: 128, k: 64},
             ),
-            patch(
-                "torch_spyre._inductor.dump_cost_model.extract_op_features"
-            ) as extract,
+            patch("torch_spyre._inductor.cost_features.extract_op_features") as extract,
             patch("torch_spyre._inductor.cost_model.predict_ops", return_value=1.0),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
@@ -222,7 +220,7 @@ class SymbolicTiledFeatureTest(TestCase):
     """
 
     #: One residency symbol PER BUFFER NAME, matching ``LifetimeBoundBuffer.sym_is_lx``
-    #: (plan_solver.py) and how ``dump_cost_model.extract_op_features`` looks each arg's
+    #: (plan_solver.py) and how ``cost_features.extract_op_features`` looks each arg's
     #: own buffer name up in the co-optimizer's buffer map --
     #: two different buffers get two DIFFERENT symbols, not one shared symbol.
     @staticmethod
@@ -462,7 +460,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
     """A matmul whose CORE SPLITS -- not just ``is_lx`` -- are undecided symbols.
 
     ``CoOptimizingAllocator._extract_op_features`` builds the work slices from
-    ``plan_solver.sym_core_divs``, so ``dump_cost_model._matmul_features`` sees one
+    ``plan_solver.sym_core_divs``, so ``cost_features._matmul_features`` sees one
     ``sympy.Symbol`` per split and a matmul reaches ``predict_ops`` with symbolic
     ``m``/``n``/``k``, symbolic ``cores`` and a symbolic ``matmul_rows_per_core``.
     That is a DIFFERENT shape from ``SymbolicTiledFeatureTest``, which symbolises
@@ -554,19 +552,19 @@ class SymbolicMatmulSplitCostTest(TestCase):
         )
 
     def test_the_extractor_max_is_symbolic_aware(self):
-        """``dump_cost_model`` SHADOWS the builtin ``max`` with the sympy-aware one.
+        """``cost_features`` SHADOWS the builtin ``max`` with the sympy-aware one.
 
         ``_matmul_features`` reduces the splits with ``max(1, readable.get(...))``.
         With ``builtins.max`` that raises ``cannot determine truth value of
         Relational``, its best-effort ``except Exception`` zeroes
         ``matmul_a_bytes``/``matmul_b_bytes``, and every matmul bundle then loses the
         graph's whole cost objective (see the counterfactual below). The import at
-        the top of ``dump_cost_model`` is the only thing preventing that, so pin it.
+        the top of ``cost_features`` is the only thing preventing that, so pin it.
         """
-        from torch_spyre._inductor import dump_cost_model
+        from torch_spyre._inductor import cost_features
 
-        self.assertEqual(dump_cost_model.max(1, self.M_SPLIT), self.M_SPLIT)
-        self.assertEqual(dump_cost_model.max(1, 3), 3)
+        self.assertEqual(cost_features.max(1, self.M_SPLIT), self.M_SPLIT)
+        self.assertEqual(cost_features.max(1, 3), 3)
 
     def test_symbolic_splits_still_resolve_the_matmul_axes(self):
         """``M``/``N``/``K``/``B`` come back CONCRETE; only the splits stay symbolic.

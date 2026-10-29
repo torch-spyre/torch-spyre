@@ -59,6 +59,7 @@
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "spyre_views.h"
@@ -230,6 +231,14 @@ PYBIND11_MODULE(_C, m) {
       }
       at::Generator getNewGenerator(c10::DeviceIndex device) const override {
         return spyre::detail::createSpyreGenerator(device);
+      }
+      at::Allocator* getPinnedMemoryAllocator() const override {
+        return spyre::GetSpyrePinnedAllocator();
+      }
+      bool isPinnedPtr(const void* data) const override {
+        auto* allocator = static_cast<spyre::SpyrePinnedAllocator*>(
+            spyre::GetSpyrePinnedAllocator());
+        return allocator->isPinnedPtr(data);
       }
     };
     static auto* hooks = new SpyreHooksInterface();
@@ -470,9 +479,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device") = -1);
 
   // Memory copy function
+  // Lets go of the GIL while it runs, so other Python threads (for example
+  // the threaded weight upload in model_utils) can run at the same time. Most
+  // of the time goes to turning the host data into the device format.
+  // spyre_copy_from does not use any Python object.
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false);
+        py::arg("dst"), py::arg("non_blocking") = false,
+        py::call_guard<py::gil_scoped_release>());
 
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,

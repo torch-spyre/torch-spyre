@@ -136,6 +136,14 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
+# Enable optional ownership proofs added after prefix relayout support.
+# Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
+lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # How many destination views the CP-SAT relayout enumeration keeps per
 # (source, consumer) edge, cheapest first: a consumer with many equal-core
 # divisions induces one distinct destination partition (one relayout copy the
@@ -438,6 +446,12 @@ lx_same_tile_group_relayout: bool = (
     os.environ.get("SPYRE_LX_SAME_TILE_GROUP_RELAYOUT", "0") == "1"
 )
 
+# Allow post-solve matmul output staging before an all-reduce's HBM copy.
+# Set SPYRE_LX_COLLECTIVE_OUTPUT_STAGING=0 to disable this step alone.
+lx_collective_output_staging: bool = (
+    os.environ.get("SPYRE_LX_COLLECTIVE_OUTPUT_STAGING", "1") == "1"
+)
+
 # Settings left out of the Inductor FX graph cache key. This module is the Spyre
 # backend's ``device_custom_config``, so ``save_config_portable`` puts every
 # other setting's value in the key. A setting belongs here when it describes the
@@ -447,6 +461,16 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
+    # Where logs go and whether kernels are kept on disk: these do not change
+    # the compiled code (spyre_kernel_cache only picks between the kernel disk
+    # cache and a fresh backend compile). Without them, a run that only writes
+    # its timing log to a new file cannot reuse any cached graph and compiles
+    # everything again. These are prefixes: "timing" covers both timing and
+    # timing_out. A test in test_solver_relayout_decision.py pins what each
+    # prefix matches.
+    "timing",
+    "dump_cost_expr_file",
+    "spyre_kernel_cache",
 ]
 
 install_config_module(sys.modules[__name__])

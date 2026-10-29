@@ -14,7 +14,10 @@
 
 # Owner(s): ["module: spyre"]
 
+import os
+import threading
 import unittest
+import warnings
 from unittest import mock
 
 import torch
@@ -367,6 +370,168 @@ class TestLoadModelToSpyre(TestCase):
         ptr = model.weight.data_ptr()
         load_model_to_spyre(model)
         self.assertEqual(model.weight.data_ptr(), ptr)
+
+    # ── upload from several threads ────────────────────────────────
+
+    def test_upload_thread_count(self):
+        """The default is min(8, torch's threads); any count is kept in 1..16,
+        below the 32 pool streams the threads take one each."""
+        from torch_spyre.model_utils import _upload_thread_count
+
+        for torch_threads, expected in ((3, 3), (64, 8)):
+            with mock.patch("torch.get_num_threads", return_value=torch_threads):
+                self.assertEqual(_upload_thread_count(None), expected)
+        self.assertEqual(_upload_thread_count(3), 3)
+        self.assertEqual(_upload_thread_count(0), 1)
+        self.assertEqual(_upload_thread_count(64), 16)
+
+    def test_aliased_submodule_is_listed_once(self):
+        """A module reachable by two paths, like ``torch.compile``'s
+        ``_orig_mod``, is uploaded once."""
+        from torch_spyre.model_utils import _transfer_module
+
+        backbone = nn.Module()
+        backbone.big = nn.Linear(8, 8)
+        backbone.norm = nn.LayerNorm(8)
+        model = nn.Module()
+        model.backbone = backbone
+        model.shared_big = backbone.big
+        model.compiled_norm = nn.Module()
+        model.compiled_norm._orig_mod = backbone.norm
+        uploads = []
+        _transfer_module(model, None, uploads)
+        listed = [(id(u.module), u.name) for u in uploads]
+        self.assertEqual(len(listed), 4)  # weight and bias of each
+        self.assertEqual(len(set(listed)), 4)
+
+    def test_modules_that_compare_equal_are_both_listed(self):
+        """The visited set uses identity: two modules under different parents
+        whose class overrides ``__eq__`` and ``__hash__`` are both uploaded, as
+        ``nn.Module.to`` moves both. (Equal siblings are one child to
+        ``named_children``, and so to ``nn.Module.to`` as well.)"""
+        from torch_spyre.model_utils import _transfer_module
+
+        class SameLinear(nn.Linear):
+            def __eq__(self, other):
+                return isinstance(other, SameLinear)
+
+            def __hash__(self):
+                return 0
+
+        model = nn.Module()
+        model.first = nn.Module()
+        model.first.proj = SameLinear(8, 8)
+        model.second = nn.Module()
+        model.second.proj = SameLinear(8, 8)
+        uploads = []
+        _transfer_module(model, None, uploads)
+        self.assertEqual(len(uploads), 4)  # weight and bias of each
+
+    def test_embedding_fallback_warning_points_at_the_caller(self):
+        """However deep the embedding is, the warning names the caller's file,
+        not a frame inside the recursive walk."""
+        from torch_spyre.model_utils import _transfer_module
+
+        table = nn.Embedding(1000, 100, dtype=torch.float16)  # 100 % 64 != 0
+        model = nn.Sequential(nn.Sequential(table))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _transfer_module(model, None, [])
+        self.assertEqual(
+            [os.path.basename(w.filename) for w in caught],
+            [os.path.basename(__file__)],
+        )
+
+    def test_embedding_fallback_warns_while_walking(self):
+        """The fallback warning comes from the caller's thread, before any
+        upload runs, so ``assertWarns`` around a threaded load is reliable."""
+        from torch_spyre.model_utils import _transfer_module
+
+        model = nn.Embedding(1000, 100, dtype=torch.float16)  # 100 % 64 != 0
+        uploads = []
+        with self.assertWarns(UserWarning):
+            _transfer_module(model, None, uploads)
+        self.assertEqual(len(uploads), 1)
+
+    def test_results_are_put_in_as_uploads_finish(self):
+        """Each result goes into its module on the caller's thread, the list of
+        uploads is emptied, and a failed upload is raised."""
+        from torch_spyre import model_utils
+
+        modules = [nn.Linear(4, 4, bias=False) for _ in range(6)]
+        caller = threading.get_ident()
+        put_on = []
+        real_put = model_utils._put_upload
+
+        def put(*args):
+            put_on.append(threading.get_ident())
+            real_put(*args)
+
+        def uploads_for(fail_at=None):
+            out = []
+            for i, m in enumerate(modules):
+
+                def run(i=i, m=m):
+                    if i == fail_at:
+                        raise RuntimeError("upload failed")
+                    return m.weight.data + 1, "linear"
+
+                out.append(model_utils._Upload(m, "weight", True, run))
+            return out
+
+        with (
+            mock.patch.object(model_utils, "_start_upload_thread"),
+            mock.patch.object(model_utils, "current_device", return_value=0),
+            mock.patch.object(model_utils, "_put_upload", side_effect=put),
+        ):
+            uploads = uploads_for()
+            counts = {"linear": 0}
+            before = [m.weight for m in modules]
+            model_utils._run_uploads(uploads, counts, 4)
+            self.assertEqual(uploads, [])
+            self.assertEqual(counts["linear"], 6)
+            self.assertEqual(set(put_on), {caller})
+            for m, old in zip(modules, before):
+                self.assertIsNot(m.weight, old)
+                torch.testing.assert_close(m.weight.data, old.data + 1)
+
+            with self.assertRaisesRegex(RuntimeError, "upload failed"):
+                model_utils._run_uploads(uploads_for(fail_at=3), {"linear": 0}, 4)
+
+    @requires_spyre
+    def test_threaded_upload_matches_serial_upload(self):
+        """Uploading from 8 threads gives the same device layout and the same
+        bytes (copied back to the host) as uploading from 1 thread."""
+        import copy
+
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        layers = [nn.Linear(256, 128, dtype=torch.float16) for _ in range(6)]
+        model = nn.Sequential(
+            nn.Embedding(1000, 256, dtype=torch.float16),
+            *layers,
+            nn.LayerNorm(128, dtype=torch.float16),
+        )
+        model.register_buffer("scale", torch.randn(64, dtype=torch.float16))
+        serial = copy.deepcopy(model)
+        threaded = copy.deepcopy(model)
+
+        load_model_to_spyre(serial, num_threads=1)
+        load_model_to_spyre(threaded, num_threads=8)
+
+        a = dict(serial.state_dict())
+        b = dict(threaded.state_dict())
+        self.assertEqual(a.keys(), b.keys())
+        for name in a:
+            self.assertEqual(b[name].device.type, "spyre", name)
+            self.assertEqual(
+                get_spyre_tensor_layout(a[name]),
+                get_spyre_tensor_layout(b[name]),
+                name,
+            )
+            host_a = a[name].cpu().view(torch.int16)
+            host_b = b[name].cpu().view(torch.int16)
+            self.assertTrue(torch.equal(host_a, host_b), name)
 
     # ── nn.Module.to() patch ───────────────────────────────────────
 
