@@ -308,7 +308,7 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       return "aiuInitializeP2P";
 
-    // Scheduler submit/barrier CBIDS (102-106)
+    // Scheduler submit/barrier CBIDS (102-107)
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
       return "aiuSubmitDMA";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
@@ -319,6 +319,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueBarrier";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_NULL_OP:
       return "aiuSubmitNullOp";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_SIGNAL:
+      return "aiuSubmitP2PFirmwareSignal";
     default:
       break;
   }
@@ -500,6 +502,10 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
 
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       runtime_activity->addMetadata("world_size", activity->data);
+      break;
+
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_P2P_FIRMWARE_SIGNAL:
+      runtime_activity->addMetadata("is_ack", activity->data);
       break;
 
     default:
