@@ -1841,7 +1841,8 @@ def _restickify_restore_elided_dim(op_spec) -> None:
     The two operands are rebuilt to share ``new_sym`` (64 = fp16 stick elements):
 
     - ELIDED operand: its stick is rebuilt as
-      ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
+      ``[floor(new_sym/64) + k] + real_dims + [Mod(new_sym, 64)]``, where ``k``
+      is the stick-tile index of an access past the first stick (0 otherwise).
     - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim the
       padding pass (``_pad_elided_dim``) prepended to cover the 64-plane sweep
       (see the reuse site below).  ``new_sym`` has iteration RANGE 1, so it only
@@ -1869,19 +1870,34 @@ def _restickify_restore_elided_dim(op_spec) -> None:
 
     def _restore(new_sym, elided_arg, intact_arg) -> None:
         # Rebuild the elided stick as [floor(new_sym/64)] + reals + [Mod(new_sym, 64)].
+        # A constant outer coordinate is dropped as a size-1 placeholder unless it
+        # is nonzero: then it is the stick-tile index an access past the first
+        # stick starts at (x[..., 64:65] reads tile 1), and it stays as the
+        # leading coordinate's offset over that dim's full size.
         elided_coords = list(elided_arg.device_coordinates)
         elided_size = list(elided_arg.device_size)
         real_coords, real_sizes = [], []
+        stick_tiles = []
         for i in range(len(elided_coords) - 1):  # exclude within-stick
             if elided_coords[i].free_symbols:
                 real_coords.append(elided_coords[i])
                 real_sizes.append(elided_size[i])
+            elif elided_coords[i] != 0:
+                stick_tiles.append((elided_coords[i], elided_size[i]))
+        if len(stick_tiles) > 1:
+            # TODO: several nonzero constant outer coordinates (an offset on more
+            # than one dim) have no single dim to carry them.
+            raise Unsupported(
+                f"restickify restore: several constant offsets {stick_tiles} on an "
+                "elided operand"
+            )
+        tile_offset, tile_size = stick_tiles[0] if stick_tiles else (0, 1)
         new_elided_coords = (
-            [sympy.floor(new_sym / stick_size)]
+            [sympy.floor(new_sym / stick_size) + tile_offset]
             + real_coords
             + [sympy.Mod(new_sym, stick_size)]
         )
-        new_elided_size = [1] + real_sizes + [stick_size]
+        new_elided_size = [tile_size] + real_sizes + [stick_size]
 
         # Bind new_sym to the size-64 dim _pad_elided_dim prepended, so the
         # descriptor's total size matches the grown allocation. The grow always
