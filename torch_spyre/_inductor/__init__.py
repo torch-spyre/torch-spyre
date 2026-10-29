@@ -78,6 +78,21 @@ def enable_spyre_compile_fx_wrapper():
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
+    import torch._inductor.graph as graph_mod
+
+    if not getattr(graph_mod.GraphLowering, "_spyre_dump_wrapped", False):
+        _orig_compile_to_module_lines = graph_mod.GraphLowering._compile_to_module_lines
+
+        def _debug_compile_to_module_lines(self, code):
+            try:
+                with open("/tmp/last_inductor_wrapper.py", "w") as f:
+                    f.write(code)
+            except Exception:
+                pass
+            return _orig_compile_to_module_lines(self, code)
+
+        graph_mod.GraphLowering._compile_to_module_lines = _debug_compile_to_module_lines
+        graph_mod.GraphLowering._spyre_dump_wrapped = True
 
     if getattr(cfx, "_spyre_wrapped", False):
         return
