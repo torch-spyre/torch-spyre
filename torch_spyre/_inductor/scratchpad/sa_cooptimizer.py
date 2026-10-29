@@ -2536,6 +2536,27 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 charges.get((lo, hi), 0),
             )
 
+    def _log_coupling_drops(self, addresses: list[Optional[int]]) -> None:
+        """Log the buffers the packer placed but the committed plan drops for
+        the relayout coupling (:meth:`_resident_indices`), with the LX they held.
+
+        The coupling is enforced after packing, so a dropped buffer's range
+        still pushed others out while the packer ran. No final plan of the
+        measured attention graphs drops anything, so this is the signal to look
+        for before teaching the packer the coupling."""
+        if not self._relayout_on:
+            return
+        dropped = sorted(
+            i for i in self.packer.allocated_indices() if addresses[i] is None
+        )
+        if dropped:
+            logger.debug(
+                "relayout coupling dropped %d placed buffer(s), %d B of LX: %s",
+                len(dropped),
+                sum(self._per_core_size(i, self.chosen[i]) for i in dropped),
+                ", ".join(self._bufs[i].name for i in dropped),
+            )
+
     def _write_back(self) -> None:
         """Commit the best state to the buffers and record spill causes.
 
@@ -2554,6 +2575,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         commit path to materialize.
         """
         addresses = self._resident_addresses()
+        self._log_coupling_drops(addresses)
         for i, b in enumerate(self._bufs):
             addr = addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])

@@ -37,6 +37,7 @@ carry one 4-way division; ``cd_parent_matches`` is EMPTY on the edge, so
 residency for P is possible only through the relayout copy.
 """
 
+import logging
 import random
 from dataclasses import replace
 from types import SimpleNamespace
@@ -56,6 +57,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 )
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import logger as sa_logger
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
     FiredRelayoutGroup,
@@ -925,6 +927,19 @@ def test_annealer_drops_a_placed_source_whose_copy_did_not_fit():
     solver._write_back()
     assert solver._bufs[p].address is None
     assert solver._bufs[_index(solver, "C")].chosen_relayouts == {}
+
+
+def test_annealer_logs_what_the_coupling_dropped(caplog):
+    """A buffer the packer placed but the plan drops held LX the packer gave
+    no one else: the write-back says so at debug level, the signal to look for
+    before teaching the packer the coupling."""
+    solver = _primed_annealer(_pc(5000.0), size=16)
+    p, copy = _index(solver, "P"), _index(solver, relayout_copy_name("P", 0))
+    solver._toggle_relayout(copy)
+    solver.packer.rotate(list(solver.packer.permutation).index(p), 0)
+    with caplog.at_level(logging.DEBUG, logger=sa_logger.name):
+        solver._write_back()
+    assert "relayout coupling dropped 1 placed buffer(s), 16 B of LX: P" in caplog.text
 
 
 def test_annealer_drops_a_placed_copy_whose_source_did_not_fit():

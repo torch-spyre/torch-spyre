@@ -163,6 +163,9 @@ A copy is eligible only while some consumer it can serve does not match its sour
 The half that depends on placement is the packer's outcome: under capacity pressure it can place a source and spill the copy a consumer must read it through, or the reverse.
 `_resident_addresses` enforces it after packing by removing, never adding: a placed source a consumer cannot read is dropped, then every copy whose source is not resident.
 That is already a fixpoint, since dropping a source orphans only its own copies.
+A dropped buffer's range still pushed others out while the packer ran, which teaching the packer the coupling would avoid.
+It has not been needed: on the decode (ctx 512 and 2048) and prefill (128 and 512) attention graphs no final plan drops anything, and only the search's intermediate states do (21% of them on prefill 512), which the score prices.
+The write-back logs any drop at debug level (`_log_coupling_drops`), the signal to look for before changing the packer.
 The score, the dump and the write-back all read that resident set, and the write-back records each relayout read in `chosen_relayouts`, as CP-SAT does.
 
 Residency cannot decide a shuffle on its own.
