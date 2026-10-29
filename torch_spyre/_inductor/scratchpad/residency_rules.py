@@ -37,6 +37,7 @@ class ResidencyChecks(Protocol):
     def loop_carry(self) -> bool: ...
     def drain(self) -> bool: ...
     def prefix_gather(self) -> bool: ...
+    def local_subrange(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,7 @@ BUFFER_RESIDENCY_RULES = (
             "solver checks each candidate division, so the committed-division "
             "barrier can reject a valid candidate (#4655)."
         ),
-        ("TestRestickifyBarrierDeferredOnJointPath",),
+        ("test_buffer_residency_adapter_rejection_strings",),
     ),
     ResidencyRule(
         "extern",
@@ -232,7 +233,21 @@ BUFFER_RESIDENCY_RULES = (
             "certified zero-offset prefix needs a served full-backing gather."
         ),
         ("test_buffer_residency_adapter_rejection_strings",),
-        (PREFIX_GATHER,),
+        (
+            PREFIX_GATHER,
+            ResidencyException(
+                "Contained local read",
+                "local_lx_subrange_source",
+                lambda c: c.local_subrange(),
+                (
+                    "rollout enabled",
+                    "existing compact materializer",
+                    "storage and lifetime permission",
+                    "exact local byte coverage",
+                ),
+                ("test_registry_exception_keeps_later_guards",),
+            ),
+        ),
     ),
     ResidencyRule(
         "core_division",
@@ -378,6 +393,38 @@ TRANSFER_CERTIFICATES = (
         (
             "test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias",
         ),
+    ),
+    TransferCertificate(
+        "Contained local LX read",
+        "torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract",
+        "ownership flag ON; shared graph and compact-read geometry gate; "
+        "same-core byte certificate; fresh final access; disjoint live allocations",
+        (
+            "test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected",
+            "test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access",
+        ),
+        ("test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",),
+    ),
+    TransferCertificate(
+        "Full-parent copy for local subranges",
+        "torch_spyre._inductor.scratchpad.lx_relayout.materialize_lx_relayouts",
+        "complete parent copied once per destination group; every partial reader "
+        "re-certified against the destination view; positive disjoint LX spans",
+        (
+            "test_subrange_transfer.py::test_gate_up_siblings_have_distinct_copy_identity",
+            "test_solver_relayout_decision.py::test_copy_is_sized_by_the_destination_span_not_the_source_share",
+        ),
+        ("test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition",),
+    ),
+    TransferCertificate(
+        "Pointwise persistent-scatter materializer",
+        "torch_spyre._inductor.scratchpad.lx_relayout._pointwise_scatter_materializer",
+        "ownership flag ON; one certified compact parent subrange; complete "
+        "scatter read; persistent-scatter storage, alias and ordering checks",
+        (
+            "test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission",
+        ),
+        (),
     ),
     TransferCertificate(
         "Factored ownership",

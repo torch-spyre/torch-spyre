@@ -823,3 +823,172 @@ def test_prefix_lx_contraction_requires_exact_backing_stride(invalid):
         assert lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1])
         graph.operations = [source, consumer, other]
         assert not lx_relayout.prefix_lx_gather_source(graph, "source", [0, 1, 2])
+
+
+@pytest.mark.parametrize(
+    "violation",
+    [
+        None,
+        "source_alias",
+        "aliasing_reader",
+        "graph_output",
+        "partial_scatter_read",
+        "off",
+    ],
+)
+def test_pointwise_scatter_materializer_admission(monkeypatch, violation):
+    """A real pointwise producer must pass the new path and its safety guards."""
+    import torch
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        MutationLayoutSHOULDREMOVE,
+        Pointwise,
+        Scatter,
+    )
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V, ops
+    from torch.utils._ordered_set import OrderedSet
+    from torch_spyre._C import ElementArrangement
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    row, feature = [
+        Symbol(name, integer=True, nonnegative=True) for name in ("row", "feature")
+    ]
+    indirect = Symbol("tmp0", integer=True)
+    device, dtype = torch.device("cpu"), torch.float16
+
+    def layout(rows):
+        physical = SimpleNamespace(
+            device_size=[2, rows, 64],
+            stride_map=[64, 128, 1],
+            device_dtype=dtype,
+            element_arrangement=ElementArrangement.STANDARD,
+            elems_per_stick=lambda: 64,
+        )
+        return FixedTiledLayout(device, dtype, [rows, 128], [128, 1], physical)
+
+    parent = ComputedBuffer(
+        name="parent",
+        layout=layout(4),
+        data=Pointwise(
+            device=device, dtype=dtype, inner_fn=lambda index: 0, ranges=[4, 128]
+        ),
+    )
+    source = ComputedBuffer(
+        name="value",
+        layout=layout(2),
+        data=Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index: ops.load("parent", 128 * (index[0] + 1) + index[1]),
+            ranges=[2, 128],
+        ),
+    )
+    cache = InputBuffer(
+        name="cache", layout=FixedLayout(device, dtype, [4, 128], [128, 1])
+    )
+    indices = InputBuffer(
+        name="indices", layout=FixedLayout(device, torch.int64, [2], [1])
+    )
+    mutations = set()
+    with V.set_graph_handler(SimpleNamespace(mark_buffer_mutated=mutations.add)):
+        update = ComputedBuffer(
+            name="update",
+            layout=MutationLayoutSHOULDREMOVE(cache),
+            data=Scatter(
+                device=device,
+                dtype=dtype,
+                ranges=[2, 128],
+                inner_fn=lambda index: ops.load("value", 128 * index[0] + index[1]),
+                output_indexer=lambda index: [
+                    ops.indirect_indexing(
+                        ops.load("indices", index[0]), 4, check=False
+                    ),
+                    index[1],
+                ],
+            ),
+        )
+    assert mutations == {"cache"}
+
+    def dependencies(reads, write):
+        return ReadWrites(OrderedSet(reads), OrderedSet([write]), OrderedSet())
+
+    # Use explicit pre-scheduling dependencies to isolate the admission predicate.
+    parent.get_read_writes = lambda: dependencies(
+        [], MemoryDep("parent", 128 * row + feature, (row, feature), (4, 128))
+    )
+    source.get_read_writes = lambda: dependencies(
+        [MemoryDep("parent", 128 * (row + 1) + feature, (row, feature), (2, 128))],
+        MemoryDep("value", 128 * row + feature, (row, feature), (2, 128)),
+    )
+    reads = [
+        MemoryDep("value", 128 * row + feature, (row, feature), (2, 128)),
+        MemoryDep("indices", row, (row,), (2,)),
+    ]
+    update.get_read_writes = lambda: dependencies(
+        reads,
+        MemoryDep("update", 128 * indirect + feature, (row, feature), (2, 128)),
+    )
+    buffers = {op.get_name(): op for op in (parent, source, update, cache, indices)}
+    graph = SimpleNamespace(
+        sizevars=SizeVarAllocator(),
+        operations=[parent, source, update],
+        graph_inputs={"cache": cache, "indices": indices},
+        get_buffer=buffers.__getitem__,
+        try_get_buffer=buffers.get,
+        get_output_names=lambda: [],
+    )
+    with (
+        V.set_graph_handler(graph),
+        config.patch(
+            lx_planner_relayout=True, lx_extended_ownership=True, ktir_emitter=False
+        ),
+    ):
+        assert not lx_relayout._is_matmul_op(source)
+        assert lx_relayout.local_lx_subrange_geometry(graph, parent, source) == (
+            (0, 1, 0),
+            (2, 2, 64),
+        )
+        assert lx_relayout._pointwise_scatter_materializer(
+            graph, source, update, "value"
+        )
+        assert lx_relayout._persistent_scatter_consumer(graph, source, update, "value")
+        if violation == "source_alias":
+            monkeypatch.setattr(
+                source, "get_inputs_that_alias_output", lambda: ("external",)
+            )
+        elif violation == "aliasing_reader":
+            other = ComputedBuffer(
+                name="other",
+                layout=layout(2),
+                data=Pointwise(
+                    device=device,
+                    dtype=dtype,
+                    ranges=[2, 128],
+                    inner_fn=lambda index: ops.load("value", 128 * index[0] + index[1]),
+                ),
+            )
+            other.get_read_writes = lambda: dependencies(
+                [MemoryDep("value", 128 * row + feature, (row, feature), (2, 128))],
+                MemoryDep("other", 128 * row + feature, (row, feature), (2, 128)),
+            )
+            graph.operations.append(other)
+            # An immutable second reader is safe. An aliasing reader is not.
+            assert lx_relayout._persistent_scatter_consumer(
+                graph, source, update, "value"
+            )
+            monkeypatch.setattr(
+                other, "get_inputs_that_alias_output", lambda: ("value",)
+            )
+        elif violation == "graph_output":
+            graph.get_output_names = lambda: ["value"]
+        elif violation == "partial_scatter_read":
+            reads[0] = MemoryDep("value", 128 * row + feature, (row, feature), (1, 128))
+            update.__dict__.pop("_ts_cached_read_writes", None)
+        with config.patch(lx_extended_ownership=violation != "off"):
+            assert lx_relayout._persistent_scatter_consumer(
+                graph, source, update, "value"
+            ) is (violation is None)

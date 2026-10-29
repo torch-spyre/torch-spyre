@@ -136,7 +136,7 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
-# Enable optional ownership proofs added after prefix relayout support.
+# Enable optional ownership proofs and local reads added after prefix support.
 # Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
 lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
     "1",

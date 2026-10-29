@@ -30,6 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.ir import ComputedBuffer, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -58,12 +59,18 @@ from .core_mapping import (
     work_division_from_view,
 )
 from .errors import Unsupported
+from .lx_read_contracts import (
+    LocalReadEmission,
+    has_partial_read,
+    normalize_local_read as normalize_local_lx_subrange,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
 )
 from .pass_utils import (
     concretize_expr,
+    op_read_writes,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -563,6 +570,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.scheduled_nodes: list[SchedulerNode] = []
         self.failed_node: SchedulerNode | None = None
         self.pool_size: int = pool_size
+        self.local_read_contract_factory: (
+            Callable[[str, Any], LocalReadEmission | None] | None
+        ) = None
         # Live call args, deduped and filtered to names in spyre_kernel_args.
         # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
         # values match .run() positional args.
@@ -907,6 +917,26 @@ class SpyreKernel(Kernel[CSEVariable]):
             kernel_local=kernel_local,
             replicated_scalar=replicated_scalar,
         )
+        if (
+            _spyre_config.lx_planner_relayout
+            and not _spyre_config.ktir_emitter
+            and tensor_arg.is_input
+            and "lx" in tensor_arg.allocation
+            and isinstance(operation, ComputedBuffer)
+            and isinstance(operation.data, Pointwise)
+        ):
+            reads = [dep for dep in op_read_writes(operation).reads if dep.name == name]
+            if has_partial_read(V.graph.get_buffer(name).layout.size, reads):
+                if self.local_read_contract_factory is None:
+                    raise ValueError(f"{name}: local LX contract provider is missing")
+                contract = self.local_read_contract_factory(name, operation)
+                tensor_arg = normalize_local_lx_subrange(
+                    contract,
+                    name,
+                    tensor_arg,
+                    it_space,
+                    allow_extended=_spyre_config.lx_extended_ownership,
+                )
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation

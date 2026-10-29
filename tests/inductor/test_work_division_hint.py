@@ -1304,6 +1304,8 @@ def test_lx_relayout_planner_uses_projected_read_ownership(reader):
         mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
         mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
         mock_patch.object(lx_relayout_module, "Pointwise", SimpleNamespace),
+        # This fixture tests projected ownership with synthetic access geometry.
+        mock_patch.object(lx_relayout_module, "is_partial_lx_read", return_value=False),
         mock_patch.object(
             lx_relayout_module, "op_read_writes", side_effect=read_writes
         ),
@@ -2612,3 +2614,22 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         assert [
             int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
         ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_local_read_rollout_declines_before_graph_access(enabled):
+    class GraphAccess(Exception):
+        pass
+
+    class Graph:
+        def get_buffer(self, name):
+            raise GraphAccess
+
+    with config.patch(lx_extended_ownership=enabled):
+        if enabled:
+            with pytest.raises(GraphAccess):
+                lx_relayout_module.local_lx_subrange_source(Graph(), "source", [])
+        else:
+            assert not lx_relayout_module.local_lx_subrange_source(
+                Graph(), "source", []
+            )
