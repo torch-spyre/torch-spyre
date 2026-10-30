@@ -690,9 +690,17 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          # A grouped entry names its report after the group; others after the config.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
+          MEMBERS="${{ matrix.suite.configs }}"
+          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
@@ -700,7 +708,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           # matrix.suite.config is relative to the dir generate_matrix scanned.
-          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
+          config: ${{ env.CONFIG_PATHS }}
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv (a sibling of the source, not inside it); normal: the
           # checkout (default 'torch-spyre') + its local '.venv'.
@@ -1198,28 +1206,33 @@ jobs:
       fail-fast: false
       matrix:
         suite:
+          # Configs in a distributed_tests/ ci_group share ONE job (and one JUnit
+          # report, group_distributed_tests_<group>.xml): a 2-card runner is scarce
+          # and each suite is ~30s of tests behind ~40s of wheel install. Members of
+          # a group must have identical `global:` blocks (make check-all-configs
+          # enforces that). `config` is the first member, `configs` lists them all;
+          # every distributed config must still appear here, which
+          # tests/scripts/check_test_coverage.sh checks.
           - name: Test Multi-Spyre Setup
             config: distributed_tests/test_general.yaml
-          - name: Test Multi-Spyre Barrier
-            config: distributed_tests/test_barrier.yaml
-          - name: Test Multi-Spyre Broadcast
-            config: distributed_tests/test_broadcast.yaml
-          - name: Test Multi-Spyre Gather
-            config: distributed_tests/test_gather.yaml
-          - name: Test Multi-Spyre Allgather
+            configs: distributed_tests/test_general.yaml distributed_tests/test_barrier.yaml
+            report: group_distributed_tests_setup
+          - name: Test Multi-Spyre Collectives A
             config: distributed_tests/test_allgather.yaml
-          - name: Test Multi-Spyre Allreduce
+            configs: distributed_tests/test_allgather.yaml distributed_tests/test_gather.yaml
+            report: group_distributed_tests_collectives_a
+          - name: Test Multi-Spyre Collectives B
+            config: distributed_tests/test_broadcast.yaml
+            configs: distributed_tests/test_broadcast.yaml distributed_tests/test_broadcast_compiled.yaml distributed_tests/test_allgather_compiled.yaml
+            report: group_distributed_tests_collectives_b
+          - name: Test Multi-Spyre Reductions
             config: distributed_tests/test_allreduce.yaml
-          - name: Test Multi-Spyre Reduce
-            config: distributed_tests/test_reduce.yaml
-          - name: Test Multi-Spyre Broadcast Compiled
-            config: distributed_tests/test_broadcast_compiled.yaml
-          - name: Test Multi-Spyre Allgather Compiled
-            config: distributed_tests/test_allgather_compiled.yaml
-          - name: Test Multi-Spyre Allreduce Compiled
-            config: distributed_tests/test_allreduce_compiled.yaml
+            configs: distributed_tests/test_allreduce.yaml distributed_tests/test_allreduce_compiled.yaml distributed_tests/test_reduce.yaml
+            report: group_distributed_tests_reductions
           - name: Test Multi-Spyre Profiler Coll Metadata
             config: distributed_tests/test_profiler_coll_metadata.yaml
+            configs: distributed_tests/test_profiler_coll_metadata.yaml
+            report: test_profiler_coll_metadata
 
     steps:
       # See the `test` job above: prebaked path symlinks the baked .github into
@@ -1278,15 +1291,22 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          # A grouped entry names its report after the group; others after the config.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
+          MEMBERS="${{ matrix.suite.configs }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }tests/configs/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} tests
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/${{ matrix.suite.config }}
+          config: ${{ env.CONFIG_PATHS }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
@@ -1507,9 +1527,17 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          # A grouped entry names its report after the group; others after the config.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
+          MEMBERS="${{ matrix.suite.configs }}"
+          ROOT="${{ needs.generate_matrix.outputs.config_root }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }${ROOT}/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
@@ -1526,7 +1554,7 @@ jobs:
           retried: pod
           replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
-          config: ${{ format('{0}/{1}', needs.generate_matrix.outputs.config_root, matrix.suite.config) }}
+          config: ${{ env.CONFIG_PATHS }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ matrix.suite.extra_test_flags || inputs.extra_test_flags }}
@@ -1625,9 +1653,16 @@ jobs:
       - name: Derive report paths
         run: |
           CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          # A grouped entry names its report after the group; others after the config.
+          REPORT_STEM="${{ matrix.suite.report }}"
+          REPORT_NAME="${REPORT_STEM:-$(basename "${CONFIG%.yaml}")}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # Every member of a ci_group, root-qualified; one path for an ungrouped suite.
+          MEMBERS="${{ matrix.suite.configs }}"
+          CONFIG_PATHS=""
+          for m in ${MEMBERS:-$CONFIG}; do CONFIG_PATHS="${CONFIG_PATHS:+$CONFIG_PATHS }tests/configs/${m}"; done
+          echo "CONFIG_PATHS=${CONFIG_PATHS}" >> "$GITHUB_ENV"
 
       # The first attempt's report, which this job's upload overwrites; kept as prior_* props.
       - name: Download the first attempt's JUnit XML report
@@ -1643,7 +1678,7 @@ jobs:
           retried: pod
           replaced_junit_xml: ${{ runner.temp }}/replaced-report/${{ env.REPORT_NAME }}
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/${{ matrix.suite.config }}
+          config: ${{ env.CONFIG_PATHS }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}

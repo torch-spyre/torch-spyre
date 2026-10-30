@@ -10,6 +10,7 @@
 
 test_suite_config:
   labels: [regression, trunk, integration]
+  ci_group: reductions
   files:
     # AllReduce Tests
     - path: ${TORCH_DEVICE_ROOT}/tests/distributed/test_allreduce.py

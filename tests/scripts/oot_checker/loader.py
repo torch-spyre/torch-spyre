@@ -77,6 +77,26 @@ def load_labels(config_files: list[Path]) -> dict[Path, list | None]:
     return result
 
 
+def load_ci_groups(config_files: list[Path]) -> dict[Path, tuple[str, dict]]:
+    """
+    Read (ci_group, global block) from each config file that declares a ci_group.
+
+    Configs without a ci_group are omitted. The global block is {} when absent.
+    """
+    result: dict[Path, tuple[str, dict]] = {}
+    for cf in config_files:
+        try:
+            cfg = yaml.safe_load(cf.read_text()) or {}
+        except Exception as e:
+            _warn(f"Cannot load {cf}: {e}")
+            continue
+        tsc = cfg.get("test_suite_config") or {}
+        group = str(tsc.get("ci_group") or "").strip()
+        if group:
+            result[cf] = (group, tsc.get("global") or {})
+    return result
+
+
 def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
     """
     Read exclude__plat_<arch> tag suffixes from each config file's test entries.

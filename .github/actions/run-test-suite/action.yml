@@ -24,7 +24,7 @@ inputs:
     description: Human-readable label (used in echo/log output)
     required: true
   config:
-    description: Path passed to run_test.sh (e.g. tests/configs/...)
+    description: Path passed to run_test.sh (e.g. tests/configs/...); several space-separated paths are merged into one run
     required: true
   extra_test_flags:
     description: Extra flags forwarded to run_test.sh (e.g. "-v")
@@ -262,11 +262,11 @@ runs:
           # quotes or $(...). The unquoted vars split into words exactly as they
           # do in the invocation below, so the printed and run word lists match.
           printf '  command       :'
-          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" \
+          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh $CONFIG \
             ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag}
           printf '\n'
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh $CONFIG ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${xdist_flag} \
             >&"$FIFO_FD" 2>&1 &
           test_pid=$!
 

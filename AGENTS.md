@@ -108,6 +108,23 @@ them with `PARAMS`, and `pr-review` checks them.
   suite skips xfail-marked tests and tests tagged `_expects_raise`, which the
   `expect_raise` key and the `@expects_raise` decorator both set.
 
+### CI jobs: group short suites
+
+Every config file is one CI job by default, and each job pays about a minute of runner
+setup. A config whose tests take under a couple of minutes should join a group with
+`ci_group: <name>` in `test_suite_config`, next to `labels`. Configs in the same
+directory with the same `ci_group` run as one job (one `run_test.sh` call, still one
+pytest process per test file) and report as `group_<dir>_<name>.xml`. Aim for groups of
+about 5-10 minutes; leave anything over 5 minutes on its own. Grouping happens after tier
+filtering, so a smoke or integration run only runs the members that match. Members must
+share a runner (`.github/runner_overrides.yaml`), flags and an identical `global:` block,
+because `run_test.sh` unions `global` list keys across merged configs and differing
+blocks would widen each other's coverage. `make check-all-configs` rejects differing
+`global:` blocks and one-member groups; `filter_configs.py` rejects runner or flag
+mismatches when the matrix is built. The multi-card job (`test_multi_spyre`) lists its
+suites by hand in `_test_matrix.yaml`, so a `distributed_tests/` group must also be
+mirrored there; `test_filter_configs.py` checks that they agree.
+
 ### Local results can differ from CI
 
 - Backend-level outcomes (`dbo-opt` errors, masking, layout limits) can differ between

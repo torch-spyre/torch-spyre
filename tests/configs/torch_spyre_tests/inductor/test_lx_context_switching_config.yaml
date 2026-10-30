@@ -1,5 +1,6 @@
 test_suite_config:
   labels: [unit, integration, regression, trunk]
+  ci_group: scratchpad_lx
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_lx_context_switching.py
       unlisted_test_mode: mandatory_success
