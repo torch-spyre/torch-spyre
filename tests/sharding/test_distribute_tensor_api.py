@@ -126,8 +126,13 @@ def test_placement_must_be_exact_shard(no_runtime, placement):
 
 
 def test_spec_object_is_not_the_public_placement(no_runtime):
-    with pytest.raises(TypeError, match="Shard"):
-        distribute_tensor(_source(), SpyreShardingSpec(Shard(0)))
+    # Construct a fully valid spec first: SpyreShardingSpec(Shard(0)) alone
+    # raises a dataclass TypeError whose message names the class (which
+    # contains "Shard"), so that form passes even if distribute_tensor
+    # accepts spec objects. A valid spec isolates the placement rejection.
+    spec = SpyreShardingSpec(Shard(0), 8)
+    with pytest.raises(TypeError, match="placement must be exactly"):
+        distribute_tensor(_source(), spec)
     assert no_runtime == []
 
 

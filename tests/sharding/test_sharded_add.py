@@ -437,17 +437,86 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
     "view",
     [lambda t: t.view(-1), lambda t: t[: t.shape[0] // 2], lambda t: t.t()],
 )
-def test_views_of_sharded_inputs_fail_at_compile(view):
+def test_views_of_sharded_inputs_fail(view):
     # A view keeps the base's shard layout, which no longer matches the
-    # view's shape; chunk addressing would read permuted data.
+    # view's shape; chunk addressing would read permuted data. The native
+    # view constructors reject it before the tensor can reach a kernel.
     # TODO: positive once views of sharded tensors have a shard mapping.
     n = _num_shards()
     torch.manual_seed(0)
     x = _sharded(torch.randn(2 * n, 128, dtype=torch.float16), 0, n)
     y = _sharded(torch.randn(2 * n, 128, dtype=torch.float16), 0, n)
 
-    with pytest.raises(RuntimeError, match="no views, slices or reshapes"):
-        torch.compile(lambda a, b: a + b, dynamic=False)(view(x), view(y))
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        view(x)
+        view(y)
+
+
+@_requires_emulation
+def test_compiled_add_over_detached_views(launched):
+    """Detached views of sharded inputs reach the compiled path unchanged.
+
+    A detach is an identity view (same sizes, strides and storage offset),
+    so it keeps the element-to-shard mapping and must stay accepted where
+    non-identity views are rejected; the compiled kernel still binds core c
+    to shard c and produces the right values. (Other identity views such as
+    an explicit as_strided are still held back by the compile-time
+    base-tensor check in sharded_hbm.py, which cannot see that the view is
+    an identity one.)
+    """
+    n = _num_shards()
+    torch.manual_seed(0)
+    a_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    b_cpu = torch.randn(4 * n, 64, dtype=torch.float16)
+    a, b = _sharded(a_cpu, 0, n), _sharded(b_cpu, 0, n)
+
+    c = torch.compile(lambda x, y: x + y, dynamic=False)(a.detach(), b.detach())
+    _assert_one_non_unified_kernel(launched, n)
+
+    assert torch.spyre.is_sharded(c)
+    expected = (a_cpu.to("spyre") + b_cpu.to("spyre")).cpu()
+    assert torch.equal(c.cpu(), expected)
+
+
+@_requires_emulation
+@expects_raise
+def test_contiguous_prefix_view_of_sharded_fails():
+    # The hole the copy-path guards could not see: a contiguous view from
+    # storage offset zero passes every is_contiguous()/storage_offset()
+    # check, yet maps view elements onto the wrong shards (element N comes
+    # from the start of a later shard instead of the shards that back the
+    # first N elements). It must be rejected at construction, not copied.
+    n = _num_shards()
+    x = _sharded(torch.arange(4 * n, dtype=torch.float16), 0, n)
+
+    with pytest.raises(
+        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    ):
+        x.narrow(0, 0, 2 * n)
+
+
+@_requires_emulation
+def test_identity_views_of_sharded_keep_round_trip():
+    # Identity views (detach, as_strided of the base tensor) reproduce the
+    # base tensor exactly, so the element-to-shard mapping still holds and
+    # the whole-tensor copy path must keep working through them.
+    n = _num_shards()
+    torch.manual_seed(0)
+    cpu = torch.randn(2 * n, 128, dtype=torch.float16)
+    x = _sharded(cpu, 0, n)
+    d = x.detach()
+    a = torch.as_strided(x, x.size(), x.stride(), 0)
+
+    assert torch.spyre.is_sharded(d) and torch.spyre.is_sharded(a)
+    # Reference through the same device round-trip the suite uses elsewhere,
+    # so the emulation's fp16 last-bit DMA difference does not mask a real
+    # mismatch; the three round-trips must be identical to each other.
+    expected = cpu.to("spyre").to("cpu")
+    assert torch.equal(x.to("cpu"), expected)
+    assert torch.equal(d.to("cpu"), expected)
+    assert torch.equal(a.to("cpu"), expected)
 
 
 @_requires_emulation
