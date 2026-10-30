@@ -67,6 +67,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_REDUCTION_OPS,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -683,22 +684,25 @@ def _single_arg_op_layout(
                     in_coords = host_coordinates(in_layout, dep, None)
                     source_device_coords = device_coordinates(stl, dep, None)
                     staggered_arg = PropArg(dep, in_layout, [stl])
-                    for target_stick_expr in in_coords:
-                        if not target_stick_expr.free_symbols:
-                            continue
-                        target_stl = compute_restickify_target_layout(
-                            stl,
-                            in_layout,
-                            target_stick_expr,
-                            in_coords,
-                            source_device_coords,
-                            arg=staggered_arg,
-                        )
-                        if target_stl is None:
-                            continue
-                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
-                        if candidate not in layouts:
-                            layouts.append(candidate)
+                    if source_device_coords[-1].free_symbols:
+                        for target_stick_expr in in_coords:
+                            if not target_stick_expr.free_symbols:
+                                continue
+                            target_stl = compute_restickify_target_layout(
+                                stl,
+                                in_layout,
+                                target_stick_expr,
+                                in_coords,
+                                source_device_coords,
+                                arg=staggered_arg,
+                            )
+                            if target_stl is None:
+                                continue
+                            candidate = rescale_stl_for_dtype(
+                                target_stl, output.dtype, fmt
+                            )
+                            if candidate not in layouts:
+                                layouts.append(candidate)
 
                 # Under the current EA map, an already-staggered input is the
                 # reverse staggered-to-STANDARD restoration. It needs no
@@ -1015,7 +1019,6 @@ def _factorized_chain(
     host_size: list,
     host_stride: list,
     var: sympy.Symbol,
-    reduction_type: str,
     label: str,
 ) -> tuple[list[int], int, int]:
     """Validate the host dims that jointly carry ``var`` as one contiguous chain.
@@ -1068,7 +1071,7 @@ def _factorized_chain(
         or host_stride[chain[-1]] != var_stride
     ):
         raise Unsupported(
-            f"{reduction_type}: cannot canonicalize factorized {label}_var="
+            f"cannot canonicalize factorized {label}_var="
             f"{var}; expected an affine contiguous host dimension chain "
             f"covering a window of whole inner dims, got host coordinates "
             f"{host_coords}, size={list(arg.layout.size)}, "
@@ -1137,7 +1140,7 @@ def _rebuild_stl_for_matmul(
         if var is None:
             continue
         hdims, _, var_stride = _factorized_chain(
-            arg, host_coords, host_size, host_stride, var, reduction_type, label
+            arg, host_coords, host_size, host_stride, var, label
         )
         if len(hdims) == 1 and not is_stick:
             continue
@@ -1340,6 +1343,11 @@ def _stl_via_restickify(
         if target_stick_expr is None:
             continue
         stl, dev_coords = _prepare_for_restickify(stl, dev_coords, reduction_type)
+        if (
+            not dev_coords[-1].free_symbols
+            and reduction_type not in MATMUL_REDUCTION_OPS
+        ):
+            continue
         result = compute_restickify_target_layout(
             stl,
             arg.layout,
@@ -1347,7 +1355,6 @@ def _stl_via_restickify(
             arg_host_coords,
             dev_coords,
             arg=arg,
-            reduction_type=reduction_type,
             label=label,
         )
         if result is not None:
