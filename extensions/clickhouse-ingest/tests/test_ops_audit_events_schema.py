@@ -46,7 +46,7 @@ def _insert(s, row):
 
 
 def test_rows_are_validated(chdb_session):
-    for bad in ({"event_id": NIL}, {"result": "denied"}):
+    for bad in ({"event_id": NIL}, {"result": "denied"}, {"actor_kind": "root"}):
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             _insert(chdb_session, _event(**bad))
 
@@ -67,3 +67,23 @@ def test_a_refused_attempt_may_have_no_actor(chdb_session):
         {"actor": "", "result": "refused", "status": 401},
         {"actor": "alice@ibm.com", "result": "ok", "status": 200},
     ]
+
+
+def test_the_view_has_one_row_per_event(chdb_session):
+    s = chdb_session
+    _insert(s, _event(actor_kind="human"))
+    _insert(
+        s,
+        _event(
+            event_id="018f0000-0000-7000-8000-000000000002",
+            actor="",
+            actor_kind="anonymous",
+            result="refused",
+            status=401,
+        ),
+    )
+    got = s.query(
+        "SELECT count() AS n, countIf(actor_kind = 'anonymous') AS a FROM v_ops_audit_events",
+        "JSONEachRow",
+    ).data()
+    assert json.loads(got) == {"n": 2, "a": 1}
