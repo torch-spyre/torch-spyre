@@ -38,7 +38,7 @@ def chdb_session():
 
 def _event(**over):
     row = {"turn_id": TID, "event": "turn", "surface": "chat", "actor": "alice@ibm.com",
-           "actor_kind": "user", "question": "q", "tool_calls": 2, "latency_ms": 100}  # fmt: skip
+           "actor_kind": "human", "question": "q", "tool_calls": 2, "latency_ms": 100}  # fmt: skip
     return {**row, **over}
 
 
@@ -57,9 +57,13 @@ def test_rows_are_validated(chdb_session):
         {"event": "edit"},
         {"surface": "email"},
         {"actor_kind": "robot"},
+        {"actor_kind": "user"},
+        {"outcome": "client_aborted"},
+        {"model_choice": "tier1"},
+        {"cost_usd": -1},
         {"thumbs": "sideways"},
         {"actor_kind": "anonymous", "actor": "alice@ibm.com"},
-        {"actor_kind": "user", "actor": "anon:abc"},
+        {"actor_kind": "human", "actor": "anon:abc"},
     ):
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             _insert(chdb_session, _event(**bad))
@@ -74,7 +78,7 @@ def test_the_view_joins_the_latest_thumbs_to_the_turn(chdb_session):
             ts="2026-10-30 10:01:00.000",
             event="feedback",
             thumbs="up",
-            actor_kind="user",
+            actor_kind="human",
         ),
     )
     _insert(
@@ -109,6 +113,12 @@ def test_a_turn_without_feedback_has_none(chdb_session):
         chdb_session.query("SELECT thumbs FROM v_chat_turns", "JSONEachRow").data()
     )
     assert got == {"thumbs": "none"}
+
+
+def test_defaults_and_shared_columns(chdb_session):
+    _insert(chdb_session, _event(model_alias="Gemma", served_model="g", session_id="s1", prompt_version="abc"))
+    got = json.loads(chdb_session.query("SELECT outcome, cost_usd, session_id, model_alias, served_model FROM v_chat_turns", "JSONEachRow").data())
+    assert got == {"outcome": "ok", "cost_usd": 0, "session_id": "s1", "model_alias": "Gemma", "served_model": "g"}
 
 
 def test_retention_rows_are_validated_and_only_the_actor_sets_their_own(chdb_session):
