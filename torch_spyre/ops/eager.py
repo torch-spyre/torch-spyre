@@ -628,6 +628,47 @@ def register_inplace_kernels(ops):
 register_inplace_kernels(COMPILED_OPS)
 
 
+# cumsum's decomposition covers only aten.cumsum.default; out= and in-place
+# (cumsum_ reaches cumsum.out) run it and copy_ the result, like
+# _make_inplace_kernel.
+@torch.library.register_kernel("aten::cumsum.out", ["spyre"])  # type:ignore
+def spyre__cumsum_out(
+    self: torch.Tensor,
+    dim: int,
+    *,
+    dtype: torch.dtype | None = None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Functional cumsum + ``copy_`` into ``out``.
+
+    Without ``dtype`` the result takes ``out``'s dtype, as on CPU.
+    """
+    _check_same_device([(out, True), (self, False)])
+    if dtype is not None and dtype != out.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    result = torch.cumsum(self, dim, dtype=out.dtype)
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out
+
+
+@torch.library.register_kernel("aten::cumsum_", ["spyre"])  # type:ignore
+def spyre__cumsum_(
+    self: torch.Tensor, dim: int, *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Functional cumsum in ``self``'s dtype + ``copy_`` back into ``self``."""
+    if dtype is not None and dtype != self.dtype:
+        raise RuntimeError(
+            f"Bad in-place call: input tensor dtype {self.dtype} and output "
+            f"tensor dtype {dtype} should match"
+        )
+    self.copy_(torch.cumsum(self, dim, dtype=self.dtype))
+    return self
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
