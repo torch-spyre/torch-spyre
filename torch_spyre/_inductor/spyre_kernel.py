@@ -1692,7 +1692,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
         elif isinstance(op_spec, (UnimplementedOp, OpSpecUnimplementedOp)):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"op_spec: UnimplementedOp({op_spec.op})")
-            buf.writeline(f"UnimplementedOp(op='{op_spec.op}')")
+            buf.writeline(f"UnimplementedOp(op='{op_spec.op}'),")
         else:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
