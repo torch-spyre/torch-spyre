@@ -828,6 +828,36 @@ def _floor_div(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+# TODO: cite an issue once the shuffle compile failure is reported on the
+# shuffle-op PR.
+_ARG_REDUCE_SHUFFLE_COMPILE_FAIL = (
+    "the backend compiler fails on the fused float16 cast and shuffle kernel"
+)
+# TODO: cite an issue once reported; the shuffle takes whole float32 stick pairs.
+_ARG_REDUCE_NARROW_FP16 = (
+    "the float16 upcast cannot be shuffled back to STANDARD on a row narrower than "
+    "64 columns"
+)
+
+
+def _argmax_rows(shape, dtype=torch.float32):
+    """fp32 rows with the cases argmax must break like PyTorch: ties, NaN and inf.
+
+    Row 0 ties its max at three columns, row 1 ties +inf, row 2 holds two NaN and
+    a +inf, row 3 is all -inf and row 4 all equal; the rest are random. The lowest
+    index wins a tie, a NaN wins over any number.
+    """
+    rows, v = shape
+    x = torch.randn(shape, generator=torch.Generator().manual_seed(rows * v))
+    x[0, [3, v // 2, v - 1]] = 9.0
+    x[1, [5, 9]] = float("inf")
+    x[2, [v - 1, 11]] = float("nan")
+    x[2, 4] = float("inf")
+    x[3] = float("-inf")
+    x[4] = 1.0
+    return x.to(dtype)
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -2126,6 +2156,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     0,
                 ),
+            },
+        },
+        ("test_arg_reduce", "test_arg_reduce_base"): {
+            "ops_dict": {"argmax": torch.argmax, "argmin": torch.argmin},
+            "param_sets": {
+                f"{_dtype_name(dtype)}_{rows}x{v}": (_argmax_rows((rows, v), dtype),)
+                for dtype in (torch.float32, torch.float16)
+                for rows, v in (
+                    (8, 256),
+                    (8, 768),
+                    (64, 32000),
+                    (8, 128256),
+                    (64, 151936),
+                    (5344, 768),
+                )
+            },
+            # The float16 path shuffles its staggered float32 upcast back to
+            # STANDARD; the backend compiler fails on the fused cast and shuffle
+            # kernel at these shapes.
+            "expect_fail": {
+                **{
+                    f"float16_{shape}": _ARG_REDUCE_SHUFFLE_COMPILE_FAIL
+                    for shape in ("8x768", "64x151936")
+                },
+                "argmin_float16_8x256": _ARG_REDUCE_SHUFFLE_COMPILE_FAIL,
             },
         },
         ("test_topk_indices", "test_topk_indices_cpu"): {
@@ -10435,6 +10490,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    @pytest.mark.xfail(
+        strict=True, raises=InductorError, reason=_ARG_REDUCE_NARROW_FP16
+    )
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -10443,6 +10501,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_arg_reduce_base(self, op, x):
+        # Indices are exact, so compare them exactly. The CPU reference reads the
+        # card-rounded input, as float16 rounds to DLFloat16 on the device and
+        # makes more ties.
+        x = x.to("spyre").cpu()
+
+        def fn(t):
+            return op(t, dim=-1), op(t, dim=1, keepdim=True)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
+
+    @pytest.mark.xfail(
+        strict=True, raises=InductorError, reason=_ARG_REDUCE_NARROW_FP16
+    )
     def test_argmin_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(

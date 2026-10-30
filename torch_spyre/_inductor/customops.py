@@ -1203,6 +1203,36 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op("spyre::argmax_cpu", mutates_args=())
+def argmax_cpu(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    """CPU fallback for the argmax cases the Spyre decomposition does not cover.
+
+    Mirrors max_dim_int64_fallback: the Spyre kernel is registered in
+    fallbacks.py, and this body computes the real result for non-Spyre inputs.
+    """
+    return torch.argmax(input, dim, keepdim)
+
+
+@argmax_cpu.register_fake
+def _(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    return torch.argmax(torch.empty_like(input, device="meta"), dim, keepdim).to(
+        input.device
+    )
+
+
+@torch.library.custom_op("spyre::argmin_cpu", mutates_args=())
+def argmin_cpu(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    """CPU fallback for the argmin cases the Spyre decomposition does not cover."""
+    return torch.argmin(input, dim, keepdim)
+
+
+@argmin_cpu.register_fake
+def _(input: torch.Tensor, dim: Optional[int], keepdim: bool) -> torch.Tensor:
+    return torch.argmin(torch.empty_like(input, device="meta"), dim, keepdim).to(
+        input.device
+    )
+
+
 @torch.library.custom_op("spyre::triu_cpu", mutates_args=())
 def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
     """

@@ -242,8 +242,6 @@ register_fallback_default(
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
         aten.bitwise_or.Tensor_out,
-        aten.argmax.default,
-        aten.argmin.default,
         aten.where.default,
     ]
 )
@@ -255,6 +253,18 @@ register_fallback_default(
 # The kernel itself is registered in eager.py.
 fallback_ops.append(aten.normal_.default)
 fallback_ops.append(getattr(aten.random_, "from"))
+
+
+@register_fallback(["spyre::argmax_cpu"])
+def spyre__argmax_cpu(input, dim, keepdim, **kwargs):
+    """CPU fallback for argmax cases with no Spyre decomposition."""
+    return torch.argmax(input, dim, keepdim)
+
+
+@register_fallback(["spyre::argmin_cpu"])
+def spyre__argmin_cpu(input, dim, keepdim, **kwargs):
+    """CPU fallback for argmin cases with no Spyre decomposition."""
+    return torch.argmin(input, dim, keepdim)
 
 
 @register_fallback(["spyre::triu_cpu"])
