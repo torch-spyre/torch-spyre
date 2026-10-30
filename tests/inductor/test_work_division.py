@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import sympy
 from torch._inductor.utils import sympy_index_symbol
 import torch
@@ -50,7 +52,6 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_dtype,
 )
-from torch_spyre._inductor import passes
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -2406,11 +2407,12 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
 
     def test_unblocked_window_split_is_dropped_before_codegen(self):
         """What the guard prevents: permit (and force) a kh split, and the
-        committed plan cannot be carried to codegen."""
+        committed plan cannot be carried to codegen -- compilation now raises
+        rather than silently dropping the split and running on fewer cores."""
+        from torch._inductor.exc import InductorError
+
         forced = {}
-        committed = {}
         real_window = work_division_constraints.reduction_window_blocked_vars
-        real_finalize = passes.finalize_work_division_for_scheduler
 
         def force_kh_split(ctx):
             if getattr(ctx.op.data, "reduction_type", None) != DEPTHWISE_CONV2D_OP:
@@ -2419,14 +2421,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
             forced["kh"] = kh
             return ConstraintResult(allowed_splits={kh: frozenset({3})})
 
-        def finalize(graph):
-            for op in graph.operations:
-                data = getattr(op, "data", None)
-                if getattr(data, "reduction_type", None) == DEPTHWISE_CONV2D_OP:
-                    committed.update(op.iteration_space_ownership.work_slices)
-            real_finalize(graph)
-
-        x, w, x_dev, w_dev = self._inputs()
+        _, _, x_dev, w_dev = self._inputs()
         torch._dynamo.reset()
         with (
             fresh_cache(),
@@ -2435,25 +2430,16 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 "reduction_window_blocked_vars",
                 force_kh_split,
             ),
-            patch.object(passes, "finalize_work_division_for_scheduler", finalize),
-        ):
-            with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
-                out = torch.compile(self._conv)(x_dev, w_dev).cpu()
-        ref = self._conv(x, w)
-        kh = forced["kh"]
-        self.assertEqual(committed[kh], 3)
-        self.assertTrue(
-            any(
-                "lossy work-division scheduler transport" in line
-                and f"reduction:{kh}=absent" in line
-                for line in logs.output
+            pytest.raises(
+                InductorError,
+                match="cannot be represented by the scheduler's "
+                "coefficient-keyed transport",
             ),
-            logs.output,
-        )
-        # The dropped split leaves numerics intact -- the op simply runs on
-        # fewer cores than the solver priced -- which is why only the guard,
-        # not a numeric test, keeps this plan out.
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.1)
+        ):
+            torch.compile(self._conv)(x_dev, w_dev).cpu()
+        # The guard that forced the split ran, so this is the hazard the
+        # finalize hard failure is defending against, not a vacuous pass.
+        self.assertIn("kh", forced)
 
 
 class TestQfp8wtConstraints(unittest.TestCase):

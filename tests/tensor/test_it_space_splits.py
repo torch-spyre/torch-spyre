@@ -26,6 +26,7 @@ from unittest.mock import patch
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
@@ -220,7 +221,11 @@ class TestItSpaceSplits(TestCase):
         recovered = apply_splits_from_index_coeff(stored, s0, s0, {s0: 8})
         self.assertEqual(recovered, {s0: 1})
 
-    def test_scheduler_transport_warns_and_uses_last_axis_for_collision(self):
+    def test_scheduler_transport_raises_on_collision(self):
+        """Two distinct split axes sharing one write-index coefficient can no
+        longer be silently resolved by iteration-order last-axis-wins:
+        finalize now raises rather than committing a lossy encoding."""
+
         class Op:
             def __init__(self):
                 self.op_it_space_splits = None
@@ -240,17 +245,18 @@ class TestItSpaceSplits(TestCase):
 
         op = Op()
         graph = type("Graph", (), {"operations": [op]})()
-        with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
+        with self.assertRaisesRegex(
+            Unsupported,
+            "cannot be represented by the scheduler's coefficient-keyed transport",
+        ):
             with patch(
                 "torch_spyre._inductor.pass_utils.iteration_space_from_op",
                 return_value={i0: 8, i1: 8},
             ):
                 finalize_work_division_for_scheduler(graph)
 
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("lossy work-division scheduler transport", logs.output[0])
-        self.assertEqual(op.op_it_space_splits, ({8: 4}, {}))
-        self.assertFalse(hasattr(op, "iteration_space_ownership"))
+        self.assertIsNone(op.op_it_space_splits)
+        self.assertTrue(hasattr(op, "iteration_space_ownership"))
 
 
 if __name__ == "__main__":
