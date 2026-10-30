@@ -1153,6 +1153,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # sets the packer's eligibility (:meth:`_note_eligibility`): all
         # the post-packing cleanup has to look at (:meth:`_resident_indices`).
         self._eligible_copies: set[int] = set()
+        # The occupants the layout moves draw from (:meth:`_draw_layout_buffer`):
+        # every buffer but the copies, which join while eligible.
+        self._layout_buffers = [
+            idx
+            for idx, b in enumerate(self._bufs)
+            if not isinstance(b, RelayoutCopyBuffer)
+        ]
+        self._has_copies = len(self._layout_buffers) < n
         if self._relayout_source:
             logger.debug(
                 "%d relayout copies over %d sources",
@@ -1689,6 +1697,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 for p in b.in_place_parents
                 if sizes[self._name_to_idx[p]] >= child_size
             ]
+        # Every copy starts off, so ineligible, and an ineligible occupant is
+        # transparent to the packer. Left in this pass it would still take an
+        # address, and so shape the order of the buffers around it; pinned
+        # here, it sorts after them, and the seed pi of the buffers is the one
+        # the solve without relayouts starts from.
+        for idx in range(n):
+            if isinstance(self._bufs[idx], RelayoutCopyBuffer):
+                ff_bufs[idx].residency_reason = "relayout copy (off in the seed)"
         # Deep-copied so FirstFit lays out its own objects, never the ones the
         # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(
@@ -2285,6 +2301,38 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if self._score() > with_seams:
             self._adopt(snap)
 
+    def _draw_layout_buffer(self) -> int:
+        """A buffer for a layout move, uniformly over the buffers and the
+        eligible relayout copies.
+
+        A copy that is not eligible is transparent to the packer: moving it, or
+        moving a buffer past it, changes no address. A graph with copies has
+        many times more of them than buffers, and almost all are off, so a draw
+        over every occupant would spend most layout moves on nothing. An
+        ineligible *buffer* stays in the draw, as on a graph without copies.
+        """
+        movers = self._layout_buffers
+        r = self._rng.randrange(len(movers) + len(self._eligible_copies))
+        if r < len(movers):
+            return movers[r]
+        return sorted(self._eligible_copies)[r - len(movers)]
+
+    def _draw_layout_position(self) -> int:
+        """A permutation position for a layout move: the position of
+        :meth:`_draw_layout_buffer`'s buffer, or, on a graph without copies,
+        any position (the same draw, without the lookup)."""
+        if not self._has_copies:
+            return self._rng.randrange(len(self._bufs))
+        return self.packer.position(self._draw_layout_buffer())
+
+    def _layout_positions(self) -> list[int]:
+        """The permutation positions :meth:`_draw_layout_buffer` can land on,
+        in position order."""
+        if not self._has_copies:
+            return list(range(len(self._bufs)))
+        movers = self._layout_buffers + sorted(self._eligible_copies)
+        return sorted(self.packer.position(idx) for idx in movers)
+
     def _burst(self) -> None:
         """A short cold layout burst: greedily accept layout steps that do not
         lower the packer's quality, letting ``pi`` adapt to the new footprints
@@ -2293,17 +2341,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Rejected steps are reverted rather than snapshotted, since
         ``rotate(j, i)`` undoes ``rotate(i, j)``.
         """
-        n = len(self._bufs)
-        if n < 2:
+        if len(self._bufs) < 2:
             return
+        # Per buffer, as the step budget is: a copy carries no decision.
         # The floor of 1 is there so a small graph still gets a burst.
-        for _ in range(max(1, int(_BURST_FRACTION * n))):
+        for _ in range(max(1, int(_BURST_FRACTION * len(self._layout_buffers)))):
             # Nothing left for pi to win once the structural move has left every
             # eligible buffer resident; the rest of the burst is noise.
             if self._all_eligible_resident():
                 return
-            i = self._rng.randrange(n)
-            j = self._rng.randrange(n)
+            i = self._draw_layout_position()
+            j = self._draw_layout_position()
             if self.packer.rotate(i, j) < 0:
                 self.packer.rotate(j, i)  # revert
 
@@ -2374,9 +2422,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _execute_move(self, name: str) -> None:
         """Apply move ``name`` in place; structural moves carry their own burst."""
-        n = len(self._bufs)
         if name == "reorder":
-            self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
+            i = self._draw_layout_position()
+            self.packer.rotate(i, self._draw_layout_position())
         elif name == "flip":
             idx = self._rng.choice(self._flippable_ops)
             # One axis's factor, or one coarse tile level, drawn uniformly
@@ -2422,11 +2470,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Pick the permutation *position* to lift out for a sweep reorder, using
         the layout-only annealer's bias (weight ``n`` for a fully-allocated buffer,
         ``n_allocated + 1`` otherwise), which oversamples the buffers that miss LX
-        -- the ones the objective prices."""
-        n = len(allocated)
-        n_allocated = sum(1 for a in allocated if a)
+        -- the ones the objective prices. Over the positions a layout move
+        draws (:meth:`_layout_positions`): a copy that is off is never
+        allocated, and would otherwise take the larger part of the draws."""
+        positions = self._layout_positions()
+        n = len(positions)
+        n_allocated = sum(1 for p in positions if allocated[p])
         return self._rng.choices(
-            range(n), weights=[n if a else n_allocated + 1 for a in allocated]
+            positions,
+            weights=[n if allocated[p] else n_allocated + 1 for p in positions],
         )[0]
 
     def _sweep_upper_bound(self, i: int, allocated: list[bool]) -> int:
@@ -2437,12 +2489,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         legally allocated can only be made to fit by moving earlier: past the last
         legally-allocated position, nothing it reaches changes the outcome. An
         allocated buffer has no such bound and sweeps to the end.
+
+        Nor past the last occupant a layout move draws: everything after it is
+        a copy that is off, which no address depends on, so every position
+        there is the one just after that occupant.
         """
         n = len(allocated)
-        if allocated[i]:
-            return n - 1
-        last = max((pos for pos, a in enumerate(allocated) if a), default=0)
-        return min(n - 1, last + 1)
+        upper = n - 1
+        if not allocated[i]:
+            last = max((pos for pos, a in enumerate(allocated) if a), default=0)
+            upper = min(upper, last + 1)
+        if self._has_copies:
+            last = max((p for p in self._layout_positions() if p != i), default=0)
+            # Lifting ``i`` shifts an occupant after it down by one.
+            upper = min(upper, last if i < last else last + 1)
+        return upper
 
     def _step_reorder(self, temperature: float, cur: int) -> int:
         """One best-first reinsertion reorder, the layout-only annealer's move

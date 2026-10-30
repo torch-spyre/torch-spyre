@@ -191,6 +191,11 @@ The second score costs one re-place on the moves that open a seam; a move that o
 
 The memory-only fallback has no price for a shuffle, so under it every copy stays off: the move is not offered and no seam is bought.
 A relayout copy carries no division decision, so it buys the search no steps.
+Nor does a copy that is off take layout moves, or a place in the seed order.
+It is transparent to the packer, so no address depends on where it sits in `pi`, and a graph has many times more copies than buffers.
+So the seed's FirstFit pass treats every copy as pinned, which sorts the copies after the buffers and orders the buffers as the solve without copies does.
+The rotate and reinsertion moves draw over the buffers and the eligible copies only (`_draw_layout_buffer`), the native packer giving a buffer's position in O(1), and the reinsertion sweep stops after the last such occupant.
+Drawn over every occupant, most layout moves went to copies that were off, and on the decode attention graphs with relayout prices raised tenfold the search ended 1-7% worse than the solve without relayouts, with no copy fired.
 Its price term is summed directly over the resident copies rather than compiled into the score function, since a graph can carry thousands of copies and each is zero while the copy is off.
 
 ## The apply round

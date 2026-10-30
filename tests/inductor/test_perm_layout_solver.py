@@ -929,6 +929,12 @@ class NativeSolverDifferentialTests(TestCase):
         self.assertEqual(list(plan.addresses), list(ref.addresses), tag)
         self.assertEqual(plan.quality(), ref.quality(), tag)
         self.assertEqual(plan.count_allocated(), ref.count_allocated(), tag)
+        n = len(ref.permutation)
+        self.assertEqual(
+            [plan.position(i) for i in range(n)],
+            [ref.position(i) for i in range(n)],
+            tag,
+        )
 
     def test_fast_path_reads_pokethrough_top_not_dead_parent(self):
         """The aggregate fast path's boundary case, pinned deterministically.
@@ -1204,6 +1210,12 @@ class IndexGuardTestsMixin(MixinBase):
         for bad in self.BAD_INDICES:
             with self.assertRaises(ValueError):
                 plan.set_eligible(bad, True)
+
+    def test_position_index_out_of_range_raises(self):
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.position(bad)
 
     def test_top_or_inf_index_out_of_range_raises(self):
         plan = self._plan()

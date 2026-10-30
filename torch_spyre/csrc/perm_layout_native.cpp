@@ -502,6 +502,17 @@ class NativePermutationLayoutSolver {
     return allocated_[idx] != 0;
   }
 
+  // The permutation position buffer ``idx`` holds: the inverse of
+  // ``permutation[pos]``, kept incrementally, so a caller that picks a buffer
+  // finds its slot in O(1) instead of scanning the permutation. Bounds-checked;
+  // mirrors the Python reference's ``position(idx)``.
+  int position(int idx) const {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("position index out of range");
+    }
+    return position_[idx];
+  }
+
  private:
   // Cuts the timeline at the sorted unique lifetime endpoints and records, per
   // resulting interval, how many buffers are alive on it and which intervals
@@ -893,6 +904,7 @@ void register_perm_layout_native(py::module_& m) {
            &NativePermutationLayoutSolver::is_fully_allocated, py::arg("idx"))
       .def("top_or_inf", &NativePermutationLayoutSolver::top_or_inf,
            py::arg("idx"))
+      .def("position", &NativePermutationLayoutSolver::position, py::arg("idx"))
       .def("finalize", &NativePermutationLayoutSolver::finalize)
       .def_property_readonly("buffers", &NativePermutationLayoutSolver::buffers)
       // The view borrows the solver, so the solver must outlive it. The

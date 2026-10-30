@@ -1214,6 +1214,87 @@ def test_annealer_never_draws_a_copy_no_edge_in_the_solve_reads():
     assert r[relayout_copy_name("P", 0)].address is None
 
 
+def _crowded(consumers=3):
+    """P feeds C0..C2 one tick each, each through a copy of its own (group k,
+    of the three views a 4-core source can move to) and none matching."""
+    return _with_copies(
+        _producer([0, consumers + 2]),
+        *(
+            _consumer(f"C{k}", k + 1, k + 2, [_candidate(f"C{k}", 0, 5000.0, k)])
+            for k in range(consumers)
+        ),
+    )
+
+
+def _copy_indices(solver) -> set[int]:
+    return {i for i, b in enumerate(solver._bufs) if isinstance(b, RelayoutCopyBuffer)}
+
+
+def test_annealer_seed_pi_puts_every_copy_after_the_buffers():
+    """Every copy is off in the seed, so no address depends on it. Its slot in
+    pi must not shape the buffers' order either: the seed orders the buffers
+    as the solve without copies does, and the copies after them."""
+    bufs = _crowded()
+    solver = _primed_annealer(bufs, size=1024)
+    copies = _copy_indices(solver)
+    perm = list(solver.packer.permutation)
+    head = len(perm) - len(copies)
+    assert set(perm[head:]) == copies
+    without = _primed_annealer(
+        [b for b in bufs if not isinstance(b, RelayoutCopyBuffer)], size=1024
+    )
+    assert [solver._bufs[i].name for i in perm[:head]] == [
+        without._bufs[i].name for i in without.packer.permutation
+    ]
+
+
+def test_annealer_layout_moves_draw_no_copy_that_is_off():
+    """A copy that is off is transparent to the packer, so a layout move on it
+    moves nothing. Neither the rotate draws nor the reinsertion source may land
+    on one; a copy joins the draws once it is eligible."""
+    solver = _primed_annealer(_crowded(), size=1024)
+    copies = _copy_indices(solver)
+    perm = solver.packer.permutation
+    allocated = [solver.packer.is_fully_allocated(perm[k]) for k in range(len(perm))]
+    for _ in range(300):
+        assert perm[solver._draw_layout_position()] not in copies
+        assert perm[solver._choose_reinsertion_source(allocated)] not in copies
+
+    solver._switch_relayouts(copies, on=True)
+    assert solver._eligible_copies == copies
+    drawn = {perm[solver._draw_layout_position()] for _ in range(300)}
+    assert drawn == set(range(len(solver._bufs)))
+
+
+def test_annealer_sweep_bound_hides_no_layout_past_the_last_drawn_occupant():
+    """Past the last occupant a layout move draws, only copies that are off
+    remain, so reinserting anywhere there lands the layout the bound does."""
+    solver = _primed_annealer(_crowded(), size=1024)
+    copies = sorted(_copy_indices(solver))
+    # Scatter the copies through pi, then switch half of them off again.
+    solver._switch_relayouts(set(copies), on=True)
+    for _ in range(40):
+        solver.packer.rotate(
+            solver._rng.randrange(len(solver._bufs)),
+            solver._rng.randrange(len(solver._bufs)),
+        )
+    solver._switch_relayouts(set(copies[::2]), on=False)
+    n = len(solver._bufs)
+    for i in solver._layout_positions():
+        perm = solver.packer.permutation
+        allocated = [solver.packer.is_fully_allocated(perm[k]) for k in range(n)]
+        upper = solver._sweep_upper_bound(i, allocated)
+        snap = solver._snapshot()
+        solver.packer.rotate(i, upper)
+        bound = list(solver.packer.addresses)
+        solver._adopt(snap)
+        for j in range(upper + 1, n):
+            snap = solver._snapshot()
+            solver.packer.rotate(i, j)
+            assert list(solver.packer.addresses) == bound, (i, j, upper)
+            solver._adopt(snap)
+
+
 def test_a_solve_replaces_chosen_relayouts(engine):
     """Every consumer's ``chosen_relayouts`` holds only this solve's reads: an
     entry left on the buffer from before is dropped, not merged."""
