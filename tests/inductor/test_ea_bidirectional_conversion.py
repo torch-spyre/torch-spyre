@@ -951,7 +951,7 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     assert_ea(y, expected_ea)
 
     if _d2h_unsupported(expected_ea, shape):
-        with pytest.raises(RuntimeError, match="D2H requires whole stick pairs"):
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
             y.cpu()  # D2H -> ea_restore
         return
 
