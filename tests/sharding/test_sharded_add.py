@@ -435,7 +435,14 @@ def test_unsupported_ops_fail_at_compile(fn, other, match):
 @expects_raise
 @pytest.mark.parametrize(
     "view",
-    [lambda t: t.view(-1), lambda t: t[: t.shape[0] // 2], lambda t: t.t()],
+    [
+        lambda t: t.view(-1),
+        lambda t: t[: t.shape[0] // 2],
+        lambda t: t.t(),
+        # Rank-increasing: the guard must reject on rank alone, before any
+        # per-dimension comparison (which would read past the base's rank).
+        lambda t: t.unsqueeze(0),
+    ],
 )
 def test_views_of_sharded_inputs_fail(view):
     # A view keeps the base's shard layout, which no longer matches the
@@ -444,14 +451,15 @@ def test_views_of_sharded_inputs_fail(view):
     # TODO: positive once views of sharded tensors have a shard mapping.
     n = _num_shards()
     torch.manual_seed(0)
-    x = _sharded(torch.randn(2 * n, 128, dtype=torch.float16), 0, n)
-    y = _sharded(torch.randn(2 * n, 128, dtype=torch.float16), 0, n)
-
-    with pytest.raises(
-        RuntimeError, match="views of sharded Spyre tensors are not supported"
+    for cpu in (
+        torch.randn(2 * n, 128, dtype=torch.float16),
+        torch.randn(2 * n, 128, dtype=torch.float16),
     ):
-        view(x)
-        view(y)
+        x = _sharded(cpu, 0, n)
+        with pytest.raises(
+            RuntimeError, match="views of sharded Spyre tensors are not supported"
+        ):
+            view(x)
 
 
 @_requires_emulation

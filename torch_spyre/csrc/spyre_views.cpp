@@ -52,17 +52,21 @@ static void check_sharded_view(const at::Tensor& self, const SizeVec& sizes,
                                const StrideVec& strides,
                                const c10::SymInt& storage_offset) {
   if (!spyre_is_sharded(self)) return;
+  // Rank mismatch must fail before the comparison loop: SymBool's operator&
+  // does not short-circuit, so folding the rank check into the chain below
+  // would let a rank-increasing view (e.g. unsqueeze) index past the base
+  // tensor's sizes/strides, and SymIntArrayRef::operator[] is unchecked in
+  // release builds.
+  const bool same_rank = static_cast<int64_t>(sizes.size()) == self.dim() &&
+                         static_cast<int64_t>(strides.size()) == self.dim();
   c10::SymBool identity = storage_offset == self.sym_storage_offset();
-  identity = identity &
-             c10::SymBool(static_cast<int64_t>(sizes.size()) ==
-                              static_cast<int64_t>(self.sym_sizes().size()) &&
-                          static_cast<int64_t>(strides.size()) ==
-                              static_cast<int64_t>(self.sym_strides().size()));
-  for (const auto i : c10::irange(static_cast<int64_t>(sizes.size()))) {
-    identity = identity & (c10::SymInt(sizes[i]) == self.sym_sizes()[i]) &
-               (c10::SymInt(strides[i]) == self.sym_strides()[i]);
+  if (same_rank) {
+    for (const auto i : c10::irange(self.dim())) {
+      identity = identity & (c10::SymInt(sizes[i]) == self.sym_sizes()[i]) &
+                 (c10::SymInt(strides[i]) == self.sym_strides()[i]);
+    }
   }
-  TORCH_CHECK(identity.expect_true(__FILE__, __LINE__),
+  TORCH_CHECK(same_rank && identity.expect_true(__FILE__, __LINE__),
               "views of sharded Spyre tensors are not supported: only views "
               "that reproduce the base tensor exactly (same sizes, strides "
               "and storage offset) keep the element-to-shard mapping. Copy "
