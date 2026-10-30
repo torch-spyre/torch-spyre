@@ -797,6 +797,21 @@ class TestUnrepresentableStickCandidates(TestCase):
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
 
+    def test_compute_coordinates_multi_level_overflow(self):
+        # [8, 65] fp16: size=[2, 8, 64], stride=[64, 65, 1], index=c0 in [0, 520).
+        # Multi-level modulo overflow requires chained mod (issues #5197, #5872).
+        c0 = sympy.Symbol("c0", integer=True, nonnegative=True)
+        size = [2, 8, 64]
+        stride = [64, 65, 1]
+        var_ranges = {c0: 520}
+        coords = compute_coordinates(size, stride, var_ranges, c0)
+
+        # Evaluate across the entire range to confirm 0 discrepancies.
+        for v in range(520):
+            eval_c = [int(c.xreplace({c0: v})) for c in coords]
+            true_c = [(v % 65) // 64, v // 65, (v % 65) % 64]
+            self.assertEqual(eval_c, true_c, f"Mismatch at c0={v}")
+
 
 class TestFactorizedMatmulCandidates(TestCase):
     def _scenario(self, layouts):

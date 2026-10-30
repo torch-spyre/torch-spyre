@@ -284,15 +284,7 @@ def compute_coordinates(
     if repeat_info_out is not None:
         repeat_info_out.update(repeat_info)
 
-    # find stride immediately strictly larger that dim stride
     n = len(size)
-    next_stride = [sympy.oo] * n
-    for i in range(n):
-        for j in range(n):
-            # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
-                next_stride[i] = stride[j]
-    # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
     def add_term(var, step, limit):
@@ -323,6 +315,22 @@ def compute_coordinates(
                 f"be expressed as a device coordinate"
             )
 
+        def _wrap_and_project(target_stride):
+            enclosing = sorted(
+                {
+                    _concretize_for_cmp(stride[j])
+                    for j in range(n)
+                    if size[j] > 1
+                    and _concretize_for_cmp(stride[j]) > target_stride
+                    and _concretize_for_cmp(stride[j]) < concrete_limit
+                },
+                reverse=True,
+            )
+            term = var * step
+            for s in enclosing:
+                term = term % s
+            return term // target_stride
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -330,26 +338,17 @@ def compute_coordinates(
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if st <= concrete_step and st > primary_stride:
+            c_st = _concretize_for_cmp(st)
+            if c_st <= concrete_step and c_st > primary_stride:
                 # found candidate primary dim
-                primary_stride = st
+                primary_stride = c_st
                 primary_dim = dim
-            elif st > concrete_step and st < concrete_limit:
+            elif c_st > concrete_step and c_st < concrete_limit:
                 # var range intersects dim, add term
-                if next_stride[dim] < concrete_limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
-                    coordinates[dim] += var * step // st
+                coordinates[dim] += _wrap_and_project(c_st)
         # add term for primary dim
         if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
-                coordinates[primary_dim] += (
-                    # var range overflows primary dim
-                    var * step % next_stride[primary_dim] // primary_stride
-                )
-            else:
-                coordinates[primary_dim] += var * step // primary_stride
+            coordinates[primary_dim] += _wrap_and_project(primary_stride)
 
     vars = index.free_symbols
     offset = index.xreplace(dict.fromkeys(vars, 0))
@@ -1004,14 +1003,21 @@ def align_tensors_pure(
         if var is None:
             # A constant/broadcast innermost coordinate has no stick loop to split.
             continue
-        has_outer_stick_coordinate = any(
-            term.var == var and term.den == physical_stick_size for term in terms[:-1]
-        )
-        if not has_outer_stick_coordinate:
+        outer_stick_mods = [
+            _concrete_alignment_value(term.mod)
+            for term in terms[:-1]
+            if term.var == var and term.den == physical_stick_size
+        ]
+        if not outer_stick_mods:
             continue
+        # The outer-stick coordinate's own ``mod`` ends its stick span, so a
+        # boundary there (for example 65 from a flattened [R, 65] fp32 tensor)
+        # only leaves a partial last stick, which is legal.  Only a boundary
+        # strictly inside the span cuts a stick.
+        outer_stick_span = max(outer_stick_mods)
         for boundary_expr in splits[var][1:-1]:
             boundary = _concrete_alignment_value(boundary_expr)
-            if boundary % int(physical_stick_size) != 0:
+            if boundary < outer_stick_span and boundary % int(physical_stick_size) != 0:
                 raise UnalignedStickSplit(
                     tensor_index,
                     var,

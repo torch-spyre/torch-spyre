@@ -794,16 +794,29 @@ def _single_arg_op_layout(
         ]
         if out_stl is not None
     ]
-    if output_stls:
-        return output_stls
-    return _candidate_output_stls(
-        out_coords,
-        output_dep,
-        c_size,
-        c_stride,
-        stick_expr,
-        out_dtype_for_layout,
+    candidates = (
+        list(output_stls)
+        if output_stls
+        else _candidate_output_stls(
+            out_coords,
+            output_dep,
+            c_size,
+            c_stride,
+            stick_expr,
+            out_dtype_for_layout,
+        )
     )
+    dense_stl = _generic_layout_for(output)
+    if dense_stl not in candidates:
+        candidates.append(dense_stl)
+    sparse_stl = SpyreTensorLayout(
+        [*c_size, get_elem_in_stick(out_dtype_for_layout)],
+        [*c_stride, -1],
+        out_device_dtype,
+    )
+    if sparse_stl not in candidates:
+        candidates.append(sparse_stl)
+    return candidates
 
 
 def _clone_layout(
@@ -1996,6 +2009,17 @@ def _multi_arg_pointwise_layouts(
         if results:
             break
 
+    sparse_stl = SpyreTensorLayout(
+        [*c_size, stick_size],
+        [*c_stride, -1],
+        out_device_dtype,
+        output_ea,
+    )
+    if sparse_stl not in results:
+        results.append(sparse_stl)
+
+    # LX in-place: promote a same-frame input's layout to FIRST so the beam
+    # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
     # Phase 4 — LX in-place promotion.
     # Promote a same-frame input's layout to FIRST so the beam commits it on a
     # cost tie, avoiding a free-but-in-place-defeating permutation

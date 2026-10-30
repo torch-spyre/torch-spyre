@@ -1457,6 +1457,8 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     - A bare variable (symbol)
     - Zero
     """
+    if isinstance(stick_expr, sympy.floor) and len(stick_expr.args) == 1:
+        stick_expr = stick_expr.args[0]
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -2698,8 +2700,22 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
+    # An unaligned-view case: a reshape flattens a multi-dim input with an
+    # unaligned innermost dim (e.g. [8, 65].reshape(-1)).  The idc then has a
+    # single flat variable (Mod(c0, 64)), but align_tensors would reject it with
+    # UnalignedStickSplit.  Detect: single-variable access (flat/reshape) AND
+    # multi-dim input with unaligned last dim.
+    stick_size_elems = in_stl.elems_per_stick()
+    is_unaligned_view = (
+        not is_sparse_stl(out_stl)
+        and not is_sparse_stl(in_stl)
+        and len(in_host.size) >= 2
+        and len(in_dep.ranges) == 1
+        and int(concretize_expr(in_host.size[-1])) % stick_size_elems != 0
+    )
     if (
         not factorized_layout_mismatch
+        and not is_unaligned_view
         and in_stick_offset_free
         and stick_compatible([idc, out_idc])
     ):
@@ -2792,6 +2808,41 @@ def compute_restickify_needed(
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
             return True, expanded_stl
+
+    if is_sparse_stl(out_stl) and not is_sparse_stl(in_stl):
+        # Use the consumer's flat dimension count (from out_stl or out_dep.ranges)
+        # to build a 1D Sparse target, matching the same logic as is_unaligned_view.
+        stick_size = in_stl.elems_per_stick()
+        # out_stl is already Sparse [N, stick_size] sm=[1,-1]; read N directly.
+        flat_n = (
+            int(out_stl.device_size[0])
+            if len(out_stl.device_size) == 2
+            else int(  # noqa: SIM210
+                math.prod(concretize_expr(r) for r in out_dep.ranges.values())
+            )
+        )
+        sparse_in_stl = SpyreTensorLayout(
+            [flat_n, stick_size],
+            [1, -1],
+            in_stl.device_dtype,
+        )
+        return True, sparse_in_stl
+
+    if is_unaligned_view:
+        # Target a 2D Sparse layout that keeps the input's host dims
+        # ([8, 65] -> device [8, 65, 64], stride_map [65, 1, -1]).  The restickify
+        # transposes whole sticks, so codegen writes every row padded to a stick
+        # multiple (65 -> 128).  Keeping the dim separate lets
+        # insert_restickify_padding pad it, so rows land 128 sticks apart instead
+        # of overwriting the next row.  insert_restickify then adds a tighten copy
+        # to 1D Sparse ([N, stick] sm=[1, -1]) before the Sparse -> Dense compact.
+        stick_size = in_stl.elems_per_stick()
+        sparse_in_stl = SpyreTensorLayout(
+            [*(concretize_expr(s) for s in in_host.size), stick_size],
+            [*(concretize_expr(s) for s in in_host.stride), -1],
+            in_stl.device_dtype,
+        )
+        return True, sparse_in_stl
 
     # Local import avoids circular dependency (propagate_layouts imports pass_utils).
     from .propagate_layouts import PropArg  # noqa: PLC0415
