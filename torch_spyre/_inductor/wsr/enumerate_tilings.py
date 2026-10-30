@@ -446,8 +446,9 @@ def build_tiling_space(
     views through another shape is not admitted
     (:func:`_unit_tile_breaks_a_reader`).
 
-    Logs, at DEBUG, one line per op: what it is offered, and why each refused
-    dim -- or the whole op -- is refused.
+    Logs, at DEBUG, one line per call: what ``op`` is offered, and why each
+    refused dim -- or the whole op -- is refused. A caller that builds the
+    space repeatedly repeats the line.
     """
     reason = _untileable_reason(op)
     stick_dim = _output_stick_host_dim(op) if reason is None else None

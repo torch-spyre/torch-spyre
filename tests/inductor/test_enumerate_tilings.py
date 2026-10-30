@@ -599,7 +599,8 @@ class TestTilingSpace(unittest.TestCase):
 
 
 class TestRefusalLog(unittest.TestCase):
-    """One DEBUG line per op: what it is offered, and why the rest is refused."""
+    """One DEBUG line per call: what the op is offered, and why the rest is
+    refused."""
 
     def _log(self, op, **kwargs):
         with self.assertLogs(enumerate_tilings_module.logger, level="DEBUG") as logs:
@@ -609,10 +610,10 @@ class TestRefusalLog(unittest.TestCase):
     def test_an_offered_op_names_each_refused_dim(self):
         log = self._log(_pointwise_op((1, 6, 128)))
         self.assertIn("buf0 is offered coarse tiling counts {1: [2, 3, 6]}", log)
+        # Dim 0's reason is forwarded from _split_candidates_for_host_dim, so
+        # match only the word that identifies it.
         self.assertIn("dim 0: ", log)
-        self.assertIn(
-            "Cannot auto-tile buf0: selected host dim 0 has unsplittable", log
-        )
+        self.assertIn("unsplittable", log)
         self.assertIn("dim 2: the stick dim", log)
 
     def test_a_dim_whose_every_count_breaks_a_reader_says_so(self):
