@@ -374,6 +374,17 @@ inline void addCollMetadata(trace_activity_type& trace_activity,
   }
 }
 
+// Per-CB hardware attributes: power counter, firmware begin/end timestamps
+// (VF only; 0 on PF), and the CB's index within its submitted batch.
+template <class trace_activity_type, class aiupti_activity_type>
+inline void addCbHardwareMetadata(trace_activity_type& trace_activity,
+                                  const aiupti_activity_type* activity) {
+  trace_activity->addMetadata("power", activity->power);
+  trace_activity->addMetadata("fw_begin_time", activity->fw_begin_time);
+  trace_activity->addMetadata("fw_end_time", activity->fw_end_time);
+  trace_activity->addMetadata("cb_idx", activity->cb_idx);
+}
+
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
@@ -564,6 +575,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   // Compute records always carry counters, so emit unconditionally: an
   // all-zero array here signals a counter failure rather than absence.
   kernel_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
+  addCbHardwareMetadata(kernel_activity, activity);
 
   recordStream(kernel_activity->device, kernel_activity->resource);
   kernel_activity->log(*logger);
@@ -684,6 +696,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
     memcpy_activity->addMetadata("cycles_ts", cyclesTsJson(activity));
   }
   addCollMetadata(memcpy_activity, activity);
+  addCbHardwareMetadata(memcpy_activity, activity);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
