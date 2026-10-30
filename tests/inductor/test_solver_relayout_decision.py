@@ -50,7 +50,7 @@ pytest.importorskip("ortools")
 from torch_spyre._inductor import config
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.pass_utils import PerCoreView
-from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+from torch_spyre._inductor.scratchpad import ilp_solver_ortools, sa_cooptimizer, utils
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     _sibling_pinned_divisions,
@@ -1022,11 +1022,18 @@ def test_annealer_relayout_move_keeps_a_link_another_copy_is_priced_for():
         assert assignment[m].menu_index == 1, "the anchored division moved"
 
 
+def _paying_chain_annealer():
+    """The chain, with spilling M priced as spilling P is: each link's
+    shuffle (1000) is then worth its source's residency (20000)."""
+    bufs = _chain(1000.0)
+    return _primed_annealer(bufs, expr=_objective(bufs, {"M": _SPILL_NS}))
+
+
 def test_annealer_relayout_move_buys_the_seams_it_opens():
     """Switching on P -> M moves M to division 1, which no longer matches C:
-    the move switches on the copy that pair names in the same step, so P, M
-    and both copies are eligible at once."""
-    solver = _primed_annealer(_chain(1000.0))
+    the move switches on the copy that pair names in the same step, and keeps
+    it because it pays, so P, M and both copies are eligible at once."""
+    solver = _paying_chain_annealer()
     first = _index(solver, relayout_copy_name("P", 0))
     second = _index(solver, relayout_copy_name("M", 0))
     solver._rng.choice = lambda options: first if second in options else options[0]
@@ -1056,14 +1063,16 @@ class _CountingPacker:
 def test_annealer_relayout_move_is_one_re_place():
     """The divisions, the drawn copy and the seam it opens all land in one
     packer update: a re-place is O(n), and one per copy would cost a recolor
-    whose boundary opens k seams k + 1 of them."""
-    solver = _primed_annealer(_chain(1000.0))
+    whose boundary opens k seams k + 1 of them. (Judging the seams afterwards
+    costs one more, however many there are.)"""
+    solver = _paying_chain_annealer()
     first = _index(solver, relayout_copy_name("P", 0))
     second = _index(solver, relayout_copy_name("M", 0))
-    solver._rng.choice = lambda options: first if second in options else options[0]
     solver.packer = _CountingPacker(solver.packer)
-    solver._relayout()
-    assert {first, second} <= solver._relayout_on
+    seams = solver._apply_assignment(
+        solver._relayout_assignment(first), buy_seams=True, switch_on=(first,)
+    )
+    assert seams == {second} and {first, second} <= solver._relayout_on
     assert solver.packer.updates == 1
     _assert_eligible_count(solver)
 
@@ -1080,6 +1089,92 @@ def test_annealer_buys_seams_only_under_the_cost_objective(expr):
     solver._apply_assignment(solver._relayout_assignment(first), buy_seams=True)
     assert solver._relayout_on == (set() if expr is None else {first, second})
     _assert_eligible_count(solver)
+
+
+def _sibling(relayout_cost_ns):
+    """P feeds C1 and C2. C1 has two divisions and both match P; C2 matches
+    no division of P and reads it only through a copy priced
+    ``relayout_cost_ns``. Moving C1 changes no edge into C2."""
+    c1 = CoreDivisionBuffer(
+        "C1",
+        64,
+        [1, 2],
+        core_divisions=[CoreDivision(splits={1: 4}), CoreDivision(splits={1: 2})],
+        parents=["P"],
+        cd_parent_matches={"P": [(0, 0), (0, 1)]},
+    )
+    c2 = _consumer("C2", 2, 3, [_candidate("C2", 0, relayout_cost_ns)])
+    return _with_copies(_producer([0, 3]), c1, c2)
+
+
+def test_annealer_sibling_move_keeps_a_switched_off_copy_off():
+    """A flip of C1 changes P -> C1 only. The P -> C2 copy, off because it costs
+    more than spilling P, must stay off: bought again, it would make P eligible
+    and charge the flip a shuffle on an edge it did not change."""
+    solver = _primed_annealer(_sibling(50000.0))
+    p, c1 = _index(solver, "P"), _index(solver, "C1")
+    copy = _index(solver, relayout_copy_name("P", 0))
+    assert solver.chosen[c1].menu_index == 0 and copy not in solver._relayout_on
+    seams = solver._atomic_flip(c1, solver._menus[c1].configs[1], buy_seams=True)
+    assert seams == set() and copy not in solver._relayout_on
+    assert not solver._eligible(p)
+    _assert_eligible_count(solver)
+
+
+def _seam(relayout_cost_ns):
+    """P feeds C, which matches P at its division 0 and reads it through a copy
+    priced ``relayout_cost_ns`` at its division 1."""
+    c = CoreDivisionBuffer(
+        "C",
+        64,
+        [1, 2],
+        core_divisions=[CoreDivision(splits={1: 4}), CoreDivision(splits={0: 4})],
+        parents=["P"],
+        cd_parent_matches={"P": [(0, 0)]},
+        cd_parent_relayouts={"P": [_candidate("C", 0, relayout_cost_ns, j=1)]},
+    )
+    return _with_copies(_producer([0, 3]), c)
+
+
+@pytest.mark.parametrize("relayout_cost_ns, kept", [(5000.0, True), (50000.0, False)])
+def test_annealer_keeps_a_seam_only_where_it_pays(relayout_cost_ns, kept):
+    """Flipping C to division 1 opens the P -> C seam, and the flip buys its
+    copy. The move is then judged at the better of its two plans: the shuffle
+    where it costs less than spilling P (20000), the spill where it costs more."""
+    solver = _primed_annealer(_seam(relayout_cost_ns))
+    p, c = _index(solver, "P"), _index(solver, "C")
+    copy = _index(solver, relayout_copy_name("P", 0))
+    seams = solver._atomic_flip(c, solver._menus[c].configs[1], buy_seams=True)
+    assert seams == {copy}
+    with_seam = solver._score()
+    solver._settle(seams)
+    assert (copy in solver._relayout_on) is kept
+    assert solver._eligible(p) is kept
+    _assert_eligible_count(solver)
+    spill = utils.to_fixed_us(_SPILL_NS / 1000)
+    assert solver._score() == min(with_seam, spill)
+
+
+@pytest.mark.parametrize("relayout_weight", [None, 0.0])
+@pytest.mark.parametrize("seed", range(5))
+def test_annealer_moves_a_sibling_of_a_spilled_source(
+    monkeypatch, seed, relayout_weight
+):
+    """The best plan spills P (20000 against a 50000 shuffle) and moves C1 to
+    its division 1, which saves 5000. Moving C1 must not buy the P -> C2 copy
+    back: with the relayout move off, nothing else could switch it off again,
+    and the search would stop at the seed. LX holds everything, so the packer
+    cannot make the call for it by leaving the copy out."""
+    monkeypatch.setattr(sa_cooptimizer, "_SEED", seed)
+    if relayout_weight is not None:
+        monkeypatch.setitem(sa_cooptimizer._MOVE_WEIGHTS, "relayout", relayout_weight)
+    bufs = _sibling(50000.0)
+    c1 = next(b for b in bufs if b.name == "C1")
+    expr = _objective(bufs) + 5000 * (1 - c1.sym_division)
+    r = _solve("annealer", bufs, size=1024, expr=expr)
+    assert r["C1"].chosen_division == 1
+    assert r["P"].address is None and _copy(r).address is None
+    assert r["C2"].chosen_relayouts == {}
 
 
 def test_annealer_never_draws_a_copy_whose_source_is_pinned_out():
@@ -1173,8 +1268,6 @@ def test_annealer_scores_relayout_charges_as_the_expression_does():
     compiling them. Over every division of M and every resident set, its score
     must equal the whole objective evaluated directly."""
     import itertools
-
-    from torch_spyre._inductor.scratchpad import utils
 
     bufs = _chain(1000.0)
     expr = _objective(bufs, {"M": 20000.0})

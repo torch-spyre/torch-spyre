@@ -1869,16 +1869,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _atomic_flip(
         self, idx: int, config: DivisionConfig, *, buy_seams: bool = False
-    ) -> None:
+    ) -> set[int]:
         """Change buffer ``idx``'s division to ``config`` and ripple: resize its
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
         an op's own division and its children's -- plus their relayout copies,
         whose eligibility follows their source's. The one-op case of
-        :meth:`_apply_assignment`, whose ripple is exactly that."""
-        self._apply_assignment({idx: config}, buy_seams=buy_seams)
+        :meth:`_apply_assignment`, whose ripple is exactly that. Returns the
+        seams it bought."""
+        return self._apply_assignment({idx: config}, buy_seams=buy_seams)
 
-    def _retile_boundary(self, idx: int, config: DivisionConfig) -> None:
+    def _retile_boundary(self, idx: int, config: DivisionConfig) -> set[int]:
         """Spread ``config``'s tiling from ``idx`` to one end of its run.
 
         The tiling arm of flip. ``idx`` sits in a uniform run ``A..Z``; this
@@ -1905,10 +1906,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         The single-op flip survives as the degenerate case -- ``H`` at a run end
         -- and a mid-run split is two steps rather than one.
+
+        Returns the seams it bought.
         """
         position = self._position_of[idx]
         if position is None:
-            return  # no operation position, so no run to move a boundary in
+            return set()  # no operation position, so no run to move a boundary in
         lo, hi = self._run_bounds(position)
         # The only randomness this move draws beyond the neighbour choice, and it
         # is drawn only here: a space with no tiling half never reaches this arm,
@@ -1932,8 +1935,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             if at == end:
                 break
             at += step
-        if assignment:
-            self._apply_assignment(assignment, buy_seams=True)
+        if not assignment:
+            return set()
+        return self._apply_assignment(assignment, buy_seams=True)
 
     def _misread_across(
         self, at: int, start: int, spec: "TileSpec", forward: bool
@@ -2038,7 +2042,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         *,
         buy_seams: bool = False,
         switch_on: Sequence[int] = (),
-    ) -> None:
+    ) -> set[int]:
         """Commit a multi-op division assignment: set every op's division, resize
         its footprint, and refresh eligibility for the assigned set plus their
         parents (the same ripple as a flip, unioned over the set).
@@ -2047,7 +2051,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         boundary flip's sub-run, a single-op flip and a relayout move. With
         ``buy_seams`` it also switches on the copies the new divisions need
         (:meth:`_seam_copies`), and the copies in ``switch_on``, all in the same
-        one re-place.
+        one re-place. Returns the seams it switched on, apart from
+        ``switch_on``, for :meth:`_settle` to judge.
         """
         # The affected set is division-invariant, so it is built (and its old
         # eligibility counted, off the mask) before the coloring lands. A copy
@@ -2061,10 +2066,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         before = sum(self._eligible_mask[x] for x in affected)
         for op, config in assignment.items():
             self.chosen[op] = config
-        bought = set(switch_on)
-        if buy_seams:
-            bought |= self._seam_copies(assignment)
-        bought -= self._relayout_on
+        seams = self._seam_copies(assignment) if buy_seams else set()
+        seams.difference_update(switch_on)
+        bought = (seams | set(switch_on)) - self._relayout_on
         self._relayout_on |= bought
         affected_sorted = sorted(affected | bought)
         resizes = [
@@ -2076,6 +2080,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._note_eligibility(flags)
         self._switch_off_stale_copies(flags)
         self._n_eligible += sum(flags.values()) - before
+        return seams
 
     def _toggle_relayout(self, copy_idx: int) -> None:
         """Switch relayout copy ``copy_idx`` on or off, and ripple.
@@ -2085,15 +2090,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         only saves traffic, and wrong for a copy, whose residency costs its
         price. Off, the copy is ineligible, and so is its source wherever a
         consumer reads it only through this copy. On, both may be placed.
+        """
+        self._switch_relayouts({copy_idx}, on=copy_idx not in self._relayout_on)
 
-        A toggle changes the eligibility of the copy and its source, and the
+    def _switch_relayouts(self, copies: set[int], *, on: bool) -> None:
+        """Switch every copy in ``copies`` on or off, and ripple, in one
+        re-place.
+
+        A switch changes the eligibility of the copy and its source, and the
         source's decides its other copies' (:meth:`_relayout_copy_eligible`).
         """
-        affected = sorted(
-            self._with_relayout_copies({self._relayout_source[copy_idx]}) | {copy_idx}
-        )
+        sources = {self._relayout_source[c] for c in copies}
+        affected = sorted(self._with_relayout_copies(sources) | copies)
         before = sum(self._eligible_mask[x] for x in affected)
-        self._relayout_on ^= {copy_idx}
+        if on:
+            self._relayout_on |= copies
+        else:
+            self._relayout_on -= copies
         flags = self._eligibility(affected)
         self.packer.update([], [(x, flags[x]) for x in affected])
         self._note_eligibility(flags)
@@ -2111,18 +2124,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         serve to one of its priced pairs (:meth:`_relayout_assignment`), and
         buys every seam that change opens (:meth:`_seam_copies`) -- the whole
         group, and the copies the new divisions need around it, bought in one
-        re-place and judged as a unit, as recolor judges a flooded region.
+        re-place and judged as a unit, as recolor judges a flooded region. The
+        drawn copy is the move; the seams around it are kept only where they
+        pay (:meth:`_settle`).
         """
         copy_idx = self._rng.choice(self._relayout_copy_list)
         if copy_idx in self._relayout_on:
             self._toggle_relayout(copy_idx)
+            self._burst()
         else:
-            self._apply_assignment(
-                self._relayout_assignment(copy_idx),
-                buy_seams=True,
-                switch_on=(copy_idx,),
+            self._settle(
+                self._apply_assignment(
+                    self._relayout_assignment(copy_idx),
+                    buy_seams=True,
+                    switch_on=(copy_idx,),
+                )
             )
-        self._burst()
 
     def _relayout_assignment(self, copy_idx: int) -> dict[int, DivisionConfig]:
         """The divisions that make copy ``copy_idx`` serve: its source at one of
@@ -2179,18 +2196,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return anchored
 
     def _seam_copies(self, assignment: dict[int, DivisionConfig]) -> set[int]:
-        """The switched-off copies an edge the ``assignment`` touched now needs,
+        """The switched-off copies an edge the ``assignment`` changed now needs,
         under the divisions it set -- after any structural move, not only a
         relayout one: the edges out of each reassigned buffer and into it from
         its parents that no longer match, where the new pair of divisions names
         a copy that could be resident.
 
-        Without them, a source with a second mismatched consumer, or the next
-        link of a chain, stays ineligible until another relayout move happens
-        to draw exactly that copy, and that move alone is worth nothing to the
-        score. A seam with no priced copy is left as it is: the source goes out
-        of LX, which the score judges. Under the memory-only fallback there is
-        no price for a shuffle, so none is bought."""
+        Without them, the next link of a chain, or a source whose reassignment
+        mismatches several consumers, stays ineligible until another relayout
+        move happens to draw exactly that copy, and that move alone is worth
+        nothing to the score. A seam with no priced copy is left as it is: the
+        source goes out of LX, which the score judges. Under the memory-only
+        fallback there is no price for a shuffle, so none is bought.
+
+        Only edges with an end in ``assignment``: an edge between a parent and
+        a sibling of a reassigned buffer has the pair of divisions it had, so a
+        copy the search switched off there stays off. Whether a bought seam
+        pays is :meth:`_settle`'s call."""
         if self._score_fn is None or not self._relayout_buyable:
             return set()
         touched = set(assignment)
@@ -2202,6 +2224,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 continue
             config = self.chosen[parent]
             for child, relation in self._children[parent]:
+                if parent not in assignment and child not in assignment:
+                    continue
                 if relation.compatible(config, self.chosen[child]):
                     continue
                 read = self._relayout_read(parent, child)
@@ -2230,8 +2254,36 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # The flood stops at every edge with no compatible pair, and those
         # seams are where a relayout can stand: buying them turns an accepted
         # seam into a priced choice rather than a source spilled.
-        self._apply_assignment(assignment, buy_seams=True)
+        self._settle(self._apply_assignment(assignment, buy_seams=True))
+
+    def _settle(self, seams: set[int]) -> None:
+        """Burst, then judge the ``seams`` a structural move bought as a unit:
+        keep them only if the state scores no worse with them than without.
+
+        A seam is a choice between two plans for its edge: the copy on and its
+        price paid, or the copy off and its source spilled. Bought blind, every
+        structural move is scored as the first, so a move whose own gain beats
+        the spill but not the shuffle is rejected for a price it need not pay.
+        A per-copy price test (price below the source's spill) cannot replace
+        this: two copies of one source can each pass it and together cost more
+        than the spill, and the spill a copy saves depends on the source's
+        other consumers. Scoring both is exact, for one more re-place and score
+        on the moves that open a seam. A subset of the seams stays reachable
+        through the relayout move.
+
+        The variant without the seams keeps the burst's ``pi``: switching
+        copies off only removes eligible buffers, so the packer re-places what
+        is left from the same order. Draws no randomness, so a move that buys
+        no seam -- every move on a graph without copies -- is just the burst.
+        """
         self._burst()
+        if not seams:
+            return
+        with_seams = self._score()
+        snap = self._snapshot()
+        self._switch_relayouts(seams, on=False)
+        if self._score() > with_seams:
+            self._adopt(snap)
 
     def _burst(self) -> None:
         """A short cold layout burst: greedily accept layout steps that do not
@@ -2338,10 +2390,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             # a stretch that reaches one end of the op's run rather than the op
             # alone (see ``_retile_boundary`` for where it stops short).
             if config.tiling == self.chosen[idx].tiling:
-                self._atomic_flip(idx, config, buy_seams=True)
+                seams = self._atomic_flip(idx, config, buy_seams=True)
             else:
-                self._retile_boundary(idx, config)
-            self._burst()
+                seams = self._retile_boundary(idx, config)
+            self._settle(seams)
         elif name == "recolor":
             self._recolor()
         elif name == "relayout":

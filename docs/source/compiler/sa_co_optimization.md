@@ -178,9 +178,16 @@ Switching it on alone would pay only when the divisions already sat on one of it
 Among the copy's source divisions, it draws from those that move the fewest buffers another switched-on copy is priced for, so a chain of relayouts (a buffer that is the consumer of one copy and the source of the next) does not lose one link for every link it gains.
 
 Every structural move also buys the seams it opened (`_seam_copies`): each edge out of a reassigned buffer, or into it from a parent, that no longer matches and whose new pair names a copy gets that copy switched on in the same step.
+Only those edges: an edge from a parent to a sibling of a reassigned buffer keeps its pair of divisions, so a copy the search switched off there stays off.
 The divisions, the copies and the packer's eligibility all change in one re-place, so a move pays for one re-place however many seams it opens.
 A recolor's flood stops at every edge with no compatible pair, and those seams are exactly where a relayout can stand, so a region and the relayouts at its boundary are judged as one move.
 On the prefill attention graphs this is what reaches CP-SAT's plans, which recolor a region and relay out into it.
+
+A seam is a choice between two plans for its edge: the copy on and its price paid, or the copy off and its source spilled.
+So a move that bought seams is scored both ways after its burst, and keeps the seams only if they score no worse (`_settle`).
+Bought blind, every move would be scored with its copies on, and a move whose own gain beats the spill but not the shuffle would be rejected.
+A per-copy price test cannot replace this: two copies of one source can each cost less than its spill and together cost more.
+The second score costs one re-place on the moves that open a seam; a move that opens none, which is every move on a graph without copies, is unchanged.
 
 The memory-only fallback has no price for a shuffle, so under it every copy stays off: the move is not offered and no seam is bought.
 A relayout copy carries no division decision, so it buys the search no steps.
