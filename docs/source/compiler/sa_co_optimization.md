@@ -167,6 +167,10 @@ A dropped buffer's range still pushed others out while the packer ran, which tea
 It has not been needed: on the decode (ctx 512 and 2048) and prefill (128 and 512) attention graphs no final plan drops anything, and only the search's intermediate states do (21% of them on prefill 512), which the score prices.
 The write-back logs any drop at debug level (`_log_coupling_drops`), the signal to look for before changing the packer.
 The score, the dump and the write-back all read that resident set, and the write-back records each relayout read in `chosen_relayouts`, as CP-SAT does.
+The eligibility that resident set rests on is kept incrementally: each move updates only the buffers it can change, and the cleanup reads only the eligible copies.
+So before committing anything, the write-back recounts eligibility from scratch and raises if the tracked state disagrees (`_check_tracked_eligibility`), and raises if a resident source has a mismatched consumer with no resident copy to read it through.
+Both are explicit raises, not asserts: either failure would commit a consumer reading LX in the wrong layout, and `python -O` strips an assert.
+A randomized test drives every move, keeping or restoring each at random, and checks the tracking after every step against a recount, the coupling read off the graph, and the objective evaluated directly.
 
 Residency cannot decide a shuffle on its own.
 The packer places every eligible buffer that fits, which is right for a buffer whose residency only saves traffic and wrong for a copy, whose residency costs its price.

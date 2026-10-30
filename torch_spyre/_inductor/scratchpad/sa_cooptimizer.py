@@ -2708,9 +2708,30 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         (:meth:`_resident_addresses`); that read is recorded on the consumer
         with the copy's address, as ``CpSatLayoutSolver`` records it, for the
         commit path to materialize.
+
+        Both checks run before any buffer is touched, and raise rather than
+        assert: a failure would otherwise commit a consumer reading LX in the
+        wrong layout, and ``python -O`` strips an ``assert``.
         """
+        self._check_tracked_eligibility()
         addresses = self._resident_addresses()
         self._log_coupling_drops(addresses)
+        reads: list[tuple[int, int, int, RelayoutCandidate]] = []
+        for source, copies in enumerate(self._relayout_copies_of):
+            if not copies or addresses[source] is None:
+                continue
+            parent = self.chosen[source]
+            for consumer, relation in self._children[source]:
+                if relation.compatible(parent, self.chosen[consumer]):
+                    continue
+                read = self._relayout_read(source, consumer)
+                if read is None or addresses[read[0]] is None:
+                    raise RuntimeError(
+                        f"SA co-optimizer: {self._bufs[source].name} is resident "
+                        f"but {self._bufs[consumer].name} has no resident copy to "
+                        "read it through"
+                    )
+                reads.append((source, consumer, *read))
         for i, b in enumerate(self._bufs):
             addr = addresses[i]
             b.chosen_division = self._menu_position(i, self.chosen[i])
@@ -2720,23 +2741,43 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             b.address = addr
             spilled = b.residency_reason or _SOLVER_CHOSE_SPILL
             b.spill_reason = spilled if addr is None else None
-        for source, copies in enumerate(self._relayout_copies_of):
-            if not copies or addresses[source] is None:
-                continue
-            parent = self.chosen[source]
-            for consumer, relation in self._children[source]:
-                if relation.compatible(parent, self.chosen[consumer]):
-                    continue
-                read = self._relayout_read(source, consumer)
-                assert read is not None and addresses[read[0]] is not None, (
-                    f"{self._bufs[source].name} is resident but "
-                    f"{self._bufs[consumer].name} has no resident copy to read it "
-                    "through"
-                )
-                copy_idx, candidate = read
-                self._bufs[consumer].chosen_relayouts[self._bufs[source].name] = (
-                    ChosenRelayout(candidate, cast(int, addresses[copy_idx]))
-                )
+        for source, consumer, copy_idx, candidate in reads:
+            self._bufs[consumer].chosen_relayouts[self._bufs[source].name] = (
+                ChosenRelayout(candidate, cast(int, addresses[copy_idx]))
+            )
+
+    def _check_tracked_eligibility(self) -> None:
+        """Recount eligibility from scratch and raise if the tracked state
+        disagrees.
+
+        The anneal keeps the eligibility mask, the eligible copies and their
+        count incrementally: each move updates only the buffers it can change.
+        The coupling cleanup (:meth:`_resident_indices`) reads the eligible
+        copies alone, so a buffer a move missed would let a source stay
+        resident without the copy a consumer reads it through. A disagreement
+        also means the search scored states under the wrong eligibility, so it
+        is an error in the tracking, never repaired here. One O(n) pass, next
+        to an anneal of thousands of moves.
+        """
+        n = len(self._bufs)
+        recount = [self._eligible(i) for i in range(n)]
+        wrong = {i for i in range(n) if bool(self._eligible_mask[i]) != recount[i]}
+        wrong |= self._eligible_copies ^ {
+            c for c in self._relayout_source if recount[c]
+        }
+        if not wrong and self._n_eligible == sum(recount):
+            return
+        names = sorted(self._bufs[i].name for i in wrong)
+        logger.error(
+            "SA co-optimizer: tracked eligibility drifted from a recount "
+            "(eligible count %d, recount %d; buffers that differ: %s)",
+            self._n_eligible,
+            sum(recount),
+            names,
+        )
+        raise RuntimeError(
+            f"SA co-optimizer: tracked eligibility drifted from a recount: {names}"
+        )
 
     def _known_menu_position(self, idx: int, config: DivisionConfig) -> Optional[int]:
         """The position in buffer ``idx``'s ``core_divisions`` that names

@@ -1344,6 +1344,154 @@ def test_annealer_switches_off_a_copy_a_division_change_strands():
     _assert_eligible_count(solver)
 
 
+def _two_way(name, uses, parents=(), matches=None, relayouts=None):
+    """A buffer with two 4-way divisions (0 splits dim 1, 1 dim 0)."""
+    return CoreDivisionBuffer(
+        name,
+        64,
+        list(uses),
+        core_divisions=[CoreDivision(splits={1 - d: 4}) for d in range(2)],
+        parents=list(parents),
+        cd_parent_matches=matches or {},
+        cd_parent_relayouts=relayouts or {},
+    )
+
+
+def _mixed():
+    """A chain and a fan-out over one source, with cheap and dear copies:
+    P -> M -> C relays out twice (P -> M cheap, M -> C dear), P -> C1 matches
+    at (0, 0) and relays out cheaply from P's division 1, and P -> C2 matches
+    nowhere and relays out dearly. Every buffer has two divisions, so every
+    move applies."""
+    return _with_copies(
+        _two_way("P", [0, 4]),
+        _two_way(
+            "M",
+            [1, 2],
+            ["P"],
+            {"P": []},
+            {"P": [_candidate("M", 0, 1000.0, 0, j=1)]},
+        ),
+        _two_way(
+            "C",
+            [2, 3],
+            ["M"],
+            {"M": []},
+            {
+                "M": [
+                    _candidate("C", i, 50000.0, parent="M", j=j)
+                    for i in (0, 1)
+                    for j in (0, 1)
+                ]
+            },
+        ),
+        _two_way(
+            "C1",
+            [1, 2],
+            ["P"],
+            {"P": [(0, 0)]},
+            {"P": [_candidate("C1", 1, 1000.0, 1)]},
+        ),
+        _two_way(
+            "C2",
+            [3, 4],
+            ["P"],
+            {"P": []},
+            {
+                "P": [
+                    _candidate("C2", i, 50000.0, 2, j=j) for i in (0, 1) for j in (0, 1)
+                ]
+            },
+        ),
+    )
+
+
+def _resident_oracle(s) -> set[int]:
+    """The coupling read directly off the graph, without the tracked eligible
+    copies: placed, minus each source a mismatched consumer cannot read
+    through a placed copy, minus each copy whose source is then not
+    resident."""
+    resident = set(s.packer.allocated_indices())
+    for source in list(resident):
+        for consumer, relation in s._children[source]:
+            if relation.compatible(s.chosen[source], s.chosen[consumer]):
+                continue
+            read = s._relayout_read(source, consumer)
+            if read is None or read[0] not in resident:
+                resident.discard(source)
+                break
+    return {
+        i
+        for i in resident
+        if i not in s._relayout_source or s._relayout_source[i] in resident
+    }
+
+
+def _score_oracle(s, expr, resident: set[int]) -> int:
+    """``expr`` evaluated as ``solved_bindings`` binds a solved plan, from the
+    live state: the division index looked up in the buffer's own menu."""
+    bindings = {}
+    for i, b in enumerate(s._bufs):
+        bindings[b.sym_is_lx] = int(i in resident)
+        division = s.chosen[i].division
+        bindings[b.sym_division] = (
+            b.core_divisions.index(division) if division in b.core_divisions else -1
+        )
+        for key, sym in b.sym_core_divs.items():
+            bindings[sym] = division.splits.get(key, 1)
+        for key, sym in b.sym_tile_counts.items():
+            bindings[sym] = division.tiling.count_for(key)
+    return utils.to_fixed_us(max(0.0, float(expr.xreplace(bindings))) / 1000.0)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("size", [40, 1024])
+def test_annealer_tracking_survives_random_moves_and_restores(seed, size):
+    """Random moves, each kept or restored at random, checked after every step
+    against references that share no state with the tracking: the eligibility
+    recount, the coupling read off the graph, and the objective evaluated
+    directly. A drift then fails at the move that caused it, not at the end of
+    a long anneal."""
+    bufs = _mixed()
+    expr = _objective(bufs, {"M": 20000.0, "C1": 3000.0, "C2": 3000.0})
+    s = _primed_annealer(bufs, size=size, expr=expr)
+    s._rng = random.Random(seed)
+    s._flippable_ops = s._flippable()
+    coin = random.Random(1000 + seed)
+    cur = s._score()
+    # Best-seen, as _anneal starts it: the reorder step updates it.
+    s._best_score, s._best_snap = cur, s._snapshot()
+    for step in range(300):
+        name = s._choose_move()
+        if name == "reorder":
+            cur = s._step(name, coin.choice([1e-9, 1e9]), cur)
+        else:
+            snap = s._snapshot()
+            s._execute_move(name)
+            if coin.random() < 0.5:
+                s._adopt(snap)
+            cur = s._score()
+        tag = f"seed={seed} size={size} step={step} move={name}"
+        _assert_eligible_count(s)
+        resident = _resident_oracle(s)
+        assert s._resident_indices() == resident, tag
+        companions = s._companions(resident)
+        assert s._score() == _score_oracle(s, expr, resident) + companions, tag
+    s._check_tracked_eligibility()
+
+
+def test_annealer_write_back_raises_on_drifted_eligibility():
+    """A drift the moves left behind fails the solve loudly, naming the
+    buffer, before anything is committed; ``python -O`` must not strip it."""
+    s = _primed_annealer(_mixed(), size=1024)
+    p = _index(s, "P")
+    s._eligible_mask[p] = not s._eligible_mask[p]
+    before = [(b.chosen_division, b.address) for b in s._bufs]
+    with pytest.raises(RuntimeError, match="drifted from a recount: \\['P'\\]"):
+        s._write_back()
+    assert [(b.chosen_division, b.address) for b in s._bufs] == before
+
+
 def test_annealer_scores_relayout_charges_as_the_expression_does():
     """The annealer sums the copies' RelayoutCharge terms itself instead of
     compiling them. Over every division of M and every resident set, its score
