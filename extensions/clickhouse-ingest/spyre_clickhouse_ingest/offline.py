@@ -877,6 +877,9 @@ def add_offline_options(parser) -> None:
     )
     g.add_argument("--bundle-prop", action="append", type=_pair, default=[],
                    help="--from-bundle: k=v added to the verdict's props (the source keys win)")  # fmt: skip
+    g.add_argument("--append-to-run", action="store_true",
+                   help="--from-bundle: add this bundle's files to the manual run it names, "
+                   "which already has results (needs --bundle-prop upload_id=<id>)")  # fmt: skip
     g.add_argument("--trusted-job-prefix", action="append", default=[],
                    help="--from-bundle: accept a Jenkins run key only from these jobs")  # fmt: skip
     g.add_argument(
