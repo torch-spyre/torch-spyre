@@ -953,7 +953,8 @@ def align_tensors_pure(
     # dict.fromkeys preserves insertion order; set() does not. This matters for two
     # reasons: (1) frontend determinism; (2) backend workaround — the backend is
     # sensitive to iteration_space dim label order even though semantically it
-    # should not be.
+    # should not be. The restored size-1 loops (the synthetic vars) come after the
+    # original loops. For a matmul, simplify_op_spec moves them in front of K.
     all_vars = dict.fromkeys(var_ranges.keys())
     for terms in all_terms:
         for term in terms:

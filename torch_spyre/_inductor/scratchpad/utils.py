@@ -615,6 +615,8 @@ def get_ncores_for_buffers(
     validated drain plan will repoint at the post-loop drain.  The judge runs
     before that rewrite, so that collective's use is not one of the storage's.
     """
+    from .lx_relayout import is_partial_lx_read, local_lx_subrange_certificate
+
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
@@ -706,6 +708,20 @@ def get_ncores_for_buffers(
                     f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
                 )
                 break
+        if mismatch_reason is None:
+            producer = graph.try_get_buffer(buf_name)
+            for op, dep in users:
+                if dep in op_read_writes(op).reads and is_partial_lx_read(
+                    producer, dep
+                ):
+                    if (
+                        local_lx_subrange_certificate(
+                            graph, producer, op, ref_view, ref_view
+                        )
+                        is None
+                    ):
+                        mismatch_reason = f"partial LX read on '{op.get_name()}'"
+                        break
         if mismatch_reason is not None:
             num_cores = -1
             mismatch_reasons_cache[buf_name] = mismatch_reason
@@ -762,6 +778,8 @@ def _would_produce_lx_back_gap(
     certified prefix-slice gather whose unsplit-K consumer uses a uniform
     outer tail gap, with a guaranteed disjoint full-buffer copy.
     """
+    from .lx_relayout import local_lx_subrange_geometry
+
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout
     device_size = stl.device_size
@@ -771,6 +789,13 @@ def _would_produce_lx_back_gap(
         rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             if dep.name != buf_name:
+                continue
+            if (
+                dep in rw.reads
+                and local_lx_subrange_geometry(graph, buf, op) is not None
+            ):
+                # Emission uses the proved compact input shape. Other readers
+                # still undergo the ordinary back-gap test below.
                 continue
             try:
                 coords = device_coordinates(stl, dep, None)

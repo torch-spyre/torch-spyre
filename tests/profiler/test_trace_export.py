@@ -144,6 +144,20 @@ def test_device_flows_require_both_endpoints(native_traces):
     )
 
 
+def test_runtime_data_metadata(native_traces):
+    events = _read(native_traces / "runtime-metadata.json")["traceEvents"]
+    spans = {
+        event["args"]["correlation"]: event
+        for event in events
+        if event.get("ph") == "X" and "correlation" in event.get("args", {})
+    }
+    barrier, send = spans[40], spans[41]
+    assert barrier["name"] == "aiuIssueBarrier"
+    assert barrier["args"]["fence_size"] == 3
+    assert send["name"] == "aiuLaunchP2PRdmaSend"
+    assert send["args"]["num_dest_ranks"] == 5
+
+
 @pytest.mark.parametrize("prefix", ["reused", "scheduled-reused"])
 def test_capture_state_does_not_leak(native_traces, prefix):
     snapshots = [_read(native_traces / f"{prefix}-{window}.json") for window in (0, 1)]
@@ -247,6 +261,12 @@ def _capture_native_traces(output):
     ) as prof:
         fixture.emit_flow_pairs()
     prof.export_chrome_trace(str(output / "flow-pairs.json"))
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        fixture.emit_runtime_metadata()
+    prof.export_chrome_trace(str(output / "runtime-metadata.json"))
 
     lookups = []
     for window in range(2):
