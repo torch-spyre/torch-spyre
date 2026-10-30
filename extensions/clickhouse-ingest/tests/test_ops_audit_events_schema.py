@@ -60,14 +60,12 @@ def test_a_refused_attempt_may_have_no_actor(chdb_session):
     s = chdb_session
     _insert(s, _event(actor="", result="refused", status=401, reason="no login"))
     _insert(s, _event(event_id="018f0000-0000-7000-8000-000000000002"))
-    got = json.loads(
-        "[" + ",".join(
-            s.query(
-                "SELECT actor, result, status FROM ops_audit_events ORDER BY event_id",
-                "JSONEachRow",
-            ).data().decode().split("\n")[:-1]
-        ) + "]"
-    )  # fmt: skip
+    raw = s.query(
+        "SELECT actor, result, status FROM ops_audit_events ORDER BY event_id",
+        "JSONEachRow",
+    ).data()
+    raw = raw.decode() if isinstance(raw, bytes) else raw
+    got = [json.loads(line) for line in raw.splitlines()]
     assert got == [
         {"actor": "", "result": "refused", "status": 401},
         {"actor": "alice@ibm.com", "result": "ok", "status": 200},
