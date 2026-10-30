@@ -28,7 +28,7 @@ def chdb_session():
     session = pytest.importorskip("chdb.session")
     s = session.Session()
     for stmt in SchemaApplier.statements(
-        (SCHEMA_DIR / "66-ops-audit-events.sql").read_text()
+        (SCHEMA_DIR / "72-ops-audit-events.sql").read_text()
     ):
         s.query(stmt)
     yield s
