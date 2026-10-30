@@ -294,7 +294,6 @@ def _inductor_cache_key_config():
 # one, so the test also changes something when the environment sets it.
 _KEPT_OUT_OF_THE_CACHE_KEY = {
     "num_cpus": lambda value: (value or 1) + 2,
-    "backend_compile_timeout_seconds": lambda value: value + 1,
     "timing": lambda value: not value,
     "timing_out": lambda value: value + ".other",
     "dump_cost_expr_file": lambda value: value + ".other",
@@ -328,7 +327,6 @@ def test_each_cache_key_ignore_prefix_matches_only_known_settings():
     }
     assert matched == {
         "num_cpus": ["num_cpus"],
-        "backend_compile_timeout_seconds": ["backend_compile_timeout_seconds"],
         "timing": ["timing", "timing_out"],
         "dump_cost_expr_file": ["dump_cost_expr_file"],
         "spyre_kernel_cache": ["spyre_kernel_cache"],

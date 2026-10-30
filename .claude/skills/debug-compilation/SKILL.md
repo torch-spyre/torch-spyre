@@ -168,7 +168,7 @@ compiler.
 **Failure symptoms:**
 
 - `dbo-opt` exit code != 0
-- Compilation timeout (default 60s; set `SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS`)
+- Compilation timeout (bounded by `_COMPILE_TIMEOUT_S`, 60s)
 - Exit 0 having written no `spyreCodeDir/spyrecode.json`
 
 **Debugging:**

@@ -1268,17 +1268,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # division-dependent ineligibility is deliberately *not* expressed here: it
         # must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
-        # FirstFit rejects an in-place child larger than its parent outright; the
-        # packer instead skips such a pair per move, as sizes change with the
-        # division. Drop those pairs for the seed pass only, as
-        # ExhaustiveSearchSolver does (an unsized parent clamps to 0 here).
-        for b in ff_bufs:
-            child_size = sizes[self._name_to_idx[b.name]]
-            b.in_place_parents = [
-                p
-                for p in b.in_place_parents
-                if sizes[self._name_to_idx[p]] >= child_size
-            ]
         # Deep-copied so FirstFit lays out its own objects, never the ones the
         # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(

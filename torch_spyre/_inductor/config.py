@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import decimal
-import math
 import os
 import sys
 from typing import Literal
@@ -128,33 +126,6 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-
-# Wall-clock ceiling, in seconds, on ONE backend-compiler (dbo-opt) invocation,
-# on both the bundle and the KTIR path. It bounds a wedged compiler -- which
-# would otherwise block torch.compile forever with no diagnostic -- rather than
-# policing slowness: a small kernel finishes in well under a second. Raise it if
-# a large bundle legitimately needs longer; non-positive values disable the
-# limit. The parent reads it and passes it to each compile, so a runtime
-# ``config.patch`` also reaches compiles in Inductor's subprocess pool.
-def _backend_compile_timeout_from_env() -> float:
-    value = os.environ.get("SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS", "60")
-    try:
-        timeout = float(value)
-    except ValueError as exc:
-        raise ValueError(
-            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a number of seconds, "
-            f"got {value!r}"
-        ) from exc
-    if not math.isfinite(timeout) or (timeout == 0 and decimal.Decimal(value) != 0):
-        raise ValueError(
-            "SPYRE_BACKEND_COMPILE_TIMEOUT_SECONDS must be a finite number "
-            f"of seconds representable as a float, got {value!r}"
-        )
-    return timeout
-
-
-backend_compile_timeout_seconds: float = _backend_compile_timeout_from_env()
-
 # Enable certified LX ownership changes: movement, exact fused-axis views,
 # consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
@@ -165,7 +136,7 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
-# Enable optional ownership proofs and local reads added after prefix support.
+# Enable optional ownership proofs added after prefix relayout support.
 # Set SPYRE_LX_EXTENDED_OWNERSHIP=0 to keep the earlier ownership and prefix rules.
 lx_extended_ownership: bool = os.getenv("SPYRE_LX_EXTENDED_OWNERSHIP", "1").lower() in (
     "1",
@@ -490,8 +461,6 @@ _cache_config_ignore_prefix: list[str] = [
     # The CP-SAT worker count: an explicit SPYRE_NUM_CPUS or patch would
     # otherwise split the cache by machine for identical graphs.
     "num_cpus",
-    # A limit on compiler execution time, not an input to generated code.
-    "backend_compile_timeout_seconds",
     # Where logs go and whether kernels are kept on disk: these do not change
     # the compiled code (spyre_kernel_cache only picks between the kernel disk
     # cache and a fresh backend compile). Without them, a run that only writes

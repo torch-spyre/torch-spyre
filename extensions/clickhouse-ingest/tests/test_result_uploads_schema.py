@@ -72,7 +72,7 @@ def test_rows_must_be_linked_and_the_view_names_the_uploader():
     def insert(row):
         s.query("INSERT INTO result_uploads FORMAT JSONEachRow\n" + json.dumps(row))
 
-    for bad in ({"artifact_id": NIL}, {"run_id": NIL}, {"format": "xml"}, {"state": "approved"},
+    for bad in ({"artifact_id": NIL}, {"run_id": NIL}, {"format": "xml"}, {"state": "rejected"},
                 {"test_type": "nightly"}, {"result_kind": "tests"}):  # fmt: skip
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             insert(_upload(**bad))
@@ -189,78 +189,3 @@ def test_a_retracted_upload_leaves_the_capability_views():
         .split()
     )
     assert got == [f'"{CI_RUN}"']
-
-
-def test_a_pending_upload_is_not_published():
-    session = pytest.importorskip("chdb.session")
-
-    s = session.Session()
-    for name in (
-        "10-functional-tests.sql",
-        "20-artifacts.sql",
-        "49-result-uploads.sql",
-    ):
-        for stmt in SchemaApplier.statements((SCHEMA_DIR / name).read_text()):
-            s.query(stmt)
-    for state in ("pending", "rejected", "expired"):
-        s.query(
-            "INSERT INTO result_uploads FORMAT JSONEachRow\n"
-            + json.dumps(_upload(state=state))
-        )
-    got = s.query("SELECT state FROM v_result_uploads", "JSONEachRow").data()
-    assert json.loads(got) == {"state": "expired"}
-
-
-def test_rbac_keeps_the_newest_version_and_logs_every_one():
-    session = pytest.importorskip("chdb.session")
-
-    s = session.Session()
-    for stmt in SchemaApplier.statements((SCHEMA_DIR / "64-rbac.sql").read_text()):
-        s.query(stmt)
-
-    def put(table, row):
-        s.query(f"INSERT INTO {table} FORMAT JSONEachRow\n" + json.dumps(row))
-
-    with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
-        put("rbac_roles", {"role_id": "r", "permissions": ["uploads"]})
-    put(
-        "rbac_roles",
-        {
-            "role_id": "uploader",
-            "permissions": ["uploads:publish"],
-            "updated_at": "2026-01-01 00:00:00",
-        },
-    )
-    put(
-        "rbac_roles",
-        {
-            "role_id": "uploader",
-            "permissions": ["uploads:*"],
-            "updated_at": "2026-02-01 00:00:00",
-        },
-    )
-    got = s.query("SELECT permissions FROM rbac_roles FINAL", "JSONEachRow").data()
-    assert json.loads(got) == {"permissions": ["uploads:*"]}
-
-    b = {
-        "binding_id": "b1",
-        "subject": "alice@ibm.com",
-        "role_id": "uploader",
-        "subject_type": "user",
-    }
-    with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
-        put("rbac_bindings", {**b, "subject_type": "team"})
-    put(
-        "rbac_bindings",
-        {**b, "scope": {"arch": ["s390x"]}, "updated_at": "2026-01-01 00:00:00"},
-    )
-    put("rbac_bindings", {**b, "active": False, "updated_at": "2026-02-01 00:00:00"})
-    got = s.query("SELECT active, scope FROM rbac_bindings FINAL", "JSONEachRow").data()
-    assert json.loads(got) == {"active": False, "scope": {}}
-    assert (
-        s.query("SELECT count() FROM rbac_binding_versions", "CSV").data().strip()
-        == "2"
-    )
-    assert (
-        s.query("SELECT count() FROM rbac_role_versions", "CSV").data().strip() == "2"
-    )

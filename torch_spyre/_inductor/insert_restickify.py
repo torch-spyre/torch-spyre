@@ -31,7 +31,6 @@ from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
-from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     BaseView,
@@ -49,6 +48,7 @@ from torch._inductor.ir import (
 )
 from torch_spyre._C import SpyreTensorLayout
 from torch._inductor.virtualized import V
+from torch._inductor.ops_handler import WrapperHandler
 
 from torch.utils._ordered_set import OrderedSet
 
@@ -287,66 +287,6 @@ def _create_restickify_node(
     return arg_name, restick_buff
 
 
-# There are multiple ways to redirect loads inside an inner_fn:
-#
-# 1. Name-only: redirect_computed_buffer_reads() in pass_utils.py wraps inner_fn
-#    with NameSwapHandler, routing every load of old_name to new_name regardless
-#    of index or occurrence. Used by dedup, padding, while_loop_bridge, coarse_tile.
-#
-# 2. Per-edge (below): restickify needs finer control — the same buffer can appear
-#    at multiple index expressions where each read site requires a *different*
-#    restickified buffer. make_per_edge_inner_fn wraps inner_fn with
-#    InputEdgeSwapHandler, which routes each load by (dep_index, occurrence).
-#    It also handles direct_inner_fn, the second inner function carried by
-#    ReadCopyElisionRecord, which redirect_computed_buffer_reads does not touch.
-
-
-def make_per_edge_inner_fn(orig_fn, swaps, name_map, canonical_args):
-    """Wrap orig_fn with InputEdgeSwapHandler for per-edge load redirection.
-
-    Builds index_replacements lazily at each call by mapping the live i*/r0_*
-    SymPy symbols in args to the canonical d* symbols from canonical_args
-    (built via index_vars_squeeze(prefix="d")), so InputEdgeSwapHandler can
-    match loads against dep.index correctly across inner_fn trace calls.
-    """
-
-    def inner(
-        *args,
-        _swaps=swaps,
-        _map=name_map,
-        _orig=orig_fn,
-        _canonical=canonical_args,
-    ):
-        assert len(args) == len(_canonical), (
-            f"{_orig.__qualname__}: inner_fn argument cardinality changed: "
-            f"actual={len(args)}, canonical={len(_canonical)}"
-        )
-        index_replacements: dict = {}
-        for actual_group, canonical_group in zip(
-            args, _canonical
-        ):  # asserts above guard length
-            assert len(actual_group) == len(canonical_group), (
-                f"{_orig.__qualname__}: inner_fn index rank changed: "
-                f"actual={len(actual_group)}, canonical={len(canonical_group)}"
-            )
-            for actual, canonical in zip(
-                actual_group, canonical_group
-            ):  # asserts above guard length
-                if actual == sympy.S.Zero:
-                    continue
-                previous = index_replacements.setdefault(actual, canonical)
-                assert previous == canonical, (
-                    f"live inner_fn index maps to multiple canonical indices: "
-                    f"{actual} -> {previous}, {canonical}"
-                )
-        with V.set_ops_handler(
-            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
-        ):
-            return _orig(*args)
-
-    return inner
-
-
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
     resticks_needed: list[RestickifyArgInfo],
@@ -537,7 +477,18 @@ def insert_restickify_on_node_inputs(
             )
             del old_name_buf._read_copy_elision_record  # type: ignore[attr-defined]
 
-    # prefix="d" must match extract_read_writes so dep.index symbols align.
+    # Wrap inner_fn with InputEdgeSwapHandler so each load is redirected to
+    # the correct per-edge restickified buffer via index-matched routing.
+    # Then call redirect_computed_buffer_reads with an empty name_map solely for
+    # its ComputedBuffer reconstruction, cache invalidation, and mutation-target
+    # repointing side-effects. The empty map means the NameSwapHandler it installs
+    # is a no-op; it is intentionally kept rather than extracted to avoid
+    # duplicating that reconstruction logic here.
+    orig_inner = op.data.inner_fn
+
+    # Build canonical d* args using the same prefix/squeeze logic as extract_read_writes.
+    # These are the exact SymPy objects that dep.index was built with, so
+    # index_replacements maps live i*/r0_* symbols → canonical d* symbols correctly.
     (canonical_idx, canonical_ridx), _ = index_vars_squeeze(
         op.data.get_pointwise_size(), op.data.get_reduction_size(), prefix="d"
     )
@@ -546,12 +497,59 @@ def insert_restickify_on_node_inputs(
         if op.data.get_reduction_type()
         else (canonical_idx,)
     )
-    object.__setattr__(
-        op.data,
-        "inner_fn",
-        make_per_edge_inner_fn(op.data.inner_fn, edge_swaps, name_map, canonical_args),
-    )
+
+    def new_inner_fn(
+        *args,
+        _swaps=edge_swaps,
+        _map=name_map,
+        _orig=orig_inner,
+        _canonical=canonical_args,
+    ):
+        assert len(args) == len(_canonical), (
+            f"inner_fn argument cardinality changed while inserting restickify: "
+            f"actual={len(args)}, canonical={len(_canonical)}"
+        )
+        index_replacements: dict = {}
+        for actual_group, canonical_group in zip(args, _canonical, strict=True):
+            assert len(actual_group) == len(canonical_group), (
+                f"inner_fn index rank changed: actual={len(actual_group)}, canonical={len(canonical_group)}"
+            )
+            for actual, canonical in zip(actual_group, canonical_group, strict=True):
+                if actual == sympy.S.Zero:
+                    continue
+                previous = index_replacements.setdefault(actual, canonical)
+                assert previous == canonical, (
+                    f"live inner_fn index maps to multiple canonical indices: {actual} -> {previous}, {canonical}"
+                )
+        with V.set_ops_handler(
+            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+        ):
+            return _orig(*args)
+
+    object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
     if isinstance(existing_record, ReadCopyElisionRecord):
+
+        def direct_inner_fn(
+            *args,
+            _swaps=edge_swaps,
+            _map=name_map,
+            _direct_inner=existing_record.direct_inner_fn,
+            _canonical=canonical_args,
+        ):
+            assert len(args) == len(_canonical)
+            index_replacements = {}
+            for actual_group, canonical_group in zip(args, _canonical, strict=True):
+                for actual, canonical in zip(
+                    actual_group, canonical_group, strict=True
+                ):
+                    if actual != sympy.S.Zero:
+                        index_replacements[actual] = canonical
+            with V.set_ops_handler(
+                InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+            ):
+                return _direct_inner(*args)
+
         copy_name = existing_record.copy_name
         for old_name, _dep_index, _occurrence, new_name in edge_swaps:
             if old_name == copy_name:
@@ -561,9 +559,7 @@ def insert_restickify_on_node_inputs(
         op._read_copy_elision_record = dataclasses.replace(  # type: ignore[attr-defined]
             existing_record,
             copy_name=copy_name,
-            direct_inner_fn=make_per_edge_inner_fn(
-                existing_record.direct_inner_fn, edge_swaps, name_map, canonical_args
-            ),
+            direct_inner_fn=direct_inner_fn,
         )
 
 
@@ -643,8 +639,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 if not all_tiled_rdims_empty:
                     # If accum_full already has a FixedTiledLayout,
-                    # _allocate_full_buffer gave it the layout planning
-                    # recorded — nothing to do. Otherwise promote
+                    # _allocate_full_buffer derived the correct layout via
+                    # _resize_device_layout — nothing to do. Otherwise promote
                     # to FixedTiledLayout using the reduction op's device layout.
                     accum_name = getattr(op, "_tiled_reduction_accum_name", None)
                     if accum_name is not None:

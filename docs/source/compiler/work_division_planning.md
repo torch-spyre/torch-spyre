@@ -555,9 +555,7 @@ ring positions. The permutation is implemented in
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when
 k-fast was also a planner. The permutation runs whenever any planner
-picks a K-split. It takes K as the matmul's last loop. Alignment can add
-range-1 loops after K, for example for a batch-1 matmul in a `for_each_tile`
-body. `simplify_op_spec` moves these batch loops to the front, so K stays last.
+picks a K-split.
 
 :::{figure} ../_static/images/work-division/core-id-k-mapping.svg
 :alt: Default core order places the two K slices of one output tile four cores apart; contiguous_dim on K places them on adjacent cores.

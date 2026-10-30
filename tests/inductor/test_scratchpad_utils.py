@@ -344,7 +344,7 @@ class ExternalOperandTest(TestCase):
                 ),
                 mock.patch(
                     f"{utils}.op_read_writes",
-                    return_value=SimpleNamespace(reads=set(), writes={write}),
+                    return_value=SimpleNamespace(writes={write}),
                 ),
             ):
                 counts, _reasons, views = get_ncores_for_buffers(

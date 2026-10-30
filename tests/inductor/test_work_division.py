@@ -2782,14 +2782,6 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         # the consumer's, the edge its producer's -- so each name is patched
         # wherever it is bound.
         stack = ExitStack()
-        # This ownership-policy fixture supplies views, not physical read geometry.
-        stack.enter_context(
-            patch.object(
-                work_division_module.ResidencyEdge,
-                "_has_partial_read",
-                return_value=False,
-            )
-        )
         for target, kwargs in [
             ("_view_for_div", {"side_effect": self._view_for_div}),
             ("op_read_writes", {"side_effect": lambda op: self.rw[op]}),
@@ -4672,14 +4664,6 @@ class TestMultiReadEdgeInversion(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(pass_utils_module.V.set_graph_handler(graph))
-            # This inverse-ownership sweep does not build a subrange proof graph.
-            stack.enter_context(
-                patch.object(
-                    work_division_module.ResidencyEdge,
-                    "_has_partial_read",
-                    return_value=False,
-                )
-            )
             stack.enter_context(
                 patch.object(
                     pass_utils_module,
@@ -4836,7 +4820,6 @@ class TestResidencyRuleRegistry(unittest.TestCase):
             checks.loop_carry = lambda: False
             checks.drain = lambda: False
             checks.prefix_gather = lambda: False
-            checks.local_subrange = lambda: False
             with self.subTest(rule=failing.name):
                 self.assertEqual(buffer_residency_reason(checks), failing.reason)
                 self.assertEqual(
@@ -4864,11 +4847,7 @@ class TestResidencyRuleRegistry(unittest.TestCase):
         checks.core_division = lambda: "core div mismatch: reader"
         self.assertEqual(buffer_residency_reason(checks), "core div mismatch: reader")
         checks.prefix_gather = lambda: False
-        checks.local_subrange = lambda: False
         self.assertEqual(buffer_residency_reason(checks), "partial/offset read")
-        checks.local_subrange = lambda: True
-        self.assertEqual(buffer_residency_reason(checks), "core div mismatch: reader")
-        checks.local_subrange = lambda: False
         checks.mutated_output = lambda: "graph output mutated after production"
         checks.drain = lambda: True
         self.assertEqual(buffer_residency_reason(checks), "partial/offset read")

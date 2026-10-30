@@ -372,13 +372,13 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `empty tensor` | A zero-sized tensor needs no LX reservation. | nonempty output | None | `TestEmptyLxEligibility` |
 | `mutation target` | Offset writes cannot use one fixed LX base. A counted-loop carry is accepted only when the solver also chooses its update division. | no mutation target | Counted-loop carry: `_is_loop_carry_storage` (joint division choice) | `TestLoopCarryLxEligibility` |
 | `tiled (advancing)` | LX addresses cannot use affine.apply symbols. The write or read advances per tile; loop_info supplies the tile geometry. | fixed LX address | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
-| `read by restickify` | A transposed or uncertified local read may cross cores. The joint solver checks each candidate division, so the committed-division barrier can reject a valid candidate (#4655). | fixed divisions agree or exact local-read proof | None | `test_buffer_residency_adapter_rejection_strings` |
+| `read by restickify` | A transposed or uncertified local read may cross cores. The joint solver checks each candidate division, so the committed-division barrier can reject a valid candidate (#4655). | fixed divisions agree or exact local-read proof | None | `TestRestickifyBarrierDeferredOnJointPath` |
 | `extern kernel user or live across extern kernel` | Extern kernels read HBM. PR #3683 added this guard; enable_lx_context_switching uses LxContextSwitchingPass to dump and restore LX around the call. | extern boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
 | `live across multi-output extern kernel` | Multi-output extern calls need HBM under either flag setting. LxContextSwitchingPass does not bracket them; the earlier extern guard handles the disabled case. | multi-output boundary protected | None | `test_buffer_residency_adapter_rejection_strings` |
 | `index tensor or indirectly accessed` | Data-dependent indices and the values they address resolve through HBM. | direct addressing | None | `test_buffer_residency_adapter_rejection_strings` |
 | `graph output is a ReinterpretView` | A boundary output clone cannot rewrap a ReinterpretView. | rewritable output clone | None | `test_buffer_residency_adapter_rejection_strings` |
 | `graph output mutated after production` | An output clone placed after its producer would copy a stale value before a later mutation. Only a validated drain plan moves that clone after the counted loop. | output clone sees final value | Validated output drain: `validated_drain_plans` (clone follows counted loop) | `TestLoopCarryLxEligibility` |
-| `partial/offset read` | Sliced or multi-offset LX reads can address the wrong data. A certified zero-offset prefix needs a served full-backing gather. | complete read | Zero-offset linear prefix: `prefix_lx_gather_source` (one reader and one writer, full-backing served copy, physical stride preserved, unsplit K, disjoint LX spans); Contained local read: `local_lx_subrange_source` (rollout enabled, compact materializer or certified cache scatter, storage and lifetime permission, exact local byte coverage) | `test_buffer_residency_adapter_rejection_strings`; `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone`; `test_prefix_lx_contraction_requires_exact_backing_stride[second_reader]`; `test_registry_exception_keeps_later_guards` |
+| `partial/offset read` | Sliced or multi-offset LX reads can address the wrong data. A certified zero-offset prefix needs a served full-backing gather. | complete read | Zero-offset linear prefix: `prefix_lx_gather_source` (one reader and one writer, full-backing served copy, physical stride preserved, unsplit K, disjoint LX spans) | `test_buffer_residency_adapter_rejection_strings`; `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone`; `test_prefix_lx_contraction_requires_exact_backing_stride[second_reader]` |
 | `core div mismatch: ...` | Fixed divisions must agree across users. The joint solver chooses compatible divisions instead of rejecting a provisional mismatch. | compatible fixed division | None | `test_buffer_residency_adapter_rejection_strings` |
 | `graph output (no clone); no consumer reads it from LX` | Without a boundary clone, a graph output must land in HBM. Residency also saves no reads when the producer has no LX consumer. | untiled reuse or boundary clone | None | `TestLoopCarryLxEligibility`; `test_buffer_residency_adapter_rejection_strings` |
 | `lx back gap` | A generic LX back gap can misaddress a read. The prefix exception needs a full-backing copy, an unsplit-K reader and a uniform per-core gap. | no unsupported LX gap | Zero-offset linear prefix: `prefix_lx_gather_source` (one reader and one writer, full-backing served copy, physical stride preserved, unsplit K, disjoint LX spans) | `test_prefix_linear_reads_a_separate_full_backing_lx_gather`; `test_buffer_residency_adapter_rejection_strings`; `test_prefix_lx_contraction_requires_exact_backing_stride`; `test_prefix_linear_without_served_copy_spills_the_source`; `test_prefix_linear_scheduler_demotion_retains_valid_hbm_clone`; `test_prefix_lx_contraction_requires_exact_backing_stride[second_reader]` |
@@ -437,12 +437,6 @@ conditions and its tests. Add later ownership exceptions to the registry.
 An ownership proof does not replace storage, lifetime or capacity checks.
 The untiled prefix case does not require same-tile-group search.
 
-The planner and final emitter share the `local_lx_subrange_geometry` gate.
-Work division receives immutable facts through `local_lx_read_geometry`.
-At emission, `local_lx_emission_contract` repeats the gate on the live graph.
-Keep these paths on the same gate. A geometry certificate does not replace
-storage, alias, lifetime or allocation checks.
-
 The symbolic proof registry below is separate from storage permission. It
 selects the existing containment proofs in order. The view-recovery caller
 keeps its floor-only, single-driven-axis restriction. An emitted-access proof
@@ -469,10 +463,6 @@ slot is a search heuristic, not an ownership proof or a performance guarantee.
 | Updated-input cache snapshot | `torch_spyre._inductor.scratchpad.lx_relayout._is_activation_source` | earlier direct cache mutation; immutable restickified snapshot; original cache load and dependencies preserved | `test_work_division_hint.py::test_lx_relayout_activation_policy_is_source_wide` | `test_solver_relayout_e2e.py::test_attention_cache_transpose_handoff` |
 | Fewer-core complete partitions | `torch_spyre._inductor.scratchpad.lx_relayout.core_domain_rejection` | integral core ratio; complete disjoint partitions; larger domain uses every compute core; physical spans stay separate | `test_solver_relayout_candidates.py::test_consumer_rules_are_shared_with_the_committed_collector` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
 | Persistent external cache scatter | `torch_spyre._inductor.scratchpad.lx_relayout._persistent_scatter_consumer` | fresh immutable matmul source; one external indirect overwrite; no source alias or cache read; mutation order and lifetime preserved | `test_solver_relayout_candidates.py::test_persistent_scatter_requires_independent_immutable_source` | `test_solver_relayout_e2e.py::test_v_projection_cache_handoff_preserves_persistent_alias` |
-| Contained local LX read | `torch_spyre._inductor.scratchpad.lx_relayout.local_lx_emission_contract` | ownership flag ON; shared graph and compact-read geometry gate; same-core byte certificate; fresh final access; disjoint live allocations | `test_lx_read_contracts.py::test_stale_or_unsafe_final_facts_are_rejected`; `test_work_division_hint.py::test_local_read_rollout_declines_before_graph_access` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
-| Full-parent copy for local subranges | `torch_spyre._inductor.scratchpad.lx_relayout.materialize_lx_relayouts` | complete parent copied once per destination group; every partial reader re-certified against the destination view; positive disjoint LX spans | `test_subrange_transfer.py::test_gate_up_siblings_have_distinct_copy_identity`; `test_solver_relayout_decision.py::test_copy_is_sized_by_the_destination_span_not_the_source_share` | `test_solver_relayout_e2e.py::test_gate_up_full_parent_repartition` |
-| Pointwise persistent-scatter materializer | `torch_spyre._inductor.scratchpad.lx_relayout._pointwise_scatter_materializer` | ownership flag ON; one certified compact parent subrange; complete scatter read; persistent-scatter storage, alias and ordering checks | `test_solver_relayout_candidates.py::test_pointwise_scatter_materializer_admission` | None |
-| Direct cache-snapshot subrange read | `torch_spyre._inductor.scratchpad.lx_relayout._local_lx_scatter_geometry` | single-writer complete immutable snapshot; one direct partial read; other reads are scatter indices; standard 128-byte sticks; zero inner origin and exact rectangle size; external mutation target and final same-core ownership checks preserved | `test_solver_relayout_candidates.py::test_direct_cache_snapshot_scatter_geometry` | None |
 | Factored ownership | `torch_spyre._inductor.slice_ownership.factor_slice_axis` | exact zero-origin dense product; independent digits; complete rectangular slices; no address rewrite or storage permission | `test_work_division_hint.py::test_factored_slice_rejects_inexact_products` | `test_solver_relayout_e2e.py::test_k_projection_rope_complete_contraction` |
 <!-- END GENERATED TRANSFER CERTIFICATES -->
 
@@ -863,31 +853,9 @@ interpretation. Symbolic projections stay in `slice_ownership.py`. A caller
 passes its rollout choice explicitly. Geometry cannot grant storage permission.
 The old `pass_utils.PerCoreView` name remains an import alias.
 
-The dense subrange certificate records physical domains, byte offsets, strides
-and fragment coverage. It does not allocate storage, approve a reader or emit a
-native shuffle. The planner must still check storage, writers, aliases,
-lifetimes and supported emission.
-
 `cost_features.py` owns feature extraction. Planning and reporting use the same
 functions. `dump_cost_model.py` keeps diagnostic output and latest-report state.
 This extraction does not change coefficients, units or physical core domains.
-
-### Local-read permission and final facts
-
-The planner checks graph structure, independent storage, writers, aliases and
-lifetimes. It exports `LocalReadGeometry` for one residency edge. Work division
-uses this immutable value to test physical ownership. Missing facts decline a
-partial match. Geometry alone cannot authorize storage.
-
-At the actual emitted read, the scheduler's provider repeats the planner's
-live checks. It returns a frozen `LocalReadEmission` value. The emitter checks
-that the final TensorArg still has the certified shape, format, owner map and
-allocation. It checks addresses and overlap before rebasing the read. A missing
-provider fails closed. A preparation retry creates a fresh provider and facts;
-no local-read certificate is reused across demotion.
-
-The earlier materialized-relayout registry still certifies copy identities.
-This interface does not alter that contract or add a new attention operation.
 
 ### Matched OFF-plan comparison
 
@@ -922,16 +890,3 @@ verified hash. Fetch the baseline history and main ref before using a later
 checkout. Only these verified sources may omit `lx_extended_ownership`; the
 missing flag represents OFF. Other missing settings stop capture. Iteration-axis
 order remains significant in the saved plan.
-
-### Cumulative local-read rollout
-
-`SPYRE_LX_EXTENDED_OWNERSHIP=0` also disables the optional local subrange
-admissions. This includes same-core compact readers and full-parent copies
-that serve them. The geometry helpers remain available for validation.
-Existing prefix support remains active. Mandatory span, ownership, lifetime,
-alias and final-emission checks stay active. The switch is part of the compile
-cache key; reuse of an ON plan cannot establish an OFF-plan comparison.
-
-The same switch disables the hinted compact-reader FX rewrite. Direct cache
-subranges use the local-read admission gates. Their physical and final-access
-validators remain active. No separate switch or relaxed cache guard is added.

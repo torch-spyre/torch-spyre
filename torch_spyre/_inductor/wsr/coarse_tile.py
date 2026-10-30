@@ -463,7 +463,7 @@ def _planned_full_device_layout(
     ``None`` when ``op`` has no device layout yet (pre-stickify), or when the
     full buffer is not ``op``'s own shape -- a WhileLoop-splice dim, which
     ``_compute_full_ranges_planned`` multiplies up. ``_allocate_full_buffer``
-    then raises for a post-stickify op.
+    then derives a layout from the tile instead.
     """
     layout = op.layout
     if not isinstance(layout, FixedTiledLayout):
@@ -3529,7 +3529,7 @@ def _propagate_tiled_op(
         full_strides,
         operations,
         group_start_idx,
-        device_layout=propagation.full_device_layout,
+        full_device_layout=propagation.full_device_layout,
     )
 
     # Capture before _insert_copy_op overwrites op.layout.
@@ -3732,7 +3732,7 @@ def _allocate_full_buffer(
     full_strides: tuple[Expr, ...],
     operations: list[Operation],
     insert_at_idx: int,
-    device_layout: SpyreTensorLayout | None = None,
+    full_device_layout: SpyreTensorLayout | None = None,
 ) -> ComputedBuffer:
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
@@ -3741,21 +3741,13 @@ def _allocate_full_buffer(
     FixedTiledLayout post-stickify), splices it into operations at
     insert_at_idx, and returns the new ComputedBuffer.
 
-    ``device_layout`` is the buffer's device layout, required post-stickify:
-    the one planning recorded for a full buffer
-    (``PropagationPlan.full_device_layout`` for a copy-out,
-    ``ReductionPlan.full_output_device_layout`` for an accumulator), or the
-    tile's own for a tile-sized accumulator. It is not grown back from the
-    tile's, which is ambiguous where the tile has two host dims of extent 1.
+    ``full_device_layout`` is the device layout planning recorded for the full
+    buffer (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). Without
+    one, the layout is grown from the tile's, which is only sound while at most
+    one host dim of the tile has extent 1.
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
-
-    orig_layout = tiled_op.layout
-    if isinstance(orig_layout, FixedTiledLayout) and device_layout is None:
-        raise RuntimeError(
-            f"{tiled_op.get_name()} has a FixedTiledLayout but no "
-            f"device_layout was given"
-        )
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -3786,12 +3778,62 @@ def _allocate_full_buffer(
     # Assign a layout for the full-sized buffer.  Pre-stickify we use a plain
     # FixedLayout (stickification assigns the device layout later); post-stickify
     # we must build a FixedTiledLayout because stickification has already run.
+    orig_layout = tiled_op.layout
     strides: list[Expr] = list(full_strides)
 
     layout: FixedTiledLayout | FixedLayout
-    if isinstance(orig_layout, FixedTiledLayout):
-        assert device_layout is not None  # checked above
-        # Post-stickify path: the caller's device layout.
+    if isinstance(orig_layout, FixedTiledLayout) and full_device_layout is not None:
+        # Post-stickify path, with the full buffer's device layout planned: it
+        # is the layout the op's output had before it was divided.
+        layout = FixedTiledLayout(
+            device,
+            dtype,
+            list(full_ranges),
+            strides,
+            full_device_layout,
+        )
+    elif isinstance(orig_layout, FixedTiledLayout):
+        # Post-stickify path (span-overflow groups): stickification has already
+        # run, so we must assign a FixedTiledLayout now.  Derive the full
+        # buffer's device layout by scaling the per-tile device layout up to
+        # the full host size using _resize_device_layout.
+        full_size_ints = [int(s) for s in full_ranges]
+        tile_size_ints = [int(s) for s in orig_layout.size]
+        # Authoritative stick host dim from coordinate identity (issue #3116);
+        # None falls back to size-based inference inside _resize_device_layout.
+        stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
+        try:
+            # The tile's real strides and the full buffer's, as _divide_ranges
+            # passes them the other way: a tile written in a permuted order
+            # grows back along the dims it was shrunk on.
+            device_layout = _resize_device_layout(
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+                stick_host_dim=stick_hd,
+                old_host_stride=[int(s) for s in orig_layout.stride],
+                new_host_stride=[int(s) for s in strides],
+            )
+        except RuntimeError:
+            # Non-standard device layout (e.g. post-restickify HBM strides that
+            # don't correspond to contiguous host strides).  Fall back to a
+            # default row-major allocation, preserving element_arrangement.
+            logger.debug(
+                "_allocate_full_buffer: _resize_device_layout could not classify "
+                "%r (tile_size=%s full_size=%s); using row-major fallback",
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+            )
+            ndim_full = len(full_size_ints)
+            full_strides_ints = [int(s) for s in strides]
+            device_layout = SpyreTensorLayout(
+                full_size_ints,
+                full_strides_ints,
+                dtype,
+                list(range(ndim_full)),
+                orig_layout.device_layout.element_arrangement,
+            )
         layout = FixedTiledLayout(
             device,
             dtype,
@@ -4102,7 +4144,7 @@ def _insert_copy_op(
 class _NameSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) calls for names present in name_map.
 
-    See NameSwapHandler in pass_utils.py — same pattern (AGENTS.md
+    See NameSwapHandler in insert_restickify.py — same pattern (AGENTS.md
     "Compiler Pass Conventions": wrap inner_fn via a WrapperHandler, never
     reconstruct it from index expressions). Duplicated locally rather than
     imported to avoid a coarse_tile <-> insert_restickify import-order
@@ -4671,28 +4713,15 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
-            device_layout=reduction_plan.full_output_device_layout,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
-        assert isinstance(op.layout, FixedTiledLayout), (
-            f"{op.get_name()}: a nested reduction is only tiled post-stickify, "
-            f"but its layout is {type(op.layout).__name__}"
-        )
-        # _divide_ranges has already made op's layout the tile's, so its device
-        # layout is accum_tile's.
-        tile_layout = (tuple(op.layout.size), tuple(op.layout.stride))
-        planned = (tuple(per_tile_ranges), tuple(reduction_plan.per_tile_strides))
-        assert tile_layout == planned, (
-            f"{op.get_name()}: layout (size, stride) {tile_layout} is not the "
-            f"planned tile's {planned}"
-        )
         accum_tile = _allocate_full_buffer(
             op,
             per_tile_ranges,
             reduction_plan.per_tile_strides,
             operations,
             group_start_idx_after_full,
-            device_layout=op.layout.device_layout,
         )
         fill_target = accum_tile
         combine_target = accum_tile
@@ -4704,7 +4733,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
-            device_layout=reduction_plan.full_output_device_layout,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         fill_target = accum_full
         combine_target = accum_full

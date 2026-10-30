@@ -158,10 +158,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     solver_relayout_pair_cost,
     prefix_lx_contraction_axis,
     prefix_lx_gather_source,
-    local_lx_subrange_source,
-    local_lx_read_geometry,
-    local_lx_subrange_geometry,
-    local_lx_subrange_certificate,
     work_division_from_view,
 )
 from torch_spyre._inductor.cost_model import CostParams
@@ -747,9 +743,7 @@ def _assert_drain_plan_committed(
             f"drain plan for {plan.storage_name}: solver left the storage or "
             "update division unchosen"
         )
-    edge = CoOptimizingAllocator._loop_carry_update_edge(
-        update_op, op_by_name, {}, graph=graph
-    )
+    edge = CoOptimizingAllocator._loop_carry_update_edge(update_op, op_by_name, {})
     pairs = (
         edge.match_pairs(
             storage_buffer.core_divisions,
@@ -921,9 +915,6 @@ class _BufferResidencyChecks:
 
     def prefix_gather(self) -> bool:
         return self._prefix_gather
-
-    def local_subrange(self) -> bool:
-        return local_lx_subrange_source(self.graph, self.name, self.uses)
 
     def core_division(self) -> Optional[str]:
         if self.division_is_fixed and self.ncores.get(self.name, -1) < 0:
@@ -4083,9 +4074,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if record.update_name != update_op.get_name():
                 continue
-            edge = self._loop_carry_update_edge(
-                update_op, op_by_name, prep_cache, graph=graph
-            )
+            edge = self._loop_carry_update_edge(update_op, op_by_name, prep_cache)
             if edge is None:
                 if residency_by_buf.get(record.storage_name) is None:
                     residency_by_buf[record.storage_name] = (
@@ -4169,7 +4158,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if drained_collectives.get(parent) != output_name
             ]
             residency_edges = self._parent_residency_edges(
-                op, parent_proj, op_by_name, prep_cache, residency_by_buf, graph=graph
+                op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )
             cd_parent_matches = self._cd_parent_matches(
                 residency_edges, buf_divisions, divisions
@@ -4228,7 +4217,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # preparation demotes it (#4990). A relayout copy taken before the
             # update would be stale, so this edge also has match pairs only.
             for storage_name, read_edge in self._loop_carry_read_edges(
-                op, carry_update_edges, prep_cache, graph=graph
+                op, carry_update_edges, prep_cache
             ).items():
                 read_matches = read_edge.match_pairs(
                     divisions[storage_name],
@@ -4388,8 +4377,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         update_op: Optional[Operation],
         op_by_name: dict[str, Operation],
         prep_cache: dict,
-        *,
-        graph: GraphLowering | None = None,
     ) -> Optional[ResidencyEdge]:
         """Return the physical-ownership edge for an aliased carry update.
 
@@ -4433,9 +4420,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             write_dep=storage_write,
             read_deps=(update_write.rename({record.update_name: record.storage_name}),),
             prep_cache=prep_cache,
-            local_read_geometry=local_lx_read_geometry(graph, storage_op, update_op)
-            if graph is not None
-            else None,
         )
 
     @staticmethod
@@ -4443,8 +4427,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         consumer_op: Optional[Operation],
         carry_update_edges: dict[str, ResidencyEdge],
         prep_cache: dict,
-        *,
-        graph: GraphLowering | None = None,
     ) -> dict[str, ResidencyEdge]:
         """Storage-ownership edges for ``consumer_op``'s reads of carry updates.
 
@@ -4478,11 +4460,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 write_dep=carry_edge.write_dep,
                 read_deps=(read,),
                 prep_cache=prep_cache,
-                local_read_geometry=local_lx_read_geometry(
-                    graph, carry_edge.parent_op, consumer_op
-                )
-                if graph is not None
-                else None,
             )
         return edges
 
@@ -4712,8 +4689,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
-        *,
-        graph: GraphLowering | None = None,
     ) -> dict[str, ResidencyEdge]:
         """One :class:`ResidencyEdge` per divided producer this op reads, which
         decides both which candidate pairs are compatible and which producers
@@ -4737,11 +4712,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 consumer_reads,
                 residency_by_buf.get(parent, "not in graph"),
                 prep_cache,
-                local_read_geometry=local_lx_read_geometry(
-                    graph, op_by_name[parent], consumer_op
-                )
-                if graph is not None
-                else None,
             )
             if edge is not None:
                 edges[parent] = edge
@@ -4952,9 +4922,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             write_dep, read_dep, prod_coords, cons_coords, prod_space, cons_space = (
                 context
             )
-            local_subrange = (
-                local_lx_subrange_geometry(graph, parent_op, consumer_op) is not None
-            )
             parent_divs = divisions[parent]
             # Same per-candidate view screens as _cd_parent_matches: the source
             # gets LX-pinned exactly like a matched producer, so the same
@@ -5059,14 +5026,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         # Uniform tail gaps apply only to a full K row. A K
                         # split would require ragged ownership/offset support.
                         continue
-                    if (
-                        local_subrange
-                        and local_lx_subrange_certificate(
-                            graph, parent_op, consumer_op, cv, cv
-                        )
-                        is None
-                    ):
-                        continue
                     if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
@@ -5092,7 +5051,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     # the unsplit-K reader's view was checked independently.
                     copy_coords, copy_space, copy_frame = (
                         (prod_coords, prod_space, "prod")
-                        if padded_axis is not None or local_subrange
+                        if padded_axis is not None
                         else (cons_coords, cons_space, "cons")
                     )
                     src_division = _projected(pv, copy_coords, copy_space, copy_frame)

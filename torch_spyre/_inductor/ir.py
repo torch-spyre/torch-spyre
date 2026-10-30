@@ -136,16 +136,24 @@ def _resize_device_layout(
     old_host_stride: list[int] | None = None,
     new_host_stride: list[int] | None = None,
 ):
-    """Derive a new SpyreTensorLayout for a host buffer shrunk by tiling.
+    """Derive a new SpyreTensorLayout for a resized host buffer.
 
-    The buffer is the same physical allocation; coarse tiling narrows the
-    per-tile iteration range, so ``device_size`` entries for non-stick dims
-    shrink to the smaller per-tile extents.  Raises ``ValueError`` if any host
-    dim grows: growing back is ambiguous where the tile has two host dims of
-    extent 1.
+    Used in two directions:
+
+    * **shrink** (``_divide_ranges``): the buffer is the same physical
+      allocation; coarse tiling narrows the per-tile iteration range.
+      ``device_size`` entries for non-stick dims shrink to reflect the smaller
+      per-tile extents.
+    * **grow** (``_allocate_full_buffer``): a full-sized scatter-target buffer
+      is allocated to match a per-tile source.  ``device_size`` entries grow
+      back to the full extent.  The stick orientation (transposed vs row-major,
+      ``element_arrangement``) is propagated verbatim so both buffers agree on
+      physical layout and scatter-copy address arithmetic is correct.
 
     ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
-    extent 1 and is never stepped through; its stride is undefined."  For
+    extent 1 and is never stepped through; its stride is undefined."  When
+    growing back from a singleton (``orig_sm[j] == -1``), the stride is
+    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
     non-contiguous (transposed / col-major) dims, the *physical* stride on
     device is invariant to resizing, so it is left unchanged.
 
@@ -153,12 +161,13 @@ def _resize_device_layout(
 
     * **inner stick** (always ``j == ndev-1``) — ``device_size`` is always
       ``elems_per_stick``; left unchanged.  ``stride_map`` updated only if the
-      stick host dim is contiguous.
+      stick host dim is contiguous or was a singleton.
     * **non-stick dim** — one device dim per non-stick host dim.  Matched to
       host dim ``p`` by size (``device_size[j] == old_host_size[p]``), with
       ``stride_map[j]`` used as a tiebreaker when two host dims share the same
       size.  ``device_size`` updated to ``new_host_size[p]``.  ``stride_map``
-      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous).
+      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous) or ``== -1``
+      (was a singleton being grown).
     * **stick tile-count** — ``ceil(old_host_size[p*] / eps)`` device elements
       spanning the stick host dim ``p*``.  Updated to
       ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
@@ -167,7 +176,7 @@ def _resize_device_layout(
     * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
       placeholder (no corresponding host dim) or a non-stick dim tiled to
       extent 1.  Left as-is when there is no host dim to match; matched by
-      size-1 to a host dim of size 1 when one exists.
+      size-1 to a host dim of size 1 when one exists (grow path from singleton).
 
     ``p*`` (the stick host dim) is identified by elimination: the unique host
     dim *not* matched as a non-stick dim.  When a reduction collapses the stick
@@ -217,12 +226,6 @@ def _resize_device_layout(
     if the stick host dim cannot be uniquely determined by elimination.
     """
     from torch._inductor.ir import FlexibleLayout
-
-    if any(n > o for o, n in zip(old_host_size, new_host_size, strict=True)):
-        raise ValueError(
-            f"_resize_device_layout only shrinks, but was asked to resize "
-            f"{old_host_size} to {new_host_size}"
-        )
 
     orig_sm = list(orig_stl.stride_map)
     orig_ds = list(orig_stl.device_size)
@@ -362,7 +365,7 @@ def _resize_device_layout(
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == old_hs[p]:
+        elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
 
@@ -400,7 +403,7 @@ def _resize_device_layout(
         new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == tc_stride:
+        elif orig_sm[j] == tc_stride or orig_sm[j] == -1:
             new_sm[j] = new_tc_scale * new_hs[pstar]
         # else: non-contiguous stick; physical stride invariant.
 
@@ -408,7 +411,7 @@ def _resize_device_layout(
     j = ndev - 1
     if new_host_size[pstar] == 1:
         new_sm[j] = -1
-    elif orig_sm[j] == old_hs[pstar]:
+    elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; physical stride invariant.
 
