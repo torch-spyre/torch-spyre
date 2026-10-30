@@ -1492,6 +1492,26 @@ def test_annealer_write_back_raises_on_drifted_eligibility():
     assert [(b.chosen_division, b.address) for b in s._bufs] == before
 
 
+def test_annealer_anchors_only_for_copies_that_are_eligible():
+    """In ``_mixed``, P -> M's copy can be on while P is ineligible: P -> C2
+    mismatches and C2's copy is off. That copy delivers nothing, so it must
+    not anchor P and M; once C2's copy is on too, P is eligible and both
+    copies anchor their ends."""
+    s = _primed_annealer(_mixed(), size=1024)
+    p, m, c2 = (_index(s, n) for n in ("P", "M", "C2"))
+    to_m = _index(s, relayout_copy_name("P", 0))
+    to_c2 = _index(s, relayout_copy_name("P", 2))
+    s._atomic_flip(m, s._menus[m].configs[1])  # M onto the pair P -> M prices
+    s._switch_relayouts({to_m}, on=True)
+    assert to_m in s._relayout_on and to_m not in s._eligible_copies
+    assert s._relayout_anchored(exclude=-1) == set()
+
+    s._switch_relayouts({to_c2}, on=True)
+    assert {to_m, to_c2} <= s._eligible_copies
+    assert s._relayout_anchored(exclude=-1) == {p, m, c2}
+    assert s._relayout_anchored(exclude=to_c2) == {p, m}
+
+
 def test_annealer_scores_relayout_charges_as_the_expression_does():
     """The annealer sums the copies' RelayoutCharge terms itself instead of
     compiling them. Over every division of M and every resident set, its score

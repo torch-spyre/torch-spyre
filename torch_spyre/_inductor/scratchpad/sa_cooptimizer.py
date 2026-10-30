@@ -2198,10 +2198,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return by_division[division]
 
     def _relayout_anchored(self, exclude: int) -> set[int]:
-        """The buffers whose current division a switched-on copy other than
-        ``exclude`` is priced for: its source and the consumers reading it."""
+        """The buffers whose current division an eligible copy other than
+        ``exclude`` is priced for: its source and the consumers reading it.
+
+        Eligible, not merely switched on: a copy that is on while its source is
+        ineligible for another reason (too big at its division, another
+        mismatched child with no copy) delivers nothing, and anchoring for it
+        would steer the draw away from divisions no paying relayout depends
+        on. Not resident either: placement follows ``pi``, which the burst
+        after the move adjusts."""
         anchored: set[int] = set()
-        for copy_idx in sorted(self._relayout_on):
+        for copy_idx in sorted(self._eligible_copies):
             if copy_idx == exclude:
                 continue
             source = self._relayout_source[copy_idx]

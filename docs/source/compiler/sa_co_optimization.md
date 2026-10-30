@@ -179,7 +179,7 @@ The `relayout` move draws a copy uniformly among the ones that could ever be res
 It switches a copy that is on off.
 It switches a copy that is off on together with one of its candidates' divisions, for the source and for every consumer the group can serve from it.
 Switching it on alone would pay only when the divisions already sat on one of its few priced pairs, so each half of the change would be worth nothing to the score on its own.
-Among the copy's source divisions, it draws from those that move the fewest buffers another switched-on copy is priced for, so a chain of relayouts (a buffer that is the consumer of one copy and the source of the next) does not lose one link for every link it gains.
+Among the copy's source divisions, it draws from those that move the fewest buffers another eligible copy is priced for (one that is on but whose source is ineligible for another reason delivers nothing, so it anchors nothing), so a chain of relayouts (a buffer that is the consumer of one copy and the source of the next) does not lose one link for every link it gains.
 
 Every structural move also buys the seams it opened (`_seam_copies`): each edge out of a reassigned buffer, or into it from a parent, that no longer matches and whose new pair names a copy gets that copy switched on in the same step.
 Only those edges: an edge from a parent to a sibling of a reassigned buffer keeps its pair of divisions, so a copy the search switched off there stays off.
