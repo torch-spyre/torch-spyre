@@ -109,3 +109,85 @@ def test_a_turn_without_feedback_has_none(chdb_session):
         chdb_session.query("SELECT thumbs FROM v_chat_turns", "JSONEachRow").data()
     )
     assert got == {"thumbs": "none"}
+
+
+def test_retention_rows_are_validated_and_only_the_actor_sets_their_own(chdb_session):
+    ok = {
+        "actor": "alice@ibm.com",
+        "kind": "retention",
+        "retention_days": 30,
+        "set_by": "alice@ibm.com",
+    }
+    chdb_session.query(
+        "INSERT INTO chat_turn_retention FORMAT JSONEachRow\n" + json.dumps(ok)
+    )
+    for bad in (
+        {"set_by": "bob@ibm.com"},
+        {"kind": "erase"},
+        {"actor": "", "set_by": ""},
+        {"retention_days": 99999},
+    ):
+        with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
+            chdb_session.query(
+                "INSERT INTO chat_turn_retention FORMAT JSONEachRow\n"
+                + json.dumps({**ok, **bad})
+            )
+
+
+def test_a_purge_hides_the_actors_earlier_turns_only(chdb_session):
+    s = chdb_session
+    _insert(s, _event(ts="2026-10-30 10:00:00.000"))
+    _insert(
+        s,
+        _event(
+            turn_id="018f0000-0000-7000-8000-000000000002",
+            actor="bob@ibm.com",
+            ts="2026-10-30 10:00:00.000",
+        ),
+    )
+    s.query(
+        "INSERT INTO chat_turn_retention FORMAT JSONEachRow\n"
+        + json.dumps(
+            {
+                "actor": "alice@ibm.com",
+                "kind": "purge",
+                "set_by": "alice@ibm.com",
+                "ts": "2026-10-30 11:00:00.000",
+            }
+        )
+    )
+    _insert(
+        s,
+        _event(
+            turn_id="018f0000-0000-7000-8000-000000000003", ts="2026-10-30 12:00:00.000"
+        ),
+    )
+    rows = [
+        json.loads(r)["actor"]
+        for r in s.query("SELECT actor FROM v_chat_turns ORDER BY ts", "JSONEachRow")
+        .data()
+        .splitlines()
+    ]
+    assert rows == ["bob@ibm.com", "alice@ibm.com"]
+
+
+def test_the_latest_retention_wins_and_forever_is_zero(chdb_session):
+    s = chdb_session
+    for ts, days in (("2026-10-30 10:00:00.000", 30), ("2026-10-30 11:00:00.000", 0)):
+        s.query(
+            "INSERT INTO chat_turn_retention FORMAT JSONEachRow\n"
+            + json.dumps(
+                {
+                    "actor": "a",
+                    "kind": "retention",
+                    "retention_days": days,
+                    "set_by": "a",
+                    "ts": ts,
+                }
+            )
+        )
+    assert json.loads(
+        s.query(
+            "SELECT retention_days FROM v_chat_turn_retention", "JSONEachRow"
+        ).data()
+    ) == {"retention_days": 0}
