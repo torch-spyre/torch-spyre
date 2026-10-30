@@ -69,6 +69,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     RelayoutCopyBuffer,
     relayout_copy_name,
 )
+from test_sa_cooptimizer import _live_state  # noqa: E402
 
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
@@ -1187,6 +1188,26 @@ def test_annealer_never_draws_a_copy_whose_source_is_pinned_out():
     assert "relayout" not in solver._applicable_moves()
 
 
+def test_annealer_relayout_move_leaves_a_consumer_the_copy_cannot_serve():
+    """One copy (group 0) with candidates for C, which reads P, and for D,
+    which is in the solve but does not list P as a parent. The relayout move
+    sets the divisions that make the copy serve: P's and C's, never D's, since
+    no copy reads for D."""
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    d = CoreDivisionBuffer(
+        "D",
+        64,
+        [2, 3],
+        core_divisions=[CoreDivision(splits={1 - k: 4}) for k in range(2)],
+        cd_parent_relayouts={"P": [_candidate("D", 0, 5000.0, j=1)]},
+    )
+    s = _primed_annealer(_with_copies(_producer([0, 3]), c, d))
+    copy = _index(s, relayout_copy_name("P", 0))
+    assert s._relayout_consumers[copy] == [_index(s, "C")]
+    for _ in range(20):
+        assert set(s._relayout_assignment(copy)) == {_index(s, "P"), _index(s, "C")}
+
+
 def _unread_copy():
     """P and C with one copy whose only candidate names the edge P -> C, which
     the solve does not carry: C does not list P as a parent."""
@@ -1490,6 +1511,22 @@ def test_annealer_write_back_raises_on_drifted_eligibility():
     with pytest.raises(RuntimeError, match="drifted from a recount: \\['P'\\]"):
         s._write_back()
     assert [(b.chosen_division, b.address) for b in s._bufs] == before
+
+
+def test_annealer_restore_rewinds_the_relayout_state():
+    """A restore puts back the copies switched on and eligible with the rest
+    of the joint state: nothing else can rebuild them."""
+    s = _primed_annealer(_mixed(), size=1024)
+    m = _index(s, "M")
+    before = _live_state(s)
+    snap = s._snapshot()
+    s._atomic_flip(m, s._menus[m].configs[1])
+    s._switch_relayouts(
+        {_index(s, relayout_copy_name("P", g)) for g in (0, 2)}, on=True
+    )
+    assert s._eligible_copies and _live_state(s) != before
+    s._adopt(snap)
+    assert _live_state(s) == before
 
 
 def test_annealer_anchors_only_for_copies_that_are_eligible():

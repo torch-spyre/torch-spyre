@@ -2164,18 +2164,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         where that is priced, the first in candidate order otherwise.
 
         The source division is drawn uniformly among those that move the
-        fewest *anchored* buffers: ones another switched-on copy serves or
-        reads from under their current divisions. Moving one unprices that
-        copy, which is how a chain of relayouts (a buffer that is the consumer
-        of one copy and the source of the next) used to lose one link for every
-        link it gained."""
+        fewest *anchored* buffers: ones another eligible copy serves or reads
+        from under their current divisions. Moving one unprices that copy,
+        which is how a chain of relayouts (a buffer that is the consumer of one
+        copy and the source of the next) used to lose one link for every link
+        it gained.
+
+        Only the consumers the copy can serve (``_relayout_consumers``, built
+        with the topology): a candidate whose edge the solve does not carry
+        would move a consumer no copy reads for."""
         copy = cast(RelayoutCopyBuffer, self._bufs[copy_idx])
         source = self._relayout_source[copy_idx]
+        served = set(self._relayout_consumers[copy_idx])
         anchored = self._relayout_anchored(exclude=copy_idx)
         by_division: dict[int, dict[int, DivisionConfig]] = {}
         for candidate in copy.candidates:
             consumer = self._name_to_idx.get(candidate.consumer)
-            if consumer is None:
+            if consumer not in served:
                 continue
             assignment = by_division.setdefault(
                 candidate.source_division,

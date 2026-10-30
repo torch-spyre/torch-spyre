@@ -725,8 +725,8 @@ def _chain_caps(buffers):
 
 def _live_state(solver):
     """The observable joint state: layout addresses, packer quality, divisions,
-    and the eligible count and mask ``W`` implies (tracked, so a restore must
-    rewind them)."""
+    the eligible count and mask ``W`` implies, and the relayout copies switched
+    on and eligible (tracked, so a restore must rewind them)."""
     return (
         list(solver.packer.addresses),
         solver.packer.quality(),
@@ -736,6 +736,8 @@ def _live_state(solver):
         [(c.key, c.menu_index) for c in solver.chosen],
         solver._n_eligible,
         bytes(solver._eligible_mask),
+        sorted(solver._relayout_on),
+        sorted(solver._eligible_copies),
     )
 
 
