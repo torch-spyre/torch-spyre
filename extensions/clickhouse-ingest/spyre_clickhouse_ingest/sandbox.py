@@ -133,6 +133,8 @@ class Sandbox:
         ),
         # By time: a pending or rejected upload has no run_id.
         ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
+        ("ops_audit_events", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
+        ("ci_access_audit", "ts >= now() - INTERVAL {days} DAY", "(event_id)"),
         (
             "dispatch_targets",
             "published_at >= now() - INTERVAL {days} DAY",
