@@ -61,3 +61,18 @@ def test_rows_are_validated_and_defaults_fill_in():
         ).data()
     )
     assert got == {"channel": "ui", "actor_kind": "human", "reason": ""}
+
+
+def test_there_is_no_ttl_and_the_view_has_one_row_per_event():
+    s = _session()
+    assert "TTL" not in (SCHEMA_DIR / "73-ci-access-audit.sql").read_text()
+    for event_id in (
+        "018f0000-0000-7000-8000-0000000000a1",
+        "018f0000-0000-7000-8000-0000000000a2",
+    ):
+        s.query(
+            "INSERT INTO ci_access_audit FORMAT JSONEachRow\n"
+            + json.dumps(_row(event_id=event_id))
+        )
+    got = s.query("SELECT count() AS n FROM v_ci_access_audit", "JSONEachRow").data()
+    assert json.loads(got) == {"n": 2}

@@ -25,5 +25,23 @@ CREATE TABLE IF NOT EXISTS ci_access_audit
     CONSTRAINT chk_request    CHECK ci_request_id != toUUID('00000000-0000-0000-0000-000000000000')
 )
 ENGINE = MergeTree()
-ORDER BY (ci_request_id, ts)
-TTL toDateTime(ts) + INTERVAL 400 DAY;
+ORDER BY (event_id, ts);
+
+-- One row per event (an event is never rewritten), same shape as v_ops_audit_events.
+CREATE VIEW IF NOT EXISTS v_ci_access_audit AS
+SELECT
+    e.event_id                                AS event_id,
+    argMax(e.ts, e.audit_timestamp)           AS ts,
+    argMax(e.actor, e.audit_timestamp)        AS actor,
+    argMax(e.actor_kind, e.audit_timestamp)   AS actor_kind,
+    argMax(e.on_behalf_of, e.audit_timestamp) AS on_behalf_of,
+    argMax(e.action, e.audit_timestamp)       AS action,
+    argMax(e.permission, e.audit_timestamp)   AS permission,
+    argMax(e.target, e.audit_timestamp)       AS target,
+    argMax(e.ci_request_id, e.audit_timestamp) AS ci_request_id,
+    argMax(e.result, e.audit_timestamp)       AS result,
+    argMax(e.reason, e.audit_timestamp)       AS reason,
+    argMax(e.channel, e.audit_timestamp)      AS channel,
+    argMax(e.props, e.audit_timestamp)        AS props
+FROM ci_access_audit AS e  -- qualified: the aliases above would shadow the columns
+GROUP BY e.event_id;
