@@ -280,18 +280,12 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_GET_RUNTIME_OPERATIONS:
       return "aiuCommsGetRuntimeOps";
-    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_MSG_MATCHER:
-      return "aiuCommsWorkSchedMsgMatcher";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_ARTIFACT_CLEANUP:
       return "aiuCommsWorkSchedArtifactCleanup";
     case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET_HMLT_CHECK:
       return "aiuCommsHdmaResetHmltCheck";
-    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET_BARRIER_ENTRY:
-      return "aiuCommsHdmaResetBarrierEntry";
     case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET_CLEAR_BOOKKEEPING:
       return "aiuCommsHdmaResetClearBookkeeping";
-    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET_BARRIER_EXIT:
-      return "aiuCommsHdmaResetBarrierExit";
     case AIUPTI_RUNTIME_TRACE_CBID_RDMA_INIT_CONTEXT:
       return "aiuCommsRdmaInitContext";
     case AIUPTI_RUNTIME_TRACE_CBID_RDMA_FINALIZE_CONTEXT:
