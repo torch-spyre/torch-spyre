@@ -27,15 +27,15 @@ def _session():
     session = pytest.importorskip("chdb.session")
     s = session.Session()
     for stmt in SchemaApplier.statements(
-        (SCHEMA_DIR / "69-ci-access-audit.sql").read_text()
+        (SCHEMA_DIR / "73-ci-access-audit.sql").read_text()
     ):
         s.query(stmt)
     return s
 
 
 def _row(**over):
-    row = {"action": "cancel", "request_id": RID, "actor": "bob@ibm.com", "owner": "alice@ibm.com",
-           "result": "cancelled", "permission": "jobs:cancel-any"}  # fmt: skip
+    row = {"action": "cancel", "ci_request_id": RID, "actor": "bob@ibm.com", "target": "alice@ibm.com",
+           "result": "ok", "permission": "jobs:cancel-any"}  # fmt: skip
     return {**row, **over}
 
 
@@ -46,9 +46,10 @@ def test_rows_are_validated_and_defaults_fill_in():
         s.query("INSERT INTO ci_access_audit FORMAT JSONEachRow\n" + json.dumps(row))
 
     for bad in (
-        {"request_id": NIL},
+        {"ci_request_id": NIL},
         {"action": "delete"},
-        {"result": "ok"},
+        {"result": "cancelled"},
+        {"actor_kind": "bot"},
         {"channel": "slack"},
     ):
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
@@ -56,7 +57,7 @@ def test_rows_are_validated_and_defaults_fill_in():
     insert(_row())
     got = json.loads(
         s.query(
-            "SELECT channel, on_behalf_of, reason FROM ci_access_audit", "JSONEachRow"
+            "SELECT channel, actor_kind, reason FROM ci_access_audit", "JSONEachRow"
         ).data()
     )
-    assert got == {"channel": "ui", "on_behalf_of": "", "reason": ""}
+    assert got == {"channel": "ui", "actor_kind": "human", "reason": ""}
