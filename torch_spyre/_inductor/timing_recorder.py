@@ -380,6 +380,7 @@ def _run_metadata() -> dict[str, Any]:
         # stage:compile_fx:spyre_compile event's meta, not here.
         "frontend_only": config.frontend_only,
         "torch_version": torch.__version__,
+        # "Unknown" for a torch built without git metadata, e.g. from an sdist.
         "torch_git_version": torch.version.git_version,
         "python_version": sys.version.split()[0],
     }

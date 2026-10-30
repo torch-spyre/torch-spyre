@@ -94,6 +94,9 @@ from typing import Any, Optional
 
 from . import config, timing_recorder
 from .logging_utils import get_inductor_logger
+
+# The bridge uses the recorder's private API on purpose: a phase's start and end
+# arrive in separate callbacks, which a stage() block cannot span.
 from .timing_recorder import _Event
 
 
