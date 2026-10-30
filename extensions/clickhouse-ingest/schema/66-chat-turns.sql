@@ -2,9 +2,8 @@
 -- turn_id, for signed-in and anonymous callers. Append-only like result_uploads; written by the dashboard with the
 -- upload writer's login, and only when its V2_CHAT_TURN_LOG_ENABLED flag is on.
 -- Privacy: an anonymous caller is a browser-held random id plus a salted hash of ip+user-agent, never the raw IP;
--- tool arguments are kept as a sha256, the answer as a sha256 and its length. Rows are kept forever (a decision of
--- 2026-10-30); to expire them run ALTER TABLE chat_turns MODIFY TTL ts + INTERVAL <n> DAY and set the dashboard's
--- chat.turnLog.retentionDays to the same <n> so the notice says so.
+-- tool arguments are kept as a sha256, the answer as a sha256 and its length. Rows are kept forever by default (a decision of
+-- 2026-10-30) with no table TTL; a person sets their own retention in chat_turn_retention below.
 CREATE TABLE IF NOT EXISTS chat_turns
 (
     ts              DateTime64(3, 'UTC') DEFAULT now64(3),
@@ -55,7 +54,41 @@ CREATE TABLE IF NOT EXISTS chat_turns
 ENGINE = MergeTree()
 ORDER BY (turn_id, ts);
 
--- One row per turn with its latest thumbs. A feedback event whose turn is gone (TTL) or never logged is dropped.
+-- Per-person retention settings and purge requests, append-only like chat_turns. A person sets how long their turns are kept
+-- (retention_days, 0 = forever, the default for anyone with no row) or asks for their history to be deleted ('purge': every turn
+-- of theirs up to the event's ts). actor is the login or anon:<browser id>. Nothing here deletes anything: the scheduled prune
+-- (extensions/clickhouse-ingest/maintenance/prune-chat-turns.sql) is the only deleter. Reads hide purged turns at once.
+CREATE TABLE IF NOT EXISTS chat_turn_retention
+(
+    ts              DateTime64(3, 'UTC') DEFAULT now64(3),
+    actor           String,
+    kind            LowCardinality(String),        -- retention | purge
+    retention_days  UInt32 DEFAULT 0,              -- retention events only; 0 = keep forever
+    set_by          String,                        -- the verified login, or anon:<id> for a signed-out browser
+    props           Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
+    CONSTRAINT chk_kind      CHECK kind IN ('retention', 'purge'),
+    CONSTRAINT chk_days      CHECK retention_days <= 36500,
+    CONSTRAINT chk_actor     CHECK actor != '' AND set_by = actor
+)
+ENGINE = MergeTree()
+ORDER BY (actor, ts);
+
+-- One row per actor with a setting or purge: the latest retention (0 = forever) and the time of the latest purge request
+-- (the epoch when there is none).
+CREATE VIEW IF NOT EXISTS v_chat_turn_retention AS
+SELECT
+    r.actor                                              AS actor,
+    argMaxIf(r.retention_days, r.ts, r.kind = 'retention') AS retention_days,
+    maxIf(r.ts, r.kind = 'purge')                        AS purge_before,
+    max(r.ts)                                            AS updated_at
+FROM chat_turn_retention AS r  -- qualified: the aliases above would shadow the columns
+GROUP BY r.actor;
+
+-- One row per turn with its latest thumbs, without turns their owner purged. A feedback event whose turn is gone or never
+-- logged is dropped.
 CREATE VIEW IF NOT EXISTS v_chat_turns AS
 SELECT
     t.turn_id                                              AS turn_id,
@@ -89,6 +122,8 @@ SELECT
     if(countIf(t.event = 'feedback') = 0, 'none', argMaxIf(t.thumbs, t.ts, t.event = 'feedback')) AS thumbs,
     argMaxIf(t.reason, t.ts, t.event = 'feedback')         AS thumbs_reason
 FROM chat_turns AS t  -- qualified: the aliases above would shadow the columns
+LEFT JOIN (SELECT actor, maxIf(ts, kind = 'purge') AS purged FROM chat_turn_retention GROUP BY actor) AS p ON t.actor = p.actor
+WHERE t.ts > ifNull(p.purged, toDateTime64(0, 3, 'UTC'))
 GROUP BY t.turn_id
 HAVING countIf(t.event = 'turn') > 0;
 

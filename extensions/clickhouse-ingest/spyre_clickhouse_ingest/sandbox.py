@@ -145,6 +145,7 @@ class Sandbox:
         ("result_uploads", "ts >= now() - INTERVAL {days} DAY", "(upload_id, ts)"),
         ("insight_reports", "ts >= now() - INTERVAL {days} DAY", "(report_id, ts)"),
         ("chat_turns", "ts >= now() - INTERVAL {days} DAY", "(turn_id, ts)"),
+        ("chat_turn_retention", "ts >= now() - INTERVAL {days} DAY", "(actor, ts)"),
         (
             "dispatch_targets",
             "published_at >= now() - INTERVAL {days} DAY",
