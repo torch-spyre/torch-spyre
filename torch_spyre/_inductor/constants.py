@@ -18,6 +18,7 @@ from torch_spyre._C import DataFormats, ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
+SHUFFLE_OP = "shuffle"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 # Relative restickify cost per device byte, by device dtype. The restickify cost
@@ -69,6 +70,10 @@ STAGGERED_EAS = frozenset(
         ElementArrangement.FP32_TO_DL16,
     }
 )
+
+# SUPPORTED_EAS can be a separate a list of all non-STANDARD EAs that can be
+# used with the new torch.ops.spyre.shuffle but now it is same as STAGGERED_EAS
+SUPPORTED_EAS = STAGGERED_EAS
 
 
 def is_ea_compatible(eas) -> bool:

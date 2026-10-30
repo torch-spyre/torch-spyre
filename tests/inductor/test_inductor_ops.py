@@ -507,6 +507,12 @@ _CMP_BIGINT_REASON = (
     "integers above 2**24 are compared as fp32, so near neighbours collapse"
 )
 
+# A comparison of an integer with an fp16 tensor converts the integer to fp16 on
+# device, and the bool result then has operands in both fp16 and fp32 device formats.
+_BOOL_RESULT_MIXED_FORMAT_REJECTION = (
+    "torch.bool result from operands with device format"
+)
+
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
@@ -597,6 +603,28 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
 ]
 
+# EA-shuffle (bfloat16/float16 -> float32) requires whole FP32 stick pairs. The copy
+# round trip is rejected at compile time when a core gets an odd number of FP32
+# sticks: 1 for 4x16, 3 for 68. The add round trip is not rejected: it compiles on
+# these shapes, where it either passes (68) or returns a wrong result (4x16, an
+# xfail below).
+_WHOLE_PAIR_REJECTION = "requires whole FP32 stick pairs"
+ROUND_TRIP_COPY_PAIR_REJECTED = {
+    "bfloat16_to_float32_4x16",
+    "float16_to_float32_4x16",
+    "bfloat16_to_float32_68",
+    "float16_to_float32_68",
+}
+# The copy round trip of a 5120 upcast gets through the frontend and fails in the
+# backend compiler (dbo-opt, sbf-ddc: "Cannot find a valid minimum value for data
+# stage 5"). That is a backend bug, not a deliberate rejection, so it is an xfail.
+# TODO: cite an issue once one is filed.
+_COPY_UPCAST_5120_FAIL = {
+    f"{src}_to_float32_5120": "dbo-opt fails to schedule the copy round trip: "
+    "sbf-ddc 'Cannot find a valid minimum value for data stage 5'"
+    for src in ("bfloat16", "float16")
+}
+
 # The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
 # host, and the result is wrong on 27-88% of its elements. The values on the device
 # are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
@@ -677,20 +705,25 @@ _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL = [
 # Further round-trip cases that now pass on every config. They differ between the
 # add and copy variants, so each variant gets its own expect_fail list. The implicit
 # variant is the same as the shared implicit list minus its own passing cases.
-_ROUND_TRIP_ADD_NOW_PASSING = {
-    "bfloat16_to_float16_4x16",
+_ROUND_TRIP_COMMON_NOW_PASSING = {
     "bfloat16_to_float16_4x32",
     "bfloat16_to_float16_4x63",
     "bfloat16_to_float16_4x68",
-    "bfloat16_to_float16_68",
     "bfloat16_to_float32_4x63",
     "float16_to_float32_4x63",
-    "float32_to_float16_4x16",
     "float32_to_float16_4x63",
 }
-_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_ADD_NOW_PASSING | {
-    "bfloat16_to_float32_4x16",
-    "float16_to_float32_4x16",
+_ROUND_TRIP_ADD_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
+    "bfloat16_to_float16_4x16",
+    "bfloat16_to_float16_68",
+    "bfloat16_to_float32_4x68",
+    "float16_to_float32_4x68",
+    "float32_to_float16_4x16",
+}
+_ROUND_TRIP_COPY_NOW_PASSING = _ROUND_TRIP_COMMON_NOW_PASSING | {
+    "bfloat16_to_float16_4x16",
+    "bfloat16_to_float16_68",
+    "float32_to_float16_4x16",
 }
 _ROUND_TRIP_IMPLICIT_NOW_PASSING = {
     "float32_to_float16_4x16",
@@ -705,6 +738,7 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     case
     for case in _TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL_ALL
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
+    and case not in ROUND_TRIP_COPY_PAIR_REJECTED
 ]
 # These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
 # the xfail-marked tests, each has passed in some of them), so they are non-strict
@@ -742,6 +776,7 @@ _PAIR_SECOND_STICK_UNSPLIT = (
     "with SENCORES=1 (#5361)"
 )
 _ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
+    "68": _PAIR_SECOND_STICK_LOST,
     "4x16": _PAIR_SECOND_STICK_LOST,
     "4x63": _PAIR_SECOND_STICK_LOST,
     "4x68": _PAIR_SECOND_STICK_UNSPLIT,
@@ -3359,33 +3394,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #
         #   fp16  x fp32 -> fp32 : dl16tofp32 is a STICK-REORDERING conversion
         #                          (2B -> 4B changes the element arrangement).
-        #                          expect_fail, but for TWO different reasons
-        #                          depending on the other operand:
-        #                            - neither operand broadcasts at the stick
-        #                              dim: propagate_layouts.py rejects the
-        #                              mixed-EA pointwise op. A clean compile
-        #                              error.
-        #                            - the other operand DOES broadcast at the
-        #                              stick dim: that combination is legal and
-        #                              propagate_layouts allows it, correctly.
-        #                              The compare is computed CORRECTLY too.
-        #                              But the result carries the staggered EA,
-        #                              and the D2H copy-out ignores
-        #                              element_arrangement and reads the buffer
-        #                              as STANDARD, so the mask comes back
-        #                              PERMUTED with no error raised (issue
-        #                              #4393). These two cases are therefore
-        #                              skipped: the defect is pre-existing and
-        #                              not in this lowering.
+        #                          The element-arrangement shuffle makes the
+        #                          operands compatible, so the compare compiles
+        #                          and runs correctly when neither operand
+        #                          broadcasts at the stick dim.
+        #                          When the other operand DOES broadcast at the
+        #                          stick dim, the compare is computed correctly
+        #                          too, but the result carries the staggered EA,
+        #                          and the D2H copy-out ignores
+        #                          element_arrangement and reads the buffer
+        #                          as STANDARD, so the mask comes back
+        #                          PERMUTED with no error raised (issue
+        #                          #4393). Those two cases are therefore
+        #                          expect_fail: the defect is pre-existing and
+        #                          not in this lowering.
         #
         #   int32 x fp32 -> fp32 : int32tofp32 is 4B -> 4B, so the EA is unchanged
         #                          and this runs entirely on device. The only
         #                          genuinely on-device mixed case here.
         #
         #   int32 x fp16 -> fp16 : int32tofp32 then fp32todl16, the second of
-        #                          which reorders sticks, so the converted operand
-        #                          is staggered and meets the STANDARD fp16 one:
-        #                          rejected as mixed EA, like fp16 x fp32.
+        #                          which reorders sticks. The bool result is then
+        #                          computed from operands whose device formats
+        #                          differ (fp16 and fp32), which the backend
+        #                          rejects at compile time.
         #
         # Promoting to fp16 also inherits fp16's 11-bit significand, so integers
         # above 2048 lose their distinction. That is not a divergence: eager does
@@ -3402,19 +3434,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            # A STANDARD operand mixed with a staggered one is rejected at compile
-            # time unless the STANDARD operand broadcasts at the stick dim (see
-            # test_round_trip_to_dtype_implicit_invalid, which asserts the same).
+            # A bool result computed from operands in different device formats
+            # (fp16 and fp32) is rejected at compile time.
             "expect_raise": {
-                "fp16_fp32_1d256": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
-                "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                "int32_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int32_1d256": "Multi-arg pointwise with mixed EA",
-                "int32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
-                "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
-                "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
+                "int32_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "fp16_int32_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "int32_fp16_2d4x64": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "int64_fp16_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
+                "fp16_int64_1d256": _BOOL_RESULT_MIXED_FORMAT_REJECTION,
             },
             # The compare is right on the device, but its staggered result is read
             # back permuted with no error (#4393).
@@ -3423,7 +3450,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
             },
             "param_sets": {
-                # fp16 -> fp32 is stick-reordering: blocked by mixed EA
+                # fp16 -> fp32 is stick-reordering: handled by the EA shuffle
                 "fp16_fp32_1d256": (
                     torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3456,7 +3483,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16
                     ),
                 ),
-                # fp16 vs a broadcaster at the stick dim: skipped, result incorrect
+                # fp16 vs a broadcaster at the stick dim: result incorrect
                 "fp16_fp32_bcast_stick": (
                     torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -3471,7 +3498,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     torch.tensor(2.0, dtype=torch.float32),
                 ),
-                # int32 -> fp16 gives a staggered operand (see the header above)
+                # int32 -> fp16 gives operands in different formats (see header)
                 "int32_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int32),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3503,7 +3530,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         cached_randn((4, 64), abs=True, scale=50.0, dtype=torch.float32)
                     ),
                 ),
-                # int64 x float16 -> float16: staggered, as for int32
+                # int64 x float16 -> float16: different formats, as for int32
                 "int64_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int64),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -3567,12 +3594,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "clamp": torch.clamp,
                 "clamp_min": torch.clamp_min,
                 "clamp_max": torch.clamp_max,
-            },
-            # TODO: the clamped int64 mask converts to fp16 on device, which makes
-            # it staggered, and it does not broadcast at the stick dim, so its
-            # product with the STANDARD fp16 operand is rejected as mixed EA.
-            "expect_raise": {
-                "fp16_1x64x64": "Multi-arg pointwise with mixed EA",
             },
             "param_sets": {
                 "fp16_1x64x64": (cached_randn((1, 64, 64)),),
@@ -7606,9 +7627,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
+            "expect_raise": {
+                **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
+            },
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -7825,10 +7846,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
-            "expect_raise": dict.fromkeys(
-                ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION
-            ),
+            "expect_fail": {
+                **TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
+                **_COPY_UPCAST_5120_FAIL,
+            },
+            "expect_raise": {
+                **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
+                **dict.fromkeys(ROUND_TRIP_COPY_PAIR_REJECTED, _WHOLE_PAIR_REJECTION),
+            },
         },
         (
             "test_round_trip_to_dtype_implicit",

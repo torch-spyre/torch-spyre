@@ -50,6 +50,7 @@ from .constants import (
     RESTICKIFY_SUPPORTED_DEVICE_DTYPES,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
+    SHUFFLE_OP,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -1008,7 +1009,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             # Check if operation supports the argument's dtype
             if not (
-                op == IDENTITY_OP
+                op in (IDENTITY_OP, SHUFFLE_OP)
                 or (
                     op == RESTICKIFY_OP
                     and arg.device_dtype in RESTICKIFY_SUPPORTED_DEVICE_DTYPES
@@ -1382,6 +1383,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             out_coords = args[-1].device_coordinates
             if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
+            elif (
+                args[-2].element_arrangement != args[-1].element_arrangement
+                and not indirect_syms_used
+            ):
+                # A copy whose two sides arrange the elements of a stick
+                # differently (spyre.shuffle) is a `shuffle`, not a plain identity.
+                op = SHUFFLE_OP
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(
