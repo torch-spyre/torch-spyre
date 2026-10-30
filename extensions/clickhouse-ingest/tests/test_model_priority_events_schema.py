@@ -65,7 +65,9 @@ def test_rows_are_validated(chdb_session):
 
 def test_a_reset_needs_no_order(chdb_session):
     _insert(chdb_session, _event(1, action="reset", model_order=[]))
-    assert _rows(chdb_session, "SELECT action FROM v_model_priority") == [{"action": "reset"}]
+    assert _rows(chdb_session, "SELECT action FROM v_model_priority") == [
+        {"action": "reset"}
+    ]
 
 
 def test_the_newest_event_per_use_case_wins_and_older_ones_stay(chdb_session):
@@ -73,7 +75,10 @@ def test_the_newest_event_per_use_case_wins_and_older_ones_stay(chdb_session):
     _insert(s, _event(1))
     _insert(s, _event(2, model_order=["gemma", "cb"], reason="cb quota"))
     _insert(s, _event(3, use_case="slack", model_order=["gemma"]))
-    got = _rows(s, "SELECT use_case, model_order, reason FROM v_model_priority ORDER BY use_case")
+    got = _rows(
+        s,
+        "SELECT use_case, model_order, reason FROM v_model_priority ORDER BY use_case",
+    )
     assert got == [
         {"use_case": "chat", "model_order": ["gemma", "cb"], "reason": "cb quota"},
         {"use_case": "slack", "model_order": ["gemma"], "reason": ""},
