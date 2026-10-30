@@ -17,6 +17,7 @@
 import json
 
 import pytest
+import regex as re
 from spyre_clickhouse_ingest.apply_schema import SCHEMA_DIR, SchemaApplier
 
 TID = "018f0000-0000-7000-8000-000000000001"
@@ -45,9 +46,9 @@ def _insert(s, row):
     s.query("INSERT INTO chat_turns FORMAT JSONEachRow\n" + json.dumps(row))
 
 
-def test_the_table_expires_rows():
+def test_rows_are_kept_forever_unless_a_ttl_is_set():
     sql = (SCHEMA_DIR / "66-chat-turns.sql").read_text()
-    assert "TTL ts + INTERVAL 90 DAY" in sql
+    assert not re.search(r"^TTL ", sql, re.M)
 
 
 def test_rows_are_validated(chdb_session):

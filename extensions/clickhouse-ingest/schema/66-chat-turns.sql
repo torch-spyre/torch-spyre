@@ -2,8 +2,9 @@
 -- turn_id, for signed-in and anonymous callers. Append-only like result_uploads; written by the dashboard with the
 -- upload writer's login, and only when its V2_CHAT_TURN_LOG_ENABLED flag is on.
 -- Privacy: an anonymous caller is a browser-held random id plus a salted hash of ip+user-agent, never the raw IP;
--- tool arguments are kept as a sha256, the answer as a sha256 and its length. Retention is the TTL below: change it
--- with ALTER TABLE chat_turns MODIFY TTL, and keep the dashboard's V2_CHAT_TURN_LOG_RETENTION_DAYS (the notice) in step.
+-- tool arguments are kept as a sha256, the answer as a sha256 and its length. Rows are kept forever (a decision of
+-- 2026-10-30); to expire them run ALTER TABLE chat_turns MODIFY TTL ts + INTERVAL <n> DAY and set the dashboard's
+-- chat.turnLog.retentionDays to the same <n> so the notice says so.
 CREATE TABLE IF NOT EXISTS chat_turns
 (
     ts              DateTime64(3, 'UTC') DEFAULT now64(3),
@@ -52,8 +53,7 @@ CREATE TABLE IF NOT EXISTS chat_turns
                                  OR (actor_kind != 'anonymous' AND NOT startsWith(actor, 'anon:'))
 )
 ENGINE = MergeTree()
-ORDER BY (turn_id, ts)
-TTL ts + INTERVAL 90 DAY DELETE;
+ORDER BY (turn_id, ts);
 
 -- One row per turn with its latest thumbs. A feedback event whose turn is gone (TTL) or never logged is dropped.
 CREATE VIEW IF NOT EXISTS v_chat_turns AS
