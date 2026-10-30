@@ -433,8 +433,15 @@ the splits to legacy coefficient-keyed `op_it_space_splits` transport so
 Scheduler/codegen can survive iteration-symbol renaming.
 
 For the worked example below, the pre-scheduler ownership is
-`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
-coefficient-keyed encoding.
+`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives this same split
+re-keyed by write/read index coefficient rather than by symbol.
+`WorkDivisionContext.is_legal` and user-hint application reject any split
+the coefficient-keyed encoding cannot carry losslessly (an axis absent from
+the relevant index, or two split axes that would collide on one
+coefficient) before it is ever committed, so this re-keying is lossless for
+every split that reaches `finalize_work_division_for_scheduler()`; that
+function re-checks the same condition defensively and raises rather than
+emitting a lossy encoding if it is somehow still reached.
 :::
 
 Two op-kind constraints apply on top of the algorithm above. For

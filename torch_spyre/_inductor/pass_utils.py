@@ -2145,6 +2145,78 @@ def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
     return coeff
 
 
+def unrepresentable_splits_by_index_coeff(
+    splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> list[str]:
+    """Report which of ``splits`` (factor > 1 entries) ``splits_by_index_coeff``
+    cannot carry losslessly.
+
+    The coefficient-keyed scheduler transport keys output-axis splits by
+    their symbol's coefficient in ``write_index``, and reduction-axis splits
+    (those absent from ``write_index``) by their coefficient in
+    ``read_index``. An axis's split is unrepresentable there when:
+
+    - its symbol's coefficient in the relevant index is 0 (the symbol is not
+      a linear term there -- e.g. a kernel-window offset that lives in op
+      metadata rather than the index expression), or
+    - it shares a nonzero coefficient with a *different* symbol that also
+      has factor > 1: the coefficient-keyed dict holds one entry per
+      coefficient, so the later axis silently overwrites the earlier one.
+
+    Returns one description string per unrepresentable axis/collision, empty
+    iff ``splits`` is fully representable. This is the single
+    collision-detection implementation shared by
+    :func:`~.work_division.WorkDivisionContext.is_legal` and
+    :func:`~.work_division._apply_user_hint` (which must reject an
+    unrepresentable candidate before it is ever committed) and by
+    :func:`finalize_work_division_for_scheduler` (which must never see a
+    non-empty result once those checks hold, and raises if it does).
+    """
+    reduction_syms = {sym for sym in splits if write_index.coeff(sym) == 0}
+    problems: list[str] = []
+    for label, index, symbols in (
+        (
+            "output",
+            write_index,
+            {s: v for s, v in splits.items() if s not in reduction_syms},
+        ),
+        (
+            "reduction",
+            read_index,
+            {s: v for s, v in splits.items() if s in reduction_syms},
+        ),
+    ):
+        seen: dict[sympy.Expr, sympy.Symbol] = {}
+        for sym, split in symbols.items():
+            if split <= 1:
+                continue
+            coeff = index.coeff(sym)
+            if coeff == 0:
+                problems.append(f"{label}:{sym}=absent")
+                continue
+            if coeff in seen:
+                problems.append(
+                    f"{label}: coeff {coeff} {seen[coeff]} -> {sym} collide"
+                )
+            else:
+                seen[coeff] = sym
+    return problems
+
+
+def splits_representable_by_index_coeff(
+    splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> bool:
+    """Whether ``splits_by_index_coeff`` can carry every split in ``splits``
+    (factor > 1 entries) without loss. See
+    :func:`unrepresentable_splits_by_index_coeff`.
+    """
+    return not unrepresentable_splits_by_index_coeff(splits, write_index, read_index)
+
+
 def _coeff_splits_from_index(
     splits: dict[sympy.Symbol, _V],
     index: sympy.Expr,
@@ -2180,8 +2252,11 @@ def splits_by_index_coeff(
     This is intentionally a boundary representation: pre-scheduler passes keep
     symbol-keyed ownership. Coefficients are stable across scheduler renaming,
     but cannot distinguish distinct non-unity splits sharing one coefficient.
-    This encoder retains the established iteration-order last-axis-wins behavior;
-    ``finalize_work_division_for_scheduler`` warns when that transport is lossy.
+    Callers (``WorkDivisionContext.is_legal``, ``_apply_user_hint``) must
+    reject a ``splits`` map ``unrepresentable_splits_by_index_coeff`` flags
+    before it is ever committed, so this encoder may assume representability
+    holds; ``finalize_work_division_for_scheduler`` re-checks it defensively
+    and raises rather than encoding a lossy result.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
@@ -2310,13 +2385,8 @@ def select_work_division_transport_indexes(
 def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
     """Convert committed symbol ownership to legacy scheduler split transport.
 
-    Coefficient keys cannot distinguish every symbol.  Preserve the established
-    iteration-order last-wins behavior, but warn once per affected operation.
-
-    Runs after the pass loop, where ``graph.operations`` may hold LoopNodes
-    (they reach the Scheduler as one node each). The ops inside a loop are
-    finalized like any other: a LoopNode has no ownership of its own, so a
-    loop over the top level would skip its whole body without an error.
+    Reject split maps the scheduler cannot carry losslessly. Recurse through
+    LoopNodes because the pass may run before they are expanded.
     """
     for op in all_ops(graph.operations):
         ownership = getattr(op, "iteration_space_ownership", None)
@@ -2329,40 +2399,15 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
             )
         except Unsupported:
             continue
-        collisions: list[str] = []
-        for label, index, symbols in (
-            ("output", write_index, ownership.work_slices),
-            (
-                "reduction",
-                read_index,
-                {
-                    sym: split
-                    for sym, split in ownership.work_slices.items()
-                    if write_index.coeff(sym) == 0
-                },
-            ),
-        ):
-            seen: dict[sympy.Expr, tuple[sympy.Symbol, int, sympy.Expr]] = {}
-            for sym, split in symbols.items():
-                if split <= 1:
-                    continue
-                coeff = index.coeff(sym)
-                if coeff == 0:
-                    collisions.append(f"{label}:{sym}=absent")
-                    continue
-                value = (sym, split, ownership.core_id_to_work_slice[sym])
-                if coeff in seen and seen[coeff][1:] != value[1:]:
-                    collisions.append(
-                        f"{label}: coeff {coeff} {seen[coeff][0]}={seen[coeff][1:]} "
-                        f"-> {sym}={value[1:]}"
-                    )
-                seen[coeff] = value
-        if collisions:
-            logger.warning(
-                "lossy work-division scheduler transport for %s; using "
-                "iteration-order last-axis-wins: %s",
-                op.get_name(),
-                "; ".join(collisions),
+        problems = unrepresentable_splits_by_index_coeff(
+            ownership.work_slices, write_index, read_index
+        )
+        if problems:
+            raise Unsupported(
+                f"work division for {op.get_name()} cannot be represented by "
+                "the scheduler's coefficient-keyed transport (this should be "
+                "unreachable: is_legal/_apply_user_hint are expected to "
+                f"reject such a split before it is committed): {'; '.join(problems)}"
             )
         op.op_it_space_splits = splits_by_index_coeff(
             ownership.work_slices, write_index, read_index

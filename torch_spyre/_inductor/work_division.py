@@ -70,6 +70,8 @@ from .pass_utils import (
     commit_iteration_space_ownership,
     op_out_coords,
     op_read_writes,
+    select_work_division_transport_indexes,
+    unrepresentable_splits_by_index_coeff,
     _per_core_view_from_prep,
     _prepare_per_core_view,
     tile_ownership_view,
@@ -863,6 +865,14 @@ class WorkDivisionContext:
     constraints: ConstraintResult
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
+    # The write/read indexes the scheduler's coefficient-keyed transport will
+    # key this op's committed split by (``select_work_division_transport_indexes``),
+    # or ``None`` when the op has no ``MemoryDep`` write and so never goes
+    # through that transport -- in which case no split is representability-
+    # checked. Used by :meth:`is_legal` to reject a split that transport
+    # cannot carry losslessly.
+    write_index: Expr | None
+    read_index: Expr | None
     # factor_domain is asked once per axis by the enumeration and again per
     # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
     _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
@@ -908,6 +918,17 @@ class WorkDivisionContext:
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
             and self.meets_span_floors(splits)
+            and self._representable_by_index_coeff(splits)
+        )
+
+    def _representable_by_index_coeff(self, splits: dict[Symbol, int]) -> bool:
+        """Whether the scheduler's coefficient-keyed transport can carry
+        ``splits`` without loss -- see ``unrepresentable_splits_by_index_coeff``.
+        """
+        if self.write_index is None:
+            return True
+        return not unrepresentable_splits_by_index_coeff(
+            splits, self.write_index, self.read_index
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
@@ -1004,9 +1025,10 @@ def work_division_context_for_op(
         if frame is None:
             return None
         it_space = frame.iter_space
+    rw = op_read_writes(op)
     input_tds, output_td = collect_tensor_deps(
         op,
-        _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
+        _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw)),
     )
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
@@ -1031,6 +1053,12 @@ def work_division_context_for_op(
             committed_splits={},
         )
     )
+    try:
+        write_index, read_index = select_work_division_transport_indexes(
+            op, rw, it_space
+        )
+    except Unsupported:
+        write_index = read_index = None
     return WorkDivisionContext(
         op=op,
         max_cores=max_cores,
@@ -1042,6 +1070,8 @@ def work_division_context_for_op(
         reduction_vars=reduction_vars,
         constraints=constraint_result,
         span_min_splits=_span_min_splits(op),
+        write_index=write_index,
+        read_index=read_index,
     )
 
 
@@ -1918,6 +1948,27 @@ def _apply_user_hint(
             f"work_division_hint: {op_name} conflicts with legal split domains "
             f"{conflicting_domains} or span floors {below_span_floor}."
         )
+
+    try:
+        write_index, read_index = select_work_division_transport_indexes(
+            op, op_read_writes(op), it_space_adjusted
+        )
+    except (Unsupported, AttributeError):
+        # Unsupported: op has no MemoryDep write, so this transport never
+        # applies to it. AttributeError: op is a lightweight stand-in (unit
+        # tests of this function's pruning/validation logic) with no real
+        # read/write analysis to run the representability check against.
+        write_index = read_index = None
+    if write_index is not None:
+        problems = unrepresentable_splits_by_index_coeff(
+            splits, write_index, read_index
+        )
+        if problems:
+            raise Unsupported(
+                f"work_division_hint: {op_name} split {splits} cannot be "
+                "represented by the scheduler's coefficient-keyed transport: "
+                f"{'; '.join(problems)}."
+            )
 
     return splits
 
