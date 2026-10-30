@@ -308,7 +308,7 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_INITIALIZE_P2P:
       return "aiuInitializeP2P";
 
-    // Scheduler submit/barrier CBIDS (102-107)
+    // Scheduler submit/barrier and VF firmware CBIDS (102-109)
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_DMA:
       return "aiuSubmitDMA";
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_COMPUTE:
@@ -528,7 +528,6 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
       break;
 
     case AIUPTI_RUNTIME_TRACE_CBID_VF_DLM_MESSAGE:
-      runtime_activity->addMetadataQuoted("type", "DLM");
       runtime_activity->addMetadata("msg_type", activity->data);
       break;
 
