@@ -7849,6 +7849,105 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"sum": torch.sum},
             "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
         },
+        # EA propagation through reduction ops (#5553, #5598).
+        #
+        # Two staggered EA cases × two reduction directions (10 combinations
+        # from the table in docs/source/compiler/element_arrangement.md):
+        #
+        # DL16_TO_FP32 input: fp16 upcast to fp32 in-graph (x.to(fp32)).
+        # Case A: reduce stick → stagger consumed → STANDARD output.
+        # Case B: reduce non-stick → stagger preserved → DL16_TO_FP32 output;
+        #         D2H restore (#5187) must un-shuffle the elements correctly.
+        (
+            "test_ea_reduction_dl16tofp32",
+            "test_ea_reduction_dl16tofp32_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "amax": torch.amax,
+            },
+            "param_sets": {
+                # Case A: reduce stick dim → STANDARD output
+                "2d_stick": (-1, cached_randn((8, 128), dtype=torch.float16)),
+                "3d_stick": (-1, cached_randn((4, 8, 128), dtype=torch.float16)),
+                # Case B: reduce non-stick dim → DL16_TO_FP32 output
+                "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float16)),
+                "3d_dim0": (0, cached_randn((4, 8, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float16)),
+            },
+        },
+        # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph (x.to(fp16)).
+        # Case A: reduce stick → stagger consumed → STANDARD output.
+        # Case B: reduce non-stick → stagger preserved → FP32_TO_DL16 output;
+        #         D2H restore (#5187) must un-shuffle the elements correctly.
+        (
+            "test_ea_reduction_fp32todl16",
+            "test_ea_reduction_fp32todl16_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "amax": torch.amax,
+            },
+            "param_sets": {
+                # Case A: reduce stick dim → STANDARD output
+                "2d_stick": (-1, cached_randn((8, 128), dtype=torch.float32)),
+                "3d_stick": (-1, cached_randn((4, 8, 128), dtype=torch.float32)),
+                # Case B: reduce non-stick dim → FP32_TO_DL16 output
+                "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float32)),
+                "3d_dim0": (0, cached_randn((4, 8, 128), dtype=torch.float32)),
+                "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float32)),
+            },
+        },
+        # Case A row 4/5 and Case B row 4/5: staggered EA with stick on a
+        # non-trailing dim.  softmax(dim=0) forces the stick onto dim=0,
+        # then a second reduction exercises both reduce directions.
+        #
+        # DL16_TO_FP32 (non-stick dim): fp16 → fp32 softmax along dim=0.
+        # Case A (reduce stick dim=0): order-independent → STANDARD output.
+        # Case B (reduce non-stick dim=-1): intra-stick preserved → DL16_TO_FP32 output.
+        (
+            "test_ea_reduction_dl16tofp32_nonstick",
+            "test_ea_reduction_dl16tofp32_nonstick_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "amax": torch.amax,
+            },
+            "param_sets": {
+                # Case A: reduce stick dim (dim=0) → STANDARD output
+                "2d_reduce_stick": (0, cached_randn((8, 128), dtype=torch.float16)),
+                "3d_reduce_stick": (0, cached_randn((4, 8, 128), dtype=torch.float16)),
+                # Case B: reduce non-stick dim (dim=-1) → DL16_TO_FP32 output
+                "2d_reduce_nonstick": (-1, cached_randn((8, 128), dtype=torch.float16)),
+                "3d_reduce_nonstick": (
+                    -1,
+                    cached_randn((4, 8, 128), dtype=torch.float16),
+                ),
+            },
+        },
+        # FP32_TO_DL16 (non-stick dim): fp32 → fp16 softmax along dim=0.
+        # Case A (reduce stick dim=0): order-independent → STANDARD output.
+        # Case B (reduce non-stick dim=-1): intra-stick preserved → FP32_TO_DL16 output.
+        (
+            "test_ea_reduction_fp32todl16_nonstick",
+            "test_ea_reduction_fp32todl16_nonstick_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "amax": torch.amax,
+            },
+            "param_sets": {
+                # Case A: reduce stick dim (dim=0) → STANDARD output
+                "2d_reduce_stick": (0, cached_randn((8, 128), dtype=torch.float32)),
+                "3d_reduce_stick": (0, cached_randn((4, 8, 128), dtype=torch.float32)),
+                # Case B: reduce non-stick dim (dim=-1) → FP32_TO_DL16 output
+                "2d_reduce_nonstick": (-1, cached_randn((8, 128), dtype=torch.float32)),
+                "3d_reduce_nonstick": (
+                    -1,
+                    cached_randn((4, 8, 128), dtype=torch.float32),
+                ),
+            },
+        },
         (
             "test_round_trip_to_dtype_implicit_invalid",
             "test_round_trip_to_dtype_implicit_invalid_cpu",
@@ -12455,6 +12554,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             run_eager=False,
         )
+
+    def test_ea_reduction_dl16tofp32_cpu(self, op, dim, x):
+        # DL16_TO_FP32 input: fp16 upcast to fp32 in-graph.
+        # Case A (dim=-1, stick): stagger consumed → STANDARD output.
+        # Case B (dim=0/1, non-stick): stagger preserved → DL16_TO_FP32 output;
+        #   EA tag propagation requires #5598, D2H restore requires #5187.
+        def fn(op, dim, x):
+            z = x.to(torch.float32)
+            return op(z, dim=dim)
+
+        self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_fp32todl16_cpu(self, op, dim, x):
+        # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph.
+        # Case A (dim=-1, stick): stagger consumed → STANDARD output.
+        # Case B (dim=0/1, non-stick): stagger preserved → FP32_TO_DL16 output;
+        #   EA tag propagation requires #5598, D2H restore requires #5187.
+        def fn(op, dim, x):
+            z = x.to(torch.float16)
+            return op(z, dim=dim)
+
+        self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_dl16tofp32_nonstick_cpu(self, op, dim, x):
+        # DL16_TO_FP32 with stick on a non-trailing dim: produced by
+        # softmax(fp16, dim=0, dtype=fp32), whose stick is on dim=0.
+        # Case A (reduce_dim=0, stick dim): order-independent → STANDARD output.
+        # Case B (reduce_dim=-1, non-stick dim): intra-stick preserved → DL16_TO_FP32 output.
+        def fn(op, dim, x):
+            z = torch.softmax(x, dim=0, dtype=torch.float32)
+            return op(z, dim=dim)
+
+        self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_fp32todl16_nonstick_cpu(self, op, dim, x):
+        # FP32_TO_DL16 with stick on a non-trailing dim: produced by
+        # softmax(fp32, dim=0, dtype=fp16), whose stick is on dim=0.
+        # Case A (reduce_dim=0, stick dim): order-independent → STANDARD output.
+        # Case B (reduce_dim=-1, non-stick dim): intra-stick preserved → FP32_TO_DL16 output.
+        def fn(op, dim, x):
+            z = torch.softmax(x, dim=0, dtype=torch.float16)
+            return op(z, dim=dim)
+
+        self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
 
     def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
         # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
