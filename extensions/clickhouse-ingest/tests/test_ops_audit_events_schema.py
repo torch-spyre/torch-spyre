@@ -46,7 +46,12 @@ def _insert(s, row):
 
 
 def test_rows_are_validated(chdb_session):
-    for bad in ({"event_id": NIL}, {"result": "denied"}, {"actor_kind": "root"}):
+    for bad in (
+        {"event_id": NIL},
+        {"result": "denied"},
+        {"actor_kind": "root"},
+        {"channel": "carrier-pigeon"},
+    ):
         with pytest.raises(Exception, match="VIOLATED_CONSTRAINT|violated"):
             _insert(chdb_session, _event(**bad))
 
