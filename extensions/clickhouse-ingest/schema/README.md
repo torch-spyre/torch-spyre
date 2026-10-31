@@ -36,6 +36,7 @@ Applying them in filename order works from an empty database.
 | `63-perf-regression-gate.sql` | `v_perf_regression_gate` | 20, 62 |
 | `64-rbac.sql` | `rbac_roles`, `rbac_bindings`, each with a `*_versions` log and MV | — |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata`, their `_by_tag` copies + their MVs | 30, 60 |
+| `74-model-priority-events.sql` | `model_priority_events`, `v_model_priority` | — |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
 families are independent, and `v_run_coverage` is separate because it measures the join between
