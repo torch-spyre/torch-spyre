@@ -1340,12 +1340,10 @@ def generate_sdsc(
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
         }
-        # dsOffset / allocateNode_ are part of the forward-conv (#3284) and
-        # general memOrg contract; depthwise conv (#3510) intentionally omits
-        # them. Restore them for every non-depthwise op so forward conv2d
-        # matches its golden SDSC.
+        # allocateNode_ is part of the forward-conv (#3284) and general memOrg
+        # contract; depthwise conv (#3510) intentionally omits it. Restore it
+        # for every non-depthwise op so forward conv2d matches its golden SDSC.
         if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP:
-            extra["dsOffset"] = 0
             extra["allocateNode_"] = alloc_node
         return extra
 
@@ -1440,9 +1438,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
@@ -1458,9 +1453,6 @@ def generate_sdsc(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
                                         "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": sdsc_spec.padding_sizes_per_core
                                         if sdsc_spec.padding_sizes_per_core
                                         else sdsc_spec.padding_sizes,
@@ -1499,11 +1491,6 @@ def generate_sdsc(
                                 # the future, key by (i, tensor.layout) instead.
                                 for i, tensor in enumerate(sdsc_spec.args)
                             },
-                            **(
-                                {"pdsRelation_": {"isPdsReuse": 1}}
-                                if sdsc_spec.pds_reuse
-                                else {}
-                            ),
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
@@ -1701,7 +1688,6 @@ def generate_sdsc(
                                         "dataFormat_": sdsc_spec.data_format.name,
                                         "fidelity_": "regular",
                                     },
-                                    "location": "Inner",
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
@@ -1729,13 +1715,10 @@ def generate_sdsc(
                 # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
                 **(
                     {
-                        "datadscs_": [],
-                        "dimToSymbolMappingOpcodeCorrection_": {},
                         "inputSymbolsAndTags_": {
                             str(sym_id): pytorch_sym
                             for pytorch_sym, sym_id in dim_local_symbols.items()
                         },
-                        "symbolDefinitions_": {},
                     }
                     if symbolic_dims
                     else {}
