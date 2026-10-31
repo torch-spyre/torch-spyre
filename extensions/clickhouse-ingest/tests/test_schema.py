@@ -328,7 +328,7 @@ def test_fact_tables_declare_no_identity_and_dimensions_do():
 
 def test_registry_covers_exactly_the_v2_tables():
     # The functional/benchmark four, the artifact four, the capability two, pipeline_runs,
-    # ci_run_timings, the rbac pair and the dispatch four. Pinned as an exact set so adding a table to the DDL
+    # ci_run_timings, the rbac pair, the dispatch four and the experiment ledger's seven. Pinned as an exact set so adding a table to the DDL
     # without modelling it here (or vice versa) fails rather than drifting.
     assert set(TABLES) == {
         "test_cases",
@@ -351,6 +351,13 @@ def test_registry_covers_exactly_the_v2_tables():
         "dispatch_requests",
         "artifact_dispatches",
         "dispatch_targets",
+        "experiment_events",
+        "experiment_arms",
+        "experiment_samples",
+        "experiment_decisions",
+        "experiment_findings",
+        "experiment_links",
+        "run_env_reports",
     }
 
 

@@ -69,5 +69,10 @@ nightly: {}
 weekly: {}
 snap: {}
 
+# experiment-<experiment or campaign>[@<arm>]: the images an experiment ran
+# (spyre_clickhouse_ingest.experiments writes them).
+experiment:
+  prefix: true
+
 # Explicit tags only: never matched by prefix, never dated (see the header).
 misc: {}
