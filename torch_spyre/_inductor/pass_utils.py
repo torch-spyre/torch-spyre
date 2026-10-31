@@ -1482,10 +1482,32 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     if not (offset_free or has_offset):
+        # Check for the sub-stick-aligned view pattern: Mod(var, N) where N is
+        # smaller than the required elems_per_stick. This arises
+        # when a tensor whose innermost allocation stride is N (a sub-stick
+        # value, e.g. 32 for fp16 where elems_per_stick=64) is viewed into a
+        # wider shape -- the merged index produces Mod(var, N) instead of the
+        # required Mod(var, 64).
+        # Emit a targeted hint so the user knows to fix the allocation shape.
+        _sub_stick_hint = ""
+        if (
+            isinstance(stick_expr, sympy.Mod)
+            and len(stick_expr.args[0].free_symbols) == 1
+            and isinstance(stick_expr.args[1], sympy.Integer)
+            and int(stick_expr.args[1]) < elems_per_stick
+        ):
+            actual_stride = int(stick_expr.args[1])
+            _sub_stick_hint = (
+                f"The expression may result from a sub-stick-aligned allocation "
+                f"being viewed into a wider shape. The innermost allocation "
+                f"stride ({actual_stride}) is smaller than elems_per_stick "
+                f"({elems_per_stick}). Ensure the innermost allocation "
+                f"dimension is aligned to elems_per_stick ({elems_per_stick})."
+            )
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"with a constant offset.{_sub_stick_hint}"
         )
 
 
